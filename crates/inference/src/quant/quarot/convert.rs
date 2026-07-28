@@ -3,7 +3,7 @@
 //! [`convert_quarot_qwen35`] reads `config.json` + SafeTensors from
 //! `input_dir`, runs the full pipeline
 //! (`materialize_lm_head` → `fuse_rmsnorms` → `absorb_rotations` →
-//! [`assert_forward_equivalence_qwen35`]) entirely in f64, and on success
+//! forward equivalence) entirely in f64, and on success
 //! writes the converted model to `output_dir`:
 //!
 //! - Planned (rotated) tensors → `<sanitized>.q4` via
@@ -32,7 +32,8 @@ use crate::error::InferenceError;
 use crate::model::qwen35::qwen_required_tensor_names;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::forward_equivalence::{
-    ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_forward_equivalence_qwen35,
+    ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_prepared_forward_equivalence_qwen35,
+    prepare_forward_equivalence_qwen35,
 };
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader};
@@ -553,26 +554,27 @@ pub fn convert_quarot_qwen35(
         materialize_lm_head_for_qwen35(&mut working_set, &cfg)?;
     }
 
-    let original_snapshot = working_set.clone();
-
     let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg)?;
     fusion_plan.push(qwen35_final_norm_fusion_target());
     let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
     let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
+    let forward_cfg = ForwardEquivalenceConfig {
+        num_probe_tokens: opts.num_probe_tokens,
+        tolerance: opts.tolerance,
+        seed: opts.rotation_seed,
+    };
+    let equivalence_snapshot =
+        prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)?;
 
     fuse_rmsnorms(&mut working_set, &fusion_plan)?;
     absorb_rotations(&mut working_set, &rotation_plan, &rotation)?;
 
-    let forward_equivalence = assert_forward_equivalence_qwen35(
-        &original_snapshot,
+    let forward_equivalence = assert_prepared_forward_equivalence_qwen35(
+        equivalence_snapshot,
+        &reader,
         &working_set,
         &cfg,
         &rotation,
-        &ForwardEquivalenceConfig {
-            num_probe_tokens: opts.num_probe_tokens,
-            tolerance: opts.tolerance,
-            seed: opts.rotation_seed,
-        },
     )?;
 
     if !opts.dry_run {
@@ -1290,6 +1292,64 @@ mod tests {
         let out_cfg_str = fs::read_to_string(output.join("config.json")).unwrap();
         let out_cfg = Qwen35Config::from_config_json_str(&out_cfg_str).unwrap();
         assert!(!out_cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn prepared_equivalence_streams_original_tensors_and_refuses_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 0x1074);
+
+        let reader = QuarotTensorReader::open(&input).unwrap();
+        let required_names = qwen_required_tensor_names(&cfg);
+        let mut working_set = load_tensors_f64(&reader, &required_names).unwrap();
+        materialize_lm_head_for_qwen35(&mut working_set, &cfg).unwrap();
+
+        let rotation = RandomizedHadamard::new(0xA11C_E5E5, cfg.hidden_size).unwrap();
+        let forward_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: 2,
+            ..Default::default()
+        };
+        let passing_snapshot =
+            prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)
+                .unwrap();
+        let refusing_snapshot =
+            prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)
+                .unwrap();
+
+        let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg).unwrap();
+        fusion_plan.push(qwen35_final_norm_fusion_target());
+        let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        fuse_rmsnorms(&mut working_set, &fusion_plan).unwrap();
+        absorb_rotations(&mut working_set, &rotation_plan, &rotation).unwrap();
+
+        let report = assert_prepared_forward_equivalence_qwen35(
+            passing_snapshot,
+            &reader,
+            &working_set,
+            &cfg,
+            &rotation,
+        )
+        .unwrap();
+        assert!(report.max_abs_error <= forward_cfg.tolerance);
+
+        let chain_skipped = "model.language_model.layers.1.self_attn.k_proj.weight";
+        working_set
+            .get_mut(chain_skipped)
+            .expect("full-attention k_proj must exist")
+            .data[0] += 0.25;
+
+        let err = assert_prepared_forward_equivalence_qwen35(
+            refusing_snapshot,
+            &reader,
+            &working_set,
+            &cfg,
+            &rotation,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("per-tensor"), "unexpected error: {msg}");
     }
 
     // ------------------------------------------------------------------
