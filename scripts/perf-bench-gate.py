@@ -221,7 +221,32 @@ def render_report(results: list[BenchResult], arch: str,
     if wins:
         lines.append(f"**🚀 {len(wins)} confirmed improvement**")
     if not (fails or warns or wins):
-        lines.append(f"✅ All {len(gated)} gated benches within noise band (±{WARN_PCT}%)")
+        # A clean run is a NEGATIVE result, and a negative is interpretable only
+        # if the report publishes what it could have detected. Two things make
+        # the bare pass line misleading on its own. The ±WARN_PCT band is a
+        # policy constant, not an achieved precision, so "within noise band" reads
+        # as a measurement claim while asserting a threshold. And the CI table
+        # below is guarded on something having crossed a threshold, which
+        # suppresses the intervals in exactly the case where they carry the most
+        # information: quick mode on a loaded machine can produce CIs several
+        # times wider than the band they are compared against, and this line
+        # would still say pass. Publishing the widest interval actually observed
+        # is what separates "nothing regressed" from "this run could not have
+        # seen a regression" — the same distinction --require-measurements draws
+        # one layer up, applied to resolution rather than to presence.
+        widest = max(
+            gated, key=lambda r: r.ci_high_pct - r.ci_low_pct, default=None
+        )
+        detail = ""
+        if widest is not None:
+            detail = (
+                f" — widest 95% CI observed [{widest.ci_low_pct:+.2f}%, "
+                f"{widest.ci_high_pct:+.2f}%] on `{widest.name}`"
+            )
+        lines.append(
+            f"✅ All {len(gated)} gated benches within noise band "
+            f"(±{WARN_PCT}%){detail}"
+        )
     lines.append("")
 
     if fails or warns or wins:
