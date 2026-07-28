@@ -7064,13 +7064,29 @@ mod inner {
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
         ///
+        /// # Errors
+        ///
+        /// Returns an error when more than one position is requested while a
+        /// LoRA adapter is active, because the batched all-position path does
+        /// not apply LoRA projections.
+        ///
         /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
         /// comment for the invariant this enforces.
-        pub fn forward_prefill_all_logits(&mut self, token_ids: &[u32]) -> Vec<f32> {
+        pub fn forward_prefill_all_logits(
+            &mut self,
+            token_ids: &[u32],
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            if token_ids.len() > 1 && self.lora.is_some() {
+                return Err(crate::error::InferenceError::Inference(
+                    "forward_prefill_all_logits: all-position prefill does not apply LoRA \
+                     adapters; unload the adapter before requesting all-position logits"
+                        .into(),
+                ));
+            }
             self.cross_turn_prefix_cache.clear();
-            self.forward_prefill_impl(token_ids, true)
+            Ok(self.forward_prefill_impl(token_ids, true))
         }
 
         fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
@@ -7097,12 +7113,6 @@ mod inner {
             }
             if self.lora.is_some() {
                 // Batched helper does not apply LoRA adapters; stay on sequential path.
-                if all_positions {
-                    panic!(
-                        "forward_prefill_all_logits: LoRA active — \
-                         batch/all-position prefill does not apply LoRA"
-                    );
-                }
                 let mut last_logits = Vec::new();
                 for (pos, &id) in token_ids.iter().enumerate() {
                     last_logits = self.forward_step(id, pos);
@@ -15946,8 +15956,8 @@ mod inner {
         /// softmax runs over the full vocabulary at decode step `i`.
         ///
         /// Errors if `tokens.len() < 2`, if `tokens.len() > self.max_context()`
-        /// (the KV cache would overflow during the walk), or if any
-        /// `token_id >= cfg.vocab_size`.
+        /// (the KV cache would overflow during the walk), if any
+        /// `token_id >= cfg.vocab_size`, or if a LoRA adapter is active.
         pub fn compute_token_nlls(
             &mut self,
             tokens: &[u32],
@@ -15985,7 +15995,7 @@ mod inner {
             // Sequential forward_step from pos=0 with reset_state does NOT
             // produce usable next-token distributions and is not used here.
             self.reset_state();
-            let flat = self.forward_prefill_all_logits(tokens);
+            let flat = self.forward_prefill_all_logits(tokens)?;
             debug_assert_eq!(flat.len(), tokens.len() * vocab_size);
             let mut nlls = Vec::with_capacity(tokens.len() - 1);
             for i in 0..tokens.len() - 1 {
@@ -24761,6 +24771,52 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn lora_all_position_prefill_and_nll_return_typed_errors() {
+            let _gpu = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture constructs");
+            state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 1)], 1.0, None)
+                .expect("valid LoRA adapter loads");
+
+            let direct_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.forward_prefill_all_logits(&[1, 2])
+            }));
+            let direct_result =
+                direct_outcome.expect("LoRA all-position prefill must return Err, not panic");
+            let direct_error = direct_result.expect_err("active LoRA must reject all-position");
+            assert!(
+                matches!(
+                    &direct_error,
+                    crate::error::InferenceError::Inference(message)
+                        if message.contains("all-position prefill")
+                            && message.contains("LoRA adapters")
+                ),
+                "unexpected all-position error: {direct_error}"
+            );
+
+            let nll_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.compute_token_nlls(&[1, 2])
+            }));
+            let nll_result =
+                nll_outcome.expect("LoRA compute_token_nlls must return Err, not panic");
+            let nll_error = nll_result.expect_err("active LoRA must reject per-token NLLs");
+            assert!(
+                matches!(
+                    &nll_error,
+                    crate::error::InferenceError::Inference(message)
+                        if message.contains("all-position prefill")
+                            && message.contains("LoRA adapters")
+                ),
+                "unexpected NLL error: {nll_error}"
+            );
+        }
+
+        #[test]
         fn load_lora_adapter_rejects_short_a() {
             let Some(_dev) = metal::Device::system_default() else {
                 return;
@@ -30804,7 +30860,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // the emit_logits gate) — its final-position row is what an unskipped last
             // chunk would have produced.
             state.reset_state();
-            let all_logits = state.forward_prefill_all_logits(&tokens);
+            let all_logits = state
+                .forward_prefill_all_logits(&tokens)
+                .expect("LoRA-inactive all-position prefill succeeds");
             assert_eq!(
                 all_logits.len(),
                 tokens.len() * vocab,
@@ -30879,7 +30937,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             // Must not panic; returns n * vocab_size f32 values.
             state.reset_state();
-            let flat = state.forward_prefill_all_logits(&tokens);
+            let flat = state
+                .forward_prefill_all_logits(&tokens)
+                .expect("LoRA-inactive all-position prefill succeeds");
             assert_eq!(
                 flat.len(),
                 tokens.len() * model.config().vocab_size,
@@ -31468,7 +31528,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // fail the gate, never get masked by a lucky retry.
                 state.use_gdn_chunked = true;
                 state.reset_state();
-                let chunked_all = state.forward_prefill_all_logits(&tokens);
+                let chunked_all = state
+                    .forward_prefill_all_logits(&tokens)
+                    .expect("LoRA-inactive chunked all-position prefill succeeds");
                 assert_eq!(
                     chunked_all.len(),
                     n * vocab,
@@ -31487,7 +31549,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     // Serial path (chunked OFF): per-position logits via all_logits.
                     state.use_gdn_chunked = false;
                     state.reset_state();
-                    let serial_all = state.forward_prefill_all_logits(&tokens);
+                    let serial_all = state
+                        .forward_prefill_all_logits(&tokens)
+                        .expect("LoRA-inactive serial all-position prefill succeeds");
                     assert_eq!(
                         serial_all.len(),
                         n * vocab,

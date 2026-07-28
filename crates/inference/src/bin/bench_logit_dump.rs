@@ -83,7 +83,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     eprintln!("[bench_logit_dump] running forward_prefill_all_logits...");
-    let logits_flat = metal.forward_prefill_all_logits(&tokens);
+    let logits_flat = metal.forward_prefill_all_logits(&tokens)?;
 
     let vocab = cfg.vocab_size;
     let n_pos = tokens.len();
