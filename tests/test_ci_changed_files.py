@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -204,6 +205,41 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             with self.subTest(workflow=relative_path):
                 contents = (_ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertIn(trigger, contents)
+
+
+class E2eParityChangeFilterTests(unittest.TestCase):
+    def test_future_rust_setup_action_changes_trigger_engine_parity(self) -> None:
+        workflow = (
+            _ROOT / ".github/workflows/e2e-parity.yml"
+        ).read_text(encoding="utf-8")
+        filters = [
+            line.strip()
+            for line in workflow.splitlines()
+            if line.strip().startswith("if grep -E ")
+        ]
+        self.assertGreaterEqual(len(filters), 1)
+        engine_filter = filters[0]
+
+        self.assertIn(
+            r"^\.github/actions/rust-setup/",
+            engine_filter,
+        )
+        pattern_match = re.search(r"grep -E '([^']+)'", engine_filter)
+        self.assertIsNotNone(pattern_match)
+        pattern = pattern_match.group(1)
+
+        for changed_path in (
+            ".github/actions/rust-setup/action.yml",
+            ".github/actions/rust-setup/scripts/verify.sh",
+        ):
+            with self.subTest(changed_path=changed_path):
+                result = subprocess.run(
+                    ["grep", "-E", pattern],
+                    input=f"{changed_path}\n",
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":
