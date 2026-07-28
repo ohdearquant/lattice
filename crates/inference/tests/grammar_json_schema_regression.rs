@@ -135,3 +135,50 @@ fn user_defs_does_not_clobber_builtin_rule() {
         "def named 'ws' must stay an integer, not alias the whitespace builtin"
     );
 }
+
+#[test]
+fn ref_narrowing_siblings_never_widen_public_compiler() {
+    let cases: [(&str, serde_json::Value, &[u8]); 3] = [
+        (
+            "const",
+            serde_json::json!({
+                "$defs": { "S": { "type": "string" } },
+                "$ref": "#/$defs/S",
+                "const": "a"
+            }),
+            b"\"b\"",
+        ),
+        (
+            "enum",
+            serde_json::json!({
+                "$defs": { "S": { "type": "string" } },
+                "$ref": "#/$defs/S",
+                "enum": ["a"]
+            }),
+            b"\"b\"",
+        ),
+        (
+            "type",
+            serde_json::json!({
+                "$defs": { "N": { "type": "number" } },
+                "$ref": "#/$defs/N",
+                "type": "integer"
+            }),
+            b"1.5",
+        ),
+    ];
+
+    for (keyword, schema, forbidden) in cases {
+        match compile_json_schema(&schema) {
+            Ok(grammar) => assert!(
+                !full_accept(&grammar, forbidden),
+                "`{keyword}` sibling must narrow the referenced schema"
+            ),
+            Err(err) => assert!(
+                err.0.contains(keyword) && err.0.contains("$ref"),
+                "fail-closed error should name `{keyword}` and `$ref`, got: {}",
+                err.0
+            ),
+        }
+    }
+}
