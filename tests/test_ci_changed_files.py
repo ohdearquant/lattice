@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -18,6 +19,17 @@ _REQUIRED_WORKFLOWS = (
     ".github/workflows/ci.yml",
     ".github/workflows/e2e-parity.yml",
 )
+_E2E_PARITY_WORKFLOW = _ROOT / ".github/workflows/e2e-parity.yml"
+
+
+def _workflow_job(contents: str, name: str) -> str:
+    match = re.search(
+        rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [a-z0-9][a-z0-9-]*:\n|\Z)",
+        contents,
+    )
+    if match is None:
+        raise AssertionError(f"workflow job {name!r} is missing")
+    return match.group(0)
 
 
 class ChangedFilesTests(unittest.TestCase):
@@ -204,6 +216,48 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             with self.subTest(workflow=relative_path):
                 contents = (_ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertIn(trigger, contents)
+
+
+class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.contents = _E2E_PARITY_WORKFLOW.read_text(encoding="utf-8")
+        cls.job = _workflow_job(cls.contents, "embed-drift-x86")
+
+    def test_job_selects_x86_64_for_engine_changes(self) -> None:
+        self.assertIn("name: embed drift gate (x86_64 observation)", self.job)
+        self.assertIn("needs: changes", self.job)
+        self.assertIn("if: needs.changes.outputs.engine == 'true'", self.job)
+        self.assertIn("runs-on: ubuntu-latest", self.job)
+        self.assertIn("""run: test "$(uname -m)" = 'x86_64'""", self.job)
+
+    def test_job_provisions_the_checkpoint_and_fails_closed(self) -> None:
+        self.assertIn("-- --model bge-small-en-v1.5 --download-only", self.job)
+        self.assertIn("LATTICE_DRIFT_GATE_ENFORCE: '1'", self.job)
+        self.assertIn(
+            "-- --nocapture > embed-drift-x86.log 2>&1",
+            self.job,
+        )
+        self.assertIn('exit "$status"', self.job)
+        self.assertIn(
+            "grep -Fq 'Loaded drift baseline:' embed-drift-x86.log",
+            self.job,
+        )
+        self.assertIn(
+            "grep -Fq '[bge-small drift gate] max(1-cosine)=' "
+            "embed-drift-x86.log",
+            self.job,
+        )
+        self.assertNotIn("continue-on-error", self.job)
+
+    def test_observation_does_not_replace_the_required_arm_gate(self) -> None:
+        arm_job = _workflow_job(self.contents, "embed-drift")
+        self.assertIn("runs-on: ubuntu-24.04-arm", arm_job)
+        self.assertIn("LATTICE_DRIFT_GATE_ENFORCE: '1'", arm_job)
+
+        parity_gate = _workflow_job(self.contents, "parity-gate")
+        self.assertIn("embed-drift,", parity_gate)
+        self.assertNotIn("embed-drift-x86", parity_gate)
 
 
 if __name__ == "__main__":
