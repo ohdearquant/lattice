@@ -53,8 +53,8 @@ pub struct MRopeTables {
 /// Text runs advance all three axes together, one position per token. Each
 /// image run consumes the next entry in `grids`, starts all axes at the
 /// current position, sweeps the merged `(T, H/m, W/m)` grid row-major, and
-/// advances the shared position counter by `max(H, W) / m` afterward — not
-/// by the number of image-pad tokens consumed.
+/// advances the shared position counter by `max(T, H/m, W/m)` afterward —
+/// not by the number of image-pad tokens consumed.
 ///
 /// Fails closed (`InvalidInput`) on: empty `input_ids`, zero merge size,
 /// zero-dimension grids, grids not divisible by the merge size, image runs
@@ -152,7 +152,7 @@ pub fn build_position_ids(
                 }
             }
 
-            current_pos = advance(current_pos, lh.max(lw), "post-image position")?;
+            current_pos = advance(current_pos, lt.max(lh).max(lw), "post-image position")?;
             i = run_end;
         } else {
             positions.push((current_pos, current_pos, current_pos));
@@ -186,9 +186,10 @@ pub fn build_position_ids(
 ///
 /// `rope_half = (head_dim as f32 * partial_rotary_factor) as usize / 2`
 /// (32 for Qwen3.5-0.8B). `mrope_section` must have exactly 3 entries
-/// (T, H, W lane counts) summing to `rope_half`; lane `i` selects axis
-/// `i % 3` (the cyclic `T,H,W,T,H,W,...` schedule — RECON sec. 2 confirms
-/// this reduces to exactly the given per-axis counts for `[11,11,10]`).
+/// (T, H, W section lengths) summing to `rope_half`. Every lane starts on T;
+/// H then overwrites lanes `1,4,...` up to its declared section length and
+/// W overwrites lanes `2,5,...` up to its declared section length, matching
+/// the reference's saturating strided assignment.
 /// `inv_freq[i] = theta^(-2*i / rope_dim)`, `rope_dim = 2 * rope_half`.
 pub fn build_cos_sin(
     positions: &MRopePositions,
@@ -241,22 +242,6 @@ pub fn build_cos_sin(
         )));
     }
 
-    // The cyclic T,H,W,T,H,W,... lane schedule below assigns axis `a` exactly
-    // ceil((rope_half - a) / 3) lanes. Only sections matching those counts
-    // (e.g. [11,11,10] for rope_half=32) have been verified against the
-    // reference; any other split would silently rotate lanes with the wrong
-    // axis, so reject it rather than guess.
-    for (axis, &count) in mrope_section.iter().enumerate() {
-        let cyclic_count = (0..rope_half).filter(|i| i % 3 == axis).count();
-        if count != cyclic_count {
-            return Err(InferenceError::InvalidInput(format!(
-                "mrope_section {mrope_section:?} does not match the interleaved \
-                 cyclic schedule for rope_half={rope_half} (axis {axis}: got {count}, \
-                 cyclic schedule assigns {cyclic_count}); this split is unverified"
-            )));
-        }
-    }
-
     let inv_freq: Vec<f32> = (0..rope_half)
         .map(|i| theta.powf(-2.0 * i as f32 / rope_dim as f32))
         .collect();
@@ -268,10 +253,10 @@ pub fn build_cos_sin(
         let mut cos_row = Vec::with_capacity(rope_half);
         let mut sin_row = Vec::with_capacity(rope_half);
         for i in 0..rope_half {
-            let axis_val = match i % 3 {
-                0 => t,
-                1 => h,
-                _ => w,
+            let axis_val = match (i % 3, i / 3) {
+                (1, section_idx) if section_idx < mrope_section[1] => h,
+                (2, section_idx) if section_idx < mrope_section[2] => w,
+                _ => t,
             };
             let angle = axis_val as f32 * inv_freq[i];
             cos_row.push(angle.cos());
@@ -408,46 +393,67 @@ mod tests {
         assert_eq!(decoded, 26);
     }
 
-    // ---- Test 3: lane schedule with section [11,11,10] ----
-    // Drives build_cos_sin itself (not a restatement of the formula) with
-    // theta=1.0 -- inv_freq[i] = 1.0^anything = 1.0 for every lane, so
-    // angle == axis_val exactly and cos/sin directly reveal which axis a
-    // lane selected. T/H/W are distinct small values chosen so their
-    // cos values are pairwise well-separated (no aliasing near the 1e-4
-    // tolerance).
     #[test]
-    fn lane_schedule_matches_section_counts() {
-        let section = [11usize, 11, 10];
+    fn post_image_advance_accounts_for_temporal_axis() {
+        let mut input_ids = vec![TOKEN_A; 5];
+        input_ids.extend(std::iter::repeat_n(IMAGE_PAD, 12));
+        input_ids.push(TOKEN_B);
+
+        let grids = [GridThw { t: 3, h: 4, w: 4 }];
+        let result = build_position_ids(&input_ids, IMAGE_PAD, &grids, 2).unwrap();
+
+        assert_eq!(result.positions[5], (5, 5, 5));
+        assert_eq!(result.positions[16], (7, 6, 6));
+        assert_eq!(result.positions[17], (8, 8, 8));
+    }
+
+    fn assert_hf_lane_schedule(section: [usize; 3], rope_half: usize, expected_counts: [usize; 3]) {
         let (t, h, w) = (2u32, 3u32, 5u32);
         let positions = MRopePositions {
             positions: vec![(t, h, w)],
             rope_delta: 0,
         };
-        let tables = build_cos_sin(&positions, 256, 0.25, 1.0, &section).unwrap();
+        let tables = build_cos_sin(&positions, rope_half * 2, 1.0, 1.0, &section).unwrap();
 
-        for lane in 0..32usize {
-            let expected_axis = match lane % 3 {
+        let mut expected_axes = vec![0usize; rope_half];
+        for (axis, offset) in [(1usize, 1usize), (2, 2)] {
+            let end = (section[axis] * 3).min(rope_half);
+            for lane in (offset..end).step_by(3) {
+                expected_axes[lane] = axis;
+            }
+        }
+
+        let actual_counts = [
+            expected_axes.iter().filter(|&&axis| axis == 0).count(),
+            expected_axes.iter().filter(|&&axis| axis == 1).count(),
+            expected_axes.iter().filter(|&&axis| axis == 2).count(),
+        ];
+        assert_eq!(actual_counts, expected_counts);
+
+        for (lane, axis) in expected_axes.into_iter().enumerate() {
+            let expected_axis = match axis {
                 0 => t,
                 1 => h,
-                _ => w,
+                2 => w,
+                _ => unreachable!(),
             };
             let expected_cos = (expected_axis as f32).cos();
             let expected_sin = (expected_axis as f32).sin();
             assert_close(tables.cos[0][lane], expected_cos, 1e-4);
             assert_close(tables.sin[0][lane], expected_sin, 1e-4);
         }
+    }
 
-        // T lanes: 0,3,...,30 (11). H lanes: 1,4,...,31 (11). W lanes:
-        // 2,5,...,29 (10) -- exactly the counts in `section`.
-        let t_lanes: Vec<usize> = (0..32).filter(|i| i % 3 == 0).collect();
-        let h_lanes: Vec<usize> = (0..32).filter(|i| i % 3 == 1).collect();
-        let w_lanes: Vec<usize> = (0..32).filter(|i| i % 3 == 2).collect();
-        assert_eq!(t_lanes.len(), section[0]);
-        assert_eq!(h_lanes.len(), section[1]);
-        assert_eq!(w_lanes.len(), section[2]);
-        assert_eq!(t_lanes, (0..=30).step_by(3).collect::<Vec<_>>());
-        assert_eq!(h_lanes, (1..=31).step_by(3).collect::<Vec<_>>());
-        assert_eq!(w_lanes, (2..=29).step_by(3).collect::<Vec<_>>());
+    #[test]
+    fn lane_schedule_matches_hf_saturating_overwrite() {
+        for (section, rope_half, expected_counts) in [
+            ([11, 11, 10], 32, [11, 11, 10]),
+            ([16, 24, 24], 64, [22, 21, 21]),
+            ([22, 21, 21], 64, [22, 21, 21]),
+            ([20, 6, 6], 32, [20, 6, 6]),
+        ] {
+            assert_hf_lane_schedule(section, rope_half, expected_counts);
+        }
     }
 
     // ---- Test 4: cos/sin numerics vs probe_mrope_lanes_result.json ----
@@ -537,20 +543,6 @@ mod tests {
             rope_delta: 0,
         };
         let err = build_cos_sin(&positions, 256, 0.25, 1e7, &[10, 10, 10]).unwrap_err();
-        assert!(matches!(err, InferenceError::InvalidInput(_)));
-    }
-
-    #[test]
-    fn rejects_mrope_section_not_matching_cyclic_schedule() {
-        // Sums to rope_half=32 but is not the cyclic schedule's [11,11,10]
-        // split; must fail closed rather than rotate lanes with wrong axes.
-        let positions = MRopePositions {
-            positions: vec![(0, 0, 0)],
-            rope_delta: 0,
-        };
-        let err = build_cos_sin(&positions, 256, 0.25, 1e7, &[20, 6, 6]).unwrap_err();
-        assert!(matches!(err, InferenceError::InvalidInput(_)));
-        let err = build_cos_sin(&positions, 256, 0.25, 1e7, &[10, 11, 11]).unwrap_err();
         assert!(matches!(err, InferenceError::InvalidInput(_)));
     }
 
