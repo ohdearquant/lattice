@@ -119,9 +119,9 @@ automatically as part of its output.
 
 QuaRot (Ashkboos et al., NeurIPS 2024) applies a Hadamard rotation to the residual stream before
 quantizing, spreading outlier magnitude across channels so that per-block min/max quantization has
-less dynamic range to cover. `quantize_quarot` implements ADR-044 step 3c: rotate, quantize, then
-verify the rotation didn't change the model's forward output beyond a tight numerical tolerance
-before writing anything.
+less dynamic range to cover. `quantize_quarot` implements ADR-044 steps 3c and 4 as one fail-closed
+promotion: it rotates and quantizes in a hidden staging directory, verifies forward equivalence,
+runs the PPL delta gate, records the evidence, and only then publishes `--output-dir`.
 
 Unlike `quantize_q4`, this tool has real `--help`:
 
@@ -139,12 +139,20 @@ required:
 options:
   --tolerance <F64>          Forward-equivalence tolerance. Default 1e-5.
   --num-probe-tokens <USIZE> Chain-probe sample size. Default 4.
-  --dry-run                  Run pipeline + gate; skip disk writes.
+  --ppl-evaluator <PATH>     Absolute path to eval_perplexity. Required.
+  --baseline-q4-dir <PATH>   Unrotated Q4 baseline directory. Required.
+  --tokenizer-dir <PATH>     Directory containing tokenizer.json. Required.
+  --corpus-file <PATH>       Held-out UTF-8 PPL corpus. Required.
+  --window <USIZE>           PPL window. Default 512.
+  --stride <USIZE>           PPL stride. Default 256.
+  --max-tokens <USIZE>       Optional PPL token cap.
+  --delta-threshold <F64>    PPL delta ceiling. Default 0.5.
+  --dry-run                  Run both gates in staging; do not promote output.
   -h, --help                 Print this help and exit.
 
-The converter refuses to write any output if the forward-equivalence
-gate fails (delta > tolerance) — this protects against silently shipping
-a model whose logits diverged during conversion.
+The converter stages all output, runs forward-equivalence and the PPL delta
+gate, records quarot_ppl_acceptance.json, and only then promotes --output-dir.
+No flag skips PPL acceptance.
 ```
 
 `--seed` is required and has no default: converted artifacts from different seeds are not
@@ -153,45 +161,44 @@ the seed used, not rely on an implicit default. It accepts decimal or `0x`-prefi
 optional `_` separators exactly like a Rust integer literal (`0xCAFE_BABE_DEAD_BEEF`).
 
 ```bash
-cargo build --release -p lattice-inference --bin quantize_quarot
+cargo build --release -p lattice-inference \
+  --bin quantize_quarot --bin eval_perplexity \
+  --features f16,metal-gpu
+PPL_EVALUATOR="$(pwd)/target/release/eval_perplexity"
+
 ./target/release/quantize_quarot \
   --model-dir ~/.lattice/models/qwen3.5-0.8b \
   --output-dir ~/.lattice/models/qwen3.5-0.8b-q4-quarot \
-  --seed 0xC0FFEE
+  --seed 0xC0FFEE \
+  --ppl-evaluator "$PPL_EVALUATOR" \
+  --baseline-q4-dir ~/.lattice/models/qwen3.5-0.8b-q4 \
+  --tokenizer-dir ~/.lattice/models/qwen3.5-0.8b \
+  --corpus-file docs/bench_results/wiki.test.raw
 ```
 
-Real output from that command:
+The evaluator path must be absolute so promotion never depends on whichever same-named binary
+happens to appear on `PATH`. The baseline directory must be a loadable unrotated Q4 artifact,
+including `config.json`; Step 1 explains why a raw `quantize_q4` output needs that file copied.
 
-```
-=== quantize_quarot: QuaRot Q4_0 converter ===
-Model dir:   ~/.lattice/models/qwen3.5-0.8b
-Output dir:  ~/.lattice/models/qwen3.5-0.8b-q4-quarot
-Seed:        0x0000000000c0ffee
-Tolerance:   0.00001
-Probe toks:  4
-Mode:        WRITE
+The default `delta < 0.5` policy is the historical ADR-044 shipping-quality target. The current
+offline QuaRot v0 implementation is known to miss it by roughly +2.4 PPL, as the superseding ADR
+amendment and Step 3 below explain. A normal invocation against that implementation therefore
+exits 1 and publishes no directory. A diagnostic workflow may pass a larger explicit
+`--delta-threshold` as a regression ceiling, but the resulting receipt records that policy so it
+cannot be confused with the nominal 0.5 acceptance.
 
-=== Summary ===
-Tied input:        true
-Quantized (Q4_0):  188
-Kept (F16):        148
-Input bytes:       1.44 GB
-Output bytes:      0.62 GB
-Compression:       2.30x (43.4%)
-Forward-equiv:     max_abs=7.017e-14, mean_abs=1.050e-14 (tol=1e-5, probes=[17156, 85503, 9161, 94570])
-Wall time:         77.6s
-```
+Both gates run before publication:
 
-`Tied input: true` means this checkpoint ties its embedding and `lm_head` weights (one tensor,
-two roles) — the converter detected and preserved that. The `Forward-equiv` line is the
-correctness gate: it runs the _unrotated_ and _rotated_ model forward on `--num-probe-tokens`
-sample token chains and reports the max/mean absolute logit difference. Here `max_abs=7e-14`
-against a `tol=1e-5` tolerance is nine orders of magnitude inside the bound — the rotation is
-mathematically exact up to floating-point noise, as it should be (a Hadamard rotation is
-orthogonal; it changes representation, not the function computed). **If this gate fails, the tool
-writes nothing** — `ConversionReport` is never returned, `main` prints `ERROR: ...` and returns
-`ExitCode::FAILURE` (exit 1), and the output directory is left without a completed conversion.
-There is no partial/corrupt output state to clean up.
+- Forward equivalence compares the unrotated and rotated pre-quantization forward paths.
+- PPL acceptance launches the exact `--ppl-evaluator`, requires structured measurements for both
+  Q4 artifacts with identical token/window coverage, recomputes the delta, and rejects non-finite,
+  missing, duplicate, or over-threshold evidence even if the evaluator exits 0.
+
+On pass, the output contains `quarot_ppl_acceptance.json` with the policy, measurements, paths,
+and SHA-256 hashes of the artifact manifest, evaluator, baseline manifest, tokenizer, and corpus.
+On any failure the hidden staging directory is removed and `--output-dir` is not published.
+`--dry-run` is not a gate bypass: it needs enough temporary disk space for the complete converted
+artifact, runs both gates, then discards staging.
 
 Note the different tensor counts (188 quantized + 148 kept = 336) versus plain `quantize_q4`'s
 271 + 217 = 488 on the same source directory. The two exclusions behind that gap are different
@@ -212,13 +219,14 @@ If your workflow needs the QuaRot path specifically for text generation (chat/se
 expected — the language-model tensors are the ones rotated and quantized, and MTP still loads and
 runs (as f16), it's just not yet part of the rotation; it is not a partial-conversion bug.
 
-## Step 3: verify with perplexity, not just "it loaded"
+## Step 3: inspect or independently re-run perplexity
 
 A checkpoint that loads and generates _something_ is not evidence the quantization preserved
 quality — Q4_0 and especially a botched rotation can produce fluent-looking but degraded text.
-`eval_perplexity` (ADR-044 step 4) is the actual acceptance check: it scores a held-out text
-corpus and reports perplexity (PPL), and in its dual-Q4 mode it computes the PPL delta between an
-unrotated and a rotated checkpoint against a threshold.
+`eval_perplexity` (ADR-044 step 4) is the acceptance engine the converter invokes before
+promotion. You can run it again to audit the receipt, compare a different corpus or threshold, or
+measure an older artifact that predates the receipt contract. It scores a held-out text corpus and
+in dual-Q4 mode computes the PPL delta between unrotated and rotated checkpoints.
 
 ```
 $ ./target/release/eval_perplexity --help
@@ -376,11 +384,12 @@ a sequence` manifest error for QuaRot directories. That failure mode is historic
 ## Summary checklist
 
 1. `quantize_q4 --model-dir SRC --output-dir Q4_DIR` — fast, no rotation, no `config.json` written.
-2. `quantize_quarot --model-dir SRC --output-dir QUAROT_DIR --seed 0x...` — rotated, includes its
-   own `config.json`, refuses to write output if its internal forward-equivalence check fails.
+2. `quantize_quarot --model-dir SRC --output-dir QUAROT_DIR --seed 0x... --ppl-evaluator
+   /absolute/path/to/eval_perplexity --baseline-q4-dir Q4_DIR --tokenizer-dir SRC --corpus-file
+   CORPUS` — rotated, stages output, runs both gates, and only publishes a directory with a PPL
+   acceptance receipt.
 3. Copy `config.json` from `SRC` into `Q4_DIR` (not needed for `QUAROT_DIR`).
 4. `lattice doctor --model <dir> --tokenizer-dir SRC` before loading anything for real.
-5. `eval_perplexity --q4-dir Q4_DIR --quarot-q4-dir QUAROT_DIR --tokenizer-dir SRC --corpus-file <corpus>`
-   (full corpus, no `--max-tokens`) as the actual quality gate — exit code 0 plus a delta below
-   the threshold is the real "it worked" signal, not just successful loading.
+5. Audit `QUAROT_DIR/quarot_ppl_acceptance.json`, or independently re-run `eval_perplexity`
+   against the same inputs. Successful loading alone is not a quality signal.
 6. `lattice chat` / `lattice serve --model <dir> --tokenizer-dir SRC` to actually use the result.

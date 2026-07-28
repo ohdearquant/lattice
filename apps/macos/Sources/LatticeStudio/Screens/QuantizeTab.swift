@@ -2,10 +2,11 @@ import SwiftUI
 
 // MARK: - Quantize verb tab
 //
-// Runs `quantize_q4` (plain Q4_0) or `quantize_quarot` (Hadamard-rotated Q4_0) over a BF16 model,
-// writing a sibling `<name>-q4` / `<name>-q4-quarot` directory. Live progress (per-layer index,
-// before/after size, compression ratio, equivalence verdict) streams from the run's LiveRun. Only
-// BF16 models can be quantized; an already-quantized target shows an honest note instead of buttons.
+// Runs `quantize_q4` (plain Q4_0) over a BF16 model, writing a sibling `<name>-q4` directory.
+// QuaRot stays disabled until this panel exposes the mandatory PPL-promotion inputs. Live progress
+// (per-layer index, before/after size, compression ratio, equivalence verdict) streams from the
+// run's LiveRun. Only BF16 models can be quantized; an already-quantized target shows an honest
+// note instead of buttons.
 
 struct QuantizeTab: View {
     @Bindable var store: AppStore
@@ -62,15 +63,17 @@ struct QuantizeTab: View {
                     .buttonStyle(LatticePrimaryButtonStyle())
                     .disabled(liveQuant != nil)
 
-                    Button {
-                        store.startQuantize(quantConfig(model, method: .quarot, suffix: "-q4-quarot"))
-                    } label: {
+                    Button {} label: {
                         Text("Quantize to QuaRot Q4").font(Theme.Fonts.body)
                     }
                     .buttonStyle(LatticeSecondaryButtonStyle())
-                    .disabled(liveQuant != nil)
+                    .disabled(true)
                 }
-                Text("QuaRot applies a Hadamard rotation before Q4 to cut outlier error — slower, higher fidelity.")
+                Text(
+                    "QuaRot promotion is CLI-only until this panel can collect the required "
+                        + "unrotated Q4 baseline and held-out PPL corpus. The CLI refuses to "
+                        + "publish an artifact without that acceptance gate."
+                )
                     .font(Theme.Fonts.caption)
                     .foregroundStyle(Theme.Palette.textTertiary)
             }

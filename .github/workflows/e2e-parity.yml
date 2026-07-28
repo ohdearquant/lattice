@@ -664,19 +664,61 @@ jobs:
         with:
           shared-key: q4-composed
 
-      - name: Build QuaRot converter
-        run: cargo build --release -p lattice-inference --bin quantize_quarot --features f16
+      - name: Build QuaRot conversion and acceptance tools
+        run: |
+          cargo build --release -p lattice-inference \
+            --bin quantize_q4 \
+            --bin quantize_quarot \
+            --bin eval_perplexity \
+            --features "f16,metal-gpu"
+
+      - name: Generate unrotated Q4 PPL baseline
+        run: |
+          target/release/quantize_q4 \
+            --model-dir ~/.lattice/models/qwen3.5-0.8b \
+            --output-dir "$RUNNER_TEMP/qwen3.5-0.8b-q4"
+          cp ~/.lattice/models/qwen3.5-0.8b/config.json \
+            "$RUNNER_TEMP/qwen3.5-0.8b-q4/config.json"
 
       # Regenerate the ephemeral QuaRot+Q4 artifact (NOT committed). The frozen
       # golden the test asserts against WAS produced from this exact conversion
       # (same seed), so a green run proves the runtime composed path still matches.
+      # Offline QuaRot v0 is a documented +~2.4 PPL net negative (ADR-044's
+      # superseding amendment), so this diagnostic leg uses a 3.0 regression
+      # ceiling rather than mislabeling it as the nominal 0.5 shipping gate.
       - name: Generate ephemeral QuaRot Q4 artifact
         run: |
           target/release/quantize_quarot \
             --model-dir ~/.lattice/models/qwen3.5-0.8b \
             --output-dir "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4" \
             --seed 0xCAFE_BABE_DEAD_BEEF \
-            --num-probe-tokens 4
+            --num-probe-tokens 4 \
+            --ppl-evaluator "$PWD/target/release/eval_perplexity" \
+            --baseline-q4-dir "$RUNNER_TEMP/qwen3.5-0.8b-q4" \
+            --tokenizer-dir ~/.lattice/models/qwen3.5-0.8b \
+            --corpus-file docs/bench_results/wiki.test.raw \
+            --max-tokens 4096 \
+            --delta-threshold 3.0
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          receipt = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "qwen3.5-0.8b-quarot-q4"
+              / "quarot_ppl_acceptance.json"
+          )
+          record = json.loads(receipt.read_text())
+          assert record["accepted"] is True
+          assert record["evidence"]["delta"] < record["evidence"]["threshold"]
+          manifest = receipt.parent / "quantize_index.json"
+          assert hashlib.sha256(manifest.read_bytes()).hexdigest() == record[
+              "artifact_manifest_sha256"
+          ]
+          print(f"QuaRot PPL acceptance receipt verified: {receipt}")
+          PY
 
       - name: Run QuaRot Q4 composed golden gate
         env:

@@ -31,7 +31,10 @@ Requirements:
 """
 
 import argparse
+import hashlib
 import json
+import math
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -72,6 +75,11 @@ def parse_args() -> argparse.Namespace:
         help="Ephemeral output dir for the QuaRot Q4 artifact",
     )
     p.add_argument(
+        "--baseline-q4-dir",
+        default="target/quarot-q4-golden/qwen3.5-0.8b-q4",
+        help="Ephemeral unrotated Q4 baseline used by the mandatory PPL gate",
+    )
+    p.add_argument(
         "--seed", default=DEFAULT_SEED, help="QuaRot rotation seed (decimal or 0x... hex)"
     )
     p.add_argument(
@@ -82,6 +90,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--max-new-tokens", type=int, default=8, help="Greedy tokens generated per prompt"
+    )
+    p.add_argument(
+        "--ppl-max-tokens",
+        type=int,
+        default=4096,
+        help="Token cap for the mandatory PPL regression gate",
+    )
+    p.add_argument(
+        "--ppl-delta-threshold",
+        type=float,
+        default=3.0,
+        help="PPL regression ceiling around the known +~2.4 offline QuaRot v0 fixture delta",
     )
     p.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Committed golden JSON path")
     p.add_argument(
@@ -94,8 +114,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--skip-convert",
         action="store_true",
-        help="Reuse an existing --q4-dir instead of rerunning quantize_quarot "
-        "(useful when iterating on the dumper only).",
+        help="Reuse an existing accepted --q4-dir instead of rerunning quantize_quarot; "
+        "the script refuses directories without a passing acceptance receipt.",
     )
     return p.parse_args()
 
@@ -118,6 +138,9 @@ def main() -> None:
     q4_dir = Path(args.q4_dir)
     if not q4_dir.is_absolute():
         q4_dir = REPO_ROOT / q4_dir
+    baseline_q4_dir = Path(args.baseline_q4_dir)
+    if not baseline_q4_dir.is_absolute():
+        baseline_q4_dir = REPO_ROOT / baseline_q4_dir
 
     if not args.skip_convert:
         run(
@@ -128,14 +151,28 @@ def main() -> None:
                 "-p",
                 "lattice-inference",
                 "--bin",
+                "quantize_q4",
+                "--bin",
                 "quantize_quarot",
+                "--bin",
+                "eval_perplexity",
                 "--features",
-                "f16",
+                "f16,metal-gpu",
             ]
         )
+        if baseline_q4_dir.exists():
+            shutil.rmtree(baseline_q4_dir)
+        run(
+            [
+                "target/release/quantize_q4",
+                "--model-dir",
+                str(model_dir),
+                "--output-dir",
+                str(baseline_q4_dir),
+            ]
+        )
+        shutil.copy2(model_dir / "config.json", baseline_q4_dir / "config.json")
         if q4_dir.exists():
-            import shutil
-
             shutil.rmtree(q4_dir)
         run(
             [
@@ -148,11 +185,58 @@ def main() -> None:
                 args.seed,
                 "--num-probe-tokens",
                 str(args.num_probe_tokens),
+                "--ppl-evaluator",
+                str((REPO_ROOT / "target/release/eval_perplexity").resolve()),
+                "--baseline-q4-dir",
+                str(baseline_q4_dir),
+                "--tokenizer-dir",
+                str(model_dir),
+                "--corpus-file",
+                str(REPO_ROOT / "docs/bench_results/wiki.test.raw"),
+                "--max-tokens",
+                str(args.ppl_max_tokens),
+                "--delta-threshold",
+                str(args.ppl_delta_threshold),
             ]
         )
     else:
+        receipt_path = q4_dir / "quarot_ppl_acceptance.json"
+        try:
+            receipt = json.loads(receipt_path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit(
+                f"ERROR: --skip-convert requires a readable PPL acceptance receipt at "
+                f"{receipt_path}: {error}"
+            ) from error
+        if receipt.get("accepted") is not True:
+            raise SystemExit(
+                f"ERROR: --skip-convert refuses an unaccepted QuaRot artifact: {receipt_path}"
+            )
+        manifest_path = q4_dir / "quantize_index.json"
+        try:
+            manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            recorded_sha256 = receipt["artifact_manifest_sha256"]
+            evidence = receipt["evidence"]
+            delta = float(evidence["delta"])
+            threshold = float(evidence["threshold"])
+        except (OSError, KeyError, TypeError, ValueError) as error:
+            raise SystemExit(
+                f"ERROR: --skip-convert found an incomplete acceptance receipt at "
+                f"{receipt_path}: {error}"
+            ) from error
+        if (
+            manifest_sha256 != recorded_sha256
+            or not math.isfinite(delta)
+            or not math.isfinite(threshold)
+            or not delta < threshold
+        ):
+            raise SystemExit(
+                "ERROR: --skip-convert refuses an artifact whose manifest or PPL evidence "
+                f"does not match its acceptance receipt: {q4_dir}"
+            )
         print(
-            f"[gen_quarot_q4_composed_golden] --skip-convert set; reusing {q4_dir}", file=sys.stderr
+            f"[gen_quarot_q4_composed_golden] --skip-convert set; reusing accepted {q4_dir}",
+            file=sys.stderr,
         )
 
     run(

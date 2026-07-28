@@ -79,8 +79,9 @@ AppStore (@Observable @MainActor)
 - TrainScreen: full config → subprocess → live step/loss/eval/done parsing → StripChart,
   ReadoutWells, PAUSE/RESUME/STOP, adapter path on save. End-to-end verified in production
   (NLL 5.18→0.61 documented in MEMORY.md).
-- QuantizeScreen: Q4 and QuaRot, layer progress, mass bars, ratio, verdict GatePill.
-  Drives both `quantize_q4` and `quantize_quarot` binaries.
+- QuantizeScreen: Q4 layer progress, mass bars, ratio, and verdict GatePill. QuaRot promotion is
+  disabled until the panel can collect the mandatory unrotated baseline and held-out PPL corpus;
+  the bundled `quantize_quarot` remains available through the CLI with explicit gate inputs.
 - ModelsScreen: model discovery (parses config.json), layer summary, adapter list, navigate-to
   shortcuts, Finder reveal.
 - DataScreen: .jsonl scan, summary stats, 5-example preview, builder-script copy buttons.
@@ -219,10 +220,15 @@ the current binary (train_grad_full.rs line 743).
 --output-dir <PATH>
 --dry-run               (Q4 and QuaRot)
 --seed <U64>            (QuaRot only; required by the binary)
+--ppl-evaluator <PATH>  (QuaRot only; absolute path, required)
+--baseline-q4-dir <PATH> (QuaRot only; required)
+--tokenizer-dir <PATH>  (QuaRot only; required)
+--corpus-file <PATH>    (QuaRot only; required)
 ```
 
-The macOS `QuantConfig` wrapper always supplies this required flag, inserting `0xC0FFEE` when
-the UI leaves the seed unset. Direct `quantize_quarot` callers must choose and pass a seed.
+The macOS `QuantConfig` wrapper can still represent a QuaRot seed, but the current panel does not
+have fields for the four PPL-gate inputs and therefore keeps the QuaRot action disabled. Direct
+`quantize_quarot` callers must provide all of them; there is no acceptance opt-out.
 
 ### 3.6 ASCII Architecture Diagram
 

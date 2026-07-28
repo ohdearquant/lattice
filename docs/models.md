@@ -101,8 +101,9 @@ but support is path-specific, not universal across all models:
 - **f16** — half-precision helpers; not a shipped f16 KV-cache path (see §3).
 - **Q8** — dense-only; panics on MoE configs.
 - **Q4** — available via the `quantize_q4` binary for supported paths.
-- **QuaRot Q4** — offline converter (`quantize_quarot` binary) + Metal direct-load path. Converter
-  refuses non-power-of-two hidden dims and MoE configs.
+- **QuaRot Q4** — offline converter (`quantize_quarot` binary) + Metal direct-load path. The CLI
+  stages conversion and requires a passing, recorded dual-Q4 PPL gate before publishing output;
+  it also refuses non-power-of-two hidden dims and MoE configs.
 
 ---
 

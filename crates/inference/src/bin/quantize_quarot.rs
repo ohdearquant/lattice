@@ -3,7 +3,10 @@
 //! Step 3c-5 of ADR-044. Thin argparse wrapper over
 //! [`lattice_inference::quant::quarot::convert::convert_quarot_qwen35`],
 //! which owns the actual rotation + fusion + materialize_lm_head +
-//! forward-equivalence-refuse-on-fail pipeline.
+//! forward-equivalence-refuse-on-fail pipeline. A successful non-dry
+//! invocation additionally runs the ADR-044 PPL delta gate through an
+//! explicitly selected `eval_perplexity` executable and publishes the
+//! staged output only after recording a passing receipt.
 //!
 //! # Usage
 //!
@@ -11,7 +14,11 @@
 //! cargo run --release --bin quantize_quarot -- \
 //!   --model-dir ~/.lattice/models/qwen3.5-0.8b \
 //!   --output-dir ~/.lattice/models/qwen3.5-0.8b-quarot-q4 \
-//!   --seed 0xC0FFEE
+//!   --seed 0xC0FFEE \
+//!   --ppl-evaluator /absolute/path/to/eval_perplexity \
+//!   --baseline-q4-dir ~/.lattice/models/qwen3.5-0.8b-q4 \
+//!   --tokenizer-dir ~/.lattice/models/qwen3.5-0.8b \
+//!   --corpus-file wiki.test.raw
 //! ```
 //!
 //! Flags:
@@ -27,16 +34,15 @@
 //! - `--tolerance <F64>`: forward-equivalence tolerance. Default `1e-5`
 //!   per ADR-044 §"Step 3c contract".
 //! - `--num-probe-tokens <USIZE>`: chain-probe sample size. Default `4`.
-//! - `--dry-run`: run the pipeline + gate but skip every disk write.
-//!   Useful for CI sanity passes against a real safetensors source.
-//!   Dry-run also skips the output-directory layout checks (same-path,
-//!   non-empty) because there are no writes that could be corrupted —
-//!   the caller can point `--output-dir` at the input directory or at
-//!   a populated location and the existing files are untouched.
+//! - `--ppl-evaluator <PATH>`: absolute path to `eval_perplexity`.
+//! - `--baseline-q4-dir <PATH>`: unrotated Q4 baseline for the PPL delta.
+//! - `--tokenizer-dir <PATH>` and `--corpus-file <PATH>`: gate inputs.
+//! - `--dry-run`: run both gates in a temporary staging directory but
+//!   do not publish `--output-dir`.
 //!
 //! Exit codes:
-//! - `0`: conversion succeeded; output dir is complete (or dry-run
-//!   verified the pipeline).
+//! - `0`: both gates passed; output dir is complete and carries
+//!   `quarot_ppl_acceptance.json` (or dry-run verified both gates).
 //! - `1`: error (refuse-on-fail, missing file, parse failure, etc.).
 //!   Standard error contains the diagnostic; output dir is left empty
 //!   when the forward-equivalence gate refused.
@@ -49,6 +55,11 @@ use lattice_inference::quant::quarot::convert::{
     ConversionOptions, ConversionReport, convert_quarot_qwen35,
 };
 
+#[path = "quantize_quarot/promotion.rs"]
+mod promotion;
+
+use promotion::{PplGateConfig, promote_with_gate, run_ppl_evaluator};
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
 
@@ -57,6 +68,14 @@ fn main() -> ExitCode {
     let mut seed: Option<u64> = None;
     let mut tolerance: Option<f64> = None;
     let mut num_probe_tokens: Option<usize> = None;
+    let mut ppl_evaluator: Option<PathBuf> = None;
+    let mut baseline_q4_dir: Option<PathBuf> = None;
+    let mut tokenizer_dir: Option<PathBuf> = None;
+    let mut corpus_file: Option<PathBuf> = None;
+    let mut window: Option<usize> = None;
+    let mut stride: Option<usize> = None;
+    let mut max_tokens: Option<usize> = None;
+    let mut delta_threshold: Option<f64> = None;
     let mut dry_run = false;
 
     let mut i = 1;
@@ -106,6 +125,74 @@ fn main() -> ExitCode {
                     Err(e) => return usage(&format!("--num-probe-tokens: invalid usize: {e}")),
                 });
             }
+            "--ppl-evaluator" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--ppl-evaluator requires an argument");
+                };
+                ppl_evaluator = Some(PathBuf::from(v));
+            }
+            "--baseline-q4-dir" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--baseline-q4-dir requires an argument");
+                };
+                baseline_q4_dir = Some(PathBuf::from(v));
+            }
+            "--tokenizer-dir" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--tokenizer-dir requires an argument");
+                };
+                tokenizer_dir = Some(PathBuf::from(v));
+            }
+            "--corpus-file" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--corpus-file requires an argument");
+                };
+                corpus_file = Some(PathBuf::from(v));
+            }
+            "--window" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--window requires an argument");
+                };
+                window = Some(match v.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(e) => return usage(&format!("--window: invalid usize: {e}")),
+                });
+            }
+            "--stride" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--stride requires an argument");
+                };
+                stride = Some(match v.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(e) => return usage(&format!("--stride: invalid usize: {e}")),
+                });
+            }
+            "--max-tokens" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--max-tokens requires an argument");
+                };
+                max_tokens = Some(match v.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(e) => return usage(&format!("--max-tokens: invalid usize: {e}")),
+                });
+            }
+            "--delta-threshold" => {
+                i += 1;
+                let Some(v) = args.get(i) else {
+                    return usage("--delta-threshold requires an argument");
+                };
+                delta_threshold = Some(match v.parse::<f64>() {
+                    Ok(n) => n,
+                    Err(e) => return usage(&format!("--delta-threshold: invalid f64: {e}")),
+                });
+            }
             "--dry-run" => {
                 dry_run = true;
             }
@@ -127,12 +214,35 @@ fn main() -> ExitCode {
     let Some(seed) = seed else {
         return usage("--seed is required (rotation determinism)");
     };
+    let Some(ppl_evaluator) = ppl_evaluator else {
+        return usage("--ppl-evaluator is required (PPL acceptance cannot be skipped)");
+    };
+    let Some(baseline_q4_dir) = baseline_q4_dir else {
+        return usage("--baseline-q4-dir is required (PPL acceptance cannot be skipped)");
+    };
+    let Some(tokenizer_dir) = tokenizer_dir else {
+        return usage("--tokenizer-dir is required (PPL acceptance cannot be skipped)");
+    };
+    let Some(corpus_file) = corpus_file else {
+        return usage("--corpus-file is required (PPL acceptance cannot be skipped)");
+    };
 
     let opts = ConversionOptions {
         rotation_seed: seed,
         tolerance: tolerance.unwrap_or(1e-5),
         num_probe_tokens: num_probe_tokens.unwrap_or(4),
-        dry_run,
+        dry_run: false,
+    };
+    let gate = PplGateConfig {
+        evaluator: ppl_evaluator,
+        baseline_q4_dir,
+        tokenizer_dir,
+        corpus_file,
+        window: window.unwrap_or(512),
+        stride: stride.unwrap_or(256),
+        max_tokens,
+        delta_threshold: delta_threshold.unwrap_or(0.5),
+        rotation_seed: seed,
     };
 
     eprintln!("=== quantize_quarot: QuaRot Q4_0 converter ===");
@@ -141,24 +251,56 @@ fn main() -> ExitCode {
     eprintln!("Seed:        0x{seed:016x}");
     eprintln!("Tolerance:   {}", opts.tolerance);
     eprintln!("Probe toks:  {}", opts.num_probe_tokens);
+    eprintln!("PPL eval:    {}", gate.evaluator.display());
+    eprintln!("PPL base:    {}", gate.baseline_q4_dir.display());
+    eprintln!("PPL corpus:  {}", gate.corpus_file.display());
+    eprintln!("PPL limit:   delta < {}", gate.delta_threshold);
     eprintln!(
         "Mode:        {}",
-        if opts.dry_run {
-            "DRY RUN (no files written)"
+        if dry_run {
+            "DRY RUN (stage + both gates; no output promoted)"
         } else {
-            "WRITE"
+            "STAGED PROMOTION"
         }
     );
     eprintln!();
 
     let start = Instant::now();
-    let report = match convert_quarot_qwen35(&model_dir, &output_dir, &opts) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("ERROR: {e}");
+    let promoted = promote_with_gate(
+        &output_dir,
+        dry_run,
+        &gate,
+        |stage_dir| {
+            convert_quarot_qwen35(&model_dir, stage_dir, &opts).map_err(|error| error.to_string())
+        },
+        run_ppl_evaluator,
+    );
+    let (report, evidence) = match promoted {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("ERROR: {error}");
+            if !dry_run {
+                eprintln!(
+                    "No QuaRot artifact was promoted to {}",
+                    output_dir.display()
+                );
+            }
             return ExitCode::FAILURE;
         }
     };
+    if dry_run {
+        eprintln!("Dry run accepted; staged artifact was discarded.");
+    } else {
+        eprintln!(
+            "Accepted artifact promoted to {} with {}",
+            output_dir.display(),
+            promotion::ACCEPTANCE_RECEIPT_FILE
+        );
+    }
+    eprintln!(
+        "PPL acceptance:     q4={:.6}, quarot={:.6}, delta={:+.6} < {:.6}",
+        evidence.unrotated.ppl, evidence.quarot.ppl, evidence.delta, evidence.threshold
+    );
     let elapsed = start.elapsed();
 
     print_report(&report, elapsed.as_secs_f64());
@@ -221,12 +363,20 @@ required:
 options:
   --tolerance <F64>          Forward-equivalence tolerance. Default 1e-5.
   --num-probe-tokens <USIZE> Chain-probe sample size. Default 4.
-  --dry-run                  Run pipeline + gate; skip disk writes.
+  --ppl-evaluator <PATH>     Absolute path to eval_perplexity. Required.
+  --baseline-q4-dir <PATH>   Unrotated Q4 baseline directory. Required.
+  --tokenizer-dir <PATH>     Directory containing tokenizer.json. Required.
+  --corpus-file <PATH>       Held-out UTF-8 PPL corpus. Required.
+  --window <USIZE>           PPL window. Default 512.
+  --stride <USIZE>           PPL stride. Default 256.
+  --max-tokens <USIZE>       Optional PPL token cap.
+  --delta-threshold <F64>    PPL delta ceiling. Default 0.5.
+  --dry-run                  Run both gates in staging; do not promote output.
   -h, --help                 Print this help and exit.
 
-The converter refuses to write any output if the forward-equivalence
-gate fails (delta > tolerance) — this protects against silently shipping
-a model whose logits diverged during conversion.
+The converter stages all output, runs forward-equivalence and the PPL delta
+gate, records quarot_ppl_acceptance.json, and only then promotes --output-dir.
+No flag skips PPL acceptance.
 ";
 
 fn parse_u64_flex(s: &str) -> Result<u64, String> {
