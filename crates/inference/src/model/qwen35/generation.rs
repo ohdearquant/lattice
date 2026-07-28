@@ -181,7 +181,7 @@ impl Qwen35Model {
         // sample. mask_logits sets every disallowed token to NEG_INFINITY in-place,
         // so the sampler only sees the grammar-permitted candidate set.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
             // If the grammar blocked every token the sampler's non-finite-max
             // short-circuit would silently return token 0. An accepting state
             // terminates normally; an incomplete state remains a hard error.
@@ -635,7 +635,7 @@ impl Qwen35Model {
 
         // Grammar mask on the post-prefill logits, identical to the generate() path.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                 if engine.is_complete_without_continuation(gs) {
                     return Ok(grammar_output(String::new(), &[], prompt_len, true, vec![]));
@@ -810,7 +810,7 @@ impl Qwen35Model {
 
                 // Grammar mask before sampling; fail closed on an all-blocked step.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
                     if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                         if engine.is_complete_without_continuation(gs) {
                             stopped = true;
@@ -1018,7 +1018,7 @@ impl Qwen35Model {
 
                 // Grammar mask before sampling; fail closed on an all-blocked step.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
                     if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                         if engine.is_complete_without_continuation(gs) {
                             stopped = true;
@@ -1905,7 +1905,7 @@ fn decode_loop(
 
         // Grammar mask before sampling; fail closed when every token is blocked.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                 if engine.is_complete_without_continuation(gs) {
                     return Ok((true, StopReason::Grammar));
@@ -2033,7 +2033,7 @@ fn decode_loop_with_stops(
 
         // Grammar mask before sampling; fail closed when every token is blocked.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                 if engine.is_complete_without_continuation(gs) {
                     stopped = true;
@@ -2448,7 +2448,9 @@ mod tests {
         // Set logits so the forbidden token (index 2) has the highest value.
         // Without masking, greedy sampling would return 2.
         let mut logits = vec![1.0_f32, 2.0_f32, 1000.0_f32];
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
 
         // The forbidden token must be blocked.
         assert_eq!(
