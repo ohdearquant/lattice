@@ -18,6 +18,14 @@ name: app-binaries
 on:
   pull_request:
     branches: [main]
+    # `ready_for_review` is load-bearing, not decorative. `build-app-bins` is
+    # skipped while a PR is a draft, and the DEFAULT type set is
+    # [opened, synchronize, reopened] — it contains no event for the
+    # draft-to-ready transition. Without this line, a PR marked ready that
+    # never pushes again would keep its draft-shaped run forever and could
+    # never report an app-binary build, wedging the PR on a gate that fails
+    # closed for drafts.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
     paths:
@@ -34,8 +42,15 @@ on:
     types: [checks_requested]
 
 # Cancel a PR's own superseded runs so they stop occupying the shared macOS
-# runner pool (~5 concurrent, account-wide) while a newer push on the same PR
-# waits behind them. Never cancel a push to main or a manual dispatch: neither
+# runner pool while a newer push on the same PR waits behind them. An earlier
+# revision of this comment put the pool at "~5 concurrent, account-wide". That
+# figure was inherited and never measured; ci.yml and e2e-parity.yml already
+# retracted it and this was the last copy still asserting it as fact. Measured
+# instead over a 39.6 h window on this repo: median macOS queue 0.0 min, p90
+# 32.5 min, max 87.8 min, against an ubuntu control at p90 5.7 min. Contention
+# is bursty rather than a fixed slot cap, so the reason to cancel superseded
+# runs is the tail, not a slot count.
+# Never cancel a push to main or a manual dispatch: neither
 # has a "next run" to fall back on if killed mid-flight. The event_name segment
 # keeps a push run and a workflow_dispatch run on the same ref out of each
 # other's queue: GitHub cancels a PENDING run whenever another run enters its
@@ -89,10 +104,17 @@ jobs:
             echo "→ no app-binary change: build skipped, gate passes"
           fi
 
+  # Deferred while a PR is a draft, matching the macOS legs of `ci` and
+  # `feature-matrix` and every macOS job in `e2e-parity`. A draft
+  # cannot merge, so a 45-minute macOS build on every draft push buys nothing
+  # the ready-flip does not buy later, while occupying a runner pool whose
+  # measured p90 queue is 32.5 min against an ubuntu control at 5.7 min.
+  # `app-binaries-gate` fails closed on drafts so a draft is never reported as
+  # having a verified app-binary build.
   build-app-bins:
     name: build app-shipped binaries
     needs: changes
-    if: needs.changes.outputs.bins == 'true'
+    if: needs.changes.outputs.bins == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -125,6 +147,19 @@ jobs:
           if [ "$BINS" != "true" ]; then
             echo "No app-binary change — build not required. PASS."
             exit 0
+          fi
+          # Fail closed on drafts, and only after the no-change PASS above: a
+          # docs-only draft defers nothing, so it must still pass. When the
+          # app-binary surface HAS changed, `build-app-bins` is skipped while
+          # the PR is a draft, and a skipped build must not read as a verified
+          # one — a pass in the shape of a verdict is the failure mode this
+          # gate exists to prevent. On merge_group, push, and workflow_dispatch
+          # there is no pull_request payload, so DRAFT is empty and this branch
+          # cannot fire.
+          DRAFT="${{ github.event.pull_request.draft }}"
+          if [ "$DRAFT" = "true" ]; then
+            echo "::error::Draft PR: the macOS app-binary build is deferred while this PR is a draft, so the app-binary surface is UNVERIFIED and this gate fails by design. Mark the PR ready for review and it runs automatically on the ready_for_review event."
+            exit 1
           fi
           if [ "$BUILD_RESULT" != "success" ]; then
             echo "::error::App-binary surface changed and build did not succeed (result=$BUILD_RESULT)."
