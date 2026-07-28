@@ -655,6 +655,12 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      # bench_quality.sh's canonical-artifact publication guard. Runs the
+      # shipping script in a disposable repo with stub lattice/MLX scorers,
+      # proving failures preserve the tracked TSV and a complete run publishes
+      # all rows; no benchmark, model, GPU, network, or cargo build is used.
+      - name: bash scripts/bench_quality_selftest.sh
+        run: bash scripts/bench_quality_selftest.sh
 
       # bench-compare.sh's isolation guards: the lock proof (the measurement
       # body refuses unless the supervisor that recorded the lock status is one
