@@ -56,20 +56,27 @@ if [ "$PRINT_TARGET_RELEASE" = true ]; then
 fi
 
 VERSION="$(
-    python3 - "$REPO_ROOT/Cargo.toml" <<'PY'
+    cargo metadata \
+        --no-deps \
+        --format-version 1 \
+        --manifest-path "$REPO_ROOT/Cargo.toml" |
+        python3 -c '
+import json
 import sys
-import tomllib
 
-with open(sys.argv[1], "rb") as cargo_toml:
-    metadata = tomllib.load(cargo_toml)
-try:
-    version = metadata["workspace"]["package"]["version"]
-except (KeyError, TypeError) as error:
-    raise SystemExit(f"workspace package version is missing or malformed: {error}") from error
-if not isinstance(version, str) or not version:
-    raise SystemExit("workspace package version must be a non-empty string")
-print(version)
-PY
+metadata = json.load(sys.stdin)
+members = set(metadata["workspace_members"])
+versions = {
+    package["version"]
+    for package in metadata["packages"]
+    if package["id"] in members
+}
+if len(versions) != 1:
+    raise SystemExit(
+        f"workspace packages must share exactly one version, found: {sorted(versions)}"
+    )
+print(next(iter(versions)))
+'
 )"
 if [[ -z "$VERSION" ]]; then
     echo "ERROR: workspace version resolved to an empty string" >&2

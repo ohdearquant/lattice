@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 
@@ -17,8 +17,33 @@ APP_BINARIES_WORKFLOW = REPO_ROOT / ".github/workflows/app-binaries.yml"
 
 
 def workspace_version() -> str:
-    with (REPO_ROOT / "Cargo.toml").open("rb") as cargo_toml:
-        return tomllib.load(cargo_toml)["workspace"]["package"]["version"]
+    result = subprocess.run(
+        [
+            "cargo",
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            str(REPO_ROOT / "Cargo.toml"),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    metadata = json.loads(result.stdout)
+    members = set(metadata["workspace_members"])
+    versions = {
+        package["version"]
+        for package in metadata["packages"]
+        if package["id"] in members
+    }
+    if len(versions) != 1:
+        raise AssertionError(
+            f"workspace packages must share exactly one version: {versions}"
+        )
+    return next(iter(versions))
 
 
 class PackageScriptContractTest(unittest.TestCase):
