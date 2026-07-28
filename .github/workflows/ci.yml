@@ -515,7 +515,12 @@ jobs:
   msrv:
     name: msrv (1.93, f16+metal-gpu)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # This job is macOS and is NOT matrix-driven, so the oslist selector that
+    # defers `ci` and `feature-matrix` on drafts does not reach it. It carries
+    # the draft condition directly, matching the form the parity workflow uses
+    # on its own single-runner macOS jobs. ci-gate's draft branch exits before
+    # it reads this job's result, so skipping here cannot produce a false green.
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     # RUSTUP_TOOLCHAIN pins every rustup-mediated invocation in this job to 1.93.1.
     # Without it, rustup's checked-in rust-toolchain.toml (1.94.1, repo dev/CI pin)
@@ -686,6 +691,14 @@ jobs:
       # bench-compare.sh call site, and runs no benchmark.
       - name: bash scripts/ensure-noindex-marker-selftest.sh
         run: bash scripts/ensure-noindex-marker-selftest.sh
+      # e2e-parity's engine/tune change classifier. Same "harness plumbing only"
+      # scope: it extracts the live regexes out of e2e-parity.yml and asserts
+      # their verdicts on fixture path lists, running no parity job. It belongs
+      # in THIS workflow rather than e2e-parity's own, because the classification
+      # it grades is what decides whether e2e-parity's jobs run at all — a test
+      # gated on the decision it is testing cannot observe the false-negative.
+      - name: bash scripts/ci-engine-filter-selftest.sh
+        run: bash scripts/ci-engine-filter-selftest.sh
       - name: python3 tests/test_bench_disposition.py
         run: python3 tests/test_bench_disposition.py -v
       # perf-bench-gate's own fixture self-test. Same "harness plumbing only"
@@ -776,7 +789,7 @@ jobs:
           # verdict, which is the failure mode this gate exists to prevent.
           DRAFT="${{ github.event.pull_request.draft }}"
           if [ "$DRAFT" = "true" ]; then
-            echo "::error::Draft PR: the macOS legs of ci and feature-matrix are deferred while this PR is a draft, so macOS coverage is UNVERIFIED and this gate fails by design. Mark the PR ready for review and they run automatically on the ready_for_review event."
+            echo "::error::Draft PR: the macOS legs of ci and feature-matrix, and the macOS msrv job, are deferred while this PR is a draft, so macOS coverage is UNVERIFIED and this gate fails by design. Mark the PR ready for review and they run automatically on the ready_for_review event."
             exit 1
           fi
           if [ "$CI_RESULT" != "success" ]; then

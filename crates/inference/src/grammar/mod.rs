@@ -13,7 +13,7 @@
 //!                          GrammarEngine::new()
 //!                                    │
 //!                              generate loop:
-//!                      engine.mask_logits(state, logits)
+//!                      engine.mask_logits(state, logits)?
 //!                      token = sampler.sample(logits)
 //!                      engine.advance(state, token_id)
 //! ```
