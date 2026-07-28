@@ -302,8 +302,8 @@ impl BatchWorker {
         }
     }
 
-    /// Fallible constructor — returns `InvalidInput` on overflow rather than
-    /// panicking or silently allocating a wrong-sized pool.
+    /// Fallible constructor — validates the batch configuration and returns
+    /// `InvalidInput` on invalid geometry or overflow.
     pub fn try_new(
         config: BatchConfig,
         kv_pool_config: PagedKVCacheConfig,
@@ -311,6 +311,7 @@ impl BatchWorker {
         conv_floats_per_slot: usize,
         eos_token_id: Option<u32>,
     ) -> Result<Self, InferenceError> {
+        config.validate().map_err(InferenceError::InvalidInput)?;
         let floats_per_page = kv_pool_config.try_floats_per_page_pub()?;
         let kv_pool = PagePool::try_new(kv_pool_config.max_pages, floats_per_page)?;
         let gdn_pool = GdnStatePool::try_new(
@@ -1022,6 +1023,51 @@ mod tests {
             matches!(r, Err(InferenceError::InvalidInput(_))),
             "expected InvalidInput on worker PagePool capacity overflow"
         );
+    }
+
+    #[test]
+    fn batch_worker_try_new_rejects_invalid_batch_config() {
+        let invalid_configs = [
+            (
+                "max_batch_size",
+                BatchConfig {
+                    max_batch_size: 0,
+                    ..BatchConfig::default()
+                },
+            ),
+            (
+                "max_seq_len",
+                BatchConfig {
+                    max_seq_len: 0,
+                    ..BatchConfig::default()
+                },
+            ),
+            (
+                "chunk_size",
+                BatchConfig {
+                    chunk_size: 0,
+                    ..BatchConfig::default()
+                },
+            ),
+            (
+                "chunk_size",
+                BatchConfig {
+                    chunk_size: 513,
+                    ..BatchConfig::default()
+                },
+            ),
+        ];
+
+        for (field, config) in invalid_configs {
+            let result = BatchWorker::try_new(config, test_kv_config(), 1, 1, None);
+            let Err(InferenceError::InvalidInput(message)) = result else {
+                panic!("expected InvalidInput for invalid {field}");
+            };
+            assert!(
+                message.contains(field),
+                "error for invalid {field} must identify the field, got: {message}"
+            );
+        }
     }
 
     // --- GdnStatePool isize::MAX boundary test (Fix 2) ---
