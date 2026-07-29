@@ -602,10 +602,25 @@ impl VisionModelConfig {
                 self.num_position_embeddings
             )));
         }
-        if self.in_channels == 0 {
-            return Err(InferenceError::Inference(
-                "invalid vision_config: in_channels must be > 0".to_string(),
-            ));
+        // The preprocessor (`vision::qwen35_vit::preprocess_qwen35_image`) is RGB-only by
+        // construction: it decodes every image to a fixed 3-channel `RgbImage` and then
+        // indexes `pixel[c]` for `c in 0..in_channels`. A shape-consistent checkpoint
+        // declaring `in_channels >= 4` otherwise passes this validation and panics the sole
+        // Metal worker on the first ordinary image request, because `pixel[3]` is out of
+        // bounds for a 3-element `Rgb<u8>`. Fail closed here instead of silently truncating
+        // or padding channels.
+        //
+        // This is a dimension (B) semantic-validity bound and it subsumes both the
+        // `in_channels == 0` and the `in_channels > MAX_VISION_IN_CHANNELS` dimension (A)
+        // allocation bounds on the parse path. The (A) bound below is kept deliberately: it
+        // states the allocation limit independently, so relaxing this check for a future
+        // non-RGB preprocessor cannot silently uncap the allocation.
+        if self.in_channels != 3 {
+            return Err(InferenceError::Inference(format!(
+                "invalid vision_config: in_channels must be 3 (RGB); got {} -- the image \
+                 preprocessor is RGB-only and cannot serve any other channel count",
+                self.in_channels
+            )));
         }
         if self.in_channels > MAX_VISION_IN_CHANNELS {
             return Err(InferenceError::Inference(format!(
@@ -5009,7 +5024,9 @@ mod tests {
         // num_heads itself does not feed any `checked_derived_sizes` product (only
         // hidden_size % num_heads == 0 is checked), so it stays accepted at its own cap as
         // long as hidden_size (here set to a realistic divisible value, not also maxed) keeps
-        // every derived tensor under MAX_VISION_TENSOR_BYTES.
+        // every derived tensor under MAX_VISION_TENSOR_BYTES. `in_channels` is 3 because the
+        // preprocessor is RGB-only and every other value is now rejected outright; this test's
+        // subject is `num_heads`, so the channel count is held at the one servable value.
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
@@ -5020,7 +5037,7 @@ mod tests {
                 "out_hidden_size": 1024,
                 "temporal_patch_size": 1,
                 "num_position_embeddings": 2304,
-                "in_channels": 1
+                "in_channels": 3
             }}"#
         ));
         assert!(
@@ -5551,6 +5568,12 @@ mod tests {
         );
     }
 
+    /// Both `in_channels` boundary cases land on the RGB-only semantic bound rather than the
+    /// `MAX_VISION_IN_CHANNELS` allocation bound, because `preprocess_qwen35_image` indexes a
+    /// fixed 3-element `Rgb<u8>` and any other channel count panics the worker on the first
+    /// image. The allocation constant is still exercised here so the two bounds cannot drift
+    /// apart unnoticed: a value at the allocation limit must be rejected too, and rejected by
+    /// the semantic guard.
     #[test]
     fn parser_rejects_present_vision_config_with_in_channels_over_max() {
         let json = config_json_with_vision(&format!(
@@ -5571,13 +5594,13 @@ mod tests {
             .expect_err("in_channels above MAX_VISION_IN_CHANNELS must be rejected")
             .to_string();
         assert!(
-            err.contains("in_channels") && err.contains("MAX_VISION_IN_CHANNELS"),
+            err.contains("in_channels must be 3"),
             "wrong guard fired: {err}"
         );
     }
 
     #[test]
-    fn parser_accepts_present_vision_config_with_in_channels_at_max() {
+    fn parser_rejects_present_vision_config_with_in_channels_at_max() {
         let json = config_json_with_vision(&format!(
             r#"{{
                 "depth": 4,
@@ -5591,9 +5614,92 @@ mod tests {
                 "in_channels": {MAX_VISION_IN_CHANNELS}
             }}"#
         ));
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("in_channels == MAX_VISION_IN_CHANNELS is not RGB and must be rejected")
+            .to_string();
         assert!(
-            Qwen35Config::from_config_json_str(&json).is_ok(),
-            "in_channels == MAX_VISION_IN_CHANNELS must be accepted"
+            err.contains("in_channels must be 3"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// The channel count the preprocessor can actually serve. Without this positive case the
+    /// rejection tests above are satisfied by a validator that rejects every `in_channels`.
+    #[test]
+    fn parser_accepts_present_vision_config_with_in_channels_three() {
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 3
+            }"#,
+        );
+        let cfg = Qwen35Config::from_config_json_str(&json)
+            .expect("in_channels: 3 vision_config must parse");
+        assert_eq!(
+            cfg.vision_config
+                .expect("vision_config present")
+                .in_channels,
+            3
+        );
+    }
+
+    /// The panic this guard exists to prevent, pinned at the boundary that matters:
+    /// `in_channels: 4` is shape-consistent everywhere else, so before this validation it
+    /// parsed cleanly and failed only when a request reached `pixel[3]`.
+    #[test]
+    fn parser_rejects_present_vision_config_with_in_channels_four() {
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 4
+            }"#,
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("in_channels: 4 vision_config must be rejected at parse time")
+            .to_string();
+        assert!(
+            err.contains("in_channels must be 3"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    /// `in_channels: 0` was previously rejected by its own `> 0` check; the RGB bound subsumes
+    /// it, and this pins that the zero case is still refused rather than falling through.
+    #[test]
+    fn parser_rejects_present_vision_config_with_in_channels_zero() {
+        let json = config_json_with_vision(
+            r#"{
+                "depth": 4,
+                "hidden_size": 768,
+                "num_heads": 12,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 1024,
+                "temporal_patch_size": 2,
+                "num_position_embeddings": 2304,
+                "in_channels": 0
+            }"#,
+        );
+        let err = Qwen35Config::from_config_json_str(&json)
+            .expect_err("in_channels: 0 vision_config must be rejected at parse time")
+            .to_string();
+        assert!(
+            err.contains("in_channels must be 3"),
+            "wrong guard fired: {err}"
         );
     }
 
