@@ -16631,47 +16631,33 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
-            // Config preflight checks live here, in the public wrapper, and
-            // must return BEFORE the `match` below (PR #787): the
-            // error-recovery arm of that `match` unconditionally
-            // calls `reset_state()` and removes the cache slot on ANY `Err`
-            // from `_inner`, including a not-yet-attempted preflight
-            // rejection. A caller passing an unsupported config (e.g.
-            // `logprobs` or an active `enable_mtp`) never touches cache/session
-            // state in the first place, so routing that rejection through the
-            // destructive recovery path would evict a valid pre-existing
-            // cross-turn entry the call never mutated. Returning here, before
-            // `_inner` is even called, leaves any existing entry untouched.
-            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-            crate::model::qwen35::check_mtp_not_requested(gen_cfg)?;
-
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-
-            // #856: empty prompt is rejected here too, same reasoning as the
-            // two preflights above (PR #787) -- `_inner` no longer special-
-            // cases an empty prompt as an early `Ok` (it now unifies on this
-            // exact typed `Err` like every other entry point, see
-            // `check_prompt_not_empty` and docs/generation-entrypoint-matrix.md
-            // row 2), so this must reject before `_inner` is even called, or
-            // the rejection would flow through the destructive `Err`-recovery
-            // match below and evict a valid pre-existing cross-turn entry
-            // this call never touched.
-            crate::model::qwen35::check_prompt_not_empty(prompt_ids.len())?;
-
-            if gen_cfg.max_new_tokens > 0 {
-                crate::model::qwen35::check_context_budget(
-                    prompt_ids.len(),
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.max_new_tokens,
-                    self.max_context(),
-                )?;
-            }
+            let generation_plan = match prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
+                self.max_context(),
+                GenerationEntryContract::MetalPrefixCache,
+            )? {
+                GenerationPreparation::Complete(output) => {
+                    return Ok(CachedGenerateOutput {
+                        cache: CrossTurnCacheStats {
+                            slot_id,
+                            prompt_tokens: output.prompt_tokens,
+                            reused_tokens: 0,
+                            prefetched_tokens: 0,
+                            mode: crate::kv_cache::PrefixReuseMode::FullRefill,
+                        },
+                        output,
+                    });
+                }
+                GenerationPreparation::Ready(plan) => plan,
+            };
 
             // #835: validate the suffix a reuse plan would select for this
             // slot BEFORE calling `_inner` at all -- same reasoning as the
-            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
-            // above (PR #787): the `match` below unconditionally calls
+            // prefix contract's capability preflights above (PR #787): the
+            // `match` below unconditionally calls
             // `reset_state()` and evicts the cache slot on ANY `Err` from
             // `_inner`, so a suffix-validation-only rejection (out-of-vocab
             // token, empty suffix, or a suffix overflowing `max_cache_len`)
@@ -16680,15 +16666,13 @@ mod inner {
             // reachable), or a valid pre-existing cross-turn entry this call
             // never touched would be destroyed alongside it.
             //
-            if gen_cfg.max_new_tokens > 0 {
-                let metadata = self.cross_turn_metadata(tokenizer);
-                let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
-                self.plan_prefix_request(&prompt_ids, &plan)?;
-            }
+            let metadata = self.cross_turn_metadata(tokenizer);
+            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &generation_plan.prompt_ids);
+            self.plan_prefix_request(&generation_plan.prompt_ids, &plan)?;
 
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
-                prompt_ids,
+                generation_plan,
                 tokenizer,
                 gen_cfg,
                 on_token,
@@ -16709,7 +16693,7 @@ mod inner {
         fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
-            prompt_ids: Vec<u32>,
+            generation_plan: GenerationPlan,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut on_token: F,
@@ -16722,77 +16706,34 @@ mod inner {
             use crate::error::InferenceError;
             use crate::kv_cache::PrefixReuseMode;
 
-            // The `logprobs` / `enable_mtp` / empty-prompt config preflight
-            // checks (PR #787, #856), and the suffix-content preflight below
-            // (#835), live in the public wrapper
-            // `generate_streaming_with_prefix_cache_and_cancel`, not here:
-            // that wrapper's error-recovery path unconditionally evicts the
-            // cache slot on any `Err` from this function, so a
-            // preflight-only rejection must never reach `_inner` in the first
-            // place, or a valid pre-existing cross-turn entry this call never
-            // touched would be destroyed alongside it. `prompt_ids` arrives
-            // already tokenized by the wrapper (which needs them to run that
-            // preflight) so this function never re-tokenizes `prompt`, and
-            // is therefore guaranteed non-empty by the time it reaches this
-            // function -- unlike `logprobs`/`enable_mtp`/suffix-content,
-            // empty-prompt has no cheap "run it again here as defense in
-            // depth" form: any duplicate check inside `_inner` would have to
-            // return `Err`, and an `Err` from `_inner` is exactly what the
-            // wrapper's blanket eviction match treats as cache-invalidating.
-            // `plan_cross_turn_reuse`/`plan_prefix_request` are still run
-            // again below, cheaply, as defense in depth (this function's own
-            // safety invariant should not depend solely on its one caller
-            // getting the guard conditions right).
-
             let cfg = self.engine.config.clone();
+            let GenerationPlan {
+                mut rng_state,
+                prompt_ids,
+                prompt_len,
+                ..
+            } = generation_plan;
 
-            let mut rng_state = match gen_cfg.seed {
-                Some(s) => {
-                    if s == 0 {
-                        1
-                    } else {
-                        s
-                    }
-                }
-                None => {
-                    use std::time::SystemTime;
-                    let t = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x12345678_9abcdef0);
-                    if t == 0 { 1 } else { t }
-                }
-            };
-
-            let prompt_len = prompt_ids.len();
+            // Shared preparation and the suffix-content preflight (#835)
+            // live in the public wrapper. A preflight-only rejection must
+            // never reach this function because the wrapper's error recovery
+            // treats every `Err` returned here as cache-invalidating.
+            // `plan_cross_turn_reuse`/`plan_prefix_request` still run again
+            // below as defense in depth before restore or reset.
             debug_assert!(
                 prompt_len > 0,
-                "the wrapper's check_prompt_not_empty (#856) must reject an \
-                 empty prompt before calling _inner"
+                "shared prefix-cache preparation must reject an empty prompt"
+            );
+            debug_assert!(
+                gen_cfg.max_new_tokens > 0,
+                "shared prefix-cache preparation must complete zero-budget requests"
+            );
+            debug_assert_eq!(
+                prompt_len,
+                prompt_ids.len(),
+                "shared preparation must report the tokenized prompt length"
             );
 
-            // Zero-budget requests return before any state mutation, leaving an
-            // existing cache entry exactly as-is.
-            if gen_cfg.max_new_tokens == 0 {
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: false,
-                        stop_reason: Some(StopReason::Length),
-                        token_logprobs: vec![],
-                    },
-                    cache: CrossTurnCacheStats {
-                        slot_id,
-                        prompt_tokens: prompt_len,
-                        reused_tokens: 0,
-                        prefetched_tokens: 0,
-                        mode: PrefixReuseMode::FullRefill,
-                    },
-                });
-            }
             let metadata = self.cross_turn_metadata(tokenizer);
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
 
@@ -21822,9 +21763,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // -------------------------------------------------------------------
 
         /// A drop guard that restores (or clears) an env var on scope exit,
-        /// so a panicking assertion inside a test can't leak
-        /// `LATTICE_MOE_EXPERT_CACHE_SLOTS` into whichever GPU test the
-        /// `gpu_test_lock()` mutex hands the machine to next.
+        /// so a panicking assertion inside a test cannot leak its setting
+        /// into whichever GPU test the `gpu_test_lock()` mutex runs next.
         struct EnvVarGuard {
             key: &'static str,
             prior: Option<String>,
@@ -21832,10 +21772,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         impl EnvVarGuard {
             fn set(key: &'static str, value: &str) -> Self {
                 let prior = std::env::var(key).ok();
-                // SAFETY: callers only mutate `LATTICE_MOE_EXPERT_CACHE_SLOTS`
-                // from inside a `gpu_test_lock()`-guarded test, which
-                // serializes every GPU test in this binary (same pattern as
-                // `with_self_spec_env` above) — no concurrent reader/writer.
+                // SAFETY: callers only mutate process environment from inside
+                // a `gpu_test_lock()`-guarded test, which serializes every GPU
+                // test in this binary (same pattern as `with_self_spec_env`).
                 unsafe {
                     std::env::set_var(key, value);
                 }
@@ -33276,6 +33215,197 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
+        #[derive(Debug, Clone, PartialEq)]
+        struct WarmCrossTurnSnapshot {
+            generic: crate::kv_cache::CrossTurnPrefixEntry,
+            gdn_snapshot: crate::attention::gdn::GdnSnapshot,
+            checkpoints: Vec<(usize, crate::attention::gdn::GdnSnapshot)>,
+            kv_seq_len: usize,
+            position: usize,
+        }
+
+        fn warm_cross_turn_snapshot(state: &MetalQwen35State) -> WarmCrossTurnSnapshot {
+            let entry = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .expect("precondition: the cross-turn slot must be warm");
+            WarmCrossTurnSnapshot {
+                generic: entry.generic.clone(),
+                gdn_snapshot: entry.gdn_snapshot.clone(),
+                checkpoints: entry
+                    .checkpoints
+                    .iter()
+                    .map(|checkpoint| (checkpoint.len, checkpoint.snapshot.clone()))
+                    .collect(),
+                kv_seq_len: state.session.kv_cache.seq_len,
+                position: state.session.position,
+            }
+        }
+
+        fn assert_warm_cross_turn_snapshot(
+            state: &MetalQwen35State,
+            expected: &WarmCrossTurnSnapshot,
+        ) {
+            assert_eq!(
+                warm_cross_turn_snapshot(state),
+                expected.clone(),
+                "preparation-only rejection or completion must not mutate the warm slot or live state"
+            );
+        }
+
+        fn single_char_prompt(token_ids: &[u32]) -> String {
+            token_ids
+                .iter()
+                .map(|&id| {
+                    if id < 26 {
+                        (b'a' + id as u8) as char
+                    } else {
+                        (b'A' + (id - 26) as u8) as char
+                    }
+                })
+                .collect()
+        }
+
+        #[test]
+        fn cross_turn_preparation_outcomes_preserve_warm_slot() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::kv_cache::PrefixReuseMode;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(7, 2),
+                    |_, _| true,
+                )
+                .expect("warm-up call must succeed");
+            let warm = warm_cross_turn_snapshot(&state);
+
+            let empty = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &cross_turn_test_gen_cfg(8, 2),
+                |_, _| true,
+            );
+            assert!(
+                matches!(empty, Err(InferenceError::Inference(ref message)) if message == "empty prompt"),
+                "empty prompt must preserve its exact typed rejection; got {empty:?}"
+            );
+            assert_warm_cross_turn_snapshot(&state, &warm);
+
+            let zero = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(9, 0),
+                    |_, _| true,
+                )
+                .expect("zero-budget request must complete successfully");
+            assert!(zero.output.text.is_empty());
+            assert!(zero.output.token_ids.is_empty());
+            assert_eq!(zero.output.prompt_tokens, 2);
+            assert_eq!(zero.output.generated_tokens, 0);
+            assert!(!zero.output.stopped);
+            assert_eq!(zero.output.stop_reason, Some(StopReason::Length));
+            assert!(zero.output.token_logprobs.is_empty());
+            assert_eq!(zero.cache.slot_id, slot_id);
+            assert_eq!(zero.cache.prompt_tokens, 2);
+            assert_eq!(zero.cache.reused_tokens, 0);
+            assert_eq!(zero.cache.prefetched_tokens, 0);
+            assert_eq!(zero.cache.mode, PrefixReuseMode::FullRefill);
+            assert_warm_cross_turn_snapshot(&state, &warm);
+
+            let over_context_prompt = "a".repeat(31);
+            let over_context = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                &over_context_prompt,
+                &tokenizer,
+                &cross_turn_test_gen_cfg(10, 2),
+                |_, _| true,
+            );
+            assert_context_budget_error(&over_context, 31, 2, 32);
+            assert_warm_cross_turn_snapshot(&state, &warm);
+
+            let logprobs_cfg = GenerateConfig {
+                max_new_tokens: 0,
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(11, 0)
+            };
+            let logprobs = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &logprobs_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(logprobs, Err(InferenceError::InvalidInput(ref message))
+                    if message.starts_with("per-token logprobs are not yet supported")),
+                "logprobs must reject before empty/zero handling; got {logprobs:?}"
+            );
+            assert_warm_cross_turn_snapshot(&state, &warm);
+
+            let mtp_cfg = GenerateConfig {
+                max_new_tokens: 0,
+                enable_mtp: Some(true),
+                ..cross_turn_test_gen_cfg(12, 0)
+            };
+            let mtp = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &mtp_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(mtp, Err(InferenceError::InvalidInput(ref message))
+                    if message.starts_with("enable_mtp (or LATTICE_MTP) is not supported")),
+                "explicit MTP must reject before empty/zero handling; got {mtp:?}"
+            );
+            assert_warm_cross_turn_snapshot(&state, &warm);
+
+            {
+                let _mtp_env = EnvVarGuard::set("LATTICE_MTP", "1");
+                let env_mtp_cfg = GenerateConfig {
+                    max_new_tokens: 0,
+                    enable_mtp: None,
+                    ..cross_turn_test_gen_cfg(13, 0)
+                };
+                let env_mtp = state.generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "",
+                    &tokenizer,
+                    &env_mtp_cfg,
+                    |_, _| true,
+                );
+                assert!(
+                    matches!(env_mtp, Err(InferenceError::InvalidInput(ref message))
+                        if message.starts_with("enable_mtp (or LATTICE_MTP) is not supported")),
+                    "environment-requested MTP must reject before empty/zero handling; got {env_mtp:?}"
+                );
+                assert_warm_cross_turn_snapshot(&state, &warm);
+            }
+        }
+
         /// The correctness gate for #462: a growing multi-turn conversation run
         /// through `generate_streaming_with_prefix_cache` on one long-lived state
         /// must produce byte-identical token IDs, turn by turn, to running each
@@ -34405,6 +34535,85 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        #[test]
+        fn cross_turn_cache_cancel_after_exact_restore_is_fail_closed() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.eos_token_id = u32::MAX;
+
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut state = MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let gen_cfg = cross_turn_test_gen_cfg(29, 2);
+
+            state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    "ab",
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("warm-up call must succeed");
+            let represented_ids = state
+                .cross_turn_prefix_cache
+                .entry
+                .as_ref()
+                .expect("warm-up call must retain a cache entry")
+                .generic
+                .token_ids
+                .clone();
+            let mut appended_prompt = single_char_prompt(&represented_ids);
+            appended_prompt.push('q');
+
+            let cancelled = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &appended_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || true,
+                )
+                .expect("cancellation after restore must be a successful interrupt");
+            assert_eq!(
+                cancelled.cache.mode,
+                crate::kv_cache::PrefixReuseMode::ExactAppend,
+                "the cancellation must exercise an exact-prefix restore, not a full refill"
+            );
+            assert_eq!(cancelled.output.stop_reason, Some(StopReason::Interrupt));
+            assert_eq!(cancelled.output.generated_tokens, 0);
+            assert!(
+                state.cross_turn_prefix_cache.entry.is_none(),
+                "restore consumes the warm entry before cancellation and must leave the slot fail-closed"
+            );
+
+            let mut reference =
+                MetalQwen35State::new(&weights, &cfg, 64).expect("tiny hybrid fixture");
+            let expected = reference
+                .generate_streaming(&appended_prompt, &tokenizer, &gen_cfg, |_, _| true)
+                .expect("full-refill reference must succeed");
+            let resumed = state
+                .generate_streaming_with_prefix_cache_and_cancel(
+                    slot_id,
+                    &appended_prompt,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                )
+                .expect("generation after a restore-time cancellation must succeed");
+            assert_eq!(
+                resumed.output.token_ids, expected.token_ids,
+                "restore-time cancellation must leave state safe for a later full refill"
+            );
+        }
+
         /// Serve-boundary correctness gate: `lattice_serve` always calls the
         /// cancel-aware prefix-cache API on the single `CrossTurnSlotId::DEFAULT`
         /// slot regardless of which logical conversation issued the request.
@@ -35429,10 +35638,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// reject the request before any cache/state mutation, so no cache
         /// entry is created (or consumed) for the rejected call.
         ///
-        /// Mutation sensitivity: removing the `check_logprobs_not_set` call
-        /// at the top of `generate_streaming_with_prefix_cache_and_cancel_inner`
-        /// makes this assertion fail (the call returns `Ok` with empty
-        /// `token_logprobs` instead of `Err`).
+        /// Mutation sensitivity: removing `check_logprobs_not_set` from the
+        /// outer `MetalPrefixCache` preparation contract makes this assertion
+        /// fail (the call returns `Ok` with empty `token_logprobs` instead of
+        /// `Err`).
         #[test]
         fn generate_streaming_with_prefix_cache_rejects_logprobs_request() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -35583,9 +35792,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// falling back to plain per-token decode with no MTP applied and
         /// no indication the request was ignored.
         ///
-        /// Mutation sensitivity: removing the `check_mtp_not_requested` call
-        /// in `generate_streaming_with_prefix_cache_and_cancel` makes this
-        /// assertion fail (the call returns `Ok` instead of `Err`).
+        /// Mutation sensitivity: removing `check_mtp_not_requested` from the
+        /// outer `MetalPrefixCache` preparation contract makes this assertion
+        /// fail (the call returns `Ok` instead of `Err`).
         #[test]
         fn generate_streaming_with_prefix_cache_rejects_active_mtp_request() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();

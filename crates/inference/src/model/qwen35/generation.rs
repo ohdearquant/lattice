@@ -2312,12 +2312,11 @@ pub(crate) fn check_reasoning_budget_not_set(
 /// rejected here too, rather than silently falling back to plain per-token
 /// decode with no indication MTP was skipped.
 ///
-/// Sole caller: the Metal cross-turn prefix-cache path
-/// (`generate_streaming_with_prefix_cache_and_cancel`), which has no MTP
-/// draft/verify wiring at all -- gated identically to that Metal-only
-/// consumer (same gate as the `DecodePolicy`/`StepOutcome` re-export in
-/// `mod.rs`) so non-metal-gpu builds don't carry an unused function.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+/// Sole production caller: the shared generation preparation contract for
+/// the Metal cross-turn prefix-cache path, which has no MTP draft/verify
+/// wiring at all. Test builds also compile the guard so that contract and
+/// ordering can be exercised without a Metal device.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 pub(crate) fn check_mtp_not_requested(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
     let mtp_enabled = gen_cfg
         .enable_mtp

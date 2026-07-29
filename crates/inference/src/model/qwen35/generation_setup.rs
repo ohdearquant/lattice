@@ -1,5 +1,5 @@
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-use super::generation::check_context_budget;
+use super::generation::{check_context_budget, check_mtp_not_requested};
 use super::generation::{
     check_grammar_not_set, check_logprobs_not_set, check_prompt_ids_in_vocab,
     check_prompt_not_empty, check_reasoning_budget_not_set, check_stop_strings_not_set,
@@ -19,9 +19,24 @@ pub(crate) enum GenerationEntryContract {
     MetalDirect,
     #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
     MetalStreaming,
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    MetalPrefixCache,
 }
 
 impl GenerationEntryContract {
+    fn validate_before_tokenization(self, _gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
+        match self {
+            #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+            Self::MetalPrefixCache => {
+                check_logprobs_not_set(_gen_cfg)?;
+                check_mtp_not_requested(_gen_cfg)
+            }
+            Self::StandaloneCpu => Ok(()),
+            #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+            Self::MetalDirect | Self::MetalStreaming => Ok(()),
+        }
+    }
+
     fn validate_prompt_ids(
         self,
         prompt_ids: &[u32],
@@ -30,7 +45,7 @@ impl GenerationEntryContract {
         match self {
             Self::StandaloneCpu => check_prompt_ids_in_vocab(prompt_ids, vocab_size),
             #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-            Self::MetalDirect | Self::MetalStreaming => Ok(()),
+            Self::MetalDirect | Self::MetalStreaming | Self::MetalPrefixCache => Ok(()),
         }
     }
 
@@ -49,6 +64,8 @@ impl GenerationEntryContract {
             }
             #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
             Self::MetalStreaming => Ok(()),
+            #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+            Self::MetalPrefixCache => Ok(()),
         }
     }
 
@@ -70,7 +87,7 @@ impl GenerationEntryContract {
                 Ok(gen_cfg.max_new_tokens)
             }
             #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-            Self::MetalDirect | Self::MetalStreaming => {
+            Self::MetalDirect | Self::MetalStreaming | Self::MetalPrefixCache => {
                 check_context_budget(
                     prompt_len,
                     gen_cfg.reasoning_budget,
@@ -105,6 +122,8 @@ pub(crate) fn prepare_generation(
     max_context: usize,
     contract: GenerationEntryContract,
 ) -> Result<GenerationPreparation, InferenceError> {
+    contract.validate_before_tokenization(gen_cfg)?;
+
     let rng_state = normalize_seed(gen_cfg.seed, system_seed);
 
     let input = tokenizer.tokenize(prompt);
@@ -422,16 +441,90 @@ mod tests {
     }
 
     #[test]
+    fn metal_prefix_cache_contract_preserves_pre_token_capability_order() {
+        let tokenizer = tokenizer(&[("a", 0)]);
+        let both_rejected = GenerateConfig {
+            max_new_tokens: 0,
+            logprobs: Some(0),
+            enable_mtp: Some(true),
+            ..Default::default()
+        };
+        let err = prepare_with_contract(
+            &tokenizer,
+            "",
+            &both_rejected,
+            1,
+            0,
+            GenerationEntryContract::MetalPrefixCache,
+        )
+        .expect_err("logprobs must reject before MTP, tokenization, empty, and zero");
+        assert!(matches!(
+            err,
+            InferenceError::InvalidInput(ref message)
+                if message.starts_with("per-token logprobs are not yet supported")
+        ));
+
+        let mtp_rejected = GenerateConfig {
+            max_new_tokens: 0,
+            enable_mtp: Some(true),
+            ..Default::default()
+        };
+        let err = prepare_with_contract(
+            &tokenizer,
+            "",
+            &mtp_rejected,
+            1,
+            0,
+            GenerationEntryContract::MetalPrefixCache,
+        )
+        .expect_err("MTP must reject before tokenization, empty, and zero");
+        assert!(matches!(
+            err,
+            InferenceError::InvalidInput(ref message)
+                if message.starts_with("enable_mtp (or LATTICE_MTP) is not supported")
+        ));
+    }
+
+    #[test]
+    fn metal_prefix_cache_zero_budget_completes_before_context() {
+        let tokenizer = tokenizer(&[("a", 0)]);
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 0,
+            enable_mtp: Some(false),
+            reasoning_budget: Some(9),
+            ..Default::default()
+        };
+        let result = prepare_with_contract(
+            &tokenizer,
+            "a",
+            &gen_cfg,
+            1,
+            0,
+            GenerationEntryContract::MetalPrefixCache,
+        )
+        .expect("supported zero-budget request must complete before context");
+        let GenerationPreparation::Complete(output) = result else {
+            panic!("zero budget must return a completed generation");
+        };
+
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.generated_tokens, 0);
+        assert_eq!(output.stop_reason, Some(StopReason::Length));
+    }
+
+    #[test]
     fn metal_contracts_preserve_no_prompt_id_admission() {
         let tokenizer = tokenizer(&[("z", 2)]);
         let gen_cfg = GenerateConfig {
             max_new_tokens: 1,
+            enable_mtp: Some(false),
             ..Default::default()
         };
 
         for contract in [
             GenerationEntryContract::MetalDirect,
             GenerationEntryContract::MetalStreaming,
+            GenerationEntryContract::MetalPrefixCache,
         ] {
             let result = prepare_with_contract(&tokenizer, "z", &gen_cfg, 2, 2, contract)
                 .expect("Metal preparation must preserve its existing admission ordering");
@@ -440,30 +533,30 @@ mod tests {
     }
 
     #[test]
-    fn metal_streaming_context_uses_reasoning_aware_decode_cap() {
+    fn metal_streaming_and_prefix_contracts_use_reasoning_aware_decode_cap() {
         let tokenizer = tokenizer(&[("a", 0)]);
         let gen_cfg = GenerateConfig {
             max_new_tokens: 1,
             reasoning_budget: Some(1),
+            enable_mtp: Some(false),
             ..Default::default()
         };
-        let err = prepare_with_contract(
-            &tokenizer,
-            "a",
-            &gen_cfg,
-            1,
-            3,
-            GenerationEntryContract::MetalStreaming,
-        )
-        .expect_err("prompt plus reasoning-aware decode cap must fit the context");
 
-        assert!(matches!(
-            err,
-            InferenceError::Inference(ref message)
-                if message
-                    == "prompt (1 tokens) plus effective decode cap (3 tokens; \
-                        max_new_tokens=1, reasoning_budget=1) exceeds model context window (3)"
-        ));
+        for contract in [
+            GenerationEntryContract::MetalStreaming,
+            GenerationEntryContract::MetalPrefixCache,
+        ] {
+            let err = prepare_with_contract(&tokenizer, "a", &gen_cfg, 1, 3, contract)
+                .expect_err("prompt plus reasoning-aware decode cap must fit the context");
+
+            assert!(matches!(
+                err,
+                InferenceError::Inference(ref message)
+                    if message
+                        == "prompt (1 tokens) plus effective decode cap (3 tokens; \
+                            max_new_tokens=1, reasoning_budget=1) exceeds model context window (3)"
+            ));
+        }
     }
 
     #[test]
