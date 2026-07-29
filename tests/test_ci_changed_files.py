@@ -13,6 +13,7 @@ from pathlib import Path
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "ci-changed-files.sh"
 _ROOT = _SCRIPT.parent.parent
 _ZERO_SHA = "0" * 40
+_GIT = ("git", "-c", "core.hooksPath=/dev/null")
 _REQUIRED_WORKFLOWS = (
     ".github/workflows/app-binaries.yml",
     ".github/workflows/cargo-audit.yml",
@@ -65,8 +66,9 @@ class ChangedFilesTests(unittest.TestCase):
         self._tempdir.cleanup()
 
     def _git(self, *args: str) -> str:
+        # Test helpers invoking real Git must disable repository hooks.
         result = subprocess.run(
-            ["git", *args],
+            [*_GIT, *args],
             cwd=self.repo,
             check=True,
             capture_output=True,
