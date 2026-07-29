@@ -35,6 +35,38 @@ fi
 exit 0
 """
 
+STUB_GOVERNOR = """#!/usr/bin/env python3
+import json
+import sys
+from datetime import UTC, datetime
+
+label = sys.argv[sys.argv.index("--label") + 1]
+print(json.dumps({
+    "schema": "lattice-machine-state-v1",
+    "label": label,
+    "captured_at_utc": datetime.now(UTC).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z"),
+    "power": {"status": "measured", "source": "fixture", "state": "ac"},
+    "thermal": {
+        "status": "measured",
+        "source": "fixture",
+        "state": "nominal",
+    },
+    "idle": {
+        "status": "measured",
+        "source": "fixture",
+        "seconds": 30.0,
+    },
+    "gate": {
+        "status": "passed",
+        "cooldown_seconds": 30.0,
+        "afk_threshold_seconds": 30.0,
+        "kill_switch": "clear",
+    },
+}, separators=(",", ":"), sort_keys=True))
+"""
+
 # Test helpers invoking real Git must disable repository hooks.
 GIT = ("git", "-c", "core.hooksPath=/dev/null")
 
@@ -136,6 +168,9 @@ def _run(
         shutil.copy2(GATE, root / "scripts" / GATE.name)
         shutil.copytree(LIB, root / "scripts" / "lib")
         shutil.copy2(REPO / ".gitignore", root / ".gitignore")
+        governor = root / "scripts" / "perf_governor.py"
+        governor.write_text(STUB_GOVERNOR)
+        governor.chmod(0o755)
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}

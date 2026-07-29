@@ -178,34 +178,50 @@ verify_locks() {
 }
 verify_locks
 
-# --- Ambient load gate ---
-# A lock excludes peers; it says nothing about ambient load. Both are needed.
-# Sampled at three points and refused at each: an unquiet machine before the
-# base phase invalidates the run before it costs anything, and an unquiet
-# machine after the head phase invalidates numbers that were already taken,
-# which is exactly when the temptation to keep them is strongest.
+# --- Machine-state and ambient-load gates ---
+# A lock excludes peers; it says nothing about ambient load, thermal pressure,
+# power source, or an operator actively using the machine. These checkpoints
+# settle the macOS host before every sample, then gate AC power, thermal state,
+# HID idle time, and current CPU idle. Linux CI runners have no repository
+# equivalent for the macOS hardware probes, so that limitation is recorded
+# explicitly while the portable CPU-idle gate still applies.
 QUIET_SAMPLES=""
 MACHINE_STATE_SAMPLES=""
 machine_state_probe() {
-  local label="$1" record
-  if ! record="$(
-    python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
-  )"; then
-    echo "bench-compare: machine-state probe failed at '$label' — refusing." >&2
+  local label="$1" platform record rc=0
+  if ! platform="$(uname -s)"; then
+    echo "bench-compare: could not identify the host platform — refusing." >&2
     exit 2
+  fi
+  if [ "$platform" = "Darwin" ]; then
+    record="$(
+      python3 "$REPO/scripts/perf_governor.py" \
+        --checkpoint \
+        --label "$label" \
+        --cooldown 30 \
+        --afk-threshold 30
+    )" || rc=$?
+  else
+    record="$(
+      python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
+    )" || rc=$?
   fi
   echo "[state] $label: $record"
   MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
 }$record"
+  if [ "$rc" -ne 0 ]; then
+    echo "bench-compare: machine-state checkpoint '$label' failed — refusing to certify this A/B." >&2
+    exit 2
+  fi
 }
 
 quiet_gate() {
   local label="$1" line rc=0
+  machine_state_probe "$label"
   line="$(python3 "$REPO/scripts/lib/quiet-probe.py" --label "$label")" || rc=$?
   echo "$line"
   QUIET_SAMPLES="${QUIET_SAMPLES}${QUIET_SAMPLES:+
 }$line"
-  machine_state_probe "$label"
   if [ "$rc" -ne 0 ]; then
     echo "bench-compare: machine was not quiet at '$label' — refusing to" \
          "certify this A/B. Set BENCH_IDLE_FLOOR to judge against a" \
@@ -720,7 +736,7 @@ echo "  locks:"
 echo "$LOCK_SUMMARY"
 echo "  ambient load:"
 echo "$QUIET_SAMPLES" | sed 's/^/    /'
-echo "  thermal/power:"
+echo "  machine state:"
 echo "$MACHINE_STATE_SAMPLES" | sed 's/^/    /'
 
 echo ""

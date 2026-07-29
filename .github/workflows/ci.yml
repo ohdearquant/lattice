@@ -724,6 +724,8 @@ jobs:
       # the lock the guard replaced.
       - name: python3 tests/test_bench_locks.py
         run: python3 tests/test_bench_locks.py -v
+      - name: python3 tests/test_perf_governor.py
+        run: python3 tests/test_perf_governor.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is

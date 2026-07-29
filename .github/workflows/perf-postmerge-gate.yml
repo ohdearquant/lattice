@@ -62,6 +62,7 @@ on:
       - 'scripts/lib/bench-locks.py'
       - 'scripts/lib/quiet-probe.py'
       - 'scripts/lib/machine-state-probe.py'
+      - 'scripts/perf_governor.py'
       - 'scripts/lib/bench-informational-groups.sh'
       - 'scripts/lib/bench-quick-informational-targets.txt'
       - 'scripts/lib/resolve-informational-groups.sh'

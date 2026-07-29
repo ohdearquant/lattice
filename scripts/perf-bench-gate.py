@@ -181,6 +181,54 @@ def validate_capability(
         raise ValueError(f"{field} measured state must name its source")
 
 
+def validate_idle(value: object, field: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    if value.get("status") == "unavailable":
+        reason = value.get("reason")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(f"{field} unavailable state must name a reason")
+        return
+    if value.get("status") != "measured":
+        raise ValueError(f"{field} status must be 'measured' or 'unavailable'")
+    source = value.get("source")
+    if not isinstance(source, str) or not source:
+        raise ValueError(f"{field} measured state must name its source")
+    seconds = value.get("seconds")
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, (int, float))
+        or not math.isfinite(seconds)
+        or seconds < 0
+    ):
+        raise ValueError(f"{field} seconds must be a finite non-negative number")
+
+
+def validate_checkpoint_gate(value: object, field: str) -> None:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    status = value.get("status")
+    if status not in ("passed", "blocked"):
+        raise ValueError(f"{field} status must be 'passed' or 'blocked'")
+    for key in ("cooldown_seconds", "afk_threshold_seconds"):
+        seconds = value.get(key)
+        if (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+            or seconds < 0
+        ):
+            raise ValueError(
+                f"{field} {key} must be a finite non-negative number"
+            )
+    if status == "passed" and value.get("kill_switch") != "clear":
+        raise ValueError(f"{field} passed state must record kill_switch=clear")
+    if status == "blocked":
+        reason = value.get("reason")
+        if not isinstance(reason, str) or not reason:
+            raise ValueError(f"{field} blocked state must name a reason")
+
+
 def validate_machine_state(value: str, expected_label: str) -> dict[str, object]:
     try:
         record = json.loads(value)
@@ -212,8 +260,17 @@ def validate_machine_state(value: str, expected_label: str) -> dict[str, object]
     validate_capability(
         record.get("thermal"),
         f"machine_state[{expected_label}].thermal",
-        frozenset(("nominal", "throttled")),
+        frozenset(("nominal", "throttled", "fair", "serious", "critical")),
     )
+    validate_idle(
+        record.get("idle"),
+        f"machine_state[{expected_label}].idle",
+    )
+    if "gate" in record:
+        validate_checkpoint_gate(
+            record["gate"],
+            f"machine_state[{expected_label}].gate",
+        )
     thermal = record["thermal"]
     if isinstance(thermal, dict) and "cpu_speed_limit_percent" in thermal:
         limit = thermal["cpu_speed_limit_percent"]
@@ -343,6 +400,24 @@ def load_run_provenance(path: Path) -> RunProvenance:
             )
     if captured_times != sorted(captured_times):
         raise ValueError(f"{path}: machine-state timestamps are out of phase order")
+    if fields["os"].split(maxsplit=1)[0] == "Darwin":
+        for record in machine_states:
+            gate = record.get("gate")
+            if not isinstance(gate, dict) or gate.get("status") != "passed":
+                raise ValueError(
+                    f"{path}: macOS machine_state[{record['label']}] lacks a "
+                    "passed fail-closed gate"
+                )
+            if gate["cooldown_seconds"] < 30:
+                raise ValueError(
+                    f"{path}: macOS machine_state[{record['label']}] cooldown "
+                    "must be at least 30 seconds"
+                )
+            if gate["afk_threshold_seconds"] < 30:
+                raise ValueError(
+                    f"{path}: macOS machine_state[{record['label']}] AFK floor "
+                    "must be at least 30 seconds"
+                )
 
     fields.pop("schema")
     return RunProvenance(
@@ -687,6 +762,26 @@ def capability_summary(value: object) -> str:
     return f"{state} via {value.get('source')}"
 
 
+def idle_summary(value: object) -> str:
+    if not isinstance(value, dict):
+        return "invalid"
+    if value.get("status") == "unavailable":
+        return f"unavailable ({value.get('reason')})"
+    return f"{float(value['seconds']):.1f}s via {value.get('source')}"
+
+
+def checkpoint_gate_summary(value: object) -> str:
+    if not isinstance(value, dict):
+        return "not enforced on this platform"
+    if value.get("status") == "blocked":
+        return f"blocked ({value.get('reason')})"
+    return (
+        f"passed (cooldown {float(value['cooldown_seconds']):.1f}s, "
+        f"AFK floor {float(value['afk_threshold_seconds']):.1f}s, "
+        f"kill-switch {value.get('kill_switch')})"
+    )
+
+
 def render_run_provenance(
     provenance: RunProvenance | None,
     results: list[BenchResult],
@@ -712,7 +807,9 @@ def render_run_provenance(
                 f"    machine_state[{state['label']}]="
                 f"captured {state['captured_at_utc']}; "
                 f"power {capability_summary(state['power'])}; "
-                f"thermal {capability_summary(state['thermal'])}"
+                f"thermal {capability_summary(state['thermal'])}; "
+                f"HID idle {idle_summary(state['idle'])}; "
+                f"gate {checkpoint_gate_summary(state.get('gate'))}"
             )
     lines.append(f"    criterion_base_samples={sample_shape_summary(results, 'base')}")
     lines.append(f"    criterion_head_samples={sample_shape_summary(results, 'head')}")
@@ -1552,6 +1649,11 @@ def run_selftest() -> int:
                     "state": "nominal",
                     "cpu_speed_limit_percent": 100,
                 },
+                "idle": {
+                    "status": "measured",
+                    "source": "IOHIDSystem.HIDIdleTime",
+                    "seconds": 30.0,
+                },
             },
             {
                 "schema": MACHINE_STATE_SCHEMA,
@@ -1559,6 +1661,10 @@ def run_selftest() -> int:
                 "captured_at_utc": "2026-07-29T12:00:20Z",
                 "power": {"status": "unavailable", "reason": "fixture unsupported"},
                 "thermal": {
+                    "status": "unavailable",
+                    "reason": "fixture unsupported",
+                },
+                "idle": {
                     "status": "unavailable",
                     "reason": "fixture unsupported",
                 },
@@ -1577,6 +1683,11 @@ def run_selftest() -> int:
                     "source": "pmset",
                     "state": "throttled",
                     "cpu_speed_limit_percent": 90,
+                },
+                "idle": {
+                    "status": "measured",
+                    "source": "IOHIDSystem.HIDIdleTime",
+                    "seconds": 31.0,
                 },
             },
         ]
@@ -1620,12 +1731,39 @@ def run_selftest() -> int:
             "ambient=[quiet] after head",
             "machine_state[between phases]=captured",
             "power unavailable (fixture unsupported)",
+            "HID idle unavailable (fixture unsupported)",
+            "gate not enforced on this platform",
             "| 4 Linear | 2 Flat |",
         ):
             if expected not in provenance_run.stdout:
                 failures.append(
                     f"run-provenance: stored report omitted {expected!r}"
                 )
+
+        darwin_ungated = Path(td) / "darwin-ungated-provenance.txt"
+        darwin_ungated.write_text(
+            "\n".join(
+                "os=Darwin 24.6.0 arm64"
+                if line.startswith("os=")
+                else line
+                for line in provenance_lines
+            )
+            + "\n"
+        )
+        darwin_ungated_run = _run(
+            provenance_root,
+            "--provenance-file",
+            str(darwin_ungated),
+            "--require-provenance",
+        )
+        if (
+            darwin_ungated_run.returncode != 2
+            or "lacks a passed fail-closed gate" not in darwin_ungated_run.stderr
+        ):
+            failures.append(
+                "run-provenance: macOS handoff without machine-state gates "
+                "did not fail closed"
+            )
 
         legacy_report = _run(provenance_root)
         if legacy_report.returncode != 0:
