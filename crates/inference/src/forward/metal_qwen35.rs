@@ -35015,7 +35015,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 "epsilon grammar must start complete with no legal continuation"
             );
             let mut logits = vec![0.0; 32];
-            engine.mask_logits(&mut grammar_state, &mut logits);
+            engine
+                .mask_logits(&mut grammar_state, &mut logits)
+                .expect("local epsilon engine and full vocabulary logits must mask");
             assert!(
                 !crate::forward::metal_qwen35::has_finite_logit(&logits),
                 "terminal epsilon grammar must mask every continuation"
