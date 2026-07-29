@@ -64,7 +64,11 @@ impl QuantizationTier {
         }
     }
 
-    /// **Unstable**: maps recency to a storage tier; boundaries may be tuned.
+    /// **Unstable**: placeholder recency-to-tier mapping with no retrieval-quality basis.
+    ///
+    /// The fixed boundaries are an example storage policy, not evidence that older
+    /// vectors tolerate lower precision. Applications should select tiers from
+    /// workload-specific quality measurements.
     pub fn from_age_seconds(age_secs: u64) -> Self {
         const HOUR: u64 = 3600;
         const DAY: u64 = 86400;
@@ -557,6 +561,176 @@ mod tests {
                 unit * 2.0 - 1.0
             })
             .collect()
+    }
+
+    fn scalar_cosine_f64(a: &[f32], b: &[f32]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut dot = 0.0f64;
+        let mut norm_a = 0.0f64;
+        let mut norm_b = 0.0f64;
+        for (&a, &b) in a.iter().zip(b) {
+            let a = f64::from(a);
+            let b = f64::from(b);
+            dot += a * b;
+            norm_a += a * a;
+            norm_b += b * b;
+        }
+        let denom = norm_a.sqrt() * norm_b.sqrt();
+        if denom == 0.0 { 0.0 } else { dot / denom }
+    }
+
+    fn reference_ranking(query: &[f32], corpus: &[Vec<f32>]) -> Vec<usize> {
+        let mut ranked: Vec<_> = corpus
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (index, scalar_cosine_f64(query, candidate)))
+            .collect();
+        ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.into_iter().map(|(index, _)| index).collect()
+    }
+
+    fn tier_ranking(query: &[f32], stored: &[QuantizedData], tier: QuantizationTier) -> Vec<usize> {
+        let prepared = PreparedQuery::from_f32(query, tier);
+        assert_eq!(prepared.tier(), tier);
+        let mut ranked: Vec<_> = stored
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                (
+                    index,
+                    approximate_cosine_distance_prepared(&prepared, candidate).unwrap(),
+                )
+            })
+            .collect();
+        ranked.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.into_iter().map(|(index, _)| index).collect()
+    }
+
+    fn recall_at(reference: &[usize], actual: &[usize], k: usize) -> f64 {
+        let hits = actual[..k]
+            .iter()
+            .filter(|candidate| reference[..k].contains(candidate))
+            .count();
+        hits as f64 / k as f64
+    }
+
+    fn pairwise_ranking_agreement(reference: &[usize], actual: &[usize]) -> f64 {
+        assert_eq!(reference.len(), actual.len());
+        let mut actual_position = vec![0usize; actual.len()];
+        for (position, &candidate) in actual.iter().enumerate() {
+            actual_position[candidate] = position;
+        }
+        let mut agreements = 0usize;
+        let mut pairs = 0usize;
+        for (position, &left) in reference.iter().enumerate() {
+            for &right in &reference[position + 1..] {
+                agreements += usize::from(actual_position[left] < actual_position[right]);
+                pairs += 1;
+            }
+        }
+        agreements as f64 / pairs as f64
+    }
+
+    fn fixed_retrieval_fixture() -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        const DIMS: usize = 384;
+        const CORPUS_SIZE: usize = 256;
+        const QUERY_COUNT: usize = 16;
+        let corpus = (0..CORPUS_SIZE)
+            .map(|index| generate_vector(DIMS, 0xC0A5_0000 + index as u64))
+            .collect();
+        let queries = (0..QUERY_COUNT)
+            .map(|index| generate_vector(DIMS, 0x0A11_0000 + index as u64))
+            .collect();
+        (corpus, queries)
+    }
+
+    #[test]
+    fn test_tier_retrieval_quality_against_independent_f32_ranking() {
+        const TOP_K: usize = 10;
+        let (corpus, queries) = fixed_retrieval_fixture();
+
+        for tier in [
+            QuantizationTier::Full,
+            QuantizationTier::Int8,
+            QuantizationTier::Int4,
+            QuantizationTier::Binary,
+        ] {
+            let stored: Vec<_> = corpus
+                .iter()
+                .map(|candidate| QuantizedData::from_f32(candidate, tier))
+                .collect();
+            assert!(
+                stored.iter().all(|candidate| candidate.tier() == tier),
+                "{tier:?} conversion was bypassed or routed to another tier"
+            );
+            assert!(
+                stored
+                    .iter()
+                    .all(|candidate| candidate.storage_bytes()
+                        == tier.storage_bytes(candidate.dims())),
+                "{tier:?} conversion produced the wrong representation size"
+            );
+
+            if tier != QuantizationTier::Full {
+                assert!(
+                    stored.iter().zip(&corpus).any(|(quantized, original)| {
+                        quantized
+                            .to_f32()
+                            .iter()
+                            .zip(original)
+                            .any(|(actual, expected)| (actual - expected).abs() > 1e-4)
+                    }),
+                    "{tier:?} conversion did not exercise a lossy representation"
+                );
+            }
+
+            let mut recall = 0.0;
+            let mut agreement = 0.0;
+            let mut quantized_distance_witness = false;
+            for query in &queries {
+                let reference = reference_ranking(query, &corpus);
+                let actual = tier_ranking(query, &stored, tier);
+                recall += recall_at(&reference, &actual, TOP_K);
+                agreement += pairwise_ranking_agreement(&reference, &actual);
+
+                if tier != QuantizationTier::Full {
+                    let prepared = PreparedQuery::from_f32(query, tier);
+                    quantized_distance_witness |=
+                        stored.iter().zip(&corpus).any(|(quantized, original)| {
+                            let actual =
+                                approximate_cosine_distance_prepared(&prepared, quantized).unwrap();
+                            let reference = 1.0 - scalar_cosine_f64(query, original) as f32;
+                            (actual - reference).abs() > 1e-4
+                        });
+                }
+            }
+            recall /= queries.len() as f64;
+            agreement /= queries.len() as f64;
+            eprintln!(
+                "{tier:?}: Recall@{TOP_K}={recall:.6}, pairwise ranking agreement={agreement:.6}"
+            );
+
+            let (minimum_recall, minimum_agreement) = match tier {
+                QuantizationTier::Full => (1.0, 0.999),
+                QuantizationTier::Int8 => (0.98, 0.995),
+                QuantizationTier::Int4 => (0.85, 0.95),
+                QuantizationTier::Binary => (0.30, 0.70),
+            };
+            assert!(
+                recall >= minimum_recall,
+                "{tier:?} Recall@{TOP_K} {recall:.6} is below the measured-data floor {minimum_recall:.3}"
+            );
+            assert!(
+                agreement >= minimum_agreement,
+                "{tier:?} pairwise ranking agreement {agreement:.6} is below the measured-data floor {minimum_agreement:.3}"
+            );
+            if tier != QuantizationTier::Full {
+                assert!(
+                    quantized_distance_witness,
+                    "{tier:?} distance path did not differ from the independent f32 reference"
+                );
+            }
+        }
     }
 
     #[test]

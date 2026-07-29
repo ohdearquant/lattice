@@ -152,11 +152,12 @@ dimensions.
 | `Int4`   | two unsigned nibbles per byte |                 0.5 |                    8x | Cool data and pre-filtering    |
 | `Binary` | one sign bit per dimension    |               0.125 |                   32x | Cold data and coarse filtering |
 
-`QuantizationTier::from_age_seconds` is a simple recency heuristic, not a
-measurement of vector quality: under one hour selects `Full`; one hour through
-under one day selects `Int8`; one day through under one week selects `Int4`;
-one week or older selects `Binary`. Applications can select tiers directly when
-their retention or recall policy differs.
+`QuantizationTier::from_age_seconds` is a placeholder recency heuristic with no
+retrieval-quality basis: under one hour selects `Full`; one hour through under
+one day selects `Int8`; one day through under one week selects `Int4`; one week
+or older selects `Binary`. Age does not establish that a vector tolerates lower
+precision. Applications should select tiers directly from workload-specific
+retention and retrieval-quality measurements.
 
 `QuantizedData` holds any tier behind one enum. Promoting or demoting it always
 dequantizes to `f32` and quantizes into the destination tier. Promotion does not

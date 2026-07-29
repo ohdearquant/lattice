@@ -7,13 +7,12 @@
 ## Context
 
 Storing and computing distances over millions of f32 embeddings at full precision is expensive:
-a 384-dim BGE-small vector is 1536 bytes; 1M such vectors occupy 1.5 GB. Semantic search does
-not require full f32 fidelity — approximate distances within a few percent of the exact value
-are sufficient for top-K retrieval candidates that are later re-ranked.
+a 384-dim BGE-small vector is 1536 bytes; 1M such vectors occupy 1.5 GB. Approximate retrieval
+can trade ranking fidelity for storage, but the acceptable loss is workload-specific and must be
+measured against the corpus and query distribution.
 
 The system must support multiple precision levels to allow trading memory/speed for accuracy.
-The selection criterion for a stored vector should be data-dependent (access recency) rather
-than requiring per-query configuration.
+The API includes a convenience access-recency mapping in addition to direct tier selection.
 
 ## Decision
 
@@ -23,17 +22,20 @@ in `src/simd/tier.rs`.
 
 ### Key Design Choices
 
-**Four tiers with access-age heuristic**
+**Four tiers with placeholder access-age heuristic**
 
-| Tier   | Type              | Bytes/dim | Compression | Distance                | Age threshold |
-| ------ | ----------------- | --------- | ----------- | ----------------------- | ------------- |
-| Full   | f32               | 4.0       | 1x          | Exact cosine            | < 1 hour      |
-| Int8   | i8, symmetric     | 1.0       | 4x          | SIMD i8 dot + scale     | < 1 day       |
-| Int4   | u4, packed nibble | 0.5       | 8x          | Dequantize + accumulate | < 1 week      |
-| Binary | 1-bit sign        | 0.125     | 32x         | Hamming distance        | ≥ 1 week      |
+| Tier   | Type              | Bytes/dim | Compression | Distance                | Placeholder age |
+| ------ | ----------------- | --------- | ----------- | ----------------------- | --------------- |
+| Full   | f32               | 4.0       | 1x          | Exact cosine            | < 1 hour        |
+| Int8   | i8, symmetric     | 1.0       | 4x          | SIMD i8 dot + scale     | < 1 day         |
+| Int4   | u4, packed nibble | 0.5       | 8x          | Dequantize + accumulate | < 1 week        |
+| Binary | 1-bit sign        | 0.125     | 32x         | Hamming distance        | ≥ 1 week        |
 
 `QuantizationTier::from_age_seconds(age)` implements this heuristic with hard thresholds
-at `HOUR=3600`, `DAY=86400`, `WEEK=604800`.
+at `HOUR=3600`, `DAY=86400`, `WEEK=604800`. These boundaries are a placeholder storage
+policy with no retrieval-quality basis. In particular, age is not evidence that an embedding
+can be compressed without harming recall; consumers should choose a tier from measurements
+on their own corpus and queries.
 
 **INT8 symmetric quantization with VNNI invariant**
 
@@ -93,14 +95,39 @@ the dot product — the norm division can be skipped. `PreparedQueryWithMeta` ca
 `1.0 - dot_product` fast path for `Full` tier when both are `Unit`. This saves ~26% at 384d
 by eliminating two norm-squared accumulations and two square roots.
 
+**Deterministic retrieval-fidelity regression**
+
+`test_tier_retrieval_quality_against_independent_f32_ranking` exercises the stored-vector
+conversion, prepared-query conversion, and prepared cosine-distance dispatch for every tier.
+It compares each result with rankings produced independently by a scalar f64 cosine
+implementation over 16 fixed-seed queries and 256 fixed-seed 384-dimensional synthetic
+vectors. The test reports mean Recall@10 and full-corpus pairwise ranking agreement:
+
+| Tier   | Recall@10 snapshot | Recall floor | Agreement snapshot | Agreement floor |
+| ------ | -----------------: | -----------: | -----------------: | --------------: |
+| Full   |            1.00000 |         1.00 |            1.00000 |           0.999 |
+| Int8   |            1.00000 |         0.98 |            0.99829 |           0.995 |
+| Int4   |            0.91875 |         0.85 |            0.96984 |           0.950 |
+| Binary |            0.44375 |         0.30 |            0.77285 |           0.700 |
+
+The floors leave margin below the deterministic aarch64 snapshot for backend reduction
+rounding while still detecting material ranking regressions. Representation, tier identity,
+lossy conversion, and distance divergence assertions ensure an f32 bypass or tier misrouting
+cannot satisfy the quality checks accidentally.
+
+This fixture is synthetic regression evidence, not a model benchmark. It neither establishes
+quality on production embedding distributions nor identifies acceptable end-user recall.
+It also has no temporal data, so it cannot justify the `from_age_seconds` thresholds or the use
+of any lossy tier for final ranking.
+
 ### Alternatives Considered
 
-| Alternative                | Pros                                             | Cons                                                            | Why Not                                                            |
-| -------------------------- | ------------------------------------------------ | --------------------------------------------------------------- | ------------------------------------------------------------------ |
-| Product Quantization (PQ)  | Higher recall at same bit budget                 | Complex codebook training; inference requires codebook lookup   | Training dependency; complexity not justified for current scale    |
-| Single INT8 tier only      | Simpler; AVX-512 VNNI gives excellent throughput | No memory savings beyond 4x; binary needed for cold-data budget | Need 32x compression for cold data that rarely surfaces in queries |
-| FAISS integration          | Battle-tested quantization + index               | C++ FFI; requires FAISS install; opaque memory model            | Pure Rust path is required; no C++ FFI allowed                     |
-| ScaNN / HNSW with pure f32 | Simpler; no quantization error                   | 4-32x more memory; cache pressure increases                     | Memory budget and L3 fit are primary constraints                   |
+| Alternative                | Pros                                             | Cons                                                          | Why Not                                                               |
+| -------------------------- | ------------------------------------------------ | ------------------------------------------------------------- | --------------------------------------------------------------------- |
+| Product Quantization (PQ)  | Higher recall at same bit budget                 | Complex codebook training; inference requires codebook lookup | Training dependency; complexity not justified for current scale       |
+| Single INT8 tier only      | Simpler; AVX-512 VNNI gives excellent throughput | No representation beyond 4x compression                       | Expose the full storage range; consumers must validate tier selection |
+| FAISS integration          | Battle-tested quantization + index               | C++ FFI; requires FAISS install; opaque memory model          | Pure Rust path is required; no C++ FFI allowed                        |
+| ScaNN / HNSW with pure f32 | Simpler; no quantization error                   | 4-32x more memory; cache pressure increases                   | Memory budget and L3 fit are primary constraints                      |
 
 ## Consequences
 
@@ -112,15 +139,15 @@ by eliminating two norm-squared accumulations and two square roots.
 
 ### Negative
 
-- INT8 round-trip error is bounded by `max_abs / 254` per element. For a unit-norm 384-dim vector, element-wise absolute error ≤ 0.004; cosine similarity error ≤ ~0.5%. This is acceptable for HNSW candidate pre-filtering.
-- Binary cosine approximation is rough (within ~0.35 of f32 cosine for random 384-dim vectors per the test). It should only be used for coarse pre-filtering, not for final ranking.
+- INT8 round-trip error is bounded by `max_abs / 254` per element. This element-wise bound does not establish corpus-level recall; consumers still need a retrieval-quality gate.
+- Binary cosine approximation is rough. The fixed synthetic fixture records 0.44375 mean Recall@10 and 0.77285 pairwise ranking agreement, but those values do not transfer to production corpora. Binary should only be considered for coarse pre-filtering after workload-specific validation, not assumed suitable for final ranking.
 - The `avx512` Cargo feature must be explicitly enabled to activate the AVX-512 VNNI path. Omitting it falls back to AVX2, which is still ~3x faster than scalar.
 - `promote()` / `demote()` between tiers loses information — Int4 promoted to Int8 fills new bits from the dequantized approximation, not the original f32 values. This is documented but could surprise callers.
 
 ### Risks
 
 - The `-128` invariant on `QuantizedVector.data` is enforced in release builds by the public `dot_product_i8` function. The `data` field is `pub` (marked `Unstable`) — direct writes can bypass the invariant and cause silently incorrect VNNI results without panicking in release mode. The `trusted` variants skip the O(N) scan in release; callers must guarantee construction via `from_f32`.
-- The `from_age_seconds` age thresholds (HOUR/DAY/WEEK) are not configurable at runtime. Workloads with different access patterns (e.g., archival data always queried with long gaps) will get suboptimal tier assignments.
+- The `from_age_seconds` age thresholds (HOUR/DAY/WEEK) are non-configurable placeholders with no retrieval-quality or temporal-utility evidence. Consumers should not infer that old vectors are less relevant or safer to quantize.
 
 ## References
 
