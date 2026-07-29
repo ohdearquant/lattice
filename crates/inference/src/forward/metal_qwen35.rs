@@ -1925,6 +1925,95 @@ mod inner {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SamplingLogprobsGate {
+        NotRequired,
+        RequireAbsent,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SamplingRouteEnvironment {
+        compact: bool,
+        selection: bool,
+        approximate_top_p: bool,
+    }
+
+    impl SamplingRouteEnvironment {
+        fn current() -> Self {
+            Self {
+                compact: std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
+                selection: std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                approximate_top_p: std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SamplingRoutePlan {
+        use_compact: bool,
+        compact_route: GpuTopkRoute,
+        compact_topk: usize,
+    }
+
+    fn plan_sampling_route(
+        gen_cfg: &GenerateConfig,
+        history_is_empty: bool,
+        logprobs_gate: SamplingLogprobsGate,
+        environment: SamplingRouteEnvironment,
+    ) -> SamplingRoutePlan {
+        let block_route = choose_gpu_block_topk_route(
+            gen_cfg.top_k,
+            gen_cfg.top_p,
+            environment.compact,
+            environment.approximate_top_p,
+        );
+        let route = if block_route != GpuTopkRoute::CpuFallback {
+            block_route
+        } else {
+            choose_gpu_topk_route(gen_cfg.top_k, environment.compact, environment.selection)
+        };
+        let logprobs_eligible = match logprobs_gate {
+            SamplingLogprobsGate::NotRequired => true,
+            SamplingLogprobsGate::RequireAbsent => gen_cfg.logprobs.is_none(),
+        };
+        let use_compact = route != GpuTopkRoute::CpuFallback
+            && (gen_cfg.repetition_penalty == 1.0 || history_is_empty)
+            && gen_cfg.grammar.is_none()
+            && logprobs_eligible;
+
+        if use_compact {
+            SamplingRoutePlan {
+                use_compact,
+                compact_route: route,
+                compact_topk: match route {
+                    GpuTopkRoute::BlockArgmax => 1,
+                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
+                    _ => gen_cfg.top_k,
+                },
+            }
+        } else {
+            SamplingRoutePlan {
+                use_compact,
+                compact_route: GpuTopkRoute::CpuFallback,
+                compact_topk: 0,
+            }
+        }
+    }
+
+    fn apply_sampling_route_plan(
+        plan: SamplingRoutePlan,
+        compact_route: &mut GpuTopkRoute,
+        compact_topk: &mut usize,
+        compact_result: &mut Vec<crate::sampling::Candidate>,
+    ) -> bool {
+        *compact_route = plan.compact_route;
+        *compact_topk = plan.compact_topk;
+        if !plan.use_compact {
+            compact_result.clear();
+        }
+        plan.use_compact
+    }
+
     /// Resolves a `compact_route` to `(local_k, precompiled Stage-1 pipeline
     /// slot)`, or `None` if the route isn't a block-top-k route at all
     /// (`Argmax`/`Select64`/`HierarchicalK50`/`CpuFallback`) **or** if
@@ -8823,6 +8912,26 @@ mod inner {
             Ok(GenerateAdmission::Ready(prompt_ids))
         }
 
+        fn configure_sampling_route(
+            &mut self,
+            gen_cfg: &GenerateConfig,
+            history_is_empty: bool,
+            logprobs_gate: SamplingLogprobsGate,
+        ) -> bool {
+            let plan = plan_sampling_route(
+                gen_cfg,
+                history_is_empty,
+                logprobs_gate,
+                SamplingRouteEnvironment::current(),
+            );
+            apply_sampling_route_plan(
+                plan,
+                &mut self.session.compact_route,
+                &mut self.session.compact_topk,
+                &mut self.session.compact_result,
+            )
+        }
+
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
         ///
         /// Generate text from a prompt.
@@ -8875,44 +8984,11 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
+            let use_compact = self.configure_sampling_route(
+                gen_cfg,
+                all_ids.is_empty(),
+                SamplingLogprobsGate::NotRequired,
             );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            // Repetition penalty requires full logits — disable compact mode when active.
-            // Grammar-constrained decoding also requires full logits (CpuFallback).
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -13868,43 +13944,11 @@ mod inner {
             // default (no logprobs requested) path pays no extra cost.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
+            let use_compact = self.configure_sampling_route(
+                gen_cfg,
+                all_ids.is_empty(),
+                SamplingLogprobsGate::RequireAbsent,
             );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none()
-                && gen_cfg.logprobs.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -16885,43 +16929,11 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
+            let use_compact = self.configure_sampling_route(
+                gen_cfg,
+                all_ids.is_empty(),
+                SamplingLogprobsGate::RequireAbsent,
             );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none()
-                && gen_cfg.logprobs.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
 
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
@@ -19357,7 +19369,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // ── Route-logic unit tests (pure Rust, no Metal device needed) ────────
 
         #[test]
-        fn test_choose_gpu_topk_route_all_cases() {
+        fn sampling_route_legacy_helper_all_cases() {
             // k=0 → always CPU
             assert_eq!(
                 choose_gpu_topk_route(0, true, true),
@@ -19418,6 +19430,267 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 choose_gpu_topk_route(1000, true, true),
                 GpuTopkRoute::CpuFallback,
                 "k=1000"
+            );
+        }
+
+        #[test]
+        fn sampling_route_block_helper_gate() {
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 0.9, true, false),
+                GpuTopkRoute::CpuFallback,
+                "top_p<1.0 without the approx gate must stay exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 0.9, true, true),
+                GpuTopkRoute::BlockTopK { local_k: 8 },
+                "top_p<1.0 WITH the explicit approx gate may take the block route"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(0, 1.0, true, false),
+                GpuTopkRoute::CpuFallback,
+                "top_k=0 means top-k DISABLED (full-distribution sampling), \
+                 not greedy; BlockArgmax here would collapse sampling to top-1"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(1, 1.0, true, false),
+                GpuTopkRoute::BlockArgmax
+            );
+            for &k in &[8u32, 16, 40, 64] {
+                assert_eq!(
+                    choose_gpu_block_topk_route(k as usize, 1.0, true, false),
+                    GpuTopkRoute::BlockTopK { local_k: k },
+                    "k={k} must map to BlockTopK"
+                );
+            }
+            assert_eq!(
+                choose_gpu_block_topk_route(50, 1.0, true, false),
+                GpuTopkRoute::CpuFallback,
+                "k=50 has no precompiled Stage-1 variant; must fall back exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 1.0, false, false),
+                GpuTopkRoute::CpuFallback,
+                "LATTICE_COMPACT_TOPK unset must stay exact regardless of k"
+            );
+        }
+
+        fn compact_sampling_config(top_k: usize) -> GenerateConfig {
+            GenerateConfig {
+                top_k,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                ..Default::default()
+            }
+        }
+
+        fn compact_sampling_environment() -> SamplingRouteEnvironment {
+            SamplingRouteEnvironment {
+                compact: true,
+                selection: true,
+                approximate_top_p: false,
+            }
+        }
+
+        #[test]
+        fn sampling_route_plan_composes_block_first_then_legacy_fallback() {
+            for (top_k, expected_route, expected_topk) in [
+                (1, GpuTopkRoute::BlockArgmax, 1),
+                (8, GpuTopkRoute::BlockTopK { local_k: 8 }, 8),
+                (16, GpuTopkRoute::BlockTopK { local_k: 16 }, 16),
+                (40, GpuTopkRoute::BlockTopK { local_k: 40 }, 40),
+                (64, GpuTopkRoute::BlockTopK { local_k: 64 }, 64),
+            ] {
+                let plan = plan_sampling_route(
+                    &compact_sampling_config(top_k),
+                    false,
+                    SamplingLogprobsGate::NotRequired,
+                    compact_sampling_environment(),
+                );
+                assert_eq!(
+                    plan,
+                    SamplingRoutePlan {
+                        use_compact: true,
+                        compact_route: expected_route,
+                        compact_topk: expected_topk,
+                    },
+                    "top_k={top_k}"
+                );
+            }
+
+            let legacy_plan = plan_sampling_route(
+                &compact_sampling_config(50),
+                false,
+                SamplingLogprobsGate::NotRequired,
+                compact_sampling_environment(),
+            );
+            assert_eq!(
+                legacy_plan,
+                SamplingRoutePlan {
+                    use_compact: true,
+                    compact_route: GpuTopkRoute::HierarchicalK50,
+                    compact_topk: 50,
+                }
+            );
+        }
+
+        #[test]
+        fn sampling_route_plan_preserves_direct_and_streaming_logprobs_difference() {
+            let config = GenerateConfig {
+                logprobs: Some(5),
+                ..compact_sampling_config(1)
+            };
+
+            let direct = plan_sampling_route(
+                &config,
+                false,
+                SamplingLogprobsGate::NotRequired,
+                compact_sampling_environment(),
+            );
+            assert!(
+                direct.use_compact,
+                "the direct call site's historical route gate ignores logprobs"
+            );
+            assert_eq!(direct.compact_route, GpuTopkRoute::BlockArgmax);
+            assert_eq!(direct.compact_topk, 1);
+
+            let streaming = plan_sampling_route(
+                &config,
+                false,
+                SamplingLogprobsGate::RequireAbsent,
+                compact_sampling_environment(),
+            );
+            assert_eq!(
+                streaming,
+                SamplingRoutePlan {
+                    use_compact: false,
+                    compact_route: GpuTopkRoute::CpuFallback,
+                    compact_topk: 0,
+                },
+                "streaming and prefix-cache generation require full logits for logprobs"
+            );
+        }
+
+        #[test]
+        fn sampling_route_plan_preserves_grammar_and_repetition_gates() {
+            let penalized = GenerateConfig {
+                repetition_penalty: 1.1,
+                ..compact_sampling_config(8)
+            };
+            assert!(
+                !plan_sampling_route(
+                    &penalized,
+                    false,
+                    SamplingLogprobsGate::NotRequired,
+                    compact_sampling_environment(),
+                )
+                .use_compact,
+                "non-empty history with a repetition penalty requires full logits"
+            );
+            assert!(
+                plan_sampling_route(
+                    &penalized,
+                    true,
+                    SamplingLogprobsGate::NotRequired,
+                    compact_sampling_environment(),
+                )
+                .use_compact,
+                "an empty history preserves the existing repetition-penalty exception"
+            );
+
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            let grammar = GrammarEngine::new(
+                &GrammarSpec::Gbnf("root ::= \"a\"\n".to_string()),
+                vec![b"a".to_vec()],
+            )
+            .expect("trivial grammar must compile");
+            let constrained = GenerateConfig {
+                grammar: Some(std::sync::Arc::new(grammar)),
+                ..compact_sampling_config(8)
+            };
+            assert!(
+                !plan_sampling_route(
+                    &constrained,
+                    false,
+                    SamplingLogprobsGate::NotRequired,
+                    compact_sampling_environment(),
+                )
+                .use_compact,
+                "grammar-constrained decoding requires full logits"
+            );
+        }
+
+        #[test]
+        fn sampling_route_state_transition_preserves_enabled_result_and_clears_fallback() {
+            let sentinel = crate::sampling::Candidate {
+                token_id: 17,
+                logit: 3.5,
+            };
+            let mut compact_route = GpuTopkRoute::CpuFallback;
+            let mut compact_topk = 0;
+            let mut compact_result = vec![sentinel];
+
+            let enabled = plan_sampling_route(
+                &compact_sampling_config(8),
+                false,
+                SamplingLogprobsGate::NotRequired,
+                compact_sampling_environment(),
+            );
+            assert!(apply_sampling_route_plan(
+                enabled,
+                &mut compact_route,
+                &mut compact_topk,
+                &mut compact_result,
+            ));
+            assert_eq!(compact_route, GpuTopkRoute::BlockTopK { local_k: 8 });
+            assert_eq!(compact_topk, 8);
+            assert_eq!(
+                compact_result,
+                vec![sentinel],
+                "eligible routing preserves the existing compact_result until prefill replaces it"
+            );
+
+            let disabled = plan_sampling_route(
+                &compact_sampling_config(8),
+                false,
+                SamplingLogprobsGate::NotRequired,
+                SamplingRouteEnvironment {
+                    compact: false,
+                    selection: true,
+                    approximate_top_p: true,
+                },
+            );
+            assert!(!apply_sampling_route_plan(
+                disabled,
+                &mut compact_route,
+                &mut compact_topk,
+                &mut compact_result,
+            ));
+            assert_eq!(compact_route, GpuTopkRoute::CpuFallback);
+            assert_eq!(compact_topk, 0);
+            assert!(
+                compact_result.is_empty(),
+                "fallback routing must clear stale compact candidates"
+            );
+        }
+
+        #[test]
+        fn sampling_route_configurator_owns_all_three_generation_call_sites() {
+            let source = include_str!("metal_qwen35.rs");
+            let production = source
+                .split_once("    // Tests\n")
+                .expect("inner test section marker must exist")
+                .0;
+            assert_eq!(
+                production.matches("self.configure_sampling_route(").count(),
+                3,
+                "direct, streaming, and prefix-cache generation must share the configurator"
+            );
+            assert_eq!(
+                production
+                    .matches("let block_route = choose_gpu_block_topk_route(")
+                    .count(),
+                1,
+                "route chooser composition must have one production owner"
             );
         }
 
@@ -25900,52 +26173,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // the lm_head two-stage block-top-k path (issue #171).
         // ===================================================================
 
-        /// Pure unit test for the route gate (no GPU). Design-spec "Routing
-        /// Rules": top_p < 1.0 must stay on the exact full-logit path
-        /// (`CpuFallback`) unless the explicit approximate gate is set, since
-        /// nucleus sampling over a truncated candidate set is not equivalent
-        /// to full-vocab nucleus sampling.
-        #[test]
-        fn choose_gpu_block_topk_route_gate() {
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 0.9, true, false),
-                GpuTopkRoute::CpuFallback,
-                "top_p<1.0 without the approx gate must stay exact"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 0.9, true, true),
-                GpuTopkRoute::BlockTopK { local_k: 8 },
-                "top_p<1.0 WITH the explicit approx gate may take the block route"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(0, 1.0, true, false),
-                GpuTopkRoute::CpuFallback,
-                "top_k=0 means top-k DISABLED (full-distribution sampling), \
-                 not greedy; BlockArgmax here would collapse sampling to top-1"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(1, 1.0, true, false),
-                GpuTopkRoute::BlockArgmax
-            );
-            for &k in &[8u32, 16, 40, 64] {
-                assert_eq!(
-                    choose_gpu_block_topk_route(k as usize, 1.0, true, false),
-                    GpuTopkRoute::BlockTopK { local_k: k },
-                    "k={k} must map to BlockTopK"
-                );
-            }
-            assert_eq!(
-                choose_gpu_block_topk_route(50, 1.0, true, false),
-                GpuTopkRoute::CpuFallback,
-                "k=50 has no precompiled Stage-1 variant; must fall back exact"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 1.0, false, false),
-                GpuTopkRoute::CpuFallback,
-                "LATTICE_COMPACT_TOPK unset must stay exact regardless of k"
-            );
-        }
-
         /// Same construction as `tiny_metal_qwen35_fixture` but with a
         /// caller-chosen vocab size and an all-zero embedding table (only
         /// component 0 of a token's embedding is ever set below — the same
@@ -26261,7 +26488,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// setting them directly here isolates this test to the
         /// `reset_state`/route-builder clearing bug rather than also
         /// depending on route *selection*, which already has its own
-        /// coverage in `choose_gpu_block_topk_route_gate`).
+        /// coverage in `sampling_route_block_helper_gate`).
         ///
         /// MUTATION-SENSITIVE: commenting out the `reset_state` compact-state
         /// clear (the `self.session.compact_topk = 0; self.session.compact_route
