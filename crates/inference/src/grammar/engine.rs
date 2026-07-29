@@ -875,7 +875,9 @@ mod tests {
 
         let mut logits = vec![0.0];
         enable_mask_profiling();
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("locally constructed engine and matching logits length must mask");
         let profile = take_mask_profile();
         assert_eq!(logits, vec![f32::NEG_INFINITY]);
         assert_eq!(profile.precomputed_calls, 1);
@@ -894,7 +896,9 @@ mod tests {
 
         let mut logits = vec![0.0];
         enable_mask_profiling();
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("locally constructed engine and matching logits length must mask");
         let profile = take_mask_profile();
         assert_eq!(logits, vec![0.0]);
         assert_eq!(profile.precomputed_calls, 1);
