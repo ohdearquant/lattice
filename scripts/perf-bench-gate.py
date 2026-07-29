@@ -11,9 +11,12 @@ For every Criterion bench under target/criterion/, read change/estimates.json
 
 Usage:
   perf-bench-gate.py <criterion_root> <arch_label> [--out report.md]
-  perf-bench-gate.py <criterion_root> <arch_label> --informational-groups-file <path>
-  perf-bench-gate.py <criterion_root> <arch_label> \
-      --ambient-samples samples.jsonl --status-out status.json
+  perf-bench-gate.py <criterion_root> --prepare-baseline-copy
+  perf-bench-gate.py <criterion_root> --prepare-head
+  perf-bench-gate.py <criterion_root> <arch_label> --target <crate>:<bench-target>
+                      [--informational-target <crate>:<bench-target>]
+  perf-bench-gate.py <criterion_root> <arch_label> --target <crate>:<bench-target>
+                      --ambient-samples <jsonl> --status-out <json>
 
 Exit codes:
   0 — pass (no gated FAILs)
@@ -23,36 +26,28 @@ Exit codes:
       level this implies, which is tighter than "95%")
   2 — parse error / bad input, or (with --require-measurements) the gate
       refusing to certify a run it could not judge: no comparison data, or
-      no gating comparison among the parsed results. An automated lane must
-      not read "nothing was measured" as "nothing regressed".
-  3 — not measurable: nightly ambient-load samples were missing, malformed,
-      incomplete, or below `BENCH_IDLE_FLOOR`. No performance report is
-      rendered in this state.
+      no gating comparison among the parsed results, or a benchmark in the
+      selected baseline set with no head comparison. An automated lane must not
+      read "nothing was measured" as "nothing regressed".
+  3 — not measurable: the automated lane's before/between/after ambient sample
+      stream is missing, malformed, duplicated, or below BENCH_IDLE_FLOOR.
 
-`--status-out` activates the nightly contract. It requires a JSONL ambient
-sample stream containing exactly one sample for each voting phase (`before`,
-`between`, and `after`). Each line has this shape:
+Status mode is opt-in. It requires exactly one perf-ambient-sample/v1 record for
+each voting phase (before, between, after), ignores other phase labels, and
+writes an atomic perf-bench-gate-status/v1 document. Ambient refusal is checked
+before Criterion verdict rendering, so exit 3 outranks pass or regression for
+every target in the run.
 
-  {"schema":"perf-ambient-sample/v1","phase":"before","idle_pct":92.5}
-
-Other phase labels may be present but do not vote. The three required phases
-inherit the same `BENCH_IDLE_FLOOR` environment variable as bench-compare
-(70% by default). The status file is written atomically with one of four named
-verdicts: `pass`, `regression`, `error`, or `not_measurable`. A refused run
-contains ambient evidence but no measurement counts, so a trend consumer
-records a visible gap rather than a performance data point.
-
---informational-groups-file (lattice#714): quick-mode Criterion runs on
+--informational-target (lattice#714): quick-mode Criterion runs on
 sub-microsecond micro-benches (lattice-embed's `simd` bench target) are
 dominated by scheduler/thermal jitter rather than code changes — confirmed
 by two same-toolchain quick-mode A/A runs on identical refs flipping FAIL/
-WARN sign across dozens of entries (lattice#714). Groups listed in this file
-(one Criterion top-level group name per line, e.g. from `cargo bench ... --
---list`) are still measured and reported, but excluded from the FAIL/WARN
-gate and the exit code — they render in a separate "informational" section
-labeled below quick-mode resolution. This file should only be passed for
-quick-mode runs; full-mode (tight-CI) runs gate every group normally so a
-real embed SIMD regression is still caught.
+WARN sign across dozens of entries (lattice#714). bench-compare isolates each
+bench target in its own Criterion output root, passes that root's exact target
+key through --target, and marks the key informational only when the reviewed
+manifest says so. Every result in that root is still measured and reported,
+but excluded from the FAIL/WARN gate and exit code. Full mode omits
+--informational-target, so every result gates normally.
 """
 
 from __future__ import annotations
@@ -61,6 +56,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,7 +85,6 @@ EXIT_PASS = 0
 EXIT_REGRESSION = 1
 EXIT_ERROR = 2
 EXIT_NOT_MEASURABLE = 3
-
 AMBIENT_SAMPLE_SCHEMA = "perf-ambient-sample/v1"
 STATUS_SCHEMA = "perf-bench-gate-status/v1"
 REQUIRED_AMBIENT_PHASES = ("before", "between", "after")
@@ -116,8 +111,10 @@ def idle_floor_from_env() -> float:
     raw = os.environ.get("BENCH_IDLE_FLOOR", str(DEFAULT_IDLE_FLOOR))
     try:
         floor = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"BENCH_IDLE_FLOOR must be numeric, got {raw!r}") from exc
+    except ValueError as error:
+        raise ValueError(
+            f"BENCH_IDLE_FLOOR must be numeric, got {raw!r}"
+        ) from error
     if not math.isfinite(floor) or not 0.0 <= floor <= 100.0:
         raise ValueError(
             f"BENCH_IDLE_FLOOR must be finite and between 0 and 100, got {raw!r}"
@@ -131,15 +128,12 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
         return AmbientAssessment(
             {}, floor_pct, "ambient sample input was not provided"
         )
-
     try:
-        lines = path.read_text().splitlines()
-    except OSError as exc:
+        records = [line for line in path.read_text().splitlines() if line.strip()]
+    except OSError as error:
         return AmbientAssessment(
-            {}, floor_pct, f"ambient sample input could not be read: {exc}"
+            {}, floor_pct, f"ambient sample input could not be read: {error}"
         )
-
-    records = [line for line in lines if line.strip()]
     if not records:
         return AmbientAssessment({}, floor_pct, "ambient sample input was empty")
 
@@ -147,11 +141,11 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
     for line_number, line in enumerate(records, start=1):
         try:
             record = json.loads(line)
-        except json.JSONDecodeError as exc:
+        except json.JSONDecodeError as error:
             return AmbientAssessment(
                 samples,
                 floor_pct,
-                f"ambient sample line {line_number} is malformed JSON: {exc.msg}",
+                f"ambient sample line {line_number} is malformed JSON: {error.msg}",
             )
         if not isinstance(record, dict):
             return AmbientAssessment(
@@ -165,7 +159,6 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
                 floor_pct,
                 f"ambient sample line {line_number} has an unsupported schema",
             )
-
         phase = record.get("phase")
         if not isinstance(phase, str) or not phase.strip():
             return AmbientAssessment(
@@ -173,7 +166,6 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
                 floor_pct,
                 f"ambient sample line {line_number} has no valid phase",
             )
-
         idle_pct = record.get("idle_pct")
         if (
             isinstance(idle_pct, bool)
@@ -186,7 +178,6 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
                 floor_pct,
                 f"ambient sample line {line_number} has no valid idle_pct",
             )
-
         phase = phase.strip()
         if phase not in REQUIRED_AMBIENT_PHASES:
             continue
@@ -205,7 +196,6 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
             floor_pct,
             "ambient sample input is incomplete; missing " + ", ".join(missing),
         )
-
     busy = [
         f"{phase}={samples[phase]:.1f}%"
         for phase in REQUIRED_AMBIENT_PHASES
@@ -218,7 +208,6 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
             f"ambient idle was below the {floor_pct:.1f}% floor at "
             + ", ".join(busy),
         )
-
     return AmbientAssessment(samples, floor_pct)
 
 
@@ -226,12 +215,12 @@ def write_gate_status(
     path: Path,
     *,
     arch: str,
+    target: str | None,
     verdict: str,
     exit_code: int,
     reason: str,
     ambient: AmbientAssessment | None,
     measurement_count: int | None = None,
-    gated_count: int | None = None,
     regression_count: int | None = None,
 ) -> None:
     """Atomically publish the machine-readable gate status."""
@@ -240,6 +229,7 @@ def write_gate_status(
         "verdict": verdict,
         "exit_code": exit_code,
         "arch": arch,
+        "target": target,
         "reason": reason,
     }
     if ambient is not None:
@@ -255,11 +245,10 @@ def write_gate_status(
         }
     if measurement_count is not None:
         payload["measurement_count"] = measurement_count
-    if gated_count is not None:
-        payload["gated_count"] = gated_count
     if regression_count is not None:
         payload["regression_count"] = regression_count
 
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -267,15 +256,6 @@ def write_gate_status(
     finally:
         try:
             temporary.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def remove_stale_report(path: Path | None) -> None:
-    """Prevent a refused automated run from exposing an older verdict."""
-    if path is not None:
-        try:
-            path.unlink()
         except FileNotFoundError:
             pass
 
@@ -295,13 +275,8 @@ class BenchResult:
     def ci_low_pct(self) -> float: return self.ci_low * 100.0
     @property
     def ci_high_pct(self) -> float: return self.ci_high * 100.0
-    @property
-    def group(self) -> str:
-        """Top-level Criterion group name (name is 'group/function/param' or 'group/param')."""
-        return self.name.split("/", 1)[0]
-
-    def is_informational(self, informational_groups: frozenset[str]) -> bool:
-        return self.group in informational_groups
+    def is_informational(self, target: str | None, informational_target: str | None) -> bool:
+        return target is not None and target == informational_target
 
     def verdict(self) -> str:
         if self.ci_low_pct > FAIL_PCT:
@@ -313,29 +288,149 @@ class BenchResult:
         return "PASS"
 
 
-def load_informational_groups(path: Path | None) -> frozenset[str]:
-    """Load top-level group names to exclude from gating (lattice#714).
-
-    One group name per line; blank lines and '#'-prefixed comments ignored.
-    """
-    if path is None:
-        return frozenset()
-    if not path.exists():
-        print(f"warn: --informational-groups-file {path} does not exist — gating "
-              f"every group normally", file=sys.stderr)
-        return frozenset()
-    groups = set()
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        groups.add(line)
-    return frozenset(groups)
-
-
 def find_change_files(root: Path) -> list[Path]:
     """Find every change/estimates.json under root (Criterion's per-bench output)."""
     return sorted(root.rglob("change/estimates.json"))
+
+
+def _baseline_parts(baseline_name: str) -> tuple[str, ...]:
+    """Return a safe relative path for a Criterion named baseline."""
+    path = Path(baseline_name)
+    if path.is_absolute() or not path.parts or any(part in (".", "..") for part in path.parts):
+        raise ValueError(
+            f"baseline name must be a non-empty relative path without '.' or '..': "
+            f"{baseline_name!r}"
+        )
+    return path.parts
+
+
+def find_selected_baseline_files(root: Path, baseline_name: str) -> list[Path]:
+    """Find estimates files belonging to the exact CLI-selected baseline.
+
+    Do not use parse_bench's tolerant `base/` or sole-sibling fallbacks here:
+    those can be useful when rendering an ad-hoc local report, but they are not
+    evidence about the named base arm selected by `--baseline-name`.
+    """
+    baseline_parts = _baseline_parts(baseline_name)
+    suffix = (*baseline_parts, "estimates.json")
+    matches = []
+    for estimate_file in root.rglob("estimates.json"):
+        relative_parts = estimate_file.relative_to(root).parts
+        if len(relative_parts) > len(suffix) and relative_parts[-len(suffix):] == suffix:
+            matches.append(estimate_file)
+    return sorted(matches)
+
+
+def artifact_bench_id(estimate_file: Path, root: Path, artifact_parts: int) -> str:
+    """Return a platform-independent Criterion bench ID for an artifact file."""
+    relative_parts = estimate_file.relative_to(root).parts
+    trim = artifact_parts + 1  # artifact directory component(s) + estimates.json
+    if len(relative_parts) <= trim:
+        raise ValueError(f"{estimate_file} is not below a Criterion benchmark directory")
+    return Path(*relative_parts[:-trim]).as_posix()
+
+
+def selected_baseline_bench_ids(root: Path, baseline_name: str) -> set[str]:
+    """Return bench IDs measured by the exact named base arm."""
+    artifact_parts = len(_baseline_parts(baseline_name))
+    return {
+        artifact_bench_id(estimate_file, root, artifact_parts)
+        for estimate_file in find_selected_baseline_files(root, baseline_name)
+    }
+
+
+def _checked_criterion_root(root: Path) -> Path:
+    """Resolve an invariant-checked Criterion cleanup root."""
+    if root.name != "criterion":
+        raise ValueError(f"refusing cleanup outside a directory named 'criterion': {root}")
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"criterion cleanup root must be a real directory: {root}")
+    return root.resolve(strict=True)
+
+
+def _require_within_root(path: Path, root_resolved: Path, description: str) -> Path:
+    """Resolve path and reject traversal outside the cleanup root."""
+    resolved = path.resolve(strict=True)
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError as error:
+        raise ValueError(f"{description} resolves outside criterion root: {path}") from error
+    return resolved
+
+
+def clear_selected_baseline_artifacts(root: Path, baseline_name: str) -> int:
+    """Validate, then remove exact baseline dirs before copying a fresh base set."""
+    root_resolved = _checked_criterion_root(root)
+    baseline_files = find_selected_baseline_files(root, baseline_name)
+    deletion_plan: set[Path] = set()
+
+    for baseline_file in baseline_files:
+        if baseline_file.is_symlink() or not baseline_file.is_file():
+            raise ValueError(f"selected baseline estimate is not a real file: {baseline_file}")
+        _require_within_root(
+            baseline_file, root_resolved, "selected baseline estimate"
+        )
+        baseline_dir = baseline_file.parent
+        if baseline_dir.is_symlink() or not baseline_dir.is_dir():
+            raise ValueError(
+                f"selected baseline artifact is not a real directory: {baseline_dir}"
+            )
+        _require_within_root(
+            baseline_dir, root_resolved, "selected baseline artifact"
+        )
+        deletion_plan.add(baseline_dir)
+
+    for baseline_dir in sorted(deletion_plan):
+        shutil.rmtree(baseline_dir)
+
+    return len(deletion_plan)
+
+
+def clear_selected_head_artifacts(root: Path, baseline_name: str) -> tuple[int, int]:
+    """Remove stale new/change siblings for exact selected-baseline benches.
+
+    This is intentionally narrower than cleaning a Criterion tree: it derives
+    each benchmark directory from a selected baseline estimates file, checks
+    that the resolved directory stays under an actual `criterion/` root, and
+    removes only that benchmark's `new/` and `change/` directories. The full
+    deletion plan is validated before any artifact is removed.
+    """
+    root_resolved = _checked_criterion_root(root)
+    baseline_parts = _baseline_parts(baseline_name)
+    baseline_files = find_selected_baseline_files(root, baseline_name)
+    deletion_plan: set[Path] = set()
+
+    for baseline_file in baseline_files:
+        if baseline_file.is_symlink() or not baseline_file.is_file():
+            raise ValueError(f"selected baseline estimate is not a real file: {baseline_file}")
+        _require_within_root(
+            baseline_file, root_resolved, "selected baseline estimate"
+        )
+
+        bench_dir = baseline_file.parents[len(baseline_parts)]
+        _require_within_root(
+            bench_dir, root_resolved, "selected baseline benchmark"
+        )
+
+        for artifact_name in ("new", "change"):
+            artifact_dir = bench_dir / artifact_name
+            if artifact_dir.is_symlink():
+                raise ValueError(f"refusing to remove symlinked Criterion artifact: {artifact_dir}")
+            if not artifact_dir.exists():
+                continue
+            if not artifact_dir.is_dir():
+                raise ValueError(
+                    f"Criterion artifact is not a directory: {artifact_dir}"
+                )
+            _require_within_root(
+                artifact_dir, root_resolved, "Criterion artifact"
+            )
+            deletion_plan.add(artifact_dir)
+
+    for artifact_dir in sorted(deletion_plan):
+        shutil.rmtree(artifact_dir)
+
+    return len(baseline_files), len(deletion_plan)
 
 
 def find_baseline_estimates(bench_dir: Path, baseline_name: str) -> Path | None:
@@ -386,8 +481,7 @@ def parse_bench(change_file: Path, root: Path, baseline_name: str) -> BenchResul
     Returns None if files are malformed (bench skipped, not failed).
     """
     bench_dir = change_file.parent.parent  # .../<bench>/<test>/
-    rel = bench_dir.relative_to(root)
-    name = str(rel)
+    name = artifact_bench_id(change_file, root, artifact_parts=1)
 
     try:
         change = json.loads(change_file.read_text())
@@ -414,10 +508,16 @@ def parse_bench(change_file: Path, root: Path, baseline_name: str) -> BenchResul
                        new_ns=new_ns, old_ns=old_ns)
 
 
-def render_report(results: list[BenchResult], arch: str,
-                   informational_groups: frozenset[str] = frozenset()) -> str:
-    gated = [r for r in results if not r.is_informational(informational_groups)]
-    info = [r for r in results if r.is_informational(informational_groups)]
+def render_report(results: list[BenchResult], arch: str, target: str | None = None,
+                  informational_target: str | None = None) -> str:
+    gated = [
+        r for r in results
+        if not r.is_informational(target, informational_target)
+    ]
+    info = [
+        r for r in results
+        if r.is_informational(target, informational_target)
+    ]
 
     fails = [r for r in gated if r.verdict() == "FAIL"]
     warns = [r for r in gated if r.verdict() == "WARN"]
@@ -485,27 +585,33 @@ def render_report(results: list[BenchResult], arch: str,
         f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
         f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
     )
-    if informational_groups:
+    if informational_target is not None:
         lines.append(
-            f"_{len(informational_groups)} group(s) excluded from gating as quick-mode "
-            f"informational-only (lattice#714): {', '.join(sorted(informational_groups))}._\n"
+            f"_Target `{informational_target}` classified informational-only in quick mode "
+            f"(lattice#714); its {len(info)} measurement(s) are excluded from the verdict._\n"
         )
     else:
         lines.append("")
     return "\n".join(lines)
 
 
+def _fabricate_baseline(bench_dir: Path, baseline_dirname: str,
+                        base_ns: float = 90.0) -> None:
+    """Write one fake Criterion named-baseline estimate for --selftest."""
+    bench_dir.mkdir(parents=True, exist_ok=True)
+    (bench_dir / baseline_dirname).mkdir(parents=True, exist_ok=True)
+    (bench_dir / baseline_dirname / "estimates.json").write_text(
+        json.dumps({"mean": {"point_estimate": base_ns}}))
+
+
 def _fabricate_bench(bench_dir: Path, baseline_dirname: str,
                      point: float = 0.10, ci_low: float = 0.05, ci_high: float = 0.15,
                      new_ns: float = 100.0, base_ns: float = 90.0) -> None:
     """Write a fake Criterion bench dir (new/, <baseline_dirname>/, change/) for --selftest."""
-    bench_dir.mkdir(parents=True, exist_ok=True)
+    _fabricate_baseline(bench_dir, baseline_dirname, base_ns)
     (bench_dir / "new").mkdir(exist_ok=True)
     (bench_dir / "new" / "estimates.json").write_text(
         json.dumps({"mean": {"point_estimate": new_ns}}))
-    (bench_dir / baseline_dirname).mkdir(exist_ok=True)
-    (bench_dir / baseline_dirname / "estimates.json").write_text(
-        json.dumps({"mean": {"point_estimate": base_ns}}))
     (bench_dir / "change").mkdir(exist_ok=True)
     (bench_dir / "change" / "estimates.json").write_text(json.dumps({
         "mean": {
@@ -527,6 +633,7 @@ def run_selftest() -> int:
     """
     import contextlib
     import io
+    import os
     import subprocess
     import tempfile
 
@@ -602,59 +709,56 @@ def run_selftest() -> int:
         if "bench_multi" not in stderr_text or "refusing to guess" not in stderr_text:
             failures.append("multi-sibling layout: no loud refusal warning emitted")
 
-        # lattice#714: informational-groups exclusion. Two confirmed FAILs, one in a
-        # group named as informational (quick-mode embed-SIMD noise floor), one not —
-        # the exit-code fail count and the gated report section must only count the
-        # real one; the informational one must still be measured and reported.
+        # lattice#714 / lattice#1090: classification follows the target-qualified
+        # Criterion root, never a slash-derived group prefix. Criterion 0.5 permits
+        # `/` in group names and also uses `/` between group/function/parameter, so
+        # splitting the rendered ID cannot recover the group boundary.
         noisy_dir = root / "grp_f" / "noisy_fail"
         _fabricate_bench(noisy_dir, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
         real_dir = root / "grp_g" / "real_fail"
         _fabricate_bench(real_dir, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
+        slash_dir = root / "slash" / "is" / "legal" / "noisy_fail"
+        _fabricate_bench(slash_dir, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
 
         for cf in find_change_files(root):
             r = parse_bench(cf, root, baseline_name="compare-base")
             if r is not None:
                 results[r.name] = r
 
-        informational = frozenset({"grp_f"})
-        all_results = list(results.values())
-        gated_fails = [
-            r for r in all_results
-            if r.verdict() == "FAIL" and not r.is_informational(informational)
-        ]
-        if "grp_f/noisy_fail" not in results or "grp_g/real_fail" not in results:
-            failures.append("informational-groups fixture: benches not parsed")
-        elif not results["grp_f/noisy_fail"].is_informational(informational):
-            failures.append("informational-groups: grp_f/noisy_fail not classified informational")
-        elif results["grp_g/real_fail"].is_informational(informational):
-            failures.append("informational-groups: grp_g/real_fail wrongly classified informational")
-        elif any(r.name == "grp_f/noisy_fail" for r in gated_fails):
-            failures.append("informational-groups: noisy FAIL leaked into gated fail count")
-        elif not any(r.name == "grp_g/real_fail" for r in gated_fails):
-            failures.append("informational-groups: real FAIL missing from gated fail count")
+        embed_target = "lattice-embed:simd"
+        inference_target = "lattice-inference:elementwise_cpu_bench"
+        needed = {"grp_f/noisy_fail", "grp_g/real_fail", "slash/is/legal/noisy_fail"}
+        if not needed.issubset(results):
+            failures.append("target-qualified fixture: benches not parsed")
+        else:
+            noisy = results["grp_f/noisy_fail"]
+            real = results["grp_g/real_fail"]
+            slash = results["slash/is/legal/noisy_fail"]
+            if not noisy.is_informational(embed_target, embed_target):
+                failures.append("target-qualified: demoted target did not classify informational")
+            if real.is_informational(inference_target, embed_target):
+                failures.append("target-qualified: gated target crossed into demotion")
+            if not slash.is_informational(embed_target, embed_target):
+                failures.append("target-qualified: slash-containing group was misclassified")
 
-        report = render_report(all_results, "selftest-arch", informational)
-        if "grp_g/real_fail" not in report:
-            failures.append("informational-groups: real FAIL missing from rendered report")
-        if "ℹ️" not in report or "grp_f/noisy_fail" not in report:
-            failures.append("informational-groups: noisy FAIL not shown in informational section")
-        if "bench-allow-regression" in report:
-            failures.append("rendered report advertises an unsupported label override")
+            embed_report = render_report(
+                [noisy, slash], "selftest-embed", embed_target, embed_target)
+            inference_report = render_report(
+                [real], "selftest-inference", inference_target, embed_target)
+            if "ℹ️" not in embed_report or "slash/is/legal/noisy_fail" not in embed_report:
+                failures.append("target-qualified: informational report lost slash-group bench")
+            if "❌" not in inference_report or "grp_g/real_fail" not in inference_report:
+                failures.append("target-qualified: gated FAIL missing from inference report")
+            if "bench-allow-regression" in embed_report + inference_report:
+                failures.append("rendered report advertises an unsupported label override")
 
-        # lattice#714 / lattice#1060: the shell-side manifest handoff,
-        # exercised end-to-end against the real helper and the real
-        # manifest (scripts/lib/bench-quick-informational-targets.txt) —
-        # the same files bench-compare.sh uses in production. Three
-        # probes: (1) --print-targets must equal the reviewed expectation
-        # set below, so a manifest-only or expectation-only edit fails
-        # the selftest; (2) a demoted target key must emit every group of
-        # a controlled listing (target-level semantics — including groups
-        # the old per-group allowlist never contained); (3) a non-demoted
-        # target key against the same listing must emit nothing — the
-        # cross-target guarantee that keeps inference gating intact.
-        # Probe 2's output then drives the Python classifier to prove
-        # embed FAILs land informational while an inference FAIL gates.
-        helper = Path(__file__).resolve().parent / "lib" / "bench-informational-groups.sh"
+        # The shell owns manifest membership. Python receives only the exact
+        # target identity selected by that shell path, so there is no second
+        # parser whose group-name semantics can drift. The controlled manifest
+        # probes cover CRLF, surrounding whitespace, comments, duplicate
+        # entries and C-locale sorting; malformed or whitespace-bearing keys
+        # must refuse rather than demote.
+        helper = Path(__file__).resolve().parent / "lib" / "bench-informational-targets.sh"
         # The reviewed demoted-target set, duplicated here on purpose:
         # the selftest compares this against the manifest itself (via
         # --print-targets), so a target added to only ONE side —
@@ -682,161 +786,71 @@ def run_selftest() -> int:
                     f"expectation-only: {sorted(approved_targets - raw_targets)}. "
                     "Every demotion change must update both sides in one PR."
                 )
-            listing_dir = root / "manifest-listing"
-            listing_dir.mkdir(parents=True, exist_ok=True)
-            listing_file = listing_dir / "list.txt"
-            listing_file.write_text(
-                "simd_dot_product/scalar/384: benchmark\n"
-                "simd_dot_product/simd/384: benchmark\n"
-                "simd_cosine_similarity/scalar/384: benchmark\n"
-                "simd_normalize/scalar/384: benchmark\n"
-                "simd_dot_product_extra/scalar/384: benchmark\n"
-                "int8_raw_dot_product/dot_product_i8_raw/128: benchmark\n"
-            )
-            expected_groups = frozenset({
-                "simd_dot_product", "simd_cosine_similarity", "simd_normalize",
-                "simd_dot_product_extra", "int8_raw_dot_product",
-            })
             demoted_proc = subprocess.run(
-                ["bash", str(helper), "lattice-embed:simd", str(listing_file)],
+                ["bash", str(helper), "--is-informational", embed_target],
                 capture_output=True, text=True, timeout=30,
-            )
-            shell_emitted = frozenset(
-                ln.strip() for ln in demoted_proc.stdout.splitlines() if ln.strip()
             )
             gated_proc = subprocess.run(
-                ["bash", str(helper), "lattice-inference:elementwise_cpu_bench",
-                 str(listing_file)],
+                ["bash", str(helper), "--is-informational", inference_target],
                 capture_output=True, text=True, timeout=30,
             )
-            gated_emitted = [ln for ln in gated_proc.stdout.splitlines() if ln.strip()]
             if demoted_proc.returncode != 0:
                 failures.append(
                     f"manifest-handoff: demoted-target probe exited "
                     f"{demoted_proc.returncode}: {demoted_proc.stderr}"
                 )
-            elif shell_emitted != expected_groups:
+            elif gated_proc.returncode != 1:
                 failures.append(
-                    "manifest-handoff: demoted target emitted "
-                    f"{sorted(shell_emitted)}, expected every listing group "
-                    f"{sorted(expected_groups)}"
+                    "manifest-handoff: non-demoted target did not return the "
+                    f"expected predicate miss (1): {gated_proc.returncode}"
                 )
-            elif gated_proc.returncode != 0:
-                failures.append(
-                    f"manifest-handoff: non-demoted-target probe exited "
-                    f"{gated_proc.returncode}: {gated_proc.stderr}"
-                )
-            elif gated_emitted:
-                failures.append(
-                    "manifest-handoff: non-demoted target emitted "
-                    f"{gated_emitted} — cross-target exemption leak"
-                )
-            else:
-                manifest_dir = root / "manifest"
-                emb_a = manifest_dir / "simd_dot_product" / "384"
-                _fabricate_bench(emb_a, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-                emb_b = manifest_dir / "simd_normalize" / "384"
-                _fabricate_bench(emb_b, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
-                inf_c = manifest_dir / "rms_norm" / "4096"
-                _fabricate_bench(inf_c, "compare-base", point=0.10, ci_low=0.10, ci_high=0.20)
 
-                manifest_results: dict[str, BenchResult] = {}
-                for cf in find_change_files(manifest_dir):
-                    r = parse_bench(cf, manifest_dir, baseline_name="compare-base")
-                    if r is not None:
-                        manifest_results[r.name] = r
-
-                needed = {"simd_dot_product/384", "simd_normalize/384", "rms_norm/4096"}
-                if not needed.issubset(manifest_results):
-                    failures.append("manifest-handoff fixture: not all benches parsed")
-                else:
-                    manifest_gated_fails = {
-                        r.name for r in manifest_results.values()
-                        if r.verdict() == "FAIL" and not r.is_informational(shell_emitted)
-                    }
-                    if "simd_dot_product/384" in manifest_gated_fails:
-                        failures.append(
-                            "manifest-handoff: demoted simd_dot_product "
-                            "leaked into gated fails"
-                        )
-                    if "simd_normalize/384" in manifest_gated_fails:
-                        failures.append(
-                            "manifest-handoff: simd_normalize gated despite "
-                            "target-level demotion (listing-derivation broken)"
-                        )
-                    if "rms_norm/4096" not in manifest_gated_fails:
-                        failures.append(
-                            "manifest-handoff: inference group rms_norm did not gate"
-                        )
-
-        # Composed-path collision guard. The two probes above show the
-        # helper is target-aware in isolation, but bench-compare.sh used to
-        # concatenate every target's helper output into one flat file with
-        # no target attribution — a group name demoted for one target
-        # silently exempted an identically-named group produced by a
-        # different, gated target. This drives the resolver
-        # (scripts/lib/resolve-informational-groups.sh) with a fabricated
-        # listing where the demoted target's groups include `rms_norm`,
-        # which also appears in the gated target's listing, and asserts
-        # the collision gates instead of staying informational.
-        resolver = Path(__file__).resolve().parent / "lib" / "resolve-informational-groups.sh"
-        if not resolver.exists():
-            failures.append(f"collision-guard: resolver missing at {resolver}")
-        else:
-            collision_dir = root / "collision-listing"
-            collision_dir.mkdir(parents=True, exist_ok=True)
-            embed_listing = collision_dir / "embed-list.txt"
-            embed_listing.write_text(
-                "simd_dot_product/scalar/384: benchmark\n"
-                "simd_normalize/scalar/384: benchmark\n"
-                "rms_norm/scalar/384: benchmark\n"  # fabricated bare-name collision
+            policy_dir = root / "manifest-policy"
+            policy_dir.mkdir(parents=True, exist_ok=True)
+            normalized_manifest = policy_dir / "normalized.txt"
+            normalized_manifest.write_bytes(
+                b"  z-target  # comment\r\n"
+                b"\r\n"
+                b"a-target \r\n"
+                b"z-target\r\n"
             )
-            inference_listing = collision_dir / "inference-list.txt"
-            inference_listing.write_text(
-                "rms_norm/4096: benchmark\n"
-                "gelu/4096: benchmark\n"
+            policy_env = {
+                **os.environ,
+                "INFO_TARGETS_MANIFEST": str(normalized_manifest),
+            }
+            normalized = subprocess.run(
+                ["bash", str(helper), "--print-targets"],
+                capture_output=True, text=True, timeout=30, env=policy_env,
             )
-
-            def list_groups(listing_path: Path) -> str:
-                proc = subprocess.run(
-                    ["bash", str(helper), "--list-groups", str(listing_path)],
-                    capture_output=True, text=True, timeout=30,
+            if normalized.returncode != 0 or normalized.stdout != "a-target\nz-target\n":
+                failures.append(
+                    "manifest-normalization: CRLF/whitespace/dedup/C-sort drifted: "
+                    f"rc={normalized.returncode}, stdout={normalized.stdout!r}, "
+                    f"stderr={normalized.stderr!r}"
                 )
-                return proc.stdout
 
-            demoted_groups_file = collision_dir / "demoted.txt"
-            demoted_groups_file.write_text(list_groups(embed_listing))
-            gated_groups_file = collision_dir / "gated.txt"
-            gated_groups_file.write_text(list_groups(inference_listing))
-
-            resolve_proc = subprocess.run(
-                ["bash", str(resolver),
-                 str(demoted_groups_file), "lattice-embed:simd",
-                 str(gated_groups_file), "lattice-inference:elementwise_cpu_bench"],
+            malformed_manifest = policy_dir / "malformed.txt"
+            malformed_manifest.write_text("one-target two-targets\n")
+            malformed_env = {
+                **os.environ,
+                "INFO_TARGETS_MANIFEST": str(malformed_manifest),
+            }
+            malformed = subprocess.run(
+                ["bash", str(helper), "--print-targets"],
+                capture_output=True, text=True, timeout=30, env=malformed_env,
+            )
+            if malformed.returncode != 2:
+                failures.append(
+                    "manifest-normalization: malformed policy did not fail closed "
+                    f"(rc={malformed.returncode})"
+                )
+            bad_key = subprocess.run(
+                ["bash", str(helper), "--is-informational", "bad target"],
                 capture_output=True, text=True, timeout=30,
             )
-            resolved = frozenset(
-                ln.strip() for ln in resolve_proc.stdout.splitlines() if ln.strip()
-            )
-            if resolve_proc.returncode != 0:
+            if bad_key.returncode != 2:
                 failures.append(
-                    f"collision-guard: resolver exited {resolve_proc.returncode}: "
-                    f"{resolve_proc.stderr}"
-                )
-            if "rms_norm" in resolved:
-                failures.append(
-                    "collision-guard: rms_norm (demoted+gated collision) leaked "
-                    "into the informational set instead of gating"
-                )
-            if "rms_norm" not in resolve_proc.stderr or "lattice-embed:simd" not in resolve_proc.stderr:
-                failures.append(
-                    "collision-guard: no stderr warning naming the colliding "
-                    "group and both targets"
-                )
-            if not {"simd_dot_product", "simd_normalize"}.issubset(resolved):
-                failures.append(
-                    "collision-guard: non-colliding demoted groups lost "
-                    "informational status — resolver over-suppressed"
+                    "manifest-normalization: whitespace-bearing target key did not refuse"
                 )
 
     # --require-measurements: the lane must not read "nothing measured" as
@@ -848,17 +862,25 @@ def run_selftest() -> int:
         empty_root = Path(td) / "empty" / "criterion"
         empty_root.mkdir(parents=True)
 
-        def _run(
-            root: Path,
-            *extra: str,
-            env: dict[str, str] | None = None,
-        ) -> subprocess.CompletedProcess:
-            run_env = os.environ.copy() if env is None else env
-            if env is None:
-                run_env.pop("BENCH_IDLE_FLOOR", None)
+        def _run(root: Path, *extra: str) -> subprocess.CompletedProcess:
             return subprocess.run(
                 [sys.executable, str(gate), str(root), "selftest-arch", *extra],
-                capture_output=True, text=True, timeout=60, env=run_env,
+                capture_output=True, text=True, timeout=60,
+            )
+
+        def _prepare(root: Path, mode: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [
+                    sys.executable,
+                    str(gate),
+                    str(root),
+                    "--baseline-name",
+                    "compare-base",
+                    mode,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
             )
 
         # Without the flag, an absent baseline stays a pass (first-run semantics).
@@ -870,6 +892,48 @@ def run_selftest() -> int:
             failures.append("require-measurements: empty criterion root exited "
                             "0 with the flag set — the lane can go green having "
                             "measured nothing (the #1105 fail-open)")
+        empty_informational = _run(
+            empty_root,
+            "--require-measurements",
+            "--target",
+            "lattice-embed:simd",
+            "--informational-target",
+            "lattice-embed:simd",
+        )
+        if empty_informational.returncode != 0:
+            failures.append(
+                "require-measurements: an empty informational target changed "
+                "the enforcing exit code"
+            )
+        if "for target lattice-embed:simd" not in empty_informational.stderr:
+            failures.append(
+                "require-measurements: empty informational target was not "
+                "reported with its target identity"
+            )
+
+        # A stale comparison against a DIFFERENT baseline is not a substitute
+        # for the exact selected base set. Mutation-sensitive: condition
+        # selected-set filtering on a non-empty set (or omit the empty-set
+        # refusal) and this valid base/new/change tree exits 0.
+        wrong_baseline_root = Path(td) / "wrong-baseline" / "criterion"
+        _fabricate_bench(
+            wrong_baseline_root / "rms_norm" / "4096", "base"
+        )
+        wrong_baseline = _run(
+            wrong_baseline_root, "--require-measurements"
+        )
+        if wrong_baseline.returncode != 2:
+            failures.append(
+                "require-measurements: stale default-base comparison certified "
+                "an empty selected compare-base set"
+            )
+        if "selected baseline 'compare-base' contains no benchmark estimates" not in (
+            wrong_baseline.stderr
+        ):
+            failures.append(
+                "require-measurements: empty selected-set refusal did not name "
+                "the selected baseline"
+            )
 
         # A real gating comparison must still pass, or the flag is just a brake.
         ok_root = Path(td) / "ok" / "criterion"
@@ -878,23 +942,32 @@ def run_selftest() -> int:
             failures.append("require-measurements: a parsed gating comparison "
                             "was rejected — the flag over-fails")
 
-        # All-informational is measured-but-unjudgeable: nothing could FAIL.
-        info_file = Path(td) / "informational.txt"
-        info_file.write_text("grp_info\n")
+        # A target can be intentionally all-informational only when the exact
+        # target key accompanies both the root and the demotion. This remains a
+        # measured target and is valid in an enforcing multi-target run; another
+        # target supplies the gating comparisons. A mismatched key must refuse.
         info_root = Path(td) / "info" / "criterion"
         _fabricate_bench(info_root / "grp_info" / "bench_info", "compare-base")
         if _run(info_root, "--require-measurements",
-                "--informational-groups-file", str(info_file)).returncode != 2:
-            failures.append("require-measurements: an all-informational run was "
-                            "certified — no gating comparison was judged")
+                "--target", "lattice-embed:simd",
+                "--informational-target", "lattice-embed:simd").returncode != 0:
+            failures.append("require-measurements: an explicitly qualified "
+                            "informational target was rejected")
+        if _run(info_root, "--require-measurements",
+                "--target", "lattice-inference:elementwise_cpu_bench",
+                "--informational-target", "lattice-embed:simd").returncode != 2:
+            failures.append("target-qualified: mismatched informational target "
+                            "did not fail closed")
 
         # PARTIAL is the shape the first fix missed: asking whether ANY judgeable
         # comparison exists passes a run where one target compared cleanly and the
-        # other produced an unresolvable baseline. The unmeasured target is exactly
-        # the one a green exit would be vouching for.
+        # other produced malformed selected-baseline data. The unmeasured target
+        # is exactly the one a green exit would be vouching for.
         mixed_root = Path(td) / "mixed" / "criterion"
         _fabricate_bench(mixed_root / "grp_ok" / "bench_ok", "compare-base")
         mixed_orphan = mixed_root / "grp_bad" / "bench_orphan"
+        (mixed_orphan / "compare-base").mkdir(parents=True)
+        (mixed_orphan / "compare-base" / "estimates.json").write_text("{}")
         (mixed_orphan / "new").mkdir(parents=True)
         (mixed_orphan / "new" / "estimates.json").write_text(
             json.dumps({"mean": {"point_estimate": 100.0}}))
@@ -917,291 +990,269 @@ def run_selftest() -> int:
             failures.append("require-measurements: the mixed root without the flag "
                             "must still exit 0 (reporter behavior changed)")
 
-        # Automated status contract (#1123). A report is a performance verdict,
-        # while not_measurable is a run-status gap. Keep those artifacts
-        # structurally separate so a busy or incomplete sample stream cannot
-        # leave behind a current-looking pass or regression.
-        pass_root = Path(td) / "status-pass" / "criterion"
-        _fabricate_bench(
-            pass_root / "grp_pass" / "bench_pass",
+        # lattice#1204: completeness is selected-base minus head-change, not
+        # merely change-found minus change-parsed. These use actual IDs from
+        # the shipping inference/embed targets, including Criterion's nested
+        # function/parameter path. Mutation-sensitive: remove the set
+        # subtraction (or exempt informational groups from it) and this exits
+        # 0 even though two base measurements vanished from the head.
+        coverage_root = Path(td) / "coverage" / "criterion"
+        _fabricate_bench(coverage_root / "rms_norm" / "896", "compare-base")
+        _fabricate_baseline(coverage_root / "rms_norm" / "4096", "compare-base")
+        _fabricate_baseline(
+            coverage_root / "simd_dot_product" / "scalar" / "384",
             "compare-base",
-            point=0.01,
-            ci_low=-0.01,
-            ci_high=0.02,
         )
-        regression_root = Path(td) / "status-regression" / "criterion"
         _fabricate_bench(
-            regression_root / "grp_regression" / "bench_regression",
-            "compare-base",
-            point=0.12,
-            ci_low=0.10,
-            ci_high=0.14,
+            coverage_root / "renamed_rms_norm" / "4096", "compare-base"
         )
-
-        def _sample_stream(
-            values: dict[str, float],
-            extra_records: list[dict[str, object]] | None = None,
-        ) -> str:
-            records: list[dict[str, object]] = [
-                {
-                    "schema": AMBIENT_SAMPLE_SCHEMA,
-                    "phase": phase,
-                    "idle_pct": values[phase],
-                }
-                for phase in REQUIRED_AMBIENT_PHASES
-                if phase in values
-            ]
-            records.extend(extra_records or [])
-            return "".join(json.dumps(record) + "\n" for record in records)
-
-        def _status_case(
-            name: str,
-            criterion_root: Path,
-            *,
-            sample_text: str | None,
-            include_ambient_arg: bool = True,
-            stale_report: bool = False,
-            env: dict[str, str] | None = None,
-        ) -> tuple[subprocess.CompletedProcess, dict[str, object], Path]:
-            case_dir = Path(td) / "status-cases" / name
-            case_dir.mkdir(parents=True, exist_ok=True)
-            samples = case_dir / "ambient.jsonl"
-            status = case_dir / "status.json"
-            report_path = case_dir / "report.md"
-            if sample_text is not None:
-                samples.write_text(sample_text)
-            if stale_report:
-                report_path.write_text("stale performance verdict\n")
-            extra = [
-                "--status-out", str(status),
-                "--out", str(report_path),
-            ]
-            if include_ambient_arg:
-                extra.extend(["--ambient-samples", str(samples)])
-            proc = _run(criterion_root, *extra, env=env)
-            try:
-                payload = json.loads(status.read_text())
-            except (OSError, json.JSONDecodeError) as exc:
-                failures.append(
-                    f"status-contract {name}: no valid machine status was emitted: {exc}"
-                )
-                payload = {}
-            return proc, payload, report_path
-
-        quiet = _sample_stream({
-            "before": 92.0,
-            "between": 91.0,
-            "after": DEFAULT_IDLE_FLOOR,
-        })
-        passed, passed_status, passed_report = _status_case(
-            "pass", pass_root, sample_text=quiet
+        _fabricate_bench(
+            coverage_root / "stale_default" / "bench", "base"
         )
-        if passed.returncode != EXIT_PASS:
+        _fabricate_bench(
+            coverage_root / "stale_named" / "bench", "previous-run"
+        )
+        # An estimates file directly under the selected baseline directory has
+        # no benchmark ID and is unrelated Criterion-tree debris, not a bench.
+        (coverage_root / "compare-base").mkdir(parents=True)
+        (coverage_root / "compare-base" / "estimates.json").write_text("{}")
+
+        coverage = _run(
+            coverage_root,
+            "--require-measurements",
+            "--target",
+            "lattice-inference:elementwise_cpu_bench",
+        )
+        if coverage.returncode != 2:
             failures.append(
-                f"status-contract pass: exited {passed.returncode}, expected {EXIT_PASS}"
+                "baseline-completeness: missing head benchmarks exited "
+                f"{coverage.returncode} instead of 2"
             )
-        if passed_status.get("verdict") != "pass":
-            failures.append("status-contract pass: named status was not pass")
-        if (
-            passed_status.get("measurement_count") != 1
-            or passed_status.get("gated_count") != 1
-            or passed_status.get("regression_count") != 0
-        ):
-            failures.append("status-contract pass: measurement counts were incomplete")
-        if not passed_report.exists():
-            failures.append("status-contract pass: performance report was not emitted")
-
-        regressed, regressed_status, regressed_report = _status_case(
-            "regression", regression_root, sample_text=quiet
-        )
-        if regressed.returncode != EXIT_REGRESSION:
-            failures.append(
-                "status-contract regression: expected exit "
-                f"{EXIT_REGRESSION}, got {regressed.returncode}"
+        for expected_id in ("rms_norm/4096", "simd_dot_product/scalar/384"):
+            qualified = (
+                "  - lattice-inference:elementwise_cpu_bench: "
+                f"{expected_id}"
             )
-        if regressed_status.get("verdict") != "regression":
-            failures.append("status-contract regression: named status was not regression")
-        if regressed_status.get("regression_count") != 1:
-            failures.append("status-contract regression: regression count was not one")
-        if not regressed_report.exists():
-            failures.append("status-contract regression: performance report was not emitted")
-
-        for busy_phase in REQUIRED_AMBIENT_PHASES:
-            values = {"before": 92.0, "between": 91.0, "after": 90.0}
-            values[busy_phase] = 12.0
-            refused, refused_status, refused_report = _status_case(
-                f"busy-{busy_phase}",
-                pass_root,
-                sample_text=_sample_stream(values),
-                stale_report=True,
-            )
-            if refused.returncode != EXIT_NOT_MEASURABLE:
+            if qualified not in coverage.stderr:
                 failures.append(
-                    f"status-contract busy {busy_phase}: expected exit "
-                    f"{EXIT_NOT_MEASURABLE}, got {refused.returncode}"
+                    "baseline-completeness: refusal did not name exact missing "
+                    f"bench ID {expected_id!r}"
                 )
-            if refused_status.get("verdict") != "not_measurable":
+        for unrelated_id in ("stale_default/bench", "stale_named/bench"):
+            if unrelated_id in coverage.stderr:
                 failures.append(
-                    f"status-contract busy {busy_phase}: status was not not_measurable"
+                    "baseline-completeness: unrelated baseline tree leaked into "
+                    f"selected set: {unrelated_id}"
                 )
-            if any(
-                key in refused_status
-                for key in ("measurement_count", "gated_count", "regression_count")
-            ):
+            if unrelated_id in coverage.stdout:
                 failures.append(
-                    f"status-contract busy {busy_phase}: refused status exposed "
-                    "measurement counts"
+                    "baseline-completeness: unrelated stale comparison was "
+                    f"judged by the enforcing run: {unrelated_id}"
                 )
-            if refused_report.exists():
-                failures.append(
-                    f"status-contract busy {busy_phase}: stale report survived refusal"
-                )
-            if "### `" in refused.stdout:
-                failures.append(
-                    f"status-contract busy {busy_phase}: rendered a performance verdict"
-                )
-
-        # Refusal outranks the underlying Criterion verdict: busy regression
-        # data must still be a gap, never a red data point.
-        busy_regression, busy_regression_status, busy_regression_report = _status_case(
-            "busy-regression",
-            regression_root,
-            sample_text=_sample_stream({
-                "before": 92.0,
-                "between": 12.0,
-                "after": 90.0,
-            }),
-            stale_report=True,
-        )
-        if (
-            busy_regression.returncode != EXIT_NOT_MEASURABLE
-            or busy_regression_status.get("verdict") != "not_measurable"
-        ):
-            failures.append(
-                "status-contract busy regression: regression outranked ambient refusal"
-            )
-        if busy_regression_report.exists() or "### `" in busy_regression.stdout:
-            failures.append(
-                "status-contract busy regression: emitted a performance verdict"
-            )
-
-        # Ambient load outside the three measurement-adjacent voting phases
-        # remains non-voting; a noisy build stage must not erase a clean A/B.
-        build_busy = _sample_stream(
-            {"before": 92.0, "between": 91.0, "after": 90.0},
-            [{
-                "schema": AMBIENT_SAMPLE_SCHEMA,
-                "phase": "build",
-                "idle_pct": 0.0,
-            }],
-        )
-        build_run, build_status, build_report = _status_case(
-            "build-only-busy", pass_root, sample_text=build_busy
-        )
-        if (
-            build_run.returncode != EXIT_PASS
-            or build_status.get("verdict") != "pass"
-            or not build_report.exists()
-        ):
-            failures.append(
-                "status-contract build-only load: a non-voting phase refused a clean run"
-            )
-
-        # Missing input, unreadable input, an empty stream, sampler death
-        # (one required phase absent), malformed records, and duplicate voting
-        # samples are all unmeasurable rather than harness errors or passes.
-        refusal_cases: list[tuple[str, str | None, bool]] = [
-            ("no-ambient-argument", None, False),
-            ("missing-ambient-file", None, True),
-            ("empty-ambient", "", True),
-            ("malformed-ambient", "{not json}\n", True),
-            (
-                "duplicate-voting-phase",
-                quiet + json.dumps({
-                    "schema": AMBIENT_SAMPLE_SCHEMA,
-                    "phase": "before",
-                    "idle_pct": 95.0,
-                }) + "\n",
-                True,
-            ),
-        ]
-        for missing_phase in REQUIRED_AMBIENT_PHASES:
-            values = {
-                phase: 90.0
-                for phase in REQUIRED_AMBIENT_PHASES
-                if phase != missing_phase
-            }
-            refusal_cases.append((
-                f"missing-{missing_phase}",
-                _sample_stream(values),
-                True,
-            ))
-
-        for name, sample_text, include_arg in refusal_cases:
-            refused, refused_status, refused_report = _status_case(
-                name,
-                pass_root,
-                sample_text=sample_text,
-                include_ambient_arg=include_arg,
-                stale_report=True,
-            )
-            if (
-                refused.returncode != EXIT_NOT_MEASURABLE
-                or refused_status.get("verdict") != "not_measurable"
-            ):
-                failures.append(
-                    f"status-contract {name}: did not preserve not_measurable"
-                )
-            if refused_report.exists() or "### `" in refused.stdout:
-                failures.append(
-                    f"status-contract {name}: emitted or retained a performance verdict"
-                )
-            if any(
-                key in refused_status
-                for key in ("measurement_count", "gated_count", "regression_count")
-            ):
-                failures.append(
-                    f"status-contract {name}: refused status exposed a data point"
-                )
-
-        absent_root = Path(td) / "status-error" / "missing-criterion"
-        errored, error_status, error_report = _status_case(
-            "error", absent_root, sample_text=quiet, stale_report=True
-        )
-        if errored.returncode != EXIT_ERROR or error_status.get("verdict") != "error":
-            failures.append(
-                "status-contract error: setup failure did not remain a named error sibling"
-            )
-        if error_report.exists():
-            failures.append("status-contract error: stale performance report survived")
-
-        invalid_floor_env = os.environ.copy()
-        invalid_floor_env["BENCH_IDLE_FLOOR"] = "not-a-number"
-        bad_floor, bad_floor_status, bad_floor_report = _status_case(
-            "invalid-floor",
-            pass_root,
-            sample_text=quiet,
-            stale_report=True,
-            env=invalid_floor_env,
-        )
-        if (
-            bad_floor.returncode != EXIT_ERROR
-            or bad_floor_status.get("verdict") != "error"
-        ):
-            failures.append(
-                "status-contract invalid floor: configuration error was not named error"
-            )
-        if bad_floor_report.exists():
-            failures.append("status-contract invalid floor: stale report survived")
-
-        ambient_without_status = Path(td) / "ambient-without-status.jsonl"
-        ambient_without_status.write_text(quiet)
         if _run(
-            pass_root,
-            "--ambient-samples", str(ambient_without_status),
-        ).returncode != EXIT_ERROR:
+            coverage_root,
+        ).returncode != 0:
             failures.append(
-                "status-contract: ambient input without machine status did not fail"
+                "baseline-completeness: reporter mode rejected missing head "
+                "benchmarks without --require-measurements"
+            )
+
+        informational_missing_root = (
+            Path(td) / "coverage-informational" / "criterion"
+        )
+        _fabricate_baseline(
+            informational_missing_root / "simd_dot_product" / "scalar" / "384",
+            "compare-base",
+        )
+        informational_missing = _run(
+            informational_missing_root,
+            "--require-measurements",
+            "--target",
+            "lattice-embed:simd",
+            "--informational-target",
+            "lattice-embed:simd",
+        )
+        if informational_missing.returncode != 0:
+            failures.append(
+                "baseline-completeness: a missing informational target "
+                "incorrectly changed the enforcing exit code"
+            )
+        if (
+            "  - lattice-embed:simd: simd_dot_product/scalar/384"
+            not in informational_missing.stderr
+        ):
+            failures.append(
+                "baseline-completeness: missing informational benchmark was "
+                "not reported with its target identity"
+            )
+
+        # The CLI-selected name can itself be a relative path. Only that exact
+        # suffix contributes to completeness; a stale compare-base tree must
+        # not contaminate a run selecting snapshot/arm.
+        custom_root = Path(td) / "custom-baseline" / "criterion"
+        _fabricate_bench(custom_root / "rms_norm" / "896", "snapshot/arm")
+        _fabricate_baseline(custom_root / "gelu" / "4096", "snapshot/arm")
+        _fabricate_baseline(
+            custom_root / "stale_compare_base" / "4096", "compare-base"
+        )
+        custom = _run(
+            custom_root,
+            "--require-measurements",
+            "--baseline-name",
+            "snapshot/arm",
+        )
+        if custom.returncode != 2 or "  - gelu/4096" not in custom.stderr:
+            failures.append(
+                "baseline-completeness: nested --baseline-name did not select "
+                "and report the missing gelu/4096 benchmark"
+            )
+        if "stale_compare_base/4096" in custom.stderr:
+            failures.append(
+                "baseline-completeness: stale non-selected compare-base tree "
+                "contaminated custom selected baseline"
+            )
+
+        baseline_copy_root = Path(td) / "baseline-copy" / "criterion"
+        stale_selected = baseline_copy_root / "old_target" / "old_bench"
+        _fabricate_bench(stale_selected, "compare-base")
+        preserved_other = baseline_copy_root / "other_target" / "other_bench"
+        _fabricate_bench(preserved_other, "previous-run")
+        prepared_copy = _prepare(
+            baseline_copy_root, "--prepare-baseline-copy"
+        )
+        if prepared_copy.returncode != 0:
+            failures.append(
+                f"baseline-copy freshness: prepare step failed: {prepared_copy.stderr}"
+            )
+        if (stale_selected / "compare-base").exists():
+            failures.append(
+                "baseline-copy freshness: stale exact selected baseline survived"
+            )
+        if not (stale_selected / "change" / "estimates.json").exists():
+            failures.append(
+                "baseline-copy freshness: comparison output was removed before "
+                "the fresh selected set existed"
+            )
+        if not (preserved_other / "previous-run" / "estimates.json").exists():
+            failures.append(
+                "baseline-copy freshness: unrelated named baseline was removed"
+            )
+
+        atomic_baseline_root = Path(td) / "atomic-baseline-copy" / "criterion"
+        atomic_safe_baseline = atomic_baseline_root / "a_safe" / "1"
+        _fabricate_baseline(atomic_safe_baseline, "compare-base")
+        atomic_unsafe_baseline = atomic_baseline_root / "z_unsafe" / "1"
+        (atomic_unsafe_baseline / "compare-base").mkdir(parents=True)
+        outside_baseline = Path(td) / "outside-baseline-estimates.json"
+        outside_baseline.write_text('{"mean":{"point_estimate":90.0}}')
+        (atomic_unsafe_baseline / "compare-base" / "estimates.json").symlink_to(
+            outside_baseline
+        )
+        atomic_baseline_prepare = _prepare(
+            atomic_baseline_root, "--prepare-baseline-copy"
+        )
+        if atomic_baseline_prepare.returncode != 2:
+            failures.append(
+                "baseline-copy freshness: unsafe later baseline was not refused"
+            )
+        if not (
+            atomic_safe_baseline / "compare-base" / "estimates.json"
+        ).exists():
+            failures.append(
+                "baseline-copy freshness: cleanup partially deleted a safe "
+                "baseline before refusing a later unsafe path"
+            )
+
+        # The in-place HEAD freshness step removes only new/change siblings of
+        # exact selected-baseline benches, preserving that baseline and
+        # unrelated Criterion trees. Mutation-sensitive: stop removing the
+        # stale same-path change below and the deleted rms_norm/4096 appears
+        # judged, defeating the completeness check.
+        freshness_root = Path(td) / "freshness" / "criterion"
+        removed_bench = freshness_root / "rms_norm" / "4096"
+        _fabricate_bench(removed_bench, "compare-base")
+        unrelated_bench = freshness_root / "legacy_group" / "legacy_bench"
+        _fabricate_bench(unrelated_bench, "previous-run")
+        sibling_root = Path(td) / "freshness-sibling" / "criterion"
+        sibling_bench = sibling_root / "simd_dot_product" / "scalar" / "384"
+        _fabricate_bench(sibling_bench, "compare-base")
+        prepared = _prepare(freshness_root, "--prepare-head")
+        if prepared.returncode != 0:
+            failures.append(
+                f"head-freshness: prepare step failed: {prepared.stderr}"
+            )
+        if not (removed_bench / "compare-base" / "estimates.json").exists():
+            failures.append("head-freshness: selected baseline was removed")
+        if (removed_bench / "new").exists() or (removed_bench / "change").exists():
+            failures.append(
+                "head-freshness: stale selected-bench new/change artifacts survived"
+            )
+        if not (unrelated_bench / "new" / "estimates.json").exists():
+            failures.append(
+                "head-freshness: unrelated named-baseline benchmark was cleaned"
+            )
+        if not (sibling_bench / "change" / "estimates.json").exists():
+            failures.append(
+                "head-freshness: preparing one target root touched its sibling"
+            )
+        freshness = _run(freshness_root, "--require-measurements")
+        if freshness.returncode != 2 or "  - rms_norm/4096" not in freshness.stderr:
+            failures.append(
+                "head-freshness: deleted head benchmark was masked by stale "
+                "same-path output"
+            )
+
+        unsafe_root = Path(td) / "not-the-criterion-root"
+        _fabricate_bench(
+            unsafe_root / "rms_norm" / "4096", "compare-base"
+        )
+        unsafe_prepare = _prepare(unsafe_root, "--prepare-head")
+        if unsafe_prepare.returncode != 2:
+            failures.append(
+                "head-freshness: cleanup outside a criterion-named root was not refused"
+            )
+        if not (unsafe_root / "rms_norm" / "4096" / "change").exists():
+            failures.append(
+                "head-freshness: refused cleanup still removed an artifact"
+            )
+
+        symlink_root = Path(td) / "symlink-safety" / "criterion"
+        symlink_bench = symlink_root / "rms_norm" / "4096"
+        _fabricate_baseline(symlink_bench, "compare-base")
+        outside = Path(td) / "outside-change"
+        outside.mkdir()
+        outside_sentinel = outside / "keep.txt"
+        outside_sentinel.write_text("must survive")
+        (symlink_bench / "change").symlink_to(outside, target_is_directory=True)
+        symlink_prepare = _prepare(symlink_root, "--prepare-head")
+        if symlink_prepare.returncode != 2:
+            failures.append(
+                "head-freshness: symlinked cleanup artifact was not refused"
+            )
+        if not outside_sentinel.exists():
+            failures.append(
+                "head-freshness: cleanup followed a symlink outside criterion root"
+            )
+
+        atomic_head_root = Path(td) / "atomic-head-cleanup" / "criterion"
+        atomic_safe_head = atomic_head_root / "a_safe" / "1"
+        _fabricate_bench(atomic_safe_head, "compare-base")
+        atomic_unsafe_head = atomic_head_root / "z_unsafe" / "1"
+        _fabricate_baseline(atomic_unsafe_head, "compare-base")
+        (atomic_unsafe_head / "new").mkdir()
+        (atomic_unsafe_head / "new" / "estimates.json").write_text("{}")
+        (atomic_unsafe_head / "change").symlink_to(
+            outside, target_is_directory=True
+        )
+        atomic_head_prepare = _prepare(atomic_head_root, "--prepare-head")
+        if atomic_head_prepare.returncode != 2:
+            failures.append(
+                "head-freshness: unsafe later head artifact was not refused"
+            )
+        if not (atomic_safe_head / "new" / "estimates.json").exists():
+            failures.append(
+                "head-freshness: cleanup partially deleted a safe artifact "
+                "before refusing a later unsafe path"
             )
 
     for f in failures:
@@ -1210,11 +1261,11 @@ def run_selftest() -> int:
         print(f"SELFTEST: FAIL ({len(failures)} failure(s))")
         return 1
     print("SELFTEST: PASS — base/, compare-base/, orphan-warn, named-wins-over-stale-base, "
-          "multi-sibling-refusal, manifest-handoff (demoted target informational, "
-          "non-demoted target gated), composed-path collision-guard, require-measurements "
-          "(empty root, gating pass, all-informational refusal, partial-run refusal), and "
-          "automated status (pass/regression/error/not_measurable, three-phase ambient "
-          "refusal, no refused report/data point, non-voting build load) all correct")
+          "multi-sibling-refusal, target-qualified manifest handoff (CRLF/whitespace/C-sort, "
+          "slash-bearing group, demoted target informational, non-demoted target gated), "
+          "require-measurements (empty root, gating pass, explicit informational target, "
+          "mismatch refusal, partial-run refusal), selected-baseline completeness, "
+          "and stale-head freshness all correct")
     return 0
 
 
@@ -1228,32 +1279,91 @@ def main() -> int:
     ap.add_argument("--baseline-name", default="compare-base",
                     help="Named-baseline dir to look for when base/ is absent "
                          "(default: compare-base, matching bench-compare.sh)")
-    ap.add_argument("--informational-groups-file", type=Path, default=None,
-                    help="Path to a file listing Criterion top-level group names (one per "
-                         "line) to measure+report but exclude from gating/exit-code — quick-"
-                         "mode noise-floor groups (lattice#714). Omit for full-mode runs.")
+    ap.add_argument("--target",
+                    help="Exact <crate>:<bench-target> identity for this isolated Criterion "
+                         "root. bench-compare passes this for every target.")
+    ap.add_argument("--informational-target",
+                    help="Classify this exact target as informational-only. Must equal --target; "
+                         "omit for gating/full-mode runs.")
     ap.add_argument("--require-measurements", action="store_true",
                     help="Fail (exit 2) instead of passing when the run produced no gating "
-                         "comparison to judge. Without this, an absent baseline exits 0, which "
-                         "is right for a first run but wrong for an automated lane: it cannot "
-                         "tell 'nothing regressed' from 'nothing was measured'.")
+                         "comparison to judge or a selected-base benchmark has no head "
+                         "comparison. Without this, an absent baseline exits 0, which is "
+                         "right for a first run but wrong for an automated lane: it cannot "
+                          "tell 'nothing regressed' from 'nothing was measured'.")
     ap.add_argument("--ambient-samples", type=Path,
-                    help="JSONL ambient-load samples for before/between/after. Requires "
-                         "--status-out and refuses an unmeasurable run with exit 3.")
+                    help="JSONL before/between/after ambient samples. Requires "
+                         "--status-out; an invalid or busy run exits 3.")
     ap.add_argument("--status-out", type=Path,
-                    help="Atomically write the automated gate status as JSON. This enables "
-                         "the nightly fail-closed ambient and measurement contract.")
+                    help="Atomically write pass/regression/error/not_measurable JSON.")
+    ap.add_argument("--prepare-head", action="store_true",
+                    help="Before a head measurement, remove only new/ and change/ siblings "
+                         "of benches in the exact selected baseline set. The root must be a "
+                         "real directory named criterion. No report is generated.")
+    ap.add_argument("--prepare-baseline-copy", action="store_true",
+                    help="Before copying a fresh base arm, remove only the exact selected "
+                         "baseline artifact dirs from an invariant-checked criterion root. "
+                         "No report is generated.")
     ap.add_argument("--selftest", action="store_true",
                     help="Run the fixture self-test (no criterion_root/arch needed) and exit")
     args = ap.parse_args()
 
+    selected_modes = sum((
+        args.selftest,
+        args.prepare_head,
+        args.prepare_baseline_copy,
+    ))
+    if selected_modes > 1:
+        ap.error("--selftest, --prepare-head, and --prepare-baseline-copy are "
+                 "mutually exclusive")
     if args.selftest:
         return run_selftest()
 
-    if args.criterion_root is None or args.arch is None:
-        ap.error("criterion_root and arch are required unless --selftest is passed")
+    if args.prepare_baseline_copy:
+        if args.criterion_root is None:
+            ap.error("criterion_root is required with --prepare-baseline-copy")
+        if args.arch is not None:
+            ap.error("arch must be omitted with --prepare-baseline-copy")
+        try:
+            removed = clear_selected_baseline_artifacts(
+                args.criterion_root, args.baseline_name
+            )
+        except (OSError, ValueError) as error:
+            print(f"error: cannot prepare Criterion baseline copy: {error}", file=sys.stderr)
+            return 2
+        print(
+            f"removed {removed} stale selected-baseline artifact "
+            f"{'directory' if removed == 1 else 'directories'} before fresh base copy"
+        )
+        return 0
 
-    status_mode = args.status_out is not None
+    if args.prepare_head:
+        if args.criterion_root is None:
+            ap.error("criterion_root is required with --prepare-head")
+        if args.arch is not None:
+            ap.error("arch must be omitted with --prepare-head")
+        try:
+            selected, removed = clear_selected_head_artifacts(
+                args.criterion_root, args.baseline_name
+            )
+        except (OSError, ValueError) as error:
+            print(f"error: cannot prepare Criterion head artifacts: {error}", file=sys.stderr)
+            return 2
+        print(
+            f"prepared {selected} selected-baseline benchmark(s); "
+            f"removed {removed} stale head artifact "
+            f"{'directory' if removed == 1 else 'directories'}"
+        )
+        return 0
+
+    if args.criterion_root is None or args.arch is None:
+        ap.error("criterion_root and arch are required unless --selftest or "
+                 "a preparation mode is passed")
+
+    if args.ambient_samples is not None and args.status_out is None:
+        print("error: --ambient-samples requires --status-out", file=sys.stderr)
+        return EXIT_ERROR
+
     ambient: AmbientAssessment | None = None
 
     def finish(
@@ -1262,7 +1372,6 @@ def main() -> int:
         reason: str,
         *,
         measurement_count: int | None = None,
-        gated_count: int | None = None,
         regression_count: int | None = None,
     ) -> int:
         if args.status_out is None:
@@ -1271,64 +1380,57 @@ def main() -> int:
             write_gate_status(
                 args.status_out,
                 arch=args.arch,
+                target=args.target,
                 verdict=verdict,
                 exit_code=exit_code,
                 reason=reason,
                 ambient=ambient,
                 measurement_count=measurement_count,
-                gated_count=gated_count,
                 regression_count=regression_count,
             )
-        except OSError as exc:
-            print(f"error: could not write gate status {args.status_out}: {exc}",
-                  file=sys.stderr)
+        except OSError as error:
+            print(
+                f"error: could not write gate status {args.status_out}: {error}",
+                file=sys.stderr,
+            )
             return EXIT_ERROR
         return exit_code
 
-    if args.ambient_samples is not None and not status_mode:
-        print("error: --ambient-samples requires --status-out so refusal remains "
-              "machine-readable", file=sys.stderr)
-        return EXIT_ERROR
-
-    same_output = (
-        status_mode
-        and args.out is not None
-        and os.path.abspath(args.out) == os.path.abspath(args.status_out)
-    )
-    if same_output:
-        print("error: --out and --status-out must name different files", file=sys.stderr)
-        return finish(
-            "error",
-            EXIT_ERROR,
-            "the report and machine-readable status paths are identical",
-        )
-
-    if status_mode:
+    if args.status_out is not None:
         try:
-            remove_stale_report(args.out)
-        except OSError as exc:
-            print(f"error: could not remove stale report {args.out}: {exc}",
+            floor_pct = idle_floor_from_env()
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return finish("error", EXIT_ERROR, str(error))
+        ambient = assess_ambient_samples(args.ambient_samples, floor_pct)
+        if not ambient.measurable:
+            reason = ambient.reason or "ambient load could not be assessed"
+            print(
+                f"NOT MEASURABLE: {reason}; no performance verdict rendered",
+                file=sys.stderr,
+            )
+            return finish("not_measurable", EXIT_NOT_MEASURABLE, reason)
+
+    require_measurements = args.require_measurements or args.status_out is not None
+
+    if args.informational_target is not None:
+        if args.target is None:
+            print("error: --informational-target requires --target", file=sys.stderr)
+            return finish(
+                "error", EXIT_ERROR, "--informational-target requires --target"
+            )
+        if args.informational_target != args.target:
+            print(f"error: informational target '{args.informational_target}' does not match "
+                  f"this Criterion root's target '{args.target}' — refusing to demote",
                   file=sys.stderr)
             return finish(
                 "error",
                 EXIT_ERROR,
-                f"the stale performance report could not be removed: {exc}",
+                "the informational target does not match the selected target",
             )
-
-        try:
-            floor_pct = idle_floor_from_env()
-        except ValueError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return finish("error", EXIT_ERROR, str(exc))
-
-        ambient = assess_ambient_samples(args.ambient_samples, floor_pct)
-        if not ambient.measurable:
-            reason = ambient.reason or "ambient load could not be assessed"
-            print(f"NOT MEASURABLE: {reason}; no performance verdict rendered",
-                  file=sys.stderr)
-            return finish("not_measurable", EXIT_NOT_MEASURABLE, reason)
-
-    require_measurements = args.require_measurements or status_mode
+    informational = (
+        args.target is not None and args.target == args.informational_target
+    )
 
     if not args.criterion_root.exists():
         print(f"error: {args.criterion_root} does not exist", file=sys.stderr)
@@ -1338,25 +1440,104 @@ def main() -> int:
             f"criterion root {args.criterion_root} does not exist",
         )
 
-    change_files = find_change_files(args.criterion_root)
+    try:
+        baseline_ids = selected_baseline_bench_ids(
+            args.criterion_root, args.baseline_name
+        )
+    except ValueError as error:
+        print(f"error: invalid --baseline-name: {error}", file=sys.stderr)
+        return finish("error", EXIT_ERROR, f"invalid baseline name: {error}")
+
+    if require_measurements and not baseline_ids:
+        print(
+            f"error: --require-measurements set but selected baseline "
+            f"{args.baseline_name!r} contains no benchmark estimates under "
+            f"{args.criterion_root} for target {args.target or '<unspecified>'}. "
+            "A run with no selected base set cannot "
+            "certify an A/B comparison.",
+            file=sys.stderr,
+        )
+        code = EXIT_PASS if informational else EXIT_ERROR
+        verdict = "pass" if informational else "error"
+        return finish(verdict, code, "the selected baseline set is empty")
+
+    all_change_files = find_change_files(args.criterion_root)
+    change_file_ids = {
+        change_file: artifact_bench_id(
+            change_file, args.criterion_root, artifact_parts=1
+        )
+        for change_file in all_change_files
+    }
+    # Enforcing A/B runs judge only the exact selected base set. A persistent
+    # Criterion root can contain change output from other named baselines or
+    # bench targets; letting those rows into this run can create either a stale
+    # regression or a reassuring comparison unrelated to the selected base.
+    if require_measurements:
+        change_files = [
+            change_file
+            for change_file in all_change_files
+            if change_file_ids[change_file] in baseline_ids
+        ]
+    else:
+        change_files = all_change_files
+    change_ids = {change_file_ids[change_file] for change_file in change_files}
+    missing_head_ids = sorted(baseline_ids - change_ids)
+
+    def refuse_missing_head() -> int:
+        print(
+            f"error: --require-measurements set but {len(missing_head_ids)} "
+            f"benchmark(s) in selected baseline {args.baseline_name!r} produced no "
+            "head comparison:",
+            file=sys.stderr,
+        )
+        for bench_id in missing_head_ids:
+            print(
+                f"  - {args.target + ': ' if args.target else ''}{bench_id}",
+                file=sys.stderr,
+            )
+        print(
+            "A partial A/B is not evidence that nothing regressed."
+            + (
+                " This target is informational, so the omission is reported "
+                "without changing the enforcing exit code."
+                if informational else ""
+            ),
+            file=sys.stderr,
+        )
+        code = EXIT_PASS if informational else EXIT_ERROR
+        verdict = "pass" if informational else "error"
+        return finish(
+            verdict,
+            code,
+            f"{len(missing_head_ids)} selected baseline benchmarks have no head comparison",
+        )
+
     if not change_files:
-        print(f"warn: no change/estimates.json under {args.criterion_root}; baseline missing?",
-              file=sys.stderr)
+        if all_change_files:
+            print(
+                f"warn: no change/estimates.json for selected baseline "
+                f"{args.baseline_name!r}; ignored {len(all_change_files)} unrelated "
+                "comparison artifact(s)",
+                file=sys.stderr,
+            )
+        else:
+            print(f"warn: no change/estimates.json under {args.criterion_root}; "
+                  "baseline missing?", file=sys.stderr)
         if require_measurements:
+            if missing_head_ids:
+                return refuse_missing_head()
             print(f"error: --require-measurements set but no change/estimates.json under "
                   f"{args.criterion_root}: the run produced no comparison, so it is not "
                   f"evidence that nothing regressed.", file=sys.stderr)
             return finish(
-                "error",
-                EXIT_ERROR,
-                "the run produced no Criterion comparisons",
+                "error", EXIT_ERROR, "the run produced no Criterion comparisons"
             )
         # Treat missing baseline as pass — first run on a bench has no comparison.
         if args.out:
             args.out.write_text(f"### `{args.arch}` — no baseline to compare\n\n"
                                 f"No `change/estimates.json` found; this is expected on the "
                                 f"first run for a bench. Future runs will gate against this run.\n")
-        return EXIT_PASS
+        return finish("pass", EXIT_PASS, "no baseline exists for this first run")
 
     results = []
     unjudged = []
@@ -1372,6 +1553,8 @@ def main() -> int:
             unjudged.append(cf)
 
     if not results:
+        if require_measurements and missing_head_ids:
+            return refuse_missing_head()
         print("error: change files found but all failed to parse", file=sys.stderr)
         return finish(
             "error",
@@ -1379,17 +1562,16 @@ def main() -> int:
             "Criterion change files were present but none could be judged",
         )
 
-    try:
-        informational_groups = load_informational_groups(args.informational_groups_file)
-    except OSError as exc:
-        print(f"error: could not read informational groups: {exc}", file=sys.stderr)
-        return finish(
-            "error",
-            EXIT_ERROR,
-            f"the informational-groups input could not be read: {exc}",
-        )
+    report = render_report(
+        results, args.arch, args.target, args.informational_target)
+    print(report)
+    if args.out:
+        args.out.write_text(report)
 
-    gating = [r for r in results if not r.is_informational(informational_groups)]
+    gating = [
+        r for r in results
+        if not r.is_informational(args.target, args.informational_target)
+    ]
 
     # Completeness, not existence. The first version of this guard asked whether
     # ANY judgeable comparison existed, which passes a run where one target built
@@ -1397,6 +1579,9 @@ def main() -> int:
     # the failed target is exactly the one nobody measured, so a green exit is a
     # claim about code that was never benched. Reconcile what the run intended
     # (change files on disk) against what was actually judged.
+    if require_measurements and missing_head_ids:
+        return refuse_missing_head()
+
     if require_measurements and unjudged:
         listed = ", ".join(str(cf.parent.parent.relative_to(args.criterion_root))
                            for cf in unjudged[:5])
@@ -1408,44 +1593,16 @@ def main() -> int:
         return finish(
             "error",
             EXIT_ERROR,
-            f"{len(unjudged)} of {len(change_files)} Criterion comparisons "
-            "could not be judged",
-        )
-
-    # Parsed results are not automatically judgeable results. If every parsed
-    # result is informational, nothing in this run could have produced a FAIL,
-    # so a zero exit says only that no gating comparison existed.
-    if require_measurements and not gating:
-        print(f"error: --require-measurements set but all {len(results)} parsed result(s) are "
-              f"informational: no gating comparison was judged.", file=sys.stderr)
-        return finish(
-            "error",
-            EXIT_ERROR,
-            "all parsed Criterion results were informational",
+            f"{len(unjudged)} of {len(change_files)} comparisons could not be judged",
         )
 
     fails = sum(1 for r in gating if r.verdict() == "FAIL")
-    report = render_report(results, args.arch, informational_groups)
-    print(report)
-    if args.out:
-        try:
-            args.out.write_text(report)
-        except OSError as exc:
-            print(f"error: could not write performance report {args.out}: {exc}",
-                  file=sys.stderr)
-            return finish(
-                "error",
-                EXIT_ERROR,
-                f"the performance report could not be written: {exc}",
-            )
-
-    if fails > 0:
+    if fails:
         return finish(
             "regression",
             EXIT_REGRESSION,
             f"{fails} gated regression(s) exceeded the fail threshold",
             measurement_count=len(results),
-            gated_count=len(gating),
             regression_count=fails,
         )
     return finish(
@@ -1453,7 +1610,6 @@ def main() -> int:
         EXIT_PASS,
         "no gated regression exceeded the fail threshold",
         measurement_count=len(results),
-        gated_count=len(gating),
         regression_count=0,
     )
 

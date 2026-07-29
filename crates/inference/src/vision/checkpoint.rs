@@ -725,7 +725,7 @@ mod tests {
             out_hidden_size: 4,
             temporal_patch_size: 1,
             num_position_embeddings: 4,
-            in_channels: 1,
+            in_channels: 3,
             deepstack_visual_indexes: vec![],
             intermediate_size: None,
         }
@@ -742,8 +742,9 @@ mod tests {
         let out_hidden = 4;
         let mut v = vec![
             (
+                // [hidden, in_channels, temporal_patch_size, patch_size, patch_size]
                 "model.visual.patch_embed.proj.weight".to_string(),
-                vec![hidden, 1, 1, 2, 2],
+                vec![hidden, 3, 1, 2, 2],
             ),
             (
                 "model.visual.patch_embed.proj.bias".to_string(),

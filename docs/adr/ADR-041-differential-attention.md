@@ -39,7 +39,7 @@ Public surface:
 
 3. **Subtract scores, then one V matmul**: The reference computes `attn1 = softmax1 @ v` and `attn2 = softmax2 @ v` separately, then `attn1 - lambda_full·attn2`. The kernel instead computes `(softmax1 - lambda_full·softmax2) @ v` — a single V matmul. This is exactly equivalent by linearity of matrix multiplication and saves one GEMM per head pair.
 
-4. **GQA via post-split head mapping**: `multihead_flashdiff_1.py` *defines* a `repeat_kv` helper but does **not** call it — it splits Q/K into `q1/q2/k1/k2` first (with `num_heads` / `num_kv_heads` heads respectively), then passes them to `flash_attn_func`, which performs standard GQA grouping internally. The standard convention `kv_head = query_head // n_rep` therefore applies to the *post-split* logical heads. The kernel maps logical pair `h` to KV head `h / n_rep`, packed K heads `2·(h/n_rep)` and `2·(h/n_rep)+1`. This was verified against the Microsoft source — an earlier reading that assumed `repeat_kv` was applied to the pre-split `2·num_kv_heads` axis was wrong. `test_gqa_equals_materialized_mha` guards it: a GQA run must produce bit-identical output to a pure-MHA run (`n_rep = 1`) whose KV heads are materialized in contiguous `repeat_kv` order.
+4. **GQA via post-split head mapping**: `multihead_flashdiff_1.py` _defines_ a `repeat_kv` helper but does **not** call it — it splits Q/K into `q1/q2/k1/k2` first (with `num_heads` / `num_kv_heads` heads respectively), then passes them to `flash_attn_func`, which performs standard GQA grouping internally. The standard convention `kv_head = query_head // n_rep` therefore applies to the _post-split_ logical heads. The kernel maps logical pair `h` to KV head `h / n_rep`, packed K heads `2·(h/n_rep)` and `2·(h/n_rep)+1`. This was verified against the Microsoft source — an earlier reading that assumed `repeat_kv` was applied to the pre-split `2·num_kv_heads` axis was wrong. `test_gqa_equals_materialized_mha` guards it: a GQA run must produce bit-identical output to a pure-MHA run (`n_rep = 1`) whose KV heads are materialized in contiguous `repeat_kv` order.
 
 5. **Additive `-10,000.0` causal mask**: Consistent with ADR-010 design choice #2 — avoids the NaN risk of `-inf` on fully-masked rows. The softmax loop only iterates the causal prefix, so masked positions are also explicitly zeroed.
 
@@ -49,12 +49,12 @@ Public surface:
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why Not |
-|---|---|---|---|
-| Implement the simplified scalar-lambda version from the original research note | Less code | Diverges from the reference; would not load real DIFF Transformer weights; missing the load-bearing sub-layer norm | Correctness requires the faithful algorithm |
-| Wire differential attention into a model forward pass now | "Complete" feature | No checkpoint exists to validate against; speculative wiring | Defer until a checkpoint target is identified |
-| Two separate V matmuls (mirror the reference exactly) | Trivially matches reference structure | One extra GEMM per head pair for no numerical benefit | `(s1 - λ·s2) @ v` is exactly equivalent and cheaper |
-| `multihead_flashdiff_2.py` as the reference | Supports packages without custom qk/v dims | `flashdiff_1` is the "Recommended" reference and is simpler | `flashdiff_1` is canonical |
+| Alternative                                                                    | Pros                                       | Cons                                                                                                               | Why Not                                             |
+| ------------------------------------------------------------------------------ | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------- |
+| Implement the simplified scalar-lambda version from the original research note | Less code                                  | Diverges from the reference; would not load real DIFF Transformer weights; missing the load-bearing sub-layer norm | Correctness requires the faithful algorithm         |
+| Wire differential attention into a model forward pass now                      | "Complete" feature                         | No checkpoint exists to validate against; speculative wiring                                                       | Defer until a checkpoint target is identified       |
+| Two separate V matmuls (mirror the reference exactly)                          | Trivially matches reference structure      | One extra GEMM per head pair for no numerical benefit                                                              | `(s1 - λ·s2) @ v` is exactly equivalent and cheaper |
+| `multihead_flashdiff_2.py` as the reference                                    | Supports packages without custom qk/v dims | `flashdiff_1` is the "Recommended" reference and is simpler                                                        | `flashdiff_1` is canonical                          |
 
 ---
 
@@ -64,7 +64,7 @@ Public surface:
 
 - Differential attention is independently testable and benchmarkable (11 unit tests, 5 integration tests, dedicated benchmark).
 - When a DIFF Transformer checkpoint becomes a target, the math is already implemented and validated.
-- Benchmark isolates the differential mechanism cost (second Q/K extract + second GEMM + second softmax + subtract + sub-RMSNorm) at roughly **2x** a single-softmax baseline — observed in the ~1.9–2.1x band across the 2h-MHA / 4h-GQA / 8h-GQA shapes at seq_len 256, roughly flat across head counts. This is an unstabilized wall-clock microbenchmark with ±0.1x run-to-run variance, not a statistically rigorous measurement; treat it as an order-of-magnitude check, not a precise figure. The baseline has identical loop topology *and* identical per-pair scratch-slab layout, so the only working-set difference is the differential kernel's `scores2` slab — itself part of the mechanism. A comparison against the batched `apply_gqa_attention` would instead conflate kernel topology and scratch cache-layout with mechanism cost.
+- Benchmark isolates the differential mechanism cost (second Q/K extract + second GEMM + second softmax + subtract + sub-RMSNorm) at roughly **2x** a single-softmax baseline — observed in the ~1.9–2.1x band across the 2h-MHA / 4h-GQA / 8h-GQA shapes at seq_len 256, roughly flat across head counts. This is an unstabilized wall-clock microbenchmark with ±0.1x run-to-run variance, not a statistically rigorous measurement; treat it as an order-of-magnitude check, not a precise figure. The baseline has identical loop topology _and_ identical per-pair scratch-slab layout, so the only working-set difference is the differential kernel's `scores2` slab — itself part of the mechanism. A comparison against the batched `apply_gqa_attention` would instead conflate kernel topology and scratch cache-layout with mechanism cost.
 
 **Negative**:
 
@@ -73,7 +73,7 @@ Public surface:
 
 **Risks**:
 
-- No checkpoint validation: the implementation matches the *algorithm* in `multihead_flashdiff_1.py`, but has never been run against real trained DIFF Transformer weights. Weight-key naming, the exact RoPE variant (the reference uses `interleaved=True`), and projection layout conventions will need verification when a checkpoint is integrated.
+- No checkpoint validation: the implementation matches the _algorithm_ in `multihead_flashdiff_1.py`, but has never been run against real trained DIFF Transformer weights. Weight-key naming, the exact RoPE variant (the reference uses `interleaved=True`), and projection layout conventions will need verification when a checkpoint is integrated.
 - The lambda reparameterization vectors must be loaded per-layer from a checkpoint; the current module accepts them as a caller-supplied struct but does not define a weight-loading path.
 
 ---
