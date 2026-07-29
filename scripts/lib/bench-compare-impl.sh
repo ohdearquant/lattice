@@ -327,15 +327,25 @@ CARGO_FEATURES_INFERENCE="${CARGO_FEATURES_INFERENCE:-}"
 BENCHES_EMBED="simd"
 BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
+BENCH_BASELINE_NAME="compare-base"
 
 # Keep Criterion evidence target-qualified without giving up Cargo's shared
 # compilation target. CRITERION_HOME controls only Criterion's report/baseline
 # tree; Cargo continues to use each worktree's normal target directory.
 BENCH_CRITERION_ROOT="$REPO/.cache/bench-compare-criterion"
-INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/inference"
-EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/embed"
-rm -rf "$BENCH_CRITERION_ROOT"
-mkdir -p "$INFERENCE_CRITERION_ROOT" "$EMBED_CRITERION_ROOT"
+BASE_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/inference/criterion"
+BASE_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/embed/criterion"
+INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/inference/criterion"
+EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/embed/criterion"
+mkdir -p \
+  "$BASE_INFERENCE_CRITERION_ROOT" "$BASE_EMBED_CRITERION_ROOT" \
+  "$INFERENCE_CRITERION_ROOT" "$EMBED_CRITERION_ROOT"
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  python3 "$GATE_SCRIPT" "$BASE_INFERENCE_CRITERION_ROOT" \
+    --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+  python3 "$GATE_SCRIPT" "$BASE_EMBED_CRITERION_ROOT" \
+    --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+fi
 
 # --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
 # `cargo bench ... | grep -E "time:" || true` discards cargo's status TWICE: a
@@ -402,13 +412,13 @@ BASE_PHASE_RC=0
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
   # same channel and one of them silently deletes half the comparison.
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS
+    run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
-  run_bench "time:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS
+  run_bench "time:" env CRITERION_HOME="$BASE_EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_PHASE_RC=$?
 # `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
@@ -430,21 +440,50 @@ if [ "$HEAD_MODE" = "detached worktree" ]; then
   trap 'git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true; cleanup' EXIT
 fi
 
-# Base and head point Criterion at the same target-qualified roots above. Cargo
-# artifacts remain in their normal shared targets; no baseline tree is copied
-# between worktrees and no cross-target Criterion namespace exists.
+copy_base_artifacts() {
+  local what="$1"; shift
+  local rc=0
+  rsync "$@" 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    echo "bench-compare: $what failed (rsync exit $rc) — refusing to certify a partial A/B." >&2
+    return 2
+  fi
+  return 0
+}
+
+prepare_target_root() {
+  local target="$1" base_root="$2" head_root="$3"
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    python3 "$GATE_SCRIPT" "$head_root" \
+      --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+  fi
+  copy_base_artifacts "$target selected baseline copy" \
+    -a "$base_root/" "$head_root/" \
+    --include="**/$BENCH_BASELINE_NAME/**" --include='*/' --exclude='*'
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    python3 "$GATE_SCRIPT" "$head_root" \
+      --baseline-name "$BENCH_BASELINE_NAME" --prepare-head
+  fi
+}
+
+prepare_target_root \
+  "lattice-inference:$BENCHES_INFERENCE" \
+  "$BASE_INFERENCE_CRITERION_ROOT" "$INFERENCE_CRITERION_ROOT"
+prepare_target_root \
+  "lattice-embed:$BENCHES_EMBED" \
+  "$BASE_EMBED_CRITERION_ROOT" "$EMBED_CRITERION_ROOT"
 
 HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS
+    run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
