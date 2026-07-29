@@ -2115,7 +2115,7 @@ mod inner {
         }
     }
 
-    /// Dispatch-site counters for the Metal attention/KV-cache path-proof probe.
+    /// Dispatch/readback-site counters for the Metal path-proof probe.
     ///
     /// `&self`-compatible (interior mutability) because the dispatch helpers that
     /// increment these run inside `&self` methods sharing one command encoder.
@@ -2123,20 +2123,24 @@ mod inner {
     pub struct PathProofCounters {
         pub prefill_kv_batch: AtomicU64,
         pub prefill_attn_batched: AtomicU64,
+        pub prefill_hidden_readback: AtomicU64,
         pub decode_kv_copy: AtomicU64,
         pub decode_attn_direct: AtomicU64,
         pub decode_attn_split_partial: AtomicU64,
         pub decode_attn_split_reduce: AtomicU64,
+        pub decode_hidden_readback: AtomicU64,
     }
 
     impl PathProofCounters {
         fn reset(&self) {
             self.prefill_kv_batch.store(0, Ordering::Relaxed);
             self.prefill_attn_batched.store(0, Ordering::Relaxed);
+            self.prefill_hidden_readback.store(0, Ordering::Relaxed);
             self.decode_kv_copy.store(0, Ordering::Relaxed);
             self.decode_attn_direct.store(0, Ordering::Relaxed);
             self.decode_attn_split_partial.store(0, Ordering::Relaxed);
             self.decode_attn_split_reduce.store(0, Ordering::Relaxed);
+            self.decode_hidden_readback.store(0, Ordering::Relaxed);
         }
     }
 
@@ -2151,6 +2155,13 @@ mod inner {
         pub decode_attn_split_partial: u64,
         pub decode_attn_split_reduce: u64,
         pub kv_f16: bool,
+    }
+
+    /// Explicit hidden-readback counts recorded by the Metal path-proof probe.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct HiddenReadbackPathProofSnapshot {
+        pub decode: u64,
+        pub prefill: u64,
     }
 
     // ---------------------------------------------------------------------------
@@ -3625,10 +3636,12 @@ mod inner {
             self.session.mtp.is_some()
         }
 
-        /// Zeroes the Metal attention/KV-cache path-proof counters (issue #239).
+        /// Zeroes the Metal path-proof counters.
         ///
         /// Call before a one-shot `generate`/`generate_streaming` run so
-        /// [`Self::path_proof_snapshot`] afterward reflects only that run's dispatches.
+        /// [`Self::path_proof_snapshot`] and
+        /// [`Self::hidden_readback_path_proof_snapshot`] afterward reflect only
+        /// that run's dispatches and explicit hidden readbacks.
         pub fn reset_path_proof_counters(&self) {
             self.path_proof.reset();
         }
@@ -3650,6 +3663,20 @@ mod inner {
                     .decode_attn_split_reduce
                     .load(Ordering::Relaxed),
                 kv_f16: self.use_kv_f16,
+            }
+        }
+
+        /// Snapshots explicit hidden-readback path-proof counters without resetting them.
+        pub fn hidden_readback_path_proof_snapshot(&self) -> HiddenReadbackPathProofSnapshot {
+            HiddenReadbackPathProofSnapshot {
+                decode: self
+                    .path_proof
+                    .decode_hidden_readback
+                    .load(Ordering::Relaxed),
+                prefill: self
+                    .path_proof
+                    .prefill_hidden_readback
+                    .load(Ordering::Relaxed),
             }
         }
 
@@ -5945,6 +5972,11 @@ mod inner {
 
                 // SAFETY: GPU completed (wait_until_completed called above for head_cmd).
                 let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                    if capture_hidden && self.path_proof_enabled {
+                        self.path_proof
+                            .decode_hidden_readback
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let _signpost_host_read = crate::forward::signpost::interval_in(
                         signpost_scope,
                         crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6113,6 +6145,11 @@ mod inner {
             // Read back pre-final hidden when requested (for MTP input).
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
             let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                if capture_hidden && self.path_proof_enabled {
+                    self.path_proof
+                        .decode_hidden_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let _signpost_host_read = crate::forward::signpost::interval_in(
                     signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6172,6 +6209,20 @@ mod inner {
                 return Err(InferenceError::InvalidInput(format!(
                     "forward_step: KV cache is full at {} tokens (max_cache_len {max_cache_len})",
                     self.session.kv_cache.seq_len
+                )));
+            }
+            Ok(())
+        }
+
+        fn check_forward_token_id(
+            &self,
+            entry_point: &str,
+            token_id: u32,
+        ) -> Result<(), crate::error::InferenceError> {
+            if token_id as usize >= self.engine.config.vocab_size {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: token_id {token_id} out of range: vocab_size is {}",
+                    self.engine.config.vocab_size
                 )));
             }
             Ok(())
@@ -6285,6 +6336,35 @@ mod inner {
                     crate::forward::signpost::Scope::NotDecode,
                 )
                 .logits)
+        }
+
+        /// **Unstable**: fallible single-token forward with explicit hidden readback.
+        ///
+        /// Returns `(logits, pre_final_hidden)`. The hidden row is captured before
+        /// the final RMSNorm overwrites the activation buffer. Existing
+        /// [`Self::try_forward_step`] and generation paths retain their current
+        /// readback behavior.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
+        /// dispatch when `token_id`, `position`, or the next KV-cache row is
+        /// outside the session capacity.
+        pub fn forward_step_with_hidden(
+            &mut self,
+            token_id: u32,
+            position: usize,
+        ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
+            self.check_forward_token_id("forward_step_with_hidden", token_id)?;
+            self.check_forward_step_capacity(position)?;
+            self.cross_turn_prefix_cache.clear();
+            let output = self.forward_step_inner(
+                token_id,
+                position,
+                true,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            Ok((output.logits, output.pre_final_hidden))
         }
 
         /// **Unstable**: single-token forward step; kernel dispatch strategy evolving.
@@ -6497,6 +6577,69 @@ mod inner {
             self.forward_prefill_impl(token_ids, false)
         }
 
+        /// **Unstable**: fallible prompt prefill with explicit hidden readback.
+        ///
+        /// Returns `(last_token_logits, pre_final_hidden)`. The hidden row is
+        /// captured for the prompt's last token before final RMSNorm. Batched,
+        /// chunked, one-token, and LoRA fallback paths advance KV/GDN state by
+        /// exactly the same token range as [`Self::forward_prefill`].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
+        /// dispatch for an empty prompt, an out-of-vocabulary token, or a prompt
+        /// whose token range exceeds the session capacity.
+        pub fn forward_prefill_with_hidden(
+            &mut self,
+            token_ids: &[u32],
+        ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            if token_ids.is_empty() {
+                return Err(InferenceError::InvalidInput(
+                    "forward_prefill_with_hidden: token_ids must not be empty".into(),
+                ));
+            }
+            for (index, &token_id) in token_ids.iter().enumerate() {
+                if token_id as usize >= self.engine.config.vocab_size {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "forward_prefill_with_hidden: token_ids[{index}]={token_id} out of range: \
+                         vocab_size is {}",
+                        self.engine.config.vocab_size
+                    )));
+                }
+            }
+            self.check_forward_range_capacity(0, token_ids.len(), false)?;
+            self.cross_turn_prefix_cache.clear();
+
+            if token_ids.len() == 1 {
+                return self.forward_step_with_hidden(token_ids[0], 0);
+            }
+            if self.lora.is_some() {
+                let last_index = token_ids.len() - 1;
+                for (position, &token_id) in token_ids[..last_index].iter().enumerate() {
+                    self.try_forward_step(token_id, position)?;
+                }
+                return self.forward_step_with_hidden(token_ids[last_index], last_index);
+            }
+
+            let max_prefill = self.session.max_prefill;
+            if token_ids.len() <= max_prefill {
+                let logits = self.forward_prefill_batched_chunk(token_ids, 0, false, true, true);
+                return Ok((logits, self.session.last_pre_final_hidden.clone()));
+            }
+
+            let mut start_pos = 0usize;
+            let mut last_logits = Vec::new();
+            for chunk in token_ids.chunks(max_prefill) {
+                let is_last = start_pos + chunk.len() == token_ids.len();
+                last_logits =
+                    self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last, is_last);
+                start_pos += chunk.len();
+            }
+            Ok((last_logits, self.session.last_pre_final_hidden.clone()))
+        }
+
         /// **Unstable**: prefill that returns logits for ALL `n` positions, not
         /// just the last. Output is `n * vocab_size` f32 values, row-major:
         /// `logits[i * vocab_size .. (i+1) * vocab_size]` predicts `tokens[i+1]`.
@@ -6573,7 +6716,13 @@ mod inner {
             let max_prefill = self.session.max_prefill;
             if n <= max_prefill {
                 // Only/last chunk — its logits are always the caller's answer.
-                return self.forward_prefill_batched_chunk(token_ids, 0, all_positions, true);
+                return self.forward_prefill_batched_chunk(
+                    token_ids,
+                    0,
+                    all_positions,
+                    true,
+                    false,
+                );
             }
             // Chunked batched prefill: each chunk is one command buffer (preserving the
             // n≤512 fast path within each chunk). GDN recurrent state threads across
@@ -6584,8 +6733,9 @@ mod inner {
                 let mut start_pos = 0usize;
                 for chunk in token_ids.chunks(max_prefill) {
                     // Perplexity needs every chunk's per-position logits.
-                    all_logits
-                        .extend(self.forward_prefill_batched_chunk(chunk, start_pos, true, true));
+                    all_logits.extend(
+                        self.forward_prefill_batched_chunk(chunk, start_pos, true, true, false),
+                    );
                     start_pos += chunk.len();
                 }
                 all_logits
@@ -6598,7 +6748,7 @@ mod inner {
                     // set_position, they just skip the terminal tail (Experiment B).
                     let is_last = start_pos + chunk.len() == n;
                     last_logits =
-                        self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last);
+                        self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last, false);
                     start_pos += chunk.len();
                 }
                 last_logits
@@ -7088,7 +7238,7 @@ mod inner {
         /// once per chunk; for `n ≤ max_prefill` it IS the entire prefill (one command
         /// buffer, all 24 layers, final logits).
         ///
-        /// `emit_logits` gates ONLY the terminal RMSNorm, lm_head, MTP-capture/readback,
+        /// `emit_logits` gates ONLY the terminal RMSNorm, lm_head, hidden capture/readback,
         /// and top-k tail, which is purely terminal (it does not feed the residual
         /// stream, KV cache, or GDN recurrent state — those are fully advanced by the
         /// per-layer loop above it). When `false`, the layer command buffer for this
@@ -7102,6 +7252,7 @@ mod inner {
             start_pos: usize,
             all_positions: bool,
             emit_logits: bool,
+            capture_hidden: bool,
         ) -> Vec<f32> {
             let n = token_ids.len();
             debug_assert!(
@@ -7213,8 +7364,8 @@ mod inner {
                 None
             };
 
-            // MTP pre-final-hidden capture (last-token only; not needed for ppl).
-            if !all_positions && self.session.mtp.is_some() {
+            // Pre-final-hidden capture (last-token only; not needed for ppl).
+            if !all_positions && (capture_hidden || self.session.mtp.is_some()) {
                 enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
                 enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
                 enc.set_buffer(1, Some(&self.session.activations.pre_final_hidden), 0);
@@ -7346,7 +7497,12 @@ mod inner {
             cmd.commit();
             cmd.wait_until_completed();
 
-            if !all_positions && self.session.mtp.is_some() {
+            if !all_positions && (capture_hidden || self.session.mtp.is_some()) {
+                if capture_hidden && self.path_proof_enabled {
+                    self.path_proof
+                        .prefill_hidden_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
                 self.session.last_pre_final_hidden =
                     unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
@@ -12586,6 +12742,7 @@ mod inner {
                     start_pos,
                     all_positions,
                     true,
+                    false,
                 ));
             }
             if all_positions {
@@ -12593,7 +12750,8 @@ mod inner {
                 let mut pos = start_pos;
                 for chunk in token_ids.chunks(max_prefill) {
                     // Perplexity needs every chunk's per-position logits.
-                    all_logits.extend(self.forward_prefill_batched_chunk(chunk, pos, true, true));
+                    all_logits
+                        .extend(self.forward_prefill_batched_chunk(chunk, pos, true, true, false));
                     pos += chunk.len();
                 }
                 Ok(all_logits)
@@ -12605,7 +12763,8 @@ mod inner {
                     // Only the LAST chunk's tail is ever kept — see
                     // forward_prefill_batched_chunk's doc comment (Experiment B).
                     let is_last = pos + chunk.len() == start_pos + total;
-                    last_logits = self.forward_prefill_batched_chunk(chunk, pos, false, is_last);
+                    last_logits =
+                        self.forward_prefill_batched_chunk(chunk, pos, false, is_last, false);
                     pos += chunk.len();
                 }
                 Ok(last_logits)
@@ -16571,6 +16730,240 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 max_abs_diff < 0.05,
                 "MTP draft logits diverged after QuaRot counter-rotation: max_abs_diff={max_abs_diff}"
             );
+        }
+
+        #[test]
+        fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            let logits = state.forward_step(42, 0);
+            assert_eq!(logits.len(), cfg.vocab_size);
+            let actual = &logits[..10];
+            // Math: token 42's embedding is one-hot: x[0]=1.0, x[1..]=0.0.
+            // All attention and FFN weights are zero → residual stream equals the
+            // raw embedding at every stage. final_norm then applies the shifted
+            // RMSNorm (qwen35_rms_norm convention: output = x * (1 + gamma) / rms(x)).
+            // With final_norm=[1.0] the scale is (1+1.0)=2; identity is gamma=0.
+            //   rms(x) = sqrt(1/512),  output[0] = 1.0 * (1+1.0) * sqrt(512) = 2*sqrt(512) ≈ 45.254.
+            // Tied lm_head col-0 pattern is [-1,0,1,-1,0,1,...], so logits ≈ ±45.25 / 0.
+            // (Issue #31: the original golden ±22.62 assumed plain-gamma; ±45.24 is correct.)
+            let expected = [
+                -45.243256_f32,
+                0.0,
+                45.243256,
+                -45.243256,
+                0.0,
+                45.243256,
+                -45.243256,
+                0.0,
+                45.243256,
+                -45.243256,
+            ];
+            let max_abs_diff = actual
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, e)| (a - e).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs_diff < 1e-4,
+                "golden first-10 logits changed: actual={actual:?} expected={expected:?} max_abs_diff={max_abs_diff}"
+            );
+        }
+
+        fn assert_forward_rows_close(label: &str, left: &[f32], right: &[f32]) {
+            assert_eq!(left.len(), right.len(), "{label}: row lengths must match");
+            let max_abs_diff = left
+                .iter()
+                .zip(right)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(max_abs_diff < 1e-4, "{label}: max_abs_diff={max_abs_diff}");
+        }
+
+        #[test]
+        fn forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut ordinary = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("ordinary tiny MetalQwen35State fixture constructs");
+            let mut with_hidden = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("hidden tiny MetalQwen35State fixture constructs");
+            ordinary.path_proof_enabled = true;
+            with_hidden.path_proof_enabled = true;
+            ordinary.reset_path_proof_counters();
+            with_hidden.reset_path_proof_counters();
+
+            let error = with_hidden
+                .forward_step_with_hidden(cfg.vocab_size as u32, 0)
+                .expect_err("out-of-vocabulary token must fail before dispatch");
+            assert!(matches!(
+                error,
+                crate::error::InferenceError::InvalidInput(_)
+            ));
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 0);
+            assert_eq!(
+                with_hidden.hidden_readback_path_proof_snapshot().decode,
+                0,
+                "invalid input must not read hidden state"
+            );
+
+            let ordinary_logits = ordinary.forward_step(42, 0);
+            let (hidden_logits, hidden) = with_hidden
+                .forward_step_with_hidden(42, 0)
+                .expect("hidden-returning step succeeds");
+            assert_forward_rows_close("step logits", &ordinary_logits, &hidden_logits);
+            assert_eq!(ordinary.session.kv_cache.seq_len, 1);
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 1);
+            assert_eq!(hidden.len(), cfg.hidden_size);
+            assert!(hidden.iter().all(|value| value.is_finite()));
+            assert!(hidden.iter().any(|&value| value != 0.0));
+            assert_forward_rows_close(
+                "returned and session hidden",
+                &hidden,
+                &with_hidden.session.last_pre_final_hidden,
+            );
+            assert!(
+                ordinary
+                    .session
+                    .last_pre_final_hidden
+                    .iter()
+                    .all(|&value| value == 0.0),
+                "ordinary step must not add an unconditional hidden readback"
+            );
+
+            let ordinary_hidden_proof = ordinary.hidden_readback_path_proof_snapshot();
+            let explicit_hidden_proof = with_hidden.hidden_readback_path_proof_snapshot();
+            assert_eq!(ordinary_hidden_proof.decode, 0);
+            assert_eq!(explicit_hidden_proof.decode, 1);
+
+            let ordinary_path = ordinary.path_proof_snapshot();
+            let explicit_path = with_hidden.path_proof_snapshot();
+            assert_eq!(ordinary_path.decode_kv_copy, explicit_path.decode_kv_copy);
+            assert!(explicit_path.decode_kv_copy > 0);
+            assert_eq!(
+                ordinary_path.decode_attn_direct,
+                explicit_path.decode_attn_direct
+            );
+            assert!(explicit_path.decode_attn_direct > 0);
+
+            let ordinary_followup = ordinary.forward_step(5, 1);
+            let hidden_followup = with_hidden.forward_step(5, 1);
+            assert_forward_rows_close(
+                "step follow-up logits",
+                &ordinary_followup,
+                &hidden_followup,
+            );
+            assert_eq!(ordinary.session.kv_cache.seq_len, 2);
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 2);
+        }
+
+        #[test]
+        fn forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut ordinary = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("ordinary tiny MetalQwen35State fixture constructs");
+            let mut with_hidden = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("hidden tiny MetalQwen35State fixture constructs");
+            ordinary.path_proof_enabled = true;
+            with_hidden.path_proof_enabled = true;
+            ordinary.reset_path_proof_counters();
+            with_hidden.reset_path_proof_counters();
+
+            let empty_error = with_hidden
+                .forward_prefill_with_hidden(&[])
+                .expect_err("empty prompt must fail before dispatch");
+            assert!(matches!(
+                empty_error,
+                crate::error::InferenceError::InvalidInput(_)
+            ));
+            let oov_error = with_hidden
+                .forward_prefill_with_hidden(&[cfg.vocab_size as u32])
+                .expect_err("out-of-vocabulary token must fail before dispatch");
+            assert!(matches!(
+                oov_error,
+                crate::error::InferenceError::InvalidInput(_)
+            ));
+            let oversized = vec![1_u32; 17];
+            let capacity_error = with_hidden
+                .forward_prefill_with_hidden(&oversized)
+                .expect_err("prompt beyond session capacity must fail before dispatch");
+            assert!(matches!(
+                capacity_error,
+                crate::error::InferenceError::InvalidInput(_)
+            ));
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 0);
+            assert_eq!(
+                with_hidden.hidden_readback_path_proof_snapshot().prefill,
+                0,
+                "invalid inputs must not read hidden state"
+            );
+
+            let tokens = [42_u32, 2, 5];
+            let ordinary_logits = ordinary.forward_prefill(&tokens);
+            let (hidden_logits, hidden) = with_hidden
+                .forward_prefill_with_hidden(&tokens)
+                .expect("hidden-returning prefill succeeds");
+            assert_forward_rows_close("prefill logits", &ordinary_logits, &hidden_logits);
+            assert_eq!(ordinary.session.kv_cache.seq_len, tokens.len());
+            assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len());
+            assert_eq!(ordinary.session.position, tokens.len());
+            assert_eq!(with_hidden.session.position, tokens.len());
+            assert_eq!(hidden.len(), cfg.hidden_size);
+            assert!(hidden.iter().all(|value| value.is_finite()));
+            assert!(hidden.iter().any(|&value| value != 0.0));
+            assert_forward_rows_close(
+                "returned and session hidden",
+                &hidden,
+                &with_hidden.session.last_pre_final_hidden,
+            );
+            assert!(
+                ordinary
+                    .session
+                    .last_pre_final_hidden
+                    .iter()
+                    .all(|&value| value == 0.0),
+                "ordinary prefill must not add an unconditional hidden readback"
+            );
+
+            let ordinary_hidden_proof = ordinary.hidden_readback_path_proof_snapshot();
+            let explicit_hidden_proof = with_hidden.hidden_readback_path_proof_snapshot();
+            assert_eq!(ordinary_hidden_proof.prefill, 0);
+            assert_eq!(explicit_hidden_proof.prefill, 1);
+
+            let ordinary_path = ordinary.path_proof_snapshot();
+            let explicit_path = with_hidden.path_proof_snapshot();
+            assert_eq!(
+                ordinary_path.prefill_kv_batch,
+                explicit_path.prefill_kv_batch
+            );
+            assert!(explicit_path.prefill_kv_batch > 0);
+            assert_eq!(
+                ordinary_path.prefill_attn_batched,
+                explicit_path.prefill_attn_batched
+            );
+            assert!(explicit_path.prefill_attn_batched > 0);
+
+            let ordinary_followup = ordinary.forward_step(7, tokens.len());
+            let hidden_followup = with_hidden.forward_step(7, tokens.len());
+            assert_forward_rows_close(
+                "prefill follow-up logits",
+                &ordinary_followup,
+                &hidden_followup,
+            );
+            assert_eq!(ordinary.session.kv_cache.seq_len, tokens.len() + 1);
+            assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len() + 1);
         }
 
         #[test]
@@ -22180,7 +22573,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             for attempt in 0..2 {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    state.forward_prefill_batched_chunk(&tokens, 0, true, true)
+                    state.forward_prefill_batched_chunk(&tokens, 0, true, true, false)
                 }));
                 assert!(
                     result.is_err(),
@@ -28072,7 +28465,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut production =
                 MetalQwen35State::new(weights, cfg, 16).expect("production scheduler fixture");
             production.use_gdn_chunked = chunked;
-            let _ = production.forward_prefill_batched_chunk(tokens, 0, true, false);
+            let _ = production.forward_prefill_batched_chunk(tokens, 0, true, false, false);
             let production_artifacts = prefill_scheduler_artifacts(&mut production, tokens, 9);
 
             let mut isolated =
@@ -28162,7 +28555,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut production =
                 MetalQwen35State::new(&weights, &cfg, 8).expect("production fallback fixture");
             production.use_gdn_chunked = true;
-            let _ = production.forward_prefill_batched_chunk(&[1, 2], 0, true, false);
+            let _ = production.forward_prefill_batched_chunk(&[1, 2], 0, true, false, false);
             assert_eq!(production.session.position, 2);
             assert_eq!(production.session.kv_cache.seq_len, 2);
 
@@ -34042,7 +34435,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             start_pos: usize,
         ) {
             assert_token_ids_in_vocab(state, token_ids);
-            let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false);
+            let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false, false);
         }
     }
 }
@@ -35058,9 +35451,10 @@ mod gdn_state_traffic_tests {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
-    ChatCompletionOutput, LayerImportanceScore, LayerPruningPlan, LoraLayerData, MetalQwen35State,
-    MoeRoutingTraceRecord, PathProofSnapshot, arm_moe_routing_trace, blend_lora_layer_data,
-    dump_moe_routing_trace_jsonl, take_moe_routing_trace,
+    ChatCompletionOutput, HiddenReadbackPathProofSnapshot, LayerImportanceScore, LayerPruningPlan,
+    LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord, PathProofSnapshot,
+    arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
+    take_moe_routing_trace,
 };
 
 #[cfg(all(
@@ -35140,6 +35534,27 @@ impl MetalQwen35State {
         _token_id: u32,
         _position: usize,
     ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
+    /// **Unstable**: fallible Metal hidden-returning step stub.
+    pub fn forward_step_with_hidden(
+        &mut self,
+        _token_id: u32,
+        _position: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
+    /// **Unstable**: fallible Metal hidden-returning prefill stub.
+    pub fn forward_prefill_with_hidden(
+        &mut self,
+        _token_ids: &[u32],
+    ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
         Err(crate::error::InferenceError::Inference(
             "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
         ))
