@@ -721,7 +721,7 @@ class MachineStateGate(unittest.TestCase):
         with _Sandbox() as sb:
             sb.force_platform("Darwin")
             r = sb.run(
-                [sb.entry],
+                [sb.entry, "--fail-on-regression"],
                 BENCH_IDLE_FLOOR="0",
                 STUB_GOVERNOR_RC="2",
             )
@@ -729,6 +729,52 @@ class MachineStateGate(unittest.TestCase):
             self.assertEqual(sb.machine_state_labels(), ["before base"])
             self.assertIn("machine-state checkpoint 'before base' failed", r.stderr)
             self.assertNotIn("Building + benching BASE", r.stdout)
+
+    def test_blocked_macos_checkpoint_reports_or_refuses_by_enforcement_mode(self):
+        with _Sandbox() as sb:
+            sb.force_platform("Darwin")
+            report_only = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                STUB_GOVERNOR_RC="2",
+            )
+            self.assertEqual(
+                report_only.returncode,
+                0,
+                f"stdout:\n{report_only.stdout}\nstderr:\n{report_only.stderr}",
+            )
+            self.assertIn("Building + benching BASE", report_only.stdout)
+            self.assertIn("=== Run conditions ===", report_only.stdout)
+            self.assertIn("gate blocked (fixture block)", report_only.stdout)
+            self.assertIn(
+                "unsuitable as benchmark evidence",
+                report_only.stdout,
+            )
+            provenance = sb.root / ".cache" / "bench-run-provenance.txt"
+            states = [
+                json.loads(line.removeprefix("machine_state="))
+                for line in provenance.read_text().splitlines()
+                if line.startswith("machine_state=")
+            ]
+            self.assertEqual(len(states), 3)
+            self.assertTrue(
+                all(state["gate"]["status"] == "blocked" for state in states)
+            )
+
+        with _Sandbox() as sb:
+            sb.force_platform("Darwin")
+            enforcing = sb.run(
+                [sb.entry, "--fail-on-regression"],
+                BENCH_IDLE_FLOOR="0",
+                STUB_GOVERNOR_RC="2",
+            )
+            self.assertEqual(enforcing.returncode, 2, enforcing.stdout)
+            self.assertEqual(sb.machine_state_labels(), ["before base"])
+            self.assertIn(
+                "machine-state checkpoint 'before base' failed",
+                enforcing.stderr,
+            )
+            self.assertNotIn("Building + benching BASE", enforcing.stdout)
 
 
 class ContentionDiagnostics(unittest.TestCase):

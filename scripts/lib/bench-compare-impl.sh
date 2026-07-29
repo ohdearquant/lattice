@@ -114,6 +114,39 @@ fi
 RUN_OS="$(uname -srm)"
 PROVENANCE_FILE="$REPO/.cache/bench-run-provenance.txt"
 
+# Parse flags before any enforcement-sensitive setup. Both are optional and may
+# appear in either order, but they must precede the positional BASE/HEAD pair:
+# the first non-flag argument ends flag parsing. A flag written AFTER a ref is
+# rejected rather than silently taken as a ref. Use `--` to pass a ref that
+# legitimately begins with a dash.
+FAIL_ON_REGRESSION=0
+AFTER_DDASH=0
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --full)
+      QUICK_FLAGS=""
+      shift
+      ;;
+    --fail-on-regression)
+      FAIL_ON_REGRESSION=1
+      shift
+      ;;
+    --)
+      AFTER_DDASH=1
+      shift
+      break
+      ;;
+    -*)
+      echo "bench-compare.sh: unknown flag '$1'" >&2
+      echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 # --- Refuse to measure unless the recorded supervisor is one of our ancestors ---
 # scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
 # which records its own PID here after taking both locks. This requires that PID
@@ -218,7 +251,7 @@ machine_state_probe() {
   echo "[state] $label: $record"
   MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
 }$record"
-  if [ "$rc" -ne 0 ]; then
+  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
     echo "bench-compare: machine-state checkpoint '$label' failed — refusing to certify this A/B." >&2
     exit 2
   fi
@@ -238,49 +271,6 @@ quiet_gate() {
     exit 2
   fi
 }
-
-# Parse flags. Both are optional and may appear in either order, but they must
-# precede the positional BASE/HEAD pair: the first non-flag argument ends flag
-# parsing. A flag written AFTER a ref is rejected rather than silently taken as
-# a ref — `bench-compare.sh HEAD~1 --full` used to resolve "--full" as HEAD_REF
-# and bench against nonsense. Use `--` to pass a ref that legitimately begins
-# with a dash.
-#
-# --fail-on-regression exists because this script is a REPORTER by default: the
-# gate invocation at the bottom captures its status into GATE_RC and re-raises
-# it only under this flag, so a confirmed regression is rendered in the report
-# while the script still exits 0. That is correct for a
-# human reading an A/B, and completely wrong for an automated lane, where a
-# green exit beside a printed FAIL means the job passes on a real regression.
-# Opt in to propagate the gate's exit code instead. Default behavior is
-# unchanged so existing callers keep their current semantics.
-FAIL_ON_REGRESSION=0
-AFTER_DDASH=0
-while [ $# -gt 0 ]; do
-  case "${1:-}" in
-    --full)
-      QUICK_FLAGS=""  # configured sample size (normally 100), ~15 min total
-      shift
-      ;;
-    --fail-on-regression)
-      FAIL_ON_REGRESSION=1
-      shift
-      ;;
-    --)
-      AFTER_DDASH=1
-      shift
-      break
-      ;;
-    -*)
-      echo "bench-compare.sh: unknown flag '$1'" >&2
-      echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
-      exit 2
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
 
 BASE_REF="${1:-origin/main}"
 HEAD_REF="${2:-HEAD}"

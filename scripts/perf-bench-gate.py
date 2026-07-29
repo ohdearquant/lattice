@@ -394,7 +394,10 @@ def load_run_provenance(path: Path) -> RunProvenance:
             )
     if captured_times != sorted(captured_times):
         raise ValueError(f"{path}: machine-state timestamps are out of phase order")
-    if fields["os"].split(maxsplit=1)[0] == "Darwin":
+    if (
+        fields["os"].split(maxsplit=1)[0] == "Darwin"
+        and fields["enforcement"] == "fail-on-regression"
+    ):
         for record in machine_states:
             gate = record.get("gate")
             if not isinstance(gate, dict) or gate.get("status") != "passed":
@@ -770,6 +773,17 @@ def render_run_provenance(
         )
         lines.append("")
     else:
+        blocked_checkpoints = [
+            state for state in provenance.machine_states
+            if state.get("gate", {}).get("status") == "blocked"
+        ]
+        if blocked_checkpoints:
+            labels = ", ".join(str(state["label"]) for state in blocked_checkpoints)
+            lines.append(
+                "⚠️ One or more machine-state checkpoints were blocked "
+                f"({labels}). This report is unsuitable as benchmark evidence."
+            )
+            lines.append("")
         for field in PROVENANCE_FIELDS:
             lines.append(f"    {field}={provenance.fields[field]}")
         for lock in provenance.locks:
