@@ -3280,6 +3280,19 @@ mod tests {
     use super::*;
     use crate::grammar::pda::{GrammarState, SimResult, simulate_token};
 
+    #[test]
+    fn ref_target_annotations_exclude_structural_keys() {
+        // `resolve_ref_chain_target` follows `$ref` to a terminal target, and
+        // the other keys below do not emit instance values today. This guards
+        // a latent proof-widening risk if either behavior changes.
+        for key in ["$ref", "$defs", "definitions", "$id", "$schema"] {
+            assert!(
+                !REF_TARGET_ANNOTATION_KEYS.contains(&key),
+                "structural key `{key}` must not be admitted as a target annotation"
+            );
+        }
+    }
+
     fn compile_ok(schema_json: &str) -> CompiledGrammar {
         let v: Value = serde_json::from_str(schema_json).unwrap();
         compile(&v).unwrap()
