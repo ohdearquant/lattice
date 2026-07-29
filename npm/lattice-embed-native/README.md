@@ -103,4 +103,4 @@ npm run packlist:darwin-arm64  # pack-list guard: darwin-arm64 subpackage ships 
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0
