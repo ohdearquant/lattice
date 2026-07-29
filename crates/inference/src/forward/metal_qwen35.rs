@@ -13911,11 +13911,11 @@ mod inner {
 
             // Budget forcing: resolve the </think> token id once before the loops.
             // Only paid when reasoning_budget is Some; None path is a single branch.
-            let think_close_id = if gen_cfg.reasoning_budget.is_some() {
-                tokenizer.special_token_id("</think>")
-            } else {
-                None
-            };
+            let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
+                tokenizer,
+                gen_cfg.reasoning_budget,
+                cfg.vocab_size,
+            )?;
 
             // Checked independently of `on_token`: a client that disconnected
             // between dequeue and here must not pay for the (potentially large,
@@ -16202,7 +16202,19 @@ mod inner {
             tokenizer
                 .special_token_id("<|im_end|>")
                 .hash(&mut tok_hasher);
-            tokenizer.special_token_id("</think>").hash(&mut tok_hasher);
+            // Tokenizer identity only -- resolved unconditionally regardless
+            // of whether *this* request has an active reasoning budget.
+            // reasoning_budget is a generation-time policy choice, not a
+            // prefix-defining input: two requests with identical prompts and
+            // tokenizer state must hash to the same fingerprint whether or
+            // not either one sets a budget, so a turn that happens to omit
+            // (or vary) reasoning_budget can still reuse the other's cached
+            // prefix instead of forcing FullRefill. The close-marker
+            // VALIDATION that a budget is actually enforceable still runs
+            // separately, per-request, in `resolve_reasoning_close_token`.
+            tokenizer
+                .token_id_for_content(crate::model::qwen35::REASONING_CLOSE_MARKER)
+                .hash(&mut tok_hasher);
             let tokenizer_fingerprint = tok_hasher.finish();
 
             let adapter_id = match &self.lora {
@@ -16715,6 +16727,37 @@ mod inner {
                 self.plan_prefix_request(&prompt_ids, &plan)?;
             }
 
+            // Budget forcing: validate the </think> token id here too,
+            // before `_inner` is even called -- same reasoning as the
+            // suffix-plan preflight immediately above (#835) and the
+            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
+            // above that (PR #787). `_inner` resolves this again (defense
+            // in depth, mirroring the suffix-plan double-check), but only
+            // THIS early return -- before the destructive `match` below
+            // runs `restore_cross_turn_prefix` or `reset_state()` --
+            // guarantees a missing/out-of-range </think> token never
+            // destroys a valid pre-existing cross-turn entry the request
+            // never touched.
+            //
+            // Gated on `max_new_tokens > 0`, same as the suffix-plan
+            // preflight above: `_inner`'s own zero-budget guard (before its
+            // `resolve_reasoning_close_token` call) is
+            // unreachable-before-return for a zero-token request, so an
+            // unconditional resolve here would disagree with every other
+            // generation path (plain CPU `generate()`, non-cached-prefix
+            // Metal `generate_streaming()`) -- both short-circuit
+            // `max_new_tokens == 0` to a zero-token `StopReason::Length`
+            // BEFORE resolving the close marker, so a `reasoning_budget`
+            // set alongside `max_new_tokens == 0` succeeds there even with
+            // a missing/invalid `</think>` marker.
+            if gen_cfg.max_new_tokens > 0 {
+                crate::model::qwen35::resolve_reasoning_close_token(
+                    tokenizer,
+                    gen_cfg.reasoning_budget,
+                    self.engine.config.vocab_size,
+                )?;
+            }
+
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
                 prompt_ids,
@@ -16840,6 +16883,23 @@ mod inner {
             // caller getting the wrapper's guard conditions right.
             self.plan_prefix_request(&prompt_ids, &plan)?;
 
+            // Budget forcing: resolve the </think> token id BEFORE the match
+            // below runs `restore_cross_turn_prefix` (which `take()`s the
+            // cache slot's entry) or `reset_state()` -- same reasoning as
+            // the suffix validation immediately above (#835), extended to
+            // this check: a missing or out-of-range </think> token must be
+            // rejected before any live state or cache entry is touched, or
+            // a rejected request would destroy a valid pre-existing prefix
+            // cache it never used. This also keeps the property that its `?`
+            // propagates before the should_cancel check below, so a
+            // cancelled-but-invalid-budget request is rejected instead of
+            // returning Ok(Interrupt).
+            let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
+                tokenizer,
+                gen_cfg.reasoning_budget,
+                cfg.vocab_size,
+            )?;
+
             // The consumed entry (ExactAppend / ReplayFromCheckpoint) is
             // carried to the end-of-generation save so its checkpoint ring
             // and boundary snapshot survive across turns (#590).
@@ -16924,12 +16984,6 @@ mod inner {
             }
 
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
-
-            let think_close_id = if gen_cfg.reasoning_budget.is_some() {
-                tokenizer.special_token_id("</think>")
-            } else {
-                None
-            };
 
             // The one line that differs structurally from `generate_streaming`:
             // prefill only the divergent suffix, at its true absolute position.

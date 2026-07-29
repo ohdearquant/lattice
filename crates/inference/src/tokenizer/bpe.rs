@@ -467,6 +467,43 @@ impl BpeTokenizer {
         self.inner.special_tokens.get(name).copied()
     }
 
+    /// Look up a token ID by its exact rendered spelling (e.g. `"</think>"`,
+    /// `"<|im_end|>"`), not by decoded/detokenized text. `content` must match
+    /// the literal token string as it appears in the tokenizer's vocabulary or
+    /// added-tokens table -- it is never partial text, a text fragment
+    /// containing the token plus surrounding characters, or output that has
+    /// passed through [`Self::token_for_id`] / decoding.
+    ///
+    /// Lookup precedence (first match wins):
+    /// 1. `special_tokens` -- the fast-path table for tokens marked
+    ///    `special: true` in `tokenizer.json` (e.g. `<|im_end|>`).
+    /// 2. `vocab` -- the base BPE vocabulary (a `</think>`-style marker can
+    ///    live here if the tokenizer declares it as an ordinary vocab entry
+    ///    rather than a `special_tokens` entry or an added token).
+    /// 3. `added_render` -- added tokens with `special: false` (e.g.
+    ///    `<think>`/`</think>`, `<tool_call>`, FIM markers); this tier is an
+    ///    O(added_render.len()) linear scan, the only one of the three.
+    ///
+    /// This is the single resolution path for the `</think>` reasoning-close
+    /// marker: [`crate::model::qwen35::resolve_reasoning_close_token`] (the
+    /// actual generation-time validation, shared by the CPU and Metal decode
+    /// loops) and the Metal cross-turn prefix-cache fingerprint
+    /// (`cross_turn_metadata`) both call this directly rather than each
+    /// owning a separate cached/uncached copy of the lookup.
+    pub(crate) fn token_id_for_content(&self, content: &str) -> Option<u32> {
+        self.inner
+            .special_tokens
+            .get(content)
+            .or_else(|| self.inner.vocab.get(content))
+            .copied()
+            .or_else(|| {
+                self.inner
+                    .added_render
+                    .iter()
+                    .find_map(|(&id, token)| (token == content).then_some(id))
+            })
+    }
+
     /// **Unstable**: return the byte representation of every model token ID.
     ///
     /// `vocab_bytes(vocab_size)?[i]` is the byte sequence that token `i` decodes
@@ -1744,6 +1781,9 @@ mod tests {
         )
         .expect("construct tokenizer with rendered added tokens");
 
+        assert_eq!(tokenizer.special_token_id("</think>"), None);
+        assert_eq!(tokenizer.token_id_for_content("</think>"), Some(100));
+
         // special=false added tokens render verbatim (byte-level decode is identity
         // for printable ASCII).
         assert_eq!(tokenizer.decode(&[101]), Some("<think>".to_string()));
@@ -1767,6 +1807,50 @@ mod tests {
         }
         out.push_str(&detok.finish());
         assert_eq!(out, "a</think>b");
+    }
+
+    /// `token_id_for_content` must resolve a marker from each of its three
+    /// tiers. The `vocab` and `added_render` tiers are the load-bearing ones:
+    /// `special_token_id` alone covers only the `special_tokens` tier, so a
+    /// marker declared as an ordinary vocab entry or as a `special: false`
+    /// added token resolves to `None` through that older path -- which is
+    /// exactly how an active reasoning budget became a silent no-op.
+    #[test]
+    fn token_id_for_content_resolves_special_vocab_and_added_render_tiers() {
+        let mut vocab = HashMap::new();
+        vocab.insert("a".to_string(), 0u32);
+        // Tier 2: a marker declared as an ordinary base-vocabulary entry.
+        vocab.insert("</think>".to_string(), 7u32);
+
+        let mut specials = HashMap::new();
+        // Tier 1: the classic special-token table entry.
+        specials.insert("<|im_end|>".to_string(), 20u32);
+
+        let mut rendered = HashMap::new();
+        // Tier 3: a `special: false` added token, absent from both maps above.
+        rendered.insert("<tool_call>".to_string(), 30u32);
+
+        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
+            vocab,
+            Vec::new(),
+            specials,
+            rendered,
+            DEFAULT_BPE_CACHE_CAPACITY,
+            DEFAULT_BPE_MAX_SEQ_LEN,
+        )
+        .expect("construct three-tier tokenizer");
+
+        assert_eq!(tokenizer.token_id_for_content("<|im_end|>"), Some(20));
+
+        // Tiers 2 and 3 are invisible to `special_token_id`.
+        assert_eq!(tokenizer.special_token_id("</think>"), None);
+        assert_eq!(tokenizer.token_id_for_content("</think>"), Some(7));
+        assert_eq!(tokenizer.special_token_id("<tool_call>"), None);
+        assert_eq!(tokenizer.token_id_for_content("<tool_call>"), Some(30));
+
+        // A spelling present in no tier resolves to None rather than to some
+        // near-miss entry.
+        assert_eq!(tokenizer.token_id_for_content("<think>"), None);
     }
 
     #[test]
