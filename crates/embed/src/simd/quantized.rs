@@ -90,6 +90,42 @@ fn minmax_finite(v: &[f32]) -> (f32, f32) {
     minmax_finite_scalar(v)
 }
 
+/// Resolves the sign of a zero-valued min/max so every kernel agrees bit-for-bit.
+///
+/// `f32::min`/`f32::max`, NEON's `vminvq_f32`/`vmaxvq_f32`, and AVX2's
+/// `_mm256_min_ps`/`_mm256_max_ps` each return an unspecified one of their operands
+/// when the operands compare equal, so a `-0.0`/`+0.0` tie is broken differently per
+/// kernel and per codegen. Applying IEEE 754-2019 `minimum`/`maximum` ordering
+/// (`-0.0 < +0.0`) to the finished pair makes the choice a stated contract instead of
+/// an artifact: the min takes `-0.0` and the max takes `+0.0` whenever that sign is
+/// present in the input.
+///
+/// The sign scan runs only when a bound is exactly zero, so the cost on a typical
+/// vector is the two comparisons in the guard.
+#[inline]
+fn pin_zero_signs(v: &[f32], min_val: f32, max_val: f32) -> (f32, f32) {
+    if min_val != 0.0 && max_val != 0.0 {
+        return (min_val, max_val);
+    }
+    let mut has_negative_zero = false;
+    let mut has_positive_zero = false;
+    for &value in v {
+        has_negative_zero |= value.to_bits() == (-0.0f32).to_bits();
+        has_positive_zero |= value.to_bits() == 0.0f32.to_bits();
+    }
+    let min_val = if min_val == 0.0 {
+        if has_negative_zero { -0.0 } else { 0.0 }
+    } else {
+        min_val
+    };
+    let max_val = if max_val == 0.0 {
+        if has_positive_zero { 0.0 } else { -0.0 }
+    } else {
+        max_val
+    };
+    (min_val, max_val)
+}
+
 fn minmax_finite_scalar(v: &[f32]) -> (f32, f32) {
     let mut min_val = f32::INFINITY;
     let mut max_val = f32::NEG_INFINITY;
@@ -99,7 +135,7 @@ fn minmax_finite_scalar(v: &[f32]) -> (f32, f32) {
             max_val = max_val.max(x);
         }
     }
-    (min_val, max_val)
+    pin_zero_signs(v, min_val, max_val)
 }
 
 #[cfg(test)]
@@ -141,21 +177,7 @@ unsafe fn minmax_finite_avx2(v: &[f32]) -> (f32, f32) {
             max_val = max_val.max(x);
         }
     }
-    if min_val == 0.0 || max_val == 0.0 {
-        let mut has_negative_zero = false;
-        let mut has_positive_zero = false;
-        for &value in v {
-            has_negative_zero |= value.to_bits() == (-0.0f32).to_bits();
-            has_positive_zero |= value.to_bits() == 0.0f32.to_bits();
-        }
-        if min_val == 0.0 {
-            min_val = if has_negative_zero { -0.0 } else { 0.0 };
-        }
-        if max_val == 0.0 {
-            max_val = if has_positive_zero { 0.0 } else { -0.0 };
-        }
-    }
-    (min_val, max_val)
+    pin_zero_signs(v, min_val, max_val)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -186,7 +208,7 @@ unsafe fn minmax_finite_neon(v: &[f32]) -> (f32, f32) {
             max_val = max_val.max(x);
         }
     }
-    (min_val, max_val)
+    pin_zero_signs(v, min_val, max_val)
 }
 
 /// **Unstable**: INT8 quantized vector; struct layout and invariants may change.
@@ -991,6 +1013,66 @@ mod simd_parity_tests {
         assert_eq!(
             (params.min_val.to_bits(), params.max_val.to_bits()),
             (scalar.0.to_bits(), scalar.1.to_bits())
+        );
+    }
+
+    /// The signed-zero tie-break is a contract, not whatever the reduction happened to
+    /// pick. Parity tests can only compare kernels against each other, so they pass on
+    /// any architecture whose kernels agree by accident; this pins the value itself and
+    /// runs everywhere, including targets with no explicit SIMD path at all.
+    ///
+    /// The first block drives `pin_zero_signs` directly with bounds carrying the wrong
+    /// sign. That matters: on aarch64 the scalar fold already returns the contracted
+    /// signs, so assertions routed through `minmax_finite_scalar` alone still pass with
+    /// the sign pass deleted. Only x86-64 breaks the tie the other way, and a guard that
+    /// can be removed without any local test noticing is not a guard.
+    #[test]
+    fn test_minmax_finite_pins_zero_signs() {
+        let both_signs = [-0.0f32, 0.0, -1.0];
+        assert_eq!(
+            pin_zero_signs(&both_signs, -1.0, -0.0).1.to_bits(),
+            0.0f32.to_bits(),
+            "a max of -0.0 must be rewritten to +0.0 when +0.0 is present"
+        );
+        assert_eq!(
+            pin_zero_signs(&both_signs, 0.0, -1.0).0.to_bits(),
+            (-0.0f32).to_bits(),
+            "a min of +0.0 must be rewritten to -0.0 when -0.0 is present"
+        );
+
+        let max_ties = [-0.0f32, 0.0, -1.0];
+        let (_, max_val) = minmax_finite_scalar(&max_ties);
+        assert_eq!(
+            max_val.to_bits(),
+            0.0f32.to_bits(),
+            "max must take +0.0 when both zero signs are present"
+        );
+
+        let min_ties = [0.0f32, -0.0, 1.0];
+        let (min_val, _) = minmax_finite_scalar(&min_ties);
+        assert_eq!(
+            min_val.to_bits(),
+            (-0.0f32).to_bits(),
+            "min must take -0.0 when both zero signs are present"
+        );
+
+        // A bound that is zero with only one sign available keeps that sign.
+        let (only_neg_min, only_neg_max) = minmax_finite_scalar(&[-0.0f32, -1.0]);
+        assert_eq!(only_neg_max.to_bits(), (-0.0f32).to_bits());
+        assert_eq!(only_neg_min.to_bits(), (-1.0f32).to_bits());
+        let (only_pos_min, only_pos_max) = minmax_finite_scalar(&[0.0f32, 1.0]);
+        assert_eq!(only_pos_min.to_bits(), 0.0f32.to_bits());
+        assert_eq!(only_pos_max.to_bits(), 1.0f32.to_bits());
+
+        // Non-zero bounds are returned untouched, and an all-nonfinite input keeps the
+        // identity pair rather than being rewritten by the sign pass.
+        assert_eq!(
+            minmax_finite_scalar(&[]),
+            (f32::INFINITY, f32::NEG_INFINITY)
+        );
+        assert_eq!(
+            minmax_finite_scalar(&[f32::NAN, f32::INFINITY]),
+            (f32::INFINITY, f32::NEG_INFINITY)
         );
     }
 
