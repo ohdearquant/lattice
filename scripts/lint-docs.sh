@@ -1,11 +1,14 @@
 #!/bin/sh
 set -e
 
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
+
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 script_path="$script_dir/lint-docs.sh"
 mode=${1:-}
 
 run_discovery_selftest() {
+    index_count_before=$(git ls-files | wc -l | tr -d '[:space:]')
     sandbox=$(mktemp -d "${TMPDIR:-/tmp}/lattice-lint-docs.XXXXXX")
     case "$sandbox" in
         "${TMPDIR:-/tmp}"/lattice-lint-docs.*) ;;
@@ -75,6 +78,11 @@ EOF
     fi
     if ! cmp -s "$expected" "$capture.lint"; then
         echo "lint-docs selftest: linter did not receive the exact tracked Markdown set" >&2
+        exit 1
+    fi
+    index_count_after=$(git ls-files | wc -l | tr -d '[:space:]')
+    if [ "$index_count_after" -ne "$index_count_before" ]; then
+        echo "lint-docs selftest: real index entry count changed: $index_count_before -> $index_count_after" >&2
         exit 1
     fi
     echo "lint-docs: recursive tracked-Markdown selftest OK"

@@ -87,6 +87,13 @@
 # is what makes a confirmed regression stop something.
 set -euo pipefail
 
+# A caller may hand us an inherited git environment (git exports GIT_INDEX_FILE to
+# hooks as a RELATIVE path, and GIT_DIR/GIT_WORK_TREE arrive empty). The worktree
+# add/remove calls below write a git index, so an inherited relative GIT_INDEX_FILE
+# would resolve against our cwd and hit the caller's real index instead. Nothing in
+# this script needs the caller's index state.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
+
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 
