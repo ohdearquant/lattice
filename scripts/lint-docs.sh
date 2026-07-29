@@ -108,6 +108,8 @@ run_index_isolation_selftest() (
     after_index="$sandbox/after-index"
     tracked_files="$sandbox/tracked-files"
     committed_files="$sandbox/committed-files"
+    hook_marker="$sandbox/hook-ran"
+    global_config="$sandbox/global-config"
     mkdir -p "$repo/sentinel"
     printf '%s\n' '# outer repository' >"$repo/README.md"
     printf '%s\n' 'keep one' >"$repo/sentinel/one.txt"
@@ -115,22 +117,31 @@ run_index_isolation_selftest() (
     git -C "$repo" init -q
     git -C "$repo" add README.md sentinel
     git -C "$repo" ls-files --stage -z >"$before_index"
+    git config --file "$global_config" core.hooksPath /dev/null
 
     cat >"$repo/.git/hooks/pre-commit" <<'EOF'
 #!/bin/sh
 set -e
 LATTICE_LINT_DOCS_INDEX_PROBE=1 \
     "${LATTICE_LINT_DOCS_SELFTEST_SCRIPT:?}" --selftest
+: >"${LATTICE_LINT_DOCS_HOOK_MARKER:?}"
 EOF
     chmod +x "$repo/.git/hooks/pre-commit"
     (
         cd "$repo"
         LATTICE_LINT_DOCS_SELFTEST_SCRIPT="$script_path" \
+            LATTICE_LINT_DOCS_HOOK_MARKER="$hook_marker" \
+            GIT_CONFIG_GLOBAL="$global_config" \
             GIT_INDEX_FILE="$repo/.git/index" \
-            git -c user.name=selftest -c user.email=selftest@example.invalid \
+            git -c core.hooksPath="$repo/.git/hooks" \
+            -c user.name=selftest -c user.email=selftest@example.invalid \
             commit -qm "lint-docs hook index isolation probe"
     )
 
+    if [ ! -f "$hook_marker" ]; then
+        echo "lint-docs index selftest: synthetic pre-commit hook did not complete" >&2
+        exit 1
+    fi
     git -C "$repo" ls-files --stage -z >"$after_index"
     if ! cmp -s "$before_index" "$after_index"; then
         echo "lint-docs index selftest: staged entries changed under hook context" >&2
