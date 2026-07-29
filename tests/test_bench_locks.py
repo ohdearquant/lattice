@@ -30,6 +30,7 @@ head ref changes, so both the early log and the pasted run-conditions block must
 carry them.
 """
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -43,6 +44,7 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
 LIB = REPO / "scripts" / "lib"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
+STATE_PROBE = LIB / "machine-state-probe.py"
 
 STUB_CARGO = """#!/usr/bin/env bash
 exit 0
@@ -228,8 +230,8 @@ class HeadModeReporting(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assert_provenance_in_header_and_report(
                 r.stdout,
-                f"  head arm: in-place at {sb.root}",
-                f"  gate: {sb.root}/scripts/perf-bench-gate.py",
+                "  head arm: in-place",
+                "  gate: scripts/perf-bench-gate.py from the invoking checkout",
             )
             self.assertNotIn("head arm: detached worktree", r.stdout)
 
@@ -246,10 +248,125 @@ class HeadModeReporting(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assert_provenance_in_header_and_report(
                 r.stdout,
-                f"  head arm: detached worktree at {sb.root}/.cache/bench-compare-head",
-                f"  gate: {sb.root}/scripts/perf-bench-gate.py",
+                "  head arm: detached worktree",
+                "  gate: scripts/perf-bench-gate.py from the invoking checkout",
             )
             self.assertNotIn("head arm: in-place", r.stdout)
+
+
+class RunProvenanceHandoff(unittest.TestCase):
+    def test_supervised_run_writes_complete_three_phase_handoff(self):
+        """The Markdown gate receives auditable machine and phase conditions."""
+        with _Sandbox() as sb:
+            r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
+            self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
+            provenance = sb.root / ".cache" / "bench-run-provenance.txt"
+            self.assertTrue(provenance.is_file(), r.stdout)
+            lines = provenance.read_text().splitlines()
+
+            for prefix in (
+                "schema=lattice-bench-provenance-v1",
+                "started_utc=",
+                "finished_utc=",
+                "host_id=hostname-sha256:",
+                "os=",
+                "base_ref=HEAD~1",
+                "base_sha=",
+                "head_ref=HEAD",
+                "head_sha=",
+                "head_mode=in-place",
+                "base_rustc=",
+                "head_rustc=",
+                "base_cargo=",
+                "head_cargo=",
+                "base_criterion=",
+                "head_criterion=",
+                "criterion_mode=quick",
+                "baseline_name=compare-base",
+                "targets=lattice-inference:elementwise_cpu_bench, lattice-embed:simd",
+                "inference_features=<none>",
+                "filters=inference='<all>' embed='<all>'",
+                "enforcement=report-only",
+                "lock=",
+            ):
+                self.assertTrue(
+                    any(line.startswith(prefix) for line in lines),
+                    f"missing provenance prefix {prefix!r}:\n"
+                    + "\n".join(lines),
+                )
+            self.assertEqual(
+                sum(line.startswith("ambient=") for line in lines),
+                3,
+                "\n".join(lines),
+            )
+            self.assertEqual(
+                sum(line.startswith("machine_state=") for line in lines),
+                3,
+                "\n".join(lines),
+            )
+            states = [
+                json.loads(line.removeprefix("machine_state="))
+                for line in lines
+                if line.startswith("machine_state=")
+            ]
+            self.assertEqual(
+                [state["label"] for state in states],
+                ["before base", "between phases", "after head"],
+            )
+            self.assertTrue(
+                all(
+                    state["power"]["status"] in ("measured", "unavailable")
+                    and state["thermal"]["status"] in ("measured", "unavailable")
+                    for state in states
+                )
+            )
+            self.assertNotIn(os.uname().nodename, provenance.read_text())
+            head_mode = next(
+                line for line in lines if line.startswith("head_mode=")
+            )
+            self.assertNotIn(" at ", head_mode)
+            self.assertIn("<summary>Run provenance</summary>", r.stdout)
+            self.assertIn("host_id=hostname-sha256:", r.stdout)
+            self.assertNotIn("unsuitable as benchmark evidence", r.stdout)
+
+
+class MachineStateParsers(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "machine_state_probe", str(STATE_PROBE)
+        )
+        self.probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.probe)
+
+    def test_power_source_is_measured_only_when_pmset_names_it(self):
+        ac = self.probe.parse_macos_power("Now drawing from 'AC Power'\n")
+        battery = self.probe.parse_macos_power("Now drawing from 'Battery Power'\n")
+        missing = self.probe.parse_macos_power("Battery information unavailable\n")
+        self.assertEqual(ac["state"], "ac")
+        self.assertEqual(battery["state"], "battery")
+        self.assertEqual(missing["status"], "unavailable")
+
+    def test_thermal_error_text_is_not_reported_as_nominal(self):
+        result = self.probe.parse_macos_thermal(
+            "Error: Failed to get thermal warning level with error code 0xe00002bc\n"
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertNotEqual(result.get("state"), "nominal")
+
+    def test_cpu_speed_limit_distinguishes_nominal_and_throttled(self):
+        nominal = self.probe.parse_macos_thermal("CPU_Speed_Limit = 100\n")
+        throttled = self.probe.parse_macos_thermal("CPU_Speed_Limit = 75\n")
+        self.assertEqual(nominal["state"], "nominal")
+        self.assertEqual(throttled["state"], "throttled")
+        self.assertEqual(throttled["cpu_speed_limit_percent"], 75)
+
+    def test_explicit_no_warning_pair_is_nominal(self):
+        result = self.probe.parse_macos_thermal(
+            "Note: No thermal warning level has been recorded\n"
+            "Note: No performance warning level has been recorded\n"
+        )
+        self.assertEqual(result["status"], "measured")
+        self.assertEqual(result["state"], "nominal")
 
 
 class ContentionDiagnostics(unittest.TestCase):

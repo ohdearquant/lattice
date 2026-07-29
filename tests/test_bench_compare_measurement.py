@@ -29,6 +29,9 @@ GATE = REPO / "scripts" / "perf-bench-gate.py"
 
 # Exits 0 for every subcommand and prints nothing a measurement filter matches.
 STUB_CARGO = """#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+fi
 exit 0
 """
 
@@ -38,11 +41,19 @@ GIT = ("git", "-c", "core.hooksPath=/dev/null")
 STALE_CHANGE_CARGO = r"""#!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+  exit 0
+fi
+
 write_baseline() {
   local bench="$1"
   mkdir -p "$PWD/target/criterion/$bench/compare-base"
   printf '%s\n' '{"mean":{"point_estimate":90.0}}' \
     > "$PWD/target/criterion/$bench/compare-base/estimates.json"
+  printf '%s\n' \
+    '{"sampling_mode":"Linear","iters":[1.0,2.0],"times":[1.0,2.0]}' \
+    > "$PWD/target/criterion/$bench/compare-base/sample.json"
 }
 
 write_head() {
@@ -51,6 +62,9 @@ write_head() {
   mkdir -p "$PWD/target/criterion/$bench/change"
   printf '%s\n' '{"mean":{"point_estimate":100.0}}' \
     > "$PWD/target/criterion/$bench/new/estimates.json"
+  printf '%s\n' \
+    '{"sampling_mode":"Flat","iters":[1.0,2.0],"times":[1.0,2.0]}' \
+    > "$PWD/target/criterion/$bench/new/sample.json"
   printf '%s\n' \
     '{"mean":{"point_estimate":0.01,"confidence_interval":{"lower_bound":0.0,"upper_bound":0.02}}}' \
     > "$PWD/target/criterion/$bench/change/estimates.json"
@@ -125,6 +139,12 @@ def _run(
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
         subprocess.run([*GIT, "init", "-q", "-b", "main", str(root)], check=True)
+        (root / "Cargo.lock").write_text(
+            'version = 4\n\n'
+            '[[package]]\n'
+            'name = "criterion"\n'
+            'version = "0.5.1"\n'
+        )
         for i in range(2):
             (root / f"f{i}.txt").write_text(str(i))
             subprocess.run([*GIT, "-C", str(root), "add", "-A"], check=True)

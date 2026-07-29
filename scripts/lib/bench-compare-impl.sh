@@ -95,7 +95,17 @@ set -euo pipefail
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
+QUICK_FLAGS="--quick"  # adaptive two-point sample, ~2 min total
+RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+if [ -n "${BENCH_HOST_ID:-}" ]; then
+  RUN_HOST_ID="configured:${BENCH_HOST_ID}"
+else
+  RUN_HOST_ID="$(
+    python3 -c 'import hashlib,socket; print("hostname-sha256:" + hashlib.sha256(socket.gethostname().encode()).hexdigest()[:16])'
+  )"
+fi
+RUN_OS="$(uname -srm)"
+PROVENANCE_FILE="$REPO/.cache/bench-run-provenance.txt"
 
 # --- Refuse to measure unless the recorded supervisor is one of our ancestors ---
 # scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
@@ -177,12 +187,27 @@ verify_locks
 # machine after the head phase invalidates numbers that were already taken,
 # which is exactly when the temptation to keep them is strongest.
 QUIET_SAMPLES=""
+MACHINE_STATE_SAMPLES=""
+machine_state_probe() {
+  local label="$1" record
+  if ! record="$(
+    python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
+  )"; then
+    echo "bench-compare: machine-state probe failed at '$label' — refusing." >&2
+    exit 2
+  fi
+  echo "[state] $label: $record"
+  MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
+}$record"
+}
+
 quiet_gate() {
   local label="$1" line rc=0
   line="$(python3 "$REPO/scripts/lib/quiet-probe.py" --label "$label")" || rc=$?
   echo "$line"
   QUIET_SAMPLES="${QUIET_SAMPLES}${QUIET_SAMPLES:+
 }$line"
+  machine_state_probe "$label"
   if [ "$rc" -ne 0 ]; then
     echo "bench-compare: machine was not quiet at '$label' — refusing to" \
          "certify this A/B. Set BENCH_IDLE_FLOOR to judge against a" \
@@ -211,7 +236,7 @@ AFTER_DDASH=0
 while [ $# -gt 0 ]; do
   case "${1:-}" in
     --full)
-      QUICK_FLAGS=""  # 100 samples, ~15 min total
+      QUICK_FLAGS=""  # configured sample size (normally 100), ~15 min total
       shift
       ;;
     --fail-on-regression)
@@ -264,9 +289,21 @@ if [ "$#" -gt 2 ]; then
   exit 2
 fi
 
-# Resolve to short SHAs for display
-BASE_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
-HEAD_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$HEAD_REF" 2>/dev/null || echo "$HEAD_REF")
+# Resolve both display and audit identities before measuring.
+if ! BASE_FULL_SHA="$(
+  git -C "$REPO" rev-parse --verify --end-of-options "${BASE_REF}^{commit}" 2>/dev/null
+)"; then
+  echo "bench-compare: base ref '$BASE_REF' is not a commit — refusing." >&2
+  exit 2
+fi
+if ! HEAD_FULL_SHA="$(
+  git -C "$REPO" rev-parse --verify --end-of-options "${HEAD_REF}^{commit}" 2>/dev/null
+)"; then
+  echo "bench-compare: head ref '$HEAD_REF' is not a commit — refusing." >&2
+  exit 2
+fi
+BASE_SHA="${BASE_FULL_SHA:0:10}"
+HEAD_SHA="${HEAD_FULL_SHA:0:10}"
 
 HEAD_WT="$REPO/.cache/bench-compare-head"
 if [ "$HEAD_REF" = "HEAD" ]; then
@@ -279,8 +316,8 @@ fi
 GATE_SCRIPT="$REPO/scripts/perf-bench-gate.py"
 
 print_execution_provenance() {
-  echo "  head arm: $HEAD_MODE at $HEAD_DIR"
-  echo "  gate: $GATE_SCRIPT"
+  echo "  head arm: $HEAD_MODE"
+  echo "  gate: scripts/perf-bench-gate.py from the invoking checkout"
 }
 
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
@@ -303,6 +340,40 @@ if [ -d "$WT" ]; then
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
 fi
 git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_REF" 2>&1 | tail -1
+
+command_version() {
+  local directory="$1"; shift
+  local output
+  if ! output="$(cd "$directory" && "$@" 2>&1)" || [ -z "$output" ]; then
+    printf '%s' "unavailable"
+    return
+  fi
+  printf '%s' "$output" | tr '\n' ';'
+}
+
+criterion_version() {
+  local lockfile="$1/Cargo.lock"
+  if [ ! -f "$lockfile" ]; then
+    printf '%s' "unavailable"
+    return
+  fi
+  awk '
+    $0 == "name = \"criterion\"" { in_criterion = 1; next }
+    in_criterion && /^version = "/ {
+      value = $0
+      sub(/^version = "/, "", value)
+      sub(/"$/, "", value)
+      print value
+      exit
+    }
+    in_criterion && /^\[\[package\]\]/ { exit }
+  ' "$lockfile"
+}
+
+BASE_RUSTC="$(command_version "$WT" rustc --version)"
+BASE_CARGO="$(command_version "$WT" cargo --version)"
+BASE_CRITERION="$(criterion_version "$WT")"
+[ -n "$BASE_CRITERION" ] || BASE_CRITERION="unavailable"
 
 cleanup() {
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
@@ -412,6 +483,11 @@ if [ "$HEAD_MODE" = "detached worktree" ]; then
   # Update cleanup to also remove head worktree
   trap 'git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true; cleanup' EXIT
 fi
+
+HEAD_RUSTC="$(command_version "$HEAD_DIR" rustc --version)"
+HEAD_CARGO="$(command_version "$HEAD_DIR" cargo --version)"
+HEAD_CRITERION="$(criterion_version "$HEAD_DIR")"
+[ -n "$HEAD_CRITERION" ] || HEAD_CRITERION="unavailable"
 
 # Copy base's criterion baseline into head's target/criterion
 mkdir -p "$HEAD_DIR/target/criterion"
@@ -541,6 +617,60 @@ if [ -n "$QUICK_FLAGS" ]; then
   )
 fi
 
+write_run_provenance() {
+  local finished_utc criterion_mode enforcement
+  finished_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if [ -n "$QUICK_FLAGS" ]; then
+    criterion_mode="quick"
+  else
+    criterion_mode="full"
+  fi
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    enforcement="fail-on-regression"
+  else
+    enforcement="report-only"
+  fi
+
+  mkdir -p "$(dirname "$PROVENANCE_FILE")"
+  {
+    printf 'schema=lattice-bench-provenance-v1\n'
+    printf 'started_utc=%s\n' "$RUN_STARTED_UTC"
+    printf 'finished_utc=%s\n' "$finished_utc"
+    printf 'host_id=%s\n' "$RUN_HOST_ID"
+    printf 'os=%s\n' "$RUN_OS"
+    printf 'base_ref=%s\n' "$BASE_REF"
+    printf 'base_sha=%s\n' "$BASE_FULL_SHA"
+    printf 'head_ref=%s\n' "$HEAD_REF"
+    printf 'head_sha=%s\n' "$HEAD_FULL_SHA"
+    printf 'head_mode=%s\n' "${HEAD_MODE// /-}"
+    printf 'base_rustc=%s\n' "$BASE_RUSTC"
+    printf 'head_rustc=%s\n' "$HEAD_RUSTC"
+    printf 'base_cargo=%s\n' "$BASE_CARGO"
+    printf 'head_cargo=%s\n' "$HEAD_CARGO"
+    printf 'base_criterion=%s\n' "$BASE_CRITERION"
+    printf 'head_criterion=%s\n' "$HEAD_CRITERION"
+    printf 'criterion_mode=%s\n' "$criterion_mode"
+    printf 'baseline_name=%s\n' "$BENCH_BASELINE_NAME"
+    printf 'targets=lattice-inference:%s, lattice-embed:%s\n' \
+      "$BENCHES_INFERENCE" "$BENCHES_EMBED"
+    printf 'inference_features=%s\n' "${CARGO_FEATURES_INFERENCE:-<none>}"
+    printf "filters=inference='%s' embed='%s'\n" \
+      "${BENCH_GROUPS_INFERENCE:-<all>}" "${BENCH_GROUPS_EMBED:-<all>}"
+    printf 'enforcement=%s\n' "$enforcement"
+    while IFS= read -r line; do
+      [ -n "$line" ] && printf 'lock=%s\n' "$line"
+    done <<< "$LOCK_SUMMARY"
+    while IFS= read -r line; do
+      [ -n "$line" ] && printf 'ambient=%s\n' "$line"
+    done <<< "$QUIET_SAMPLES"
+    while IFS= read -r line; do
+      [ -n "$line" ] && printf 'machine_state=%s\n' "$line"
+    done <<< "$MACHINE_STATE_SAMPLES"
+  } > "$PROVENANCE_FILE"
+}
+
+write_run_provenance
+
 # --- Report ---
 # The conditions go in the report, not just in the log. A number that does not
 # record what produced it is indistinguishable from one produced under good
@@ -561,10 +691,15 @@ echo "  locks:"
 echo "$LOCK_SUMMARY"
 echo "  ambient load:"
 echo "$QUIET_SAMPLES" | sed 's/^/    /'
+echo "  thermal/power:"
+echo "$MACHINE_STATE_SAMPLES" | sed 's/^/    /'
 
 echo ""
 echo "=== Full gate report ==="
-GATE_ARGS=(--baseline-name "$BENCH_BASELINE_NAME")
+GATE_ARGS=(
+  --baseline-name "$BENCH_BASELINE_NAME"
+  --provenance-file "$PROVENANCE_FILE"
+)
 if [ -s "$INFO_GROUPS_FILE" ]; then
   GATE_ARGS+=(--informational-groups-file "$INFO_GROUPS_FILE")
 fi
@@ -574,6 +709,7 @@ if [ "$FAIL_ON_REGRESSION" = "1" ]; then
   # knows how many were judgeable. Testing for the criterion DIRECTORY here
   # cannot work — this script creates that directory itself before benching.
   GATE_ARGS+=(--require-measurements)
+  GATE_ARGS+=(--require-provenance)
 fi
 
 GATE_RC=0

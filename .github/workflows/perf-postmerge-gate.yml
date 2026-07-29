@@ -60,6 +60,7 @@ on:
       - 'scripts/lib/bench-compare-impl.sh'
       - 'scripts/lib/bench-locks.py'
       - 'scripts/lib/quiet-probe.py'
+      - 'scripts/lib/machine-state-probe.py'
       - 'scripts/lib/bench-informational-groups.sh'
       - 'scripts/lib/bench-quick-informational-targets.txt'
       - 'scripts/lib/resolve-informational-groups.sh'
