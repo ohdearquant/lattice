@@ -1469,10 +1469,10 @@ class ProvenanceRecord:
     """Per DESIGN.md section 3 "Hosted validation and aggregation" /
     section 4 "Baseline freshness and provenance": the identity binding a
     cell record to the exact code, config, and machine that produced it.
-    `policy_sha`/`profile_sha` are `bench_gate_math.policy_sha`-style
-    SHA-256 hex digests of the EXACT policy/profile file bytes the gate
-    was evaluated against -- `validate_run_record`'s post-run-threshold-
-    change check recomputes these and rejects on mismatch."""
+    `profile_sha` is the SHA-256 digest of the exact profile bytes.
+    `policy_sha` is a tagged `bench_gate_math.policy_sha` identity over
+    canonical parsed policy values; legacy records may carry an untagged
+    raw-byte digest, which validation never aliases to the canonical scheme."""
 
     repo_sha: str
     candidate_sha: str
@@ -1695,6 +1695,10 @@ def parse_provenance(d: dict) -> ProvenanceRecord:
         val = d[key]
         if isinstance(val, bool) or not isinstance(val, int) or val < 1:
             raise RunRecordValidationError(f"provenance: {key} must be a positive int")
+    try:
+        bench_gate_math.policy_sha_scheme(d["policy_sha"])
+    except bench_gate_math.PolicyConfigError as exc:
+        raise RunRecordValidationError(f"provenance: {exc}") from exc
     workflow_run_id = d.get("workflow_run_id")
     if workflow_run_id is not None and (not isinstance(workflow_run_id, str) or not workflow_run_id):
         raise RunRecordValidationError("provenance: workflow_run_id must be a non-empty string or null")
@@ -2174,9 +2178,10 @@ def validate_run_record(
         submitter-controlled), and so is `n_valid < required_n`. Class "C"
         (informational/trend-only) metrics are exempt from this
         derivation -- they never gate a required cell.
-      - post-run threshold change: if `current_policy_sha` is given, it
-        must equal `record.provenance.policy_sha` -- the gate must have
-        been evaluated against the policy content it claims.
+      - post-run policy change: if `current_policy_sha` is given, it must
+        use the same identity scheme and equal
+        `record.provenance.policy_sha`. Legacy byte digests are recognized
+        but never implicitly mapped to canonical identities.
       - wrong SHA: if `expected_repo_sha` is given, it must equal
         `record.provenance.candidate_sha`.
     """
@@ -2252,12 +2257,33 @@ def validate_run_record(
         # class "C": informational/trend-only, never gates a required cell
         # (perf-policy.toml) -- no required_n derivation applies.
 
-    if current_policy_sha is not None and record.provenance.policy_sha != current_policy_sha:
-        raise RunRecordValidationError(
-            f"INFRA-FAIL: cell {record.cell_id!r} was gated against policy_sha="
-            f"{record.provenance.policy_sha!r} but the current policy_sha is {current_policy_sha!r} "
-            "-- post-run threshold change, this record's verdict is no longer valid"
-        )
+    if current_policy_sha is not None:
+        try:
+            record_policy_scheme = bench_gate_math.policy_sha_scheme(record.provenance.policy_sha)
+            current_policy_scheme = bench_gate_math.policy_sha_scheme(current_policy_sha)
+        except bench_gate_math.PolicyConfigError as exc:
+            raise RunRecordValidationError(
+                f"INFRA-FAIL: cell {record.cell_id!r} carries an invalid policy identity: {exc}"
+            ) from exc
+        if record_policy_scheme != current_policy_scheme:
+            raise RunRecordValidationError(
+                f"INFRA-FAIL: cell {record.cell_id!r} policy_sha schemes differ: record uses "
+                f"{record_policy_scheme!r}, current policy uses {current_policy_scheme!r}. "
+                "A legacy byte-SHA is not comparable to a canonical policy identity and is never "
+                "migrated implicitly; use documented transition evidence or rerun the benchmark"
+            )
+        if record.provenance.policy_sha != current_policy_sha:
+            detail = (
+                "legacy byte-SHA mismatch; byte identities cannot distinguish prose from gating "
+                "changes and no transition is accepted implicitly"
+                if record_policy_scheme == bench_gate_math.LEGACY_POLICY_SHA_SCHEME
+                else "canonical gating-policy identity changed"
+            )
+            raise RunRecordValidationError(
+                f"INFRA-FAIL: cell {record.cell_id!r} was gated against policy_sha="
+                f"{record.provenance.policy_sha!r} but the current policy_sha is {current_policy_sha!r} "
+                f"-- {detail}; this record's verdict is no longer valid"
+            )
 
     if expected_repo_sha is not None and record.provenance.candidate_sha != expected_repo_sha:
         raise RunRecordValidationError(
