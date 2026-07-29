@@ -3719,6 +3719,76 @@ mod tests {
         );
     }
 
+    /// The collision entirely INSIDE the added-token table, with no base
+    /// vocabulary entry involved.
+    ///
+    /// This is a separate test rather than another case in the one above because
+    /// it was invisible for a different reason, at a different layer. The parse
+    /// step used to key renderable added tokens by CONTENT, so a second
+    /// `</think>` entry overwrote the first before any lookup ran: the ambiguity
+    /// check could not have caught it no matter how it was written, because only
+    /// one id survived loading. Keying that map by id is what makes the two
+    /// entries reach the resolver at all, and that is the thing this test pins.
+    #[test]
+    fn reasoning_budget_rejects_duplicate_added_token_aliases_of_the_close_marker() {
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(
+            r#"{
+                "model": {
+                    "type": "BPE",
+                    "vocab": {"a": 0, "b": 1},
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 100, "content": "</think>", "special": false},
+                    {"id": 101, "content": "</think>", "special": false}
+                ]
+            }"#,
+        )
+        .expect("duplicate-alias tokenizer must load");
+
+        let mut ids = tokenizer.token_ids_for_content("</think>");
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![100, 101],
+            "both added-token aliases must survive loading; if only one does, the \
+             collision was discarded at parse time and no resolver check can see it"
+        );
+
+        let result = resolve_reasoning_close_token(&tokenizer, Some(1), 200);
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("more than one") && message.contains("101")
+            ),
+            "duplicate added-token aliases must be rejected like any other ambiguity, \
+             got {result:?}"
+        );
+
+        // Control: one alias, same shape, resolves. This is what distinguishes
+        // "the resolver rejects ambiguity" from "the resolver rejects added
+        // tokens", which would pass the assertion above just as well.
+        let single = BpeTokenizer::from_tokenizer_json_str(
+            r#"{
+                "model": {
+                    "type": "BPE",
+                    "vocab": {"a": 0, "b": 1},
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 100, "content": "</think>", "special": false}
+                ]
+            }"#,
+        )
+        .expect("single-alias tokenizer must load");
+        assert_eq!(
+            resolve_reasoning_close_token(&single, Some(1), 200)
+                .expect("a single added-token alias must resolve"),
+            Some(100)
+        );
+    }
+
     /// Early-success bypass, CPU `generate`: an active reasoning budget with
     /// no resolvable `</think>` marker must fail closed even when the very
     /// first sampled token is itself a stop token -- `should_stop_token`'s

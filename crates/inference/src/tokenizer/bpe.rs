@@ -210,7 +210,7 @@ impl BpeTokenizer {
         vocab: HashMap<String, u32>,
         merges: Vec<(String, String)>,
         added_tokens: HashMap<String, u32>,
-        rendered_added: HashMap<String, u32>,
+        rendered_added: HashMap<u32, String>,
         cache_capacity: usize,
         max_seq_len: usize,
     ) -> Result<Self, InferenceError> {
@@ -218,10 +218,7 @@ impl BpeTokenizer {
         // Invert the renderable added-token set to id -> content for decode-side
         // lookup. Built once at construction; consulted by `token_for_id` only
         // when the base table misses (added-token ids exceed the base vocab range).
-        let added_render: HashMap<u32, String> = rendered_added
-            .into_iter()
-            .map(|(content, id)| (id, content))
-            .collect();
+        let added_render: HashMap<u32, String> = rendered_added;
         let mut merge_ranks: HashMap<String, HashMap<String, usize>> = HashMap::new();
         for (rank, (left, right)) in merges.into_iter().enumerate() {
             // First occurrence defines the rank: merges are listed in priority
@@ -1789,9 +1786,9 @@ mod tests {
         }
         // rendered_added = the special=false subset (content -> id), ids past base max.
         let mut rendered = HashMap::new();
-        rendered.insert("</think>".to_string(), 100u32);
-        rendered.insert("<think>".to_string(), 101u32);
-        rendered.insert("<tool_call>".to_string(), 102u32);
+        rendered.insert(100u32, "</think>".to_string());
+        rendered.insert(101u32, "<think>".to_string());
+        rendered.insert(102u32, "<tool_call>".to_string());
 
         let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
             vocab,
@@ -1850,7 +1847,7 @@ mod tests {
 
         let mut rendered = HashMap::new();
         // Tier 3: a `special: false` added token, absent from both maps above.
-        rendered.insert("<tool_call>".to_string(), 30u32);
+        rendered.insert(30u32, "<tool_call>".to_string());
 
         let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
             vocab,
@@ -1893,7 +1890,7 @@ mod tests {
 
         let mut rendered = HashMap::new();
         // The same rendered spelling, at the id an added token would really get.
-        rendered.insert("</think>".to_string(), 100u32);
+        rendered.insert(100u32, "</think>".to_string());
 
         let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
             vocab,
