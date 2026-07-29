@@ -490,18 +490,40 @@ impl BpeTokenizer {
     /// loops) and the Metal cross-turn prefix-cache fingerprint
     /// (`cross_turn_metadata`) both call this directly rather than each
     /// owning a separate cached/uncached copy of the lookup.
-    pub(crate) fn token_id_for_content(&self, content: &str) -> Option<u32> {
-        self.inner
+    ///
+    /// EVERY matching id is returned, not the first, and the tiers make that
+    /// distinction load-bearing rather than pedantic: `vocab` and
+    /// `rendered_added` are independent constructor inputs with nothing
+    /// reconciling them, and added-token ids deliberately live beyond the base
+    /// vocabulary range, so one spelling can carry *different* ids in two tiers.
+    /// A caller that took only the head would silently discard the rest, and the
+    /// model could then emit a discarded alias that renders as the marker while
+    /// an id comparison against the head says it did not. Collapsing to a single
+    /// id is therefore only sound once a caller has established there is exactly
+    /// one, which is why no single-id accessor exists here: the check and the
+    /// lookup would be separable, and separable is how they drift.
+    pub(crate) fn token_ids_for_content(&self, content: &str) -> Vec<u32> {
+        let mut ids: Vec<u32> = Vec::new();
+        for id in self
+            .inner
             .special_tokens
             .get(content)
-            .or_else(|| self.inner.vocab.get(content))
+            .into_iter()
+            .chain(self.inner.vocab.get(content))
             .copied()
-            .or_else(|| {
+            .chain(
                 self.inner
                     .added_render
                     .iter()
-                    .find_map(|(&id, token)| (token == content).then_some(id))
-            })
+                    .filter(|(_, token)| token.as_str() == content)
+                    .map(|(&id, _)| id),
+            )
+        {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
     }
 
     /// **Unstable**: return the byte representation of every model token ID.
@@ -1782,7 +1804,7 @@ mod tests {
         .expect("construct tokenizer with rendered added tokens");
 
         assert_eq!(tokenizer.special_token_id("</think>"), None);
-        assert_eq!(tokenizer.token_id_for_content("</think>"), Some(100));
+        assert_eq!(tokenizer.token_ids_for_content("</think>"), vec![100]);
 
         // special=false added tokens render verbatim (byte-level decode is identity
         // for printable ASCII).
@@ -1809,14 +1831,14 @@ mod tests {
         assert_eq!(out, "a</think>b");
     }
 
-    /// `token_id_for_content` must resolve a marker from each of its three
+    /// `token_ids_for_content` must resolve a marker from each of its three
     /// tiers. The `vocab` and `added_render` tiers are the load-bearing ones:
     /// `special_token_id` alone covers only the `special_tokens` tier, so a
     /// marker declared as an ordinary vocab entry or as a `special: false`
     /// added token resolves to `None` through that older path -- which is
     /// exactly how an active reasoning budget became a silent no-op.
     #[test]
-    fn token_id_for_content_resolves_special_vocab_and_added_render_tiers() {
+    fn token_ids_for_content_resolves_special_vocab_and_added_render_tiers() {
         let mut vocab = HashMap::new();
         vocab.insert("a".to_string(), 0u32);
         // Tier 2: a marker declared as an ordinary base-vocabulary entry.
@@ -1840,17 +1862,61 @@ mod tests {
         )
         .expect("construct three-tier tokenizer");
 
-        assert_eq!(tokenizer.token_id_for_content("<|im_end|>"), Some(20));
+        assert_eq!(tokenizer.token_ids_for_content("<|im_end|>"), vec![20]);
 
         // Tiers 2 and 3 are invisible to `special_token_id`.
         assert_eq!(tokenizer.special_token_id("</think>"), None);
-        assert_eq!(tokenizer.token_id_for_content("</think>"), Some(7));
+        assert_eq!(tokenizer.token_ids_for_content("</think>"), vec![7]);
         assert_eq!(tokenizer.special_token_id("<tool_call>"), None);
-        assert_eq!(tokenizer.token_id_for_content("<tool_call>"), Some(30));
+        assert_eq!(tokenizer.token_ids_for_content("<tool_call>"), vec![30]);
 
         // A spelling present in no tier resolves to None rather than to some
         // near-miss entry.
-        assert_eq!(tokenizer.token_id_for_content("<think>"), None);
+        assert!(tokenizer.token_ids_for_content("<think>").is_empty());
+    }
+
+    /// One spelling can carry DIFFERENT ids in two tiers, and the single-id
+    /// lookup necessarily discards all but the first.
+    ///
+    /// This is not exotic: `vocab` and `rendered_added` are independent
+    /// constructor inputs with nothing reconciling them, and added-token ids
+    /// deliberately live beyond the base vocabulary range, so a marker declared
+    /// in both is guaranteed to have two ids rather than one. The tier test
+    /// above cannot catch it because every spelling there appears in exactly one
+    /// tier -- it would pass unchanged against a lookup with no notion of
+    /// ambiguity at all.
+    #[test]
+    fn token_ids_for_content_reports_every_id_sharing_one_spelling() {
+        let mut vocab = HashMap::new();
+        vocab.insert("a".to_string(), 0u32);
+        vocab.insert("</think>".to_string(), 7u32);
+
+        let mut rendered = HashMap::new();
+        // The same rendered spelling, at the id an added token would really get.
+        rendered.insert("</think>".to_string(), 100u32);
+
+        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
+            vocab,
+            Vec::new(),
+            HashMap::new(),
+            rendered,
+            DEFAULT_BPE_CACHE_CAPACITY,
+            DEFAULT_BPE_MAX_SEQ_LEN,
+        )
+        .expect("construct colliding-spelling tokenizer");
+
+        assert_eq!(tokenizer.token_ids_for_content("</think>"), vec![7, 100]);
+
+        // Tier precedence still decides which id comes first, so a caller that
+        // took only the head would silently drop id 100 here. That discard is
+        // the reason the resolver refuses this tokenizer rather than resolving
+        // it, and the reason no single-id accessor survives on this type.
+        assert_eq!(tokenizer.token_ids_for_content("</think>")[0], 7);
+
+        // Unambiguous spellings return exactly one id, so the ambiguity signal
+        // is a real discriminator and not something every lookup trips.
+        assert_eq!(tokenizer.token_ids_for_content("a"), vec![0]);
+        assert!(tokenizer.token_ids_for_content("<think>").is_empty());
     }
 
     #[test]

@@ -16212,9 +16212,16 @@ mod inner {
             // prefix instead of forcing FullRefill. The close-marker
             // VALIDATION that a budget is actually enforceable still runs
             // separately, per-request, in `resolve_reasoning_close_token`.
-            tokenizer
-                .token_id_for_content(crate::model::qwen35::REASONING_CLOSE_MARKER)
-                .hash(&mut tok_hasher);
+            // Hash EVERY id rendering the marker, not just the first tier hit.
+            // Two tokenizers that agree on the winning id but differ in their
+            // remaining aliases are not the same tokenizer, and folding only
+            // one id in would hash them identically. Sorted because the added
+            // -token walk is over a HashMap, and a cache key should not depend
+            // on iteration order.
+            let mut close_marker_ids =
+                tokenizer.token_ids_for_content(crate::model::qwen35::REASONING_CLOSE_MARKER);
+            close_marker_ids.sort_unstable();
+            close_marker_ids.hash(&mut tok_hasher);
             let tokenizer_fingerprint = tok_hasher.finish();
 
             let adapter_id = match &self.lora {

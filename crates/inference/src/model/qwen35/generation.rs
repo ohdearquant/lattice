@@ -2339,7 +2339,10 @@ pub(crate) const REASONING_CLOSE_MARKER: &str = "</think>";
 ///
 /// Exact token-content lookup covers both base-vocabulary entries and added
 /// tokens regardless of their `special` flag. An active budget fails closed if
-/// the tokenizer has no representable `</think>` marker, or if the resolved id
+/// the tokenizer has no representable `</think>` marker, if more than one id
+/// renders as that marker (the decode loop recognises only one, so the rest
+/// would close the block in the output while the budget kept counting), or if
+/// the resolved id
 /// is outside `vocab_size` (a mismatched or malicious tokenizer can declare
 /// `</think>` in its base vocabulary at an id the loaded model has no
 /// embedding/logit row for) -- the id is later forced into decoding, and
@@ -2354,14 +2357,36 @@ pub(crate) fn resolve_reasoning_close_token(
         return Ok(None);
     }
 
-    let token_id = tokenizer
-        .token_id_for_content(REASONING_CLOSE_MARKER)
-        .ok_or_else(|| {
-            InferenceError::InvalidInput(
+    // Ambiguity is the same defect as absence and has to fail the same way.
+    // `DecodePolicy` compares the emitted id against ONE close-marker id, so if
+    // the tokenizer spells `</think>` at two different ids -- which the tiers
+    // permit, since `vocab` and `rendered_added` are independent inputs and
+    // added-token ids sit beyond the base range -- then resolving to the first
+    // tier silently discards the other. A generation that emitted the discarded
+    // alias would render `</think>` while the policy went on treating the
+    // reasoning block as open, spending the budget and forcing a second marker.
+    // That is a silently unenforced budget reached by a different route, which
+    // is the exact failure this resolver exists to refuse.
+    let ids = tokenizer.token_ids_for_content(REASONING_CLOSE_MARKER);
+    let token_id = match ids.as_slice() {
+        [] => {
+            return Err(InferenceError::InvalidInput(
                 "reasoning_budget cannot be enforced because the tokenizer has no </think> token"
                     .into(),
-            )
-        })?;
+            ));
+        }
+        [only] => *only,
+        ambiguous => {
+            let mut sorted = ambiguous.to_vec();
+            sorted.sort_unstable();
+            return Err(InferenceError::InvalidInput(format!(
+                "reasoning_budget cannot be enforced because the tokenizer maps </think> to \
+                 more than one token id ({sorted:?}); the decode loop recognises a single \
+                 close-marker id, so any other id rendering </think> would close the reasoning \
+                 block in the output while the budget kept treating it as open"
+            )));
+        }
+    };
 
     if (token_id as usize) >= vocab_size {
         return Err(InferenceError::InvalidInput(format!(
@@ -3521,7 +3546,7 @@ mod tests {
         let tokenizer =
             BpeTokenizer::from_vocab_and_merges(HashMap::from([("a".to_string(), 0)]), Vec::new())
                 .expect("marker-free tokenizer must load");
-        assert_eq!(tokenizer.token_id_for_content("</think>"), None);
+        assert!(tokenizer.token_ids_for_content("</think>").is_empty());
         assert_eq!(
             resolve_reasoning_close_token(&tokenizer, None, 97).expect("None budget never errors"),
             None
@@ -3608,6 +3633,88 @@ mod tests {
         assert_eq!(
             resolve_reasoning_close_token(&tokenizer, Some(1), 8)
                 .expect("in-range marker must resolve"),
+            Some(7)
+        );
+    }
+
+    /// Two ids, one spelling: the resolver must refuse rather than pick one.
+    ///
+    /// `DecodePolicy` recognises a single close-marker id. If `</think>` exists
+    /// as a base-vocabulary entry AND as a `special: false` added token, the
+    /// tiers give it two different ids, and resolving to the first means the
+    /// model can emit the other, render `</think>` into the output, and leave
+    /// `thinking_closed` false -- the budget then keeps counting reasoning
+    /// tokens and eventually forces a second marker. That is a silently
+    /// unenforced budget, which is the failure this resolver exists to refuse,
+    /// so ambiguity has to fail the same way absence does.
+    ///
+    /// Driven through the real public loader rather than a hand-built struct,
+    /// and both ids sit well inside `vocab_size` so the range check cannot be
+    /// what fires. The control at the end is the discriminator: drop the added
+    /// token and the identical vocabulary resolves cleanly, so the rejection is
+    /// attributable to the collision and not to anything else in the fixture.
+    #[test]
+    fn reasoning_budget_rejects_close_marker_spelled_by_more_than_one_id() {
+        let ambiguous = BpeTokenizer::from_tokenizer_json_str(
+            r#"{
+                "model": {
+                    "type": "BPE",
+                    "vocab": {"a": 0, "</think>": 7},
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 100, "content": "</think>", "special": false}
+                ]
+            }"#,
+        )
+        .expect("colliding-spelling tokenizer must load");
+
+        // Assert the SET, not the order. Which tier the real loader files an
+        // added token under is its business and not this test's subject, and
+        // measured here it files this one AHEAD of the base-vocabulary entry --
+        // so through the real loader the added alias wins precedence and id 7 is
+        // the one discarded, the opposite direction from the hand-built fixture
+        // in `bpe.rs`. Both directions are the same defect, which is the reason
+        // this resolver refuses ambiguity outright rather than trying to pick
+        // the right one.
+        let mut ids = ambiguous.token_ids_for_content("</think>");
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![7, 100],
+            "fixture precondition: the loader must actually produce two ids"
+        );
+
+        let result = resolve_reasoning_close_token(&ambiguous, Some(1), 200);
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("</think>")
+                        && message.contains("more than one")
+                        && message.contains("100")
+            ),
+            "a </think> spelled by two ids must be rejected as InvalidInput naming both, \
+             got {result:?}"
+        );
+
+        // Control: the same base vocabulary with no colliding added token
+        // resolves. Without this, a resolver that rejected every tokenizer would
+        // pass the assertion above.
+        let unambiguous = BpeTokenizer::from_tokenizer_json_str(
+            r#"{
+                "model": {
+                    "type": "BPE",
+                    "vocab": {"a": 0, "</think>": 7},
+                    "merges": []
+                },
+                "added_tokens": []
+            }"#,
+        )
+        .expect("single-spelling tokenizer must load");
+        assert_eq!(
+            resolve_reasoning_close_token(&unambiguous, Some(1), 200)
+                .expect("an unambiguous marker must resolve"),
             Some(7)
         );
     }
