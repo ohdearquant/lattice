@@ -235,6 +235,14 @@ fn unproven_ref_narrowing_siblings_fail_closed() {
             }),
         ),
         (
+            "strictly narrower integer sibling would otherwise widen to number and admit 1.5",
+            serde_json::json!({
+                "$defs": { "N": { "type": "number" } },
+                "$ref": "#/$defs/N",
+                "type": "integer"
+            }),
+        ),
+        (
             "required mixed with redundant type",
             serde_json::json!({
                 "$defs": {
