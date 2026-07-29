@@ -480,6 +480,21 @@ mod external_impl_contract {
         assert_eq!(out.len(), 1, "one embedding per input");
     }
 
+    #[cfg(feature = "native")]
+    #[tokio::test]
+    async fn cached_wrapper_preserves_external_role_override() {
+        use crate::service::CachedEmbeddingService;
+        use std::sync::Arc;
+
+        let text = "a".repeat(MAX_TEXT_BYTES);
+        let service = CachedEmbeddingService::new(Arc::new(ExactCapWithOverride), 128);
+        let out = service
+            .embed_query(&[text], EmbeddingModel::BgeSmallEnV15)
+            .await
+            .expect("cached miss must preserve the inner role override");
+        assert_eq!(out.len(), 1, "one embedding per input");
+    }
+
     /// Over-cap caller text is rejected on both external shapes, and the error
     /// reports the published cap rather than any wider internal bound.
     #[tokio::test]

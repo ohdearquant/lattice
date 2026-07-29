@@ -84,6 +84,8 @@ Run with: python3 -m pytest tests/test_bench_gate_math.py -v
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
 import statistics
@@ -96,6 +98,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_POLICY_FILE = REPO_ROOT / "scripts" / "perf-policy.toml"
 
 CELL_CLASSES = ("A", "B", "C")
+POLICY_SHA_SCHEME = "canonical-v1"
+LEGACY_POLICY_SHA_SCHEME = "legacy-bytes"
+POLICY_SHA_PREFIX = f"{POLICY_SHA_SCHEME}:"
 
 
 class PolicyConfigError(ValueError):
@@ -878,11 +883,58 @@ def load_policy(path: Path = DEFAULT_POLICY_FILE) -> dict:
     return doc
 
 
-def policy_sha(path: Path = DEFAULT_POLICY_FILE) -> str:
-    """SHA-256 of the raw policy file bytes — the value a `ProvenanceRecord`
-    pins so a later re-validation can detect a post-run threshold change
-    (the policy content changed under the same or a different
-    `policy_version` after the run was gated)."""
-    import hashlib
+def _is_lower_sha256(value: str) -> bool:
+    return len(value) == 64 and all(char in "0123456789abcdef" for char in value)
 
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def policy_sha_scheme(value: str) -> str:
+    """Classify a policy identity without treating legacy and canonical
+    digests as interchangeable."""
+    if not isinstance(value, str):
+        raise PolicyConfigError("policy_sha must be a string")
+    if value.startswith(POLICY_SHA_PREFIX) and _is_lower_sha256(value[len(POLICY_SHA_PREFIX) :]):
+        return POLICY_SHA_SCHEME
+    if _is_lower_sha256(value):
+        return LEGACY_POLICY_SHA_SCHEME
+    raise PolicyConfigError(
+        "policy_sha must be either a legacy 64-character lowercase SHA-256 "
+        f"or {POLICY_SHA_PREFIX!r} followed by one"
+    )
+
+
+def _canonical_policy_document(policy_doc: dict) -> dict:
+    """Return the identity-bearing policy values.
+
+    TOML comments are absent from the parsed document. The only parsed field
+    omitted here is `cv_bands[*].note`, which `parse_cv_bands` carries for
+    diagnostics but no gate or validator reads. Every other value remains
+    identity-bearing by default, including `other_rule`.
+    """
+    canonical = dict(policy_doc)
+    canonical["cv_bands"] = [
+        {key: value for key, value in band.items() if key != "note"}
+        for band in policy_doc["cv_bands"]
+    ]
+    return canonical
+
+
+def policy_sha(path: Path = DEFAULT_POLICY_FILE) -> str:
+    """Tagged SHA-256 of the canonical parsed gating policy.
+
+    Deterministic JSON preserves every parsed value except the explicitly
+    non-gating `cv_bands[*].note` prose. The scheme tag prevents a legacy
+    raw-byte digest from being mistaken for a comparable canonical identity.
+    """
+    policy_doc = load_policy(path)
+    try:
+        payload = json.dumps(
+            _canonical_policy_document(policy_doc),
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise PolicyConfigError(f"{path}: policy values cannot be canonicalized: {exc}") from exc
+    digest = hashlib.sha256(payload).hexdigest()
+    return f"{POLICY_SHA_PREFIX}{digest}"

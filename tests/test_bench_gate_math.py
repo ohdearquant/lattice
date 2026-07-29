@@ -13,6 +13,7 @@ import importlib.util
 import math
 import random
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -370,18 +371,81 @@ class CvBandsTest(unittest.TestCase):
 
 
 class LoadPolicyTest(unittest.TestCase):
+    def _sha_for_text(self, text: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "perf-policy.toml"
+            path.write_text(text)
+            return gm.policy_sha(path)
+
     def test_shipped_policy_file_loads(self):
         doc = gm.load_policy()
         self.assertEqual(doc["policy_version"], 1)
         self.assertIn("families", doc)
         self.assertIn("decode", doc["families"])
 
-    def test_policy_sha_is_stable_hex_digest(self):
+    def test_policy_sha_is_stable_tagged_digest(self):
         sha1 = gm.policy_sha()
         sha2 = gm.policy_sha()
         self.assertEqual(sha1, sha2)
-        self.assertEqual(len(sha1), 64)
-        int(sha1, 16)  # must be valid hex
+        self.assertEqual(
+            sha1,
+            "canonical-v1:84095f1f4e7aac7d331b87260ccb9460429527bb88b54dc4e1a6e057e30a98be",
+        )
+        self.assertTrue(sha1.startswith(gm.POLICY_SHA_PREFIX))
+        digest = sha1.removeprefix(gm.POLICY_SHA_PREFIX)
+        self.assertEqual(len(digest), 64)
+        int(digest, 16)
+        self.assertEqual(gm.policy_sha_scheme(sha1), gm.POLICY_SHA_SCHEME)
+
+    def test_policy_sha_ignores_comments_and_cv_band_notes(self):
+        original = gm.DEFAULT_POLICY_FILE.read_text()
+        changed = "# editorial comment with no gate effect\n" + original.replace(
+            'note = "applies to measured_cv <= 0.015. Calibration point cv~=1%: n=7/9 as originally registered, ~99% power vs a true 10% regression."',
+            'note = "Editorial wording only; every numeric band value is unchanged."',
+            1,
+        )
+        self.assertNotEqual(changed, original)
+        self.assertEqual(self._sha_for_text(changed), gm.policy_sha())
+
+    def test_policy_sha_detects_band_and_threshold_tampering(self):
+        original = gm.DEFAULT_POLICY_FILE.read_text()
+        mutations = [
+            ("max_cv", "max_cv = 0.015", "max_cv = 0.016"),
+            ("required_n", "required_n_class_a = 7", "required_n_class_a = 8"),
+            ("fail_margin", "fail_margin_multiplier = 2.0", "fail_margin_multiplier = 2.1"),
+            ("fail_pct", "fail_pct = 0.07", "fail_pct = 0.071"),
+            (
+                "noise_class",
+                'noise_class = "A"\nwarn_pct = 0.03\nfail_pct = 0.07',
+                'noise_class = "B"\nwarn_pct = 0.03\nfail_pct = 0.07',
+            ),
+            ("policy_version", "policy_version = 1", "policy_version = 2"),
+        ]
+        expected = gm.policy_sha()
+        for label, old, new in mutations:
+            with self.subTest(label=label):
+                self.assertEqual(original.count(old), 1, f"mutation anchor {old!r} must be unique")
+                self.assertNotEqual(self._sha_for_text(original.replace(old, new, 1)), expected)
+
+    def test_other_rule_remains_identity_bearing(self):
+        original = gm.DEFAULT_POLICY_FILE.read_text()
+        old = 'other_rule = "Any required context cell can fail; do not average contexts."'
+        new = 'other_rule = "Changed advisory rule that might gain gate semantics later."'
+        self.assertEqual(original.count(old), 1)
+        self.assertNotEqual(self._sha_for_text(original.replace(old, new, 1)), gm.policy_sha())
+
+    def test_policy_sha_scheme_classifies_legacy_and_rejects_malformed(self):
+        self.assertEqual(gm.policy_sha_scheme("d" * 64), gm.LEGACY_POLICY_SHA_SCHEME)
+        for malformed in (
+            "",
+            None,
+            "D" * 64,
+            "canonical-v1:" + "z" * 64,
+            "sha256:" + "d" * 64,
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(gm.PolicyConfigError):
+                    gm.policy_sha_scheme(malformed)
 
     def test_missing_file_rejected(self):
         with self.assertRaises(gm.PolicyConfigError):
