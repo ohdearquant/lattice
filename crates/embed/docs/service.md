@@ -93,9 +93,11 @@ solely because their raw input happens to match.
 
 ## Request validation
 
-The cache wrapper validates empty batches, batch size, and text length before any lookup. The
-native service enforces those same limits when it is called and additionally verifies that the
-requested model matches its configured model:
+The cache wrapper validates empty batches, batch size, and text length before any lookup. A direct
+native-service call enforces those same limits and additionally verifies that the requested model
+matches its configured model. When the wrapper delegates, an opaque internal capability proves the
+caller bounds were already checked; the native service skips only that identical scan and retains
+its configured-model check and prepared-text memory backstop.
 
 | Rule                                                                                                        | Failure                    |
 | ----------------------------------------------------------------------------------------------------------- | -------------------------- |
@@ -105,9 +107,10 @@ requested model matches its configured model:
 | Native request model must equal that service's configured model                                             | `EmbedError::InvalidInput` |
 
 `String::len()` measures UTF-8 bytes, so the present implementation can reject fewer than
-32,768 non-ASCII characters. Prefixes are applied before validation in role-specific calls, so
-the prefix bytes count too. A caller that needs a character-based product limit should enforce
-that separately before calling the service.
+32,768 non-ASCII characters. Role-specific calls validate caller text before adding an instruction.
+The prepared-text backstop admits the caller allowance plus the model's longest instruction, so
+service-added prefix bytes do not reduce the published caller limit. A caller that needs a
+character-based product limit should enforce that separately before calling the service.
 
 The wrapper performs its own three request-bound checks even for an all-hit request. It does
 not call `inner.embed` merely to validate a cache hit, so an inner service's model-specific
@@ -212,24 +215,32 @@ are management APIs rather than a promise of distributed or persistent caching.
 
 For every generic, query, or passage request, the wrapper does the following:
 
-1. Apply the role prefix, if any. Generic calls remain raw text with the `Generic` role.
-2. Validate only the wrapper-owned empty-batch, batch-size, and text-length bounds before lookup.
-3. If capacity is zero, bypass hash computation and locks and delegate the prompted batch to the
-   inner service.
-4. Ask the inner service for the effective `ModelConfig`, then hash each prompted text with the
+1. Keep the caller's text as-is and record the request's `EmbeddingRole` (`Generic` for a plain
+   `embed` call). The wrapper does not apply the role instruction; the wrapped service does.
+2. Validate only the wrapper-owned empty-batch, batch-size, and text-length bounds, against the
+   caller's text, before lookup. Checking caller text keeps the published cap describing what the
+   caller passed rather than what the instruction adds.
+3. If capacity is zero, bypass hash computation and locks and delegate the validated caller text
+   through the internal prevalidated role hook. Built-in services consume its validation proof
+   directly; the compatibility default reaches an unknown service's existing public role override.
+4. Ask the inner service for the effective `ModelConfig`, then hash each caller text with the
    model identifier, its key revision, active dimension, and role tag.
 5. Look up all keys in the sharded LRU. Hits are returned from cache storage as shared slices and
-   copied into the caller-owned result vectors; misses are remembered with their original input
-   positions.
-6. If misses exist, send only those texts to the inner service. It must return exactly one vector
-   for each miss. A count mismatch becomes `EmbedError::InferenceFailed` rather than allowing a
-   `zip` operation to drop positions silently.
+   copied into the caller-owned result vectors; misses are remembered by original input position.
+6. If misses exist, send borrowed views of only those already-validated caller texts through the
+   internal prevalidated role hook. Native and nested cache services consume those views directly,
+   avoiding a cloned `Vec<String>` for delegation. The compatibility default materializes raw text
+   once before calling an unknown service's public role override. The inner service must return
+   exactly one vector for each miss. A count mismatch becomes
+   `EmbedError::InferenceFailed` rather than allowing a `zip` operation to drop positions silently.
 7. Insert new vectors, fill the missing result positions, and return every vector in the order
    supplied by the caller.
 
-The wrapper avoids mixing role-specific data in two ways: text has already been prompted when a
-role needs a prefix, and the cache key additionally contains the `EmbeddingRole` tag. The latter
-keeps generic, query, and passage requests in distinct cache namespaces as prompt policies evolve.
+The wrapper avoids mixing role-specific data by keying caller text together with the
+`EmbeddingRole` tag, which keeps generic, query, and passage requests in distinct cache namespaces
+as prompt policies evolve. Keying caller text is equivalent to keying prepared text because the
+instruction is a function of the role and model configuration already in the key, so no two
+distinct prepared strings can collide under one key.
 
 The cache is a reuse optimization, not a single-flight coordinator. Concurrent cache misses for
 the same text may each call the inner service before either request inserts its result. Callers
@@ -249,7 +260,7 @@ native embedding call.
 | `InferenceFailed`     | The inference backend failed, including a cache-wrapper result-count violation      | Surface the backend failure; do not accept a partial batch                       |
 | `TaskFailed`          | A background task was cancelled or panicked                                         | Treat the current call as failed and check service state before retrying         |
 | `InvalidInput`        | Empty/oversized batch, wrong model, invalid configuration, or other invalid request | Correct the request without retrying unchanged input                             |
-| `TextTooLong`         | A text exceeded the service's length check                                          | Chunk or shorten the prompted input                                              |
+| `TextTooLong`         | A text exceeded the service's length check                                          | Chunk or shorten the caller-supplied input                                       |
 | `DimensionMismatch`   | An operation received vectors of different expected and actual dimensions           | Keep model/config/index namespaces consistent                                    |
 | `UnsupportedModel`    | The selected service cannot provide that model                                      | Select a capable service or model                                                |
 | `Internal`            | An invariant failed, such as a missing single-item result                           | Treat as a bug report; do not synthesize a vector                                |
@@ -267,11 +278,36 @@ order and represents the `Generic` role. `embed_one` is a one-item convenience c
 an internal error if an implementation violates that cardinality contract rather than fabricating
 an empty vector.
 
-`embed_query` and `embed_passage` obtain a model instruction, prefix every text when one exists,
-then delegate to `embed`. The defaults cannot create role-separated cache entries by themselves:
-that behavior comes from `CachedEmbeddingService` overriding those methods and supplying its
-`Query` or `Passage` role tag. `EmbeddingRole::Generic` also has its own tag, so all three wrapper
-entry points receive distinct cache keys even when their resulting text is identical.
+`embed_with_role` is the single role entry point: it validates the caller's text against the
+published cap first, then prepends the model instruction, then hands the prepared text to the
+backend. The trait default reaches the backend by calling `embed`; both implementations in this
+crate override the method and go straight to their own backend entry point, precisely so the
+prepared text is not re-checked against a cap that describes caller input. Validating before
+preparation is deliberate. The cap describes what the caller may submit, so charging the
+caller for the instruction bytes the service itself adds would reject text that is within the
+documented limit. `embed_query` and `embed_passage` are thin wrappers that call `embed_with_role`
+with the `Query` or `Passage` role, so all three role paths share one ordering decision instead of
+repeating it.
+
+`embed_with_role_prevalidated` is a hidden implementation hook used only by compositional wrappers.
+Its `ValidatedTextBatch` argument has no public constructor, so an external caller cannot use the
+hook to bypass the stable methods' request bounds. The default hook keeps external implementors
+behaviorally compatible by calling their existing `embed_with_role` override; for a sparse miss
+batch it first materializes the raw texts required by that public slice type. Such an unknown
+implementation may repeat caller-bound validation. The native service overrides the hook to
+consume borrowed text views directly when no instruction is required. A nested
+`CachedEmbeddingService` also overrides it, preserving one caller-bound validation across
+arbitrarily composed cache wrappers.
+
+That default cannot preserve the caller-text cap for an external implementation that enforces the
+exact cap inside its own `embed`: the prepared string reaches that `embed` already lengthened.
+Keeping `embed` the sole abstract method is a backward-compatibility choice on a published crate;
+an implementor that caps text should size that guard for the prepared length or override
+`embed_with_role` to reach its backend directly. Both in-crate implementors override it. The
+default also cannot create role-separated cache entries by itself: that behavior comes from
+`CachedEmbeddingService` supplying its role tag on the key. `EmbeddingRole::Generic` also has its
+own tag, so all three role paths receive distinct cache keys even when their resulting text is
+identical.
 
 `model_config` defaults to the model's native dimension. A service that has selected an MRL
 dimension overrides it so a caching wrapper hashes the actual output space, not merely the model
@@ -300,13 +336,17 @@ wrapper's LRU.
 
 ## CachedEmbeddingService cache-hit behavior
 
-The wrapper applies an optional role prefix, performs its local request-bound checks, and then
-either bypasses a disabled cache or computes keys from the prompted text, effective model
+The wrapper keeps the caller's text, performs its local request-bound checks against that text,
+and then either bypasses a disabled cache or computes keys from the caller text, effective model
 configuration, and role. It gathers every LRU hit before deciding whether to call the inner
 service. A full hit returns immediately and never invokes the inner service.
 
 Consequently, the wrapper cannot enforce an inner service's model selection, authorization, or
 other service-specific validation on a full hit. With at least one miss it delegates only the
-misses, and `NativeEmbeddingService::embed` performs its configured-model check before loading or
-encoding them. The wrapper rejects a mismatched number of returned vectors before insertion, which
-prevents a partial `zip` from losing original result positions.
+misses through the prevalidated role hook; the wrapped service applies the role instruction and
+performs service-specific checks, such as the native configured-model check, before loading or
+encoding them. Native and nested cache services do not repeat the caller-bound validation the
+wrapper already completed. An unknown implementation reaches its existing public role method
+instead, preserving custom behavior even when that method repeats validation. The wrapper rejects a
+mismatched number of returned vectors before insertion, which prevents a partial `zip` from losing
+original result positions.

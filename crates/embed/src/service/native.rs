@@ -3,7 +3,7 @@
 //! Model loading is lazy and cancellation-safe; BERT-family and Qwen models take different
 //! loading and batching paths. See `docs/service.md` for lifecycle and persistence details.
 
-use super::{DEFAULT_MAX_BATCH_SIZE, EmbeddingService, MAX_TEXT_BYTES};
+use super::{EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES, ValidatedTextBatch};
 use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
@@ -176,6 +176,59 @@ impl NativeEmbeddingService {
             .as_ref()
             .map_err(|e| EmbedError::ModelInitialization(e.clone()))
     }
+
+    /// Encodes text that has already been prepared, meaning any retrieval
+    /// instruction is applied and the caller-facing contract is checked.
+    ///
+    /// The length bound here is a memory backstop, not the published cap: it
+    /// admits the caller's allowance plus whatever instruction this model
+    /// prepends, which is zero bytes for symmetric models.
+    async fn encode_prepared(
+        &self,
+        texts: &[&str],
+        model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>> {
+        if model != self.model_config.model {
+            return Err(EmbedError::InvalidInput(format!(
+                "requested model {:?} but this service is loaded with {:?}",
+                model, self.model_config.model
+            )));
+        }
+        super::validate_texts_bounded(
+            texts,
+            MAX_TEXT_BYTES.saturating_add(model.max_instruction_bytes()),
+        )?;
+
+        let loaded = self.ensure_model().await?;
+        loaded
+            .encode_batch(texts)
+            .map_err(EmbedError::InferenceFailed)
+    }
+
+    async fn encode_prevalidated_with_role(
+        &self,
+        texts: ValidatedTextBatch<'_>,
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<Vec<f32>>> {
+        let prefix = role.instruction(model);
+        if prefix.is_none()
+            && let Some(borrowed) = texts.borrowed()
+        {
+            return self.encode_prepared(borrowed, model).await;
+        }
+
+        if prefix.is_none() {
+            let borrowed = (0..texts.len())
+                .map(|index| texts.get(index))
+                .collect::<Vec<_>>();
+            return self.encode_prepared(&borrowed, model).await;
+        }
+
+        let prepared = texts.to_owned_with_prefix(prefix);
+        let borrowed = prepared.iter().map(String::as_str).collect::<Vec<_>>();
+        self.encode_prepared(&borrowed, model).await
+    }
 }
 
 /// Synchronous model loading (runs on blocking thread pool).
@@ -292,36 +345,28 @@ fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
 #[async_trait]
 impl EmbeddingService for NativeEmbeddingService {
     async fn embed(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
-        if model != self.model_config.model {
-            return Err(EmbedError::InvalidInput(format!(
-                "requested model {:?} but this service is loaded with {:?}",
-                model, self.model_config.model
-            )));
-        }
-        if texts.is_empty() {
-            return Err(EmbedError::InvalidInput("no texts provided".into()));
-        }
-        if texts.len() > DEFAULT_MAX_BATCH_SIZE {
-            return Err(EmbedError::InvalidInput(format!(
-                "batch size {} exceeds maximum {}",
-                texts.len(),
-                DEFAULT_MAX_BATCH_SIZE
-            )));
-        }
-        for text in texts {
-            if text.len() > MAX_TEXT_BYTES {
-                return Err(EmbedError::TextTooLong {
-                    length: text.len(),
-                    max: MAX_TEXT_BYTES,
-                });
-            }
-        }
+        let texts = ValidatedTextBatch::new(texts)?;
+        self.encode_prevalidated_with_role(texts, model, EmbeddingRole::Generic)
+            .await
+    }
 
-        let loaded = self.ensure_model().await?;
-        let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
-        loaded
-            .encode_batch(&text_refs)
-            .map_err(EmbedError::InferenceFailed)
+    async fn embed_with_role(
+        &self,
+        texts: &[String],
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<Vec<f32>>> {
+        let texts = ValidatedTextBatch::new(texts)?;
+        self.encode_prevalidated_with_role(texts, model, role).await
+    }
+
+    async fn embed_with_role_prevalidated(
+        &self,
+        texts: ValidatedTextBatch<'_>,
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.encode_prevalidated_with_role(texts, model, role).await
     }
 
     fn model_config(&self, model: EmbeddingModel) -> ModelConfig {

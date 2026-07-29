@@ -20,6 +20,23 @@ pub struct Qwen35Model {
 
 impl Qwen35Model {
     /// **Unstable**: load Qwen3.5-2B or Qwen3.6 from a local safetensors directory.
+    ///
+    /// Required names are preflighted, then each tensor's own declared
+    /// payload is decoded and finite-value-checked at the shared ingress
+    /// seam (`weights::ingress::validate_ingested_tensor`) while owned
+    /// weights are assembled; a failure there drops the local assembly state
+    /// and returns an error without exposing a partially built model.
+    ///
+    /// Every required tensor — embeddings, the LM head, the final norm,
+    /// per-layer input/post-attention norms, dense FFN weights, full
+    /// attention Q/K/V/O and their norms, the GDN projection and decay
+    /// tensors, and the MoE router/expert/shared-expert tensors — is also
+    /// checked against a config-derived expected shape at assembly
+    /// (`load_owned_tensor_checked`), so a finite but undersized or
+    /// otherwise config-incompatible tensor is rejected here rather than
+    /// reaching a forward pass built for a different shape. A checkpoint
+    /// whose tensor shapes are incompatible with the config returns
+    /// `Err(InferenceError::ShapeMismatch)` instead of constructing a model.
     pub fn from_safetensors(path: &Path) -> Result<Self, InferenceError> {
         let model_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");
@@ -34,11 +51,17 @@ impl Qwen35Model {
             )));
         };
 
-        let config = Qwen35Config::from_model_dir(path)?;
+        // CLASS C ingress: `from_model_dir_validated` runs `Qwen35Config::validate` before
+        // this directory's tensors are ever touched, and `validate_required_tensor_names` /
+        // `load_weights` both require the resulting `ValidatedQwen35Config` -- an
+        // unvalidated config cannot reach either. See the CLASS C ingress table in the PR
+        // body.
+        let validated_config = Qwen35Config::from_model_dir_validated(path)?;
 
-        validate_required_tensor_names(source.as_mut(), &config)?;
+        validate_required_tensor_names(source.as_mut(), &validated_config)?;
 
-        let weights = load_weights(source.as_mut(), &config)?;
+        let weights = load_weights(source.as_mut(), &validated_config)?;
+        let config = validated_config.into_inner();
 
         let tokenizer_path = path.join("tokenizer.json");
         let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)?;
@@ -94,28 +117,27 @@ impl Qwen35Model {
         &self.config
     }
 
-    /// **Unstable**: mutable access to the post-load Qwen3.5 configuration.
+    /// **Unstable**: override the post-load model's configured EOS token id.
     ///
-    /// Additive builder-style setter (`Qwen35Model.config` is a private
-    /// field; this is the only way an external caller can adjust it after
-    /// load). Intended for benchmark/tooling call sites that need to change
-    /// generation behavior without adding a new field to the
-    /// request-scoped [`GenerateConfig`](crate::model::qwen35_config::GenerateConfig)
-    /// (which is a plain public-literal struct with a `Default` impl --
-    /// `cargo-semver-checks` treats any new field there as
-    /// `constructible_struct_adds_field`, a semver-major break).
+    /// CLASS C ingress: replaces the former `config_mut(&mut self) -> &mut Qwen35Config`,
+    /// which handed out an unrestricted `&mut` onto a config that had already passed
+    /// [`Qwen35Config::validate`] -- every call site in this crate (grepped before this
+    /// change) only ever touched `eos_token_id`, so this checked setter covers the real
+    /// need without reopening a path for a caller to mutate an allocation-driving field
+    /// (`hidden_size`, `vocab_size`, the GDN dims, ...) post-validation. `eos_token_id`
+    /// itself drives no allocation or indexing -- it is only ever compared against a
+    /// generated token id -- so no re-validation is required here. See the CLASS C
+    /// ingress table in the PR body.
     ///
-    /// Established idiom already used throughout this crate's own test
-    /// suite (e.g. `cfg.eos_token_id = u32::MAX`) to push the model's
-    /// configured EOS token id out of the reachable vocab range, which
-    /// `should_stop_token` (the single shared stop predicate every
-    /// CPU/Metal decode loop calls) then never matches -- see
-    /// `qwen35_generate --emit-phase-events` (PR #882), which combines this
-    /// with `GenerateConfig::stop_token_ids: vec![]` (already public) to
-    /// force continuation to the exact requested token count for a
-    /// benchmark trial.
-    pub fn config_mut(&mut self) -> &mut Qwen35Config {
-        &mut self.config
+    /// Established idiom already used throughout this crate's own test suite (e.g.
+    /// `model.set_eos_token_id(u32::MAX)`) to push the model's configured EOS token id out
+    /// of the reachable vocab range, which `should_stop_token` (the single shared stop
+    /// predicate every CPU/Metal decode loop calls) then never matches -- see
+    /// `qwen35_generate --emit-phase-events` (PR #882), which combines this with
+    /// `GenerateConfig::stop_token_ids: vec![]` (already public) to force continuation to
+    /// the exact requested token count for a benchmark trial.
+    pub fn set_eos_token_id(&mut self, eos_token_id: u32) {
+        self.config.eos_token_id = eos_token_id;
     }
 
     /// **Unstable**: access the BPE tokenizer.
@@ -240,6 +262,20 @@ impl Qwen35Model {
             &dense.up_proj,
             &dense.down_proj,
         ))
+    }
+
+    /// **Unstable (train-backward)**: Number of layers actually present in the
+    /// loaded weight storage.
+    ///
+    /// [`Self::config_mut`] allows a caller to change `config.num_hidden_layers`
+    /// after load, independently of the weights this model was loaded with.
+    /// Callers deriving a layer range from `config().num_hidden_layers` must
+    /// check it against this value first — indexing past it inside
+    /// [`Self::gqa_layer_weights`]/[`Self::gdn_layer_weights`] panics rather
+    /// than returning `None`.
+    #[cfg(feature = "train-backward")]
+    pub fn loaded_layer_count(&self) -> usize {
+        self.weights.layers.len()
     }
 
     /// **Unstable (train-backward)**: Return lm_head, final_norm, and embed slices.

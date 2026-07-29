@@ -1,4 +1,4 @@
-.PHONY: check clippy test fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
+.PHONY: check clippy test test-timing fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
 
 check:
 	cargo check --workspace
@@ -9,9 +9,17 @@ clippy:
 test:
 	cargo test --workspace
 
+# The suites carrying wall-clock regression checks (cached-SIMD-config lookup,
+# 1000-batch dot product, FANN inference). Those assertions are skipped when the
+# CI env var is set, because absolute-time bounds flake under shared-CI
+# scheduling contention. Run this on an idle host to exercise them for real.
+test-timing:
+	cargo test -p lattice-embed --test integration
+	cargo test -p lattice-fann --lib
+
 fmt:
 	cargo fmt --all
-	deno fmt **/*.md
+	./scripts/lint-docs.sh --format
 
 fmt-check:
 	cargo fmt --all -- --check
@@ -89,11 +97,11 @@ bench-compare:
 # Prereqs: bench_decode_ab binary built, ollama serve running, mlx_lm available.
 # Build binary: cargo build --release --bin bench_decode_ab -p lattice-inference --features "f16,metal-gpu"
 bench-agentic:
-	uv run python3 scripts/bench_compare_1k.py --sweep
+	uv run --with mlx-lm python3 scripts/bench_decode_harness.py run --profile agentic --sweep --allow-missing-engine
 
 # Fast sanity check: ctx=1000 only, 3 runs.
 bench-agentic-quick:
-	uv run python3 scripts/bench_compare_1k.py --ctx 1000 --runs 3
+	uv run --with mlx-lm python3 scripts/bench_decode_harness.py run --profile agentic --ctx 1000 --runs 3 --allow-missing-engine
 
 # wasm embedding parity gate: builds lattice-embed for wasm32, runs it against
 # the same HF-reference goldens + native-lattice reference as the embed

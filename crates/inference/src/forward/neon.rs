@@ -311,14 +311,30 @@ pub fn matmul_q8_neon_into(
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any element in `weights` is non-finite.
-/// IEEE-754 `NaN > x` is always false; a NaN would silently leave `max_abs` unchanged,
-/// producing a wrong (finite) scale while quantizing the corrupt element to a clamped
-/// i8 — wrong-but-quiet. Rejecting here makes the error point at the source weights
-/// rather than a downstream matmul producing garbage output.
+/// Returns [`InferenceError::InvalidInput`] if any element in `weights` is non-finite,
+/// if `weights.len()` does not match the declared `[n, k]` shape, or if `k` is not a
+/// multiple of 32 (the Q8_0 block size). The shape checks used to be `assert_eq!`s: a
+/// malformed but finite checkpoint tensor reaching this public function (e.g. through
+/// `quantize_model`'s NEON conversion path) would panic the process instead of
+/// returning an error the caller can propagate.
 pub fn pack_weights_q8(weights: &[f32], n: usize, k: usize) -> Result<Vec<u8>, InferenceError> {
-    assert_eq!(weights.len(), n * k);
-    assert_eq!(k % QK8_0, 0);
+    if !k.is_multiple_of(QK8_0) {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q8_0 NEON packing: k={k} is not a multiple of {QK8_0} (block size)"
+        )));
+    }
+    let expected_len = n.checked_mul(k).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "Q8_0 NEON packing: shape [{n}, {k}] overflows usize element count"
+        ))
+    })?;
+    if weights.len() != expected_len {
+        return Err(InferenceError::InvalidInput(format!(
+            "Q8_0 NEON packing: weights length {} does not match shape [{n}, {k}] (expected \
+             {expected_len})",
+            weights.len()
+        )));
+    }
     let blocks_per_row = k / QK8_0;
     let row_bytes = blocks_per_row * Q8_0_BLOCK_BYTES;
     let mut packed = vec![0u8; n * row_bytes];
@@ -510,10 +526,9 @@ mod tests {
         );
     }
 
-    /// Mutation check: removing the `!v.is_finite()` guard in `pack_weights_q8`
-    /// makes this test pass NaN weights silently (NaN never updates `max_abs` via `>`,
-    /// so the scale stays finite and the corrupt element is clamped to an arbitrary
-    /// i8 value without error). The test must FAIL when the guard is removed.
+    /// Rejects a NaN block element instead of quantizing it silently. NaN never
+    /// updates `max_abs` via `>`, so without this guard the scale would stay
+    /// finite and the corrupt element would clamp to an arbitrary i8 value.
     #[test]
     fn pack_weights_q8_rejects_nan() {
         let n = 1;
@@ -526,11 +541,9 @@ mod tests {
         );
     }
 
-    /// Mutation check: removing the `!v.is_finite()` guard in `pack_weights_q8`
-    /// makes this test pass +Inf weights silently (`f32::INFINITY > max_abs` is true,
-    /// so max_abs becomes +Inf and scale becomes +Inf / 127 = +Inf, propagating
-    /// infinity into every quantized row without a typed error). The test must FAIL
-    /// when the guard is removed.
+    /// Rejects a +Inf block element instead of propagating it into the quantized
+    /// scale. `f32::INFINITY > max_abs` is true, so without this guard `max_abs`
+    /// and the resulting scale would both become +Inf, corrupting every row.
     #[test]
     fn pack_weights_q8_rejects_inf() {
         let n = 1;
@@ -541,5 +554,46 @@ mod tests {
             pack_weights_q8(&w, n, k).is_err(),
             "pack_weights_q8 must return Err when a block element is +Inf"
         );
+    }
+
+    /// A finite tensor whose element count disagrees with the declared `[n, k]` shape
+    /// must return a typed `Err`, not panic. Before this guard, `pack_weights_q8` used
+    /// `assert_eq!(weights.len(), n * k)`, so a malformed-but-finite checkpoint tensor
+    /// reaching the public NEON `quantize_model` conversion path (e.g. through
+    /// `pack_gdn_weights`) would abort the process instead of propagating an error.
+    #[test]
+    fn pack_weights_q8_rejects_element_count_mismatch_instead_of_panicking() {
+        let n = 2;
+        let k = 32;
+        let w = vec![0.5f32; n * k - 1]; // one element short, all finite
+        match pack_weights_q8(&w, n, k) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("does not match"),
+                    "error must describe the shape mismatch, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for element count mismatch, got Ok"),
+        }
+    }
+
+    /// A `k` that is not a multiple of the Q8_0 block size (32) must return a typed
+    /// `Err`, not panic via `assert_eq!(k % QK8_0, 0)`.
+    #[test]
+    fn pack_weights_q8_rejects_non_block_aligned_k_instead_of_panicking() {
+        let n = 1;
+        let k = 33; // not a multiple of 32
+        let w = vec![0.5f32; n * k];
+        match pack_weights_q8(&w, n, k) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("multiple of"),
+                    "error must describe the alignment mismatch, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for non-block-aligned k, got Ok"),
+        }
     }
 }

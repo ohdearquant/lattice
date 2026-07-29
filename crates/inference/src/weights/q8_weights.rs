@@ -25,7 +25,13 @@ use crate::model::qwen35::{
     ModelWeights,
 };
 use crate::model::qwen35_config::{LayerType, Qwen35Config};
+use crate::weights::ingress::{IngestedTensor, validate_ingested_tensor};
 use std::mem::size_of;
+
+const Q8_MATRIX_SOURCE: &str = "in-memory Q8 quantization";
+const Q8_GDN_SOURCE: &str = "GatedDeltaNet Q8 quantization";
+const Q8_ATTENTION_SOURCE: &str = "full-attention Q8 quantization";
+const Q8_FFN_SOURCE: &str = "dense FFN Q8 quantization";
 
 /// **Unstable**: per-row symmetric INT8 weight matrix; storage layout and field names may change.
 ///
@@ -51,22 +57,98 @@ pub struct Q8Matrix {
 /// - if the row is all zeros, `scale[i] = 1.0`
 /// - `q[i, j] = clamp(round(w[i, j] / scale[i]), -128, 127)`
 ///
-/// Returns `Err(InvalidInput)` if any source row contains `NaN` or `±inf`.
-/// A non-finite source value produces a non-finite scale (`inf / 127 = inf`),
-/// which then turns every matmul output for that output channel into `NaN`
-/// (`0 * inf`). Rejecting here attributes the error to the bad source weight
-/// rather than to a downstream numerical guard.
+/// Returns `Err(InvalidInput)` if the declared geometry overflows or does not
+/// match the source length, any source value is `NaN` or `±inf`, or a derived
+/// scale is non-positive or non-finite. Validation is performed through the
+/// shared weight-ingress contract so failures identify the tensor and first
+/// offending element or row.
 pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, InferenceError> {
-    if w.len() != rows * cols {
+    quantize_named_matrix(w, rows, cols, Q8_MATRIX_SOURCE, "matrix")
+}
+
+fn validate_source_geometry(
+    len: usize,
+    rows: usize,
+    cols: usize,
+    source: &str,
+    tensor_name: &str,
+) -> Result<(), InferenceError> {
+    let expected = rows.checked_mul(cols).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "{source}: tensor {tensor_name} shape [{rows}, {cols}] overflows usize element count"
+        ))
+    })?;
+    if len != expected {
         return Err(InferenceError::InvalidInput(format!(
-            "matrix length {} does not match rows({rows}) * cols({cols})",
-            w.len()
+            "{source}: tensor {tensor_name} (Q8) source element count {len} does not match shape \
+             [{rows}, {cols}] (expected {expected})"
         )));
     }
+    Ok(())
+}
+
+/// Validate a declared tensor shape against the shape derived from `cfg` — the single source
+/// of truth every downstream Q8 matmul indexes by. Never infer geometry from checkpoint data
+/// (norm lengths, projection lengths); every caller here passes cfg-derived expectations.
+fn validate_cfg_shape(
+    rows: usize,
+    expected_rows: usize,
+    cols: usize,
+    expected_cols: usize,
+    source: &str,
+    tensor_name: &str,
+) -> Result<(), InferenceError> {
+    if rows != expected_rows || cols != expected_cols {
+        return Err(InferenceError::InvalidInput(format!(
+            "{source}: tensor {tensor_name} shape [{rows}, {cols}] does not match config-derived \
+             shape [{expected_rows}, {expected_cols}]"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a 1-D vector length (a norm gamma) against the cfg-derived expected length.
+///
+/// `pub(crate)` so the NEON Q8 ingress path (`forward::neon_forward`) shares this check
+/// with the CPU Q8 path instead of re-deriving its own length-comparison logic.
+pub(crate) fn validate_cfg_len(
+    len: usize,
+    expected: usize,
+    source: &str,
+    tensor_name: &str,
+) -> Result<(), InferenceError> {
+    if len != expected {
+        return Err(InferenceError::InvalidInput(format!(
+            "{source}: tensor {tensor_name} length {len} does not match config-derived length \
+             {expected}"
+        )));
+    }
+    Ok(())
+}
+
+fn quantize_named_matrix(
+    w: &[f32],
+    rows: usize,
+    cols: usize,
+    source: &str,
+    tensor_name: &str,
+) -> Result<Q8Matrix, InferenceError> {
+    validate_source_geometry(w.len(), rows, cols, source, tensor_name)?;
+
+    let shape = [rows, cols];
 
     let mut data = Vec::with_capacity(w.len());
     let mut scales = Vec::with_capacity(rows);
+    let mut has_nonfinite = false;
 
+    // Single pass over the source matrix: finite-value validation is fused with the
+    // max-abs scale computation (both already touch every element in row-major
+    // order), instead of an earlier full pre-pass plus this loop re-reading the
+    // same bytes. max(|x_i|) is order-independent and involves no FP accumulation,
+    // so fusing cannot change the computed scale. A non-finite element still lets
+    // `abs_v > max_abs` run (NaN comparisons are false, +-inf propagates), but the
+    // resulting `max_abs`/`scale`/`data` are discarded below once `has_nonfinite`
+    // triggers the exact pre-fusion diagnostic via a full re-scan (error path only).
     for row_idx in 0..rows {
         let start = row_idx * cols;
         let end = start + cols;
@@ -74,17 +156,7 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, 
 
         let mut max_abs = 0.0f32;
         for &v in row {
-            // IEEE 754: `NaN > x` is FALSE for any x, so a NaN value would
-            // silently leave max_abs unchanged. The scale then stays finite,
-            // and the NaN element is quantized to 0 via Rust's saturating
-            // f32-as-i8 cast — wrong data, no error. Reject the row here so
-            // the error points at the source weight, not a downstream matmul.
-            if !v.is_finite() {
-                return Err(InferenceError::InvalidInput(format!(
-                    "Q8 weight row {row_idx} contains a non-finite value ({v}); \
-                     source weights must be finite"
-                )));
-            }
+            has_nonfinite |= !v.is_finite();
             let abs_v = v.abs();
             if abs_v > max_abs {
                 max_abs = abs_v;
@@ -92,16 +164,6 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, 
         }
 
         let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
-
-        // Defensive guard: the loop above already rejects NaN/±inf inputs,
-        // so a non-finite scale here would indicate an internal logic error.
-        if !scale.is_finite() {
-            return Err(InferenceError::InvalidInput(format!(
-                "Q8 weight row {row_idx} has non-finite scale ({scale}); \
-                 source row contains NaN or ±inf"
-            )));
-        }
-
         scales.push(scale);
 
         for &v in row {
@@ -109,6 +171,21 @@ pub fn quantize_matrix(w: &[f32], rows: usize, cols: usize) -> Result<Q8Matrix, 
             data.push(q);
         }
     }
+
+    if has_nonfinite {
+        // Re-scan (once, on the malformed-input path only) to reproduce the
+        // exact shared-ingress diagnostic (offending element index and value).
+        validate_ingested_tensor(IngestedTensor::q8_source(source, tensor_name, &shape, w))?;
+        unreachable!("has_nonfinite implies validate_ingested_tensor rejects tensor {tensor_name}");
+    }
+
+    validate_ingested_tensor(IngestedTensor::q8(
+        source,
+        tensor_name,
+        &shape,
+        &data,
+        &scales,
+    ))?;
 
     Ok(Q8Matrix {
         data,
@@ -350,13 +427,13 @@ pub(crate) fn quantize_model_weights(
         .map(|(attn, common)| {
             let q8_attn = match attn {
                 AttentionWeights::Linear(gdn) => {
-                    Q8AttentionWeights::Linear(quantize_gdn_weights(gdn)?)
+                    Q8AttentionWeights::Linear(quantize_gdn_weights(gdn, cfg)?)
                 }
                 AttentionWeights::Full(full) => {
                     Q8AttentionWeights::Full(quantize_full_attn_weights(full, cfg)?)
                 }
             };
-            let q8_common = quantize_common_weights(common)?;
+            let q8_common = quantize_common_weights(common, cfg)?;
             Ok((q8_attn, q8_common))
         })
         .collect::<Result<Vec<_>, InferenceError>>()?;
@@ -368,60 +445,219 @@ pub(crate) fn quantize_model_weights(
     })
 }
 
+/// Validate every GatedDeltaNet projection's declared shape against `cfg` — the same
+/// `linear_qkv_dim()` / `linear_output_dim()` / `linear_num_value_heads()` / `hidden_size`
+/// accessors the CPU and NEON forward passes index by — instead of trusting the
+/// self-reported `*_rows` / `*_cols` metadata a caller attached to `w`. Shared by
+/// `quantize_gdn_weights` (CPU Q8) and the NEON `quantize_model` packing path so a
+/// caller-supplied or checkpoint-derived `GatedDeltaNetWeights` incompatible with `cfg`
+/// is rejected at ingress on both paths, not just one.
+pub(crate) fn validate_gdn_shapes(
+    w: &GatedDeltaNetWeights,
+    cfg: &Qwen35Config,
+) -> Result<(), InferenceError> {
+    let hidden = cfg.hidden_size;
+    let value_heads = cfg.linear_num_value_heads();
+    let qkv_dim = cfg.checked_linear_qkv_dim()?;
+    let output_dim = cfg.checked_linear_output_dim()?;
+
+    validate_cfg_shape(
+        w.in_proj_qkv_rows,
+        qkv_dim,
+        w.in_proj_qkv_cols,
+        hidden,
+        Q8_GDN_SOURCE,
+        "in_proj_qkv",
+    )?;
+    validate_cfg_shape(
+        w.in_proj_z_rows,
+        output_dim,
+        w.in_proj_z_cols,
+        hidden,
+        Q8_GDN_SOURCE,
+        "in_proj_z",
+    )?;
+    validate_cfg_shape(
+        w.in_proj_b_rows,
+        value_heads,
+        w.in_proj_b_cols,
+        hidden,
+        Q8_GDN_SOURCE,
+        "in_proj_b",
+    )?;
+    validate_cfg_shape(
+        w.in_proj_a_rows,
+        value_heads,
+        w.in_proj_a_cols,
+        hidden,
+        Q8_GDN_SOURCE,
+        "in_proj_a",
+    )?;
+    validate_cfg_shape(
+        w.out_proj_rows,
+        hidden,
+        w.out_proj_cols,
+        output_dim,
+        Q8_GDN_SOURCE,
+        "out_proj",
+    )?;
+
+    validate_source_geometry(
+        w.in_proj_qkv.len(),
+        w.in_proj_qkv_rows,
+        w.in_proj_qkv_cols,
+        Q8_GDN_SOURCE,
+        "in_proj_qkv",
+    )?;
+    validate_source_geometry(
+        w.in_proj_z.len(),
+        w.in_proj_z_rows,
+        w.in_proj_z_cols,
+        Q8_GDN_SOURCE,
+        "in_proj_z",
+    )?;
+    validate_source_geometry(
+        w.in_proj_b.len(),
+        w.in_proj_b_rows,
+        w.in_proj_b_cols,
+        Q8_GDN_SOURCE,
+        "in_proj_b",
+    )?;
+    validate_source_geometry(
+        w.in_proj_a.len(),
+        w.in_proj_a_rows,
+        w.in_proj_a_cols,
+        Q8_GDN_SOURCE,
+        "in_proj_a",
+    )?;
+    validate_source_geometry(
+        w.out_proj.len(),
+        w.out_proj_rows,
+        w.out_proj_cols,
+        Q8_GDN_SOURCE,
+        "out_proj",
+    )?;
+
+    validate_cfg_len(w.a_log.len(), value_heads, Q8_GDN_SOURCE, "a_log")?;
+    validate_cfg_len(w.dt_bias.len(), value_heads, Q8_GDN_SOURCE, "dt_bias")?;
+
+    // `w.conv_dim` is a separate self-reported field from `conv1d_weight`'s length; the NEON
+    // forward path (`gdn_step_q8_neon`) indexes `qkv_proj`/`conv_buffer` through `0..conv_dim`,
+    // so a `conv_dim` that disagrees with `qkv_dim` (even if `conv1d_weight.len()` is
+    // internally consistent with it) must be rejected here, not discovered as an
+    // out-of-bounds index on the first decoded token.
+    if w.conv_dim != qkv_dim {
+        return Err(InferenceError::InvalidInput(format!(
+            "{Q8_GDN_SOURCE}: tensor conv_dim {} does not match config-derived linear_qkv_dim {qkv_dim}",
+            w.conv_dim
+        )));
+    }
+
+    let expected_conv_len = cfg.checked_linear_conv_len()?;
+    validate_cfg_len(
+        w.conv1d_weight.len(),
+        expected_conv_len,
+        Q8_GDN_SOURCE,
+        "conv1d_weight",
+    )?;
+    validate_cfg_len(
+        w.norm_weight.len(),
+        cfg.linear_value_head_dim,
+        Q8_GDN_SOURCE,
+        "norm_weight",
+    )?;
+
+    // `a_log`/`dt_bias`/`conv1d_weight`/`norm_weight` are retained verbatim (never
+    // quantized), so they never pass through `quantize_named_matrix`'s finite-value
+    // scan. Without this, NaN/Inf here reaches the GDN decay/conv/gated-norm
+    // recurrence and poisons state instead of failing closed. Checked here, in the
+    // shape-validation choke point both `quantize_gdn_weights` (CPU Q8) and the NEON
+    // `pack_gdn_weights` call before packing, so a caller-supplied or
+    // checkpoint-derived `GatedDeltaNetWeights` with non-finite retained vectors is
+    // rejected on both paths, not just one.
+    validate_ingested_tensor(IngestedTensor::q8_source(
+        Q8_GDN_SOURCE,
+        "a_log",
+        &[w.a_log.len()],
+        &w.a_log,
+    ))?;
+    validate_ingested_tensor(IngestedTensor::q8_source(
+        Q8_GDN_SOURCE,
+        "dt_bias",
+        &[w.dt_bias.len()],
+        &w.dt_bias,
+    ))?;
+    validate_ingested_tensor(IngestedTensor::q8_source(
+        Q8_GDN_SOURCE,
+        "conv1d_weight",
+        &[w.conv1d_weight.len()],
+        &w.conv1d_weight,
+    ))?;
+    validate_ingested_tensor(IngestedTensor::q8_source(
+        Q8_GDN_SOURCE,
+        "norm_weight",
+        &[w.norm_weight.len()],
+        &w.norm_weight,
+    ))?;
+
+    Ok(())
+}
+
 /// **Unstable**: convert GatedDeltaNet weights to Q8; output type may change.
 ///
 /// Quantize a `GatedDeltaNetWeights` bundle into its Q8 representation.
 ///
-/// Returns `Err` (never panics) when the decay parameter shapes are inconsistent:
-/// `in_proj_b` and `in_proj_a` data lengths must equal their declared `rows * cols`;
-/// `a_log` and `dt_bias` lengths must equal `in_proj_b_rows` (the value-head count).
+/// Returns `Err` (never panics) when any projection shape disagrees with `cfg` (shapes are
+/// validated against config-derived dimensions using checked arithmetic — `conv_dim` must
+/// equal `cfg.linear_qkv_dim()`), when data lengths disagree with declared `rows * cols`, or
+/// when any element of `a_log`, `dt_bias`, `conv1d_weight`, or `norm_weight` is non-finite
+/// (`NaN` or `±inf`) — these four vectors are retained as f32 rather than quantized, so
+/// finiteness is checked explicitly instead of falling out of per-row Q8 scale computation.
 pub fn quantize_gdn_weights(
     w: &GatedDeltaNetWeights,
+    cfg: &Qwen35Config,
 ) -> Result<Q8GatedDeltaNetWeights, InferenceError> {
-    let value_head_rows = w.in_proj_b_rows;
+    // `validate_gdn_shapes` covers both the projection geometry and the finite-value
+    // scan of the four retained (never-quantized) vectors — a_log, dt_bias,
+    // conv1d_weight, norm_weight — so this is the only pass over those buffers, not a
+    // separate scan on top of an earlier shape-only check.
+    validate_gdn_shapes(w, cfg)?;
 
-    if w.in_proj_b.len() != w.in_proj_b_rows * w.in_proj_b_cols {
-        return Err(InferenceError::InvalidInput(format!(
-            "GDN in_proj_b data length {} does not match rows({}) * cols({})",
-            w.in_proj_b.len(),
-            w.in_proj_b_rows,
-            w.in_proj_b_cols
-        )));
-    }
-    if w.in_proj_a.len() != w.in_proj_a_rows * w.in_proj_a_cols {
-        return Err(InferenceError::InvalidInput(format!(
-            "GDN in_proj_a data length {} does not match rows({}) * cols({})",
-            w.in_proj_a.len(),
-            w.in_proj_a_rows,
-            w.in_proj_a_cols
-        )));
-    }
-    if w.in_proj_a_rows != value_head_rows {
-        return Err(InferenceError::InvalidInput(format!(
-            "GDN in_proj_a_rows ({}) does not match in_proj_b_rows ({})",
-            w.in_proj_a_rows, value_head_rows
-        )));
-    }
-    if w.a_log.len() != value_head_rows {
-        return Err(InferenceError::InvalidInput(format!(
-            "GDN a_log length ({}) does not match value_head rows ({})",
-            w.a_log.len(),
-            value_head_rows
-        )));
-    }
-    if w.dt_bias.len() != value_head_rows {
-        return Err(InferenceError::InvalidInput(format!(
-            "GDN dt_bias length ({}) does not match value_head rows ({})",
-            w.dt_bias.len(),
-            value_head_rows
-        )));
-    }
-
-    let in_proj_qkv = quantize_matrix(&w.in_proj_qkv, w.in_proj_qkv_rows, w.in_proj_qkv_cols)?;
-    let in_proj_z = quantize_matrix(&w.in_proj_z, w.in_proj_z_rows, w.in_proj_z_cols)?;
-    let in_proj_b = quantize_matrix(&w.in_proj_b, w.in_proj_b_rows, w.in_proj_b_cols)?;
-    let in_proj_a = quantize_matrix(&w.in_proj_a, w.in_proj_a_rows, w.in_proj_a_cols)?;
-    let out_proj = quantize_matrix(&w.out_proj, w.out_proj_rows, w.out_proj_cols)?;
+    let in_proj_qkv = quantize_named_matrix(
+        &w.in_proj_qkv,
+        w.in_proj_qkv_rows,
+        w.in_proj_qkv_cols,
+        Q8_GDN_SOURCE,
+        "in_proj_qkv",
+    )?;
+    let in_proj_z = quantize_named_matrix(
+        &w.in_proj_z,
+        w.in_proj_z_rows,
+        w.in_proj_z_cols,
+        Q8_GDN_SOURCE,
+        "in_proj_z",
+    )?;
+    let in_proj_b = quantize_named_matrix(
+        &w.in_proj_b,
+        w.in_proj_b_rows,
+        w.in_proj_b_cols,
+        Q8_GDN_SOURCE,
+        "in_proj_b",
+    )?;
+    let in_proj_a = quantize_named_matrix(
+        &w.in_proj_a,
+        w.in_proj_a_rows,
+        w.in_proj_a_cols,
+        Q8_GDN_SOURCE,
+        "in_proj_a",
+    )?;
+    let out_proj = quantize_named_matrix(
+        &w.out_proj,
+        w.out_proj_rows,
+        w.out_proj_cols,
+        Q8_GDN_SOURCE,
+        "out_proj",
+    )?;
 
     Ok(Q8GatedDeltaNetWeights {
         in_proj_qkv,
@@ -441,20 +677,23 @@ pub fn quantize_gdn_weights(
 /// Quantize a full-attention layer into its Q8 representation.
 ///
 /// The original full-attention weight struct does not carry explicit row/column metadata,
-/// so the matrix shapes are inferred from the config's attention topology.
+/// so the matrix shapes are inferred from the config's attention topology using checked
+/// arithmetic (`num_attention_heads * head_dim` etc. reject overflow instead of wrapping).
 ///
-/// Returns `Err(InvalidInput)` if any weight matrix contains `NaN` or `±inf` values.
+/// Returns `Err(InvalidInput)` if any weight matrix contains `NaN` or `±inf` values, if a
+/// weight matrix's declared source length disagrees with its config-derived shape, or if
+/// the config-derived dimensions overflow `usize`.
 pub(crate) fn quantize_full_attn_weights(
     w: &FullAttentionLayerWeights,
     cfg: &Qwen35Config,
 ) -> Result<Q8FullAttentionLayerWeights, InferenceError> {
     let ((q_rows, hidden), (kv_rows, _), (_, _), (o_rows, o_cols)) =
-        infer_full_attention_shapes(w, cfg);
+        infer_full_attention_shapes(w, cfg)?;
 
-    let q_proj = quantize_matrix(&w.q_proj, q_rows, hidden)?;
-    let k_proj = quantize_matrix(&w.k_proj, kv_rows, hidden)?;
-    let v_proj = quantize_matrix(&w.v_proj, kv_rows, hidden)?;
-    let o_proj = quantize_matrix(&w.o_proj, o_rows, o_cols)?;
+    let q_proj = quantize_named_matrix(&w.q_proj, q_rows, hidden, Q8_ATTENTION_SOURCE, "q_proj")?;
+    let k_proj = quantize_named_matrix(&w.k_proj, kv_rows, hidden, Q8_ATTENTION_SOURCE, "k_proj")?;
+    let v_proj = quantize_named_matrix(&w.v_proj, kv_rows, hidden, Q8_ATTENTION_SOURCE, "v_proj")?;
+    let o_proj = quantize_named_matrix(&w.o_proj, o_rows, o_cols, Q8_ATTENTION_SOURCE, "o_proj")?;
 
     Ok(Q8FullAttentionLayerWeights {
         q_proj,
@@ -469,6 +708,7 @@ pub(crate) fn quantize_full_attn_weights(
 /// Quantize the common per-layer MLP weights into their Q8 representation (dense only).
 pub(crate) fn quantize_common_weights(
     w: &CommonLayerWeights,
+    cfg: &Qwen35Config,
 ) -> Result<Q8CommonLayerWeights, InferenceError> {
     let dense = match &w.ffn {
         FeedForwardWeights::Dense(d) => d,
@@ -478,12 +718,40 @@ pub(crate) fn quantize_common_weights(
             ));
         }
     };
-    let hidden = w.input_layernorm.len();
-    let ((gate_rows, _), (up_rows, _), (down_rows, down_cols)) = infer_dense_shapes(dense, hidden);
+    // Both RMSNorm vectors are validated against cfg.hidden_size: in release builds
+    // qwen35_rms_norm zips gamma against the activation, so a short
+    // post_attention_layernorm would silently leave trailing hidden values
+    // unnormalized instead of failing loudly.
+    let hidden = cfg.hidden_size;
+    validate_cfg_len(
+        w.input_layernorm.len(),
+        hidden,
+        Q8_FFN_SOURCE,
+        "input_layernorm",
+    )?;
+    validate_cfg_len(
+        w.post_attention_layernorm.len(),
+        hidden,
+        Q8_FFN_SOURCE,
+        "post_attention_layernorm",
+    )?;
+    let ((gate_rows, _), (up_rows, _), (down_rows, down_cols)) = infer_dense_shapes(dense, cfg)?;
 
-    let gate_proj = quantize_matrix(&dense.gate_proj, gate_rows, hidden)?;
-    let up_proj = quantize_matrix(&dense.up_proj, up_rows, hidden)?;
-    let down_proj = quantize_matrix(&dense.down_proj, down_rows, down_cols)?;
+    let gate_proj = quantize_named_matrix(
+        &dense.gate_proj,
+        gate_rows,
+        hidden,
+        Q8_FFN_SOURCE,
+        "gate_proj",
+    )?;
+    let up_proj = quantize_named_matrix(&dense.up_proj, up_rows, hidden, Q8_FFN_SOURCE, "up_proj")?;
+    let down_proj = quantize_named_matrix(
+        &dense.down_proj,
+        down_rows,
+        down_cols,
+        Q8_FFN_SOURCE,
+        "down_proj",
+    )?;
 
     Ok(Q8CommonLayerWeights {
         input_layernorm: w.input_layernorm.clone(),
@@ -553,77 +821,87 @@ fn add_matrix_bytes(rows: usize, cols: usize, f32_bytes: &mut usize, q8_bytes: &
     *q8_bytes += rows * cols * size_of::<i8>() + rows * size_of::<f32>();
 }
 
+type ShapePair = (usize, usize);
+
 fn infer_dense_shapes(
     dense: &crate::model::qwen35::DenseFfnWeights,
-    hidden: usize,
-) -> ((usize, usize), (usize, usize), (usize, usize)) {
-    assert_eq!(
-        dense.gate_proj.len() % hidden,
-        0,
-        "gate_proj length must be divisible by hidden"
-    );
-    let inter = dense.gate_proj.len() / hidden;
-    assert_eq!(
-        dense.up_proj.len(),
-        inter * hidden,
-        "up_proj length does not match inferred [intermediate, hidden] shape"
-    );
-    assert_eq!(
+    cfg: &Qwen35Config,
+) -> Result<(ShapePair, ShapePair, ShapePair), InferenceError> {
+    let hidden = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    // `hidden == 0` is not caught by `validate_source_geometry` below when the source
+    // tensors are also empty (0 == rows * 0 passes vacuously): an all-empty dense layer
+    // would otherwise reach ingestion successfully and panic on the first forward pass,
+    // where `qwen35_rms_norm` divides `x.len() / hidden`. Reject the zero hidden
+    // dimension explicitly, as a typed error, before that division is ever reached.
+    if hidden == 0 {
+        return Err(InferenceError::InvalidInput(format!(
+            "{Q8_FFN_SOURCE}: cfg.hidden_size must be > 0"
+        )));
+    }
+    validate_source_geometry(
+        dense.gate_proj.len(),
+        inter,
+        hidden,
+        Q8_FFN_SOURCE,
+        "gate_proj",
+    )?;
+    validate_source_geometry(dense.up_proj.len(), inter, hidden, Q8_FFN_SOURCE, "up_proj")?;
+    validate_source_geometry(
         dense.down_proj.len(),
-        hidden * inter,
-        "down_proj length does not match inferred [hidden, intermediate] shape"
-    );
-    ((inter, hidden), (inter, hidden), (hidden, inter))
+        hidden,
+        inter,
+        Q8_FFN_SOURCE,
+        "down_proj",
+    )?;
+    Ok(((inter, hidden), (inter, hidden), (hidden, inter)))
 }
-
-type ShapePair = (usize, usize);
 
 fn infer_full_attention_shapes(
     w: &FullAttentionLayerWeights,
     cfg: &Qwen35Config,
-) -> (ShapePair, ShapePair, ShapePair, ShapePair) {
-    let head_dim = w.q_norm.len();
+) -> Result<(ShapePair, ShapePair, ShapePair, ShapePair), InferenceError> {
+    // Every dimension below comes from `cfg` — the same accessors `matmul_bt_q8` and the
+    // rest of the forward pass index by — never from checkpoint tensor lengths. A
+    // checkpoint that disagrees with cfg is rejected here, at ingress, instead of
+    // reaching a shape assertion mid-matmul on the first full-attention token.
+    let head_dim = cfg.head_dim;
+    let hidden = cfg.hidden_size;
+    let q_dim = cfg.checked_full_q_dim()?;
+    let kv_dim = cfg.checked_full_kv_dim()?;
+    let q_rows = crate::model::qwen35_config::checked_double(q_dim, "full_q_dim")?;
 
-    assert!(head_dim > 0, "q_norm/head_dim must be non-zero");
-    assert_eq!(
-        w.k_norm.len(),
-        head_dim,
-        "k_norm length must match q_norm/head_dim"
-    );
-
-    let q_dim = cfg.num_attention_heads * head_dim;
-    let kv_dim = cfg.num_key_value_heads * head_dim;
-    let q_rows = 2 * q_dim;
-
-    assert_eq!(
-        w.q_proj.len() % q_rows,
-        0,
-        "q_proj length must be divisible by inferred row count"
-    );
-    let hidden = w.q_proj.len() / q_rows;
-
-    assert_eq!(
+    validate_cfg_len(w.q_norm.len(), head_dim, Q8_ATTENTION_SOURCE, "q_norm")?;
+    validate_cfg_len(w.k_norm.len(), head_dim, Q8_ATTENTION_SOURCE, "k_norm")?;
+    validate_source_geometry(
+        w.q_proj.len(),
+        q_rows,
+        hidden,
+        Q8_ATTENTION_SOURCE,
+        "q_proj",
+    )?;
+    validate_source_geometry(
         w.k_proj.len(),
-        kv_dim * hidden,
-        "k_proj length does not match inferred [kv_dim, hidden] shape"
-    );
-    assert_eq!(
+        kv_dim,
+        hidden,
+        Q8_ATTENTION_SOURCE,
+        "k_proj",
+    )?;
+    validate_source_geometry(
         w.v_proj.len(),
-        kv_dim * hidden,
-        "v_proj length does not match inferred [kv_dim, hidden] shape"
-    );
-    assert_eq!(
-        w.o_proj.len(),
-        hidden * q_dim,
-        "o_proj length does not match inferred [hidden, q_dim] shape"
-    );
+        kv_dim,
+        hidden,
+        Q8_ATTENTION_SOURCE,
+        "v_proj",
+    )?;
+    validate_source_geometry(w.o_proj.len(), hidden, q_dim, Q8_ATTENTION_SOURCE, "o_proj")?;
 
-    (
+    Ok((
         (q_rows, hidden),
         (kv_dim, hidden),
         (kv_dim, hidden),
         (hidden, q_dim),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -693,9 +971,13 @@ mod tests {
 
     /// Build a GatedDeltaNetWeights whose decay params are internally consistent at
     /// value-head granularity: a_log/dt_bias length == in_proj_b_rows == in_proj_a_rows.
+    /// `value_head_dim` is fixed at 2 (`z_rows = value_heads * 2`) so `matching_gdn_cfg`
+    /// can derive `linear_output_dim() == z_rows` for any `value_heads`.
+    const GDN_VALUE_HEAD_DIM: usize = 2;
+
     fn valid_gdn_weights(value_heads: usize, hidden: usize) -> GatedDeltaNetWeights {
         let qkv_rows = value_heads * 4;
-        let z_rows = value_heads * 2;
+        let z_rows = value_heads * GDN_VALUE_HEAD_DIM;
         GatedDeltaNetWeights {
             in_proj_qkv: vec![0.0; qkv_rows * hidden],
             in_proj_qkv_rows: qkv_rows,
@@ -714,17 +996,35 @@ mod tests {
             conv1d_weight: vec![0.0; qkv_rows * 4],
             conv_dim: qkv_rows,
             kernel_size: 4,
-            norm_weight: vec![1.0; z_rows],
+            norm_weight: vec![1.0; GDN_VALUE_HEAD_DIM],
             out_proj: vec![0.0; hidden * z_rows],
             out_proj_rows: hidden,
             out_proj_cols: z_rows,
         }
     }
 
+    /// `Qwen35Config` whose GatedDeltaNet dimensions match `valid_gdn_weights(3, 8)`'s
+    /// derived geometry: `linear_num_value_heads() == 3` (matching `in_proj_b_rows` /
+    /// `in_proj_a_rows` / `a_log.len()`), `linear_qkv_dim() == 12` (matching `qkv_rows`),
+    /// `linear_output_dim() == 6` (matching `z_rows`), and `linear_value_head_dim == 2`
+    /// (matching `norm_weight`).
+    fn matching_gdn_cfg() -> Qwen35Config {
+        Qwen35Config {
+            hidden_size: 8,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 3,
+            linear_num_value_heads: Some(3),
+            linear_value_head_dim: GDN_VALUE_HEAD_DIM,
+            linear_conv_kernel_dim: 4,
+            ..Qwen35Config::qwen35_2b()
+        }
+    }
+
     #[test]
     fn quantize_gdn_weights_accepts_consistent_value_head_shapes() {
         let w = valid_gdn_weights(3, 8);
-        let q = quantize_gdn_weights(&w).expect("consistent value-head shapes must quantize");
+        let q = quantize_gdn_weights(&w, &matching_gdn_cfg())
+            .expect("consistent value-head shapes must quantize");
         assert_eq!(q.a_log.len(), 3);
         assert_eq!(q.dt_bias.len(), 3);
     }
@@ -736,13 +1036,346 @@ mod tests {
         // (return Err — not panic via quantize_matrix's assert, not silently proceed).
         let mut w = valid_gdn_weights(3, 8);
         w.a_log = vec![0.0; 4];
-        match quantize_gdn_weights(&w) {
+        match quantize_gdn_weights(&w, &matching_gdn_cfg()) {
             Err(InferenceError::InvalidInput(msg)) => {
                 assert!(msg.contains("a_log"), "error must name a_log, got: {msg}");
             }
             Err(e) => panic!("expected InvalidInput, got: {e}"),
             Ok(_) => panic!("expected Err for decay shape mismatch, got Ok"),
         }
+    }
+
+    /// A malformed checkpoint whose GDN `conv1d_weight` does not match the
+    /// `[qkv_dim, kernel_size]` geometry the forward pass (`cpu_q8.rs`
+    /// `conv1d_silu_fused`) indexes with must be rejected at Q8 ingress, not
+    /// reach generation and panic on out-of-bounds indexing on the first token.
+    ///
+    /// Rejects a `conv1d_weight` whose length disagrees with the
+    /// `[qkv_dim, kernel_size]` geometry.
+    #[test]
+    fn quantize_gdn_weights_rejects_malformed_conv1d_weight() {
+        let mut w = valid_gdn_weights(3, 8);
+        w.conv1d_weight.pop(); // one element short of qkv_dim * kernel_size
+        match quantize_gdn_weights(&w, &matching_gdn_cfg()) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("conv1d_weight"),
+                    "error must name conv1d_weight, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for malformed conv1d_weight, got Ok"),
+        }
+    }
+
+    /// A checkpoint-supplied `conv_dim` that disagrees with `cfg.linear_qkv_dim()` must be
+    /// rejected even though `conv1d_weight.len()` is internally consistent with the bogus
+    /// `conv_dim` (so the `conv1d_weight` length guard above does not catch it). The NEON
+    /// forward path indexes `qkv_proj`/`conv_buffer` through `0..weights.conv_dim`; an
+    /// oversized `conv_dim` panics on the first decoded token instead of failing at ingress.
+    ///
+    /// Rejects a checkpoint whose self-reported `conv_dim` disagrees with `qkv_dim`,
+    /// even when `conv1d_weight.len()` is internally consistent with the bogus value.
+    #[test]
+    fn quantize_gdn_weights_rejects_conv_dim_disagreeing_with_cfg() {
+        let mut w = valid_gdn_weights(3, 8);
+        // `conv1d_weight` itself is left cfg-correct (qkv_dim(12) * kernel_size(4) = 48
+        // elements), so the existing `conv1d_weight` length guard alone would pass this —
+        // only the separate self-reported `conv_dim` field (consumed directly by the NEON
+        // forward path's `0..conv_dim` indexing) lies about being larger than `qkv_dim`.
+        w.conv_dim = 16;
+        match quantize_gdn_weights(&w, &matching_gdn_cfg()) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("conv_dim"),
+                    "error must name conv_dim, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for conv_dim disagreeing with cfg, got Ok"),
+        }
+    }
+
+    #[test]
+    fn quantize_gdn_weights_accepts_conv_dim_matching_cfg() {
+        // valid_gdn_weights already sets conv_dim == qkv_dim (12); this is an explicit
+        // positive-control counterpart to the mismatch-rejection test above.
+        let w = valid_gdn_weights(3, 8);
+        assert_eq!(w.conv_dim, 12);
+        assert!(quantize_gdn_weights(&w, &matching_gdn_cfg()).is_ok());
+    }
+
+    /// A malformed checkpoint whose GDN `norm_weight` (gated RMSNorm gamma) is
+    /// shorter than `value_dim` must be rejected at Q8 ingress, not reach
+    /// generation and panic on the `norm_weight[..value_dim]` slice in
+    /// `cpu_q8.rs` on the first token.
+    ///
+    /// Rejects a `norm_weight` (gated RMSNorm gamma) shorter than `value_dim`.
+    #[test]
+    fn quantize_gdn_weights_rejects_malformed_norm_weight() {
+        let mut w = valid_gdn_weights(3, 8);
+        w.norm_weight = vec![1.0; 1]; // shorter than value_dim (GDN_VALUE_HEAD_DIM = 2)
+        match quantize_gdn_weights(&w, &matching_gdn_cfg()) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("norm_weight"),
+                    "error must name norm_weight, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for malformed norm_weight, got Ok"),
+        }
+    }
+
+    /// A checkpoint-supplied `GatedDeltaNetWeights` whose `in_proj_b_rows` /
+    /// `in_proj_a_rows` / `a_log` / `dt_bias` are self-consistent with each other but
+    /// disagree with `cfg.linear_num_value_heads()` must be rejected by the public
+    /// `quantize_gdn_weights`, not just by internal self-consistency checks. Before this
+    /// guard, only `in_proj_a_rows == in_proj_b_rows` was checked — a value that agrees
+    /// with itself but not with the runtime config still produced Q8 matrices
+    /// `matmul_bt_q8` asserts on during inference.
+    ///
+    /// Rejects `in_proj_b`/`in_proj_a` row counts that are internally consistent with
+    /// each other but disagree with `cfg.linear_num_value_heads()`.
+    #[test]
+    fn quantize_gdn_weights_rejects_value_heads_disagreeing_with_cfg() {
+        // Internally consistent (in_proj_b_rows == in_proj_a_rows == a_log.len() ==
+        // dt_bias.len() == 5), but cfg says linear_num_value_heads() == 3.
+        let mut w = valid_gdn_weights(3, 8);
+        w.in_proj_b = vec![0.0; 5 * 8];
+        w.in_proj_b_rows = 5;
+        w.in_proj_b_cols = 8;
+        w.in_proj_a = vec![0.0; 5 * 8];
+        w.in_proj_a_rows = 5;
+        w.in_proj_a_cols = 8;
+        w.a_log = vec![0.0; 5];
+        w.dt_bias = vec![0.0; 5];
+        match quantize_gdn_weights(&w, &matching_gdn_cfg()) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("in_proj_b"),
+                    "error must name in_proj_b, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!(
+                "expected Err for value-head count disagreeing with cfg, got Ok \
+                 (Q8 matrices incompatible with cfg would have been produced)"
+            ),
+        }
+    }
+
+    /// `a_log`/`dt_bias`/`conv1d_weight`/`norm_weight` are retained as f32 (never
+    /// quantized), so they never pass through `quantize_named_matrix`'s finite-value scan.
+    /// A NaN or `+inf` in any of the four must be rejected, not silently reach the GDN
+    /// decay/conv/gated-norm recurrence and poison recurrent state.
+    ///
+    /// Rejects a NaN or `+inf` in any of `a_log`/`dt_bias`/`conv1d_weight`/`norm_weight`,
+    /// the four GDN vectors retained as f32 and never quantized.
+    #[test]
+    fn quantize_gdn_weights_rejects_non_finite_retained_vectors() {
+        let cfg = matching_gdn_cfg();
+
+        let mut w = valid_gdn_weights(3, 8);
+        w.a_log[0] = f32::NAN;
+        assert!(matches!(
+            quantize_gdn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
+
+        let mut w = valid_gdn_weights(3, 8);
+        w.a_log[0] = f32::INFINITY;
+        assert!(matches!(
+            quantize_gdn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
+
+        let mut w = valid_gdn_weights(3, 8);
+        w.dt_bias[0] = f32::NAN;
+        assert!(matches!(
+            quantize_gdn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
+
+        let mut w = valid_gdn_weights(3, 8);
+        w.dt_bias[0] = f32::INFINITY;
+        assert!(matches!(
+            quantize_gdn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
+
+        let mut w = valid_gdn_weights(3, 8);
+        w.conv1d_weight[0] = f32::NAN;
+        assert!(matches!(
+            quantize_gdn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
+
+        let mut w = valid_gdn_weights(3, 8);
+        w.conv1d_weight[0] = f32::INFINITY;
+        assert!(matches!(
+            quantize_gdn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
+
+        let mut w = valid_gdn_weights(3, 8);
+        w.norm_weight[0] = f32::NAN;
+        assert!(matches!(
+            quantize_gdn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
+
+        let mut w = valid_gdn_weights(3, 8);
+        w.norm_weight[0] = f32::INFINITY;
+        assert!(matches!(
+            quantize_gdn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn quantize_gdn_weights_accepts_all_finite_retained_vectors() {
+        let w = valid_gdn_weights(3, 8);
+        assert!(quantize_gdn_weights(&w, &matching_gdn_cfg()).is_ok());
+    }
+
+    #[test]
+    fn checked_full_q_dim_rejects_overflow() {
+        let cfg = Qwen35Config {
+            num_attention_heads: 1 << 63,
+            head_dim: 2,
+            ..Qwen35Config::qwen35_2b()
+        };
+        assert!(matches!(
+            cfg.checked_full_q_dim(),
+            Err(InferenceError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn checked_full_q_dim_accepts_valid_config() {
+        let cfg = Qwen35Config {
+            num_attention_heads: 16,
+            head_dim: 64,
+            ..Qwen35Config::qwen35_2b()
+        };
+        assert_eq!(cfg.checked_full_q_dim().unwrap(), 16 * 64);
+    }
+
+    #[test]
+    fn checked_full_kv_dim_rejects_overflow() {
+        let cfg = Qwen35Config {
+            num_key_value_heads: 1 << 63,
+            head_dim: 2,
+            ..Qwen35Config::qwen35_2b()
+        };
+        assert!(matches!(
+            cfg.checked_full_kv_dim(),
+            Err(InferenceError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn checked_full_kv_dim_accepts_valid_config() {
+        let cfg = Qwen35Config {
+            num_key_value_heads: 2,
+            head_dim: 64,
+            ..Qwen35Config::qwen35_2b()
+        };
+        assert_eq!(cfg.checked_full_kv_dim().unwrap(), 2 * 64);
+    }
+
+    #[test]
+    fn checked_linear_qkv_dim_rejects_overflow() {
+        let cfg = Qwen35Config {
+            linear_num_key_heads: 1 << 63,
+            linear_key_head_dim: 2,
+            ..Qwen35Config::qwen35_2b()
+        };
+        assert!(matches!(
+            cfg.checked_linear_qkv_dim(),
+            Err(InferenceError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn checked_linear_qkv_dim_accepts_valid_config() {
+        let cfg = matching_gdn_cfg();
+        assert_eq!(cfg.checked_linear_qkv_dim().unwrap(), cfg.linear_qkv_dim());
+        assert_eq!(cfg.checked_linear_qkv_dim().unwrap(), 12);
+    }
+
+    #[test]
+    fn checked_linear_output_dim_rejects_overflow() {
+        let cfg = Qwen35Config {
+            linear_num_value_heads: Some(1 << 63),
+            linear_value_head_dim: 2,
+            ..Qwen35Config::qwen35_2b()
+        };
+        assert!(matches!(
+            cfg.checked_linear_output_dim(),
+            Err(InferenceError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn checked_linear_output_dim_accepts_valid_config() {
+        let cfg = matching_gdn_cfg();
+        assert_eq!(
+            cfg.checked_linear_output_dim().unwrap(),
+            cfg.linear_output_dim()
+        );
+        assert_eq!(cfg.checked_linear_output_dim().unwrap(), 6);
+    }
+
+    #[test]
+    fn checked_linear_conv_len_rejects_overflow() {
+        let cfg = Qwen35Config {
+            linear_num_key_heads: 1 << 63,
+            linear_key_head_dim: 2,
+            linear_conv_kernel_dim: 4,
+            ..Qwen35Config::qwen35_2b()
+        };
+        assert!(matches!(
+            cfg.checked_linear_conv_len(),
+            Err(InferenceError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn checked_linear_conv_len_accepts_valid_config() {
+        let cfg = matching_gdn_cfg();
+        assert_eq!(
+            cfg.checked_linear_conv_len().unwrap(),
+            cfg.linear_qkv_dim() * cfg.linear_conv_kernel_dim
+        );
+    }
+
+    /// A config with `num_attention_heads = 2^63, head_dim = 2` (which passes
+    /// `Qwen35Config::validate`'s existing checks) must be rejected by
+    /// `infer_full_attention_shapes` via checked arithmetic instead of silently wrapping
+    /// `full_q_dim()` to a small/zero value that then passes geometry checks and reaches
+    /// indexing.
+    #[test]
+    fn quantize_full_attn_weights_rejects_overflowing_config() {
+        let cfg = Qwen35Config {
+            num_attention_heads: 1 << 63,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let w = FullAttentionLayerWeights {
+            q_proj: vec![],
+            k_proj: vec![],
+            v_proj: vec![],
+            o_proj: vec![],
+            q_norm: vec![0.0; cfg.head_dim],
+            k_norm: vec![0.0; cfg.head_dim],
+        };
+        assert!(matches!(
+            quantize_full_attn_weights(&w, &cfg),
+            Err(InferenceError::InvalidInput(_))
+        ));
     }
 
     #[test]
@@ -864,10 +1497,9 @@ mod tests {
         }
     }
 
-    /// Overflow guard: `m * k` must be rejected before the length `assert_eq!`
-    /// wraps it. Mutation-sensitive — dropping the `m*k` guard makes this fall
-    /// through to the `A length does not match m * k` assert (m*k wraps in
-    /// release), changing the panic message and failing this `expected`.
+    /// Overflow guard: `m * k` must be rejected with a dedicated overflow message
+    /// before the length `assert_eq!` can wrap it and panic with a misleading
+    /// "length does not match" message instead.
     #[test]
     #[should_panic(expected = "matmul shape overflow: m*k")]
     fn test_matmul_bt_q8_rejects_mk_overflow() {
@@ -900,9 +1532,9 @@ mod tests {
     /// Overflow guard for the macOS tile-scratch size `TILE_N * k`. With
     /// `m=0, k=MAX, n=0` every earlier product (`m*k`, `n*k`, `m*n`) and every
     /// length assert is zero/empty, so control reaches the tile block; `TILE_N*k`
-    /// then overflows. Mutation-sensitive: dropping this guard makes the
-    /// `vec![0.0f32; TILE_N * k]` allocation panic with "capacity overflow"
-    /// instead, failing this `expected`.
+    /// then overflows and must be rejected with a dedicated message rather than
+    /// letting the `vec![0.0f32; TILE_N * k]` allocation panic with a generic
+    /// "capacity overflow".
     #[cfg(target_os = "macos")]
     #[test]
     #[should_panic(expected = "matmul shape overflow: TILE_N*k")]
@@ -918,8 +1550,8 @@ mod tests {
 
     /// Overflow guard for the macOS tile-scratch size `m * TILE_N`. With
     /// `m=MAX, k=0, n=0` the earlier products and length asserts are all
-    /// zero/empty, so control reaches the tile block; `m*TILE_N` then overflows.
-    /// Mutation-sensitive by the same "capacity overflow" message mismatch.
+    /// zero/empty, so control reaches the tile block; `m*TILE_N` then overflows
+    /// and must be rejected with a dedicated message, same as `TILE_N*k` above.
     #[cfg(target_os = "macos")]
     #[test]
     #[should_panic(expected = "matmul shape overflow: m*TILE_N")]
@@ -1056,7 +1688,12 @@ mod tests {
             }),
         };
 
-        let result = quantize_common_weights(&moe_common);
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            intermediate_size: inter,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let result = quantize_common_weights(&moe_common, &cfg);
         assert!(
             matches!(result, Err(InferenceError::UnsupportedModel(_))),
             "expected Err(UnsupportedModel), got: {result:?}"
@@ -1064,34 +1701,28 @@ mod tests {
     }
 
     /// `quantize_matrix` must reject a weight matrix whose source row contains
-    /// `+inf` or `NaN`. Such a row produces `scale = inf / 127 = inf`, which then
-    /// poisons every matmul output for that channel via `0 * inf = NaN`.
-    ///
-    /// Mutation check: removing the `!scale.is_finite()` guard in `quantize_matrix`
-    /// causes this call to return `Ok` instead of `Err`, failing `expect_err`.
+    /// `+inf` or `NaN`. Without ingress validation such a row can produce a
+    /// non-finite scale or silently quantize NaN to zero.
     #[test]
     fn test_quantize_matrix_rejects_nonfinite_source_row() {
-        // Row 0 is finite; row 1 contains +inf → scale for row 1 = inf / 127 = inf.
+        // Row 0 is finite; row 1 contains +inf.
         let w = vec![
             1.0,
             2.0,
             3.0, // row 0: finite, scale ≈ 3/127
             1.0,
             f32::INFINITY,
-            0.0, // row 1: +inf → scale = inf
+            0.0, // row 1: non-finite source
         ];
         match quantize_matrix(&w, 2, 3) {
             Err(InferenceError::InvalidInput(msg)) => {
                 assert!(
                     msg.contains("non-finite"),
-                    "error must describe the non-finite scale; got: {msg}"
+                    "error must describe the non-finite source; got: {msg}"
                 );
-                assert!(
-                    msg.contains("1"),
-                    "error must identify the offending row index; got: {msg}"
-                );
+                assert!(msg.contains("element index 4"), "wrong attribution: {msg}");
             }
-            Err(e) => panic!("expected InvalidInput for non-finite scale, got: {e}"),
+            Err(e) => panic!("expected InvalidInput for non-finite source, got: {e}"),
             Ok(_) => panic!("expected Err for non-finite source row, got Ok"),
         }
     }
@@ -1102,15 +1733,9 @@ mod tests {
     /// in IEEE 754 — `NaN > max_abs` evaluates to `false` — so a NaN value
     /// never updates `max_abs`.  The scale then stays finite and the NaN element
     /// is silently quantized to 0 via Rust's saturating `f32 as i8` cast.
-    ///
-    /// Mutation check: removing the `!v.is_finite()` loop guard inside
-    /// `quantize_matrix` makes this test return `Ok` (NaN quietly becomes 0)
-    /// instead of `Err`, failing the `expect_err`-style match.
     #[test]
     fn test_quantize_matrix_rejects_nan_input() {
         // Row 0 is finite; row 1 contains NaN in lane 1.
-        // Without the loop guard the NaN never updates max_abs, the scale is
-        // finite, and the result is Ok (NaN → 0).  With the guard it is Err.
         let w = vec![
             1.0,
             2.0,
@@ -1125,34 +1750,62 @@ mod tests {
                     msg.contains("non-finite"),
                     "error must describe the non-finite value; got: {msg}"
                 );
-                assert!(
-                    msg.contains("1"),
-                    "error must identify the offending row index; got: {msg}"
-                );
+                assert!(msg.contains("element index 4"), "wrong attribution: {msg}");
             }
             Err(e) => panic!("expected InvalidInput for NaN input, got: {e}"),
             Ok(_) => panic!("expected Err for NaN input, got Ok"),
         }
     }
 
-    /// `quantize_gdn_weights` propagates the non-finite-scale error from
-    /// `quantize_matrix`. A single `+inf` value in `in_proj_qkv` is enough.
-    ///
-    /// Mutation check: removing the `!scale.is_finite()` guard in `quantize_matrix`
-    /// causes this to return `Ok`, failing `expect_err`.
     #[test]
-    fn test_quantize_gdn_weights_rejects_nonfinite_scale() {
+    fn test_quantize_matrix_rejects_shape_overflow() {
+        match quantize_matrix(&[], usize::MAX, 2) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("overflows usize"),
+                    "error must describe the geometry overflow; got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput for shape overflow, got: {e}"),
+            Ok(_) => panic!("expected Err for shape overflow, got Ok"),
+        }
+    }
+
+    #[test]
+    fn test_quantize_matrix_rejects_scale_underflow() {
+        let w = [f32::from_bits(1)];
+        match quantize_matrix(&w, 1, 1) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("non-positive scale 0"),
+                    "error must describe the underflowed scale; got: {msg}"
+                );
+                assert!(msg.contains("row 0"), "wrong attribution: {msg}");
+            }
+            Err(e) => panic!("expected InvalidInput for scale underflow, got: {e}"),
+            Ok(_) => panic!("expected Err for scale underflow, got Ok"),
+        }
+    }
+
+    /// `quantize_gdn_weights` propagates the shared ingress error from its
+    /// named `in_proj_qkv` conversion. A single `+inf` value is enough.
+    #[test]
+    fn test_quantize_gdn_weights_rejects_nonfinite_source() {
         let mut w = valid_gdn_weights(3, 8);
-        // row 0 of in_proj_qkv gets max_abs = +inf → scale = +inf / 127 = +inf
+        // The first in_proj_qkv element is non-finite.
         w.in_proj_qkv[0] = f32::INFINITY;
-        match quantize_gdn_weights(&w) {
+        match quantize_gdn_weights(&w, &matching_gdn_cfg()) {
             Err(InferenceError::InvalidInput(msg)) => {
                 assert!(
                     msg.contains("non-finite"),
-                    "error must describe the non-finite scale; got: {msg}"
+                    "error must describe the non-finite source; got: {msg}"
+                );
+                assert!(
+                    msg.contains("in_proj_qkv"),
+                    "error must name the offending tensor; got: {msg}"
                 );
             }
-            Err(e) => panic!("expected InvalidInput for non-finite scale, got: {e}"),
+            Err(e) => panic!("expected InvalidInput for non-finite source, got: {e}"),
             Ok(_) => panic!("expected Err for non-finite source weight, got Ok"),
         }
     }
@@ -1174,10 +1827,300 @@ mod tests {
             }),
         };
 
-        let result = quantize_common_weights(&dense_common);
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            intermediate_size: inter,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let result = quantize_common_weights(&dense_common, &cfg);
         assert!(
             result.is_ok(),
             "expected Ok for dense layer, got: {result:?}"
         );
+    }
+
+    fn valid_full_attention_weights(
+        cfg: &Qwen35Config,
+        head_dim: usize,
+        hidden: usize,
+    ) -> FullAttentionLayerWeights {
+        let q_dim = cfg.num_attention_heads * head_dim;
+        let kv_dim = cfg.num_key_value_heads * head_dim;
+        let q_rows = 2 * q_dim;
+        FullAttentionLayerWeights {
+            q_proj: vec![0.0; q_rows * hidden],
+            k_proj: vec![0.0; kv_dim * hidden],
+            v_proj: vec![0.0; kv_dim * hidden],
+            o_proj: vec![0.0; hidden * q_dim],
+            q_norm: vec![1.0; head_dim],
+            k_norm: vec![1.0; head_dim],
+        }
+    }
+
+    /// An empty `q_norm` must be rejected at Q8 ingress, not reach
+    /// `infer_full_attention_shapes`'s `head_dim > 0` invariant as a panic
+    /// (checkpoint-file DoS on Q8 conversion).
+    #[test]
+    fn quantize_full_attn_weights_rejects_empty_q_norm() {
+        let cfg = Qwen35Config {
+            head_dim: 4,
+            hidden_size: 6,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let mut w = valid_full_attention_weights(&cfg, 4, 6);
+        w.q_norm = vec![];
+        match quantize_full_attn_weights(&w, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(msg.contains("q_norm"), "error must name q_norm, got: {msg}");
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for empty q_norm, got Ok"),
+        }
+    }
+
+    /// A `k_norm` whose length disagrees with `q_norm`/`head_dim` must be
+    /// rejected at Q8 ingress rather than panicking via the `k_norm.len() ==
+    /// head_dim` invariant in `infer_full_attention_shapes`.
+    #[test]
+    fn quantize_full_attn_weights_rejects_mismatched_k_norm() {
+        let cfg = Qwen35Config {
+            head_dim: 4,
+            hidden_size: 6,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let mut w = valid_full_attention_weights(&cfg, 4, 6);
+        w.k_norm = vec![1.0; 2]; // head_dim is 4; k_norm must match
+        match quantize_full_attn_weights(&w, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(msg.contains("k_norm"), "error must name k_norm, got: {msg}");
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for mismatched k_norm, got Ok"),
+        }
+    }
+
+    /// A `q_norm`/`k_norm` pair that agree with each other but disagree with
+    /// `cfg.head_dim` must be rejected. Before this guard, `infer_full_attention_shapes`
+    /// derived `head_dim` FROM `q_norm.len()` instead of `cfg.head_dim`, so a
+    /// consistently-malformed checkpoint (`q_norm.len() == k_norm.len() != cfg.head_dim`)
+    /// passed Q8 conversion and panicked in `matmul_bt_q8` on the first full-attention
+    /// token — a checkpoint-triggerable process DoS.
+    #[test]
+    fn quantize_full_attn_weights_rejects_q_norm_disagreeing_with_cfg_head_dim() {
+        let cfg = Qwen35Config {
+            head_dim: 4,
+            hidden_size: 6,
+            ..Qwen35Config::qwen35_2b()
+        };
+        // q_norm and k_norm agree with each other (both length 5) but neither matches
+        // cfg.head_dim (4).
+        let mut w = valid_full_attention_weights(&cfg, 4, 6);
+        w.q_norm = vec![1.0; 5];
+        w.k_norm = vec![1.0; 5];
+        match quantize_full_attn_weights(&w, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(msg.contains("q_norm"), "error must name q_norm, got: {msg}");
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!(
+                "expected Err for q_norm/k_norm disagreeing with cfg.head_dim, got Ok \
+                 (would panic in matmul_bt_q8 on the first full-attention token)"
+            ),
+        }
+    }
+
+    /// An empty `input_layernorm` disagreeing with `cfg.hidden_size` must be
+    /// rejected at Q8 ingress instead of reaching `infer_dense_shapes` with an
+    /// hidden dimension the checkpoint never declared.
+    #[test]
+    fn quantize_common_weights_rejects_empty_input_layernorm() {
+        use crate::model::qwen35::{CommonLayerWeights, DenseFfnWeights, FeedForwardWeights};
+
+        let cfg = Qwen35Config {
+            hidden_size: 4,
+            intermediate_size: 2,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let common = CommonLayerWeights {
+            input_layernorm: vec![],
+            post_attention_layernorm: vec![0.0f32; 4],
+            ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                gate_proj: vec![0.0f32; 8],
+                up_proj: vec![0.0f32; 8],
+                down_proj: vec![0.0f32; 8],
+            }),
+        };
+
+        match quantize_common_weights(&common, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("input_layernorm") || msg.contains("hidden"),
+                    "error must describe the empty hidden dimension, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!("expected Err for empty input_layernorm, got Ok"),
+        }
+    }
+
+    /// `cfg.hidden_size == 0` with all-empty dense tensors satisfies every
+    /// `validate_cfg_len`/`validate_source_geometry` check vacuously (`0 == 0`), so it
+    /// must be rejected by an explicit `hidden == 0` guard, not left to reach
+    /// `qwen35_rms_norm`'s `x.len() / hidden` division on the first forward pass.
+    #[test]
+    fn quantize_common_weights_rejects_zero_hidden_size() {
+        use crate::model::qwen35::{CommonLayerWeights, DenseFfnWeights, FeedForwardWeights};
+
+        let cfg = Qwen35Config {
+            hidden_size: 0,
+            intermediate_size: 0,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let common = CommonLayerWeights {
+            input_layernorm: vec![],
+            post_attention_layernorm: vec![],
+            ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                gate_proj: vec![],
+                up_proj: vec![],
+                down_proj: vec![],
+            }),
+        };
+
+        match quantize_common_weights(&common, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("hidden_size") || msg.contains("hidden"),
+                    "error must describe the zero hidden dimension, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!(
+                "expected Err for hidden_size == 0, got Ok (would panic on x.len() / hidden \
+                 in qwen35_rms_norm on the first forward pass)"
+            ),
+        }
+    }
+
+    /// A short `post_attention_layernorm` (shorter than `cfg.hidden_size`, with a
+    /// correctly-sized `input_layernorm`) must be rejected, not silently accepted. In
+    /// release builds `qwen35_rms_norm` zips gamma against the activation, so a short
+    /// gamma would leave trailing hidden values unnormalized instead of failing loudly —
+    /// a silent-wrong-output bug, not a panic.
+    #[test]
+    fn quantize_common_weights_rejects_short_post_attention_layernorm() {
+        use crate::model::qwen35::{CommonLayerWeights, DenseFfnWeights, FeedForwardWeights};
+
+        let cfg = Qwen35Config {
+            hidden_size: 4,
+            intermediate_size: 2,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let common = CommonLayerWeights {
+            input_layernorm: vec![1.0f32; 4],
+            post_attention_layernorm: vec![1.0f32; 2], // shorter than cfg.hidden_size (4)
+            ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                gate_proj: vec![0.0f32; 8],
+                up_proj: vec![0.0f32; 8],
+                down_proj: vec![0.0f32; 8],
+            }),
+        };
+
+        match quantize_common_weights(&common, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("post_attention_layernorm"),
+                    "error must name post_attention_layernorm, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!(
+                "expected Err for short post_attention_layernorm, got Ok (would silently \
+                 leave trailing hidden values unnormalized)"
+            ),
+        }
+    }
+
+    /// Reference two-pass implementation predating the ingress fusion: a full
+    /// finite-value scan over the source matrix, followed by the max-abs +
+    /// quantize loop as two independent passes. Kept only to prove the fused
+    /// single-pass `quantize_named_matrix` produces byte-identical output.
+    fn quantize_matrix_two_pass_reference(w: &[f32], rows: usize, cols: usize) -> Q8Matrix {
+        assert!(
+            w.iter().all(|v| v.is_finite()),
+            "reference requires finite input"
+        );
+
+        let mut data = Vec::with_capacity(w.len());
+        let mut scales = Vec::with_capacity(rows);
+
+        for row_idx in 0..rows {
+            let start = row_idx * cols;
+            let end = start + cols;
+            let row = &w[start..end];
+
+            let mut max_abs = 0.0f32;
+            for &v in row {
+                let abs_v = v.abs();
+                if abs_v > max_abs {
+                    max_abs = abs_v;
+                }
+            }
+
+            let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
+            scales.push(scale);
+
+            for &v in row {
+                let q = (v / scale).round().clamp(-128.0, 127.0) as i8;
+                data.push(q);
+            }
+        }
+
+        Q8Matrix {
+            data,
+            scales,
+            rows,
+            cols,
+        }
+    }
+
+    /// Proves the fused single-pass `quantize_matrix` is byte-identical to the
+    /// pre-fusion two-pass reference across representative shapes, including a
+    /// forced zero row (the `max_abs == 0.0` branch). max(|x_i|) is
+    /// order-independent and the per-element quantization involves no FP
+    /// accumulation, so fusing the finite-value scan into the max-abs loop
+    /// must not change any output byte or scale.
+    #[test]
+    fn test_fused_pass_matches_two_pass_reference_bit_exact() {
+        let cases: [(usize, usize, u32); 4] = [
+            (4, 4, 0x1111_1111),
+            (32, 64, 0x1234_5678),
+            (17, 33, 0xDEAD_BEEF),
+            (6, 4, 0xCAFE_BABE),
+        ];
+
+        for (rows, cols, seed0) in cases {
+            let mut seed = seed0;
+            let mut w = Vec::with_capacity(rows * cols);
+            for _ in 0..rows * cols {
+                w.push(uniform_signed(&mut seed) * 0.37);
+            }
+            // Force a zero row to exercise the max_abs == 0.0 branch identically
+            // in both the fused and reference paths.
+            for v in &mut w[cols..2 * cols] {
+                *v = 0.0;
+            }
+
+            let fused = quantize_matrix(&w, rows, cols).expect("valid finite matrix must quantize");
+            let reference = quantize_matrix_two_pass_reference(&w, rows, cols);
+
+            assert_eq!(
+                fused.data, reference.data,
+                "quantized bytes diverged for {rows}x{cols}"
+            );
+            assert_eq!(
+                fused.scales, reference.scales,
+                "scales diverged for {rows}x{cols}"
+            );
+        }
     }
 }

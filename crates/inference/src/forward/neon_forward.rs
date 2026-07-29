@@ -31,6 +31,13 @@ use crate::rope::RopeTable;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
+use crate::weights::ingress::{IngestedTensor, validate_ingested_tensor};
+use crate::weights::q8_weights::{validate_cfg_len, validate_gdn_shapes};
+
+/// Source label for NEON full-attention ingress validation errors.
+const Q8_NEON_ATTENTION_SOURCE: &str = "full-attention Q8 NEON quantization";
+/// Source label for NEON common-layer (dense FFN) ingress validation errors.
+const Q8_NEON_FFN_SOURCE: &str = "dense FFN Q8 NEON quantization";
 
 // -----------------------------------------------------------------------
 // Q8 NEON weight structures
@@ -164,7 +171,17 @@ pub struct Q8NeonModel {
 // -----------------------------------------------------------------------
 
 /// Convert GDN weights to Q8_0 NEON packed format.
-fn pack_gdn_weights(w: &GatedDeltaNetWeights) -> Result<Q8NeonGdnWeights, InferenceError> {
+///
+/// Validates every projection's declared shape against `cfg` (the same accessors the
+/// CPU Q8 path validates against, via the shared `validate_gdn_shapes`) before packing,
+/// so this NEON path cannot reach `pack_weights_q8` with checkpoint- or caller-supplied
+/// geometry that disagrees with the runtime config.
+fn pack_gdn_weights(
+    w: &GatedDeltaNetWeights,
+    cfg: &Qwen35Config,
+) -> Result<Q8NeonGdnWeights, InferenceError> {
+    validate_gdn_shapes(w, cfg)?;
+
     Ok(Q8NeonGdnWeights {
         in_proj_qkv_packed: pack_weights_q8(
             &w.in_proj_qkv,
@@ -205,9 +222,39 @@ fn pack_full_attn_weights(
     cfg: &Qwen35Config,
 ) -> Result<Q8NeonFullAttnWeights, InferenceError> {
     let hidden = cfg.hidden_size;
-    let q_dim = cfg.full_q_dim();
-    let kv_dim = cfg.full_kv_dim();
-    let q_proj_rows = 2 * q_dim; // Q + gate interleaved
+    // `config.json` is untrusted input: use the checked accessors so a pathological
+    // `num_attention_heads` / `num_key_value_heads` (e.g. 2^63 with head_dim 2) overflows
+    // into a typed error instead of wrapping `q_dim`/`kv_dim` to a small value that packs
+    // an undersized tensor here and then panics in `forward_step_q8_neon`, which indexes
+    // by the original, unwrapped head count.
+    let q_dim = cfg.checked_full_q_dim()?;
+    let kv_dim = cfg.checked_full_kv_dim()?;
+    let q_proj_rows = crate::model::qwen35_config::checked_double(q_dim, "full_q_dim")?; // Q + gate interleaved
+
+    validate_cfg_len(
+        w.q_norm.len(),
+        cfg.head_dim,
+        Q8_NEON_ATTENTION_SOURCE,
+        "q_norm",
+    )?;
+    validate_cfg_len(
+        w.k_norm.len(),
+        cfg.head_dim,
+        Q8_NEON_ATTENTION_SOURCE,
+        "k_norm",
+    )?;
+    validate_ingested_tensor(IngestedTensor::q8_source(
+        Q8_NEON_ATTENTION_SOURCE,
+        "q_norm",
+        &[w.q_norm.len()],
+        &w.q_norm,
+    ))?;
+    validate_ingested_tensor(IngestedTensor::q8_source(
+        Q8_NEON_ATTENTION_SOURCE,
+        "k_norm",
+        &[w.k_norm.len()],
+        &w.k_norm,
+    ))?;
 
     Ok(Q8NeonFullAttnWeights {
         q_proj_packed: pack_weights_q8(&w.q_proj, q_proj_rows, hidden)?,
@@ -248,6 +295,34 @@ fn pack_common_weights(
         }
     };
 
+    // `qwen35_rms_norm` zips gamma against the `hidden`-length activation row; a short
+    // `input_layernorm`/`post_attention_layernorm` would otherwise be silently truncated
+    // by that zip (trailing hidden values left unnormalized) instead of failing here.
+    validate_cfg_len(
+        w.input_layernorm.len(),
+        hidden,
+        Q8_NEON_FFN_SOURCE,
+        "input_layernorm",
+    )?;
+    validate_cfg_len(
+        w.post_attention_layernorm.len(),
+        hidden,
+        Q8_NEON_FFN_SOURCE,
+        "post_attention_layernorm",
+    )?;
+    validate_ingested_tensor(IngestedTensor::q8_source(
+        Q8_NEON_FFN_SOURCE,
+        "input_layernorm",
+        &[w.input_layernorm.len()],
+        &w.input_layernorm,
+    ))?;
+    validate_ingested_tensor(IngestedTensor::q8_source(
+        Q8_NEON_FFN_SOURCE,
+        "post_attention_layernorm",
+        &[w.post_attention_layernorm.len()],
+        &w.post_attention_layernorm,
+    ))?;
+
     Ok(Q8NeonCommonWeights {
         input_layernorm: w.input_layernorm.clone(),
         post_attention_layernorm: w.post_attention_layernorm.clone(),
@@ -279,8 +354,12 @@ fn pack_common_weights(
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any weight element is non-finite,
-/// or if the model contains MoE layers (Q8 NEON packing is dense-only).
+/// Returns [`InferenceError::InvalidInput`] if any weight element is non-finite; if the
+/// model contains MoE layers (Q8 NEON packing is dense-only); if a GatedDeltaNet layer's
+/// declared shape (including `conv_dim`) disagrees with `cfg`; if a per-layer
+/// `input_layernorm`/`post_attention_layernorm` length disagrees with `cfg.hidden_size`
+/// (checked by the loader before packing); or if a config-derived dimension overflows
+/// `usize`.
 pub fn quantize_model(
     weights: &ModelWeights,
     cfg: &Qwen35Config,
@@ -294,7 +373,7 @@ pub fn quantize_model(
         .map(|(attn, common)| {
             let q8_attn = match attn {
                 AttentionWeights::Linear(gdn_w) => {
-                    Q8NeonAttentionWeights::Linear(pack_gdn_weights(gdn_w)?)
+                    Q8NeonAttentionWeights::Linear(pack_gdn_weights(gdn_w, cfg)?)
                 }
                 AttentionWeights::Full(full_w) => {
                     Q8NeonAttentionWeights::Full(pack_full_attn_weights(full_w, cfg)?)
@@ -904,6 +983,7 @@ pub fn generate_q8_neon(
     // used to accept an empty prompt and return an empty Ok) — see
     // `check_prompt_not_empty` (model::qwen35::generation).
     crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+    crate::model::qwen35::check_prompt_ids_in_vocab(&prompt_ids, cfg.vocab_size)?;
 
     // max_new_tokens == 0 means "generate nothing": return before sampling so
     // we never emit a token the caller did not ask for. Mirrors the guard in
@@ -1577,6 +1657,287 @@ mod tests {
         assert_eq!(c.up_proj_packed.len(), q8_packed_size(inter, hidden));
         assert_eq!(c.down_proj_packed.len(), q8_packed_size(hidden, inter));
         assert_eq!(c.input_layernorm.len(), hidden);
+    }
+
+    /// A `ModelWeights` whose GDN `in_proj_b_rows`/`in_proj_a_rows`/`a_log`/`dt_bias` are
+    /// internally consistent (all finite, all agree with each other) but disagree with
+    /// `cfg.linear_num_value_heads()` must be rejected by the public NEON `quantize_model`
+    /// with a typed `Err`, not a panic. Before `pack_gdn_weights` called
+    /// `validate_gdn_shapes`, this geometry reached assert-based `pack_weights_q8`
+    /// (self-consistent rows/cols always satisfy `weights.len() == n * k`) and panicked
+    /// downstream in `matmul_q8_neon_into` at inference time instead of failing at
+    /// ingress — the NEON sibling of the guarded CPU Q8 path.
+    #[test]
+    fn quantize_model_rejects_gdn_value_heads_disagreeing_with_cfg() {
+        let cfg = Qwen35Config::qwen35_2b();
+        let hidden = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let inter = cfg.intermediate_size;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+
+        // Internally consistent value-head count (5) that disagrees with
+        // cfg.linear_num_value_heads() (16 for qwen35_2b).
+        let bad_value_heads = 5;
+        assert_ne!(bad_value_heads, cfg.linear_num_value_heads());
+        let gdn_w = GatedDeltaNetWeights {
+            in_proj_qkv: vec![0.0; qkv_dim * hidden],
+            in_proj_qkv_rows: qkv_dim,
+            in_proj_qkv_cols: hidden,
+            in_proj_z: vec![0.0; output_dim * hidden],
+            in_proj_z_rows: output_dim,
+            in_proj_z_cols: hidden,
+            in_proj_b: vec![0.0; bad_value_heads * hidden],
+            in_proj_b_rows: bad_value_heads,
+            in_proj_b_cols: hidden,
+            in_proj_a: vec![0.0; bad_value_heads * hidden],
+            in_proj_a_rows: bad_value_heads,
+            in_proj_a_cols: hidden,
+            a_log: vec![0.0; bad_value_heads],
+            dt_bias: vec![0.0; bad_value_heads],
+            conv1d_weight: vec![0.0; qkv_dim * cfg.linear_conv_kernel_dim],
+            conv_dim: qkv_dim,
+            kernel_size: cfg.linear_conv_kernel_dim,
+            norm_weight: vec![0.0; cfg.linear_value_head_dim],
+            out_proj: vec![0.0; hidden * output_dim],
+            out_proj_rows: hidden,
+            out_proj_cols: output_dim,
+        };
+
+        let common_w = CommonLayerWeights {
+            input_layernorm: vec![0.0; hidden],
+            post_attention_layernorm: vec![0.0; hidden],
+            ffn: crate::model::qwen35::FeedForwardWeights::Dense(
+                crate::model::qwen35::DenseFfnWeights {
+                    gate_proj: vec![0.0; inter * hidden],
+                    up_proj: vec![0.0; inter * hidden],
+                    down_proj: vec![0.0; hidden * inter],
+                },
+            ),
+        };
+
+        let weights = ModelWeights {
+            embed_tokens: vec![0.0; vocab * hidden],
+            lm_head: None,
+            final_norm: vec![0.0; hidden],
+            layers: vec![(AttentionWeights::Linear(gdn_w), common_w)],
+        };
+
+        match quantize_model(&weights, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("in_proj_b"),
+                    "error must name in_proj_b, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!(
+                "expected Err for GDN value-head count disagreeing with cfg, got Ok \
+                 (would panic in matmul_q8_neon_into downstream)"
+            ),
+        }
+    }
+
+    /// A config with `num_attention_heads = 2^63` and `head_dim = 2` overflows
+    /// `full_q_dim()`/`full_kv_dim()` (`num_attention_heads * head_dim`) to a small
+    /// wrapped value in release builds. `pack_full_attn_weights` must reject this via
+    /// the checked accessors before packing a Q/O tensor sized to the wrapped
+    /// dimension while `forward_step_q8_neon` would still index by the original,
+    /// unwrapped head count.
+    #[test]
+    fn quantize_model_rejects_full_attention_overflowing_config() {
+        let cfg = Qwen35Config {
+            num_attention_heads: 1 << 63,
+            num_key_value_heads: 1 << 63,
+            head_dim: 2,
+            ..Qwen35Config::qwen35_2b()
+        };
+        let hidden = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let inter = cfg.intermediate_size;
+
+        // Content doesn't matter — the overflow must be caught before any tensor
+        // geometry derived from it is even consulted.
+        let full_w = FullAttentionLayerWeights {
+            q_proj: vec![0.0; 4],
+            k_proj: vec![0.0; 4],
+            v_proj: vec![0.0; 4],
+            o_proj: vec![0.0; 4],
+            q_norm: vec![0.0; cfg.head_dim],
+            k_norm: vec![0.0; cfg.head_dim],
+        };
+        let common_w = CommonLayerWeights {
+            input_layernorm: vec![0.0; hidden],
+            post_attention_layernorm: vec![0.0; hidden],
+            ffn: crate::model::qwen35::FeedForwardWeights::Dense(
+                crate::model::qwen35::DenseFfnWeights {
+                    gate_proj: vec![0.0; inter * hidden],
+                    up_proj: vec![0.0; inter * hidden],
+                    down_proj: vec![0.0; hidden * inter],
+                },
+            ),
+        };
+        let weights = ModelWeights {
+            embed_tokens: vec![0.0; vocab * hidden],
+            lm_head: None,
+            final_norm: vec![0.0; hidden],
+            layers: vec![(AttentionWeights::Full(full_w), common_w)],
+        };
+
+        match quantize_model(&weights, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("overflow"),
+                    "error must describe the overflow, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!(
+                "expected Err for overflowing full-attention config, got Ok (would pack an \
+                 undersized tensor and panic in forward_step_q8_neon downstream)"
+            ),
+        }
+    }
+
+    /// The NEON GDN path retains `a_log`, `dt_bias`, `conv1d_weight`, and `norm_weight`
+    /// as f32 without quantizing them, so they must be explicitly finite-checked (via
+    /// the shared `validate_gdn_shapes`) instead of copied verbatim. A `ModelWeights`
+    /// carrying a NaN in `a_log` must be rejected at ingress, not accepted to poison
+    /// the GDN decay recurrence at decode time.
+    #[test]
+    fn quantize_model_rejects_non_finite_gdn_a_log() {
+        let cfg = Qwen35Config::qwen35_2b();
+        let hidden = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let inter = cfg.intermediate_size;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let value_heads = cfg.linear_num_value_heads();
+
+        let mut gdn_w = GatedDeltaNetWeights {
+            in_proj_qkv: vec![0.0; qkv_dim * hidden],
+            in_proj_qkv_rows: qkv_dim,
+            in_proj_qkv_cols: hidden,
+            in_proj_z: vec![0.0; output_dim * hidden],
+            in_proj_z_rows: output_dim,
+            in_proj_z_cols: hidden,
+            in_proj_b: vec![0.0; value_heads * hidden],
+            in_proj_b_rows: value_heads,
+            in_proj_b_cols: hidden,
+            in_proj_a: vec![0.0; value_heads * hidden],
+            in_proj_a_rows: value_heads,
+            in_proj_a_cols: hidden,
+            a_log: vec![0.0; value_heads],
+            dt_bias: vec![0.0; value_heads],
+            conv1d_weight: vec![0.0; qkv_dim * cfg.linear_conv_kernel_dim],
+            conv_dim: qkv_dim,
+            kernel_size: cfg.linear_conv_kernel_dim,
+            norm_weight: vec![0.0; cfg.linear_value_head_dim],
+            out_proj: vec![0.0; hidden * output_dim],
+            out_proj_rows: hidden,
+            out_proj_cols: output_dim,
+        };
+        gdn_w.a_log[0] = f32::NAN;
+
+        let common_w = CommonLayerWeights {
+            input_layernorm: vec![0.0; hidden],
+            post_attention_layernorm: vec![0.0; hidden],
+            ffn: crate::model::qwen35::FeedForwardWeights::Dense(
+                crate::model::qwen35::DenseFfnWeights {
+                    gate_proj: vec![0.0; inter * hidden],
+                    up_proj: vec![0.0; inter * hidden],
+                    down_proj: vec![0.0; hidden * inter],
+                },
+            ),
+        };
+        let weights = ModelWeights {
+            embed_tokens: vec![0.0; vocab * hidden],
+            lm_head: None,
+            final_norm: vec![0.0; hidden],
+            layers: vec![(AttentionWeights::Linear(gdn_w), common_w)],
+        };
+
+        match quantize_model(&weights, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(msg.contains("a_log"), "error must name a_log, got: {msg}");
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!(
+                "expected Err for non-finite a_log, got Ok (would poison the GDN decay \
+                 recurrence at decode time)"
+            ),
+        }
+    }
+
+    /// A short `post_attention_layernorm` (shorter than `cfg.hidden_size`) must be
+    /// rejected by the NEON packing path, not silently accepted: `qwen35_rms_norm`
+    /// zips gamma against the `hidden`-length activation row, so a short gamma would
+    /// leave trailing hidden values unnormalized instead of failing loudly — silent
+    /// wrong output, not a panic.
+    #[test]
+    fn quantize_model_rejects_short_post_attention_layernorm() {
+        let cfg = Qwen35Config::qwen35_2b();
+        let hidden = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let inter = cfg.intermediate_size;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let output_dim = cfg.linear_output_dim();
+        let value_heads = cfg.linear_num_value_heads();
+
+        let gdn_w = GatedDeltaNetWeights {
+            in_proj_qkv: vec![0.0; qkv_dim * hidden],
+            in_proj_qkv_rows: qkv_dim,
+            in_proj_qkv_cols: hidden,
+            in_proj_z: vec![0.0; output_dim * hidden],
+            in_proj_z_rows: output_dim,
+            in_proj_z_cols: hidden,
+            in_proj_b: vec![0.0; value_heads * hidden],
+            in_proj_b_rows: value_heads,
+            in_proj_b_cols: hidden,
+            in_proj_a: vec![0.0; value_heads * hidden],
+            in_proj_a_rows: value_heads,
+            in_proj_a_cols: hidden,
+            a_log: vec![0.0; value_heads],
+            dt_bias: vec![0.0; value_heads],
+            conv1d_weight: vec![0.0; qkv_dim * cfg.linear_conv_kernel_dim],
+            conv_dim: qkv_dim,
+            kernel_size: cfg.linear_conv_kernel_dim,
+            norm_weight: vec![0.0; cfg.linear_value_head_dim],
+            out_proj: vec![0.0; hidden * output_dim],
+            out_proj_rows: hidden,
+            out_proj_cols: output_dim,
+        };
+        let common_w = CommonLayerWeights {
+            input_layernorm: vec![0.0; hidden],
+            post_attention_layernorm: vec![0.0; hidden - 1], // shorter than cfg.hidden_size
+            ffn: crate::model::qwen35::FeedForwardWeights::Dense(
+                crate::model::qwen35::DenseFfnWeights {
+                    gate_proj: vec![0.0; inter * hidden],
+                    up_proj: vec![0.0; inter * hidden],
+                    down_proj: vec![0.0; hidden * inter],
+                },
+            ),
+        };
+        let weights = ModelWeights {
+            embed_tokens: vec![0.0; vocab * hidden],
+            lm_head: None,
+            final_norm: vec![0.0; hidden],
+            layers: vec![(AttentionWeights::Linear(gdn_w), common_w)],
+        };
+
+        match quantize_model(&weights, &cfg) {
+            Err(InferenceError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("post_attention_layernorm"),
+                    "error must name post_attention_layernorm, got: {msg}"
+                );
+            }
+            Err(e) => panic!("expected InvalidInput, got: {e}"),
+            Ok(_) => panic!(
+                "expected Err for short post_attention_layernorm, got Ok (would silently \
+                 leave trailing hidden values unnormalized)"
+            ),
+        }
     }
 
     #[test]
@@ -2517,11 +2878,9 @@ mod tests {
     ///
     /// Setup: hidden=64 (must be multiple of 32 for Q8_0), vocab=64, all-zero
     /// weights → logits all 0 → greedy always picks token 0.
-    /// Config has eos_token_id=5 (not 0) and stop_token_ids=[0].
-    ///
-    /// Mutation check: reverting `should_stop_token` back to
-    /// `next_id == cfg.eos_token_id` in either check causes `0 == 5` to be false,
-    /// so token 0 is pushed to output and `generated_tokens` becomes ≥ 1.
+    /// Config has eos_token_id=5 (not 0) and stop_token_ids=[0]; `should_stop_token`
+    /// must check membership in `stop_token_ids`, not just equality with
+    /// `eos_token_id`, so generation stops on token 0 without emitting it.
     #[test]
     fn test_generate_q8_neon_honors_stop_token_ids() {
         use std::collections::HashMap;
@@ -2781,6 +3140,87 @@ mod tests {
             matches!(result, Err(InferenceError::Inference(ref msg)) if msg.contains("empty prompt")),
             "generate_q8_neon must reject an empty prompt with Err(Inference(\"empty \
              prompt\")) (#856); got {result:?}"
+        );
+    }
+
+    /// A standalone NEON driver can receive a tokenizer whose vocabulary is
+    /// larger than the supplied model config. The boundary ID `vocab_size`
+    /// must be rejected before `forward_step_q8_neon` slices the embedding
+    /// table.
+    ///
+    /// Mutation sensitivity: removing only the NEON call to
+    /// `check_prompt_ids_in_vocab` lets this request reach the unchecked
+    /// embedding slice and panic instead of returning `InvalidInput`.
+    #[test]
+    fn generate_q8_neon_rejects_out_of_vocab_prompt_id() {
+        use std::collections::HashMap;
+
+        let hidden = 32usize;
+        let vocab = 8usize;
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 32,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 32,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
+        };
+        let model = Q8NeonModel {
+            embed_tokens: vec![0.0f32; vocab * hidden],
+            final_norm: vec![0.0f32; hidden],
+            lm_head_packed: zero_packed(vocab, hidden),
+            lm_head_rows: vocab,
+            lm_head_cols: hidden,
+            layers: vec![],
+        };
+        let rope = RopeTable::new(16, 64, 10_000.0);
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        vocab_map.insert("z".to_string(), cfg.vocab_size as u32);
+        let mismatched_tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, vec![])
+            .expect("tokenizer with an OOV vocab entry still constructs");
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+
+        let err = generate_q8_neon(&model, &cfg, &mismatched_tokenizer, &rope, "z", &gen_cfg)
+            .expect_err("an out-of-vocabulary prompt token id must be rejected, not panic");
+        assert!(
+            matches!(err, crate::error::InferenceError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
         );
     }
 

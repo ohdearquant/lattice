@@ -52,7 +52,7 @@ mod gpu {
     #[cfg(feature = "test-utils")]
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Test-only diagnostic (issue: S3b gate review — cosine parity alone
+    /// Test-only diagnostic: cosine parity alone
     /// can't distinguish "every GEMM ran on Metal" from "every GEMM silently
     /// fell back to the CPU loop below", since the fallback is exact). Counts
     /// GEMM calls that actually dispatched to the GPU (`metal_matmul`/
@@ -350,8 +350,9 @@ mod tests {
             out_hidden_size: 8,
             temporal_patch_size: 1,
             num_position_embeddings: 16,
-            in_channels: 1,
+            in_channels: 3,
             deepstack_visual_indexes: vec![],
+            intermediate_size: None,
         }
     }
 

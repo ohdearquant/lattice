@@ -181,7 +181,7 @@ impl Qwen35Model {
         // sample. mask_logits sets every disallowed token to NEG_INFINITY in-place,
         // so the sampler only sees the grammar-permitted candidate set.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
             // If the grammar blocked every token the sampler's non-finite-max
             // short-circuit would silently return token 0. An accepting state
             // terminates normally; an incomplete state remains a hard error.
@@ -635,7 +635,7 @@ impl Qwen35Model {
 
         // Grammar mask on the post-prefill logits, identical to the generate() path.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                 if engine.is_complete_without_continuation(gs) {
                     return Ok(grammar_output(String::new(), &[], prompt_len, true, vec![]));
@@ -810,7 +810,7 @@ impl Qwen35Model {
 
                 // Grammar mask before sampling; fail closed on an all-blocked step.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
                     if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                         if engine.is_complete_without_continuation(gs) {
                             stopped = true;
@@ -1018,7 +1018,7 @@ impl Qwen35Model {
 
                 // Grammar mask before sampling; fail closed on an all-blocked step.
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                    engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
                     if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                         if engine.is_complete_without_continuation(gs) {
                             stopped = true;
@@ -1905,7 +1905,7 @@ fn decode_loop(
 
         // Grammar mask before sampling; fail closed when every token is blocked.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                 if engine.is_complete_without_continuation(gs) {
                     return Ok((true, StopReason::Grammar));
@@ -2033,7 +2033,7 @@ fn decode_loop_with_stops(
 
         // Grammar mask before sampling; fail closed when every token is blocked.
         if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut *grammar_state) {
-            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+            engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
             if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {
                 if engine.is_complete_without_continuation(gs) {
                     stopped = true;
@@ -2190,9 +2190,9 @@ fn truncate_token_logprobs_to_retained_text(
 
 /// Returns true when `token_id` is EOS or is in the `stop_token_ids` list.
 ///
-/// `pub(crate)` — all callers (Q8, F16, NEON, batch-prefill generate paths) live
-/// within this crate. Keeping the function crate-private avoids leaking a
-/// low-level sampling helper as part of the public API.
+/// `pub(crate)` — all call sites live within this crate. Keeping the function
+/// crate-private avoids leaking a low-level sampling helper as part of the
+/// public API.
 pub(crate) fn should_stop_token(
     cfg: &Qwen35Config,
     gen_cfg: &GenerateConfig,
@@ -2213,7 +2213,6 @@ pub(crate) fn should_stop_token(
 /// - `generate_q8` (`forward/cpu_q8.rs`)
 /// - `generate_f16` (`forward/cpu_f16.rs`)
 /// - `generate_q8_neon` (`forward/neon_forward.rs`)
-/// - `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`)
 /// - `multimodal_generate_preflight` (`forward/metal_qwen35.rs`)
 ///
 /// The base CPU `generate()` / `generate_streaming()` paths in this module wire
@@ -2255,8 +2254,7 @@ pub(crate) fn check_logprobs_not_set(gen_cfg: &GenerateConfig) -> Result<(), Inf
 /// string-level stop matching into its decode loop.
 ///
 /// Callers: `generate_f16` (`forward/cpu_f16.rs`), `generate_q8`
-/// (`forward/cpu_q8.rs`), `generate_q8_neon` (`forward/neon_forward.rs`),
-/// `Qwen35Model::generate_with_batch_prefill` (`forward/batch_prefill.rs`).
+/// (`forward/cpu_q8.rs`), `generate_q8_neon` (`forward/neon_forward.rs`).
 ///
 /// The base CPU `generate()` / `generate_streaming()` paths in this module,
 /// and the Metal `generate()` / `generate_streaming()` / `generate_multimodal`
@@ -2366,6 +2364,24 @@ pub(crate) fn check_prompt_not_empty(prompt_len: usize) -> Result<(), InferenceE
     Ok(())
 }
 
+/// Rejects tokenizer output that cannot index the configured embedding table.
+///
+/// Standalone CPU generation drivers accept their tokenizer and model config
+/// independently, so tokenizer validity alone does not prove that every prompt
+/// ID is below `vocab_size`. Perform one cold ingress scan before any decoder
+/// state allocation instead of branching inside the per-token forward path.
+pub(crate) fn check_prompt_ids_in_vocab(
+    prompt_ids: &[u32],
+    vocab_size: usize,
+) -> Result<(), InferenceError> {
+    if let Some(&bad_id) = prompt_ids.iter().find(|&&id| id as usize >= vocab_size) {
+        return Err(InferenceError::InvalidInput(format!(
+            "prompt contains out-of-vocabulary token id {bad_id} (vocab_size={vocab_size})"
+        )));
+    }
+    Ok(())
+}
+
 /// Shared total-context admission bound (#922): rejects a request whose
 /// prompt fits the window alone but whose prompt plus decode budget does
 /// not, closing exactly the gap between "will prefill" and "will actually
@@ -2450,7 +2466,9 @@ mod tests {
         // Set logits so the forbidden token (index 2) has the highest value.
         // Without masking, greedy sampling would return 2.
         let mut logits = vec![1.0_f32, 2.0_f32, 1000.0_f32];
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
 
         // The forbidden token must be blocked.
         assert_eq!(
@@ -3182,7 +3200,7 @@ mod tests {
         );
     }
 
-    /// `Qwen35Model::config_mut().eos_token_id = u32::MAX` combined with
+    /// `Qwen35Model::set_eos_token_id().eos_token_id = u32::MAX` combined with
     /// `GenerateConfig::stop_token_ids: vec![]` (the flagship CPU/Metal
     /// benchmark determinism knob -- `qwen35_generate --emit-phase-events`,
     /// PR #882) must force continuation past a token that would otherwise
@@ -3199,12 +3217,12 @@ mod tests {
     /// setter) does not incur.
     ///
     /// Two-phase design (baseline, then override), both driven through
-    /// `config_mut()`: `build_tiny_zero_model` always greedy-samples token 0
+    /// `set_eos_token_id()`: `build_tiny_zero_model` always greedy-samples token 0
     /// from this all-zero-logit fixture (see the sibling comment on
     /// `stop_reason_eos_on_first_stop_token`), so phase 1 first points the
-    /// model's own `eos_token_id` AT 0 via `config_mut()` and confirms that
+    /// model's own `eos_token_id` AT 0 via `set_eos_token_id()` and confirms that
     /// alone stops generation immediately (`StopReason::Eos`, 0 tokens
-    /// emitted) -- this is itself mutation-sensitive to `config_mut()`
+    /// emitted) -- this is itself mutation-sensitive to `set_eos_token_id()`
     /// returning a real reference into
     /// `Qwen35Model`'s private `config` field rather than, say, a detached
     /// clone: a detached clone would leave the real `eos_token_id` at its
@@ -3224,7 +3242,7 @@ mod tests {
 
         // Phase 1 (baseline): point eos_token_id at the always-sampled
         // token 0 -- must stop after exactly 1 token.
-        model.config_mut().eos_token_id = 0;
+        model.set_eos_token_id(0);
         let baseline = model
             .generate("a", &gen_cfg)
             .expect("baseline generate must succeed");
@@ -3233,7 +3251,7 @@ mod tests {
             Some(StopReason::Eos),
             "sanity: eos_token_id = 0 must stop generation on the first greedy-sampled \
              token (this fixture always samples token 0); got {:?} -- if this fails, \
-             config_mut() is not reaching the real config should_stop_token reads",
+             set_eos_token_id() is not reaching the real config should_stop_token reads",
             baseline.stop_reason
         );
         assert_eq!(
@@ -3247,7 +3265,7 @@ mod tests {
 
         // Phase 2 (the benchmark override): push eos_token_id out of the
         // reachable vocab range -- the same config now runs to max_new_tokens.
-        model.config_mut().eos_token_id = u32::MAX;
+        model.set_eos_token_id(u32::MAX);
         let result = model
             .generate("a", &gen_cfg)
             .expect("eos-override generate must succeed");
@@ -3281,7 +3299,7 @@ mod tests {
             should_stop_token(&model.config, &base_cfg, original_eos_token_id),
             "sanity: without the override, the model's own eos_token_id must stop generation"
         );
-        model.config_mut().eos_token_id = u32::MAX;
+        model.set_eos_token_id(u32::MAX);
         assert!(
             !should_stop_token(&model.config, &base_cfg, original_eos_token_id),
             "eos_token_id override must suppress a match against the model's original \
@@ -3495,8 +3513,6 @@ mod tests {
     /// masking/sampling) lets generation fall through to sampling the first
     /// token, producing `generated_tokens > 0`, non-empty `text`, and at
     /// least one `on_token` callback -- failing all three assertions below.
-    /// Verified by reverting that exact guard and re-running: see the PR
-    /// body's mutation log.
     #[test]
     fn generate_streaming_with_cancel_true_after_prefill_returns_interrupt() {
         let model = build_tiny_zero_model();
@@ -3700,8 +3716,7 @@ mod tests {
     /// Removing any of the three `on_raw_event(RawGenEvent::RawToken { .. })`
     /// call sites (pre-loop first token, fast-path decode loop, stop-string
     /// decode loop) drops an index from the collected sequence, failing the
-    /// monotonic-range assertion. Verified by reverting the fix and
-    /// re-running: see the PR body's mutation log.
+    /// monotonic-range assertion.
     #[test]
     fn raw_observer_prefill_end_precedes_first_raw_token_monotonic_index() {
         let model = build_tiny_zero_model();
@@ -3795,7 +3810,7 @@ mod tests {
              the prefill-derived first token -- not merely before the RawToken callback, \
              which a PrefillEnd emitted after sampling (but before the RawToken push) would \
              also satisfy while silently including sampling time in the reported prefill \
-             interval (codex round-2 medium, PR #882)"
+             interval (#882)"
         );
     }
 

@@ -12,7 +12,7 @@ cargo clippy --workspace -- -D warnings
 
 echo "=== Doc Lint ==="
 if command -v deno >/dev/null 2>&1; then
-    deno fmt --check **/*.md
+    ./scripts/lint-docs.sh
 else
     echo "deno not found, skipping doc lint"
 fi

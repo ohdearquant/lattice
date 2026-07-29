@@ -251,8 +251,9 @@ pub struct ForwardEquivalenceReport {
 /// - `rotation.dim() != cfg.hidden_size`.
 /// - Any planned tensor is missing from either working set, or has the
 ///   wrong shape or data length.
-/// - Either the chain probe or the per-tensor check exceeds tolerance —
-///   the refuse-on-fail case. The error message names which check tripped.
+/// - Either the chain probe or the per-tensor check produces a non-finite
+///   error or exceeds tolerance — the refuse-on-fail case. The error
+///   message names which check tripped.
 pub fn assert_forward_equivalence_qwen35(
     original: &HashMap<String, TensorEntry>,
     rotated: &HashMap<String, TensorEntry>,
@@ -314,8 +315,15 @@ pub fn assert_forward_equivalence_qwen35(
                 logits_rot.len()
             )));
         }
-        for (a, b) in logits_orig.iter().zip(logits_rot.iter()) {
+        for (logit_index, (a, b)) in logits_orig.iter().zip(logits_rot.iter()).enumerate() {
             let d = (a - b).abs();
+            if !d.is_finite() {
+                return Err(InferenceError::Inference(format!(
+                    "forward-equivalence refused: chain probe non-finite error \
+                     (token={token}, logit_index={logit_index}, original={a}, rotated={b}, \
+                     abs_error={d}). Do NOT write conversion artifacts."
+                )));
+            }
             if d > chain_max_abs {
                 chain_max_abs = d;
             }
@@ -556,11 +564,23 @@ fn check_per_tensor_rotation_equivalence(
             }
         }
 
-        let delta = expected_rot
-            .iter()
-            .zip(actual.data.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        let mut delta = 0.0_f64;
+        for (element_index, (expected, actual)) in
+            expected_rot.iter().zip(actual.data.iter()).enumerate()
+        {
+            let element_delta = (expected - actual).abs();
+            if !element_delta.is_finite() {
+                return Err(InferenceError::Inference(format!(
+                    "forward-equivalence refused: per-tensor non-finite error \
+                     (tensor={expected_name}, element_index={element_index}, \
+                     expected={expected}, actual={actual}, abs_error={element_delta}). \
+                     Do NOT write conversion artifacts."
+                )));
+            }
+            if element_delta > delta {
+                delta = element_delta;
+            }
+        }
         if delta > max_abs {
             max_abs = delta;
         }
@@ -1143,6 +1163,72 @@ mod tests {
         );
     }
 
+    /// The poisoned rotated norm is consumed only by the chain probe, so
+    /// removing the chain's non-finite guard lets this conversion pass.
+    #[test]
+    fn forward_equivalence_refuses_non_finite_chain_probe_error() {
+        let cfg = tied_tiny_test_cfg();
+        let original = build_working_set(&cfg, 32);
+        let mut rotated = original.clone();
+
+        materialize_lm_head_for_qwen35(&mut rotated, &cfg).unwrap();
+        let (fusion, rot_plan) = full_pipeline_plans(&cfg);
+        fuse_rmsnorms(&mut rotated, &fusion).unwrap();
+        let rotation = RandomizedHadamard::new(0xCA11_0BAD, cfg.hidden_size).unwrap();
+        absorb_rotations(&mut rotated, &rot_plan, &rotation).unwrap();
+
+        rotated.get_mut(QWEN35_FINAL_NORM_NAME).unwrap().data[0] = f64::NAN;
+
+        let err = assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("chain probe non-finite error"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("abs_error=NaN"), "unexpected error: {msg}");
+    }
+
+    /// `k_proj` is excluded from the chain probe, so removing the
+    /// per-tensor non-finite guard lets this conversion pass.
+    #[test]
+    fn forward_equivalence_refuses_non_finite_per_tensor_error() {
+        let cfg = tied_tiny_test_cfg();
+        let original = build_working_set(&cfg, 33);
+        let mut rotated = original.clone();
+
+        materialize_lm_head_for_qwen35(&mut rotated, &cfg).unwrap();
+        let (fusion, rot_plan) = full_pipeline_plans(&cfg);
+        fuse_rmsnorms(&mut rotated, &fusion).unwrap();
+        let rotation = RandomizedHadamard::new(0xFACE_FEED, cfg.hidden_size).unwrap();
+        absorb_rotations(&mut rotated, &rot_plan, &rotation).unwrap();
+
+        let k_name = "model.language_model.layers.1.self_attn.k_proj.weight";
+        rotated.get_mut(k_name).unwrap().data[0] = f64::NAN;
+
+        let err = assert_forward_equivalence_qwen35(
+            &original,
+            &rotated,
+            &cfg,
+            &rotation,
+            &ForwardEquivalenceConfig::default(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("per-tensor non-finite error"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains(k_name), "unexpected error: {msg}");
+        assert!(msg.contains("abs_error=NaN"), "unexpected error: {msg}");
+    }
+
     /// Refuse: rotate without fusing per-layer norms first. Rotation
     /// absorbed AROUND a non-zero γ_in breaks the residual stream
     /// because `diag(1+γ) · R^T ≠ R^T · diag(1+γ)`.
@@ -1425,7 +1511,7 @@ mod tests {
     /// Per-tensor coverage helper: run the full pipeline correctly, then
     /// scale `victim_name` by `factor` in the rotated working set and
     /// assert the gate refuses. Covers the chain-probe-skipped planned
-    /// tensors that were flagged in review.
+    /// tensors.
     fn assert_corrupting_planned_tensor_refuses(victim_name: &str, factor: f64, seed: u64) {
         let cfg = tied_tiny_test_cfg();
         let original = build_working_set(&cfg, seed);
@@ -1481,7 +1567,7 @@ mod tests {
     /// Per-tensor coverage: corrupting `k_proj` is invisible to the chain
     /// probe (probe shortcuts through `q_proj` → `o_proj`) but must be
     /// caught by the per-tensor algebraic check. This regression case is
-    /// the specific gap flagged in the PR #28 review.
+    /// the specific gap the chain probe alone leaves in PR #28.
     #[test]
     fn per_tensor_check_catches_corrupted_k_proj() {
         assert_corrupting_planned_tensor_refuses(
@@ -1576,8 +1662,8 @@ mod tests {
         );
     }
 
-    /// Matrix-equivalence vs single-vector: further review demonstrated
-    /// that the single-probe-vector implementation would miss a row
+    /// Matrix-equivalence vs single-vector: the
+    /// single-probe-vector implementation would miss a row
     /// perturbation orthogonal to the probe direction. The current
     /// matrix-equivalence implementation compares every stored element,
     /// so any non-zero element-level perturbation is caught. This test

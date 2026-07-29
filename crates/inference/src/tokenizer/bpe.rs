@@ -1344,8 +1344,8 @@ mod tests {
     /// always splits on word boundaries, so "a" and " b" land in different
     /// pieces and the cross-space merge can never fire, giving `[0, 1]`
     /// (the "a" and "Ġb" ids from separate pieces) instead. This is a
-    /// direct id-level proxy for the silent-wrong-ids failure mode a
-    /// review flagged for explicit `use_regex:false` metadata that fell
+    /// direct id-level proxy for the silent-wrong-ids failure mode when
+    /// explicit `use_regex:false` metadata falls
     /// through to the `Gpt4Regex` default unchecked.
     fn cross_space_merge_json(pre_tokenizer: &str) -> String {
         format!(
@@ -1587,7 +1587,9 @@ mod tests {
         let mut state = engine.initial_state();
         for token_id in 0..3u32 {
             let mut logits = vec![0.0; 3];
-            engine.mask_logits(&mut state, &mut logits);
+            engine
+                .mask_logits(&mut state, &mut logits)
+                .expect("matching vocab length");
             assert!(
                 logits[token_id as usize].is_finite(),
                 "split UTF-8 token {token_id} must remain grammar-legal"
@@ -1617,7 +1619,9 @@ mod tests {
         let engine = GrammarEngine::new(&spec, vocab_bytes).unwrap();
         let mut state = engine.initial_state();
         let mut logits = vec![0.0; 101];
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
         assert_eq!(logits[99], f32::NEG_INFINITY);
         assert_eq!(logits[100], f32::NEG_INFINITY);
     }
@@ -1653,7 +1657,9 @@ mod tests {
         let mut state = engine.initial_state();
         let mut logits = vec![0.0; cfg.vocab_size];
 
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
 
         assert!(
             logits[248_070..]
@@ -1679,7 +1685,9 @@ mod tests {
         let engine = GrammarEngine::new(&spec, vocab_bytes).unwrap();
         let mut state = engine.initial_state();
         let mut logits = vec![0.0; 102];
-        engine.mask_logits(&mut state, &mut logits);
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("matching vocab length");
         assert!(logits[100].is_finite());
         assert!(logits[101].is_finite());
     }

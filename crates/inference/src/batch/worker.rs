@@ -62,6 +62,19 @@ impl GdnStatePool {
     /// sizes for the full model (all GDN layers combined):
     /// - `s_floats_per_slot` = Σ_layers (num_heads × key_dim × value_dim)
     /// - `conv_floats_per_slot` = Σ_layers (conv_dim × (kernel_size - 1))
+    ///
+    /// # Deprecated
+    ///
+    /// This constructor performs no geometry checking, so an overflowing
+    /// `capacity × floats_per_slot` product reaches `Vec` and panics inside the
+    /// allocator instead of returning an error. [`GdnStatePool::try_new`]
+    /// performs the same construction with the products checked. Retained only
+    /// so the 0.7.x line stays source-compatible; scheduled for removal in
+    /// 0.8.0.
+    #[deprecated(
+        since = "0.7.1",
+        note = "unchecked geometry: panics in the allocator on overflow. Use `GdnStatePool::try_new`, which returns `InferenceError::InvalidInput`. Removed in 0.8.0."
+    )]
     pub fn new(capacity: usize, s_floats_per_slot: usize, conv_floats_per_slot: usize) -> Self {
         let s_matrices = (0..capacity)
             .map(|_| vec![0.0f32; s_floats_per_slot])
@@ -131,6 +144,9 @@ impl GdnStatePool {
                 "capacity ({capacity}) outer-vector allocation ({outer_bytes} bytes) exceeds isize::MAX"
             )));
         }
+        // The geometry is fully checked above; `new` is the unchecked body this
+        // constructor exists to wrap, so calling it here is the intended path.
+        #[allow(deprecated)]
         Ok(Self::new(capacity, s_floats_per_slot, conv_floats_per_slot))
     }
 
@@ -275,6 +291,20 @@ impl BatchWorker {
     /// * `s_floats_per_slot` — GDN s_matrix floats per concurrent sequence.
     /// * `conv_floats_per_slot` — GDN conv buffer floats per concurrent sequence.
     /// * `eos_token_id` — Token ID that signals end-of-sequence, if any.
+    ///
+    /// # Deprecated
+    ///
+    /// This constructor skips [`BatchConfig::validate`] and builds its pools
+    /// through the unchecked `PagePool::new` / `GdnStatePool::new` path, so an
+    /// invalid config or an overflowing page geometry is accepted here and
+    /// surfaces later as an allocator panic or a wrong-sized pool.
+    /// [`BatchWorker::try_new`] takes the same arguments and returns
+    /// `InferenceError::InvalidInput` instead. Retained only so the 0.7.x line
+    /// stays source-compatible; scheduled for removal in 0.8.0.
+    #[deprecated(
+        since = "0.7.1",
+        note = "skips BatchConfig::validate and unchecked page geometry. Use `BatchWorker::try_new`, which returns `InferenceError::InvalidInput`. Removed in 0.8.0."
+    )]
     pub fn new(
         config: BatchConfig,
         kv_pool_config: PagedKVCacheConfig,
@@ -283,7 +313,9 @@ impl BatchWorker {
         eos_token_id: Option<u32>,
     ) -> Self {
         let floats_per_page = kv_pool_config.floats_per_page_pub();
+        #[allow(deprecated)]
         let kv_pool = PagePool::new(kv_pool_config.max_pages, floats_per_page);
+        #[allow(deprecated)]
         let gdn_pool = GdnStatePool::new(
             config.max_batch_size,
             s_floats_per_slot,
@@ -302,8 +334,8 @@ impl BatchWorker {
         }
     }
 
-    /// Fallible constructor — returns `InvalidInput` on overflow rather than
-    /// panicking or silently allocating a wrong-sized pool.
+    /// Fallible constructor — validates the batch configuration and returns
+    /// `InvalidInput` on invalid geometry or overflow.
     pub fn try_new(
         config: BatchConfig,
         kv_pool_config: PagedKVCacheConfig,
@@ -311,6 +343,7 @@ impl BatchWorker {
         conv_floats_per_slot: usize,
         eos_token_id: Option<u32>,
     ) -> Result<Self, InferenceError> {
+        config.validate().map_err(InferenceError::InvalidInput)?;
         let floats_per_page = kv_pool_config.try_floats_per_page_pub()?;
         let kv_pool = PagePool::try_new(kv_pool_config.max_pages, floats_per_page)?;
         let gdn_pool = GdnStatePool::try_new(
@@ -342,7 +375,10 @@ impl BatchWorker {
         if request.prompt_ids.is_empty() {
             return None;
         }
-        let total_len = request.prompt_ids.len() + request.max_new_tokens;
+        let total_len = request
+            .prompt_ids
+            .len()
+            .checked_add(request.max_new_tokens)?;
         if total_len > self.config.max_seq_len {
             return None;
         }
@@ -671,7 +707,7 @@ mod tests {
 
     #[test]
     fn gdn_pool_alloc_and_free() {
-        let mut pool = GdnStatePool::new(2, 4, 2);
+        let mut pool = GdnStatePool::try_new(2, 4, 2).expect("valid pool geometry");
         assert_eq!(pool.free_count(), 2);
         let s0 = pool.alloc(SeqId(0));
         assert!(s0.is_some());
@@ -688,7 +724,7 @@ mod tests {
 
     #[test]
     fn gdn_pool_free_zeroes_buffers() {
-        let mut pool = GdnStatePool::new(1, 4, 2);
+        let mut pool = GdnStatePool::try_new(1, 4, 2).expect("valid pool geometry");
         let slot = pool.alloc(SeqId(0)).unwrap();
         pool.s_matrix_mut(slot).fill(1.0);
         pool.conv_buffer_mut(slot).fill(2.0);
@@ -702,7 +738,7 @@ mod tests {
 
     #[test]
     fn gdn_pool_slot_of() {
-        let mut pool = GdnStatePool::new(2, 4, 2);
+        let mut pool = GdnStatePool::try_new(2, 4, 2).expect("valid pool geometry");
         pool.alloc(SeqId(5)).unwrap();
         assert!(pool.slot_of(SeqId(5)).is_some());
         assert!(pool.slot_of(SeqId(99)).is_none());
@@ -743,6 +779,24 @@ mod tests {
             sampling: SamplingConfig::greedy(),
             lora_adapter: None,
             max_new_tokens: 10, // 60 + 10 = 70 > 64
+        };
+        assert!(worker.submit(req).is_none());
+    }
+
+    /// `prompt_ids.len() + max_new_tokens` must not overflow `usize`: before the fix,
+    /// `max_new_tokens = usize::MAX` wrapped the unchecked `+` to a small value in
+    /// release builds (bypassing the `total_len > max_seq_len` guard and admitting an
+    /// absurd budget) or panicked in debug. `checked_add` must reject this cleanly on
+    /// both profiles. Mutation-sensitive: reverting `checked_add` back to `+` makes
+    /// this test panic on overflow in a debug build (the profile tests run under).
+    #[test]
+    fn submit_max_new_tokens_near_usize_max_returns_none() {
+        let mut worker = test_worker();
+        let req = InferenceRequest {
+            prompt_ids: vec![1, 2, 3],
+            sampling: SamplingConfig::greedy(),
+            lora_adapter: None,
+            max_new_tokens: usize::MAX,
         };
         assert!(worker.submit(req).is_none());
     }
@@ -1001,6 +1055,51 @@ mod tests {
             matches!(r, Err(InferenceError::InvalidInput(_))),
             "expected InvalidInput on worker PagePool capacity overflow"
         );
+    }
+
+    #[test]
+    fn batch_worker_try_new_rejects_invalid_batch_config() {
+        let invalid_configs = [
+            (
+                "max_batch_size",
+                BatchConfig {
+                    max_batch_size: 0,
+                    ..BatchConfig::default()
+                },
+            ),
+            (
+                "max_seq_len",
+                BatchConfig {
+                    max_seq_len: 0,
+                    ..BatchConfig::default()
+                },
+            ),
+            (
+                "chunk_size",
+                BatchConfig {
+                    chunk_size: 0,
+                    ..BatchConfig::default()
+                },
+            ),
+            (
+                "chunk_size",
+                BatchConfig {
+                    chunk_size: 513,
+                    ..BatchConfig::default()
+                },
+            ),
+        ];
+
+        for (field, config) in invalid_configs {
+            let result = BatchWorker::try_new(config, test_kv_config(), 1, 1, None);
+            let Err(InferenceError::InvalidInput(message)) = result else {
+                panic!("expected InvalidInput for invalid {field}");
+            };
+            assert!(
+                message.contains(field),
+                "error for invalid {field} must identify the field, got: {message}"
+            );
+        }
     }
 
     // --- GdnStatePool isize::MAX boundary test (Fix 2) ---

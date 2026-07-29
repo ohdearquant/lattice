@@ -9,6 +9,7 @@ mod pipeline;
 mod teacher;
 
 pub use pipeline::{
-    DistillationConfig, DistillationPipeline, DistillationStats, LabelingResult, RawExample,
+    DistillationConfig, DistillationPipeline, DistillationStats, LabelSource, LabelingResult,
+    RawExample, TeacherAuth,
 };
 pub use teacher::{EndpointSecurity, TeacherConfig, TeacherConfigBuilder, TeacherProvider};

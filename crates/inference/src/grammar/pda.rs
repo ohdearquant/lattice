@@ -107,7 +107,13 @@ impl CompiledGrammar {
 }
 
 /// One frame on the PDA execution stack.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Eq + Hash` (added alongside `PartialEq`, structurally over the same
+/// fields) let a `GrammarState`'s `(stack, complete)` pair — the same
+/// identity `states_equal` in `engine.rs` already compares by — key a
+/// `HashMap` for state-revisit / memoization profiling without changing any
+/// existing comparison semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StackFrame {
     /// Index into `CompiledGrammar::rules`.
     pub rule_id: usize,
@@ -171,6 +177,12 @@ impl GrammarState {
     pub fn can_accept_more(&self) -> bool {
         !self.complete || !self.stack.is_empty()
     }
+}
+
+pub(crate) fn initial_grammar_state(grammar: &CompiledGrammar) -> GrammarState {
+    let mut state = GrammarState::initial();
+    state.complete = is_accepting(&state, grammar);
+    state
 }
 
 // ---------------------------------------------------------------------------

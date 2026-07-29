@@ -61,6 +61,9 @@ pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_n
 // (forward::metal_qwen35) calls this instead of its own inline
 // `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
 pub(crate) use generation::check_prompt_not_empty;
+// Shared prompt-token admission guard for standalone CPU drivers whose
+// tokenizer and model config are supplied independently (#1083).
+pub(crate) use generation::check_prompt_ids_in_vocab;
 // Shared total-context admission bound (#922): every Metal generation entry
 // point (forward::metal_qwen35) calls this after check_prompt_not_empty to
 // mirror the CPU `generate`/`generate_streaming` total bound
@@ -97,7 +100,7 @@ pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert
 
 #[cfg(test)]
 pub use detokenize::bytes_to_unicode;
-// Needed by all generate paths (cpu_q8, cpu_f16, neon_forward, batch_prefill)
+// Needed by all generate paths (cpu_q8, cpu_f16, neon_forward)
 // and by tests. `pub(crate)` keeps it out of the public API surface.
 pub(crate) use generation::should_stop_token;
 // Public raw generation-lifecycle observer event, consumed by
@@ -110,4 +113,4 @@ pub use generation::RawGenEvent;
 /// e.g., the QuaRot offline converter (ADR-044 step 3c) iterating
 /// rotation rules against an actual safetensors file. Originally
 /// `#[cfg(test)]`-only; promoted in step 3b.
-pub use loading::qwen_required_tensor_names;
+pub use loading::{qwen_layer_tensor_prefix, qwen_required_tensor_names};

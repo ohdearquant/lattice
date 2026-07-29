@@ -20,7 +20,11 @@ This process caught a 15% decode throughput regression (157 → 130 tok/s) that 
 
 ### Keep the Machine Quiet During A/B Runs — Quiet Means Zero Disk Activity, Not Just Zero Builds
 
-A bench window means no concurrent builds AND no git checkouts, worktree adds, large file copies, or downloads. Filesystem indexing churn (Spotlight `mdworker`, `fseventsd`) from a repository checkout lands asymmetrically in whichever measurement phase it overlaps, and base-then-head runs make that asymmetry read as a code regression. Two consecutive A/B runs were corrupted this way — worktree checkouts overlapping the head phase produced swings up to +250% in groups the diff could not reach.
+`scripts/bench-compare.sh` now enforces the machine side of this itself, so do not wrap it in an external bench-window helper. It takes both machine-wide advisory locks (the bench window and the Metal GPU lock) unconditionally for the whole run, samples ambient CPU idle before the base phase, between phases, and after the head phase, and refuses to certify a run that fell below the idle floor at any of them. The floor is settable with `BENCH_IDLE_FLOOR`; if you move it, say so wherever the numbers are quoted. Every run prints a `Run conditions` block recording the refs, the effective bench targets and features, the resolution, the lock dispositions, and the measured idle samples — quote that block along with the numbers, because a figure that does not record what produced it is indistinguishable from one produced on a quiet machine.
+
+Both locks are taken regardless of what the run benches. That is deliberate: deciding whether a target is GPU-driving would mean maintaining an enumeration of bench names, feature combinations, and transitive dependencies that pull Metal in without saying so, and every miss would pass the check while the GPU spins. Serializing a CPU-only bench against GPU work is correct rather than merely tolerable, since GPU work during a CPU bench is exactly the ambient load the idle floor exists to exclude.
+
+What the locks and the probe cannot see is disk activity, so the rest of this section still applies to you rather than to the script. A bench window means no concurrent builds AND no git checkouts, worktree adds, large file copies, or downloads. Filesystem indexing churn (Spotlight `mdworker`, `fseventsd`) from a repository checkout lands asymmetrically in whichever measurement phase it overlaps, and base-then-head runs make that asymmetry read as a code regression. Two consecutive A/B runs were corrupted this way — worktree checkouts overlapping the head phase produced swings up to +250% in groups the diff could not reach.
 
 Before re-running a corrupted A/B, check structural reachability first: is the changed code even compiled into the bench binaries? A diff confined to a `cfg`-gated module (e.g. `#[cfg(all(target_os = "macos", feature = "metal-gpu"))]`) is compiled out of a default-feature bench build entirely — base and head binaries are then built from identical effective source, and no rerun can attribute any delta to the diff.
 
@@ -92,7 +96,7 @@ A regression test that passes with the fix reverted is decoration. Before claimi
 
 When a harness or guard fix lands in one invocation path, grep the same file for sibling paths that construct the same operation independently: a second subprocess command builder, a second workflow step calling the same script, a reimplementation of a guarded method. Any fix expressible as "add flag X to the call" has an unguarded copy-paste sibling until proven otherwise, and the fix's own description ("mirror the CPU path") is the grep query.
 
-This class recurred three times in one week before becoming a rule — most recently a greedy-decoding sampler flag added to the CPU parity harness path while the Metal-path command builder in the same file went without it, surfacing only on that leg's first live CI run.
+This class recurs. It became a rule after a greedy-decoding sampler flag was added to the CPU parity harness path while the Metal-path command builder in the same file went without it, surfacing only on that leg's first live CI run. No count is given deliberately: a recurrence tally in guidance is a claim that no reader ever re-measures, so it can only go stale, and the invariant carries the rule without it.
 
 ### E2E Parity Gate
 

@@ -64,21 +64,49 @@ pub fn score_with_hook(
     query: &str,
     document: &str,
     lora: &dyn LoraHook,
-) -> f32;
+) -> Result<f32, InferenceError>;
 
 pub fn score_batch_with_hook(
     &self,
     query: &str,
     documents: &[&str],
     lora: &dyn LoraHook,
-) -> Vec<f32>;
+) -> Result<Vec<f32>, InferenceError>;
 ```
+
+Both methods _delegate_ geometry validation to the hook: each calls `LoraHook::validate_against_bert` with the model's BERT dimensions before the forward pass runs, and maps any `Err` to `Err(InferenceError::InvalidInput)`. The trait's default implementation of that method returns `Ok(())` — it trusts the caller — so a hook is checked here only to the extent that its own implementation checks itself. Adapters obtained through this workspace's own types (e.g. `lattice_tune::lora::LoraAdapter`) override it, which is what lets a malformed or attacker-controlled adapter be rejected with a recoverable error instead of a forward pass indexing out of bounds. `score_batch_with_hook` calls that check at the batch boundary as well, before any document is scored, so an empty `documents` slice is rejected instead of being answered `Ok(vec![])` with the hook never asked about its geometry. The boundary call is _additional_ to the per-document one rather than a replacement for it: each mapped `score_with_hook` performs its own check, so a batch of N documents asks the hook N+1 times. An implementation of `validate_against_bert` must therefore be safe to call repeatedly within one request. Read declared dimensions in it; do not put work with side effects there.
 
 `BertModel::forward_tokenized` is `pub(crate)` today. The hook-aware variant stays `pub(crate)` — downstream consumers access hooks through `CrossEncoderModel::score_with_hook` (which is `pub`), not through the internal BERT forward method directly.
 
-The existing `forward_tokenized` and `score`/`score_batch` remain unchanged (they internally pass `&NoopLoraHook` from `lattice_inference::lora_hook::NoopLoraHook`). This is additive, not breaking.
+The existing `forward_tokenized` and `score`/`score_batch` remain unchanged (they internally pass `&NoopLoraHook` from `lattice_inference::lora_hook::NoopLoraHook`) and keep their infallible `f32`/`Vec<f32>` signatures.
+
+`CrossEncoderModel::score_with_hook` and `score_batch_with_hook` are **not** new. Both are already `pub` in the released API and return the bare `f32`/`Vec<f32>`; this ADR changes them to return `Result<_, InferenceError>`, which is a breaking change to a published signature. It is carried by the `0.6.1` to `0.7.0` bump, which under Cargo's 0.x semantics is already a major boundary, so no additional version bump is needed and the change is semver-legal as written. The release notes for 0.7.0 must name both methods under breaking changes with the one-line migration.
+
+Keeping the infallible signature as the primary API was considered and rejected. The failure it hides is not cosmetic: an adapter whose projection geometry does not match is what `validate_against` exists to reject, and without that rejection an under-declared `d_out` makes the forward pass write an update across a prefix of the projection row and return a plausible-looking relevance score, in release builds, with no signal. Preserving the infallible name would leave that path under the most discoverable name in the module and make the checked one the thing a caller has to know to ask for. A compile error at an external call site is a good migration signal here, because it is loud, it points at the exact line, and the fix is a `?` or an explicit `.expect()`. A wrong relevance score is a bad one, because there isn't one.
 
 **Implementation note**: when D1 lands, the `LoraHook` trait doc comment (`crates/inference/src/lora_hook.rs:19-21`) and `LoraAdapter` module doc (`crates/tune/src/lora/mod.rs:12-15`) must be updated to include the BERT module names alongside the existing Qwen/GDN names.
+
+#### D1a: `validate_against_bert` ships with a fail-open default
+
+`validate_against_bert` is a new method on `LoraHook`, a trait that is public and unsealed and shipped before this change, so it needs a default body. Two arms were available:
+
+- **Fail-open (`Ok(())`)** — every existing downstream implementor keeps compiling, but validation becomes opt-in: a hook that does not override the method is trusted, so the "validates the geometry" statement above holds for adapters that check themselves, not for every hook the API accepts.
+- **Fail-closed (`Err(..)`)** — the guarantee holds for every hook unconditionally, but every existing downstream implementor breaks at once, and breaks at runtime rather than at compile time.
+
+**We take the fail-open arm.** The trait is already public and unsealed, so the fail-closed default would reject working third-party hooks that predate the method existing, which is a cost the geometry check does not earn. The residual exposure is bounded by `apply_lora`, but the bound is narrower than "the mismatch is caught", and the two directions of mismatch behave differently. Both are measured at the public boundary in `crates/tune/tests/bert_cross_encoder_over_complete_lora.rs`:
+
+- **Over-declared `d_out`** — the shape check, then `output.len() >= d_out`, failed; `apply_lora` no-opped and the projection row was left exactly as the base weights produced it. The score is bit-for-bit the unadapted score. No panic, no partial write. (Both bullets describe the check as it stood before this change; the tightening that resolves the second one is stated immediately below, and under it this first case behaves the same way for the same reason.)
+- **Under-declared `d_out`** — the same check _passed_, because it was an inequality, and the accumulate loop writes `output[..d_out]`. The first `d_out` elements received an update computed for a geometry the model does not have, the remainder were untouched, and a finite in-range score came back. A silent partial write producing a wrong-but-plausible score is a worse failure than a dropped update, and unlike the over-declared case it is not what the "bounded residual exposure" argument above describes.
+
+**So this change also tightens `apply_lora`'s check from `output.len() >= d_out` to exact width, and that is not deferred to the revisit below.** The inequality served no caller. Both `validate_against` and `validate_against_bert` reject any `d_in`/`d_out` disagreement outright; `LoraAdapter::apply` documents that slices must match the layer's shape; `apply_lora_rows` hands the function `chunks_exact_mut` rows at the projection's own width; and no prefix-adaptation use — an adapter deliberately covering only the leading dimensions of a wider projection — exists anywhere in the crate or its documentation. Tightening is therefore a no-op for every implementor that declares its true geometry, and it converts the one direction that produced a silent wrong answer into the same no-op the other direction already produced. Both directions are pinned by tests at the public cross-encoder boundary, and the exact-width check is itself mutation-checked: restoring the inequality fails the under-declared test and nothing else.
+
+What remains for the revisit is the original question and only that one: a hook that overrides nothing is still trusted, so validation is opt-in. The exposure that leaves is now a _dropped_ adapter, not a corrupted projection.
+
+Stated plainly, because the two statements sit in the same release and a reader is entitled to see the gap named rather than inferred: **`score_with_hook`'s own documentation previously promised this rejection unconditionally, and the mechanism does not deliver it unconditionally.** That documentation is corrected in this change to describe the check as delegated. The corrected description is accurate; it is also weaker than the guarantee we would prefer to offer.
+
+**This decision is not closed.** Choosing the fail-open arm settles which arm ships in 0.7.0; it does not settle that the API should keep a validation hook whose default is to skip validation. Backward compatibility is an argument that remains available indefinitely and grows stronger every release as more downstream code accumulates against the weak default, so the revisit is scheduled rather than left to judgment:
+
+> **Revisit trigger.** The fail-closed arm is reopened as its own PR at **0.8.0**, the next intentional breaking-change window. 0.7.0 is not that window: it is the release this change ships in, and its breaking-change budget is already spent on the `score_with_hook` / `score_batch_with_hook` return-type change described in the release notes. The 0.8.0 PR evaluates fail-closed default against sealing the trait, and may conclude either way — what it may not do is lapse. If 0.8.0 ships without that evaluation, this subsection is the record that it was owed.
 
 ### D2: Public SafeTensors save
 
@@ -200,17 +228,17 @@ let hook: Box<dyn LoraHook> = Box::new(adapter.clone());
 qwen_model.set_lora(hook);
 
 // BERT/cross-encoder — pass hook per call (D1, this ADR)
-let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter);
+let scores = cross_encoder.score_batch_with_hook(query, &docs, &adapter)?;
 ```
 
 ### Alternatives Considered
 
-| Alternative                                      | Pros                                | Cons                                                                                                         | Why Not                                                             |
-| ------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------- |
-| Generic `CrossEncoderModel<H: LoraHook>`         | Zero-cost monomorphization          | Breaks all downstream type signatures; every consumer must parameterize on H                                 | New method is additive and cheaper                                  |
-| `LoraAdapter::set_optimizer(Adam)` in D3         | Full optimizer support from day one | Adds per-parameter momentum/variance state (~2x adapter memory); Adam is not needed for single-event updates | SGD first, Adam as follow-up when consumers demonstrate need        |
-| Typed `ModuleName` enum in lattice-tune (D4)     | Compile-time typo detection         | Closed enum → new architectures require lattice release; violates ADR-008 design intent                      | Validation method gives opt-in safety without closing extensibility |
-| `serde` for SafeTensors metadata round-trip (D2) | Familiar Rust pattern               | SafeTensors metadata is `HashMap<String, String>`, not structured — serde adds a parse layer                 | Direct string key/value is simpler and matches the safetensors spec |
+| Alternative                                      | Pros                                | Cons                                                                                                         | Why Not                                                                                                                                                                                                           |
+| ------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Generic `CrossEncoderModel<H: LoraHook>`         | Zero-cost monomorphization          | Breaks all downstream type signatures; every consumer must parameterize on H                                 | Strictly the larger break: changing two return types to `Result` touches only call sites that use the hook methods, while parameterizing on `H` changes the type of `CrossEncoderModel` itself for every consumer |
+| `LoraAdapter::set_optimizer(Adam)` in D3         | Full optimizer support from day one | Adds per-parameter momentum/variance state (~2x adapter memory); Adam is not needed for single-event updates | SGD first, Adam as follow-up when consumers demonstrate need                                                                                                                                                      |
+| Typed `ModuleName` enum in lattice-tune (D4)     | Compile-time typo detection         | Closed enum → new architectures require lattice release; violates ADR-008 design intent                      | Validation method gives opt-in safety without closing extensibility                                                                                                                                               |
+| `serde` for SafeTensors metadata round-trip (D2) | Familiar Rust pattern               | SafeTensors metadata is `HashMap<String, String>`, not structured — serde adds a parse layer                 | Direct string key/value is simpler and matches the safetensors spec                                                                                                                                               |
 
 ## Consequences
 

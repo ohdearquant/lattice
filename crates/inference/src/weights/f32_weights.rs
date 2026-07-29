@@ -126,11 +126,14 @@ struct TensorMeta {
     start: usize,
     end: usize,
     converted_f32: OnceLock<Box<[f32]>>,
-    /// Set once this tensor's decoded f32 values have passed
-    /// `ingress::validate_ingested_tensor`, so repeated access to the same
-    /// zero-copy F32 tensor does not rescan already-validated pages
-    /// (lattice#800 step 4).
-    validated: OnceLock<()>,
+    /// Populated once, via `get_or_init`, by this tensor's
+    /// `ingress::validate_ingested_tensor` outcome, so repeated access to the
+    /// same zero-copy F32 tensor does not rescan already-validated pages and
+    /// concurrent first access cannot run the scan twice (lattice#800 step
+    /// 4). `validate_ingested_tensor` only ever returns
+    /// `InferenceError::InvalidSafetensors`, so the cached error is carried
+    /// as its message and rewrapped on read.
+    validated: OnceLock<Result<(), String>>,
 }
 
 /// **Unstable**: 2D tensor view over memory-mapped safetensors data; field layout may change.
@@ -270,14 +273,23 @@ impl SafetensorsFile {
         let file = File::open(path).map_err(|e| {
             InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
         })?;
+        Self::from_open_file(file, path.display().to_string())
+    }
 
+    /// Parse a safetensors file from an already-open [`File`].
+    ///
+    /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
+    /// validates the manifest string and opens the file exactly once. Mapping the fd the
+    /// caller already holds is what keeps that single open meaningful; reopening by path
+    /// here would reintroduce the window between the open and the read.
+    pub(crate) fn from_open_file(file: File, display_path: String) -> Result<Self, InferenceError> {
         // SAFETY: The file descriptor remains alive until the mmap is created,
         // and the returned Mmap owns the mapping independently of the File.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {}: {e}", path.display()))
+            InferenceError::InvalidSafetensors(format!("failed to mmap {display_path}: {e}"))
         })?;
 
-        Self::from_backing(SafetensorsBacking::Mapped(mmap), path.display().to_string())
+        Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
     }
 
     /// **Unstable**: parse a safetensors file already resident in memory.
@@ -498,17 +510,25 @@ impl SafetensorsFile {
             }
         };
 
-        if meta.validated.get().is_none() {
+        // `get_or_init` runs its closure at most once even under concurrent
+        // first access: every caller blocks on the same in-flight init
+        // rather than racing separate `get()`-then-`set()` scans of the same
+        // tensor (the previous pattern let multiple callers observe
+        // `get().is_none()` and each redo the O(n) finite scan before one
+        // `set()` won).
+        let source = &self.source;
+        let shape = meta.shape.as_slice();
+        let dtype_name = meta.dtype.name();
+        match meta.validated.get_or_init(|| {
             crate::weights::ingress::validate_ingested_tensor(
                 crate::weights::ingress::IngestedTensor::decoded_f32(
-                    &self.source,
-                    name,
-                    meta.shape.as_slice(),
-                    meta.dtype.name(),
-                    slice,
+                    source, name, shape, dtype_name, slice,
                 ),
-            )?;
-            let _ = meta.validated.set(());
+            )
+            .map_err(|e| e.to_string())
+        }) {
+            Ok(()) => {}
+            Err(msg) => return Err(InferenceError::InvalidSafetensors(msg.clone())),
         }
 
         Ok((slice, meta.shape.as_slice()))
@@ -973,6 +993,27 @@ pub struct ShardedQwenBacking {
 // Sharded safetensors index + TensorSource trait
 // ---------------------------------------------------------------------------
 
+/// Upper bound, in bytes, on `model.safetensors.index.json` accepted from a checkpoint
+/// directory (FIX 6).
+///
+/// `parse_index` previously `read_to_string`'d the entire file with no size limit before
+/// any bounded validation ran. Real sharded Qwen3.5/3.6 checkpoints (up to ~26 shards,
+/// tens of thousands of tensor names) produce index files on the order of a few MiB; 64
+/// MiB (67,108,864) leaves roughly an order of magnitude of headroom while rejecting an
+/// unbounded ignored-field or oversized `weight_map` from exhausting memory before parse.
+pub(crate) const MAX_SAFETENSORS_INDEX_BYTES: u64 = 67_108_864;
+
+/// Upper bound on the number of entries in `SafetensorsIndex::weight_map` accepted from a
+/// checkpoint directory (FIX 6).
+///
+/// Enforced incrementally inside [`deserialize_weight_map_no_duplicates`]'s visitor --
+/// admission fires before a further entry is inserted into the owned `HashMap`, not after
+/// the whole map has already collapsed. Real Qwen3.5/3.6 sharded checkpoints (including the
+/// 256-expert MoE 35B preset) carry on the order of tens of thousands of tensor names;
+/// 1,000,000 leaves well over an order of magnitude of headroom while rejecting an
+/// unbounded entry count.
+pub(crate) const MAX_WEIGHT_MAP_ENTRIES: usize = 1_000_000;
+
 /// Parsed `model.safetensors.index.json` from a HuggingFace sharded checkpoint.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SafetensorsIndex {
@@ -1010,8 +1051,18 @@ where
         where
             A: serde::de::MapAccess<'de>,
         {
-            let mut out = HashMap::with_capacity(map.size_hint().unwrap_or(0));
+            // Cap the initial reservation independent of the (attacker-controlled)
+            // declared `size_hint`, then reject before a further entry is inserted once
+            // over budget -- bounding growth during the parse itself rather than after
+            // the map has already fully materialized. See `MAX_WEIGHT_MAP_ENTRIES` docs.
+            let reserve = map.size_hint().unwrap_or(0).min(MAX_WEIGHT_MAP_ENTRIES);
+            let mut out = HashMap::with_capacity(reserve);
             while let Some((name, shard)) = map.next_entry::<String, String>()? {
+                if out.len() >= MAX_WEIGHT_MAP_ENTRIES {
+                    return Err(serde::de::Error::custom(format!(
+                        "weight_map exceeds MAX_WEIGHT_MAP_ENTRIES ({MAX_WEIGHT_MAP_ENTRIES})"
+                    )));
+                }
                 if out.insert(name.clone(), shard).is_some() {
                     return Err(serde::de::Error::custom(format!(
                         "duplicate tensor name in weight_map: {name}"
@@ -1082,25 +1133,165 @@ pub struct ShardedSafetensors {
     shards: HashMap<String, SafetensorsFile>,
 }
 
+/// Resolve an index-declared shard file name beneath `model_dir`, rejecting
+/// entries that escape the model directory.
+///
+/// Shard names come from checkpoint-controlled JSON (`model.safetensors.
+/// index.json` or a quantized-checkpoint manifest), so they are untrusted
+/// input: an absolute entry replaces `model_dir` entirely in `Path::join`,
+/// and `..` components address files outside the checkpoint — turning a
+/// malicious model directory into an open-arbitrary-readable-file
+/// primitive (#1069). The validation is purely lexical — absolute paths
+/// and any parent-directory (or Windows prefix/root) component are
+/// rejected before the join — so an index entry cannot address anything
+/// above the model directory, and no filesystem state is consulted,
+/// leaving no check-to-open window to race.
+///
+/// # Threat model
+///
+/// Manifest STRINGS are untrusted; the local FILESYSTEM is trusted.
+/// Symlinks are deliberately followed at open time, matching peer loaders
+/// (HF transformers, candle, llama.cpp). The HuggingFace hub cache stores
+/// snapshots as symlink farms (`snapshots/<rev>/x.safetensors ->
+/// ../../blobs/<sha>`) and lattice loads those directories directly;
+/// resolving symlinks and requiring the resolved target to stay beneath
+/// the model directory — or refusing to follow symlinks at all — would
+/// reject every hub-cache checkpoint (pinned by
+/// `sharded_loader_follows_hub_cache_snapshot_layout`, which fails under
+/// exactly such a policy). A symlink planted inside the model directory
+/// is therefore honored by design: an actor who can write the model
+/// directory already controls every byte the loader reads, so blocking
+/// links there defends nothing, and archive-extraction tools are the
+/// correct place to refuse hostile symlinks. Do not "re-harden" this
+/// helper to resolve or reject symlinks without revisiting that decision
+/// trail (#1069, #1072).
+pub fn contained_shard_path(model_dir: &Path, shard_file: &str) -> Result<PathBuf, InferenceError> {
+    let rel = Path::new(shard_file);
+    if rel.as_os_str().is_empty() {
+        return Err(InferenceError::InvalidSafetensors(
+            "shard entry is empty; index entries must name a file within the model directory"
+                .to_string(),
+        ));
+    }
+    if rel.is_absolute() {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "shard entry {shard_file:?} is an absolute path; \
+             index entries must stay within the model directory"
+        )));
+    }
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "shard entry {shard_file:?} escapes the model directory; \
+                     index entries must stay within the model directory"
+                )));
+            }
+        }
+    }
+    Ok(model_dir.join(rel))
+}
+
 /// Parse `model.safetensors.index.json` from a model directory.
 pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError> {
     let index_path = model_dir.join("model.safetensors.index.json");
+    // FIX 6: check the file's metadata length before `read_to_string` materializes a
+    // same-sized buffer -- admission-order applies to file parsing, not just tensor
+    // bytes. See `MAX_SAFETENSORS_INDEX_BYTES` docs.
+    let file_len = std::fs::metadata(&index_path)
+        .map_err(InferenceError::Io)?
+        .len();
+    if file_len > MAX_SAFETENSORS_INDEX_BYTES {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "{} is {file_len} bytes, exceeding MAX_SAFETENSORS_INDEX_BYTES \
+             ({MAX_SAFETENSORS_INDEX_BYTES})",
+            index_path.display()
+        )));
+    }
     let json = std::fs::read_to_string(&index_path).map_err(InferenceError::Io)?;
     serde_json::from_str(&json).map_err(|e| {
         InferenceError::InvalidSafetensors(format!("failed to parse {}: {e}", index_path.display()))
     })
 }
 
-/// Resolve a tensor name to its shard filename via the weight map.
+/// Open a manifest-derived shard entry exactly once, returning the open [`File`] and the
+/// real on-disk path it resolved to.
+///
+/// `entry_name` comes from an untrusted checkpoint manifest (`model.safetensors.index.json`'s
+/// `weight_map`, or `quantize_index.json`'s per-tensor `file` field), so it is validated by
+/// [`contained_shard_path`] before the join: absolute paths and parent-directory components
+/// are rejected, lexically, without consulting any filesystem state.
+///
+/// # Why this opens the file instead of returning a path to reopen
+///
+/// Resolving a path and handing it back leaves the caller to `open()` it separately, and a
+/// concurrent writer can swap the file or symlink in between: the path that was checked and
+/// the path that was opened are then not the same file. This function opens the candidate
+/// first and reports the identity of the descriptor actually opened. **Never reopen the path
+/// this returns** — read from the returned `File`. The returned path is for diagnostics and
+/// error text only, and nothing security-relevant keys off it.
+///
+/// # What this deliberately does NOT check
+///
+/// It does not require the opened file's real path to stay beneath the model root, and it
+/// follows symlinks. That matches the threat model documented on [`contained_shard_path`]:
+/// manifest strings are untrusted, the local filesystem is trusted. Asserting containment on
+/// the *resolved* path would reject every HuggingFace hub-cache checkpoint, since those
+/// snapshots are symlink farms (`snapshots/<rev>/x.safetensors -> ../../blobs/<sha>`) and
+/// lattice loads such directories directly. Read that threat-model section before
+/// reintroducing a resolved-path containment check here.
+pub(crate) fn open_manifest_entry_once(
+    model_root: &Path,
+    entry_name: &str,
+) -> Result<(File, PathBuf), InferenceError> {
+    let candidate = contained_shard_path(model_root, entry_name)?;
+    let file = File::open(&candidate).map_err(|e| {
+        InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", candidate.display()))
+    })?;
+    let real_path = real_path_of_open_file(&file, &candidate)?;
+    Ok((file, real_path))
+}
+
+/// Resolve the real on-disk path of an already-open file descriptor.
+///
+/// On macOS, uses `fcntl(fd, F_GETPATH, buf)` -- the fd-identity source of truth, immune
+/// to a path swap that happens after `open()` returns. On other platforms (no portable
+/// fd-to-path syscall in `std`), falls back to canonicalizing the path that was passed to
+/// `open()`; this is a narrower, best-effort check that does not close the TOCTOU window
+/// as completely as the macOS path, matching this crate's macOS-primary target (Metal GPU,
+/// e2e-parity CI runners).
+#[cfg(target_os = "macos")]
+fn real_path_of_open_file(file: &File, _candidate: &Path) -> Result<PathBuf, InferenceError> {
+    use std::os::unix::io::AsRawFd;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let ret = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) };
+    if ret == -1 {
+        return Err(InferenceError::Io(std::io::Error::last_os_error()));
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let s = std::str::from_utf8(&buf[..len]).map_err(|_| {
+        InferenceError::Inference("F_GETPATH returned a non-UTF-8 path".to_string())
+    })?;
+    Ok(PathBuf::from(s))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn real_path_of_open_file(_file: &File, candidate: &Path) -> Result<PathBuf, InferenceError> {
+    candidate.canonicalize().map_err(InferenceError::Io)
+}
+
+/// Resolve a tensor name to its shard path, contained within `model_dir`.
 pub fn resolve_shard(
     index: &SafetensorsIndex,
+    model_dir: &Path,
     tensor_name: &str,
 ) -> Result<PathBuf, InferenceError> {
     let shard_file = index
         .weight_map
         .get(tensor_name)
         .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-    Ok(PathBuf::from(shard_file))
+    contained_shard_path(model_dir, shard_file)
 }
 
 /// Eagerly load all tensors from a sharded checkpoint into an owned map.
@@ -1122,8 +1313,8 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
 
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
-        let shard_path = model_dir.join(&shard_file);
-        let shard = SafetensorsFile::open(&shard_path)?;
+        let (file, real_path) = open_manifest_entry_once(model_dir, &shard_file)?;
+        let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
             tensors.insert(
@@ -1159,14 +1350,15 @@ impl ShardedSafetensors {
         &self.index
     }
 
-    /// Resolve a tensor name to `(shard_path, tensor_name)`.
+    /// Resolve a tensor name to `(shard_path, tensor_name)`, contained within `self.root`.
     pub fn resolve_weight(&self, tensor_name: &str) -> Result<(PathBuf, String), InferenceError> {
         let shard_file = self
             .index
             .weight_map
             .get(tensor_name)
             .ok_or_else(|| InferenceError::MissingTensor(tensor_name.to_string()))?;
-        Ok((self.root.join(shard_file), tensor_name.to_string()))
+        let shard_path = contained_shard_path(&self.root, shard_file)?;
+        Ok((shard_path, tensor_name.to_string()))
     }
 
     fn shard_file_for(&self, name: &str) -> Result<String, InferenceError> {
@@ -1179,8 +1371,8 @@ impl ShardedSafetensors {
 
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
-            let shard_path = self.root.join(shard_file);
-            let shard = SafetensorsFile::open(&shard_path)?;
+            let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
+            let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
             self.shards.insert(shard_file.to_string(), shard);
         }
         self.shards.get(shard_file).ok_or_else(|| {
@@ -2456,12 +2648,11 @@ mod tests {
         assert_eq!(index.weight_map.len(), 2);
 
         // Test resolve_shard free function.
-        let shard_a_path = resolve_shard(&index, "tensor.a").expect("resolve_shard tensor.a");
-        assert_eq!(
-            shard_a_path.to_string_lossy(),
-            "model-00001-of-00002.safetensors"
-        );
-        assert!(resolve_shard(&index, "tensor.missing").is_err());
+        // The returned path is the validated entry joined onto `model_dir`, not a
+        // canonicalized one -- symlinks are followed at open time, not resolved here.
+        let shard_a_path = resolve_shard(&index, &dir, "tensor.a").expect("resolve_shard tensor.a");
+        assert_eq!(shard_a_path, shard_a);
+        assert!(resolve_shard(&index, &dir, "tensor.missing").is_err());
 
         // Test load_sharded free function.
         let loaded = load_sharded(&dir).expect("load_sharded succeeds");
@@ -2474,6 +2665,162 @@ mod tests {
         assert_eq!(tb.shape, vec![3]);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1069: index-declared shard names are untrusted checkpoint content.
+    /// Plain names and subdirectory names beneath the model directory
+    /// resolve; anything that escapes the directory is rejected.
+    #[test]
+    fn contained_shard_path_accepts_entries_beneath_model_dir() {
+        let dir = temp_dir("lattice_containment_ok_test");
+        fs::write(dir.join("shard.safetensors"), b"x").expect("test setup");
+        fs::create_dir_all(dir.join("sub")).expect("test setup");
+        fs::write(dir.join("sub").join("nested.safetensors"), b"x").expect("test setup");
+
+        let plain = contained_shard_path(&dir, "shard.safetensors").expect("plain name resolves");
+        assert_eq!(
+            plain.file_name().unwrap().to_string_lossy(),
+            "shard.safetensors"
+        );
+        contained_shard_path(&dir, "sub/nested.safetensors")
+            .expect("subdirectory entry beneath the model dir resolves");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// #1069: an absolute index entry replaces the model directory entirely
+    /// in `Path::join`; it must be rejected even when the target exists.
+    #[test]
+    fn contained_shard_path_rejects_absolute_entry() {
+        let dir = temp_dir("lattice_containment_abs_test");
+        let outside = temp_dir("lattice_containment_abs_outside");
+        let target = outside.join("outside.safetensors");
+        fs::write(&target, b"x").expect("test setup");
+
+        let err = contained_shard_path(&dir, &target.to_string_lossy())
+            .expect_err("absolute entry must be rejected");
+        assert!(
+            matches!(err, InferenceError::InvalidSafetensors(_)),
+            "unexpected error kind: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    /// #1069: `..` components must not address files outside the model
+    /// directory, whether or not the target exists.
+    #[test]
+    fn contained_shard_path_rejects_parent_traversal() {
+        let outer = temp_dir("lattice_containment_dotdot_test");
+        let dir = outer.join("model");
+        fs::create_dir_all(&dir).expect("test setup");
+        fs::write(outer.join("secret.bin"), b"x").expect("test setup");
+
+        let err = contained_shard_path(&dir, "../secret.bin")
+            .expect_err("parent traversal must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            contained_shard_path(&dir, "../nonexistent.bin").is_err(),
+            "traversal to a missing target must also fail"
+        );
+
+        fs::remove_dir_all(&outer).ok();
+    }
+
+    /// The HuggingFace hub cache stores snapshots as symlink farms:
+    /// `snapshots/<rev>/model.safetensors -> ../../blobs/<sha>`. Lattice
+    /// loads those directories directly (the e2e workflows point the
+    /// engine at `snapshot_download()` output), so index-entry validation
+    /// must stay lexical — a policy that resolved symlinks and required
+    /// the target beneath the model directory would reject every
+    /// hub-cache checkpoint. This pins the layout end-to-end through
+    /// `load_sharded`.
+    #[cfg(unix)]
+    #[test]
+    fn sharded_loader_follows_hub_cache_snapshot_layout() {
+        let outer = temp_dir("lattice_containment_hub_layout_test");
+        let blobs = outer.join("blobs");
+        let dir = outer.join("snapshots").join("rev");
+        fs::create_dir_all(&blobs).expect("test setup");
+        fs::create_dir_all(&dir).expect("test setup");
+        write_single_f32_tensor(&blobs.join("blob-sha"), "tensor.a", &[1.0, 2.0]);
+        std::os::unix::fs::symlink(
+            Path::new("../../blobs/blob-sha"),
+            dir.join("model.safetensors"),
+        )
+        .expect("test setup");
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"metadata": {}, "weight_map": {"tensor.a": "model.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
+
+        let tensors =
+            load_sharded(&dir).expect("hub-cache snapshot layout must load through the symlink");
+        assert_eq!(tensors["tensor.a"].data, vec![1.0, 2.0]);
+
+        fs::remove_dir_all(&outer).ok();
+    }
+
+    /// #1069 end-to-end: a sharded index whose weight_map entry escapes the
+    /// model directory fails to load through both sharded loaders.
+    #[test]
+    fn sharded_loaders_reject_escaping_index_entry() {
+        let outer = temp_dir("lattice_containment_loader_test");
+        let dir = outer.join("model");
+        fs::create_dir_all(&dir).expect("test setup");
+        // A structurally valid shard OUTSIDE the model dir — containment,
+        // not file validity, must be what rejects it.
+        let evil = outer.join("evil.safetensors");
+        write_single_f32_tensor(&evil, "tensor.a", &[1.0, 2.0]);
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"metadata": {}, "weight_map": {"tensor.a": "../evil.safetensors"}}"#,
+        )
+        .expect("test setup: write index");
+
+        let err = load_sharded(&dir).expect_err("load_sharded must reject the escaping entry");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+
+        let index_path = dir.join("model.safetensors.index.json");
+        let mut st = ShardedSafetensors::open_index(&index_path).expect("index itself parses");
+        let err = st
+            .get_f32_tensor_owned("tensor.a")
+            .expect_err("lazy loader must reject the escaping entry at access time");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+        let err = st
+            .resolve_weight("tensor.a")
+            .expect_err("resolve_weight must reject the escaping entry");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_dir_all(&outer).ok();
     }
 
     #[test]
@@ -2643,5 +2990,107 @@ mod tests {
             "expected ShapeMismatch, got {err:?}"
         );
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parse_index_rejects_oversized_index_file() {
+        // FIX 6 regression: an oversized model.safetensors.index.json must be rejected
+        // via the file's metadata length, before `read_to_string` materializes it.
+        let root = temp_dir("lattice_index_oversized");
+        let oversized = format!(
+            r#"{{"metadata":{{}},"weight_map":{{}}, "pad":"{}"}}"#,
+            "x".repeat(MAX_SAFETENSORS_INDEX_BYTES as usize + 1)
+        );
+        fs::write(root.join("model.safetensors.index.json"), oversized)
+            .expect("test setup: write oversized index");
+        let err = parse_index(&root).expect_err("an oversized safetensors index must be rejected");
+        assert!(
+            err.to_string().contains("MAX_SAFETENSORS_INDEX_BYTES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_weight_map_over_entry_cap() {
+        // FIX 6 regression: `weight_map` entry count must be capped incrementally during
+        // deserialization -- before the whole map collapses into an owned `HashMap`.
+        // MAX_WEIGHT_MAP_ENTRIES + 1 raw members, each mapping to the same short shard
+        // name, must be rejected.
+        let mut entries = String::with_capacity((MAX_WEIGHT_MAP_ENTRIES + 1) * 24);
+        for i in 0..=MAX_WEIGHT_MAP_ENTRIES {
+            if i > 0 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(r#""t{i}":"s""#));
+        }
+        let json = format!(r#"{{"metadata":{{}},"weight_map":{{{entries}}}}}"#);
+        let err = serde_json::from_str::<SafetensorsIndex>(&json)
+            .expect_err("weight_map over MAX_WEIGHT_MAP_ENTRIES must be rejected");
+        assert!(
+            err.to_string().contains("MAX_WEIGHT_MAP_ENTRIES"),
+            "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_accepts_weight_map_at_entry_cap() {
+        // A weight_map with exactly MAX_WEIGHT_MAP_ENTRIES entries must be accepted --
+        // this is a boundary test, not a realistic-checkpoint test (real checkpoints use
+        // far fewer entries; see `parse_index`'s doc comment).
+        let mut entries = String::with_capacity(MAX_WEIGHT_MAP_ENTRIES * 24);
+        for i in 0..MAX_WEIGHT_MAP_ENTRIES {
+            if i > 0 {
+                entries.push(',');
+            }
+            entries.push_str(&format!(r#""t{i}":"s""#));
+        }
+        let json = format!(r#"{{"metadata":{{}},"weight_map":{{{entries}}}}}"#);
+        let index: SafetensorsIndex = serde_json::from_str(&json)
+            .expect("weight_map at exactly MAX_WEIGHT_MAP_ENTRIES must be accepted");
+        assert_eq!(index.weight_map.len(), MAX_WEIGHT_MAP_ENTRIES);
+    }
+
+    #[test]
+    fn open_manifest_entry_once_rejects_traversal_before_opening() {
+        // The lexical check runs before the join, so a `../` entry is refused whether or
+        // not it names a real file -- the fd is never opened. Symlink escape is NOT
+        // tested here and NOT rejected: see the threat model on `contained_shard_path`
+        // and `sharded_loader_follows_hub_cache_snapshot_layout`.
+        let root = temp_dir("lattice_manifest_entry_traversal");
+        let err = open_manifest_entry_once(&root, "../escape.safetensors")
+            .expect_err("a `../` manifest entry must be rejected");
+        assert!(
+            err.to_string().contains("escapes the model directory"),
+            "expected the lexical traversal guard to fire, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_sharded_rejects_hostile_index_with_traversal_entry() {
+        let root = temp_dir("lattice_containment_load_sharded");
+        let escape_target = root.parent().expect("temp dir has a parent").join(format!(
+            "lattice_containment_load_sharded_secret_{}.safetensors",
+            std::process::id()
+        ));
+        write_single_f32_tensor(&escape_target, "tensor.a", &[1.0, 2.0]);
+
+        let index_path = root.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            format!(
+                r#"{{"metadata": {{"total_size": 8.0}}, "weight_map": {{"tensor.a": "../{}"}}}}"#,
+                escape_target.file_name().unwrap().to_str().unwrap()
+            ),
+        )
+        .expect("test setup: write hostile index");
+
+        let result = load_sharded(&root);
+
+        fs::remove_file(&escape_target).ok();
+
+        assert!(
+            result.is_err(),
+            "load_sharded must reject a `../` traversal entry in the index manifest"
+        );
     }
 }

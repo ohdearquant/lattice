@@ -1286,7 +1286,18 @@ mod inner {
         }
 
         /// Wrap a no-copy Metal buffer backed by `mmap` with a non-zero payload offset.
-        fn from_mmap(buffer: Buffer, payload_offset: u64, mmap: memmap2::Mmap) -> Self {
+        ///
+        /// The GPU is the only thing that will ever read these bytes, so the
+        /// caller must present the [`Q4BlocksChecked`] witness that
+        /// `open_and_mmap_q4_file` issues for an eagerly checked mapping.
+        /// A caller that deferred the block check has no witness to pass and
+        /// cannot reach this constructor without visibly unwrapping a `None`.
+        fn from_mmap(
+            buffer: Buffer,
+            payload_offset: u64,
+            mmap: memmap2::Mmap,
+            _blocks_checked: crate::weights::q4_weights::Q4BlocksChecked,
+        ) -> Self {
             Q4WeightBuf {
                 buffer,
                 payload_offset,
@@ -1299,6 +1310,20 @@ mod inner {
     /// `StorageModeShared` buffer.  Stores the mmap owner inside the returned
     /// [`Q4WeightBuf`] so the pages remain valid for the lifetime of the buffer.
     ///
+    /// This is the one Q4 load path whose bytes are never decoded on the CPU:
+    /// the packed nibbles stay resident in the no-copy GPU buffer and the
+    /// per-block scale/bias is dequantized by the Metal kernel at dispatch
+    /// time. There is therefore no traversal here to fold a scale/bias check
+    /// into, and a file with a correct header but a NaN or infinite scale
+    /// would otherwise load cleanly and propagate the NaN into the logits at
+    /// the first GEMV. The load requests [`Q4BlockCheck::Now`] so the check
+    /// happens before the buffer exists.
+    ///
+    /// That costs one sequential pass over the payload, faulting in pages
+    /// this no-copy mapping was otherwise designed not to touch — a real cost
+    /// paid once per weight at load, deliberately, because the alternative is
+    /// admitting non-finite weights to the GPU.
+    ///
     /// # Safety invariant
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
     /// modified while the process is running.
@@ -1307,27 +1332,25 @@ mod inner {
         device: &Device,
         path: &std::path::Path,
         label: &str,
+        expected_shape: &[usize],
     ) -> Result<Q4WeightBuf, String> {
-        use crate::weights::q4_weights::{read_q4_header, validate_q4_header_payload_bounds};
+        use crate::weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
 
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        let header = read_q4_header(&file)
-            .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-        let file_len = file
-            .metadata()
-            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-            .len();
-        // Fail closed on a truncated/malformed Q4 file *before* the mmap is
-        // handed to the GPU: unlike the CPU sibling (`load_q4_file`), which
-        // fails via `read_exact` short of the block payload, this no-copy
-        // path never reads the payload itself, so a missing bounds check
-        // here would let a truncated on-disk checkpoint reach Metal dispatch
-        // and read past the end of the mapped payload.
-        validate_q4_header_payload_bounds(&header, file_len, path)
-            .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        let tensor_name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("native Q4 tensor");
+        let (header, mmap, blocks_checked) = open_and_mmap_q4_file(
+            path,
+            Some(expected_shape),
+            Q4BlockCheck::Now { tensor_name },
+        )?;
+        let blocks_checked = blocks_checked.ok_or_else(|| {
+            format!(
+                "{}: block metadata was not checked before no-copy GPU publication",
+                path.display()
+            )
+        })?;
 
         // The mmap pointer is page-aligned (guaranteed by the OS).  We create the Metal
         // buffer over the *whole* file so the pointer alignment requirement of
@@ -1341,7 +1364,12 @@ mod inner {
         );
         buf.set_label(label);
 
-        Ok(Q4WeightBuf::from_mmap(buf, header.payload_offset, mmap))
+        Ok(Q4WeightBuf::from_mmap(
+            buf,
+            header.payload_offset,
+            mmap,
+            blocks_checked,
+        ))
     }
 
     /// A Q3-quantized weight buffer (ADR-072 P1, #420 Stage 2), paired with the
@@ -1365,7 +1393,7 @@ mod inner {
         ///
         /// Mirrors `Q4WeightBuf::from_buffer` for API-shape parity; unused
         /// until a non-mmap Q3 construction path (e.g. concatenated MoE-style
-        /// upload) exists — see w3_stage2_report.md "what shipped" for scope.
+        /// upload) exists.
         #[allow(dead_code)]
         fn from_buffer(buffer: Buffer) -> Self {
             Q3WeightBuf {
@@ -1378,8 +1406,7 @@ mod inner {
         /// Wrap a no-copy Metal buffer backed by `mmap` with a non-zero payload offset.
         ///
         /// Exercised today only by [`mmap_q3_weight`] and its tests; live
-        /// checkpoint loading does not yet route MLP tensors through it (see
-        /// w3_stage2_report.md "what shipped" for the scope decision).
+        /// checkpoint loading does not yet route MLP tensors through it.
         #[allow(dead_code)]
         fn from_mmap(buffer: Buffer, payload_offset: u64, mmap: memmap2::Mmap) -> Self {
             Q3WeightBuf {
@@ -1405,8 +1432,7 @@ mod inner {
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
     /// modified while the process is running.
     ///
-    /// Not yet called from live checkpoint loading — see w3_stage2_report.md
-    /// "what shipped" for the scope decision (proven end-to-end by this
+    /// Not yet called from live checkpoint loading (proven end-to-end by this
     /// module's `mmap_q3_weight_*` tests instead).
     #[cfg(feature = "metal-gpu")]
     #[allow(dead_code)]
@@ -1694,7 +1720,6 @@ mod inner {
     ///
     /// Stores up to `max_tokens + 1` snapshots (slot 0 = base, slot k = after k tokens).
     pub(crate) struct MetalGdnCheckpointPool {
-        #[allow(dead_code)] // capacity bound stored for future slot-overflow safety checks
         max_tokens: usize,
         conv_slots: Vec<Vec<Buffer>>, // [slot][linear_layer]
         s_slots: Vec<Vec<Buffer>>,    // [slot][linear_layer]
@@ -1762,6 +1787,14 @@ mod inner {
     struct MetalStepOutput {
         logits: Vec<f32>,
         pre_final_hidden: Vec<f32>,
+        // Kept alive by binding the returned struct (not discarding it),
+        // rather than dropping at the end of `forward_step_inner_impl`'s
+        // body — the zero-copy greedy path needs `decode.step` to span
+        // through its post-return logits scan (see
+        // `forward_step_greedy_argmax`); every other caller either drops
+        // this immediately (`.logits`, same timing as before) or holds a
+        // `Scope::NotDecode` no-op guard, which is a no-op to drop late.
+        _signpost_step: crate::forward::signpost::Interval,
     }
 
     struct MetalMtpForwardOutput {
@@ -4855,7 +4888,12 @@ mod inner {
                     GdnStateTrafficScope::MtpVerify,
                 );
                 #[cfg(not(feature = "gdn-state-counters"))]
-                let repair_out = self.forward_step_inner(repair_token, repair_pos, true);
+                let repair_out = self.forward_step_inner(
+                    repair_token,
+                    repair_pos,
+                    true,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 self.session.last_pre_final_hidden = repair_out.pre_final_hidden;
                 self.session.kv_cache.seq_len = seq_len;
             } else {
@@ -4888,6 +4926,7 @@ mod inner {
                     "GDN checkpoint pool required for verify_tokens_batched".into(),
                 ));
             }
+            self.check_forward_range_capacity(start_pos, tokens.len(), true)?;
             if let Some(ref mut p) = self.session.gdn_checkpoints {
                 p.active_base_seq_len = Some(start_pos);
                 p.mtp_base_seq_len = self.session.mtp.as_ref().map(|m| m.cache.seq_len);
@@ -4904,7 +4943,12 @@ mod inner {
                     GdnStateTrafficScope::MtpVerify,
                 );
                 #[cfg(not(feature = "gdn-state-counters"))]
-                let out = self.forward_step_inner(token, start_pos + i, true);
+                let out = self.forward_step_inner(
+                    token,
+                    start_pos + i,
+                    true,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 self.checkpoint_gdn_to_slot(i + 1, GdnStateTrafficScope::MtpVerify)?;
                 all_logits.push(out.logits);
                 final_hidden = out.pre_final_hidden;
@@ -4942,11 +4986,7 @@ mod inner {
                     "GDN checkpoint pool required for verify_tokens_batch_gemm".into(),
                 ));
             }
-            assert!(
-                start_pos + n <= self.session.kv_cache.max_cache_len,
-                "verify_batch: would overflow KV cache (start={start_pos} n={n} max={})",
-                self.session.kv_cache.max_cache_len
-            );
+            self.check_forward_range_capacity(start_pos, n, false)?;
 
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
@@ -6118,6 +6158,7 @@ mod inner {
             token_id: u32,
             position: usize,
             capture_hidden: bool,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> MetalStepOutput {
             self.forward_step_inner_impl(
                 token_id,
@@ -6127,6 +6168,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 None,
+                signpost_scope,
             )
         }
 
@@ -6142,6 +6184,8 @@ mod inner {
             capture_hidden: bool,
             scope: GdnStateTrafficScope,
         ) -> MetalStepOutput {
+            // Both callers (repair replay, batched verifier) are MTP-verify
+            // work, never autoregressive decode — always `NotDecode`.
             self.forward_step_inner_impl(
                 token_id,
                 position,
@@ -6150,6 +6194,7 @@ mod inner {
                 scope,
                 None,
                 None,
+                crate::forward::signpost::Scope::NotDecode,
             )
         }
 
@@ -6172,6 +6217,7 @@ mod inner {
         #[allow(dead_code)] // exercised by injection-only unit tests, see doc comment
         fn forward_step_injected(&mut self, embedding: &[f32], position: usize) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
+            // Never reached on a production path (see doc comment) — always `NotDecode`.
             self.forward_step_inner_impl(
                 0,
                 position,
@@ -6180,6 +6226,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 None,
+                crate::forward::signpost::Scope::NotDecode,
             )
             .logits
         }
@@ -6197,6 +6244,7 @@ mod inner {
             embedding: &[f32],
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl(
@@ -6207,6 +6255,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 mrope_cos_sin,
+                signpost_scope,
             )
             .logits
         }
@@ -6220,6 +6269,7 @@ mod inner {
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
             emit_head: bool,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl_with_head(
@@ -6231,6 +6281,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 mrope_cos_sin,
+                signpost_scope,
             )
             .logits
         }
@@ -6246,6 +6297,7 @@ mod inner {
             token_id: u32,
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl(
@@ -6256,6 +6308,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 mrope_cos_sin,
+                signpost_scope,
             )
             .logits
         }
@@ -6271,6 +6324,7 @@ mod inner {
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
             emit_head: bool,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
             self.forward_step_inner_impl_with_head(
@@ -6282,6 +6336,7 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 mrope_cos_sin,
+                signpost_scope,
             )
             .logits
         }
@@ -6302,6 +6357,7 @@ mod inner {
             _traffic_scope: GdnStateTrafficScope,
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> MetalStepOutput {
             self.forward_step_inner_impl_with_head(
                 token_id,
@@ -6312,6 +6368,7 @@ mod inner {
                 _traffic_scope,
                 injected_embedding,
                 mrope_cos_sin,
+                signpost_scope,
             )
         }
 
@@ -6335,7 +6392,12 @@ mod inner {
             _traffic_scope: GdnStateTrafficScope,
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
         ) -> MetalStepOutput {
+            let _signpost_step = crate::forward::signpost::interval_in(
+                signpost_scope,
+                crate::forward::signpost::Label::DecodeStep,
+            );
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
 
@@ -6458,8 +6520,20 @@ mod inner {
                         linear_idx += 1;
                         layer_enc.end_encoding();
                         let t_mixer = std::time::Instant::now();
-                        layer_cmd.commit();
-                        layer_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            layer_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            layer_cmd.wait_until_completed();
+                        }
                         prof.gpu_gdn_mixer_us += t_mixer.elapsed().as_micros();
                         // MLP-only command buffer for this GDN layer.
                         let mlp_cmd = unsafe {
@@ -6478,8 +6552,20 @@ mod inner {
                         );
                         mlp_enc.end_encoding();
                         let t_mlp = std::time::Instant::now();
-                        mlp_cmd.commit();
-                        mlp_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            mlp_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            mlp_cmd.wait_until_completed();
+                        }
                         prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                     } else {
                         // Attn-only (no MLP): measures pure GQA attention cost.
@@ -6499,8 +6585,20 @@ mod inner {
                         full_idx += 1;
                         layer_enc.end_encoding();
                         let t_attn = std::time::Instant::now();
-                        layer_cmd.commit();
-                        layer_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            layer_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            layer_cmd.wait_until_completed();
+                        }
                         prof.gpu_gqa_attn_us += t_attn.elapsed().as_micros();
                         // MLP-only command buffer for this GQA layer.
                         let mlp_cmd = unsafe {
@@ -6519,8 +6617,20 @@ mod inner {
                         );
                         mlp_enc.end_encoding();
                         let t_mlp = std::time::Instant::now();
-                        mlp_cmd.commit();
-                        mlp_cmd.wait_until_completed();
+                        {
+                            let _signpost_commit = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbCommit,
+                            );
+                            mlp_cmd.commit();
+                        }
+                        {
+                            let _signpost_wait = crate::forward::signpost::interval_in(
+                                signpost_scope,
+                                crate::forward::signpost::Label::DecodeCbWait,
+                            );
+                            mlp_cmd.wait_until_completed();
+                        }
                         prof.gpu_mlp_us += t_mlp.elapsed().as_micros();
                     }
                     // Keep legacy aggregates for backward compat with existing tooling.
@@ -6539,8 +6649,20 @@ mod inner {
                 };
                 head_enc.end_encoding();
                 let t_gpu = std::time::Instant::now();
-                head_cmd.commit();
-                head_cmd.wait_until_completed();
+                {
+                    let _signpost_commit = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeCbCommit,
+                    );
+                    head_cmd.commit();
+                }
+                {
+                    let _signpost_wait = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeCbWait,
+                    );
+                    head_cmd.wait_until_completed();
+                }
                 prof.gpu_lm_head_us += t_gpu.elapsed().as_micros();
 
                 let total_gpu_us = prof.gpu_gdn_mixer_us
@@ -6615,6 +6737,10 @@ mod inner {
                 let pre_final_hidden = if emit_head
                     && (capture_hidden || self.session.mtp.is_some())
                 {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     let h =
                         unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                     self.session.last_pre_final_hidden = h.clone();
@@ -6626,11 +6752,19 @@ mod inner {
                 let logits = if !emit_head || skip_logits_readback {
                     vec![]
                 } else if let Some(which) = topk_which_inner {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     let k = self.session.compact_topk;
                     let candidates = unsafe { self.read_topk_candidates(which, k) };
                     self.session.compact_result = candidates;
                     vec![]
                 } else {
+                    let _signpost_host_read = crate::forward::signpost::interval_in(
+                        signpost_scope,
+                        crate::forward::signpost::Label::DecodeHostScalarRead,
+                    );
                     unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
                 };
                 self.session.kv_cache.seq_len += 1;
@@ -6638,6 +6772,7 @@ mod inner {
                 return MetalStepOutput {
                     logits,
                     pre_final_hidden,
+                    _signpost_step,
                 };
             }
 
@@ -6708,8 +6843,20 @@ mod inner {
 
             // Single submit for entire forward pass + optional top-k.
             enc.end_encoding();
-            cmd.commit();
-            cmd.wait_until_completed();
+            {
+                let _signpost_commit = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeCbCommit,
+                );
+                cmd.commit();
+            }
+            {
+                let _signpost_wait = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeCbWait,
+                );
+                cmd.wait_until_completed();
+            }
 
             // Diagnostic: dump post-final-norm hidden state magnitudes for
             // divergence analysis vs MLX. Set LATTICE_HIDDEN_DUMP=path to enable.
@@ -6768,6 +6915,10 @@ mod inner {
             // never ran, so the buffer holds a stale value from a prior step.
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
             let pre_final_hidden = if emit_head && (capture_hidden || self.session.mtp.is_some()) {
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 let h = unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
                 self.session.last_pre_final_hidden = h.clone();
                 h
@@ -6780,6 +6931,10 @@ mod inner {
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
                 // SAFETY: GPU completed, buffers are StorageModeShared.
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 let k = self.session.compact_topk;
                 let candidates = unsafe { self.read_topk_candidates(which, k) };
                 self.session.compact_result = candidates;
@@ -6787,6 +6942,10 @@ mod inner {
             } else {
                 // Full path: read vocab_size f32 logits back to host.
                 // SAFETY: GPU completed, buffer is StorageModeShared.
+                let _signpost_host_read = crate::forward::signpost::interval_in(
+                    signpost_scope,
+                    crate::forward::signpost::Label::DecodeHostScalarRead,
+                );
                 unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
             };
             self.session.kv_cache.seq_len += 1;
@@ -6794,7 +6953,140 @@ mod inner {
             MetalStepOutput {
                 logits,
                 pre_final_hidden,
+                _signpost_step,
             }
+        }
+
+        fn check_forward_step_capacity(
+            &self,
+            position: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            let max_cache_len = self.session.kv_cache.max_cache_len;
+            if position >= max_cache_len {
+                return Err(InferenceError::InvalidInput(format!(
+                    "forward_step: position {position} exceeds max position {}",
+                    max_cache_len - 1
+                )));
+            }
+            if self.session.kv_cache.seq_len >= max_cache_len {
+                return Err(InferenceError::InvalidInput(format!(
+                    "forward_step: KV cache is full at {} tokens (max_cache_len {max_cache_len})",
+                    self.session.kv_cache.seq_len
+                )));
+            }
+            Ok(())
+        }
+
+        /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
+        /// starting at `start_pos` — every position `start_pos..start_pos + token_count` must
+        /// land inside the RoPE table / KV cache, and (when `gdn_pool_capacity` is `Some`)
+        /// `token_count` must not exceed the fixed-size GDN checkpoint pool. Checked before any
+        /// of it reaches Metal dispatch or GDN checkpoint mutation, so a caller-supplied token
+        /// count can never leave session state partially advanced on rejection.
+        ///
+        /// `gdn_pool_capacity` bounds callers that checkpoint one pool slot per processed token
+        /// (slot 0 = base, slot k = after k tokens, so valid slots are `0..=capacity` and at
+        /// most `capacity` tokens may be processed after the base checkpoint).
+        ///
+        /// Free function (no `&self`) so it is unit-testable on CPU without a Metal device.
+        fn validate_dispatch_capacity(
+            start_pos: usize,
+            token_count: usize,
+            kv_capacity: usize,
+            gdn_pool_capacity: Option<usize>,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            if token_count == 0 {
+                return Ok(());
+            }
+            let last_position = start_pos.saturating_add(token_count - 1);
+            if last_position >= kv_capacity {
+                return Err(InferenceError::InvalidInput(format!(
+                    "start_pos {start_pos} + {token_count} tokens reaches position \
+                     {last_position}, exceeding max position {}",
+                    kv_capacity - 1
+                )));
+            }
+            if let Some(pool_capacity) = gdn_pool_capacity
+                && token_count > pool_capacity
+            {
+                return Err(InferenceError::InvalidInput(format!(
+                    "start_pos {start_pos} + {token_count} tokens exceeds GDN checkpoint pool \
+                     capacity {pool_capacity} (checkpoint slots 0..={pool_capacity})"
+                )));
+            }
+            Ok(())
+        }
+
+        /// Method form of [`Self::validate_dispatch_capacity`], resolving the KV/RoPE bound
+        /// from live session state.
+        ///
+        /// Scope, stated precisely because the obvious paraphrase of it is wrong: this is
+        /// shared by every caller that dispatches a caller-supplied *range*,
+        /// `start_pos..start_pos + token_count`. It is not on the single-position decode
+        /// path. `forward_step_decode` and `forward_step_greedy_argmax` take one position
+        /// and are bounded by their caller instead: each decode loop tests the pending
+        /// position against `kv_cache.max_cache_len` and breaks with `StopReason::KvFull`
+        /// before dispatching, with the headroom that loop needs. There are three distinct
+        /// headroom requirements, not three loops — the loops are more numerous than the
+        /// shapes, and reading the list below as a list of loops is the mistake this
+        /// paragraph exists to prevent. The MTP loop reserves two slots
+        /// (`max_cache_len.saturating_sub(2)`); the self-speculative loop reserves
+        /// `SELF_SPEC_MAX_DRAFT + 1`; every other decode loop, including the multimodal and
+        /// vision ones, needs a single free slot and tests `seq_len >= max_cache_len`
+        /// directly.
+        /// Read as "every Metal dispatch goes through here" this comment is false, and a
+        /// reader who checks it against the decode path will correctly conclude the guard is
+        /// bypassed.
+        ///
+        /// Pass `check_gdn_pool = true` for callers that checkpoint one GDN pool slot per
+        /// token (`verify_tokens_batched`); other callers pass `false` since they never
+        /// advance the GDN checkpoint past the base slot.
+        fn check_forward_range_capacity(
+            &self,
+            start_pos: usize,
+            token_count: usize,
+            check_gdn_pool: bool,
+        ) -> Result<(), crate::error::InferenceError> {
+            let gdn_pool_capacity = if check_gdn_pool {
+                self.session.gdn_checkpoints.as_ref().map(|p| p.max_tokens)
+            } else {
+                None
+            };
+            Self::validate_dispatch_capacity(
+                start_pos,
+                token_count,
+                self.session.kv_cache.max_cache_len,
+                gdn_pool_capacity,
+            )
+        }
+
+        /// **Unstable**: fallible single-token forward step; kernel dispatch strategy evolving.
+        ///
+        /// Run a single token through the full model. Returns logits [vocab_size].
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU dispatch
+        /// when `position` or the next KV-cache row is outside the session capacity.
+        pub fn try_forward_step(
+            &mut self,
+            token_id: u32,
+            position: usize,
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            self.check_forward_step_capacity(position)?;
+            self.cross_turn_prefix_cache.clear();
+            Ok(self
+                .forward_step_inner(
+                    token_id,
+                    position,
+                    false,
+                    crate::forward::signpost::Scope::NotDecode,
+                )
+                .logits)
         }
 
         /// **Unstable**: single-token forward step; kernel dispatch strategy evolving.
@@ -6803,10 +7095,9 @@ mod inner {
         ///
         /// # Panics
         ///
-        /// Panics if `token_id >= vocab_size`. The check is O(1) and runs before any
-        /// GPU dispatch. The tokenizer-bounded generate path never triggers this; it
-        /// can only be reached by a library consumer calling the raw entry point with
-        /// an out-of-vocabulary id.
+        /// Panics if `token_id >= vocab_size`, or if `position` or the next
+        /// KV-cache row exceeds the session capacity. Use [`Self::try_forward_step`]
+        /// to receive a typed capacity error. These checks run before GPU dispatch.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -6822,15 +7113,48 @@ mod inner {
         /// so this clear is a no-op there — the cache-aware path never has a
         /// live entry saved while it is still generating.
         pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+            // General-purpose raw entry point: reused for prompt prefill (a
+            // token-at-a-time loop, e.g. `forward_prefill_impl`,
+            // `forward_prefill_from`, multimodal prefill) as well as by
+            // external library consumers calling it directly, so it cannot
+            // assume decode scope. The production autoregressive decode
+            // loops call `forward_step_decode` instead (below), which is
+            // `Scope::Decode`. Delegates to `try_forward_step` so this path
+            // gets the same before-dispatch capacity validation as external
+            // callers of the fallible API.
+            match self.try_forward_step(token_id, position) {
+                Ok(logits) => logits,
+                Err(error) => panic!("{error}"),
+            }
+        }
+
+        /// Same contract as [`Self::forward_step`], for the production
+        /// autoregressive decode loops (`generate`, `generate_streaming*`,
+        /// `generate_streaming_with_prefix_cache*`) only — marks the
+        /// `decode.*` signpost interval `Scope::Decode` so it is not silent.
+        /// Not `pub`: external consumers get the general-purpose
+        /// `forward_step`, which stays `Scope::NotDecode` since it cannot
+        /// know whether the caller is decoding or prefilling.
+        fn forward_step_decode(&mut self, token_id: u32, position: usize) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
-            self.forward_step_inner(token_id, position, false).logits
+            self.forward_step_inner(
+                token_id,
+                position,
+                false,
+                crate::forward::signpost::Scope::Decode,
+            )
+            .logits
         }
 
         /// Zero-copy greedy argmax: run forward pass then scan GPU shared buffer
         /// directly for the argmax token ID, avoiding 993KB allocation+copy.
         fn forward_step_greedy_argmax(&mut self, token_id: u32, position: usize) -> u32 {
             let cfg = self.engine.config.clone();
-            self.forward_step_inner_impl(
+            // Binding (not discarding) the returned guard keeps `decode.step`
+            // alive through the host-read/argmax scan below, matching its
+            // documented span (through logits/top-k readback) — the scan is
+            // logically part of this step, not a separate one.
+            let _step_guard = self.forward_step_inner_impl(
                 token_id,
                 position,
                 false,
@@ -6838,8 +7162,18 @@ mod inner {
                 GdnStateTrafficScope::Decode,
                 None,
                 None,
+                crate::forward::signpost::Scope::Decode,
             );
 
+            // Fused host read + greedy sample: this scan both reads the
+            // shared logits buffer off the GPU and picks the argmax token in
+            // the same pass (the whole point of the zero-copy path), so it
+            // carries both signpost labels for the span it covers.
+            let _signpost_host_read = crate::forward::signpost::interval(
+                crate::forward::signpost::Label::DecodeHostScalarRead,
+            );
+            let _signpost_sample =
+                crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample);
             // SAFETY: GPU completed (wait_until_completed called in forward_step_inner).
             // logits buffer is StorageModeShared — CPU can read it directly.
             unsafe {
@@ -6977,13 +7311,29 @@ mod inner {
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
         ///
+        /// # Errors
+        ///
+        /// Returns an error when more than one position is requested while a
+        /// LoRA adapter is active, because the batched all-position path does
+        /// not apply LoRA projections.
+        ///
         /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
         /// comment for the invariant this enforces.
-        pub fn forward_prefill_all_logits(&mut self, token_ids: &[u32]) -> Vec<f32> {
+        pub fn forward_prefill_all_logits(
+            &mut self,
+            token_ids: &[u32],
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            if token_ids.len() > 1 && self.lora.is_some() {
+                return Err(crate::error::InferenceError::Inference(
+                    "forward_prefill_all_logits: all-position prefill does not apply LoRA \
+                     adapters; unload the adapter before requesting all-position logits"
+                        .into(),
+                ));
+            }
             self.cross_turn_prefix_cache.clear();
-            self.forward_prefill_impl(token_ids, true)
+            Ok(self.forward_prefill_impl(token_ids, true))
         }
 
         fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
@@ -7010,12 +7360,6 @@ mod inner {
             }
             if self.lora.is_some() {
                 // Batched helper does not apply LoRA adapters; stay on sequential path.
-                if all_positions {
-                    panic!(
-                        "forward_prefill_all_logits: LoRA active — \
-                         batch/all-position prefill does not apply LoRA"
-                    );
-                }
                 let mut last_logits = Vec::new();
                 for (pos, &id) in token_ids.iter().enumerate() {
                     last_logits = self.forward_step(id, pos);
@@ -7063,6 +7407,481 @@ mod inner {
             }
         }
 
+        fn copy_prefill_embeddings(&self, token_ids: &[u32], hidden: usize) {
+            // SAFETY: embed_tokens is StorageModeShared f16 with no GPU work in flight;
+            // callers validate every token id before reaching the prefill schedulers.
+            unsafe {
+                let src_base = self.engine.embed_tokens.contents() as *const u16;
+                let dst_base = self.session.activations.hidden.contents() as *mut f32;
+                for (t, &id) in token_ids.iter().enumerate() {
+                    let src = src_base.add(id as usize * hidden);
+                    let dst = dst_base.add(t * hidden);
+                    convert_f16_row(src, dst, hidden);
+                }
+            }
+        }
+
+        fn encode_prefill_dense_mlp(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            common_w: &MetalCommonLayerWeights,
+            attention_delta: &Buffer,
+            cfg: &Qwen35Config,
+            m: u32,
+        ) {
+            let hidden = cfg.hidden_size;
+            let inter = cfg.intermediate_size;
+            let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
+                MetalFfnWeights::Dense {
+                    gate_up_proj,
+                    down_proj,
+                } => {
+                    let byte_size = match self.engine.quant_format {
+                        QuantFormat::Q8_0 => (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64,
+                        QuantFormat::Q4_0 => (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64,
+                    };
+                    (gate_up_proj, down_proj, byte_size)
+                }
+                MetalFfnWeights::Moe(_) => {
+                    panic!("batch prefill does not support MoE layers when M>1")
+                }
+            };
+
+            self.dispatch_fused_residual_add_norm_batch(
+                enc,
+                &self.session.activations.residual,
+                attention_delta,
+                &self.session.activations.residual,
+                &self.session.activations.hidden,
+                &common_w.post_attention_layernorm,
+                hidden as u32,
+                m,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_gemm_at(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                w_gate_up,
+                0,
+                &self.session.activations.gate,
+                0,
+                m,
+                inter as u32,
+                hidden as u32,
+            );
+            self.dispatch_gemm_at(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                w_gate_up,
+                gate_byte_size,
+                &self.session.activations.up,
+                0,
+                m,
+                inter as u32,
+                hidden as u32,
+            );
+            self.dispatch_silu_mul(enc, m * inter as u32);
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.gate,
+                0,
+                w_down,
+                &self.session.activations.ffn_out,
+                0,
+                m,
+                hidden as u32,
+                inter as u32,
+            );
+            self.dispatch_add_and_copy(
+                enc,
+                &self.session.activations.ffn_out,
+                &self.session.activations.residual,
+                &self.session.activations.hidden,
+                m * hidden as u32,
+            );
+        }
+
+        fn encode_gdn_prefill_before_recurrence(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            cfg: &Qwen35Config,
+            m: u32,
+        ) {
+            let (attn_w, common_w) = &self.engine.layer_weights[compact_idx];
+            let MetalLayerAttnWeights::Linear(gdn_w) = attn_w else {
+                unreachable!()
+            };
+            self.dispatch_copy_and_rms_norm_batch(
+                enc,
+                &self.session.activations.hidden,
+                &self.session.activations.residual,
+                &common_w.input_layernorm,
+                cfg.hidden_size as u32,
+                m,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &gdn_w.in_proj_qkv,
+                &self.session.activations.gdn_qkv,
+                0,
+                m,
+                cfg.linear_qkv_dim() as u32,
+                cfg.hidden_size as u32,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &gdn_w.in_proj_z,
+                &self.session.activations.gdn_z,
+                0,
+                m,
+                cfg.linear_output_dim() as u32,
+                cfg.hidden_size as u32,
+            );
+        }
+
+        fn encode_gdn_prefill_recurrence(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            linear_idx: usize,
+            cfg: &Qwen35Config,
+            n: usize,
+            chunked_enabled: bool,
+        ) {
+            let MetalLayerAttnWeights::Linear(gdn_w) = &self.engine.layer_weights[compact_idx].0
+            else {
+                unreachable!()
+            };
+            let chunk_params = if chunked_enabled {
+                Self::make_gdn_chunk_params(cfg, n)
+            } else {
+                None
+            };
+            if let Some(params) = chunk_params {
+                let weights = GdnChunkedWeights {
+                    conv1d_weight: &gdn_w.conv1d_weight,
+                    in_proj_b: &gdn_w.in_proj_b,
+                    in_proj_a: &gdn_w.in_proj_a,
+                    a_log: &gdn_w.a_log,
+                    dt_bias: &gdn_w.dt_bias,
+                    norm_weight: &gdn_w.norm_weight,
+                };
+                self.dispatch_gdn_chunked_prefill_layer(enc, linear_idx, weights, params);
+                return;
+            }
+
+            let qkv_d = cfg.linear_qkv_dim();
+            let out_d = cfg.linear_output_dim();
+            let num_h = cfg.linear_num_key_heads;
+            let key_d = cfg.linear_key_head_dim;
+            let val_d = cfg.linear_value_head_dim;
+            let num_vh = cfg.linear_num_value_heads();
+            let q_total = (num_h * key_d) as u32;
+            #[repr(C)]
+            struct GdnRecurParams {
+                key_dim: u32,
+                value_dim: u32,
+                num_key_heads: u32,
+                num_value_heads: u32,
+                hidden_size: u32,
+                q_total: u32,
+                v_offset: u32,
+                scale: f32,
+                eps: f32,
+            }
+            let params = GdnRecurParams {
+                key_dim: key_d as u32,
+                value_dim: val_d as u32,
+                num_key_heads: num_h as u32,
+                num_value_heads: num_vh as u32,
+                hidden_size: cfg.hidden_size as u32,
+                q_total,
+                v_offset: q_total * 2,
+                scale: 1.0 / (key_d as f32).sqrt(),
+                eps: cfg.rms_norm_eps,
+            };
+            for t in 0..n {
+                let qkv_off = (t * qkv_d) as u64 * 4;
+                let z_off = (t * out_d) as u64 * 4;
+                let h_off = (t * cfg.hidden_size) as u64 * 4;
+
+                enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
+                enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+                enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), qkv_off);
+                enc.set_buffer(2, Some(&gdn_w.conv1d_weight), 0);
+                enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
+                let qd = qkv_d as u32;
+                let ks = cfg.linear_conv_kernel_dim as u32;
+                enc.set_bytes(4, 4, &qd as *const u32 as *const _);
+                enc.set_bytes(5, 4, &ks as *const u32 as *const _);
+                let wg = 256u64;
+                enc.dispatch_threads(
+                    MTLSize::new(div_ceil(qkv_d as u64, wg) * wg, 1, 1),
+                    MTLSize::new(wg, 1, 1),
+                );
+
+                enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_recurrence);
+                enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
+                enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
+                enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
+                enc.set_buffer(3, Some(&self.session.activations.hidden), h_off);
+                enc.set_buffer(4, Some(&gdn_w.in_proj_b), 0);
+                enc.set_buffer(5, Some(&gdn_w.in_proj_a), 0);
+                enc.set_buffer(6, Some(&gdn_w.a_log), 0);
+                enc.set_buffer(7, Some(&gdn_w.dt_bias), 0);
+                enc.set_buffer(8, Some(&gdn_w.norm_weight), 0);
+                enc.set_buffer(9, Some(&self.session.activations.gdn_z), z_off);
+                enc.set_bytes(
+                    10,
+                    std::mem::size_of::<GdnRecurParams>() as u64,
+                    &params as *const GdnRecurParams as *const _,
+                );
+                enc.dispatch_thread_groups(
+                    MTLSize::new(num_vh as u64, 1, 1),
+                    MTLSize::new(32, 4, 1),
+                );
+            }
+        }
+
+        fn encode_gdn_prefill_after_recurrence(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            cfg: &Qwen35Config,
+            m: u32,
+        ) {
+            let (attn_w, common_w) = &self.engine.layer_weights[compact_idx];
+            let MetalLayerAttnWeights::Linear(gdn_w) = attn_w else {
+                unreachable!()
+            };
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.gdn_z,
+                0,
+                &gdn_w.out_proj,
+                &self.session.activations.attn_out,
+                0,
+                m,
+                cfg.hidden_size as u32,
+                cfg.linear_output_dim() as u32,
+            );
+            self.encode_prefill_dense_mlp(
+                enc,
+                common_w,
+                &self.session.activations.attn_out,
+                cfg,
+                m,
+            );
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn encode_full_attention_prefill_layer(
+            &self,
+            enc: &ComputeCommandEncoderRef,
+            compact_idx: usize,
+            full_idx: usize,
+            cfg: &Qwen35Config,
+            n: usize,
+            m: u32,
+            start_pos: usize,
+        ) {
+            let hidden = cfg.hidden_size;
+            let kv_dim = cfg.full_kv_dim();
+            let q_dim = cfg.full_q_dim();
+            let num_q_heads = cfg.num_attention_heads;
+            let num_kv_heads = cfg.num_key_value_heads;
+            let head_dim = cfg.head_dim;
+            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
+            let (attn_w, common_w) = &self.engine.layer_weights[compact_idx];
+            let MetalLayerAttnWeights::Full(full_w) = attn_w else {
+                unreachable!()
+            };
+
+            self.dispatch_copy_and_rms_norm_batch(
+                enc,
+                &self.session.activations.hidden,
+                &self.session.activations.residual,
+                &common_w.input_layernorm,
+                hidden as u32,
+                m,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &full_w.q_proj,
+                &self.session.activations.q,
+                0,
+                m,
+                (2 * q_dim) as u32,
+                hidden as u32,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &full_w.k_proj,
+                &self.session.activations.k,
+                0,
+                m,
+                kv_dim as u32,
+                hidden as u32,
+            );
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.hidden,
+                0,
+                &full_w.v_proj,
+                &self.session.activations.v,
+                0,
+                m,
+                kv_dim as u32,
+                hidden as u32,
+            );
+
+            let base_pos = start_pos as u32;
+            let nqh = num_q_heads as u32;
+            let nkh = num_kv_heads as u32;
+            let hd = head_dim as u32;
+            self.dispatch_scatter_q_gate_batch(enc, m, nqh, hd);
+            self.dispatch_per_head_rms_norm_batch(
+                enc,
+                &self.session.activations.q_separated,
+                &full_w.q_norm,
+                m,
+                nqh,
+                hd,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_per_head_rms_norm_batch(
+                enc,
+                &self.session.activations.k,
+                &full_w.k_norm,
+                m,
+                nkh,
+                hd,
+                cfg.rms_norm_eps,
+            );
+            self.dispatch_partial_rope_batch(
+                enc,
+                &self.session.activations.q_separated,
+                m,
+                nqh,
+                hd,
+                half_rope_dim,
+                base_pos,
+            );
+            self.dispatch_partial_rope_batch(
+                enc,
+                &self.session.activations.k,
+                m,
+                nkh,
+                hd,
+                half_rope_dim,
+                base_pos,
+            );
+            self.dispatch_copy_kv_cache_batch(
+                enc,
+                &self.session.activations.k,
+                &self.session.activations.v,
+                &self.session.kv_cache.k_bufs[full_idx],
+                &self.session.kv_cache.v_bufs[full_idx],
+                m,
+                kv_dim as u32,
+                base_pos,
+            );
+
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            if self
+                .dispatch_prefill_attention_batched(
+                    enc,
+                    &self.session.kv_cache.k_bufs[full_idx],
+                    &self.session.kv_cache.v_bufs[full_idx],
+                    base_pos,
+                    m,
+                    hd,
+                    nqh,
+                    nkh,
+                    q_dim as u32,
+                    kv_dim as u32,
+                    scale,
+                )
+                .is_err()
+            {
+                for t in 0..n {
+                    let abs_pos = start_pos + t;
+                    let qs_off = (t * q_dim) as u64 * 4;
+                    let ao_off = (t * q_dim) as u64 * 4;
+                    let cache_len = (abs_pos + 1) as u32;
+                    if self.use_kv_f16 {
+                        enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention_f16);
+                    } else {
+                        enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention);
+                    }
+                    enc.set_buffer(0, Some(&self.session.activations.q_separated), qs_off);
+                    enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
+                    enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
+                    enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
+                    enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
+                    enc.set_bytes(5, 4, &hd as *const u32 as *const _);
+                    enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
+                    enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
+                    let qd = q_dim as u32;
+                    let kvd = kv_dim as u32;
+                    enc.set_bytes(8, 4, &qd as *const u32 as *const _);
+                    enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
+                    enc.set_bytes(10, 4, &scale as *const f32 as *const _);
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(nkh as u64, 1, 1),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }
+            }
+
+            self.dispatch_sigmoid_gate(enc, m * q_dim as u32);
+            self.dispatch_gemm(
+                enc,
+                &self.session.activations.attn_out,
+                0,
+                &full_w.o_proj,
+                &self.session.activations.ffn_out,
+                0,
+                m,
+                hidden as u32,
+                q_dim as u32,
+            );
+            self.encode_prefill_dense_mlp(enc, common_w, &self.session.activations.ffn_out, cfg, m);
+        }
+
+        /// Every active layer's FFN must be dense (`MetalFfnWeights::Dense`) for the
+        /// batched (M>1 GEMM) prefill schedulers — `encode_prefill_dense_mlp` panics
+        /// on `MetalFfnWeights::Moe`. Called before any embedding copy, command
+        /// buffer, or per-layer encode so an unsupported config is rejected with zero
+        /// state mutation instead of panicking mid-encode after earlier layers'
+        /// GDN/KV work has already been recorded (or, for schedulers that split
+        /// encoding across multiple command buffers, already committed to the GPU).
+        fn assert_batched_prefill_dense_only(&self) {
+            let has_moe_layer = self
+                .engine
+                .layer_weights
+                .iter()
+                .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)));
+            assert!(
+                !has_moe_layer,
+                "batched prefill does not support MoE layers (M>1 GEMM path); \
+                 use decode-mode forward_step for MoE models instead"
+            );
+        }
+
         /// Batched single-command-buffer prefill for a contiguous token slice starting
         /// at absolute position `start_pos`.
         ///
@@ -7097,30 +7916,12 @@ mod inner {
                 "prefill chunk start_pos={start_pos} + n={n} exceeds max_cache_len {}",
                 self.session.kv_cache.max_cache_len
             );
+            self.assert_batched_prefill_dense_only();
             let cfg = self.engine.config.clone();
             let m = n as u32;
             let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
-            let kv_dim = cfg.full_kv_dim();
-            let q_dim = cfg.full_q_dim();
-            let num_q_heads = cfg.num_attention_heads;
-            let num_kv_heads = cfg.num_key_value_heads;
-            let head_dim = cfg.head_dim;
-            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
 
-            // Batch embedding: f16 → f32 for all N tokens
-            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight;
-            // all ids validated < vocab_size at the forward_prefill_impl entry point.
-            unsafe {
-                let src_base = self.engine.embed_tokens.contents() as *const u16;
-                let dst_base = self.session.activations.hidden.contents() as *mut f32;
-                for (t, &id) in token_ids.iter().enumerate() {
-                    let src = src_base.add(id as usize * hidden);
-                    let dst = dst_base.add(t * hidden);
-                    // SAFETY: embed_tokens row has hidden u16 values; dst row has hidden f32 values.
-                    convert_f16_row(src, dst, hidden);
-                }
-            }
+            self.copy_prefill_embeddings(token_ids, hidden);
 
             let mut active_layer_idx = 0usize;
             let mut linear_idx = 0usize;
@@ -7151,598 +7952,28 @@ mod inner {
                     MetalLayerAttnWeights::Linear(_)
                 );
 
-                // Extract weight pointers (avoids borrow conflict with &mut self)
-                let (_, common_w) = &self.engine.layer_weights[compact_idx];
-                let w_in_norm = &common_w.input_layernorm as *const Buffer;
-                let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
-                let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
-                    MetalFfnWeights::Dense {
-                        gate_up_proj,
-                        down_proj,
-                    } => {
-                        let byte_size: u64 = match self.engine.quant_format {
-                            QuantFormat::Q8_0 => {
-                                (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
-                            }
-                            QuantFormat::Q4_0 => {
-                                (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64
-                            }
-                        };
-                        (
-                            gate_up_proj as *const Q4WeightBuf,
-                            down_proj as *const Q4WeightBuf,
-                            byte_size,
-                        )
-                    }
-                    MetalFfnWeights::Moe(_) => {
-                        panic!(
-                            "forward_prefill batch GEMM: MoE layers are not supported in batch \
-                                prefill (M>1). ADR-053 v1 targets decode-mode only."
-                        );
-                    }
-                };
-
                 if is_linear {
-                    // ========= GDN layer: batch projections + sequential recurrence =========
-                    let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
-                        let MetalLayerAttnWeights::Linear(gdn_w) =
-                            &self.engine.layer_weights[compact_idx].0
-                        else {
-                            unreachable!()
-                        };
-                        (
-                            &gdn_w.in_proj_qkv as *const Q4WeightBuf,
-                            &gdn_w.in_proj_z as *const Q4WeightBuf,
-                            &gdn_w.in_proj_b as *const Buffer,
-                            &gdn_w.in_proj_a as *const Buffer,
-                            &gdn_w.a_log as *const Buffer,
-                            &gdn_w.dt_bias as *const Buffer,
-                            &gdn_w.conv1d_weight as *const Buffer,
-                            &gdn_w.norm_weight as *const Buffer,
-                            &gdn_w.out_proj as *const Q4WeightBuf,
-                        )
-                    };
-                    let qkv_d = cfg.linear_qkv_dim();
-                    let out_d = cfg.linear_output_dim();
-                    let num_h = cfg.linear_num_key_heads;
-                    let key_d = cfg.linear_key_head_dim;
-                    let val_d = cfg.linear_value_head_dim;
-                    let ks = cfg.linear_conv_kernel_dim as u32;
-
-                    // Batch: fused copy hidden → residual + norm hidden in-place.
-                    // SAFETY: w_in_norm is a live layer-owned buffer pointer (dropped only when
-                    // the model is destroyed). Activation buffers hidden/residual are sized for
-                    // m * hidden f32 elements. The Metal command buffer enc is active.
-                    unsafe {
-                        self.dispatch_copy_and_rms_norm_batch(
-                            enc,
-                            &self.session.activations.hidden,
-                            &self.session.activations.residual,
-                            &*w_in_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: QKV + Z projections (GEMM)
-                    // SAFETY: Raw GDN projection pointers are live layer-owned buffers;
-                    // GEMM dimensions match [m, hidden] by [qkv_d/out_d, hidden].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_qkv,
-                            &self.session.activations.gdn_qkv,
-                            0,
-                            m,
-                            qkv_d as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_z,
-                            &self.session.activations.gdn_z,
-                            0,
-                            m,
-                            out_d as u32,
-                            hidden as u32,
-                        );
-                    }
-
-                    // GDN recurrence: chunked-parallel path or default serial per-token.
-                    let chunk_params = if chunked_enabled {
-                        Self::make_gdn_chunk_params(&cfg, n)
-                    } else {
-                        None
-                    };
-                    if let Some(params) = chunk_params {
-                        // SAFETY: All weight/activation/state buffers are live;
-                        // GdnChunkParams dimensions match the allocation config.
-                        let weights = unsafe {
-                            GdnChunkedWeights {
-                                conv1d_weight: &*w_conv,
-                                in_proj_b: &*w_b,
-                                in_proj_a: &*w_a,
-                                a_log: &*w_alog,
-                                dt_bias: &*w_dtb,
-                                norm_weight: &*w_norm,
-                            }
-                        };
-                        self.dispatch_gdn_chunked_prefill_layer(enc, linear_idx, weights, params);
-                    } else {
-                        // Serial: conv1d + recurrence per token (causal dependency)
-                        for t in 0..n {
-                            let qkv_off = (t * qkv_d) as u64 * 4;
-                            let z_off = (t * out_d) as u64 * 4;
-                            let h_off = (t * hidden) as u64 * 4;
-
-                            // Conv1d + SiLU
-                            // SAFETY: Token offsets are within m-sized activation buffers;
-                            // conv/state/weight buffers are live for the command buffer.
-                            unsafe {
-                                enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                                enc.set_buffer(
-                                    0,
-                                    Some(&self.session.gdn_gpu_conv_bufs[linear_idx]),
-                                    0,
-                                );
-                                enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), qkv_off);
-                                enc.set_buffer(2, Some(&*w_conv), 0);
-                                enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
-                                let qd = qkv_d as u32;
-                                enc.set_bytes(4, 4, &qd as *const u32 as *const _);
-                                enc.set_bytes(5, 4, &ks as *const u32 as *const _);
-                                let wg = 256u64;
-                                enc.dispatch_threads(
-                                    MTLSize::new(div_ceil(qkv_d as u64, wg) * wg, 1, 1),
-                                    MTLSize::new(wg, 1, 1),
-                                );
-                            }
-
-                            // GDN recurrence
-                            // SAFETY: Token offsets are within the batch activation buffers;
-                            // GdnRecurParams dimensions are derived from the allocation config.
-                            unsafe {
-                                #[repr(C)]
-                                struct GdnRecurParams {
-                                    key_dim: u32,
-                                    value_dim: u32,
-                                    num_key_heads: u32,
-                                    num_value_heads: u32,
-                                    hidden_size: u32,
-                                    q_total: u32,
-                                    v_offset: u32,
-                                    scale: f32,
-                                    eps: f32,
-                                }
-                                let num_vh = cfg.linear_num_value_heads();
-                                let q_total = (num_h * key_d) as u32;
-                                let params = GdnRecurParams {
-                                    key_dim: key_d as u32,
-                                    value_dim: val_d as u32,
-                                    num_key_heads: num_h as u32,
-                                    num_value_heads: num_vh as u32,
-                                    hidden_size: hidden as u32,
-                                    q_total,
-                                    v_offset: q_total * 2,
-                                    scale: 1.0 / (key_d as f32).sqrt(),
-                                    eps: cfg.rms_norm_eps,
-                                };
-                                enc.set_compute_pipeline_state(
-                                    &self.engine.pipelines.gdn_recurrence,
-                                );
-                                enc.set_buffer(
-                                    0,
-                                    Some(&self.session.gdn_gpu_s_matrices[linear_idx]),
-                                    0,
-                                );
-                                enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
-                                enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
-                                enc.set_buffer(3, Some(&self.session.activations.hidden), h_off);
-                                enc.set_buffer(4, Some(&*w_b), 0);
-                                enc.set_buffer(5, Some(&*w_a), 0);
-                                enc.set_buffer(6, Some(&*w_alog), 0);
-                                enc.set_buffer(7, Some(&*w_dtb), 0);
-                                enc.set_buffer(8, Some(&*w_norm), 0);
-                                enc.set_buffer(9, Some(&self.session.activations.gdn_z), z_off);
-                                enc.set_bytes(
-                                    10,
-                                    std::mem::size_of::<GdnRecurParams>() as u64,
-                                    &params as *const GdnRecurParams as *const _,
-                                );
-                                enc.dispatch_thread_groups(
-                                    MTLSize::new(num_vh as u64, 1, 1),
-                                    MTLSize::new(32, 4, 1),
-                                );
-                            }
-                        }
-                    }
-
-                    // Batch: out_proj
-                    // SAFETY: The output projection pointer is live for this command
-                    // buffer and GEMM dimensions match [m, out_d] by [hidden, out_d].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gdn_z,
-                            0,
-                            &*w_out,
-                            &self.session.activations.attn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            out_d as u32,
-                        );
-                    }
-
-                    // Batch: fused residual-add + norm for MLP.
-                    // SAFETY: The post-attention norm pointer is live and hidden/m
-                    // match the activation rows in the preallocated buffers.
-                    unsafe {
-                        self.dispatch_fused_residual_add_norm_batch(
-                            enc,
-                            &self.session.activations.residual,
-                            &self.session.activations.attn_out,
-                            &self.session.activations.residual,
-                            &self.session.activations.hidden,
-                            &*w_post_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: MLP (gate + up + silu_mul + down)
-                    // SAFETY: Gate_up/down pointers are live layer-owned buffers; GEMM
-                    // dimensions match [m, hidden] by [inter, hidden].
-                    unsafe {
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            0,
-                            &self.session.activations.gate,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            gate_byte_size,
-                            &self.session.activations.up,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_silu_mul(enc, m * inter as u32);
-                    // SAFETY: Down projection pointer is live and dimensions match
-                    // [m, inter] by [hidden, inter].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gate,
-                            0,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-
-                    // Batch: fused end-of-layer residual add + copy.
-                    self.dispatch_add_and_copy(
+                    self.encode_gdn_prefill_before_recurrence(enc, compact_idx, &cfg, m);
+                    self.encode_gdn_prefill_recurrence(
                         enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
+                        compact_idx,
+                        linear_idx,
+                        &cfg,
+                        n,
+                        chunked_enabled,
                     );
-
+                    self.encode_gdn_prefill_after_recurrence(enc, compact_idx, &cfg, m);
                     linear_idx += 1;
                 } else {
-                    // ========= Full attention layer: batch proj + sequential attention =========
-                    let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
-                        let MetalLayerAttnWeights::Full(full_w) =
-                            &self.engine.layer_weights[compact_idx].0
-                        else {
-                            unreachable!()
-                        };
-                        (
-                            &full_w.q_proj as *const Q4WeightBuf,
-                            &full_w.k_proj as *const Q4WeightBuf,
-                            &full_w.v_proj as *const Q4WeightBuf,
-                            &full_w.o_proj as *const Q4WeightBuf,
-                            &full_w.q_norm as *const Buffer,
-                            &full_w.k_norm as *const Buffer,
-                        )
-                    };
-                    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-                    // Batch: fused copy hidden → residual + norm hidden in-place.
-                    // SAFETY: w_in_norm is a live layer-owned buffer pointer (dropped only when
-                    // the model is destroyed). Activation buffers hidden/residual are sized for
-                    // m * hidden f32 elements. The Metal command buffer enc is active.
-                    unsafe {
-                        self.dispatch_copy_and_rms_norm_batch(
-                            enc,
-                            &self.session.activations.hidden,
-                            &self.session.activations.residual,
-                            &*w_in_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: Q/K/V projections (GEMM)
-                    // SAFETY: Raw attention projection pointers are live layer-owned
-                    // buffers; GEMM dimensions match batch hidden/q/kv layouts.
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_q,
-                            &self.session.activations.q,
-                            0,
-                            m,
-                            (2 * q_dim) as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_k,
-                            &self.session.activations.k,
-                            0,
-                            m,
-                            kv_dim as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_v,
-                            &self.session.activations.v,
-                            0,
-                            m,
-                            kv_dim as u32,
-                            hidden as u32,
-                        );
-                    }
-
-                    // Win 1: batch scatter, norm, RoPE, and KV store — one dispatch each
-                    // instead of n dispatches. Attention loop (Win 2) kept per-token.
-                    {
-                        let base_pos = start_pos as u32;
-                        let num_tok = m;
-                        let nqh = num_q_heads as u32;
-                        let nkh = num_kv_heads as u32;
-                        let hd = head_dim as u32;
-                        let kvd = kv_dim as u32;
-                        // SAFETY: Layer norm weight pointers are live for the command buffer duration.
-                        let (qn_ref, kn_ref): (&Buffer, &Buffer) = unsafe { (&*w_qn, &*w_kn) };
-
-                        self.dispatch_scatter_q_gate_batch(enc, num_tok, nqh, hd);
-                        self.dispatch_per_head_rms_norm_batch(
-                            enc,
-                            &self.session.activations.q_separated,
-                            qn_ref,
-                            num_tok,
-                            nqh,
-                            hd,
-                            cfg.rms_norm_eps,
-                        );
-                        self.dispatch_per_head_rms_norm_batch(
-                            enc,
-                            &self.session.activations.k,
-                            kn_ref,
-                            num_tok,
-                            nkh,
-                            hd,
-                            cfg.rms_norm_eps,
-                        );
-                        self.dispatch_partial_rope_batch(
-                            enc,
-                            &self.session.activations.q_separated,
-                            num_tok,
-                            nqh,
-                            hd,
-                            half_rope_dim,
-                            base_pos,
-                        );
-                        self.dispatch_partial_rope_batch(
-                            enc,
-                            &self.session.activations.k,
-                            num_tok,
-                            nkh,
-                            hd,
-                            half_rope_dim,
-                            base_pos,
-                        );
-                        self.dispatch_copy_kv_cache_batch(
-                            enc,
-                            &self.session.activations.k,
-                            &self.session.activations.v,
-                            &self.session.kv_cache.k_bufs[full_idx],
-                            &self.session.kv_cache.v_bufs[full_idx],
-                            num_tok,
-                            kvd,
-                            base_pos,
-                        );
-                    }
-
-                    // Win 2: batched causal prefill attention — one dispatch for all n tokens.
-                    // Falls back to the per-token loop only if shape validation fails.
-                    if self
-                        .dispatch_prefill_attention_batched(
-                            enc,
-                            &self.session.kv_cache.k_bufs[full_idx],
-                            &self.session.kv_cache.v_bufs[full_idx],
-                            start_pos as u32,
-                            m,
-                            head_dim as u32,
-                            num_q_heads as u32,
-                            num_kv_heads as u32,
-                            q_dim as u32,
-                            kv_dim as u32,
-                            scale,
-                        )
-                        .is_err()
-                    {
-                        for t in 0..n {
-                            let abs_pos = start_pos + t;
-                            let qs_off = (t * q_dim) as u64 * 4;
-                            let ao_off = (t * q_dim) as u64 * 4;
-                            let cache_len = (abs_pos + 1) as u32;
-                            let hd = head_dim as u32;
-                            let nqh = num_q_heads as u32;
-                            let nkh = num_kv_heads as u32;
-                            let qd = q_dim as u32;
-                            let kvd = kv_dim as u32;
-                            // Per-token q/attn_out offsets are within batch activation buffers.
-                            {
-                                if self.use_kv_f16 {
-                                    enc.set_compute_pipeline_state(
-                                        &self.engine.pipelines.decode_attention_f16,
-                                    );
-                                } else {
-                                    enc.set_compute_pipeline_state(
-                                        &self.engine.pipelines.decode_attention,
-                                    );
-                                }
-                                enc.set_buffer(
-                                    0,
-                                    Some(&self.session.activations.q_separated),
-                                    qs_off,
-                                );
-                                enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
-                                enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
-                                enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
-                                enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
-                                enc.set_bytes(5, 4, &hd as *const u32 as *const _);
-                                enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
-                                enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
-                                enc.set_bytes(8, 4, &qd as *const u32 as *const _);
-                                enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
-                                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
-                                // Grid axis = num_kv_heads: see fallback site above for
-                                // the invariant. Same kernel, same geometry requirement.
-                                enc.dispatch_thread_groups(
-                                    MTLSize::new(nkh as u64, 1, 1),
-                                    MTLSize::new(256, 1, 1),
-                                );
-                            }
-                        }
-                    }
-
-                    // Sigmoid gate over all n*q_dim outputs in one dispatch.
-                    self.dispatch_sigmoid_gate(enc, m * q_dim as u32);
-
-                    // Batch: O projection (attn_out[N, q_dim] → ffn_out[N, hidden])
-                    // SAFETY: O-projection pointer is live and dimensions match
-                    // [m, q_dim] by [hidden, q_dim].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.attn_out,
-                            0,
-                            &*w_o,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            q_dim as u32,
-                        );
-                    }
-
-                    // Batch: fused residual-add + norm for MLP.
-                    // SAFETY: The post-attention norm pointer is live and hidden/m
-                    // match the activation rows in the preallocated buffers.
-                    unsafe {
-                        self.dispatch_fused_residual_add_norm_batch(
-                            enc,
-                            &self.session.activations.residual,
-                            &self.session.activations.ffn_out,
-                            &self.session.activations.residual,
-                            &self.session.activations.hidden,
-                            &*w_post_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: MLP
-                    // SAFETY: Gate_up/down pointers are live layer-owned buffers; GEMM
-                    // dimensions match [m, hidden] by [inter, hidden].
-                    unsafe {
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            0,
-                            &self.session.activations.gate,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            gate_byte_size,
-                            &self.session.activations.up,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_silu_mul(enc, m * inter as u32);
-                    // SAFETY: Down projection pointer is live and dimensions match
-                    // [m, inter] by [hidden, inter].
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gate,
-                            0,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-
-                    // Batch: fused end-of-layer residual add + copy.
-                    self.dispatch_add_and_copy(
+                    self.encode_full_attention_prefill_layer(
                         enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
+                        compact_idx,
+                        full_idx,
+                        &cfg,
+                        n,
+                        m,
+                        start_pos,
                     );
-
                     full_idx += 1;
                 }
             }
@@ -8012,33 +8243,12 @@ mod inner {
                 "prefill chunk start_pos={start_pos} + n={n} exceeds max_cache_len {}",
                 self.session.kv_cache.max_cache_len
             );
+            self.assert_batched_prefill_dense_only();
             let cfg = self.engine.config.clone();
             let m = n as u32;
             let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
-            let kv_dim = cfg.full_kv_dim();
-            let q_dim = cfg.full_q_dim();
-            let num_q_heads = cfg.num_attention_heads;
-            let num_kv_heads = cfg.num_key_value_heads;
-            let head_dim = cfg.head_dim;
-            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
 
-            // Batch embedding: f16 -> f32 for all N tokens. Identical to
-            // forward_prefill_batched_chunk; embedding is CPU-side memcpy work, held
-            // fixed across serial/chunked and excluded from both timing buckets below
-            // (it happens before the first command buffer opens).
-            //
-            // SAFETY: embed_tokens is StorageModeShared f16, no GPU in flight; token
-            // ids are validated by the harness bin before this is ever called.
-            unsafe {
-                let src_base = self.engine.embed_tokens.contents() as *const u16;
-                let dst_base = self.session.activations.hidden.contents() as *mut f32;
-                for (t, &id) in token_ids.iter().enumerate() {
-                    let src = src_base.add(id as usize * hidden);
-                    let dst = dst_base.add(t * hidden);
-                    convert_f16_row(src, dst, hidden);
-                }
-            }
+            self.copy_prefill_embeddings(token_ids, hidden);
 
             let mut active_layer_idx = 0usize;
             let mut linear_idx = 0usize;
@@ -8076,104 +8286,8 @@ mod inner {
                     MetalLayerAttnWeights::Linear(_)
                 );
 
-                // Extract weight pointers (avoids borrow conflict with &mut self) --
-                // identical pattern to forward_prefill_batched_chunk.
-                let (_, common_w) = &self.engine.layer_weights[compact_idx];
-                let w_in_norm = &common_w.input_layernorm as *const Buffer;
-                let w_post_norm = &common_w.post_attention_layernorm as *const Buffer;
-                let (w_gate_up, w_down, gate_byte_size) = match &common_w.ffn {
-                    MetalFfnWeights::Dense {
-                        gate_up_proj,
-                        down_proj,
-                    } => {
-                        let byte_size: u64 = match self.engine.quant_format {
-                            QuantFormat::Q8_0 => {
-                                (inter * (hidden / QK8_0) * Q8_0_BLOCK_SIZE) as u64
-                            }
-                            QuantFormat::Q4_0 => {
-                                (inter * (hidden / QK4_0) * Q4_0_BLOCK_SIZE) as u64
-                            }
-                        };
-                        (
-                            gate_up_proj as *const Q4WeightBuf,
-                            down_proj as *const Q4WeightBuf,
-                            byte_size,
-                        )
-                    }
-                    MetalFfnWeights::Moe(_) => {
-                        panic!(
-                            "forward_prefill_chunk_gdn_isolated: MoE layers are not \
-                             supported in batch prefill (M>1); the #175 harness is \
-                             0.8B-only (dense), this branch is unreachable there."
-                        );
-                    }
-                };
-
                 if is_linear {
-                    // ========= GDN layer: batch projections + isolated recurrence =========
-                    let (w_qkv, w_z, w_b, w_a, w_alog, w_dtb, w_conv, w_norm, w_out) = {
-                        let MetalLayerAttnWeights::Linear(gdn_w) =
-                            &self.engine.layer_weights[compact_idx].0
-                        else {
-                            unreachable!()
-                        };
-                        (
-                            &gdn_w.in_proj_qkv as *const Q4WeightBuf,
-                            &gdn_w.in_proj_z as *const Q4WeightBuf,
-                            &gdn_w.in_proj_b as *const Buffer,
-                            &gdn_w.in_proj_a as *const Buffer,
-                            &gdn_w.a_log as *const Buffer,
-                            &gdn_w.dt_bias as *const Buffer,
-                            &gdn_w.conv1d_weight as *const Buffer,
-                            &gdn_w.norm_weight as *const Buffer,
-                            &gdn_w.out_proj as *const Q4WeightBuf,
-                        )
-                    };
-                    let qkv_d = cfg.linear_qkv_dim();
-                    let out_d = cfg.linear_output_dim();
-                    let num_h = cfg.linear_num_key_heads;
-                    let key_d = cfg.linear_key_head_dim;
-                    let val_d = cfg.linear_value_head_dim;
-                    let ks = cfg.linear_conv_kernel_dim as u32;
-
-                    // Batch: fused copy hidden -> residual + norm hidden in-place.
-                    unsafe {
-                        self.dispatch_copy_and_rms_norm_batch(
-                            enc,
-                            &self.session.activations.hidden,
-                            &self.session.activations.residual,
-                            &*w_in_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: QKV + Z projections (GEMM) -- non-GDN, stays in this segment.
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_qkv,
-                            &self.session.activations.gdn_qkv,
-                            0,
-                            m,
-                            qkv_d as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_z,
-                            &self.session.activations.gdn_z,
-                            0,
-                            m,
-                            out_d as u32,
-                            hidden as u32,
-                        );
-                    }
+                    self.encode_gdn_prefill_before_recurrence(enc, compact_idx, &cfg, m);
 
                     // ---- GDN isolation boundary: close the pre-GDN (non-GDN) segment ----
                     enc.end_encoding();
@@ -8185,118 +8299,14 @@ mod inner {
                     let gdn_enc = gdn_cmd.new_compute_command_encoder();
                     let gdn_start = std::time::Instant::now();
 
-                    // GDN recurrence: chunked-parallel path or serial per-token --
-                    // dispatch calls/args are byte-identical to
-                    // forward_prefill_batched_chunk, only the target encoder differs.
-                    let chunk_params = if chunked_enabled {
-                        Self::make_gdn_chunk_params(&cfg, n)
-                    } else {
-                        None
-                    };
-                    if let Some(params) = chunk_params {
-                        let weights = unsafe {
-                            GdnChunkedWeights {
-                                conv1d_weight: &*w_conv,
-                                in_proj_b: &*w_b,
-                                in_proj_a: &*w_a,
-                                a_log: &*w_alog,
-                                dt_bias: &*w_dtb,
-                                norm_weight: &*w_norm,
-                            }
-                        };
-                        self.dispatch_gdn_chunked_prefill_layer(
-                            gdn_enc, linear_idx, weights, params,
-                        );
-                    } else {
-                        for t in 0..n {
-                            let qkv_off = (t * qkv_d) as u64 * 4;
-                            let z_off = (t * out_d) as u64 * 4;
-                            let h_off = (t * hidden) as u64 * 4;
-
-                            unsafe {
-                                gdn_enc
-                                    .set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                                gdn_enc.set_buffer(
-                                    0,
-                                    Some(&self.session.gdn_gpu_conv_bufs[linear_idx]),
-                                    0,
-                                );
-                                gdn_enc.set_buffer(
-                                    1,
-                                    Some(&self.session.activations.gdn_qkv),
-                                    qkv_off,
-                                );
-                                gdn_enc.set_buffer(2, Some(&*w_conv), 0);
-                                gdn_enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
-                                let qd = qkv_d as u32;
-                                gdn_enc.set_bytes(4, 4, &qd as *const u32 as *const _);
-                                gdn_enc.set_bytes(5, 4, &ks as *const u32 as *const _);
-                                let wg = 256u64;
-                                gdn_enc.dispatch_threads(
-                                    MTLSize::new(div_ceil(qkv_d as u64, wg) * wg, 1, 1),
-                                    MTLSize::new(wg, 1, 1),
-                                );
-                            }
-
-                            unsafe {
-                                #[repr(C)]
-                                struct GdnRecurParams {
-                                    key_dim: u32,
-                                    value_dim: u32,
-                                    num_key_heads: u32,
-                                    num_value_heads: u32,
-                                    hidden_size: u32,
-                                    q_total: u32,
-                                    v_offset: u32,
-                                    scale: f32,
-                                    eps: f32,
-                                }
-                                let num_vh = cfg.linear_num_value_heads();
-                                let q_total = (num_h * key_d) as u32;
-                                let params = GdnRecurParams {
-                                    key_dim: key_d as u32,
-                                    value_dim: val_d as u32,
-                                    num_key_heads: num_h as u32,
-                                    num_value_heads: num_vh as u32,
-                                    hidden_size: hidden as u32,
-                                    q_total,
-                                    v_offset: q_total * 2,
-                                    scale: 1.0 / (key_d as f32).sqrt(),
-                                    eps: cfg.rms_norm_eps,
-                                };
-                                gdn_enc.set_compute_pipeline_state(
-                                    &self.engine.pipelines.gdn_recurrence,
-                                );
-                                gdn_enc.set_buffer(
-                                    0,
-                                    Some(&self.session.gdn_gpu_s_matrices[linear_idx]),
-                                    0,
-                                );
-                                gdn_enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
-                                gdn_enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
-                                gdn_enc.set_buffer(
-                                    3,
-                                    Some(&self.session.activations.hidden),
-                                    h_off,
-                                );
-                                gdn_enc.set_buffer(4, Some(&*w_b), 0);
-                                gdn_enc.set_buffer(5, Some(&*w_a), 0);
-                                gdn_enc.set_buffer(6, Some(&*w_alog), 0);
-                                gdn_enc.set_buffer(7, Some(&*w_dtb), 0);
-                                gdn_enc.set_buffer(8, Some(&*w_norm), 0);
-                                gdn_enc.set_buffer(9, Some(&self.session.activations.gdn_z), z_off);
-                                gdn_enc.set_bytes(
-                                    10,
-                                    std::mem::size_of::<GdnRecurParams>() as u64,
-                                    &params as *const GdnRecurParams as *const _,
-                                );
-                                gdn_enc.dispatch_thread_groups(
-                                    MTLSize::new(num_vh as u64, 1, 1),
-                                    MTLSize::new(32, 4, 1),
-                                );
-                            }
-                        }
-                    }
+                    self.encode_gdn_prefill_recurrence(
+                        gdn_enc,
+                        compact_idx,
+                        linear_idx,
+                        &cfg,
+                        n,
+                        chunked_enabled,
+                    );
 
                     gdn_enc.end_encoding();
                     gdn_cmd.commit();
@@ -8325,354 +8335,18 @@ mod inner {
                     enc = cmd.new_compute_command_encoder();
                     seg_start = std::time::Instant::now();
 
-                    // Batch: out_proj -- non-GDN, in the fresh post-GDN segment.
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gdn_z,
-                            0,
-                            &*w_out,
-                            &self.session.activations.attn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            out_d as u32,
-                        );
-                    }
-
-                    // Batch: fused residual-add + norm for MLP.
-                    unsafe {
-                        self.dispatch_fused_residual_add_norm_batch(
-                            enc,
-                            &self.session.activations.residual,
-                            &self.session.activations.attn_out,
-                            &self.session.activations.residual,
-                            &self.session.activations.hidden,
-                            &*w_post_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    // Batch: MLP (gate + up + silu_mul + down)
-                    unsafe {
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            0,
-                            &self.session.activations.gate,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            gate_byte_size,
-                            &self.session.activations.up,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_silu_mul(enc, m * inter as u32);
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gate,
-                            0,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-
-                    // Batch: fused end-of-layer residual add + copy.
-                    self.dispatch_add_and_copy(
-                        enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
-                    );
-
+                    self.encode_gdn_prefill_after_recurrence(enc, compact_idx, &cfg, m);
                     linear_idx += 1;
                 } else {
-                    // ========= Full attention layer: byte-identical to
-                    // forward_prefill_batched_chunk's else-branch. No GDN work here,
-                    // so it just dispatches into whichever segment is currently open
-                    // (never split). =========
-                    let (w_q, w_k, w_v, w_o, w_qn, w_kn) = {
-                        let MetalLayerAttnWeights::Full(full_w) =
-                            &self.engine.layer_weights[compact_idx].0
-                        else {
-                            unreachable!()
-                        };
-                        (
-                            &full_w.q_proj as *const Q4WeightBuf,
-                            &full_w.k_proj as *const Q4WeightBuf,
-                            &full_w.v_proj as *const Q4WeightBuf,
-                            &full_w.o_proj as *const Q4WeightBuf,
-                            &full_w.q_norm as *const Buffer,
-                            &full_w.k_norm as *const Buffer,
-                        )
-                    };
-                    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-                    unsafe {
-                        self.dispatch_copy_and_rms_norm_batch(
-                            enc,
-                            &self.session.activations.hidden,
-                            &self.session.activations.residual,
-                            &*w_in_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_q,
-                            &self.session.activations.q,
-                            0,
-                            m,
-                            (2 * q_dim) as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_k,
-                            &self.session.activations.k,
-                            0,
-                            m,
-                            kv_dim as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_v,
-                            &self.session.activations.v,
-                            0,
-                            m,
-                            kv_dim as u32,
-                            hidden as u32,
-                        );
-                    }
-
-                    {
-                        let base_pos = start_pos as u32;
-                        let num_tok = m;
-                        let nqh = num_q_heads as u32;
-                        let nkh = num_kv_heads as u32;
-                        let hd = head_dim as u32;
-                        let kvd = kv_dim as u32;
-                        let (qn_ref, kn_ref): (&Buffer, &Buffer) = unsafe { (&*w_qn, &*w_kn) };
-
-                        self.dispatch_scatter_q_gate_batch(enc, num_tok, nqh, hd);
-                        self.dispatch_per_head_rms_norm_batch(
-                            enc,
-                            &self.session.activations.q_separated,
-                            qn_ref,
-                            num_tok,
-                            nqh,
-                            hd,
-                            cfg.rms_norm_eps,
-                        );
-                        self.dispatch_per_head_rms_norm_batch(
-                            enc,
-                            &self.session.activations.k,
-                            kn_ref,
-                            num_tok,
-                            nkh,
-                            hd,
-                            cfg.rms_norm_eps,
-                        );
-                        self.dispatch_partial_rope_batch(
-                            enc,
-                            &self.session.activations.q_separated,
-                            num_tok,
-                            nqh,
-                            hd,
-                            half_rope_dim,
-                            base_pos,
-                        );
-                        self.dispatch_partial_rope_batch(
-                            enc,
-                            &self.session.activations.k,
-                            num_tok,
-                            nkh,
-                            hd,
-                            half_rope_dim,
-                            base_pos,
-                        );
-                        self.dispatch_copy_kv_cache_batch(
-                            enc,
-                            &self.session.activations.k,
-                            &self.session.activations.v,
-                            &self.session.kv_cache.k_bufs[full_idx],
-                            &self.session.kv_cache.v_bufs[full_idx],
-                            num_tok,
-                            kvd,
-                            base_pos,
-                        );
-                    }
-
-                    if self
-                        .dispatch_prefill_attention_batched(
-                            enc,
-                            &self.session.kv_cache.k_bufs[full_idx],
-                            &self.session.kv_cache.v_bufs[full_idx],
-                            start_pos as u32,
-                            m,
-                            head_dim as u32,
-                            num_q_heads as u32,
-                            num_kv_heads as u32,
-                            q_dim as u32,
-                            kv_dim as u32,
-                            scale,
-                        )
-                        .is_err()
-                    {
-                        for t in 0..n {
-                            let abs_pos = start_pos + t;
-                            let qs_off = (t * q_dim) as u64 * 4;
-                            let ao_off = (t * q_dim) as u64 * 4;
-                            let cache_len = (abs_pos + 1) as u32;
-                            let hd = head_dim as u32;
-                            let nqh = num_q_heads as u32;
-                            let nkh = num_kv_heads as u32;
-                            let qd = q_dim as u32;
-                            let kvd = kv_dim as u32;
-                            {
-                                if self.use_kv_f16 {
-                                    enc.set_compute_pipeline_state(
-                                        &self.engine.pipelines.decode_attention_f16,
-                                    );
-                                } else {
-                                    enc.set_compute_pipeline_state(
-                                        &self.engine.pipelines.decode_attention,
-                                    );
-                                }
-                                enc.set_buffer(
-                                    0,
-                                    Some(&self.session.activations.q_separated),
-                                    qs_off,
-                                );
-                                enc.set_buffer(1, Some(&self.session.kv_cache.k_bufs[full_idx]), 0);
-                                enc.set_buffer(2, Some(&self.session.kv_cache.v_bufs[full_idx]), 0);
-                                enc.set_buffer(3, Some(&self.session.activations.attn_out), ao_off);
-                                enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
-                                enc.set_bytes(5, 4, &hd as *const u32 as *const _);
-                                enc.set_bytes(6, 4, &nqh as *const u32 as *const _);
-                                enc.set_bytes(7, 4, &nkh as *const u32 as *const _);
-                                enc.set_bytes(8, 4, &qd as *const u32 as *const _);
-                                enc.set_bytes(9, 4, &kvd as *const u32 as *const _);
-                                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
-                                enc.dispatch_thread_groups(
-                                    MTLSize::new(nkh as u64, 1, 1),
-                                    MTLSize::new(256, 1, 1),
-                                );
-                            }
-                        }
-                    }
-
-                    self.dispatch_sigmoid_gate(enc, m * q_dim as u32);
-
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.attn_out,
-                            0,
-                            &*w_o,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            q_dim as u32,
-                        );
-                    }
-
-                    unsafe {
-                        self.dispatch_fused_residual_add_norm_batch(
-                            enc,
-                            &self.session.activations.residual,
-                            &self.session.activations.ffn_out,
-                            &self.session.activations.residual,
-                            &self.session.activations.hidden,
-                            &*w_post_norm,
-                            hidden as u32,
-                            m,
-                            cfg.rms_norm_eps,
-                        );
-                    }
-
-                    unsafe {
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            0,
-                            &self.session.activations.gate,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                        self.dispatch_gemm_at(
-                            enc,
-                            &self.session.activations.hidden,
-                            0,
-                            &*w_gate_up,
-                            gate_byte_size,
-                            &self.session.activations.up,
-                            0,
-                            m,
-                            inter as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_silu_mul(enc, m * inter as u32);
-                    unsafe {
-                        self.dispatch_gemm(
-                            enc,
-                            &self.session.activations.gate,
-                            0,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            0,
-                            m,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-
-                    self.dispatch_add_and_copy(
+                    self.encode_full_attention_prefill_layer(
                         enc,
-                        &self.session.activations.ffn_out,
-                        &self.session.activations.residual,
-                        &self.session.activations.hidden,
-                        m * hidden as u32,
+                        compact_idx,
+                        full_idx,
+                        &cfg,
+                        n,
+                        m,
+                        start_pos,
                     );
-
                     full_idx += 1;
                 }
             }
@@ -9121,7 +8795,14 @@ mod inner {
                 }
                 if self.session.gdn_checkpoints.is_none() {
                     // Checkpoint pool not allocated — fall through to single-token decode.
-                    let logits = self.forward_step_inner(pending_token, pos, false).logits;
+                    let logits = self
+                        .forward_step_inner(
+                            pending_token,
+                            pos,
+                            false,
+                            crate::forward::signpost::Scope::Decode,
+                        )
+                        .logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
                     // Stop-token contract (#613): `next` is never appended when it is
@@ -9150,7 +8831,14 @@ mod inner {
                     .checkpoint_gdn_to_slot(0, GdnStateTrafficScope::Decode)
                     .is_err()
                 {
-                    let logits = self.forward_step_inner(pending_token, pos, false).logits;
+                    let logits = self
+                        .forward_step_inner(
+                            pending_token,
+                            pos,
+                            false,
+                            crate::forward::signpost::Scope::Decode,
+                        )
+                        .logits;
                     let next = argmax_logits(&logits);
                     generated_ids.push(pending_token);
                     // Stop-token contract (#613): `next` is never appended when it is
@@ -9481,11 +9169,24 @@ mod inner {
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: prompt_len,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: Some(StopReason::Grammar),
+                            token_logprobs: vec![],
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -9626,7 +9327,27 @@ mod inner {
             // Autoregressive decode
             let mut stopped = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (max_new_tokens == 1) cannot
+            // fall through to Length (#1064 follow-up).
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
             for _ in 1..gen_cfg.max_new_tokens {
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -9639,11 +9360,14 @@ mod inner {
                 let next_id = if greedy_fast {
                     self.forward_step_greedy_argmax(last_token, pos)
                 } else {
-                    let mut step_logits = self.forward_step(last_token, pos);
+                    let mut step_logits = self.forward_step_decode(last_token, pos);
 
                     // Apply grammar masking before sampling (ADR-046).
                     if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                        engine.mask_logits(gs, &mut step_logits);
+                        let _signpost_grammar = crate::forward::signpost::interval(
+                            crate::forward::signpost::Label::DecodeGrammarMask,
+                        );
+                        engine.mask_logits(gs, &mut step_logits)?;
                         // Fail closed if the grammar blocked every continuation,
                         // matching the CPU contract (#611).
                         if !super::has_finite_logit(&step_logits) {
@@ -9655,16 +9379,13 @@ mod inner {
                         }
                     }
 
-                    if use_compact {
-                        sample_from_candidates(
-                            &self.session.compact_result,
-                            gen_cfg,
-                            &all_ids,
-                            &mut rng_state,
-                        )
-                    } else {
-                        sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
-                    }
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
+                        gen_cfg,
+                        &all_ids,
+                        &mut rng_state,
+                    )
                 };
 
                 // Advance grammar state after sampling.
@@ -9691,6 +9412,19 @@ mod inner {
                         stop_reason = StopReason::Eos;
                         break;
                     }
+                }
+
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
                 }
 
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
@@ -9998,9 +9732,10 @@ mod inner {
                     stop_reason = StopReason::Eos;
                     break;
                 }
-                let step_logits = self.forward_step(last_token, pos);
+                let step_logits = self.forward_step_decode(last_token, pos);
                 pos += 1;
-                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
+                let next_id =
+                    sample_decode_traced(None, &step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
                     stop_reason = StopReason::Eos;
@@ -10302,11 +10037,21 @@ mod inner {
                         )));
                     }
                     visual_row += 1;
-                    last_logits =
-                        self.forward_step_injected_mrope_with_head(row, pos, cos_sin, emit_head);
+                    last_logits = self.forward_step_injected_mrope_with_head(
+                        row,
+                        pos,
+                        cos_sin,
+                        emit_head,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 } else {
-                    last_logits =
-                        self.forward_step_mrope_with_head(token_id, pos, cos_sin, emit_head);
+                    last_logits = self.forward_step_mrope_with_head(
+                        token_id,
+                        pos,
+                        cos_sin,
+                        emit_head,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
             }
 
@@ -10394,11 +10139,17 @@ mod inner {
                     None
                 };
 
-                let step_logits = self.forward_step_mrope(last_token, physical_pos, mrope_cos_sin);
+                let step_logits = self.forward_step_mrope(
+                    last_token,
+                    physical_pos,
+                    mrope_cos_sin,
+                    crate::forward::signpost::Scope::Decode,
+                );
                 if let Some(probe) = decode_logits_probe.as_deref_mut() {
                     probe.push(step_logits.clone());
                 }
-                let next_id = sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state);
+                let next_id =
+                    sample_decode_traced(None, &step_logits, gen_cfg, &all_ids, &mut rng_state);
                 if is_stop(next_id) {
                     stopped = true;
                     stop_reason = StopReason::Eos;
@@ -12613,7 +12364,7 @@ mod inner {
         /// # Panics
         /// Panics if `k` is zero or not a multiple of 32 (a caller
         /// programming error, not a runtime/capability condition).
-        #[allow(dead_code)] // wired to real MLP dispatch is deferred past Stage 2 — see w3_stage2_report.md
+        #[allow(dead_code)] // wiring to real MLP dispatch is deferred past Stage 2
         fn dispatch_gemm_q3(
             &self,
             enc: &ComputeCommandEncoderRef,
@@ -13977,6 +13728,13 @@ mod inner {
                     "forward_prefill_layer_traces_last_token: empty token sequence".to_string(),
                 ));
             }
+            // `reset_state` below zeroes `kv_cache.seq_len`, so this call's own
+            // `forward_step_inner` loop drives `position` from 0..token_ids.len() — a
+            // caller-supplied length reaching this public entry point via
+            // `score_layer_importance`'s `calibration_prompts`. Validate against the
+            // session's RoPE/KV capacity before any pass dispatches, same as
+            // `check_forward_step_capacity` does for `forward_step`.
+            self.check_forward_range_capacity(0, token_ids.len(), false)?;
             let orig_cfg = self.engine.config.clone();
             let hidden = orig_cfg.hidden_size;
             let n = token_ids.len();
@@ -14017,7 +13775,12 @@ mod inner {
                 // Process all tokens; capture pre-final hidden for the last one.
                 for (pos, &id) in token_ids.iter().enumerate() {
                     let is_last = pos == n - 1;
-                    let _ = self.forward_step_inner(id, pos, is_last);
+                    let _ = self.forward_step_inner(
+                        id,
+                        pos,
+                        is_last,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
 
                 // last_pre_final_hidden = post-last-active-layer hidden for the last token.
@@ -14200,6 +13963,34 @@ mod inner {
         rng_state: &mut u64,
     ) -> u32 {
         crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
+    }
+
+    /// Signpost-traced sampling shared by every autoregressive decode loop's
+    /// per-step token pick: opens the `decode.sample` interval, then routes
+    /// to the compact-candidate or full-logits sampler.
+    ///
+    /// Centralizes what was five independent copy-pasted call sites: two of
+    /// the five -- the multimodal decode loops --
+    /// had already drifted to call `sample_token` directly, with neither the
+    /// interval nor the compact-route policy the other three loops apply).
+    /// `compact` is `Some(candidates)` for the GPU-top-k route (mirrors the
+    /// `use_compact` branch every call site used to inline) and `None` for
+    /// callers with no compact route, which is the multimodal decode loops'
+    /// only case -- they gain `decode.sample` instrumentation as a side
+    /// effect of routing through here instead of `sample_token` directly.
+    fn sample_decode_traced(
+        compact: Option<&[crate::sampling::Candidate]>,
+        step_logits: &[f32],
+        cfg: &GenerateConfig,
+        previous_ids: &[u32],
+        rng_state: &mut u64,
+    ) -> u32 {
+        let _signpost_sample =
+            crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample);
+        match compact {
+            Some(candidates) => sample_from_candidates(candidates, cfg, previous_ids, rng_state),
+            None => sample_token(step_logits, cfg, previous_ids, rng_state),
+        }
     }
 
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
@@ -14485,11 +14276,24 @@ mod inner {
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(GenerateOutput {
+                            text: String::new(),
+                            token_ids: vec![],
+                            prompt_tokens: prompt_len,
+                            generated_tokens: 0,
+                            stopped: true,
+                            stop_reason: Some(StopReason::Grammar),
+                            token_logprobs: vec![],
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -14630,11 +14434,32 @@ mod inner {
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (effective cap 1: unbudgeted or
+            // zero-budget max_new_tokens == 1) cannot fall through to Length
+            // (#1064 follow-up).
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
 
             // Autoregressive decode with streaming.
             // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
             let cap = policy.cap();
             for _ in 1..cap {
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
+                    break;
+                }
                 // Checked before any per-step GPU work, independent of whether this
                 // iteration's delta ends up non-empty -- closes the gap where a run
                 // of tokens decoding to an incomplete UTF-8 tail (a multi-token
@@ -14653,11 +14478,14 @@ mod inner {
                 let last_token = *all_ids
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
-                let mut step_logits = self.forward_step(last_token, pos);
+                let mut step_logits = self.forward_step_decode(last_token, pos);
 
                 // Apply grammar masking before sampling (ADR-046).
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut step_logits);
+                    let _signpost_grammar = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeGrammarMask,
+                    );
+                    engine.mask_logits(gs, &mut step_logits)?;
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
                     if !super::has_finite_logit(&step_logits) {
@@ -14669,15 +14497,14 @@ mod inner {
                     }
                 }
 
-                let sampled_id = if use_compact {
-                    sample_from_candidates(
-                        &self.session.compact_result,
+                let sampled_id = {
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
                         gen_cfg,
                         &all_ids,
                         &mut rng_state,
                     )
-                } else {
-                    sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
                 // One atomic per-step transition (ADR-080 C3, PR #787) --
@@ -14743,6 +14570,18 @@ mod inner {
                     } => (token_id, answer_budget_exhausted),
                 };
                 last_pushed_id = next_id;
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -14860,9 +14699,12 @@ mod inner {
         /// Load raw Q4 block bytes from a `.q4` file (strips the file header).
         ///
         /// Returns the `Q4Block` bytes and the `original_len` (for validation).
-        fn load_q4_raw_bytes(path: &std::path::Path) -> Result<(Vec<u8>, usize), String> {
-            use crate::weights::q4_weights::load_q4_file;
-            let tensor = load_q4_file(path)
+        fn load_q4_raw_bytes(
+            path: &std::path::Path,
+            expected_shape: &[usize],
+        ) -> Result<(Vec<u8>, usize), String> {
+            use crate::weights::q4_weights::load_q4_file_checked;
+            let tensor = load_q4_file_checked(path, expected_shape)
                 .map_err(|e| format!("failed to load Q4 file {}: {e}", path.display()))?;
             let n_blocks = tensor.blocks.len();
             // Re-serialise the blocks into raw bytes (20 bytes each, Q4Block is
@@ -14914,32 +14756,19 @@ mod inner {
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
             use crate::weights::q4_weights::{
-                q4_f16_to_f32, q4_f32_to_f16, read_q4_header, validate_q4_header_payload_bounds,
+                Q4BlockCheck, open_and_mmap_q4_file, q4_f16_to_f32, q4_f32_to_f16,
+                validate_q4_block_metadata,
             };
-            let file = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            let header = read_q4_header(&file)
-                .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-            if header.shape != expected_shape {
-                return Err(format!(
-                    "{}: MoE tensor has shape {:?}, expected {expected_shape:?} — refusing to \
-                     load (a mismatched/transposed weight file has the same element count but \
-                     a different layout, which would silently corrupt or overrun the GPU MoE \
-                     dispatch instead of failing to load)",
-                    path.display(),
-                    header.shape
-                ));
-            }
-            let file_len = file
-                .metadata()
-                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-                .len();
-            validate_q4_header_payload_bounds(&header, file_len, path)
-                .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-            // SAFETY: read-only mmap of a file this process does not mutate
-            // while running (same invariant as `mmap_q4_weight`).
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            // Per-block scale/bias is validated inside the dequant loop below,
+            // which already reads every block, instead of by a separate pass
+            // over the same bytes.
+            let (header, mmap, _) = open_and_mmap_q4_file(
+                path,
+                Some(expected_shape),
+                Q4BlockCheck::InCallerTraversal {
+                    traversal: "load_q4_mmap_dequant_f16 dequant loop",
+                },
+            )?;
             let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
                 format!(
                     "{}: payload_offset {} beyond mapped length {}",
@@ -14948,10 +14777,19 @@ mod inner {
                     mmap.len()
                 )
             })?;
+            let source = path.display().to_string();
+            let tensor_name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("native Q4 tensor");
             let mut f16_data: Vec<u16> = Vec::with_capacity(header.original_len);
-            for chunk in payload.chunks_exact(20) {
-                let scale = q4_f16_to_f32(u16::from_ne_bytes([chunk[0], chunk[1]]));
-                let bias = q4_f16_to_f32(u16::from_ne_bytes([chunk[2], chunk[3]]));
+            for (index, chunk) in payload.chunks_exact(20).enumerate() {
+                let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                let bias_bits = u16::from_ne_bytes([chunk[2], chunk[3]]);
+                validate_q4_block_metadata(&source, tensor_name, index, scale_bits, bias_bits)
+                    .map_err(|e| e.to_string())?;
+                let scale = q4_f16_to_f32(scale_bits);
+                let bias = q4_f16_to_f32(bias_bits);
                 for b in 0..16 {
                     let byte_val = chunk[4 + b];
                     f16_data.push(q4_f32_to_f16((byte_val & 0x0f) as f32 * scale + bias));
@@ -14986,32 +14824,16 @@ mod inner {
             expected_shape: &[usize],
         ) -> Result<Buffer, String> {
             use crate::weights::q4_weights::{
-                dequantize_row_q4_0, read_q4_header, validate_q4_header_payload_bounds,
+                Q4BlockCheck, dequantize_row_q4_0, open_and_mmap_q4_file,
+                validate_q4_block_metadata,
             };
-            let file = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-            let header = read_q4_header(&file)
-                .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-            if header.shape != expected_shape {
-                return Err(format!(
-                    "{}: MoE tensor has shape {:?}, expected {expected_shape:?} - refusing to \
-                     load (a mismatched/transposed weight file has the same element count but \
-                     a different layout, which would silently corrupt or overrun the GPU MoE \
-                     dispatch instead of failing to load)",
-                    path.display(),
-                    header.shape
-                ));
-            }
-            let file_len = file
-                .metadata()
-                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-                .len();
-            validate_q4_header_payload_bounds(&header, file_len, path)
-                .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
-            // SAFETY: read-only mmap of a file this process does not mutate
-            // while running (same invariant as `mmap_q4_weight`).
-            let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-                .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+            let (header, mmap, _) = open_and_mmap_q4_file(
+                path,
+                Some(expected_shape),
+                Q4BlockCheck::InCallerTraversal {
+                    traversal: "load_q4_mmap_dequant_f32 scale/bias loop",
+                },
+            )?;
             let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
                 format!(
                     "{}: payload_offset {} beyond mapped length {}",
@@ -15020,6 +14842,22 @@ mod inner {
                     mmap.len()
                 )
             })?;
+            // Only the two small CPU-read MoE scalar gates route through this
+            // f32 path (router gate, shared-expert gate — see doc comment
+            // above); `dequantize_row_q4_0` is shared with non-ingress call
+            // sites and cannot itself validate, so scale/bias metadata is
+            // checked here against the same already-mapped bytes it dequantizes.
+            let source = path.display().to_string();
+            let tensor_name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or("native Q4 tensor");
+            for (index, chunk) in payload.chunks_exact(20).enumerate() {
+                let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                let bias_bits = u16::from_ne_bytes([chunk[2], chunk[3]]);
+                validate_q4_block_metadata(&source, tensor_name, index, scale_bits, bias_bits)
+                    .map_err(|e| e.to_string())?;
+            }
             let values = dequantize_row_q4_0(payload, header.original_len);
             Ok(make_buffer(device, &values, label))
         }
@@ -15375,8 +15213,6 @@ mod inner {
             cfg: &Qwen35Config,
             max_cache_len: usize,
         ) -> Result<Self, String> {
-            use crate::weights::q4_weights::{load_f16_tensor_file, load_q4_file};
-
             let device =
                 Device::system_default().ok_or_else(|| "No Metal device found".to_string())?;
 
@@ -15629,6 +15465,7 @@ mod inner {
             let kv_dim = cfg.full_kv_dim();
             let qkv_dim = cfg.linear_qkv_dim();
             let output_dim = cfg.linear_output_dim();
+            let value_heads = cfg.linear_num_value_heads();
             let inter = cfg.intermediate_size;
 
             // ----------------------------------------------------------------
@@ -15643,20 +15480,24 @@ mod inner {
             // Helper: mmap a Q4 file and create a Metal no-copy buffer.
             // Zero CPU copies — GPU pages fault lazily from mmap'd file.
             // ----------------------------------------------------------------
-            let load_q4_buf = |name: &str, label: &str| -> Result<Q4WeightBuf, String> {
+            let load_q4_buf = |name: &str,
+                               label: &str,
+                               expected_shape: &[usize]|
+             -> Result<Q4WeightBuf, String> {
                 let t = std::time::Instant::now();
                 let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                let result = mmap_q4_weight(&device, &path, label);
+                let result = mmap_q4_weight(&device, &path, label, expected_shape);
                 dur_c_cell.set(dur_c_cell.get() + t.elapsed());
                 result
             };
-            let load_q4_raw_timed = |name: &str| -> Result<(Vec<u8>, usize), String> {
-                let t = std::time::Instant::now();
-                let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                let result = Self::load_q4_raw_bytes(&path);
-                dur_c_cell.set(dur_c_cell.get() + t.elapsed());
-                result
-            };
+            let load_q4_raw_timed =
+                |name: &str, expected_shape: &[usize]| -> Result<(Vec<u8>, usize), String> {
+                    let t = std::time::Instant::now();
+                    let path = Self::q4_tensor_path(q4_dir, name, "q4");
+                    let result = Self::load_q4_raw_bytes(&path, expected_shape);
+                    dur_c_cell.set(dur_c_cell.get() + t.elapsed());
+                    result
+                };
             let make_fused_q4_buf = |gate_raw: &[u8], up_raw: &[u8], label: &str| -> Q4WeightBuf {
                 let combined_size = gate_raw.len() + up_raw.len();
                 let buf =
@@ -15677,11 +15518,15 @@ mod inner {
             // ----------------------------------------------------------------
             // Helper: load an F16 file, convert to f32, create a Metal f32 buffer.
             // ----------------------------------------------------------------
-            let load_f16_buf_f32 = |name: &str, label: &str| -> Result<Buffer, String> {
+            let load_f16_buf_f32 = |name: &str,
+                                    label: &str,
+                                    expected_shape: &[usize]|
+             -> Result<Buffer, String> {
                 let t = std::time::Instant::now();
                 let path = Self::q4_tensor_path(q4_dir, name, "f16");
-                let (values, _shape) = load_f16_tensor_file(&path)
-                    .map_err(|e| format!("failed to load f16 file {}: {e}", path.display()))?;
+                let (values, _shape) =
+                    crate::weights::q4_weights::load_f16_tensor_file_checked(&path, expected_shape)
+                        .map_err(|e| format!("failed to load f16 file {}: {e}", path.display()))?;
                 let buf = make_buffer(&device, &values, label);
                 dur_b_cell.set(dur_b_cell.get() + t.elapsed());
                 Ok(buf)
@@ -15771,10 +15616,12 @@ mod inner {
                     input_layernorm: load_f16_buf_f32(
                         &format!("{prefix}.input_layernorm.weight"),
                         &format!("L{i}.in_norm"),
+                        &[hidden],
                     )?,
                     post_attention_layernorm: load_f16_buf_f32(
                         &format!("{prefix}.post_attention_layernorm.weight"),
                         &format!("L{i}.post_norm"),
+                        &[hidden],
                     )?,
                     ffn: if cfg.is_moe() {
                         // MoE checkpoint: routed + shared expert tensors live under
@@ -15785,13 +15632,14 @@ mod inner {
                         // `mlp.{gate,up,down}_proj.weight` files do not exist for this layer.
                         Self::load_moe_ffn_q4(&device, q4_dir, cfg, &prefix, i)?
                     } else {
-                        let (gate_raw, gate_len) =
-                            load_q4_raw_timed(&format!("{prefix}.mlp.gate_proj.weight"))?;
-                        let (up_raw, up_len) =
-                            load_q4_raw_timed(&format!("{prefix}.mlp.up_proj.weight"))?;
-                        debug_assert_eq!(gate_len, cfg.intermediate_size * cfg.hidden_size);
-                        debug_assert_eq!(up_len, cfg.intermediate_size * cfg.hidden_size);
-                        debug_assert_eq!(up_raw.len(), gate_raw.len());
+                        let (gate_raw, _) = load_q4_raw_timed(
+                            &format!("{prefix}.mlp.gate_proj.weight"),
+                            &[inter, hidden],
+                        )?;
+                        let (up_raw, _) = load_q4_raw_timed(
+                            &format!("{prefix}.mlp.up_proj.weight"),
+                            &[inter, hidden],
+                        )?;
                         MetalFfnWeights::Dense {
                             gate_up_proj: make_fused_q4_buf(
                                 &gate_raw,
@@ -15801,6 +15649,7 @@ mod inner {
                             down_proj: load_q4_buf(
                                 &format!("{prefix}.mlp.down_proj.weight"),
                                 &format!("L{i}.down.q4"),
+                                &[hidden, inter],
                             )?,
                         }
                     },
@@ -15811,39 +15660,50 @@ mod inner {
                         q_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.q_proj.weight"),
                             &format!("L{i}.full.q.q4"),
+                            &[2 * q_dim, hidden],
                         )?,
                         k_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.k_proj.weight"),
                             &format!("L{i}.full.k.q4"),
+                            &[kv_dim, hidden],
                         )?,
                         v_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.v_proj.weight"),
                             &format!("L{i}.full.v.q4"),
+                            &[kv_dim, hidden],
                         )?,
                         o_proj: load_q4_buf(
                             &format!("{prefix}.self_attn.o_proj.weight"),
                             &format!("L{i}.full.o.q4"),
+                            &[hidden, q_dim],
                         )?,
                         // q_norm and k_norm are norm.weight → stored as .f16
                         q_norm: load_f16_buf_f32(
                             &format!("{prefix}.self_attn.q_norm.weight"),
                             &format!("L{i}.full.q_norm"),
+                            &[cfg.head_dim],
                         )?,
                         k_norm: load_f16_buf_f32(
                             &format!("{prefix}.self_attn.k_norm.weight"),
                             &format!("L{i}.full.k_norm"),
+                            &[cfg.head_dim],
                         )?,
                     })
                 } else {
                     // in_proj_b and in_proj_a are quantized on disk (ends_with _proj_b.weight /
                     // _proj_a.weight → Q4), but in new() they become f16 Metal buffers for the
                     // CPU GDN recurrence path.  Load Q4 → dequantize → f16 Metal buffer.
-                    let load_q4_as_f16_buf = |name: &str, label: &str| -> Result<Buffer, String> {
+                    let load_q4_as_f16_buf = |name: &str,
+                                              label: &str,
+                                              expected_shape: &[usize]|
+                     -> Result<Buffer, String> {
                         let t = std::time::Instant::now();
                         let path = Self::q4_tensor_path(q4_dir, name, "q4");
-                        let tensor = load_q4_file(&path).map_err(|e| {
-                            format!("failed to load Q4 file {}: {e}", path.display())
-                        })?;
+                        let tensor =
+                            crate::weights::q4_weights::load_q4_file_checked(&path, expected_shape)
+                                .map_err(|e| {
+                                    format!("failed to load Q4 file {}: {e}", path.display())
+                                })?;
                         let buf = Self::make_buffer_f16_from_q4(&device, &tensor, label);
                         dur_b_cell.set(dur_b_cell.get() + t.elapsed());
                         Ok(buf)
@@ -15853,10 +15713,12 @@ mod inner {
                         in_proj_qkv: load_q4_buf(
                             &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
                             &format!("L{i}.gdn.qkv.q4"),
+                            &[qkv_dim, hidden],
                         )?,
                         in_proj_z: load_q4_buf(
                             &format!("{prefix}.linear_attn.in_proj_z.weight"),
                             &format!("L{i}.gdn.z.q4"),
+                            &[output_dim, hidden],
                         )?,
                         in_proj_qkvz: {
                             let t_qkvz = std::time::Instant::now();
@@ -15865,6 +15727,7 @@ mod inner {
                                     &device,
                                     &merged_path,
                                     &format!("L{i}.gdn.qkvz.q4"),
+                                    &[qkv_dim + output_dim, hidden],
                                 )?,
                                 _ => {
                                     // Fallback: model dir is read-only — CPU concat path
@@ -15879,8 +15742,10 @@ mod inner {
                                         &format!("{pfx}.linear_attn.in_proj_z.weight"),
                                         "q4",
                                     );
-                                    let (mut raw, _) = Self::load_q4_raw_bytes(&qkv_p)?;
-                                    let (z_raw, _) = Self::load_q4_raw_bytes(&z_p)?;
+                                    let (mut raw, _) =
+                                        Self::load_q4_raw_bytes(&qkv_p, &[qkv_dim, hidden])?;
+                                    let (z_raw, _) =
+                                        Self::load_q4_raw_bytes(&z_p, &[output_dim, hidden])?;
                                     raw.extend_from_slice(&z_raw);
                                     Q4WeightBuf::from_buffer(Self::make_buffer_from_q4_raw(
                                         &device,
@@ -15896,31 +15761,45 @@ mod inner {
                         in_proj_b: load_q4_as_f16_buf(
                             &format!("{prefix}.linear_attn.in_proj_b.weight"),
                             &format!("L{i}.gdn.b.f16"),
+                            &[value_heads, hidden],
                         )?,
                         in_proj_a: load_q4_as_f16_buf(
                             &format!("{prefix}.linear_attn.in_proj_a.weight"),
                             &format!("L{i}.gdn.a.f16"),
+                            &[value_heads, hidden],
                         )?,
                         // Small scalars: f32 Metal buffers (CPU-read in GDN recurrence)
                         a_log: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.A_log"),
                             &format!("L{i}.gdn.a_log"),
+                            &[value_heads],
                         )?,
                         dt_bias: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.dt_bias"),
                             &format!("L{i}.gdn.dt_bias"),
+                            &[value_heads],
                         )?,
                         conv1d_weight: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.conv1d.weight"),
                             &format!("L{i}.gdn.conv1d"),
+                            &[qkv_dim, 1, cfg.linear_conv_kernel_dim],
                         )?,
                         norm_weight: load_f16_buf_f32(
                             &format!("{prefix}.linear_attn.norm.weight"),
                             &format!("L{i}.gdn.norm"),
+                            // Per-HEAD RMSNorm: one gain per value-head element,
+                            // not one per output element. `linear_output_dim()` is
+                            // `linear_num_value_heads() * linear_value_head_dim`, so
+                            // expecting it here demands the full GDN output width and
+                            // rejects the checkpoint's own [linear_value_head_dim]
+                            // tensor. The safetensors loader has always expected
+                            // `cfg.linear_value_head_dim` for this same tensor.
+                            &[cfg.linear_value_head_dim],
                         )?,
                         out_proj: load_q4_buf(
                             &format!("{prefix}.linear_attn.out_proj.weight"),
                             &format!("L{i}.gdn.out.q4"),
+                            &[hidden, output_dim],
                         )?,
                     })
                 };
@@ -15937,19 +15816,28 @@ mod inner {
             // ----------------------------------------------------------------
             let embed_name = "model.language_model.embed_tokens.weight";
             let embed_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
-            let embed_tensor = load_q4_file(&embed_path)
-                .map_err(|e| format!("failed to load embed_tokens Q4 file: {e}"))?;
+            let embed_tensor = crate::weights::q4_weights::load_q4_file_checked(
+                &embed_path,
+                &[cfg.vocab_size, hidden],
+            )
+            .map_err(|e| format!("failed to load embed_tokens Q4 file: {e}"))?;
             // f16 buffer for CPU embedding lookup
             let embed_tokens =
                 Self::make_buffer_f16_from_q4(&device, &embed_tensor, "embed_tokens.f16");
             // Q4 buffer for GPU logits GEMV — mmap no-copy
             let embed_q4_path = Self::q4_tensor_path(q4_dir, embed_name, "q4");
-            let embed_tokens_q8 = mmap_q4_weight(&device, &embed_q4_path, "embed_tokens.q4")?;
+            let embed_tokens_q8 = mmap_q4_weight(
+                &device,
+                &embed_q4_path,
+                "embed_tokens.q4",
+                &[cfg.vocab_size, hidden],
+            )?;
 
             // ----------------------------------------------------------------
             // final_norm: stored as .f16 (it's a norm.weight tensor)
             // ----------------------------------------------------------------
-            let final_norm = load_f16_buf_f32("model.language_model.norm.weight", "final_norm")?;
+            let final_norm =
+                load_f16_buf_f32("model.language_model.norm.weight", "final_norm", &[hidden])?;
 
             // ----------------------------------------------------------------
             // lm_head: only present when tie_word_embeddings = false.
@@ -15965,7 +15853,12 @@ mod inner {
             // ----------------------------------------------------------------
             let embed_tokens_q8 = if !cfg.tie_word_embeddings {
                 let lm_head_path = Self::q4_tensor_path(q4_dir, "lm_head.weight", "q4");
-                mmap_q4_weight(&device, &lm_head_path, "lm_head.q4")?
+                mmap_q4_weight(
+                    &device,
+                    &lm_head_path,
+                    "lm_head.q4",
+                    &[cfg.vocab_size, hidden],
+                )?
             } else {
                 embed_tokens_q8
             };
@@ -16131,9 +16024,13 @@ mod inner {
             // (`quarot_rotation_seed`) for backwards compatibility with artifacts
             // produced before the contract was formalized. #504 remaining slice 2:
             // a *present but malformed* index is a hard error (fail-closed) — only
-            // a genuinely absent index falls back.
-            let index_seed = crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir)
-                .map_err(|e| format!("from_q4_dir: {e}"))?;
+            // a genuinely absent index falls back. A well-formed `V1Online` index
+            // is *also* rejected here (this is the only load path into
+            // `MetalQwen35State`, Metal being the only forward implementation) — see
+            // `read_quarot_seed_from_index`'s doc comment.
+            let index_seed =
+                crate::quant::quarot::convert::read_quarot_seed_from_index(q4_dir, cfg)
+                    .map_err(|e| format!("from_q4_dir: {e}"))?;
             let quarot_seed_opt = index_seed.or(cfg.quarot_rotation_seed);
             let is_quarot = quarot_seed_opt.is_some();
 
@@ -16374,8 +16271,8 @@ mod inner {
         /// softmax runs over the full vocabulary at decode step `i`.
         ///
         /// Errors if `tokens.len() < 2`, if `tokens.len() > self.max_context()`
-        /// (the KV cache would overflow during the walk), or if any
-        /// `token_id >= cfg.vocab_size`.
+        /// (the KV cache would overflow during the walk), if any
+        /// `token_id >= cfg.vocab_size`, or if a LoRA adapter is active.
         pub fn compute_token_nlls(
             &mut self,
             tokens: &[u32],
@@ -16413,7 +16310,7 @@ mod inner {
             // Sequential forward_step from pos=0 with reset_state does NOT
             // produce usable next-token distributions and is not used here.
             self.reset_state();
-            let flat = self.forward_prefill_all_logits(tokens);
+            let flat = self.forward_prefill_all_logits(tokens)?;
             debug_assert_eq!(flat.len(), tokens.len() * vocab_size);
             let mut nlls = Vec::with_capacity(tokens.len() - 1);
             for i in 0..tokens.len() - 1 {
@@ -16509,21 +16406,56 @@ mod inner {
         }
 
         fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
-            if snapshot.is_empty() {
+            if let Err(error) = self.validate_gdn_restore_snapshot(snapshot) {
+                tracing::warn!(
+                    error = %error,
+                    "refusing malformed GDN state restore"
+                );
                 return;
             }
+            self.restore_gdn_states_validated(snapshot);
+        }
+    }
+
+    impl MetalQwen35State {
+        fn validate_gdn_restore_snapshot(
+            &self,
+            snapshot: &crate::attention::gdn::GdnSnapshot,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
             let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            debug_assert_eq!(snapshot.len(), num_layers);
-            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate().take(num_layers) {
+            if snapshot.len() != num_layers {
+                return Err(InferenceError::PrefixCache(format!(
+                    "restore_gdn_states: snapshot has {} layers, expected {num_layers}",
+                    snapshot.len()
+                )));
+            }
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
                 let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
                 let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_bytes = conv_snap.len() * 4;
-                let s_bytes = s_snap.len() * 4;
-                debug_assert_eq!(conv_bytes as u64, conv_buf.length());
-                debug_assert_eq!(s_bytes as u64, s_buf.length());
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
+                    return Err(InferenceError::PrefixCache(format!(
+                        "restore_gdn_states: layer {i} shape mismatch: conv {} != \
+                         {conv_floats} or s {} != {s_floats}",
+                        conv_snap.len(),
+                        s_snap.len()
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        fn restore_gdn_states_validated(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
                 // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
-                // the buffer directly; callers invoke this outside any in-flight command
-                // buffer (rejection branch in `mtp_verify_draft`).
+                // the buffer directly; validation above proves each snapshot exactly
+                // matches its destination, and callers invoke this outside any in-flight
+                // command buffer (rejection branch in `mtp_verify_draft`).
                 unsafe {
                     let dst = conv_buf.contents() as *mut f32;
                     std::ptr::copy_nonoverlapping(conv_snap.as_ptr(), dst, conv_snap.len());
@@ -16795,16 +16727,10 @@ mod inner {
                         .into(),
                 ));
             }
-            if start_pos + token_ids.len() > self.session.kv_cache.max_cache_len {
-                return Err(InferenceError::InvalidInput(format!(
-                    "forward_prefill_from: start_pos {start_pos} + len {} exceeds max_cache_len {}",
-                    token_ids.len(),
-                    self.session.kv_cache.max_cache_len
-                )));
-            }
             if token_ids.len() == 1 {
-                return Ok(self.forward_step(token_ids[0], start_pos));
+                return self.try_forward_step(token_ids[0], start_pos);
             }
+            self.check_forward_range_capacity(start_pos, token_ids.len(), false)?;
             if self.lora.is_some() {
                 if all_positions {
                     return Err(InferenceError::PrefixCache(
@@ -16972,40 +16898,15 @@ mod inner {
             Ok(self.snapshot_gdn_states())
         }
 
-        /// Shape-checked wrapper around [`Self::restore_gdn_states`]. The
-        /// underlying restore only asserts shapes in debug builds
-        /// (`debug_assert_eq!`); this validates explicitly in all builds and
-        /// returns `InferenceError::PrefixCache` instead of restoring
-        /// mismatched buffers or panicking.
+        /// Fallible sibling of [`Self::restore_gdn_states`] for callers that
+        /// can propagate a malformed-snapshot error instead of using the
+        /// infallible trait entry point's logged, no-write rejection.
         fn restore_gdn_states_checked(
             &mut self,
             snapshot: &crate::attention::gdn::GdnSnapshot,
         ) -> Result<(), crate::error::InferenceError> {
-            use crate::error::InferenceError;
-            use crate::speculative::MtpTargetVerifier;
-
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            if snapshot.len() != num_layers {
-                return Err(InferenceError::PrefixCache(format!(
-                    "restore_gdn_states_checked: snapshot has {} layers, expected {num_layers}",
-                    snapshot.len()
-                )));
-            }
-            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_floats = (conv_buf.length() / 4) as usize;
-                let s_floats = (s_buf.length() / 4) as usize;
-                if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
-                    return Err(InferenceError::PrefixCache(format!(
-                        "restore_gdn_states_checked: layer {i} shape mismatch: conv {} != \
-                         {conv_floats} or s {} != {s_floats}",
-                        conv_snap.len(),
-                        s_snap.len()
-                    )));
-                }
-            }
-            self.restore_gdn_states(snapshot);
+            self.validate_gdn_restore_snapshot(snapshot)?;
+            self.restore_gdn_states_validated(snapshot);
             Ok(())
         }
 
@@ -17383,11 +17284,33 @@ mod inner {
             }
 
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
-                // id. Fail closed instead, matching the CPU contract (#611).
+                // id. An accepting state with no legal continuation is a completed
+                // generation, not a failure; otherwise fail closed, matching the
+                // CPU contract (#611, generation.rs step-0 sites).
                 if !super::has_finite_logit(&prefill_logits) {
+                    if engine.is_complete_without_continuation(gs) {
+                        return Ok(CachedGenerateOutput {
+                            output: GenerateOutput {
+                                text: String::new(),
+                                token_ids: vec![],
+                                prompt_tokens: prompt_len,
+                                generated_tokens: 0,
+                                stopped: true,
+                                stop_reason: Some(StopReason::Grammar),
+                                token_logprobs: vec![],
+                            },
+                            cache: CrossTurnCacheStats {
+                                slot_id,
+                                prompt_tokens: prompt_len,
+                                reused_tokens: plan.reusable_len,
+                                prefetched_tokens: plan.suffix_len,
+                                mode: plan.mode,
+                            },
+                        });
+                    }
                     return Err(InferenceError::GrammarConstraintBlocked(
                         "grammar constraint blocked every token at step 0; \
                          no legal first token exists in the current grammar state"
@@ -17568,9 +17491,31 @@ mod inner {
             let mut stopped = false;
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
+            // A grammar completed by the prefill-derived first token with no
+            // legal continuation is a successful stop, mirroring the CPU
+            // `grammar_complete` early return. Recorded here — immediately
+            // after the initial advance — rather than probed at the loop top,
+            // so a zero-iteration decode loop (effective cap 1) cannot fall
+            // through to Length (#1064 follow-up). The completing token was
+            // never forwarded (`stopped` skips the silent step below), so the
+            // saved cross-turn prefix stays consistent with live KV state.
+            if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                && engine.is_complete_without_continuation(gs)
+            {
+                stopped = true;
+                stop_reason = StopReason::Grammar;
+            }
 
             let cap = policy.cap();
             for _ in 1..cap {
+                // Initial-token grammar completion (recorded above) terminates
+                // decode before any per-step GPU work: past this point
+                // mask_logits would block every token and the all-blocked
+                // guard below would misreport the completed generation as
+                // GrammarConstraintBlocked (#1064).
+                if stopped {
+                    break;
+                }
                 // Checked before any per-step GPU work, independent of whether
                 // this iteration's delta ends up non-empty — mirrors
                 // `generate_streaming_with_cancel`'s decode-loop check and
@@ -17592,10 +17537,13 @@ mod inner {
                 let last_token = *all_ids
                     .last()
                     .expect("invariant: prompt or previous sample populated all_ids");
-                let mut step_logits = self.forward_step(last_token, pos);
+                let mut step_logits = self.forward_step_decode(last_token, pos);
 
                 if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                    engine.mask_logits(gs, &mut step_logits);
+                    let _signpost_grammar = crate::forward::signpost::interval(
+                        crate::forward::signpost::Label::DecodeGrammarMask,
+                    );
+                    engine.mask_logits(gs, &mut step_logits)?;
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
                     if !super::has_finite_logit(&step_logits) {
@@ -17607,15 +17555,14 @@ mod inner {
                     }
                 }
 
-                let sampled_id = if use_compact {
-                    sample_from_candidates(
-                        &self.session.compact_result,
+                let sampled_id = {
+                    sample_decode_traced(
+                        use_compact.then_some(self.session.compact_result.as_slice()),
+                        &step_logits,
                         gen_cfg,
                         &all_ids,
                         &mut rng_state,
                     )
-                } else {
-                    sample_token(&step_logits, gen_cfg, &all_ids, &mut rng_state)
                 };
 
                 // `policy.stop_mode` (fixed to `StopMode::Streaming` or
@@ -17675,6 +17622,18 @@ mod inner {
                     } => (token_id, answer_budget_exhausted),
                 };
                 last_pushed_id = next_id;
+                // Post-advance completion check, mirroring the CPU
+                // `grammar_complete_without_continuation` check after every
+                // emitted token: the final loop iteration has no following
+                // loop top, so a grammar completed by the last allowed token
+                // would otherwise misreport as Length (#1064 follow-up).
+                if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &grammar_state)
+                    && engine.is_complete_without_continuation(gs)
+                {
+                    stopped = true;
+                    stop_reason = StopReason::Grammar;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -17731,7 +17690,7 @@ mod inner {
                 if !generated_ids.is_empty() && !stopped && !stopped_by_caller {
                     let seq_len = self.session.kv_cache.seq_len;
                     if seq_len < self.session.kv_cache.max_cache_len {
-                        let _ = self.forward_step(last_pushed_id, seq_len);
+                        let _ = self.forward_step_decode(last_pushed_id, seq_len);
                     }
                     // else: KV is already full; the cache boundary stays one
                     // token short of `generated_ids` — still consistent, since
@@ -17863,6 +17822,58 @@ mod inner {
             CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, FullAttentionLayerWeights,
         };
         use crate::model::qwen35_config::LayerType;
+
+        // Mutation-sensitive: five decode
+        // loops used to copy-paste their own `decode.sample` interval +
+        // compact/full-logits routing, and two of the five (the multimodal
+        // decode loops) had already drifted to call `sample_token` directly
+        // with no interval at all. `sample_decode_traced` is now the single
+        // shared call site; these two source-level checks guard both halves
+        // of that invariant without depending on a live Instruments/xctrace
+        // tool session (which real FFI emission would require to observe).
+        // Each check fails if the shared call site regresses.
+        #[test]
+        fn sample_decode_traced_opens_the_decode_sample_interval() {
+            let src = include_str!("metal_qwen35.rs");
+            let start = src
+                .find("fn sample_decode_traced(")
+                .expect("sample_decode_traced must exist in this file");
+            let body_end = src[start..]
+                .find("\n    }\n")
+                .expect("sample_decode_traced's body must close with `\\n    }\\n`");
+            let body = &src[start..start + body_end];
+            assert!(
+                body.contains(
+                    "crate::forward::signpost::interval(crate::forward::signpost::Label::DecodeSample)"
+                ),
+                "sample_decode_traced must open the decode.sample interval -- it is the \
+                 single call site all five decode loops now share; silently dropping this \
+                 line removes decode.sample instrumentation from every decode loop at once"
+            );
+        }
+
+        #[test]
+        fn all_five_decode_loops_call_sample_decode_traced() {
+            let src = include_str!("metal_qwen35.rs");
+            // Scope the search to production code, excluding `mod tests`
+            // itself -- this test's own source text contains the literal
+            // string `sample_decode_traced(` several times over (the
+            // `include_str!` search string, this function's name, etc.),
+            // which would otherwise self-count.
+            let production_end = src
+                .find("    mod tests {")
+                .expect("mod tests must exist in this file");
+            let production_src = &src[..production_end];
+            // One definition + five call sites, each enumerable by function and line.
+            let count = production_src.matches("sample_decode_traced(").count();
+            assert_eq!(
+                count, 6,
+                "expected sample_decode_traced's definition plus exactly 5 decode-loop \
+                 call sites; got {count} instead -- a decode loop likely reverted to \
+                 calling sample_token/sample_from_candidates directly, the exact drift \
+                 round 3's review caught in the two multimodal decode loops"
+            );
+        }
 
         /// #854: guards against a reintroduced manual copy of the RMS-norm
         /// reduction tree across qwen35.metal's seven RMS-norm-family kernels
@@ -20173,6 +20184,170 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn forward_step_rejects_position_and_cache_capacity_before_dispatch() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 1)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            let err = state
+                .try_forward_step(1, 1)
+                .expect_err("position at max_cache_len must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+
+            let err = state
+                .forward_prefill_from(&[1], 1, false)
+                .expect_err("one-token suffix at max_cache_len must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+
+            state.session.kv_cache.seq_len = 1;
+            let err = state
+                .try_forward_step(1, 0)
+                .expect_err("a full KV cache must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+        }
+
+        #[test]
+        fn verify_tokens_rejects_out_of_range_start_pos_before_dispatch() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 1)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            // `verify_tokens` is the public `MtpTargetVerifier` entry point (reachable by
+            // any consumer holding `&mut MetalQwen35State`). A `start_pos` at
+            // `max_cache_len` must be rejected before any GDN checkpoint or Metal
+            // dispatch — including before `verify_tokens_batched`'s own "no checkpoint
+            // pool" check, which this fixture never allocates, so a passing result here
+            // cannot be explained by that unrelated early return.
+            let err = state
+                .verify_tokens(&[1], 1)
+                .expect_err("start_pos at max_cache_len must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "no dispatch must have advanced the KV cache"
+            );
+
+            // A batch whose last token would land at/after max_cache_len must also be
+            // rejected even when start_pos itself is in range.
+            let err = state
+                .verify_tokens(&[1, 2], 0)
+                .expect_err("token batch spilling past max_cache_len must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+        }
+
+        /// Pure test of the centralized capacity validator — no `Device`, no session,
+        /// runs on CPU. Guards the blocking gap: `verify_tokens_batched` checkpoints one
+        /// GDN pool slot per token (slot 0 = base, slot k = after k tokens), so a batch
+        /// larger than the pool's `max_tokens` must be rejected even when the KV/RoPE
+        /// cache has ample room — otherwise `checkpoint_gdn_to_slot` indexes past the
+        /// pool's allocated slots mid-batch.
+        #[test]
+        fn validate_dispatch_capacity_rejects_gdn_pool_overflow_independent_of_kv_capacity() {
+            // In-bounds: 5 tokens exactly fill a 5-slot GDN pool, KV cache has room.
+            assert!(
+                MetalQwen35State::validate_dispatch_capacity(0, 5, 10, Some(5)).is_ok(),
+                "5 tokens against a 5-token GDN pool and 10-slot KV cache must fit"
+            );
+
+            // KV/RoPE overflow still rejects (unchanged behavior from the prior round).
+            let err = MetalQwen35State::validate_dispatch_capacity(8, 3, 10, Some(5))
+                .expect_err("start_pos 8 + 3 tokens reaches position 10, at kv_capacity 10");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+
+            // GDN pool overflow: 6 tokens against a 5-token pool must be rejected even
+            // though the KV cache (100) has plenty of room — this is the blocking gap.
+            let err = MetalQwen35State::validate_dispatch_capacity(0, 6, 100, Some(5))
+                .expect_err("6 tokens against a 5-token GDN pool must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+
+            // Callers that never checkpoint per-token (batch-GEMM, prefill) pass
+            // `gdn_pool_capacity = None` and must not be bounded by the pool at all.
+            assert!(
+                MetalQwen35State::validate_dispatch_capacity(0, 6, 100, None).is_ok(),
+                "a caller that never checkpoints per-token must not be pool-bounded"
+            );
+        }
+
+        /// Deferred-run regression: full round-trip through the public
+        /// `MtpTargetVerifier::verify_tokens` entry point on a GDN-backed
+        /// `MetalQwen35State`, asserting a batch larger than the GDN checkpoint pool is
+        /// rejected before any dispatch or checkpoint mutation. Compiled under
+        /// `--features metal-gpu` (this crate's GDN checkpoint pool only exists in that
+        /// configuration) but NOT executed this session — GPU test runs are out of
+        /// scope tonight. Run on the next GPU pass; the CPU-only
+        /// `validate_dispatch_capacity_rejects_gdn_pool_overflow_independent_of_kv_capacity`
+        /// test above already proves the same guard logic without a device.
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        #[test]
+        fn verify_tokens_rejects_batch_exceeding_gdn_pool_capacity_before_dispatch() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let mut state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
+            });
+
+            let pool_capacity = state
+                .session
+                .gdn_checkpoints
+                .as_ref()
+                .expect("self-spec pool must be allocated")
+                .max_tokens;
+            // One more token than the pool holds: `checkpoint_gdn_to_slot` would index
+            // past the pool's allocated slots partway through this batch if dispatched.
+            let too_many: Vec<u32> = (0..(pool_capacity as u32 + 1)).map(|i| i % 2).collect();
+
+            let err = state
+                .verify_tokens(&too_many, 0)
+                .expect_err("a batch larger than the GDN checkpoint pool must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "rejected preflight must leave state unmutated — no dispatch, no checkpoint \
+                 mutation"
+            );
+        }
+
+        #[test]
+        fn forward_prefill_layer_traces_rejects_token_sequence_past_cache_capacity() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            // `forward_prefill_layer_traces_last_token` resets `kv_cache.seq_len` to 0
+            // and then drives `position` from `0..token_ids.len()` — reachable from the
+            // public `score_layer_importance` via caller-controlled `calibration_prompts`.
+            // A 2-token sequence against a 1-slot cache must be rejected before any pass
+            // dispatches.
+            let mut state = MetalQwen35State::new(&weights, &cfg, 1)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            let result = state.forward_prefill_layer_traces_last_token(&[1, 2]);
+            match result {
+                Ok(_) => panic!("token sequence longer than max_cache_len must be rejected"),
+                Err(crate::error::InferenceError::InvalidInput(_)) => {}
+                Err(other) => panic!("expected InvalidInput, got {other}"),
+            }
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+        }
+
+        #[test]
         fn test_metal_qwen35_kv_cache_determinism_replay_5_tokens() {
             let Some(_) = Device::system_default() else {
                 return;
@@ -20616,7 +20791,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("write original_len");
             file.flush().expect("flush q4 header");
 
-            let result = mmap_q4_weight(&device, &path, "truncated-payload-proof");
+            let result = mmap_q4_weight(&device, &path, "truncated-payload-proof", &[64]);
 
             assert!(
                 result.is_err(),
@@ -20646,7 +20821,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             file.write_all(&[0u8; 19]).expect("write short payload");
             file.flush().expect("flush truncated payload");
 
-            let result = mmap_q4_weight(&device, &path, "one-byte-short-proof");
+            let result = mmap_q4_weight(&device, &path, "one-byte-short-proof", &[32]);
 
             assert!(
                 result.is_err(),
@@ -20666,7 +20841,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let tensor = crate::weights::q4_weights::Q4Tensor {
                 blocks: vec![
                     crate::weights::q4_weights::Q4Block {
-                        scale: 0,
+                        scale: 0x3C00,
                         bias: 0,
                         packed: [0u8; 16],
                     };
@@ -20678,7 +20853,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             crate::weights::q4_weights::save_q4_file(&path, &tensor)
                 .expect("save well-formed q4 file");
 
-            let result = mmap_q4_weight(&device, &path, "full-payload-accept");
+            let result = mmap_q4_weight(&device, &path, "full-payload-accept", &[64]);
 
             assert!(
                 result.is_ok(),
@@ -20941,8 +21116,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // Shape E: M=16,N=1024,K=3584 — Qwen3.5-0.8B's down-projection
             //   depth (`intermediate_size=3584`, dispatch uses
             //   `K=intermediate` — metal_qwen35.rs:5112), 112 `BK=32`
-            //   iterations — the deepest Q3-eligible production MLP shape,
-            //   round-2 review finding 2.
+            //   iterations — the deepest Q3-eligible production MLP shape.
             //
             // `max_abs_diff` is the same NaN-honest helper used by the Q4 twin
             // below (`gemm_q4_tiled_vs_naive_numeric_differential`) — a
@@ -21010,11 +21184,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 envelope.push((m, n, k, max_diff));
             }
 
-            // Bound derived from the measured envelope above (see
-            // w3_fix_r2_report.md for the full table), not a hand-waved
+            // Bound derived from the measured envelope above, not a hand-waved
             // constant: the largest observed shape (M=16 N=1024 K=3584, the
-            // Qwen3.5-0.8B down-projection depth — 112 `BK=32` iterations,
-            // round-2 review finding 2) measured max|gpu-ref| ~= 1.946e-2;
+            // Qwen3.5-0.8B down-projection depth — 112 `BK=32` iterations)
+            // measured max|gpu-ref| ~= 1.946e-2;
             // 0.037 is ~1.9x that. The headroom covers cross-device variation
             // (different Apple Silicon generations accumulate the f16
             // X/W-staging + f32-reduction residual slightly differently) and
@@ -21035,8 +21208,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Mutation-sensitivity test for the differential comparison itself
-        /// (round-1 review finding 2): corrupt a packed block's `scale` field
+        /// Mutation-sensitivity test for the differential comparison itself:
+        /// corrupt a packed block's `scale` field
         /// to an IEEE-754 f16 NaN bit pattern so the GPU kernel's dequantized
         /// weight — and therefore its GEMM output — is NaN, then prove the
         /// NaN-honest comparison fails loudly instead of silently reading as
@@ -21045,7 +21218,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// mutation-sensitive, the same way the pack/unpack mutation tests
         /// prove the kernel is.
         ///
-        /// Round-2 review finding 1: `#[should_panic(expected = "is not
+        /// `#[should_panic(expected = "is not
         /// finite")]` could not distinguish "the Apple7 dispatch ran and the
         /// NaN-honest comparison caught it" from "no Apple7 device, so this
         /// branch panicked with an unrelated message that happened to also
@@ -21374,7 +21547,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             write_tiny_q4_fixture(
                 dir,
                 &format!("{prefix}.self_attn.q_proj.weight"),
-                &[q_dim, hidden],
+                &[2 * q_dim, hidden],
             );
             write_tiny_q4_fixture(
                 dir,
@@ -22046,7 +22219,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// disarmed, and the collector must stay disarmed rather than
         /// silently self-arming on first use.
         ///
-        /// Mutation check (documented for the reviewer to exercise, not
+        /// Mutation check (documented as a manual check, not
         /// compiled in): replacing `encode_moe_ffn`'s `if let Some(trace) =
         /// c.borrow_mut().as_mut() { trace.push(..) }` guard with an
         /// unconditional `c.borrow_mut().get_or_insert_with(Vec::new).push(..)`
@@ -22108,7 +22281,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// through `encode_mlp_block` into `encode_moe_ffn`. Also exercises
         /// `dump_moe_routing_trace_jsonl`'s round-trip.
         ///
-        /// Mutation check (documented for the reviewer to exercise, not
+        /// Mutation check (documented as a manual check, not
         /// compiled in): commenting out the `trace.push(MoeRoutingTraceRecord
         /// { .. })` call inside `encode_moe_ffn`'s `MOE_ROUTING_TRACE.with(..)`
         /// block makes this test fail — `take_moe_routing_trace()` returns an
@@ -22795,7 +22968,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Ordering proof (adversarial-review Finding 1): `encode_moe_ffn`'s
+        /// Ordering proof: `encode_moe_ffn`'s
         /// routed-expert dequant work must genuinely overlap Step 2's
         /// shared-expert GEMV encoding, not just fan out across rayon
         /// before Step 2 starts and then block in front of it. Proven
@@ -22888,7 +23061,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Failure-isolation proof (adversarial-review Finding 2): a dequant
+        /// Failure-isolation proof: a dequant
         /// task panicking after `plan_prefetch` already committed its
         /// slot's ownership bookkeeping must not let a later token read
         /// stale/never-written bytes out of that slot.
@@ -23076,8 +23249,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Direct Stage-1-equivalence regression (adversarial-review
-        /// Finding 3): the `plan_prefetch` + dequant + `apply_prefetch_results`
+        /// Direct Stage-1-equivalence regression: the `plan_prefetch` + dequant + `apply_prefetch_results`
         /// path must leave a cache in EXACTLY the same bookkeeping state
         /// (`slot_owner`, `expert_to_slot`, `slot_touched`, `slot_ready`,
         /// LRU order, hit/miss/eviction counters) as calling `resolve()`
@@ -23297,6 +23469,74 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 err.contains("shape"),
                 "error must name the shape mismatch so it's diagnosable, got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_transposed_embedding_header() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            write_tiny_q4_fixture(
+                dir,
+                "model.language_model.embed_tokens.weight",
+                &[cfg.hidden_size, cfg.vocab_size],
+            );
+
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(dir, std::path::Path::new("/dev/null"), &cfg, 16)
+            else {
+                panic!("from_q4_dir must reject a same-numel transposed embedding tensor");
+            };
+            assert!(
+                err.contains("expected") && err.contains("shape"),
+                "error must report configured embedding geometry, got: {err}"
+            );
+        }
+
+        #[test]
+        fn from_q4_dir_rejects_rank_mismatched_f16_norm_header() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = synthetic_moe_test_config();
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let dir = tmp.path();
+            write_synthetic_moe_checkpoint(
+                dir,
+                &cfg,
+                moe_fixture_gate_const,
+                moe_fixture_up_const,
+                moe_fixture_down_const,
+            );
+            write_tiny_f16_fixture(
+                dir,
+                "model.language_model.layers.0.input_layernorm.weight",
+                &[1, cfg.hidden_size],
+            );
+
+            let Err(err) =
+                MetalQwen35State::from_q4_dir(dir, std::path::Path::new("/dev/null"), &cfg, 16)
+            else {
+                panic!("from_q4_dir must reject an F16 norm with mismatched rank");
+            };
+            assert!(
+                err.contains("expected") && err.contains("shape"),
+                "error must report configured F16 geometry, got: {err}"
             );
         }
 
@@ -24856,6 +25096,52 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn lora_all_position_prefill_and_nll_return_typed_errors() {
+            let _gpu = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture constructs");
+            state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 1)], 1.0, None)
+                .expect("valid LoRA adapter loads");
+
+            let direct_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.forward_prefill_all_logits(&[1, 2])
+            }));
+            let direct_result =
+                direct_outcome.expect("LoRA all-position prefill must return Err, not panic");
+            let direct_error = direct_result.expect_err("active LoRA must reject all-position");
+            assert!(
+                matches!(
+                    &direct_error,
+                    crate::error::InferenceError::Inference(message)
+                        if message.contains("all-position prefill")
+                            && message.contains("LoRA adapters")
+                ),
+                "unexpected all-position error: {direct_error}"
+            );
+
+            let nll_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.compute_token_nlls(&[1, 2])
+            }));
+            let nll_result =
+                nll_outcome.expect("LoRA compute_token_nlls must return Err, not panic");
+            let nll_error = nll_result.expect_err("active LoRA must reject per-token NLLs");
+            assert!(
+                matches!(
+                    &nll_error,
+                    crate::error::InferenceError::Inference(message)
+                        if message.contains("all-position prefill")
+                            && message.contains("LoRA adapters")
+                ),
+                "unexpected NLL error: {nll_error}"
+            );
+        }
+
+        #[test]
         fn load_lora_adapter_rejects_short_a() {
             let Some(_dev) = metal::Device::system_default() else {
                 return;
@@ -25430,6 +25716,317 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             (cfg, weights)
         }
 
+        /// Single full-attention MoE layer — batched prefill does not support MoE
+        /// (`assert_batched_prefill_dense_only`), so this is the minimal fixture for
+        /// exercising the up-front rejection path before any state mutation.
+        fn tiny_moe_prefill_fixture() -> (Qwen35Config, ModelWeights) {
+            use crate::model::qwen35::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert};
+
+            let hidden = 512usize;
+            let vocab = 32usize;
+            let num_experts = 2usize;
+            let top_k = 1usize;
+            let inter = 16usize;
+            let s_inter = 16usize;
+            let cfg = Qwen35Config {
+                hidden_size: hidden,
+                num_hidden_layers: 1,
+                vocab_size: vocab,
+                intermediate_size: 64,
+                rms_norm_eps: 1e-6,
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                head_dim: 256,
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: 0.25,
+                rope_parameters: None,
+                linear_num_key_heads: 1,
+                linear_num_value_heads: Some(1),
+                linear_key_head_dim: 16,
+                linear_value_head_dim: 16,
+                linear_conv_kernel_dim: 4,
+                num_experts: Some(num_experts),
+                num_experts_per_tok: Some(top_k),
+                moe_intermediate_size: Some(inter),
+                shared_expert_intermediate_size: Some(s_inter),
+                output_router_logits: false,
+                router_aux_loss_coef: None,
+                tie_word_embeddings: true,
+                mtp_num_hidden_layers: 0,
+                mtp_use_dedicated_embeddings: false,
+                full_attention_interval: 1,
+                layer_types: vec![LayerType::FullAttention],
+                layer_mask: vec![true],
+                eos_token_id: (vocab - 1) as u32,
+                max_position_embeddings: 64,
+                quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+            };
+
+            let full = AttentionWeights::Full(FullAttentionLayerWeights {
+                q_proj: vec![0.0; 2 * cfg.full_q_dim() * hidden],
+                k_proj: vec![0.0; cfg.full_kv_dim() * hidden],
+                v_proj: vec![0.0; cfg.full_kv_dim() * hidden],
+                o_proj: vec![0.0; hidden * cfg.full_q_dim()],
+                q_norm: vec![1.0; cfg.head_dim],
+                k_norm: vec![1.0; cfg.head_dim],
+            });
+
+            let router =
+                MoeRouter::new(vec![0.0; num_experts * hidden], num_experts, top_k, hidden)
+                    .expect("moe router fixture shape");
+            let experts = RoutedExperts::new(
+                vec![0.0; num_experts * 2 * inter * hidden],
+                vec![0.0; num_experts * hidden * inter],
+                num_experts,
+                hidden,
+                inter,
+            )
+            .expect("moe routed experts fixture shape");
+            let shared_expert = SharedExpert::new(
+                vec![0.0; s_inter * hidden],
+                vec![0.0; s_inter * hidden],
+                vec![0.0; hidden * s_inter],
+                vec![0.0; hidden],
+                hidden,
+                s_inter,
+            )
+            .expect("moe shared expert fixture shape");
+
+            let common = CommonLayerWeights {
+                input_layernorm: vec![1.0; hidden],
+                post_attention_layernorm: vec![1.0; hidden],
+                ffn: FeedForwardWeights::Moe(MoeLayerWeights {
+                    router,
+                    experts,
+                    shared_expert,
+                }),
+            };
+
+            // Non-zero so a wrongly-ordered guard (embedding copy running before
+            // the MoE rejection) is observable as a mutated `activations.hidden`.
+            let mut embed = vec![0.0f32; vocab * hidden];
+            for tok in 0..vocab {
+                embed[tok * hidden] = if tok % 2 == 0 { 1.0 } else { -1.0 };
+            }
+
+            let weights = ModelWeights {
+                embed_tokens: embed,
+                lm_head: None,
+                final_norm: vec![1.0; hidden],
+                layers: vec![(full, common)],
+            };
+            (cfg, weights)
+        }
+
+        /// Regression test: batched prefill on an unsupported (MoE) config must
+        /// reject before any state mutation, so a retry after the failure observes
+        /// exactly the same clean session state — not a partially-encoded one.
+        /// `assert_batched_prefill_dense_only` runs before the embedding copy, the
+        /// command buffer, and any recurrent/KV encode, so `session.position` and
+        /// `activations.hidden` (non-zero embedding rows would prove the copy ran)
+        /// must stay untouched across repeated failed attempts.
+        #[test]
+        fn forward_prefill_batched_chunk_rejects_moe_before_any_state_mutation() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("moe prefill fixture must construct");
+
+            let initial_position = state.session.position;
+            let tokens = [1u32, 3, 5];
+
+            for attempt in 0..2 {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.forward_prefill_batched_chunk(&tokens, 0, true, true)
+                }));
+                assert!(
+                    result.is_err(),
+                    "attempt {attempt}: unsupported-MoE batched prefill must fail cleanly, \
+                     not silently produce logits"
+                );
+                assert_eq!(
+                    state.session.position, initial_position,
+                    "attempt {attempt}: session position must be unchanged by a rejected prefill"
+                );
+                // SAFETY: StorageModeShared, read-only; the guard panics before a
+                // command buffer is ever created, so there is no GPU work in flight.
+                let hidden_after =
+                    unsafe { read_buffer(&state.session.activations.hidden, cfg.hidden_size) };
+                assert!(
+                    hidden_after.iter().all(|&v| v == 0.0),
+                    "attempt {attempt}: embedding copy must not run before the MoE guard \
+                     fires (activations.hidden should stay zero-initialized)"
+                );
+            }
+        }
+
+        #[cfg(feature = "bench-internals")]
+        fn tiny_chunked_prefill_fixture() -> (Qwen35Config, ModelWeights) {
+            use crate::attention::gdn::GatedDeltaNetWeights;
+
+            let hidden = 1024usize;
+            let intermediate = 32usize;
+            let vocab = 32usize;
+            let num_kh = 16usize;
+            let kd = 128usize;
+            let vd = 128usize;
+            let qkv_dim = num_kh * (2 * kd + vd);
+            let out_dim = num_kh * vd;
+            let ks = 4usize;
+            let cfg = Qwen35Config {
+                hidden_size: hidden,
+                num_hidden_layers: 2,
+                vocab_size: vocab,
+                intermediate_size: intermediate,
+                rms_norm_eps: 1e-6,
+                num_attention_heads: 4,
+                num_key_value_heads: 1,
+                head_dim: 256,
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: 0.25,
+                rope_parameters: None,
+                linear_num_key_heads: num_kh,
+                linear_num_value_heads: Some(num_kh),
+                linear_key_head_dim: kd,
+                linear_value_head_dim: vd,
+                linear_conv_kernel_dim: ks,
+                num_experts: None,
+                num_experts_per_tok: None,
+                moe_intermediate_size: None,
+                shared_expert_intermediate_size: None,
+                output_router_logits: false,
+                router_aux_loss_coef: None,
+                tie_word_embeddings: true,
+                mtp_num_hidden_layers: 0,
+                mtp_use_dedicated_embeddings: false,
+                full_attention_interval: 2,
+                layer_types: vec![LayerType::LinearAttention, LayerType::FullAttention],
+                layer_mask: vec![true; 2],
+                eos_token_id: (vocab - 1) as u32,
+                max_position_embeddings: 64,
+                quarot_rotation_seed: None,
+                vision_config: None,
+                image_token_id: None,
+                video_token_id: None,
+                vision_start_token_id: None,
+                vision_end_token_id: None,
+            };
+
+            let patterned = |len: usize, seed: usize, scale: f32| -> Vec<f32> {
+                (0..len)
+                    .map(|i| {
+                        let bucket = (i.wrapping_mul(37).wrapping_add(seed)) % 31;
+                        (bucket as f32 - 15.0) * scale
+                    })
+                    .collect()
+            };
+            let make_common = || CommonLayerWeights {
+                input_layernorm: patterned(hidden, 1, 0.002),
+                post_attention_layernorm: patterned(hidden, 2, 0.002),
+                ffn: FeedForwardWeights::Dense(DenseFfnWeights {
+                    gate_proj: patterned(intermediate * hidden, 3, 0.001),
+                    up_proj: patterned(intermediate * hidden, 4, 0.001),
+                    down_proj: patterned(hidden * intermediate, 5, 0.001),
+                }),
+            };
+            let gdn = AttentionWeights::Linear(GatedDeltaNetWeights {
+                in_proj_qkv: patterned(qkv_dim * hidden, 6, 0.0005),
+                in_proj_qkv_rows: qkv_dim,
+                in_proj_qkv_cols: hidden,
+                in_proj_z: patterned(out_dim * hidden, 7, 0.0005),
+                in_proj_z_rows: out_dim,
+                in_proj_z_cols: hidden,
+                in_proj_b: patterned(num_kh * hidden, 8, 0.001),
+                in_proj_b_rows: num_kh,
+                in_proj_b_cols: hidden,
+                in_proj_a: patterned(num_kh * hidden, 9, 0.001),
+                in_proj_a_rows: num_kh,
+                in_proj_a_cols: hidden,
+                a_log: patterned(num_kh, 10, 0.01),
+                dt_bias: patterned(num_kh, 11, 0.01),
+                conv1d_weight: patterned(qkv_dim * ks, 12, 0.002),
+                conv_dim: qkv_dim,
+                kernel_size: ks,
+                norm_weight: patterned(out_dim, 13, 0.002),
+                out_proj: patterned(hidden * out_dim, 14, 0.0005),
+                out_proj_rows: hidden,
+                out_proj_cols: out_dim,
+            });
+            let full = AttentionWeights::Full(FullAttentionLayerWeights {
+                q_proj: patterned(2 * cfg.full_q_dim() * hidden, 15, 0.0005),
+                k_proj: patterned(cfg.full_kv_dim() * hidden, 16, 0.0005),
+                v_proj: patterned(cfg.full_kv_dim() * hidden, 17, 0.0005),
+                o_proj: patterned(hidden * cfg.full_q_dim(), 18, 0.0005),
+                q_norm: patterned(cfg.head_dim, 19, 0.002),
+                k_norm: patterned(cfg.head_dim, 20, 0.002),
+            });
+            let weights = ModelWeights {
+                embed_tokens: patterned(vocab * hidden, 21, 0.002),
+                lm_head: None,
+                final_norm: patterned(hidden, 22, 0.002),
+                layers: vec![(gdn, make_common()), (full, make_common())],
+            };
+            (cfg, weights)
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[derive(Debug, PartialEq)]
+        struct PrefillSchedulerArtifacts {
+            position: usize,
+            kv_rows: Vec<(Vec<u8>, Vec<u8>)>,
+            gdn_snapshot: crate::attention::gdn::GdnSnapshot,
+            next_token: usize,
+        }
+
+        #[cfg(feature = "bench-internals")]
+        fn prefill_scheduler_artifacts(
+            state: &mut MetalQwen35State,
+            token_ids: &[u32],
+            next_input: u32,
+        ) -> PrefillSchedulerArtifacts {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let kv_row_bytes = if state.use_kv_f16 { 2 } else { 4 };
+            let used_bytes = token_ids.len() * state.engine.config.full_kv_dim() * kv_row_bytes;
+            let kv_rows = state
+                .session
+                .kv_cache
+                .k_bufs
+                .iter()
+                .zip(&state.session.kv_cache.v_bufs)
+                .map(|(k, v)| {
+                    // SAFETY: Both buffers are StorageModeShared, the scheduler waited for its
+                    // command buffers, and used_bytes covers only initialized prefix rows.
+                    unsafe {
+                        let k_bytes =
+                            std::slice::from_raw_parts(k.contents() as *const u8, used_bytes)
+                                .to_vec();
+                        let v_bytes =
+                            std::slice::from_raw_parts(v.contents() as *const u8, used_bytes)
+                                .to_vec();
+                        (k_bytes, v_bytes)
+                    }
+                })
+                .collect();
+            let position = state.session.position;
+            let gdn_snapshot = state.snapshot_gdn_states();
+            let next_logits = state.forward_step(next_input, token_ids.len());
+            PrefillSchedulerArtifacts {
+                position,
+                kv_rows,
+                gdn_snapshot,
+                next_token: argmax_f32(&next_logits),
+            }
+        }
+
         #[test]
         fn forward_step_gdn_only_does_not_advance_kv_cache() {
             let Some(_) = metal::Device::system_default() else {
@@ -25614,11 +26211,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // ===================================================================
-        // Tester suite (issue #171): mutation-sensitive correctness tests for
-        // the lm_head two-stage block-top-k path. See
-        // ../architect/design_spec.md (Test Plan) and
-        // ../implementer/impl_notes.md. Results + mutation-sensitivity
-        // evidence: ../tester/test_report.md.
+        // Mutation-sensitive correctness tests for
+        // the lm_head two-stage block-top-k path (issue #171).
         // ===================================================================
 
         /// Pure unit test for the route gate (no GPU). Design-spec "Routing
@@ -25754,7 +26348,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             idx
         }
 
-        /// Adversarial distribution from `design_spec.md` Test Plan §3: every
+        /// Adversarial distribution: every
         /// global top-K token clusters inside ONE Stage-1 tile. Proves Stage 1
         /// emits a true per-tile top-`local_k`, not merely a per-tile argmax
         /// or an approximate/truncated local ranking — a distribution where
@@ -25895,16 +26489,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Bypass-sensitive production-path test (design_spec.md Test Plan
-        /// §6): poisons the persistent logits buffer with a sentinel bit
+        /// Bypass-sensitive production-path test: poisons the persistent
+        /// logits buffer with a sentinel bit
         /// pattern, runs the compact greedy route, and asserts the sentinel
         /// survives untouched — proving the full `[vocab_size]` GEMV never
         /// wrote to it, i.e. Stage 1/Stage 2 actually ran instead of the
         /// full-logit path silently computing everything and discarding the
         /// extra values.
         ///
-        /// MUTATION-SENSITIVE: see test_report.md for the reverse-apply
-        /// proof — disabling the Stage-1/2 early return in
+        /// MUTATION-SENSITIVE: disabling the Stage-1/2 early return in
         /// `encode_final_head` (forcing every route through the full-logit
         /// GEMV) flips both the sentinel-buffer assertion below AND the
         /// `out.is_empty()` assertion.
@@ -26146,8 +26739,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Acceptance test #1 (task order item 7 / design_spec.md Test Plan
-        /// §4): greedy token agreement 100% vs. the full-logit path on
+        /// Acceptance test: greedy token agreement 100% vs. the full-logit path on
         /// \>=10,000 positions using the real Qwen3.5-0.8B checkpoint.
         /// Overridable via `LATTICE_TEST_GREEDY_POSITIONS` for fast local
         /// iteration; defaults to 10,000 to satisfy the acceptance gate. KV
@@ -26760,6 +27352,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     GdnStateTrafficScope::Decode,
                     Some(&row),
                     None,
+                    crate::forward::signpost::Scope::NotDecode,
                 )
                 .logits;
 
@@ -26774,6 +27367,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     GdnStateTrafficScope::Decode,
                     Some(&row),
                     None,
+                    crate::forward::signpost::Scope::NotDecode,
                 )
                 .logits;
 
@@ -26882,9 +27476,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             prime(&mut state);
-            let logits_a = state.forward_step_injected_mrope(&row, 2, Some((&cos_a, &sin_a)));
+            let logits_a = state.forward_step_injected_mrope(
+                &row,
+                2,
+                Some((&cos_a, &sin_a)),
+                crate::forward::signpost::Scope::NotDecode,
+            );
             prime(&mut state);
-            let logits_b = state.forward_step_injected_mrope(&row, 2, Some((&cos_b, &sin_b)));
+            let logits_b = state.forward_step_injected_mrope(
+                &row,
+                2,
+                Some((&cos_b, &sin_b)),
+                crate::forward::signpost::Scope::NotDecode,
+            );
 
             let max_abs_diff = logits_a
                 .iter()
@@ -26946,9 +27550,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     let end = start + request.decoder_hidden_size;
                     let row = &request.post_merger_rows[start..end];
                     visual_row += 1;
-                    last_logits_real = state_real.forward_step_injected_mrope(row, pos, cos_sin);
+                    last_logits_real = state_real.forward_step_injected_mrope(
+                        row,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 } else {
-                    last_logits_real = state_real.forward_step_mrope(token_id, pos, cos_sin);
+                    last_logits_real = state_real.forward_step_mrope(
+                        token_id,
+                        pos,
+                        cos_sin,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
                 }
             }
 
@@ -27041,11 +27655,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                         let end = start + request.decoder_hidden_size;
                         let row = &request.post_merger_rows[start..end];
                         visual_row += 1;
-                        last_logits = state
-                            .forward_step_injected_mrope_with_head(row, pos, cos_sin, emit_head);
+                        last_logits = state.forward_step_injected_mrope_with_head(
+                            row,
+                            pos,
+                            cos_sin,
+                            emit_head,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
                     } else {
-                        last_logits =
-                            state.forward_step_mrope_with_head(token_id, pos, cos_sin, emit_head);
+                        last_logits = state.forward_step_mrope_with_head(
+                            token_id,
+                            pos,
+                            cos_sin,
+                            emit_head,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
                     }
                 }
                 // Post-prefill state probe: one more decode step, same construction
@@ -27062,6 +27686,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     /* arbitrary next token id */ 13,
                     request.input_ids.len(),
                     Some((decode_cos.as_slice(), decode_sin.as_slice())),
+                    crate::forward::signpost::Scope::NotDecode,
                 );
                 (last_logits, probe_logits)
             };
@@ -27196,7 +27821,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let mut bits_last = Vec::new();
             for (pos, &token_id) in input_ids.iter().enumerate() {
-                let a = state_mrope_none.forward_step_mrope(token_id, pos, None);
+                let a = state_mrope_none.forward_step_mrope(
+                    token_id,
+                    pos,
+                    None,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 let b = state_plain_bits.forward_step(token_id, pos);
                 assert_bits_equal(&a, &b, pos);
                 bits_last = a;
@@ -27211,7 +27841,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     physical_pos, state_plain_bits.session.kv_cache.seq_len,
                     "physical KV positions diverged before decode step {step}"
                 );
-                let a = state_mrope_none.forward_step_mrope(next_id, physical_pos, None);
+                let a = state_mrope_none.forward_step_mrope(
+                    next_id,
+                    physical_pos,
+                    None,
+                    crate::forward::signpost::Scope::NotDecode,
+                );
                 let b = state_plain_bits.forward_step(next_id, physical_pos);
                 assert_bits_equal(&a, &b, input_ids.len() + step);
                 bits_last = a;
@@ -27362,9 +27997,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                         let end = start + request.decoder_hidden_size;
                         let row = &request.post_merger_rows[start..end];
                         visual_row += 1;
-                        last_logits = state.forward_step_injected_mrope(row, pos, cos_sin);
+                        last_logits = state.forward_step_injected_mrope(
+                            row,
+                            pos,
+                            cos_sin,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
                     } else {
-                        last_logits = state.forward_step_mrope(token_id, pos, cos_sin);
+                        last_logits = state.forward_step_mrope(
+                            token_id,
+                            pos,
+                            cos_sin,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
                     }
                 }
                 let mut all_ids = request.input_ids.clone();
@@ -27390,7 +28035,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 } else {
                     None
                 };
-                state.forward_step_mrope(first_id, physical_pos, cos_sin)
+                state.forward_step_mrope(
+                    first_id,
+                    physical_pos,
+                    cos_sin,
+                    crate::forward::signpost::Scope::NotDecode,
+                )
             };
 
             let logits_correct = manual_decode_logits(true);
@@ -27610,8 +28260,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Acceptance test #2 (task order item 7 / design_spec.md Test Plan
-        /// §5): top-k SET agreement 100% for K in {8,16,40,64} vs. the
+        /// Acceptance test: top-k SET agreement 100% for K in {8,16,40,64} vs. the
         /// full-logit CPU oracle, on real checkpoint positions (the
         /// clustered-tile adversarial case is covered separately by
         /// `lm_head_block_topk_clustered_single_tile_set_agreement`).
@@ -28195,11 +28844,20 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// across BOTH test threads in this process and any other process on the
         /// machine.
         ///
-        /// In-process half: concurrent GPU execution amplifies the pre-existing
-        /// ADR-065 attention race, which perturbs the *serial* GDN reference that
-        /// the cross-algorithm parity tests compare against — producing
-        /// false-positive failures under `cargo test`'s default multi-threading.
-        /// The chunked scan itself is deterministic (see
+        /// In-process half: the Metal batched/decode attention kernels carry a
+        /// runtime-only nondeterminism that perturbs logit values by small
+        /// magnitudes on roughly 1-in-N runs. Static analysis of
+        /// `gdn_recurrence_fused` and `decode_attention` found both barrier-correct
+        /// (no uninitialized threadgroup reads, no intra-dispatch cross-threadgroup
+        /// device race, no untracked buffers), so the hazard has not been
+        /// root-caused — it is only observable via GPU frame capture (Xcode Metal
+        /// debugger), which no run here has done yet. Concurrent GPU execution
+        /// amplifies it, and it perturbs the *serial* GDN reference that the
+        /// cross-algorithm parity tests compare against — producing false-positive
+        /// failures under `cargo test`'s default multi-threading. Argmax stays
+        /// stable across the perturbation; only logit values drift (see the
+        /// chunked-prefill parity test below for the magnitude evidence). The
+        /// chunked scan itself is deterministic (see
         /// `gdn_chunked_b_vs_b_self_consistency`); serializing device access keeps
         /// the serial reference clean run-to-run.
         ///
@@ -29818,7 +30476,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// old `Ok` shape would additionally have `stop_reason: None`, the
         /// invariant-violating result #856 fixes).
         ///
-        /// PR #915 review feedback (fix 4): honors
+        /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
         /// test, so a required Metal CI leg fails loud on a missing device
         /// instead of silently passing without ever exercising the guard.
@@ -29971,7 +30629,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// through prefill and sampling instead of erroring, so
         /// `result.is_err()` fails.
         ///
-        /// PR #915 review feedback (fix 4): honors
+        /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
         /// test, so a required Metal CI leg fails loud on a missing device
         /// instead of silently passing without ever exercising the guard.
@@ -30446,6 +31104,55 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
+        #[test]
+        fn restore_gdn_states_rejects_short_snapshot_without_writes() {
+            use crate::speculative::MtpTargetVerifier;
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let mut state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
+            });
+            let mut malformed = state.snapshot_gdn_states();
+            assert!(
+                malformed.len() > 1,
+                "fixture must expose a partial-restore boundary"
+            );
+            malformed.pop();
+
+            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: StorageModeShared buffer; no command buffer is in flight.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = 10.0 + li as f32 + k as f32 * 1e-4;
+                    }
+                }
+            }
+            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: see above.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = -10.0 - li as f32 - k as f32 * 1e-4;
+                    }
+                }
+            }
+
+            let before = state.snapshot_gdn_states();
+            state.restore_gdn_states(&malformed);
+            let after = state.snapshot_gdn_states();
+            assert!(
+                after == before,
+                "a malformed snapshot must not partially overwrite live GDN buffers"
+            );
+        }
+
         // -----------------------------------------------------------------------
         // Chunked batched prefill parity tests
         // -----------------------------------------------------------------------
@@ -30607,8 +31314,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // debugger). The argmax is STABLE across hundreds of runs, so generated tokens
             // are unaffected; only logit *values* drift. The hard guarantee this test
             // enforces is therefore argmax equality; the logit-value bound is a loose
-            // regression guard, not a strict-parity assertion. See RACE_FIX_NOTES.md /
-            // ADR-065 for the full diagnosis and the GPU-capture path to a true fix.
+            // regression guard, not a strict-parity assertion. Root cause is unconfirmed:
+            // a GPU frame capture of a divergent run is the diagnostic that could show the
+            // actual dispatch-level ordering hazard, and nothing in this tree has done that
+            // capture yet (see `gpu_test_lock`'s doc comment for what static analysis has
+            // and hasn't ruled out).
             assert!(
                 max_abs_diff < 0.5,
                 "chunked prefill logits diverged from step loop beyond the known-issue \
@@ -30774,7 +31484,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // the emit_logits gate) — its final-position row is what an unskipped last
             // chunk would have produced.
             state.reset_state();
-            let all_logits = state.forward_prefill_all_logits(&tokens);
+            let all_logits = state
+                .forward_prefill_all_logits(&tokens)
+                .expect("LoRA-inactive all-position prefill succeeds");
             assert_eq!(
                 all_logits.len(),
                 tokens.len() * vocab,
@@ -30849,7 +31561,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             // Must not panic; returns n * vocab_size f32 values.
             state.reset_state();
-            let flat = state.forward_prefill_all_logits(&tokens);
+            let flat = state
+                .forward_prefill_all_logits(&tokens)
+                .expect("LoRA-inactive all-position prefill succeeds");
             assert_eq!(
                 flat.len(),
                 tokens.len() * model.config().vocab_size,
@@ -30930,6 +31644,132 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 MetalQwen35State::make_gdn_chunk_params(&cfg, 0).is_none(),
                 "n_tokens=0 should return None"
             );
+        }
+
+        #[cfg(feature = "bench-internals")]
+        fn run_gdn_prefill_scheduler_pair(
+            cfg: &Qwen35Config,
+            weights: &ModelWeights,
+            tokens: &[u32],
+            chunked: bool,
+        ) -> (
+            PrefillSchedulerArtifacts,
+            PrefillSchedulerArtifacts,
+            bench_support::GdnIsolatedChunkTiming,
+            Vec<bench_support::GdnLayerCapture>,
+        ) {
+            let mut production =
+                MetalQwen35State::new(weights, cfg, 16).expect("production scheduler fixture");
+            production.use_gdn_chunked = chunked;
+            let _ = production.forward_prefill_batched_chunk(tokens, 0, true, false);
+            let production_artifacts = prefill_scheduler_artifacts(&mut production, tokens, 9);
+
+            let mut isolated =
+                MetalQwen35State::new(weights, cfg, 16).expect("isolated scheduler fixture");
+            isolated.use_gdn_chunked = chunked;
+            let capture_requests = if chunked {
+                vec![bench_support::GdnCaptureRequest {
+                    linear_idx: 0,
+                    value_head: 3,
+                }]
+            } else {
+                vec![]
+            };
+            let (timing, captures) =
+                isolated.forward_prefill_chunk_gdn_isolated(tokens, 0, &capture_requests);
+            let isolated_artifacts = prefill_scheduler_artifacts(&mut isolated, tokens, 9);
+            (production_artifacts, isolated_artifacts, timing, captures)
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn gdn_prefill_production_and_isolated_scheduler_state_matches() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_chunked_prefill_fixture();
+            let tokens = [1, 3, 5, 7];
+            for chunked in [false, true] {
+                let (production, isolated, _, _) =
+                    run_gdn_prefill_scheduler_pair(&cfg, &weights, &tokens, chunked);
+                assert_eq!(production.position, isolated.position, "chunked={chunked}");
+                assert_eq!(production.kv_rows, isolated.kv_rows, "chunked={chunked}");
+                assert_eq!(
+                    production.gdn_snapshot, isolated.gdn_snapshot,
+                    "chunked={chunked}"
+                );
+            }
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn gdn_prefill_scheduler_followup_and_capture_match() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_chunked_prefill_fixture();
+            let tokens = [1, 3, 5, 7];
+            for chunked in [false, true] {
+                let (production, isolated, timing, captures) =
+                    run_gdn_prefill_scheduler_pair(&cfg, &weights, &tokens, chunked);
+                assert_eq!(
+                    production.next_token, isolated.next_token,
+                    "chunked={chunked}"
+                );
+                assert_eq!(timing.num_gdn_layers, 1, "chunked={chunked}");
+                if chunked {
+                    assert_eq!(captures.len(), 1);
+                    let capture = &captures[0];
+                    assert_eq!(capture.linear_idx, 0);
+                    assert_eq!(capture.value_head, 3);
+                    assert_eq!(capture.length, tokens.len());
+                    assert_eq!(capture.dk, 128);
+                    assert_eq!(capture.dv, 128);
+                    assert_eq!(capture.q.len(), tokens.len() * capture.dk);
+                    assert_eq!(capture.k.len(), tokens.len() * capture.dk);
+                    assert_eq!(capture.v.len(), tokens.len() * capture.dv);
+                    assert_eq!(capture.beta.len(), tokens.len());
+                    assert_eq!(capture.log_alpha.len(), tokens.len());
+                } else {
+                    assert!(captures.is_empty());
+                }
+            }
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn gdn_prefill_schedulers_preserve_unsupported_chunked_policy() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            assert!(!MetalQwen35State::supports_gdn_chunked_prefill(&cfg));
+
+            let mut production =
+                MetalQwen35State::new(&weights, &cfg, 8).expect("production fallback fixture");
+            production.use_gdn_chunked = true;
+            let _ = production.forward_prefill_batched_chunk(&[1, 2], 0, true, false);
+            assert_eq!(production.session.position, 2);
+            assert_eq!(production.session.kv_cache.seq_len, 2);
+
+            use crate::speculative::MtpTargetVerifier as _;
+            let mut isolated =
+                MetalQwen35State::new(&weights, &cfg, 8).expect("isolated preflight fixture");
+            isolated.use_gdn_chunked = true;
+            let before = isolated.snapshot_gdn_states();
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                isolated.forward_prefill_chunk_gdn_isolated(&[1, 2], 0, &[])
+            }));
+            assert!(
+                panic.is_err(),
+                "isolated scheduler must reject unsupported chunked GDN"
+            );
+            assert_eq!(isolated.session.position, 0);
+            assert_eq!(isolated.session.kv_cache.seq_len, 0);
+            assert_eq!(isolated.snapshot_gdn_states(), before);
         }
 
         /// Verify make_gdn_chunk_params with tail chunk (n_tokens not multiple of 32).
@@ -31172,7 +32012,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // The chunked GDN scan is itself deterministic — gdn_chunked_b_vs_b_self_consistency and
             // the race-localization probe both show chunked-vs-chunked state diff = 0.0 across many
             // runs.  The only remaining nondeterminism is the pre-existing batched/decode attention
-            // race (ADR-065), which perturbs the residual stream on ~1-in-N runs.  GPU access is
+            // race (root cause unconfirmed; see `gpu_test_lock`'s doc comment for what static
+            // analysis has and hasn't ruled out), which perturbs the residual stream on
+            // ~1-in-N runs.  GPU access is
             // serialized via gpu_test_lock() so that race is not amplified by device contention, but
             // it can still occasionally perturb the *serial* forward_step reference by ~1e-3.
             //
@@ -31233,7 +32075,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         ///
         /// Both paths are selected via `state.use_gdn_chunked` (no process-env mutation), so there
         /// are no setenv races. GPU access is additionally serialized via `gpu_test_lock()` so the
-        /// pre-existing ADR-065 attention race is not amplified by concurrent device contention,
+        /// pre-existing batched/decode attention race (root cause unconfirmed; see
+        /// `gpu_test_lock`'s doc comment) is not amplified by concurrent device contention,
         /// and the deterministic chunked logits are computed once per length while only the serial
         /// reference is retried — a flaky chunked attempt cannot be masked by best-of-N.
         ///
@@ -31279,7 +32122,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             // The chunked scan is deterministic (gdn_chunked_b_vs_b_self_consistency), but
             // chunked-vs-serial all-position value drift grows with prompt length even after
-            // best-of-N discards the ADR-065 serial-race outliers: best-of-5 max_abs_diff
+            // best-of-N discards the batched/decode attention race's serial-reference outliers
+            // (root cause unconfirmed; see `gpu_test_lock`'s doc comment): best-of-5 max_abs_diff
             // reaches ~4.8e-2 at n=1009 and crosses the old 1e-2 bound at n=511/512/513
             // (#534). The value bound below is a drift sentinel, not the correctness gate —
             // the argmax-flip assertion after the sweep is the hard safety check. Tighten
@@ -31308,14 +32152,17 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // fail the gate, never get masked by a lucky retry.
                 state.use_gdn_chunked = true;
                 state.reset_state();
-                let chunked_all = state.forward_prefill_all_logits(&tokens);
+                let chunked_all = state
+                    .forward_prefill_all_logits(&tokens)
+                    .expect("LoRA-inactive chunked all-position prefill succeeds");
                 assert_eq!(
                     chunked_all.len(),
                     n * vocab,
                     "chunked all_logits len mismatch at n={n}"
                 );
 
-                // Best-of-N: the serial reference is perturbed by the ADR-065 race on a minority
+                // Best-of-N: the serial reference is perturbed by the batched/decode attention
+                // race (root cause unconfirmed; see `gpu_test_lock`'s doc comment) on a minority
                 // of runs.  Keep the attempt with the smallest max_abs (and its flip count); a
                 // single clean comparison proves the chunked algorithm correct, so stop early once
                 // one attempt is within bound and flip-free.  Mirrors
@@ -31326,7 +32173,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     // Serial path (chunked OFF): per-position logits via all_logits.
                     state.use_gdn_chunked = false;
                     state.reset_state();
-                    let serial_all = state.forward_prefill_all_logits(&tokens);
+                    let serial_all = state
+                        .forward_prefill_all_logits(&tokens)
+                        .expect("LoRA-inactive serial all-position prefill succeeds");
                     assert_eq!(
                         serial_all.len(),
                         n * vocab,
@@ -32957,27 +33806,37 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _gpu_guard = gpu_test_lock();
 
+            const LEGACY_FIXTURE_CONTEXT: usize = 128;
+            const CHAT_FIXTURE_CONTEXT: usize = 192;
+
             let tokenizer = single_char_vocab_tokenizer();
             let (mut cfg, weights) = tiny_hybrid_fixture();
             // Keep EOS unreachable so every turn generates its full budget,
             // guaranteeing the history keeps growing turn over turn (mirrors the
             // raw-prompt sibling test above).
             cfg.eos_token_id = u32::MAX;
+            cfg.max_position_embeddings = CHAT_FIXTURE_CONTEXT;
 
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
-            // max_cache_len=128 = this fixture's max_position_embeddings ceiling;
-            // four short turns of ChatML-formatted history (role words + content)
-            // stay well under it (~70 tokens at the last turn).
-            let mut cached_state =
-                MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
+            let mut cached_state = MetalQwen35State::new(&weights, &cfg, CHAT_FIXTURE_CONTEXT)
+                .expect("tiny hybrid fixture");
 
             let user_turns = ["a", "bc", "d", "ef"];
             let mut history: Vec<ChatMessage> = vec![ChatMessage::system("")];
             let mut saw_exact_append = false;
+            let mut prompt_lengths = Vec::with_capacity(user_turns.len());
 
             for (turn_idx, user_text) in user_turns.iter().enumerate() {
                 history.push(ChatMessage::user(*user_text));
                 let gen_cfg = cross_turn_test_gen_cfg(42, 2);
+                let rendered_prompt =
+                    format_chat_template(&history).expect("text-only history must render");
+                let prompt_len = tokenizer.tokenize(&rendered_prompt).real_length;
+                prompt_lengths.push(prompt_len);
+                assert!(
+                    prompt_len + gen_cfg.max_new_tokens <= CHAT_FIXTURE_CONTEXT,
+                    "turn {turn_idx}: fixture context must cover the rendered prompt and decode cap"
+                );
 
                 let cached_out = cached_state
                     .chat_completion_streaming_with_prefix_cache(
@@ -32994,7 +33853,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // history — exactly chat_metal's pre-#462 behavior (reset_state +
                 // full re-prefill of the whole ChatML-formatted history every turn).
                 let mut reference_state =
-                    MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
+                    MetalQwen35State::new(&weights, &cfg, CHAT_FIXTURE_CONTEXT)
+                        .expect("tiny hybrid fixture");
                 let reference_gen_cfg = cross_turn_test_gen_cfg(42, 2);
                 let reference_out = reference_state
                     .chat_completion_streaming(
@@ -33035,6 +33895,18 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 history.push(cached_out.output.message.clone());
             }
 
+            assert_eq!(
+                prompt_lengths,
+                [51, 92, 132, 173],
+                "record the four-turn ChatML footprint so template growth cannot silently \
+                 invalidate this cache-parity fixture"
+            );
+            assert!(
+                prompt_lengths
+                    .iter()
+                    .any(|&len| len + 2 > LEGACY_FIXTURE_CONTEXT),
+                "the fixture must exercise history beyond the obsolete 128-token window"
+            );
             assert!(
                 saw_exact_append,
                 "at least one later turn must actually exercise ExactAppend reuse through the \
@@ -34681,6 +35553,168 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        // -----------------------------------------------------------------------
+        // Grammar terminal-at-step-zero integration tests (#1153)
+        //
+        // The all-blocking tests above prove the incomplete/dead-end half of
+        // each post-prefill branch. An epsilon grammar reaches the same
+        // all-NEG_INFINITY mask from an accepting state: no token may extend
+        // the empty document, so that result is a clean Grammar stop rather
+        // than GrammarConstraintBlocked. The fixture asserts both
+        // preconditions before any GPU work so a parser or vocabulary change
+        // cannot make these tests pass through a different branch.
+
+        fn terminal_step_zero_grammar_cfg() -> GenerateConfig {
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use std::sync::Arc;
+
+            let engine = Arc::new(
+                GrammarEngine::new(
+                    &GrammarSpec::Gbnf("root ::= \"\"\n".to_string()),
+                    single_char_vocab_bytes(),
+                )
+                .expect("epsilon grammar builds over single-char vocab"),
+            );
+            let mut grammar_state = engine.initial_state();
+            assert!(
+                engine.is_complete_without_continuation(&grammar_state),
+                "epsilon grammar must start complete with no legal continuation"
+            );
+            let mut logits = vec![0.0; 32];
+            engine
+                .mask_logits(&mut grammar_state, &mut logits)
+                .expect("local epsilon engine and full vocabulary logits must mask");
+            assert!(
+                !crate::forward::metal_qwen35::has_finite_logit(&logits),
+                "terminal epsilon grammar must mask every continuation"
+            );
+
+            GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            }
+        }
+
+        fn assert_terminal_step_zero_output(output: &GenerateOutput) {
+            assert_eq!(output.text, "");
+            assert!(output.token_ids.is_empty());
+            assert_eq!(output.generated_tokens, 0);
+            assert!(output.stopped, "terminal grammar is a successful stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert!(output.token_logprobs.is_empty());
+        }
+
+        /// #1153: `generate` must distinguish an initially terminal grammar
+        /// from the incomplete all-blocking grammar covered above.
+        #[test]
+        fn generate_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let output = state
+                .generate("a", &tokenizer, &terminal_step_zero_grammar_cfg())
+                .expect("an initially terminal grammar is a successful stop");
+            assert_terminal_step_zero_output(&output);
+        }
+
+        /// #1153: the shared streaming implementation must make the same
+        /// terminal-versus-dead-end distinction without emitting a token.
+        #[test]
+        fn generate_streaming_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let mut on_token_calls = 0usize;
+
+            let output = state
+                .generate_streaming(
+                    "a",
+                    &tokenizer,
+                    &terminal_step_zero_grammar_cfg(),
+                    |_, _| {
+                        on_token_calls += 1;
+                        true
+                    },
+                )
+                .expect("an initially terminal grammar is a successful streaming stop");
+            assert_terminal_step_zero_output(&output);
+            assert_eq!(
+                on_token_calls, 0,
+                "step-zero completion must stop before any token reaches on_token"
+            );
+        }
+
+        /// #1153: the prefix-cache Metal path must also return a clean
+        /// terminal stop rather than entering its destructive error recovery.
+        #[test]
+        fn generate_streaming_with_prefix_cache_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut on_token_calls = 0usize;
+
+            let result = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "a",
+                    &tokenizer,
+                    &terminal_step_zero_grammar_cfg(),
+                    |_, _| {
+                        on_token_calls += 1;
+                        true
+                    },
+                )
+                .expect("an initially terminal grammar is a successful cached streaming stop");
+            assert_terminal_step_zero_output(&result.output);
+            assert_eq!(
+                on_token_calls, 0,
+                "step-zero completion must stop before any token reaches on_token"
+            );
+        }
+
         /// `generate_streaming_with_prefix_cache` must reject an empty
         /// prompt with a typed `Err(Inference("empty prompt"))` (#856),
         /// unifying it with all three CPU forward paths instead of the
@@ -34690,7 +35724,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// (`generate_streaming_with_prefix_cache_and_cancel`), before
         /// `_inner` is ever called.
         ///
-        /// PR #915 review feedback (fix 3): a fresh-state / `entry ==
+        /// A fresh-state / `entry ==
         /// None` assertion alone does not exercise the property that
         /// motivated putting the guard in the wrapper rather than
         /// `_inner` -- a *warmed* slot survives the rejection, because the
@@ -34701,10 +35735,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// assert both the exact error and that the pre-existing entry is
         /// unchanged afterward.
         ///
-        /// PR #915 review, second pass: the first version of this
-        /// test only compared `generic.token_ids` while claiming
+        /// Comparing only `generic.token_ids` does not prove
         /// "byte-identical" survival; `MetalCrossTurnPrefixEntry` also
-        /// carries `gdn_snapshot` and sparse `checkpoints`. This version
+        /// carries `gdn_snapshot` and sparse `checkpoints`. This test
         /// compares every field: `generic` (`kv_cache::CrossTurnPrefixEntry`,
         /// which derives `PartialEq`/`Eq` over `slot_id`, `metadata`,
         /// `token_ids`, `represented_len`, the `kv` handle -- itself a
@@ -35350,36 +36383,57 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // -----------------------------------------------------------------------
-        // Grammar fail-closed DECODE-LOOP integration tests (#611)
+        // Grammar DECODE-LOOP integration tests (#611 fail-closed + #1064
+        // completion-is-success)
         //
         // The three tests above only reach the post-prefill masking site: their
-        // fixture blocks every vocab entry from step 0, so `has_finite_logit`
-        // never survives long enough to exercise the second, structurally
-        // identical guard a few lines below in the decode loop of each function
-        // (`generate` :10502, `generate_streaming_with_cancel` :14821,
-        // `generate_streaming_with_prefix_cache_inner` :16975). Reverting any one
-        // of those three decode-loop guards left the three tests above green.
+        // fixture blocks every vocab entry from step 0. The decode loop of each
+        // function (`generate`, `generate_streaming_with_cancel`,
+        // `generate_streaming_with_prefix_cache_inner`) carries two distinct
+        // grammar contracts, each pinned by its own fixture below:
         //
-        // Fixture: a real (non-empty) single-byte vocab table plus the GBNF
-        // grammar `root ::= "a"`. Token id 0 in `single_char_vocab_tokenizer` is
-        // `'a'`, so the initial-state mask allows exactly that one token and
-        // blocks the other 31. After `'a'` is sampled and the grammar state
-        // advances past it, the PDA stack is empty AND `complete == true`
-        // (`GrammarState::can_accept_more()` is `false`), so the *next* mask
-        // blocks all 32 tokens — the fixed point this test targets is one step
-        // later than the prefill-blocked fixture above. `max_new_tokens: 2`
-        // is required so the loop actually reaches the decode iteration that
-        // hits the second mask; with `max_new_tokens: 1` the function would
-        // return successfully after the prefill token and never reach the
-        // decode-loop guard at all.
+        // 1. COMPLETION (#1064): GBNF `root ::= "a"`. Token id 0 in
+        //    `single_char_vocab_tokenizer` is `'a'`; after `'a'` is sampled and
+        //    the grammar advances past it, the state is complete with no legal
+        //    continuation (`is_complete_without_continuation` is true). That is
+        //    a SUCCESSFUL stop: the generated text must come back with
+        //    `stopped: true` / `StopReason::Grammar`, exactly like the CPU
+        //    paths. Each path checks completion at two sites, mirroring the
+        //    CPU `grammar_complete` / `grammar_complete_without_continuation`
+        //    placement: recorded immediately after the INITIAL advance (so a
+        //    zero-iteration decode loop — `max_new_tokens: 1` — cannot fall
+        //    through to Length) and re-checked after every IN-LOOP advance (so
+        //    completion on the final allowed token cannot either). Before
+        //    #1064 the Metal loops missed completion entirely, ran one more
+        //    mask (all 32 logits blocked), and misreported the completed
+        //    generation as GrammarConstraintBlocked; the first #1064 fix
+        //    probed only at the loop top, which no zero-iteration or
+        //    final-iteration run ever reaches, misreporting those as Length.
+        //    Each check is load-bearing: removing the post-initial-advance
+        //    recording fails the `max_one_token` tests below (Length, not
+        //    Grammar); removing a post-advance in-loop check fails that
+        //    path's `final_token` test the same way; removing the loop-top
+        //    `if stopped` break restores the GrammarConstraintBlocked
+        //    misclassification in the `max_new_tokens: 2` completion tests.
         //
-        // Mutation sensitivity: reverting the decode-loop `has_finite_logit`
-        // guard at the corresponding site leaves the all-`NEG_INFINITY` second
-        // mask in place, and the sampler's non-finite-max short-circuit then
-        // silently returns a token instead of failing — each assertion below
-        // fails instead of passing. Verified by temporarily reverse-applying
-        // the guard at each site (`touch`-ing the file so cargo rebuilds) and
-        // re-running these three tests; restored afterward.
+        // 2. DEAD END (#611): GBNF `root ::= "a" "!"`. `'!'` is not in the
+        //    32-entry vocab (`'a'..='z'`, `'A'..='F'`), so after `'a'` the
+        //    grammar requires a byte no token can supply: the state is NOT
+        //    complete and the next mask blocks all 32 tokens. That must remain
+        //    a hard `GrammarConstraintBlocked` error via the decode-loop
+        //    `has_finite_logit` guard; without that guard the sampler's
+        //    non-finite-max short-circuit silently returns a token instead
+        //    of failing.
+        //
+        // The dead-end fixture needs `max_new_tokens: 2` so the loop actually
+        // reaches the decode iteration after the prefill-derived token; with
+        // `max_new_tokens: 1` the function returns at the cap and never masks
+        // a second step. The completion fixtures deliberately run at BOTH
+        // caps: `max_new_tokens: 2` pins the loop-top break, and
+        // `max_new_tokens: 1` pins the post-initial-advance recording that a
+        // zero-iteration loop depends on. `root ::= "a" "a"` at
+        // `max_new_tokens: 2` pins the in-loop post-advance check (completion
+        // lands exactly on the final allowed token).
 
         /// Byte-per-token vocab matching `single_char_vocab_tokenizer`'s id
         /// order (`'a'..='z'` then `'A'..='F'`), so a `GrammarEngine` built
@@ -35398,10 +36452,42 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .collect()
         }
 
-        /// #611: `generate`'s DECODE-LOOP grammar-masking site
-        /// (:10502) must fail closed too, not just the post-prefill site.
+        /// Greedy grammar-constrained `GenerateConfig` over the single-char
+        /// vocab: `gbnf` and the token cap vary per test, everything else is
+        /// the shared deterministic-decode baseline the tests above use.
+        fn single_char_grammar_cfg(
+            gbnf: &str,
+            max_new_tokens: usize,
+        ) -> crate::model::qwen35_config::GenerateConfig {
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use std::sync::Arc;
+
+            let spec = GrammarSpec::Gbnf(gbnf.to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+            crate::model::qwen35_config::GenerateConfig {
+                max_new_tokens,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            }
+        }
+
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate`, not a constraint failure.
         #[test]
-        fn generate_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+        fn generate_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -35412,7 +36498,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -35444,21 +36529,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let result = state.generate("a", &tokenizer, &gen_cfg);
-            assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard once the second step's mask blocks every \
-                 continuation; got {result:?}"
+            let output = result.expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "a",
+                "the completing token must be in the output text"
             );
+            assert_eq!(output.generated_tokens, 1);
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
         }
 
-        /// #611: `generate_streaming`'s DECODE-LOOP grammar-masking
-        /// site (`generate_streaming_with_cancel` :14821) must fail closed
-        /// too. Also asserts `on_token` is invoked at most once — the
-        /// fail-open bug this closes would otherwise emit a bogus second
-        /// token to the caller instead of erroring.
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate_streaming`, and the completing token's delta
+        /// reaches `on_token` exactly once.
         #[test]
-        fn generate_streaming_decode_loop_fails_closed_on_grammar_blocking_second_token() {
+        fn generate_streaming_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -35469,7 +36554,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -35501,31 +36585,28 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             let mut on_token_calls = 0u32;
-            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+            let mut streamed = String::new();
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
                 on_token_calls += 1;
+                streamed.push_str(delta);
                 true
             });
 
-            assert!(
-                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard via generate_streaming(); got {result:?}"
+            let output = result.expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(output.text, "a");
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(
+                on_token_calls, 1,
+                "exactly the completing token's delta reaches on_token"
             );
-            assert!(
-                on_token_calls <= 1,
-                "the decode-loop guard must fire before a second (bogus) token \
-                 ever reaches on_token; got {on_token_calls} calls"
-            );
+            assert_eq!(streamed, "a");
         }
 
-        /// #611: `generate_streaming_with_prefix_cache`'s
-        /// DECODE-LOOP grammar-masking site (inside
-        /// `generate_streaming_with_prefix_cache_inner` :16975) must fail
-        /// closed too, AND the public wrapper's error path must not save a
-        /// cache entry the decode-loop failure invalidated.
+        /// #1064: a grammar that completes after one token is a successful
+        /// stop via `generate_streaming_with_prefix_cache` too.
         #[test]
-        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_blocking_second_token()
-         {
+        fn generate_streaming_with_prefix_cache_decode_loop_completed_grammar_is_success() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
                 assert!(
@@ -35536,7 +36617,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
-            use crate::error::InferenceError;
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
@@ -35576,11 +36656,422 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 |_, _| true,
             );
 
+            let output = result
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "a");
+            assert!(output.stopped, "grammar completion is a natural stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// One-token regression (#1064 follow-up): with `max_new_tokens: 1`
+        /// the decode loop runs zero iterations, so only the
+        /// post-initial-advance completion recording can classify the stop.
+        /// Before the fix `generate` fell through to `stopped: false` /
+        /// `StopReason::Length` for a grammar its only token had completed.
+        #[test]
+        fn generate_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let output = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "a",
+                "the completing token must be in the output text"
+            );
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// One-token regression (#1064 follow-up) via `generate_streaming`:
+        /// the completing token's delta must still reach `on_token` exactly
+        /// once, and the stop must classify as Grammar, not Length.
+        #[test]
+        fn generate_streaming_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let mut on_token_calls = 0u32;
+            let mut streamed = String::new();
+            let output = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    on_token_calls += 1;
+                    streamed.push_str(delta);
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error");
+
+            assert_eq!(output.text, "a");
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(
+                on_token_calls, 1,
+                "exactly the completing token's delta reaches on_token"
+            );
+            assert_eq!(streamed, "a");
+        }
+
+        /// One-token regression (#1064 follow-up) via
+        /// `generate_streaming_with_prefix_cache`.
+        #[test]
+        fn generate_streaming_with_prefix_cache_max_one_token_completed_grammar_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\"\n", 1);
+
+            let output = state
+                .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "a");
+            assert_eq!(output.generated_tokens, 1);
+            assert!(
+                output.stopped,
+                "first-token grammar completion at max_new_tokens=1 is a \
+                 natural stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// Final-token regression (#1064 follow-up): `root ::= "a" "a"` at
+        /// `max_new_tokens: 2` completes on the decode loop's LAST allowed
+        /// iteration, so no following loop top exists and only the in-loop
+        /// post-advance completion check can classify the stop. Before the
+        /// fix `generate` exited by count and misreported Length.
+        #[test]
+        fn generate_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let output = state
+                .generate("a", &tokenizer, &gen_cfg)
+                .expect("a completed grammar is a successful stop, not an error");
+            assert_eq!(
+                output.text, "aa",
+                "both grammar-forced tokens must be in the output text"
+            );
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// Final-token regression (#1064 follow-up) via `generate_streaming`.
+        #[test]
+        fn generate_streaming_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let mut streamed = String::new();
+            let output = state
+                .generate_streaming("a", &tokenizer, &gen_cfg, |delta, _id| {
+                    streamed.push_str(delta);
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error");
+
+            assert_eq!(output.text, "aa");
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert_eq!(streamed, "aa");
+        }
+
+        /// Final-token regression (#1064 follow-up) via
+        /// `generate_streaming_with_prefix_cache`.
+        #[test]
+        fn generate_streaming_with_prefix_cache_final_token_grammar_completion_is_grammar_stop() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let gen_cfg = single_char_grammar_cfg("root ::= \"a\" \"a\"\n", 2);
+
+            let output = state
+                .generate_streaming_with_prefix_cache(slot_id, "a", &tokenizer, &gen_cfg, |_, _| {
+                    true
+                })
+                .expect("a completed grammar is a successful stop, not an error")
+                .output;
+            assert_eq!(output.text, "aa");
+            assert_eq!(output.generated_tokens, 2);
+            assert!(
+                output.stopped,
+                "grammar completion on the final allowed token is a natural \
+                 stop, not a length cap"
+            );
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+        }
+
+        /// #611: a grammar that dead-ends mid-document (`root ::= "a" "!"`,
+        /// with `'!'` absent from the vocab) must still fail closed at
+        /// `generate`'s decode-loop `has_finite_logit` guard: the state is not
+        /// complete, so the all-blocked mask is a real constraint failure.
+        #[test]
+        fn generate_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
             assert!(
                 matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
-                "a grammar allowing exactly one token must fail closed at the \
-                 decode-loop guard via generate_streaming_with_prefix_cache(); \
-                 got {result:?}"
+                "a grammar whose only continuation byte has no vocab token must \
+                 fail closed at the decode-loop guard; got {result:?}"
+            );
+        }
+
+        /// #611: the same mid-document dead end must fail closed via
+        /// `generate_streaming` as well, with at most the first (legal) token
+        /// reaching `on_token`.
+        #[test]
+        fn generate_streaming_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let mut on_token_calls = 0u32;
+            let result = state.generate_streaming("a", &tokenizer, &gen_cfg, |_delta, _id| {
+                on_token_calls += 1;
+                true
+            });
+
+            assert!(
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
+                "a mid-document grammar dead end must fail closed via \
+                 generate_streaming(); got {result:?}"
+            );
+            assert!(
+                on_token_calls <= 1,
+                "the decode-loop guard must fire before a second (bogus) token \
+                 ever reaches on_token; got {on_token_calls} calls"
+            );
+        }
+
+        /// #611: the same mid-document dead end must fail closed via
+        /// `generate_streaming_with_prefix_cache`, and the error path must not
+        /// leave a cache entry behind.
+        #[test]
+        fn generate_streaming_with_prefix_cache_decode_loop_fails_closed_on_grammar_dead_end() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use crate::model::qwen35_config::GenerateConfig;
+            use std::sync::Arc;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            let spec = GrammarSpec::Gbnf("root ::= \"a\" \"!\"\n".to_string());
+            let engine = Arc::new(
+                GrammarEngine::new(&spec, single_char_vocab_bytes())
+                    .expect("grammar engine builds over single-char vocab"),
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 2,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+
+            assert!(
+                matches!(result, Err(InferenceError::GrammarConstraintBlocked(_))),
+                "a mid-document grammar dead end must fail closed via \
+                 generate_streaming_with_prefix_cache(); got {result:?}"
             );
             assert!(
                 state.cross_turn_prefix_cache.entry.is_none(),
@@ -37227,13 +38718,27 @@ impl MetalQwen35State {
     }
 
     /// **Unstable**: Metal single-token forward step stub.
-    pub fn forward_step(&mut self, _token_id: u32, _position: usize) -> Vec<f32> {
-        Vec::new()
+    pub fn forward_step(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+        match self.try_forward_step(token_id, position) {
+            Ok(logits) => logits,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// **Unstable**: fallible Metal single-token forward step stub.
+    pub fn try_forward_step(
+        &mut self,
+        _token_id: u32,
+        _position: usize,
+    ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
     }
 
     /// **Unstable**: Metal generate stub; always errors without metal-gpu feature.
     ///
-    /// #856 follow-up (PR #915 review, first pass): this used to
+    /// #856 follow-up: this used to
     /// return an unconditional `Ok(GenerateOutput { .. })` with empty
     /// text/tokens for *every* prompt, including non-empty ones. Because
     /// `MetalQwen35State` is a public unit struct on this cfg (directly

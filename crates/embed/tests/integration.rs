@@ -211,18 +211,40 @@ fn test_simd_config_detect_consistent() {
 
 #[test]
 fn test_simd_config_cached() {
-    // simd_config() should return cached value quickly
+    let expected = simd_config();
+    let actual = simd_config();
+    assert_eq!(actual, expected);
+
     let start = std::time::Instant::now();
     for _ in 0..10000 {
         let _ = simd_config();
     }
     let elapsed = start.elapsed();
 
-    // Should be very fast (cached)
-    assert!(
-        elapsed.as_micros() < 1000, // Less than 1ms for 10k calls
-        "simd_config() should be cached, took {:?}",
-        elapsed
+    // Should be very fast (cached). Wall-clock timing flakes under shared-CI
+    // load; assert only on a quiet non-CI machine (CI runners set the CI env
+    // var). The 10k calls above still run in CI as a smoke check.
+    if std::env::var_os("CI").is_none() {
+        assert!(
+            elapsed.as_micros() < 1000, // Less than 1ms for 10k calls
+            "simd_config() should be cached, took {:?}",
+            elapsed
+        );
+    }
+}
+
+#[test]
+fn test_simd_config_full_equality_catches_field_diff() {
+    // Comparing the whole struct (rather than enumerating fields) must
+    // discriminate on every field, including ones added after this test
+    // was written.
+    let base = simd_config();
+    let mut mutated = base;
+    mutated.dotprod_enabled = !mutated.dotprod_enabled;
+
+    assert_ne!(
+        mutated, base,
+        "SimdConfig equality did not detect a differing field"
     );
 }
 
@@ -417,12 +439,17 @@ fn test_batch_faster_than_sequential() {
 
     println!("Batch: {:?}, Sequential: {:?}", batch_time, sequential_time);
 
-    // Both should complete quickly (< 10ms for 99 pairs of 384-dim vectors)
-    assert!(
-        batch_time.as_millis() < 100,
-        "Batch operation too slow: {:?}",
-        batch_time
-    );
+    // Both should complete quickly (< 10ms for 99 pairs of 384-dim vectors).
+    // Wall-clock timing flakes under shared-CI load; assert only on a quiet
+    // non-CI machine (CI runners set the CI env var). The batch and sequential
+    // runs above still execute in CI as a smoke check.
+    if std::env::var_os("CI").is_none() {
+        assert!(
+            batch_time.as_millis() < 100,
+            "Batch operation too slow: {:?}",
+            batch_time
+        );
+    }
 }
 
 #[test]
@@ -450,10 +477,14 @@ fn test_large_batch_dot_product() {
     assert_eq!(results.len(), 1000);
     println!("1000 dot products in {:?}", elapsed);
 
-    // Should complete in < 10ms with SIMD
-    assert!(
-        elapsed.as_millis() < 100,
-        "Large batch too slow: {:?}",
-        elapsed
-    );
+    // Should complete in < 10ms with SIMD. Wall-clock timing flakes under
+    // shared-CI load; assert only on a quiet non-CI machine (CI runners set the
+    // CI env var). The results.len() correctness assert above always runs.
+    if std::env::var_os("CI").is_none() {
+        assert!(
+            elapsed.as_millis() < 100,
+            "Large batch too slow: {:?}",
+            elapsed
+        );
+    }
 }
