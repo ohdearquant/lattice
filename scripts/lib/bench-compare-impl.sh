@@ -87,6 +87,13 @@
 # is what makes a confirmed regression stop something.
 set -euo pipefail
 
+# A caller may hand us an inherited git environment (git exports GIT_INDEX_FILE to
+# hooks as a RELATIVE path, and GIT_DIR/GIT_WORK_TREE arrive empty). The worktree
+# add/remove calls below write a git index, so an inherited relative GIT_INDEX_FILE
+# would resolve against our cwd and hit the caller's real index instead. Nothing in
+# this script needs the caller's index state.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
+
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 
@@ -280,15 +287,15 @@ echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
 print_execution_provenance
 quiet_gate "before base"
 
-# --- Keep Spotlight out of the bench worktrees ---
-# The worktrees created below are full repository checkouts. Indexing them
-# produces filesystem churn that lands asymmetrically in whichever measurement
-# phase it overlaps, and a base-then-head run turns that asymmetry into an
-# apparent code delta. The marker suppresses indexing for the whole directory.
-# Recreated every run so a wiped .cache does not silently lose the protection.
+# --- Keep Spotlight out of the benchmark build trees ---
+# .cache protects the detached base/head worktrees. The separate target marker
+# protects the default in-place HEAD arm: without it the base is excluded while
+# the head build dirties thousands of indexed files immediately before timing.
+# Recreate both every run because deleting either tree deletes its own marker.
 # Inert on non-macOS. Fail-closed: refuse to measure without the protection
 # rather than emit numbers that look trustworthy and are not.
 "$REPO/scripts/lib/ensure-noindex-marker.sh" "$REPO/.cache"
+"$REPO/scripts/lib/ensure-noindex-marker.sh" "$REPO/target"
 
 # --- Worktree for base ref ---
 WT="$REPO/.cache/bench-compare-base"

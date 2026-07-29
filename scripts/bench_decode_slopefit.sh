@@ -29,6 +29,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# The scheduled macOS measurement builds in this checkout. Reapply the marker
+# before every build because cleaning target removes the protection with it.
+"$REPO/scripts/lib/ensure-noindex-marker.sh" "$REPO/target"
+
 # Build before benchmarking; cargo incremental prevents stale release binaries.
 >&2 echo "[slopefit] building bench_decode_slopefit (release)..."
 cargo build --release -p lattice-inference --bin bench_decode_slopefit \

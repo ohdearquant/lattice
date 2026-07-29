@@ -47,6 +47,9 @@ STUB_CARGO = """#!/usr/bin/env bash
 exit 0
 """
 
+# Test helpers invoking real Git must disable repository hooks.
+GIT = ("git", "-c", "core.hooksPath=/dev/null")
+
 
 class _Sandbox:
     """A throwaway repo holding the shipping scripts, with locks redirected."""
@@ -63,11 +66,11 @@ class _Sandbox:
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.root)], check=True)
+        subprocess.run([*GIT, "init", "-q", "-b", "main", str(self.root)], check=True)
         for i in range(2):
             (self.root / f"f{i}.txt").write_text(str(i))
-            subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
-            subprocess.run(["git", "-C", str(self.root), "commit", "-qm", f"c{i}"],
+            subprocess.run([*GIT, "-C", str(self.root), "add", "-A"], check=True)
+            subprocess.run([*GIT, "-C", str(self.root), "commit", "-qm", f"c{i}"],
                            check=True, env=env_git)
 
         locks = self.root / "scripts" / "lib" / "bench-locks.py"

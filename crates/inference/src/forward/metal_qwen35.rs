@@ -35048,6 +35048,168 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        // -----------------------------------------------------------------------
+        // Grammar terminal-at-step-zero integration tests (#1153)
+        //
+        // The all-blocking tests above prove the incomplete/dead-end half of
+        // each post-prefill branch. An epsilon grammar reaches the same
+        // all-NEG_INFINITY mask from an accepting state: no token may extend
+        // the empty document, so that result is a clean Grammar stop rather
+        // than GrammarConstraintBlocked. The fixture asserts both
+        // preconditions before any GPU work so a parser or vocabulary change
+        // cannot make these tests pass through a different branch.
+
+        fn terminal_step_zero_grammar_cfg() -> GenerateConfig {
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use std::sync::Arc;
+
+            let engine = Arc::new(
+                GrammarEngine::new(
+                    &GrammarSpec::Gbnf("root ::= \"\"\n".to_string()),
+                    single_char_vocab_bytes(),
+                )
+                .expect("epsilon grammar builds over single-char vocab"),
+            );
+            let mut grammar_state = engine.initial_state();
+            assert!(
+                engine.is_complete_without_continuation(&grammar_state),
+                "epsilon grammar must start complete with no legal continuation"
+            );
+            let mut logits = vec![0.0; 32];
+            engine
+                .mask_logits(&mut grammar_state, &mut logits)
+                .expect("local epsilon engine and full vocabulary logits must mask");
+            assert!(
+                !crate::forward::metal_qwen35::has_finite_logit(&logits),
+                "terminal epsilon grammar must mask every continuation"
+            );
+
+            GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            }
+        }
+
+        fn assert_terminal_step_zero_output(output: &GenerateOutput) {
+            assert_eq!(output.text, "");
+            assert!(output.token_ids.is_empty());
+            assert_eq!(output.generated_tokens, 0);
+            assert!(output.stopped, "terminal grammar is a successful stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert!(output.token_logprobs.is_empty());
+        }
+
+        /// #1153: `generate` must distinguish an initially terminal grammar
+        /// from the incomplete all-blocking grammar covered above.
+        #[test]
+        fn generate_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let output = state
+                .generate("a", &tokenizer, &terminal_step_zero_grammar_cfg())
+                .expect("an initially terminal grammar is a successful stop");
+            assert_terminal_step_zero_output(&output);
+        }
+
+        /// #1153: the shared streaming implementation must make the same
+        /// terminal-versus-dead-end distinction without emitting a token.
+        #[test]
+        fn generate_streaming_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let mut on_token_calls = 0usize;
+
+            let output = state
+                .generate_streaming(
+                    "a",
+                    &tokenizer,
+                    &terminal_step_zero_grammar_cfg(),
+                    |_, _| {
+                        on_token_calls += 1;
+                        true
+                    },
+                )
+                .expect("an initially terminal grammar is a successful streaming stop");
+            assert_terminal_step_zero_output(&output);
+            assert_eq!(
+                on_token_calls, 0,
+                "step-zero completion must stop before any token reaches on_token"
+            );
+        }
+
+        /// #1153: the prefix-cache Metal path must also return a clean
+        /// terminal stop rather than entering its destructive error recovery.
+        #[test]
+        fn generate_streaming_with_prefix_cache_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut on_token_calls = 0usize;
+
+            let result = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "a",
+                    &tokenizer,
+                    &terminal_step_zero_grammar_cfg(),
+                    |_, _| {
+                        on_token_calls += 1;
+                        true
+                    },
+                )
+                .expect("an initially terminal grammar is a successful cached streaming stop");
+            assert_terminal_step_zero_output(&result.output);
+            assert_eq!(
+                on_token_calls, 0,
+                "step-zero completion must stop before any token reaches on_token"
+            );
+        }
+
         /// `generate_streaming_with_prefix_cache` must reject an empty
         /// prompt with a typed `Err(Inference("empty prompt"))` (#856),
         /// unifying it with all three CPU forward paths instead of the

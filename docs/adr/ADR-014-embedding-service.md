@@ -25,6 +25,20 @@ pub trait EmbeddingService: Send + Sync {
 `CachedEmbeddingService` wraps any `EmbeddingService` with an LRU cache
 (sharded by text hash, configurable capacity).
 
+### Compositional validation capability (2026-07-28)
+
+`CachedEmbeddingService` validates caller text before any cache access. Delegating a disabled-cache
+request or a miss through the public role method would make a built-in inner service repeat the
+same caller-bound scan. The trait therefore has a doc-hidden `embed_with_role_prevalidated` hook
+whose opaque `ValidatedTextBatch` argument has no public constructor.
+
+The compatibility default calls the implementor's existing public `embed_with_role` method. This
+preserves arbitrary out-of-tree role overrides, even though an unknown implementation may validate
+again. `NativeEmbeddingService` consumes the proof directly while retaining its model check and
+prepared-text memory backstop. `CachedEmbeddingService` also consumes it directly, so nested cache
+wrappers validate the caller once. A cache miss is represented as borrowed views into the validated
+batch for those built-in paths rather than a cloned `Vec<String>`.
+
 ### Supported models
 
 | Model               | Dims | Use case                        |
@@ -75,4 +89,6 @@ a future step.
 - `ml/embed` is the only crate that imports `ml/inference`.
 - Verbs and the DB layer call `embed.embed_one()` — they never touch inference directly.
 - The cache prevents redundant model calls for repeated text.
+- Built-in cache delegation preserves validation-before-lookup while avoiding a repeated
+  caller-bound scan; unknown trait implementations retain their existing role-method behavior.
 - Drift detection is available but opt-in — no cost when unused.
