@@ -1,6 +1,6 @@
 # Lattice Development Guidelines
 
-Pure Rust inference engine. Apache-2.0. github.com/ohdearquant/lattice
+Pure Rust inference engine. MIT OR Apache-2.0. github.com/ohdearquant/lattice
 
 ## AI-Assisted Contribution Policy
 
