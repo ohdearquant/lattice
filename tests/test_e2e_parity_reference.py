@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import math
 import tempfile
 import unittest
@@ -170,12 +171,63 @@ class FrozenReferenceLoaderRefusalTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "root must be a JSON object"):
                 self._load_with(p)
 
-    def test_empty_object_refuses(self):
-        """An empty object has no provenance; it must not read as a valid fixture."""
+    def test_empty_object_refuses_at_the_schema_guard(self):
+        """An empty object fails the SCHEMA guard.
+
+        Named for what it actually proves. It says nothing about the
+        provenance check, which sits behind the schema guard and is covered
+        separately below.
+        """
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "obj.json"
             p.write_text("{}")
             with self.assertRaisesRegex(RuntimeError, "malformed or do not match this gate"):
+                self._load_with(p)
+
+    def _schema_valid_fixture(self, versions):
+        """A fixture that clears every schema check, so only provenance can fail."""
+        return {
+            "schema_version": 1,
+            "package_versions": versions,
+            "model": {
+                "repo_id": PARITY.MODEL_REPO,
+                "revision": PARITY.MODEL_REVISION,
+            },
+            "generation": {
+                "max_new_tokens": max(PARITY.REFERENCE_TOKEN_COUNTS),
+                "do_sample": False,
+                "temperature": None,
+                "top_p": None,
+                "top_k": None,
+            },
+            "prompts": [],
+        }
+
+    def test_wrong_package_version_refuses_on_provenance_alone(self):
+        """Isolates the provenance check.
+
+        The fixture is schema-valid in every other respect, so the only thing
+        that can reject it is the recorded-vs-installed version comparison.
+        A test that only ever feeds malformed input cannot show that
+        provenance is enforced at all.
+        """
+        bogus = {pkg: "0.0.0+not-installed" for pkg in PARITY.REFERENCE_PACKAGES}
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "prov.json"
+            p.write_text(json.dumps(self._schema_valid_fixture(bogus)))
+            with self.assertRaisesRegex(RuntimeError, "package version mismatch for"):
+                self._load_with(p)
+
+    def test_missing_package_entry_refuses_on_provenance_alone(self):
+        """Same isolation, for an incomplete rather than wrong provenance set."""
+        installed = PARITY.installed_reference_versions()
+        partial = {
+            pkg: installed[pkg] for pkg in PARITY.REFERENCE_PACKAGES[:-1]
+        }
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "partial.json"
+            p.write_text(json.dumps(self._schema_valid_fixture(partial)))
+            with self.assertRaisesRegex(RuntimeError, "must name exactly"):
                 self._load_with(p)
 
 
