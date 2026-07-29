@@ -30,7 +30,6 @@ cargo bench -p lattice-inference
 Benchmarks in `crates/inference/benches/`:
 
 - `inference_bench.rs` — matmul, attention, layer norm, GELU, softmax at BERT-small dimensions
-- `attention_bench.rs` — multi-head attention at varying sequence lengths
 - `compute_attention_bench.rs` — raw attention kernel throughput
 - `decode_attn_bench.rs` — decoder attention path (Qwen3)
 - `kv_cache_layout_bench.rs` — KV cache access patterns (flat vs. paged)
