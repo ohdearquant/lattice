@@ -7064,13 +7064,29 @@ mod inner {
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
         ///
+        /// # Errors
+        ///
+        /// Returns an error when more than one position is requested while a
+        /// LoRA adapter is active, because the batched all-position path does
+        /// not apply LoRA projections.
+        ///
         /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
         /// comment for the invariant this enforces.
-        pub fn forward_prefill_all_logits(&mut self, token_ids: &[u32]) -> Vec<f32> {
+        pub fn forward_prefill_all_logits(
+            &mut self,
+            token_ids: &[u32],
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            if token_ids.len() > 1 && self.lora.is_some() {
+                return Err(crate::error::InferenceError::Inference(
+                    "forward_prefill_all_logits: all-position prefill does not apply LoRA \
+                     adapters; unload the adapter before requesting all-position logits"
+                        .into(),
+                ));
+            }
             self.cross_turn_prefix_cache.clear();
-            self.forward_prefill_impl(token_ids, true)
+            Ok(self.forward_prefill_impl(token_ids, true))
         }
 
         fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
@@ -7097,12 +7113,6 @@ mod inner {
             }
             if self.lora.is_some() {
                 // Batched helper does not apply LoRA adapters; stay on sequential path.
-                if all_positions {
-                    panic!(
-                        "forward_prefill_all_logits: LoRA active — \
-                         batch/all-position prefill does not apply LoRA"
-                    );
-                }
                 let mut last_logits = Vec::new();
                 for (pos, &id) in token_ids.iter().enumerate() {
                     last_logits = self.forward_step(id, pos);
@@ -8912,7 +8922,7 @@ mod inner {
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
                 // id. An accepting state with no legal continuation is a completed
@@ -9110,7 +9120,7 @@ mod inner {
                         let _signpost_grammar = crate::forward::signpost::interval(
                             crate::forward::signpost::Label::DecodeGrammarMask,
                         );
-                        engine.mask_logits(gs, &mut step_logits);
+                        engine.mask_logits(gs, &mut step_logits)?;
                         // Fail closed if the grammar blocked every continuation,
                         // matching the CPU contract (#611).
                         if !super::has_finite_logit(&step_logits) {
@@ -13951,7 +13961,7 @@ mod inner {
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
                 // id. An accepting state with no legal continuation is a completed
@@ -14160,7 +14170,7 @@ mod inner {
                     let _signpost_grammar = crate::forward::signpost::interval(
                         crate::forward::signpost::Label::DecodeGrammarMask,
                     );
-                    engine.mask_logits(gs, &mut step_logits);
+                    engine.mask_logits(gs, &mut step_logits)?;
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
                     if !super::has_finite_logit(&step_logits) {
@@ -15946,8 +15956,8 @@ mod inner {
         /// softmax runs over the full vocabulary at decode step `i`.
         ///
         /// Errors if `tokens.len() < 2`, if `tokens.len() > self.max_context()`
-        /// (the KV cache would overflow during the walk), or if any
-        /// `token_id >= cfg.vocab_size`.
+        /// (the KV cache would overflow during the walk), if any
+        /// `token_id >= cfg.vocab_size`, or if a LoRA adapter is active.
         pub fn compute_token_nlls(
             &mut self,
             tokens: &[u32],
@@ -15985,7 +15995,7 @@ mod inner {
             // Sequential forward_step from pos=0 with reset_state does NOT
             // produce usable next-token distributions and is not used here.
             self.reset_state();
-            let flat = self.forward_prefill_all_logits(tokens);
+            let flat = self.forward_prefill_all_logits(tokens)?;
             debug_assert_eq!(flat.len(), tokens.len() * vocab_size);
             let mut nlls = Vec::with_capacity(tokens.len() - 1);
             for i in 0..tokens.len() - 1 {
@@ -16081,21 +16091,56 @@ mod inner {
         }
 
         fn restore_gdn_states(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
-            if snapshot.is_empty() {
+            if let Err(error) = self.validate_gdn_restore_snapshot(snapshot) {
+                tracing::warn!(
+                    error = %error,
+                    "refusing malformed GDN state restore"
+                );
                 return;
             }
+            self.restore_gdn_states_validated(snapshot);
+        }
+    }
+
+    impl MetalQwen35State {
+        fn validate_gdn_restore_snapshot(
+            &self,
+            snapshot: &crate::attention::gdn::GdnSnapshot,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
             let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            debug_assert_eq!(snapshot.len(), num_layers);
-            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate().take(num_layers) {
+            if snapshot.len() != num_layers {
+                return Err(InferenceError::PrefixCache(format!(
+                    "restore_gdn_states: snapshot has {} layers, expected {num_layers}",
+                    snapshot.len()
+                )));
+            }
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
                 let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
                 let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_bytes = conv_snap.len() * 4;
-                let s_bytes = s_snap.len() * 4;
-                debug_assert_eq!(conv_bytes as u64, conv_buf.length());
-                debug_assert_eq!(s_bytes as u64, s_buf.length());
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
+                    return Err(InferenceError::PrefixCache(format!(
+                        "restore_gdn_states: layer {i} shape mismatch: conv {} != \
+                         {conv_floats} or s {} != {s_floats}",
+                        conv_snap.len(),
+                        s_snap.len()
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        fn restore_gdn_states_validated(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
+            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
                 // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
-                // the buffer directly; callers invoke this outside any in-flight command
-                // buffer (rejection branch in `mtp_verify_draft`).
+                // the buffer directly; validation above proves each snapshot exactly
+                // matches its destination, and callers invoke this outside any in-flight
+                // command buffer (rejection branch in `mtp_verify_draft`).
                 unsafe {
                     let dst = conv_buf.contents() as *mut f32;
                     std::ptr::copy_nonoverlapping(conv_snap.as_ptr(), dst, conv_snap.len());
@@ -16538,40 +16583,15 @@ mod inner {
             Ok(self.snapshot_gdn_states())
         }
 
-        /// Shape-checked wrapper around [`Self::restore_gdn_states`]. The
-        /// underlying restore only asserts shapes in debug builds
-        /// (`debug_assert_eq!`); this validates explicitly in all builds and
-        /// returns `InferenceError::PrefixCache` instead of restoring
-        /// mismatched buffers or panicking.
+        /// Fallible sibling of [`Self::restore_gdn_states`] for callers that
+        /// can propagate a malformed-snapshot error instead of using the
+        /// infallible trait entry point's logged, no-write rejection.
         fn restore_gdn_states_checked(
             &mut self,
             snapshot: &crate::attention::gdn::GdnSnapshot,
         ) -> Result<(), crate::error::InferenceError> {
-            use crate::error::InferenceError;
-            use crate::speculative::MtpTargetVerifier;
-
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
-            if snapshot.len() != num_layers {
-                return Err(InferenceError::PrefixCache(format!(
-                    "restore_gdn_states_checked: snapshot has {} layers, expected {num_layers}",
-                    snapshot.len()
-                )));
-            }
-            for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
-                let conv_floats = (conv_buf.length() / 4) as usize;
-                let s_floats = (s_buf.length() / 4) as usize;
-                if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
-                    return Err(InferenceError::PrefixCache(format!(
-                        "restore_gdn_states_checked: layer {i} shape mismatch: conv {} != \
-                         {conv_floats} or s {} != {s_floats}",
-                        conv_snap.len(),
-                        s_snap.len()
-                    )));
-                }
-            }
-            self.restore_gdn_states(snapshot);
+            self.validate_gdn_restore_snapshot(snapshot)?;
+            self.restore_gdn_states_validated(snapshot);
             Ok(())
         }
 
@@ -16949,7 +16969,7 @@ mod inner {
             }
 
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut prefill_logits);
+                engine.mask_logits(gs, &mut prefill_logits)?;
                 // If the grammar blocked every token the sampler's non-finite-max
                 // short-circuit would silently return the first candidate's token
                 // id. An accepting state with no legal continuation is a completed
@@ -17208,7 +17228,7 @@ mod inner {
                     let _signpost_grammar = crate::forward::signpost::interval(
                         crate::forward::signpost::Label::DecodeGrammarMask,
                     );
-                    engine.mask_logits(gs, &mut step_logits);
+                    engine.mask_logits(gs, &mut step_logits)?;
                     // Fail closed if the grammar blocked every continuation,
                     // matching the CPU contract (#611).
                     if !super::has_finite_logit(&step_logits) {
@@ -24761,6 +24781,52 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn lora_all_position_prefill_and_nll_return_typed_errors() {
+            let _gpu = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture constructs");
+            state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 1)], 1.0, None)
+                .expect("valid LoRA adapter loads");
+
+            let direct_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.forward_prefill_all_logits(&[1, 2])
+            }));
+            let direct_result =
+                direct_outcome.expect("LoRA all-position prefill must return Err, not panic");
+            let direct_error = direct_result.expect_err("active LoRA must reject all-position");
+            assert!(
+                matches!(
+                    &direct_error,
+                    crate::error::InferenceError::Inference(message)
+                        if message.contains("all-position prefill")
+                            && message.contains("LoRA adapters")
+                ),
+                "unexpected all-position error: {direct_error}"
+            );
+
+            let nll_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.compute_token_nlls(&[1, 2])
+            }));
+            let nll_result =
+                nll_outcome.expect("LoRA compute_token_nlls must return Err, not panic");
+            let nll_error = nll_result.expect_err("active LoRA must reject per-token NLLs");
+            assert!(
+                matches!(
+                    &nll_error,
+                    crate::error::InferenceError::Inference(message)
+                        if message.contains("all-position prefill")
+                            && message.contains("LoRA adapters")
+                ),
+                "unexpected NLL error: {nll_error}"
+            );
+        }
+
+        #[test]
         fn load_lora_adapter_rejects_short_a() {
             let Some(_dev) = metal::Device::system_default() else {
                 return;
@@ -30473,6 +30539,55 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
+        #[test]
+        fn restore_gdn_states_rejects_short_snapshot_without_writes() {
+            use crate::speculative::MtpTargetVerifier;
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let mut state = with_self_spec_env(|| {
+                let (cfg, weights) = tiny_hybrid_fixture();
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture")
+            });
+            let mut malformed = state.snapshot_gdn_states();
+            assert!(
+                malformed.len() > 1,
+                "fixture must expose a partial-restore boundary"
+            );
+            malformed.pop();
+
+            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: StorageModeShared buffer; no command buffer is in flight.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = 10.0 + li as f32 + k as f32 * 1e-4;
+                    }
+                }
+            }
+            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+                let n = (buf.length() / 4) as usize;
+                // SAFETY: see above.
+                unsafe {
+                    let ptr = buf.contents() as *mut f32;
+                    for k in 0..n {
+                        *ptr.add(k) = -10.0 - li as f32 - k as f32 * 1e-4;
+                    }
+                }
+            }
+
+            let before = state.snapshot_gdn_states();
+            state.restore_gdn_states(&malformed);
+            let after = state.snapshot_gdn_states();
+            assert!(
+                after == before,
+                "a malformed snapshot must not partially overwrite live GDN buffers"
+            );
+        }
+
         // -----------------------------------------------------------------------
         // Chunked batched prefill parity tests
         // -----------------------------------------------------------------------
@@ -30804,7 +30919,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // the emit_logits gate) — its final-position row is what an unskipped last
             // chunk would have produced.
             state.reset_state();
-            let all_logits = state.forward_prefill_all_logits(&tokens);
+            let all_logits = state
+                .forward_prefill_all_logits(&tokens)
+                .expect("LoRA-inactive all-position prefill succeeds");
             assert_eq!(
                 all_logits.len(),
                 tokens.len() * vocab,
@@ -30879,7 +30996,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             // Must not panic; returns n * vocab_size f32 values.
             state.reset_state();
-            let flat = state.forward_prefill_all_logits(&tokens);
+            let flat = state
+                .forward_prefill_all_logits(&tokens)
+                .expect("LoRA-inactive all-position prefill succeeds");
             assert_eq!(
                 flat.len(),
                 tokens.len() * model.config().vocab_size,
@@ -31468,7 +31587,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // fail the gate, never get masked by a lucky retry.
                 state.use_gdn_chunked = true;
                 state.reset_state();
-                let chunked_all = state.forward_prefill_all_logits(&tokens);
+                let chunked_all = state
+                    .forward_prefill_all_logits(&tokens)
+                    .expect("LoRA-inactive chunked all-position prefill succeeds");
                 assert_eq!(
                     chunked_all.len(),
                     n * vocab,
@@ -31487,7 +31608,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     // Serial path (chunked OFF): per-position logits via all_logits.
                     state.use_gdn_chunked = false;
                     state.reset_state();
-                    let serial_all = state.forward_prefill_all_logits(&tokens);
+                    let serial_all = state
+                        .forward_prefill_all_logits(&tokens)
+                        .expect("LoRA-inactive serial all-position prefill succeeds");
                     assert_eq!(
                         serial_all.len(),
                         n * vocab,
@@ -33118,27 +33241,36 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _gpu_guard = gpu_test_lock();
 
+            const LEGACY_FIXTURE_CONTEXT: usize = 128;
+            const CHAT_FIXTURE_CONTEXT: usize = 192;
+
             let tokenizer = single_char_vocab_tokenizer();
             let (mut cfg, weights) = tiny_hybrid_fixture();
             // Keep EOS unreachable so every turn generates its full budget,
             // guaranteeing the history keeps growing turn over turn (mirrors the
             // raw-prompt sibling test above).
             cfg.eos_token_id = u32::MAX;
+            cfg.max_position_embeddings = CHAT_FIXTURE_CONTEXT;
 
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
-            // max_cache_len=128 = this fixture's max_position_embeddings ceiling;
-            // four short turns of ChatML-formatted history (role words + content)
-            // stay well under it (~70 tokens at the last turn).
-            let mut cached_state =
-                MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
+            let mut cached_state = MetalQwen35State::new(&weights, &cfg, CHAT_FIXTURE_CONTEXT)
+                .expect("tiny hybrid fixture");
 
             let user_turns = ["a", "bc", "d", "ef"];
             let mut history: Vec<ChatMessage> = vec![ChatMessage::system("")];
             let mut saw_exact_append = false;
+            let mut prompt_lengths = Vec::with_capacity(user_turns.len());
 
             for (turn_idx, user_text) in user_turns.iter().enumerate() {
                 history.push(ChatMessage::user(*user_text));
                 let gen_cfg = cross_turn_test_gen_cfg(42, 2);
+                let rendered_prompt = format_chat_template(&history);
+                let prompt_len = tokenizer.tokenize(&rendered_prompt).real_length;
+                prompt_lengths.push(prompt_len);
+                assert!(
+                    prompt_len + gen_cfg.max_new_tokens <= CHAT_FIXTURE_CONTEXT,
+                    "turn {turn_idx}: fixture context must cover the rendered prompt and decode cap"
+                );
 
                 let cached_out = cached_state
                     .chat_completion_streaming_with_prefix_cache(
@@ -33155,7 +33287,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 // history — exactly chat_metal's pre-#462 behavior (reset_state +
                 // full re-prefill of the whole ChatML-formatted history every turn).
                 let mut reference_state =
-                    MetalQwen35State::new(&weights, &cfg, 128).expect("tiny hybrid fixture");
+                    MetalQwen35State::new(&weights, &cfg, CHAT_FIXTURE_CONTEXT)
+                        .expect("tiny hybrid fixture");
                 let reference_gen_cfg = cross_turn_test_gen_cfg(42, 2);
                 let reference_out = reference_state
                     .chat_completion_streaming(
@@ -33196,6 +33329,18 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 history.push(cached_out.output.message.clone());
             }
 
+            assert_eq!(
+                prompt_lengths,
+                [51, 92, 132, 173],
+                "record the four-turn ChatML footprint so template growth cannot silently \
+                 invalidate this cache-parity fixture"
+            );
+            assert!(
+                prompt_lengths
+                    .iter()
+                    .any(|&len| len + 2 > LEGACY_FIXTURE_CONTEXT),
+                "the fixture must exercise history beyond the obsolete 128-token window"
+            );
             assert!(
                 saw_exact_append,
                 "at least one later turn must actually exercise ExactAppend reuse through the \
@@ -34839,6 +34984,168 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 state.cross_turn_prefix_cache.entry.is_none(),
                 "a grammar-fail-closed turn must not leave a stale cache entry behind"
+            );
+        }
+
+        // -----------------------------------------------------------------------
+        // Grammar terminal-at-step-zero integration tests (#1153)
+        //
+        // The all-blocking tests above prove the incomplete/dead-end half of
+        // each post-prefill branch. An epsilon grammar reaches the same
+        // all-NEG_INFINITY mask from an accepting state: no token may extend
+        // the empty document, so that result is a clean Grammar stop rather
+        // than GrammarConstraintBlocked. The fixture asserts both
+        // preconditions before any GPU work so a parser or vocabulary change
+        // cannot make these tests pass through a different branch.
+
+        fn terminal_step_zero_grammar_cfg() -> GenerateConfig {
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            use std::sync::Arc;
+
+            let engine = Arc::new(
+                GrammarEngine::new(
+                    &GrammarSpec::Gbnf("root ::= \"\"\n".to_string()),
+                    single_char_vocab_bytes(),
+                )
+                .expect("epsilon grammar builds over single-char vocab"),
+            );
+            let mut grammar_state = engine.initial_state();
+            assert!(
+                engine.is_complete_without_continuation(&grammar_state),
+                "epsilon grammar must start complete with no legal continuation"
+            );
+            let mut logits = vec![0.0; 32];
+            engine
+                .mask_logits(&mut grammar_state, &mut logits)
+                .expect("local epsilon engine and full vocabulary logits must mask");
+            assert!(
+                !crate::forward::metal_qwen35::has_finite_logit(&logits),
+                "terminal epsilon grammar must mask every continuation"
+            );
+
+            GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: Some(engine),
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            }
+        }
+
+        fn assert_terminal_step_zero_output(output: &GenerateOutput) {
+            assert_eq!(output.text, "");
+            assert!(output.token_ids.is_empty());
+            assert_eq!(output.generated_tokens, 0);
+            assert!(output.stopped, "terminal grammar is a successful stop");
+            assert_eq!(output.stop_reason, Some(StopReason::Grammar));
+            assert!(output.token_logprobs.is_empty());
+        }
+
+        /// #1153: `generate` must distinguish an initially terminal grammar
+        /// from the incomplete all-blocking grammar covered above.
+        #[test]
+        fn generate_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            let output = state
+                .generate("a", &tokenizer, &terminal_step_zero_grammar_cfg())
+                .expect("an initially terminal grammar is a successful stop");
+            assert_terminal_step_zero_output(&output);
+        }
+
+        /// #1153: the shared streaming implementation must make the same
+        /// terminal-versus-dead-end distinction without emitting a token.
+        #[test]
+        fn generate_streaming_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let mut on_token_calls = 0usize;
+
+            let output = state
+                .generate_streaming(
+                    "a",
+                    &tokenizer,
+                    &terminal_step_zero_grammar_cfg(),
+                    |_, _| {
+                        on_token_calls += 1;
+                        true
+                    },
+                )
+                .expect("an initially terminal grammar is a successful streaming stop");
+            assert_terminal_step_zero_output(&output);
+            assert_eq!(
+                on_token_calls, 0,
+                "step-zero completion must stop before any token reaches on_token"
+            );
+        }
+
+        /// #1153: the prefix-cache Metal path must also return a clean
+        /// terminal stop rather than entering its destructive error recovery.
+        #[test]
+        fn generate_streaming_with_prefix_cache_terminal_grammar_at_step_zero_is_success() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let mut on_token_calls = 0usize;
+
+            let result = state
+                .generate_streaming_with_prefix_cache(
+                    slot_id,
+                    "a",
+                    &tokenizer,
+                    &terminal_step_zero_grammar_cfg(),
+                    |_, _| {
+                        on_token_calls += 1;
+                        true
+                    },
+                )
+                .expect("an initially terminal grammar is a successful cached streaming stop");
+            assert_terminal_step_zero_output(&result.output);
+            assert_eq!(
+                on_token_calls, 0,
+                "step-zero completion must stop before any token reaches on_token"
             );
         }
 

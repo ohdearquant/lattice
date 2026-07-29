@@ -18,7 +18,7 @@ edition = "2024"
 # so 1.85 (the edition2024 floor previously set in .clippy.toml) is not attainable.
 rust-version = "1.93"
 authors = ["Ocean <ocean@lionagi.ai>"]
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/ohdearquant/lattice"
 
 [workspace.dependencies]
