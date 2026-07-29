@@ -680,6 +680,36 @@ impl<'a> CompileCtx<'a> {
         }
 
         let target = self.resolve_ref_chain_target(ref_str)?;
+        let target_const = target.get("const");
+        let target_enum = target.get("enum").and_then(Value::as_array);
+
+        // The redundancy proof must bound the grammar emitted for the target,
+        // not the full JSON Schema intersection. `compile_schema_inner`
+        // dispatches `enum` before `const`, and both before `type`. Refuse
+        // combinations where those early returns can emit a value outside the
+        // later assertion rather than duplicating that dispatch here.
+        if target_const.is_some() && target_enum.is_some() {
+            return Err(unrepresentable_ref_narrowing(narrowing_key));
+        }
+        if let Some(target_type) = target.get("type") {
+            match target_type {
+                Value::String(name) => {
+                    if target_const.is_some_and(|value| !value_matches_type(value, name)) {
+                        return Err(unrepresentable_ref_narrowing(narrowing_key));
+                    }
+                    if target_enum.is_some_and(|values| {
+                        values.iter().any(|value| !value_matches_type(value, name))
+                    }) {
+                        return Err(unrepresentable_ref_narrowing(narrowing_key));
+                    }
+                }
+                Value::Array(_) => {
+                    return Err(unrepresentable_ref_narrowing(narrowing_key));
+                }
+                _ => {}
+            }
+        }
+
         let target_values: Option<Vec<&Value>> = if let Some(value) = target.get("const") {
             // `Value` equality distinguishes 1 from 1.0 more strictly than
             // JSON Schema. That can refuse a proof, but cannot create one.

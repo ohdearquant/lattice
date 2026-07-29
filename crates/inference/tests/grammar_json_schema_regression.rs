@@ -273,6 +273,30 @@ fn unproven_ref_narrowing_siblings_fail_closed() {
             }),
         ),
         (
+            "target const plus enum dispatches enum before const",
+            serde_json::json!({
+                "$defs": { "S": { "const": "a", "enum": [1] } },
+                "$ref": "#/$defs/S",
+                "type": "string"
+            }),
+        ),
+        (
+            "target enum dispatch bypasses contradictory scalar type",
+            serde_json::json!({
+                "$defs": { "V": { "enum": [1, "a"], "type": "integer" } },
+                "$ref": "#/$defs/V",
+                "type": "integer"
+            }),
+        ),
+        (
+            "target const dispatch bypasses contradictory scalar type",
+            serde_json::json!({
+                "$defs": { "V": { "const": 1, "type": "string" } },
+                "$ref": "#/$defs/V",
+                "type": "string"
+            }),
+        ),
+        (
             "empty target enum",
             serde_json::json!({
                 "$defs": { "V": { "enum": [] } },
