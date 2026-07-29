@@ -1,6 +1,8 @@
 import importlib.util
 import math
+import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -66,6 +68,115 @@ class RegenerationDeterminismTest(unittest.TestCase):
                     PARITY.validate_regeneration_outputs(
                         runs, ["prompt"], 0.5
                     )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+def gen(tokens, text="", tok_per_sec=1.0):
+    return {
+        "generated_ids": tokens,
+        "logit_margins": [1.0] * len(tokens),
+        "text": text,
+        "elapsed_s": 1.0,
+        "tok_per_sec": tok_per_sec,
+    }
+
+
+class CompareGateNegativeControlTest(unittest.TestCase):
+    """The gate must still FAIL.
+
+    A frozen reference removes the live HF run, so nothing external would
+    notice if compare() silently stopped discriminating. These are the
+    durable controls: each one fails if window_match/pass is forced true.
+    """
+
+    WINDOW = 3
+
+    def test_first_token_mismatch_fails(self):
+        verdict = PARITY.compare(
+            "p", gen([10, 20, 30, 40]), gen([11, 20, 30, 40]), self.WINDOW
+        )
+        self.assertEqual(verdict["first_mismatch"], 0)
+        self.assertFalse(verdict["window_match"])
+        self.assertFalse(verdict["pass"])
+
+    def test_mismatch_inside_window_fails(self):
+        verdict = PARITY.compare(
+            "p", gen([10, 20, 30, 40]), gen([10, 20, 31, 40]), self.WINDOW
+        )
+        self.assertEqual(verdict["first_mismatch"], 2)
+        self.assertFalse(verdict["pass"])
+
+    def test_matching_prefix_passes(self):
+        """Positive control: without this, a gate stuck at FAIL looks correct."""
+        verdict = PARITY.compare(
+            "p", gen([10, 20, 30, 40]), gen([10, 20, 30, 40]), self.WINDOW
+        )
+        self.assertIsNone(verdict["first_mismatch"])
+        self.assertTrue(verdict["pass"])
+        self.assertEqual(verdict["agree_rate"], 1.0)
+
+    def test_mismatch_at_window_boundary_passes(self):
+        """Divergence at index == window is outside the gated prefix."""
+        verdict = PARITY.compare(
+            "p", gen([10, 20, 30, 40]), gen([10, 20, 30, 41]), self.WINDOW
+        )
+        self.assertEqual(verdict["first_mismatch"], 3)
+        self.assertTrue(verdict["pass"])
+
+    def test_empty_generation_fails_closed(self):
+        """An instrument that compared NOTHING must not report a pass.
+
+        min_len == 0 makes first_mismatch 0 and agree_rate 0; the verdict has
+        to be a refusal, never a vacuous green.
+        """
+        verdict = PARITY.compare("p", gen([]), gen([]), self.WINDOW)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["total_compared"], 0)
+        self.assertEqual(verdict["agree_rate"], 0)
+
+    def test_lattice_truncated_before_window_fails(self):
+        """A short lattice generation cannot satisfy a longer match window."""
+        verdict = PARITY.compare("p", gen([10, 20, 30, 40]), gen([10, 20]), self.WINDOW)
+        self.assertFalse(verdict["pass"])
+        self.assertEqual(verdict["total_compared"], 2)
+
+
+class FrozenReferenceLoaderRefusalTest(unittest.TestCase):
+    """The loader must refuse missing / empty / malformed fixtures."""
+
+    def _load_with(self, path):
+        with unittest.mock.patch.object(PARITY, "REFERENCE_PATH", path):
+            return PARITY.load_frozen_reference(64)
+
+    def test_missing_fixture_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaisesRegex(RuntimeError, "missing, unreadable, or malformed"):
+                self._load_with(Path(d) / "does_not_exist.json")
+
+    def test_empty_fixture_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "empty.json"
+            p.write_text("")
+            with self.assertRaisesRegex(RuntimeError, "missing, unreadable, or malformed"):
+                self._load_with(p)
+
+    def test_non_object_root_refuses(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "list.json"
+            p.write_text("[]")
+            with self.assertRaisesRegex(RuntimeError, "root must be a JSON object"):
+                self._load_with(p)
+
+    def test_empty_object_refuses(self):
+        """An empty object has no provenance; it must not read as a valid fixture."""
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "obj.json"
+            p.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "malformed or do not match this gate"):
+                self._load_with(p)
 
 
 if __name__ == "__main__":
