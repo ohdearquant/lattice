@@ -285,10 +285,10 @@ class HeadModeReporting(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assert_provenance_in_header_and_report(
                 r.stdout,
-                "  head arm: in-place",
+                "  head arm: detached snapshot worktree",
                 "  gate: scripts/perf-bench-gate.py from the invoking checkout",
             )
-            self.assertNotIn("head arm: detached worktree", r.stdout)
+            self.assertNotIn("head arm: in-place", r.stdout)
 
     def test_explicit_head_ref_uses_and_reports_a_detached_worktree(self):
         """Mutation-sensitive: collapsing the mode selection to in-place makes
@@ -332,8 +332,8 @@ class HeadModeReporting(unittest.TestCase):
             cargo = Path(shim) / "cargo"
             cargo.write_text(
                 "#!/usr/bin/env bash\n"
-                f'if [ "$PWD" = "{sb.root}" ]; then\n'
-                "  printf '%s\\n' changed > f1.txt\n"
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]]; then\n'
+                f'  printf "%s\\n" changed > "{sb.root}/f1.txt"\n'
                 "fi\n"
                 "exit 0\n"
             )
@@ -346,16 +346,48 @@ class HeadModeReporting(unittest.TestCase):
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertIn("not commit-clean", r.stderr)
 
+    def test_restored_source_race_cannot_change_snapshot_measurement(self):
+        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
+            cargo = Path(shim) / "cargo"
+            observed = Path(shim) / "observed"
+            cargo.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]] '
+                '&& [ "${1:-}" != "--version" ]; then\n'
+                f'  printf "%s:%s\\n" "$PWD" "$(cat f1.txt)" >> "{observed}"\n'
+                f'  original="$(cat "{sb.root}/f1.txt")"\n'
+                f'  printf "%s" mutated-during-run > "{sb.root}/f1.txt"\n'
+                f'  printf "%s" "$original" > "{sb.root}/f1.txt"\n'
+                "fi\n"
+                "exit 0\n"
+            )
+            cargo.chmod(0o755)
+            r = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                PATH=f"{shim}:{sb.env['PATH']}",
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual((sb.root / "f1.txt").read_text(), "1")
+            lines = observed.read_text().splitlines()
+            self.assertTrue(lines, r.stdout)
+            self.assertTrue(
+                all(line.endswith(":1") for line in lines),
+                "\n".join(lines),
+            )
+
     def test_in_place_head_refuses_commit_changed_during_measurement(self):
         with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
             cargo = Path(shim) / "cargo"
             cargo.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
-                f'if [ "$PWD" = "{sb.root}" ] '
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]] '
                 '&& [ "${1:-}" != "--version" ] '
-                '&& [ "$(cat f1.txt)" != "committed-during-run" ]; then\n'
-                "  printf '%s\\n' committed-during-run > f1.txt\n"
+                f'&& [ "$(cat "{sb.root}/f1.txt")" != "committed-during-run" ]; then\n'
+                f'  printf "%s\\n" committed-during-run > "{sb.root}/f1.txt"\n'
+                f'  cd "{sb.root}"\n'
                 "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
                 "add f1.txt\n"
                 "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
@@ -393,7 +425,7 @@ class RunProvenanceHandoff(unittest.TestCase):
                 "base_sha=",
                 "head_ref=HEAD",
                 "head_sha=",
-                "head_mode=in-place",
+                "head_mode=detached-worktree",
                 "base_rustc=",
                 "head_rustc=",
                 "base_cargo=",

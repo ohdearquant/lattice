@@ -1108,10 +1108,10 @@ def run_selftest() -> int:
             "--informational-target",
             "lattice-embed:simd",
         )
-        if empty_informational.returncode != 0:
+        if empty_informational.returncode != 2:
             failures.append(
-                "require-measurements: an empty informational target changed "
-                "the enforcing exit code"
+                "require-measurements: an empty informational target exited "
+                "0 with enforcement enabled"
             )
         if "for target lattice-embed:simd" not in empty_informational.stderr:
             failures.append(
@@ -1280,10 +1280,10 @@ def run_selftest() -> int:
             "--informational-target",
             "lattice-embed:simd",
         )
-        if informational_missing.returncode != 0:
+        if informational_missing.returncode != 2:
             failures.append(
                 "baseline-completeness: a missing informational target "
-                "incorrectly changed the enforcing exit code"
+                "did not fail measurement completeness"
             )
         if (
             "  - lattice-embed:simd: simd_dot_product/scalar/384"
@@ -1928,7 +1928,7 @@ def main() -> int:
             "certify an A/B comparison.",
             file=sys.stderr,
         )
-        return 0 if informational else 2
+        return 2
 
     all_change_files = find_change_files(args.criterion_root)
     change_file_ids = {
@@ -1965,15 +1965,10 @@ def main() -> int:
                 file=sys.stderr,
             )
         print(
-            "A partial A/B is not evidence that nothing regressed."
-            + (
-                " This target is informational, so the omission is reported "
-                "without changing the enforcing exit code."
-                if informational else ""
-            ),
+            "A partial A/B is not evidence that nothing regressed.",
             file=sys.stderr,
         )
-        return 0 if informational else 2
+        return 2
 
     if not change_files:
         if all_change_files:

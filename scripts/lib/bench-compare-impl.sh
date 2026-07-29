@@ -21,7 +21,7 @@
 # Unset filters run all groups in the default bench targets:
 #   lattice-inference: elementwise_cpu_bench
 #   lattice-embed: simd
-# Uses a git worktree for the base ref so your working tree stays untouched.
+# Uses detached git worktrees for both refs so your working tree stays untouched.
 #
 # VOCABULARY, because these four are separate and get conflated. A group is
 # MEASURED if the bench ran and produced numbers; REPORTED if those numbers
@@ -314,12 +314,11 @@ HEAD_SHA="${HEAD_FULL_SHA:0:10}"
 
 HEAD_WT="$REPO/.cache/bench-compare-head"
 if [ "$HEAD_REF" = "HEAD" ]; then
-  HEAD_MODE="in-place"
-  HEAD_DIR="$REPO"
+  HEAD_MODE="detached snapshot worktree"
 else
   HEAD_MODE="detached worktree"
-  HEAD_DIR="$HEAD_WT"
 fi
+HEAD_DIR="$HEAD_WT"
 GATE_SCRIPT="$REPO/scripts/perf-bench-gate.py"
 
 print_execution_provenance() {
@@ -328,28 +327,28 @@ print_execution_provenance() {
 }
 
 require_commit_clean_head() {
-  if [ "$HEAD_MODE" != "in-place" ]; then
+  if [ "$HEAD_REF" != "HEAD" ]; then
     return
   fi
   local current_head status
   if ! current_head="$(
     git -C "$REPO" rev-parse --verify --end-of-options 'HEAD^{commit}' 2>/dev/null
   )"; then
-    echo "bench-compare: cannot resolve the in-place HEAD commit — refusing." >&2
+    echo "bench-compare: cannot resolve the invoking HEAD commit — refusing." >&2
     exit 2
   fi
   if [ "$current_head" != "$HEAD_FULL_SHA" ]; then
-    echo "bench-compare: the in-place HEAD commit changed during the run — refusing." >&2
+    echo "bench-compare: the invoking HEAD commit changed during the run — refusing." >&2
     echo "  expected $HEAD_FULL_SHA" >&2
     echo "  observed $current_head" >&2
     exit 2
   fi
   if ! status="$(git -C "$REPO" status --porcelain=v1 --untracked-files=normal)"; then
-    echo "bench-compare: cannot inspect the in-place HEAD worktree — refusing." >&2
+    echo "bench-compare: cannot inspect the invoking HEAD worktree — refusing." >&2
     exit 2
   fi
   if [ -n "$status" ]; then
-    echo "bench-compare: the in-place HEAD worktree is not commit-clean — refusing." >&2
+    echo "bench-compare: the invoking HEAD worktree is not commit-clean — refusing." >&2
     echo "  Commit or remove tracked, staged, and untracked changes so the measured" >&2
     echo "  source is exactly reconstructible from the recorded head SHA." >&2
     exit 2
@@ -363,8 +362,7 @@ quiet_gate "before base"
 
 # --- Keep Spotlight out of the benchmark build trees ---
 # .cache protects the detached base/head worktrees. The separate target marker
-# protects the default in-place HEAD arm: without it the base is excluded while
-# the head build dirties thousands of indexed files immediately before timing.
+# protects build artifacts created by callers outside these detached worktrees.
 # Recreate both every run because deleting either tree deletes its own marker.
 # Inert on non-macOS. Fail-closed: refuse to measure without the protection
 # rather than emit numbers that look trustworthy and are not.
@@ -414,6 +412,7 @@ BASE_CRITERION="$(criterion_version "$WT")"
 
 cleanup() {
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
+  git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -530,14 +529,11 @@ quiet_gate "between phases"
 echo ""
 echo "--- Building + benching HEAD ($HEAD_SHA) ---"
 
-if [ "$HEAD_MODE" = "detached worktree" ]; then
-  if [ -d "$HEAD_WT" ]; then
-    git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
-  fi
-  git -C "$REPO" worktree add --detach --end-of-options "$HEAD_WT" "$HEAD_REF" 2>&1 | tail -1
-  # Update cleanup to also remove head worktree
-  trap 'git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true; cleanup' EXIT
+if [ -d "$HEAD_WT" ]; then
+  git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
 fi
+git -C "$REPO" worktree add --detach --end-of-options \
+  "$HEAD_WT" "$HEAD_FULL_SHA" 2>&1 | tail -1
 
 HEAD_RUSTC="$(command_version "$HEAD_DIR" rustc --version)"
 HEAD_CARGO="$(command_version "$HEAD_DIR" cargo --version)"
@@ -620,7 +616,7 @@ write_run_provenance() {
     printf 'base_sha=%s\n' "$BASE_FULL_SHA"
     printf 'head_ref=%s\n' "$HEAD_REF"
     printf 'head_sha=%s\n' "$HEAD_FULL_SHA"
-    printf 'head_mode=%s\n' "${HEAD_MODE// /-}"
+    printf 'head_mode=detached-worktree\n'
     printf 'base_rustc=%s\n' "$BASE_RUSTC"
     printf 'head_rustc=%s\n' "$HEAD_RUSTC"
     printf 'base_cargo=%s\n' "$BASE_CARGO"
