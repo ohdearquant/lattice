@@ -822,6 +822,33 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
     tokens
 }
 
+/// Parse every valid `added_tokens` entry into an ID-indexed content table.
+pub(crate) fn parse_added_token_contents(root: &JsonValue) -> HashMap<u32, String> {
+    let mut tokens = HashMap::new();
+    let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
+        return tokens;
+    };
+
+    for item in array {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(content) = object.get("content").and_then(JsonValue::as_str) else {
+            continue;
+        };
+        let Some(id) = object
+            .get("id")
+            .and_then(JsonValue::as_u64)
+            .and_then(|v| u32::try_from(v).ok())
+        else {
+            continue;
+        };
+        tokens.insert(id, content.to_string());
+    }
+
+    tokens
+}
+
 /// Parse the subset of `added_tokens` that should be **rendered as literal text**
 /// when decoding, i.e. those whose `"special"` flag is `false` (or absent).
 ///

@@ -7,8 +7,8 @@
 use crate::error::InferenceError;
 use crate::tokenizer::common::{
     JsonValue, ThreadSafeLruCache, TokenizedInput, Tokenizer, invert_vocab, json_object_to_vocab,
-    json_path, known_special_id, pad_ids, parse_added_tokens, parse_json,
-    parse_post_processor_flags, parse_rendered_added_tokens, push_eos_preserving_limit,
+    json_path, known_special_id, pad_ids, parse_added_token_contents, parse_added_tokens,
+    parse_json, parse_post_processor_flags, parse_rendered_added_tokens, push_eos_preserving_limit,
     vocab_txt_to_map,
 };
 use std::cmp::Ordering;
@@ -40,6 +40,7 @@ struct BpeInner {
     byte_encoder: Vec<char>,
     special_tokens: HashMap<String, u32>,
     special_tokens_sorted: Vec<String>,
+    added_tokens_by_id: HashMap<u32, String>,
     /// Decode-side map for added tokens with `special=false` (`<think>`/`</think>`,
     /// `<tool_call>`, FIM markers). These ids are absent from the base BPE `vocab`,
     /// so `token_for_id` falls back to this map to render them as literal text
@@ -158,12 +159,14 @@ impl BpeTokenizer {
         })?;
         let merges = parse_merges_json(merges_value)?;
         let added = parse_added_tokens(&root);
+        let added_tokens_by_id = parse_added_token_contents(&root);
         let rendered_added = parse_rendered_added_tokens(&root);
 
         let mut tokenizer = Self::from_vocab_and_merges_with_config(
             vocab,
             merges,
             added,
+            added_tokens_by_id,
             rendered_added,
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
@@ -201,6 +204,7 @@ impl BpeTokenizer {
             merges,
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
         )
@@ -210,15 +214,12 @@ impl BpeTokenizer {
         vocab: HashMap<String, u32>,
         merges: Vec<(String, String)>,
         added_tokens: HashMap<String, u32>,
+        mut added_tokens_by_id: HashMap<u32, String>,
         rendered_added: HashMap<u32, String>,
         cache_capacity: usize,
         max_seq_len: usize,
     ) -> Result<Self, InferenceError> {
         let id_to_token = invert_vocab(&vocab)?;
-        // Invert the renderable added-token set to id -> content for decode-side
-        // lookup. Built once at construction; consulted by `token_for_id` only
-        // when the base table misses (added-token ids exceed the base vocab range).
-        let added_render: HashMap<u32, String> = rendered_added;
         let mut merge_ranks: HashMap<String, HashMap<String, usize>> = HashMap::new();
         for (rank, (left, right)) in merges.into_iter().enumerate() {
             // First occurrence defines the rank: merges are listed in priority
@@ -229,6 +230,18 @@ impl BpeTokenizer {
                 .entry(right)
                 .or_insert(rank);
         }
+
+        for (content, id) in &added_tokens {
+            added_tokens_by_id
+                .entry(*id)
+                .or_insert_with(|| content.clone());
+        }
+        for (id, content) in &rendered_added {
+            added_tokens_by_id
+                .entry(*id)
+                .or_insert_with(|| content.clone());
+        }
+        let added_render = rendered_added;
 
         let mut special_tokens = added_tokens;
         // A zero-length special token would match at every position
@@ -271,6 +284,7 @@ impl BpeTokenizer {
             byte_encoder: bytes_to_unicode(),
             special_tokens,
             special_tokens_sorted,
+            added_tokens_by_id,
             added_render,
             pad_id,
             unk_id,
@@ -312,6 +326,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_tokens_by_id: self.inner.added_tokens_by_id.clone(),
             added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
@@ -338,6 +353,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_tokens_by_id: self.inner.added_tokens_by_id.clone(),
             added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id,
@@ -368,6 +384,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_tokens_by_id: self.inner.added_tokens_by_id.clone(),
             added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
@@ -392,6 +409,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_tokens_by_id: self.inner.added_tokens_by_id.clone(),
             added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
@@ -416,6 +434,7 @@ impl BpeTokenizer {
             byte_encoder: self.inner.byte_encoder.clone(),
             special_tokens: self.inner.special_tokens.clone(),
             special_tokens_sorted: self.inner.special_tokens_sorted.clone(),
+            added_tokens_by_id: self.inner.added_tokens_by_id.clone(),
             added_render: self.inner.added_render.clone(),
             pad_id: self.inner.pad_id,
             unk_id: self.inner.unk_id,
@@ -471,15 +490,12 @@ impl BpeTokenizer {
     /// containing the token plus surrounding characters, or output that has
     /// passed through [`Self::token_for_id`] / decoding.
     ///
-    /// Lookup precedence (first match wins):
-    /// 1. `special_tokens` -- the fast-path table for tokens marked
-    ///    `special: true` in `tokenizer.json` (e.g. `<|im_end|>`).
-    /// 2. `vocab` -- the base BPE vocabulary (a `</think>`-style marker can
+    /// Lookup sources:
+    /// 1. `vocab` -- the base BPE vocabulary (a `</think>`-style marker can
     ///    live here if the tokenizer declares it as an ordinary vocab entry
-    ///    rather than a `special_tokens` entry or an added token).
-    /// 3. `added_render` -- added tokens with `special: false` (e.g.
-    ///    `<think>`/`</think>`, `<tool_call>`, FIM markers); this tier is an
-    ///    O(added_render.len()) linear scan, the only one of the three.
+    ///    rather than an added token).
+    /// 2. `added_tokens_by_id` -- every added-token declaration, independently
+    ///    of whether decode renders or skips it.
     ///
     /// This is the single resolution path for the `</think>` reasoning-close
     /// marker: [`crate::model::qwen35::resolve_reasoning_close_token`] (the
@@ -488,9 +504,9 @@ impl BpeTokenizer {
     /// (`cross_turn_metadata`) both call this directly rather than each
     /// owning a separate cached/uncached copy of the lookup.
     ///
-    /// EVERY matching id is returned, not the first, and the tiers make that
-    /// distinction load-bearing rather than pedantic: `vocab` and
-    /// `rendered_added` are independent constructor inputs with nothing
+    /// EVERY matching id is returned, not the first, and the sources make that
+    /// distinction load-bearing rather than pedantic: `vocab` and the added
+    /// token table are independent constructor inputs with nothing
     /// reconciling them, and added-token ids deliberately live beyond the base
     /// vocabulary range, so one spelling can carry *different* ids in two tiers.
     /// A caller that took only the head would silently discard the rest, and the
@@ -501,21 +517,13 @@ impl BpeTokenizer {
     /// lookup would be separable, and separable is how they drift.
     pub(crate) fn token_ids_for_content(&self, content: &str) -> Vec<u32> {
         let mut ids: Vec<u32> = Vec::new();
-        for id in self
-            .inner
-            .special_tokens
-            .get(content)
-            .into_iter()
-            .chain(self.inner.vocab.get(content))
-            .copied()
-            .chain(
-                self.inner
-                    .added_render
-                    .iter()
-                    .filter(|(_, token)| token.as_str() == content)
-                    .map(|(&id, _)| id),
-            )
-        {
+        for id in self.inner.vocab.get(content).into_iter().copied().chain(
+            self.inner
+                .added_tokens_by_id
+                .iter()
+                .filter(|(_, token)| token.as_str() == content)
+                .map(|(&id, _)| id),
+        ) {
             if !ids.contains(&id) {
                 ids.push(id);
             }
@@ -1568,6 +1576,7 @@ mod tests {
             Vec::new(),
             added,
             HashMap::new(),
+            HashMap::new(),
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
         )
@@ -1794,6 +1803,7 @@ mod tests {
             vocab,
             Vec::new(),
             HashMap::new(),
+            HashMap::new(),
             rendered,
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
@@ -1853,6 +1863,7 @@ mod tests {
             vocab,
             Vec::new(),
             specials,
+            HashMap::new(),
             rendered,
             DEFAULT_BPE_CACHE_CAPACITY,
             DEFAULT_BPE_MAX_SEQ_LEN,
@@ -1895,6 +1906,7 @@ mod tests {
         let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
             vocab,
             Vec::new(),
+            HashMap::new(),
             HashMap::new(),
             rendered,
             DEFAULT_BPE_CACHE_CAPACITY,

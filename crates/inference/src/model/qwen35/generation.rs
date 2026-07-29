@@ -3789,6 +3789,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reasoning_budget_rejects_duplicate_special_added_token_aliases() {
+        let tokenizer = BpeTokenizer::from_tokenizer_json_str(
+            r#"{
+                "model": {
+                    "type": "BPE",
+                    "vocab": {"a": 0, "b": 1},
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 100, "content": "</think>", "special": true},
+                    {"id": 101, "content": "</think>", "special": true}
+                ]
+            }"#,
+        )
+        .expect("duplicate special-alias tokenizer must load");
+
+        let mut ids = tokenizer.token_ids_for_content("</think>");
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![100, 101],
+            "every special added-token alias must survive loading"
+        );
+
+        let result = resolve_reasoning_close_token(&tokenizer, Some(1), 200);
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("more than one") && message.contains("101")
+            ),
+            "duplicate special added-token aliases must be rejected as ambiguous, got {result:?}"
+        );
+    }
+
     /// Early-success bypass, CPU `generate`: an active reasoning budget with
     /// no resolvable `</think>` marker must fail closed even when the very
     /// first sampled token is itself a stop token -- `should_stop_token`'s
