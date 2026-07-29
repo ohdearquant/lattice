@@ -43,19 +43,19 @@ and (c) a (currently inert) scheduled workflow that wires the two together.
 
 ### Gate table (from issue #167, reproduced for traceability)
 
-| Row | Metric(s) | Threshold (1-sided 95% CI lower bound) |
-| --- | --- | --- |
-| Decode tok/s | `decode/tok_s/{ctx}` | regression `> 7%` |
-| Decode slope | `decode/slope_ms_per_ctx_tok` | regression `> 5%` |
-| Decode intercept | `decode/intercept_ms` | regression `> 7%` |
-| TTFT | `decode/ttft_ms/4096`, `decode/ttft_ms/16384` | regression `> 10%` |
-| Dispatch/token | `decode/dispatches_per_token` | regression `> 5%` OR absolute `+10` |
-| Command buffers/token | `decode/command_buffers_per_token` | absolute ceiling `<= 2` |
-| Quality (PPL) | `quality/ppl_delta/{f16,bf16,q4_kv}` | absolute `<= 0.005 / 0.05 / 0.30` |
-| Quality (agreement) | `quality/greedy_agreement`, `quality/topk_exact` | must equal `1.0` |
-| Contention W=4 | `contention/loss_pp/w4` | absolute `+3pp` |
-| Contention W=10 | `contention/loss_frac/w10` | absolute `<= 10%`, regression `> 5%` |
-| KV layout | `runtime/kv_layout_assertion` | must equal `1.0` |
+| Row                   | Metric(s)                                        | Threshold (1-sided 95% CI lower bound) |
+| --------------------- | ------------------------------------------------ | -------------------------------------- |
+| Decode tok/s          | `decode/tok_s/{ctx}`                             | regression `> 7%`                      |
+| Decode slope          | `decode/slope_ms_per_ctx_tok`                    | regression `> 5%`                      |
+| Decode intercept      | `decode/intercept_ms`                            | regression `> 7%`                      |
+| TTFT                  | `decode/ttft_ms/4096`, `decode/ttft_ms/16384`    | regression `> 10%`                     |
+| Dispatch/token        | `decode/dispatches_per_token`                    | regression `> 5%` OR absolute `+10`    |
+| Command buffers/token | `decode/command_buffers_per_token`               | absolute ceiling `<= 2`                |
+| Quality (PPL)         | `quality/ppl_delta/{f16,bf16,q4_kv}`             | absolute `<= 0.005 / 0.05 / 0.30`      |
+| Quality (agreement)   | `quality/greedy_agreement`, `quality/topk_exact` | must equal `1.0`                       |
+| Contention W=4        | `contention/loss_pp/w4`                          | absolute `+3pp`                        |
+| Contention W=10       | `contention/loss_frac/w10`                       | absolute `<= 10%`, regression `> 5%`   |
+| KV layout             | `runtime/kv_layout_assertion`                    | must equal `1.0`                       |
 
 All comparisons use the ADR-058 method: for a lower-is-better metric,
 `lb = (current.ci95_low - baseline.ci95_high) / baseline.ci95_high`; for a higher-is-better metric,

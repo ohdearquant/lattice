@@ -20,17 +20,17 @@ npm install @khive-ai/lattice-embed-wasm
 ## Usage
 
 ```js
-import { embed, embedText, Embedder } from '@khive-ai/lattice-embed-wasm';
+import { embed, Embedder, embedText } from "@khive-ai/lattice-embed-wasm";
 
 // Primary form: pick a model explicitly.
-const vec = await embed('a sentence to embed', 'minilm');
+const vec = await embed("a sentence to embed", "minilm");
 
 // Default model, no name needed.
-const vec2 = await embedText('another sentence');
+const vec2 = await embedText("another sentence");
 
 // Pin a model once, reuse it.
-const e = new Embedder('bge');
-const vec3 = await e.embed('a third sentence');
+const e = new Embedder("bge");
+const vec3 = await e.embed("a third sentence");
 ```
 
 `embed` and `embedText` are async because the first call for a given model
@@ -70,24 +70,24 @@ in Node v25.6.0 with `process.hrtime.bigint()`, 5000 timed reps + 500 warmup
 reps per cell, both variants marshaling identical `Float32Array` inputs
 through wasm-bindgen so the delta isolates the kernel, not call overhead:
 
-| op | dim | baseline median (ns) | baseline p95 (ns) | simd128 median (ns) | simd128 p95 (ns) | median speedup |
-|---|---|---|---|---|---|---|
-| dot_product | 384 | 583.0 | 958.0 | 333.0 | 417.0 | 1.75x |
-| squared_l2 | 384 | 584.0 | 1250.0 | 333.0 | 417.0 | 1.75x |
-| cosine | 384 | 1208.0 | 1292.0 | 292.0 | 500.0 | 4.14x |
-| normalize | 384 | 708.0 | 1375.0 | 334.0 | 916.0 | 2.12x |
-| dot_product | 768 | 1042.0 | 1125.0 | 334.0 | 375.0 | 3.12x |
-| squared_l2 | 768 | 1000.0 | 1084.0 | 333.0 | 375.0 | 3.00x |
-| cosine | 768 | 2459.0 | 2584.0 | 375.0 | 416.0 | 6.56x |
-| normalize | 768 | 1208.0 | 1292.0 | 375.0 | 459.0 | 3.22x |
-| dot_product | 1024 | 1375.0 | 1458.0 | 375.0 | 417.0 | 3.67x |
-| squared_l2 | 1024 | 1292.0 | 1375.0 | 375.0 | 417.0 | 3.45x |
-| cosine | 1024 | 3333.0 | 3417.0 | 458.0 | 542.0 | 7.28x |
-| normalize | 1024 | 1584.0 | 1708.0 | 500.0 | 542.0 | 3.17x |
-| dot_product | 4096 | 4959.0 | 6875.0 | 959.0 | 1000.0 | 5.17x |
-| squared_l2 | 4096 | 4916.0 | 4959.0 | 1000.0 | 1000.0 | 4.92x |
-| cosine | 4096 | 13375.0 | 26708.0 | 1125.0 | 1250.0 | 11.89x |
-| normalize | 4096 | 5541.0 | 5791.0 | 1250.0 | 2583.0 | 4.43x |
+| op          | dim  | baseline median (ns) | baseline p95 (ns) | simd128 median (ns) | simd128 p95 (ns) | median speedup |
+| ----------- | ---- | -------------------- | ----------------- | ------------------- | ---------------- | -------------- |
+| dot_product | 384  | 583.0                | 958.0             | 333.0               | 417.0            | 1.75x          |
+| squared_l2  | 384  | 584.0                | 1250.0            | 333.0               | 417.0            | 1.75x          |
+| cosine      | 384  | 1208.0               | 1292.0            | 292.0               | 500.0            | 4.14x          |
+| normalize   | 384  | 708.0                | 1375.0            | 334.0               | 916.0            | 2.12x          |
+| dot_product | 768  | 1042.0               | 1125.0            | 334.0               | 375.0            | 3.12x          |
+| squared_l2  | 768  | 1000.0               | 1084.0            | 333.0               | 375.0            | 3.00x          |
+| cosine      | 768  | 2459.0               | 2584.0            | 375.0               | 416.0            | 6.56x          |
+| normalize   | 768  | 1208.0               | 1292.0            | 375.0               | 459.0            | 3.22x          |
+| dot_product | 1024 | 1375.0               | 1458.0            | 375.0               | 417.0            | 3.67x          |
+| squared_l2  | 1024 | 1292.0               | 1375.0            | 375.0               | 417.0            | 3.45x          |
+| cosine      | 1024 | 3333.0               | 3417.0            | 458.0               | 542.0            | 7.28x          |
+| normalize   | 1024 | 1584.0               | 1708.0            | 500.0               | 542.0            | 3.17x          |
+| dot_product | 4096 | 4959.0               | 6875.0            | 959.0               | 1000.0           | 5.17x          |
+| squared_l2  | 4096 | 4916.0               | 4959.0            | 1000.0              | 1000.0           | 4.92x          |
+| cosine      | 4096 | 13375.0              | 26708.0           | 1125.0              | 1250.0           | 11.89x         |
+| normalize   | 4096 | 5541.0               | 5791.0            | 1250.0              | 2583.0           | 4.43x          |
 
 Speedup is consistent (1.75x-11.9x median) across all four kernels and
 grows with dimension; `cosine` shows the largest win because it fuses three
@@ -104,11 +104,11 @@ that can load this package at all falls short of the SIMD128 requirement.
 
 ## Supported models
 
-| name | pooling | dimensions |
-| --- | --- | --- |
-| `minilm` (default) | mean | 384 |
-| `bge` | CLS | 384 |
-| `paraphrase-minilm` | mean | 384 |
+| name                | pooling | dimensions |
+| ------------------- | ------- | ---------- |
+| `minilm` (default)  | mean    | 384        |
+| `bge`               | CLS     | 384        |
+| `paraphrase-minilm` | mean    | 384        |
 
 `qwen3-0.6b` is a known model name that is **not** supported over this wasm
 channel: it is a decoder-style embedding model, and the wasm core here only

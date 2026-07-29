@@ -7,6 +7,9 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 use super::simd_config;
 
 /// **Unstable**: binary quantization format and struct layout are under active design.
@@ -45,16 +48,7 @@ impl BinaryVector {
         let norm = norm_sq.sqrt();
 
         let packed_len = dims.div_ceil(8);
-        let mut data = vec![0u8; packed_len];
-
-        for (i, &v) in vector.iter().enumerate() {
-            let val = if v.is_finite() { v } else { 0.0 };
-            if val >= threshold {
-                let byte_idx = i / 8;
-                let bit_idx = 7 - (i % 8); // bit 7 = first dimension in byte
-                data[byte_idx] |= 1 << bit_idx;
-            }
-        }
+        let data = quantize_binary(vector, threshold, packed_len);
 
         Self { data, dims, norm }
     }
@@ -107,6 +101,108 @@ impl BinaryVector {
     pub fn cosine_similarity_approx(&self, other: &BinaryVector) -> f32 {
         1.0 - self.cosine_distance_approx(other)
     }
+}
+
+fn quantize_binary(vector: &[f32], threshold: f32, packed_len: usize) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd_config().avx2_enabled {
+            // SAFETY: AVX2 was detected at runtime; the kernel bounds every load and store.
+            return unsafe { quantize_binary_avx2(vector, threshold, packed_len) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if simd_config().neon_enabled {
+            // SAFETY: NEON was detected at runtime; the kernel bounds every load and store.
+            return unsafe { quantize_binary_neon(vector, threshold, packed_len) };
+        }
+    }
+    quantize_binary_scalar(vector, threshold, packed_len)
+}
+
+fn quantize_binary_scalar(vector: &[f32], threshold: f32, packed_len: usize) -> Vec<u8> {
+    let mut data = vec![0u8; packed_len];
+    quantize_binary_scalar_tail(vector, threshold, &mut data, 0);
+    data
+}
+
+fn quantize_binary_scalar_tail(vector: &[f32], threshold: f32, data: &mut [u8], start: usize) {
+    for (i, &value) in vector.iter().enumerate().skip(start) {
+        let finite_value = if value.is_finite() { value } else { 0.0 };
+        if finite_value >= threshold {
+            data[i / 8] |= 1 << (7 - i % 8);
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BINARY_QUANTIZE_SIMD_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_binary_avx2(vector: &[f32], threshold: f32, packed_len: usize) -> Vec<u8> {
+    #[cfg(test)]
+    BINARY_QUANTIZE_SIMD_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    let mut data = vec![0u8; packed_len];
+    let chunks = vector.len() / 8;
+    let threshold_scalar = threshold;
+    let sign = _mm256_set1_ps(-0.0);
+    let inf = _mm256_set1_ps(f32::INFINITY);
+    let threshold = _mm256_set1_ps(threshold_scalar);
+
+    for i in 0..chunks {
+        let input = _mm256_loadu_ps(vector.as_ptr().add(i * 8));
+        let abs = _mm256_andnot_ps(sign, input);
+        let finite = _mm256_cmp_ps(abs, inf, _CMP_LT_OQ);
+        let values = _mm256_and_ps(input, finite);
+        let above_threshold = _mm256_cmp_ps(values, threshold, _CMP_GE_OQ);
+        data[i] = (_mm256_movemask_ps(above_threshold) as u8).reverse_bits();
+    }
+
+    quantize_binary_scalar_tail(vector, threshold_scalar, &mut data, chunks * 8);
+    data
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_binary_neon(vector: &[f32], threshold: f32, packed_len: usize) -> Vec<u8> {
+    #[cfg(test)]
+    BINARY_QUANTIZE_SIMD_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    let mut data = vec![0u8; packed_len];
+    let chunks = vector.len() / 8;
+    let inf = vdupq_n_f32(f32::INFINITY);
+    let zero = vdupq_n_f32(0.0);
+    let threshold_vector = vdupq_n_f32(threshold);
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let first = vld1q_f32(vector.as_ptr().add(base));
+        let second = vld1q_f32(vector.as_ptr().add(base + 4));
+        let first_values = vbslq_f32(vcaltq_f32(first, inf), first, zero);
+        let second_values = vbslq_f32(vcaltq_f32(second, inf), second, zero);
+        let first_mask = vcgeq_f32(first_values, threshold_vector);
+        let second_mask = vcgeq_f32(second_values, threshold_vector);
+        let mut first_lanes = [0u32; 4];
+        let mut second_lanes = [0u32; 4];
+        vst1q_u32(first_lanes.as_mut_ptr(), first_mask);
+        vst1q_u32(second_lanes.as_mut_ptr(), second_mask);
+
+        let mut packed = 0u8;
+        for (lane, mask) in first_lanes.into_iter().chain(second_lanes).enumerate() {
+            if mask != 0 {
+                packed |= 1 << (7 - lane);
+            }
+        }
+        data[i] = packed;
+    }
+
+    quantize_binary_scalar_tail(vector, threshold, &mut data, chunks * 8);
+    data
 }
 
 /// **Unstable**: returns packed-bit Hamming distance or `u32::MAX` for invalid inputs.
@@ -280,6 +376,57 @@ mod tests {
                 unit * 2.0 - 1.0
             })
             .collect()
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn test_binary_quantize_explicit_simd_matches_scalar_and_is_dispatched() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        for threshold in [0.0, 0.25, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for dim in [0usize, 1, 3, 4, 7, 8, 9, 31, 32, 33, 383, 384, 385] {
+                let mut input = generate_vector(dim, 900 + dim as u64);
+                if dim > 0 {
+                    input[0] = f32::NAN;
+                }
+                if dim > 1 {
+                    input[1] = f32::INFINITY;
+                }
+                if dim > 2 {
+                    input[2] = f32::NEG_INFINITY;
+                }
+
+                let packed_len = dim.div_ceil(8);
+                let scalar = quantize_binary_scalar(&input, threshold, packed_len);
+                #[cfg(target_arch = "aarch64")]
+                // SAFETY: baseline aarch64 provides NEON; the kernel bounds every access.
+                let simd = unsafe { quantize_binary_neon(&input, threshold, packed_len) };
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: AVX2 was detected above; the kernel bounds every access.
+                let simd = unsafe { quantize_binary_avx2(&input, threshold, packed_len) };
+                assert_eq!(
+                    simd, scalar,
+                    "explicit SIMD mismatch at dim={dim}, threshold={threshold}"
+                );
+            }
+        }
+
+        let input = generate_vector(385, 1_063);
+        let before = BINARY_QUANTIZE_SIMD_HITS.with(std::cell::Cell::get);
+        let quantized = BinaryVector::from_f32(&input);
+        let after = BINARY_QUANTIZE_SIMD_HITS.with(std::cell::Cell::get);
+        assert_eq!(
+            after,
+            before + 1,
+            "BinaryVector::from_f32 did not execute its explicit SIMD quantizer"
+        );
+        assert_eq!(
+            quantized.data,
+            quantize_binary_scalar(&input, 0.0, input.len().div_ceil(8))
+        );
     }
 
     #[test]
