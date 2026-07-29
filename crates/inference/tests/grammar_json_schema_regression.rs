@@ -207,6 +207,44 @@ fn redundant_ref_narrowing_siblings_compile_target_language() {
     }
 }
 
+#[test]
+fn redundant_ref_narrowing_target_annotations_compile_target_language() {
+    let cases = [
+        ("comment", "$comment", serde_json::json!("why")),
+        ("title", "title", serde_json::json!("Value")),
+        ("description", "description", serde_json::json!("A value")),
+        ("default", "default", serde_json::json!("fallback")),
+        ("examples", "examples", serde_json::json!(["example"])),
+        ("deprecated", "deprecated", serde_json::json!(true)),
+        ("read only", "readOnly", serde_json::json!(true)),
+        ("write only", "writeOnly", serde_json::json!(true)),
+    ];
+
+    for (shape, annotation, value) in cases {
+        let mut target = serde_json::json!({ "type": "string" });
+        target
+            .as_object_mut()
+            .unwrap()
+            .insert(annotation.to_string(), value);
+        let schema = serde_json::json!({
+            "$defs": { "V": target },
+            "$ref": "#/$defs/V",
+            "type": "string"
+        });
+
+        let grammar = compile_json_schema(&schema)
+            .unwrap_or_else(|err| panic!("{shape} annotation should compile: {err}"));
+        assert!(
+            full_accept(&grammar, br#""accepted""#),
+            "{shape} annotation must preserve a value accepted by the target"
+        );
+        assert!(
+            !full_accept(&grammar, b"7"),
+            "{shape} annotation must not drop the referenced target"
+        );
+    }
+}
+
 fn assert_unmodeled_target_ref_narrowing_fails_closed(
     shape: &str,
     target: serde_json::Value,

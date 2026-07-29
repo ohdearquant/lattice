@@ -126,6 +126,22 @@ const REF_IGNORED_SIBLING_KEYS: &[&str] = &[
 /// must fail closed until their intersections are implemented.
 const REF_NARROWING_SIBLING_KEYS: &[&str] = &["const", "enum", "type"];
 
+/// Annotation keys that cannot narrow the resolved target's instance language.
+///
+/// Structural keys from `REF_IGNORED_SIBLING_KEYS` are deliberately excluded:
+/// `$ref` would mean resolution stopped early, while `$defs`, `definitions`,
+/// `$id`, and `$schema` describe schema structure rather than emitted values.
+const REF_TARGET_ANNOTATION_KEYS: &[&str] = &[
+    "$comment",
+    "title",
+    "description",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
@@ -679,9 +695,10 @@ impl<'a> CompileCtx<'a> {
         let target = self.resolve_ref_chain_target(ref_str)?;
         let target_shape_is_modeled = target.as_object().is_some_and(|object| {
             !object.is_empty()
-                && object
-                    .keys()
-                    .all(|key| matches!(key.as_str(), "const" | "enum" | "type"))
+                && object.keys().all(|key| {
+                    matches!(key.as_str(), "const" | "enum" | "type")
+                        || REF_TARGET_ANNOTATION_KEYS.contains(&key.as_str())
+                })
                 && !(object.contains_key("const") && object.contains_key("enum"))
                 && object.get("enum").is_none_or(Value::is_array)
                 && object.get("type").is_none_or(Value::is_string)
