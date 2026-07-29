@@ -24,11 +24,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
-LIB = REPO / "scripts" / "lib"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
+LIB = REPO / "scripts" / "lib"
 
 # Exits 0 for every subcommand and prints nothing a measurement filter matches.
 STUB_CARGO = """#!/usr/bin/env bash
+if [ "${STUB_EMIT_CRITERION_HOME:-0}" = "1" ]; then
+  case " $* " in
+    *" --save-baseline "*|*" --baseline "*)
+      echo "time: criterion-home=${CRITERION_HOME:-<unset>}"
+      ;;
+  esac
+fi
 exit 0
 """
 
@@ -40,20 +47,20 @@ set -euo pipefail
 
 write_baseline() {
   local bench="$1"
-  mkdir -p "$PWD/target/criterion/$bench/compare-base"
+  mkdir -p "$CRITERION_HOME/$bench/compare-base"
   printf '%s\n' '{"mean":{"point_estimate":90.0}}' \
-    > "$PWD/target/criterion/$bench/compare-base/estimates.json"
+    > "$CRITERION_HOME/$bench/compare-base/estimates.json"
 }
 
 write_head() {
   local bench="$1"
-  mkdir -p "$PWD/target/criterion/$bench/new"
-  mkdir -p "$PWD/target/criterion/$bench/change"
+  mkdir -p "$CRITERION_HOME/$bench/new"
+  mkdir -p "$CRITERION_HOME/$bench/change"
   printf '%s\n' '{"mean":{"point_estimate":100.0}}' \
-    > "$PWD/target/criterion/$bench/new/estimates.json"
+    > "$CRITERION_HOME/$bench/new/estimates.json"
   printf '%s\n' \
     '{"mean":{"point_estimate":0.01,"confidence_interval":{"lower_bound":0.0,"upper_bound":0.02}}}' \
-    > "$PWD/target/criterion/$bench/change/estimates.json"
+    > "$CRITERION_HOME/$bench/change/estimates.json"
 }
 
 args=" $* "
@@ -69,7 +76,7 @@ if [[ "$args" == *" --list "* ]]; then
   exit 0
 fi
 
-if [[ "$PWD" == *"/.cache/bench-compare-base" ]]; then
+if [[ "$args" == *" --save-baseline "* ]]; then
   if [[ "$args" == *" lattice-inference "* ]]; then
     write_baseline "rms_norm/896"
     write_baseline "rms_norm/4096"
@@ -113,6 +120,7 @@ def _run(
     stub_rsync=None,
     setup=None,
     extra_env=None,
+    emit_criterion_home=False,
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -121,6 +129,13 @@ def _run(
         shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, root / "scripts" / GATE.name)
         shutil.copytree(LIB, root / "scripts" / "lib")
+        quiet_probe = root / "scripts" / "lib" / "quiet-probe.py"
+        quiet_probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "label = sys.argv[sys.argv.index('--label') + 1]\n"
+            "print(f'[quiet] {label}: idle 100.0% (fixture) ok')\n"
+        )
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -175,6 +190,7 @@ def _run(
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
             **(extra_env or {}),
+            "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
         return subprocess.run(
             ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, "HEAD~1", "HEAD"],
@@ -222,7 +238,10 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         enforcing run exits 0 instead of 2.
         """
         def seed_stale_change(root):
-            bench = root / "target" / "criterion" / "rms_norm" / "4096"
+            bench = (
+                root / ".cache" / "bench-compare-criterion" / "head" /
+                "inference" / "criterion" / "rms_norm" / "4096"
+            )
             (bench / "new").mkdir(parents=True)
             (bench / "change").mkdir()
             (bench / "new" / "estimates.json").write_text(
@@ -245,7 +264,10 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn("selected baseline 'compare-base'", result.stdout)
-        self.assertIn("  - rms_norm/4096", result.stdout)
+        self.assertIn(
+            "  - lattice-inference:elementwise_cpu_bench: rms_norm/4096",
+            result.stdout,
+        )
         self.assertIn("removed 2 stale head artifact directories", result.stdout)
 
     def test_stale_unrelated_selected_baseline_is_pruned_before_copy(self):
@@ -257,7 +279,10 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         even though every benchmark in today's fresh base set ran on HEAD.
         """
         def seed_unrelated_run(root):
-            bench = root / "target" / "criterion" / "old_group" / "42"
+            bench = (
+                root / ".cache" / "bench-compare-criterion" / "head" /
+                "inference" / "criterion" / "old_group" / "42"
+            )
             (bench / "compare-base").mkdir(parents=True)
             (bench / "new").mkdir()
             (bench / "change").mkdir()
@@ -306,7 +331,34 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"expected exit 2 (partial baseline copy), got {result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertIn("selected baseline copy failed (rsync exit 23)", result.stderr)
+        self.assertIn(
+            "lattice-inference:elementwise_cpu_bench selected baseline copy "
+            "failed (rsync exit 23)",
+            result.stderr,
+        )
+
+    def test_each_bench_target_gets_a_distinct_criterion_root(self):
+        """Target identity must be structural, not reconstructed from group names.
+
+        Mutation-sensitive: point EMBED_CRITERION_ROOT at the inference root (or
+        drop either CRITERION_HOME assignment) and the observed path set has one
+        member or includes `<unset>`, reproducing the shared namespace behind
+        #1090. The stub emits only its inherited CRITERION_HOME; no benchmark
+        implementation is duplicated here.
+        """
+        result = _run([], emit_criterion_home=True)
+        self.assertEqual(
+            result.returncode, 0,
+            f"reporter-mode probe failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        roots = set(re.findall(r"criterion-home=(\S+)", result.stdout))
+        self.assertEqual(
+            len(roots), 4,
+            f"expected isolated base/head roots per target, saw {roots}\n"
+            f"stdout:\n{result.stdout}")
+        self.assertNotIn("<unset>", roots)
+        self.assertTrue(any("/inference/criterion" in path for path in roots), roots)
+        self.assertTrue(any("/embed/criterion" in path for path in roots), roots)
 
 
 if __name__ == "__main__":

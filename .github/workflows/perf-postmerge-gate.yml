@@ -25,13 +25,13 @@ name: perf post-merge detection (informational)
 # requires a dedicated quiet runner and is tracked separately; do not read the
 # absence of a FAIL as evidence of a small change's absence.
 #
-# WHY AN A/B AGAINST THE PARENT rather than against the perf-baselines branch:
+# WHY AN A/B AGAINST THE LAST MEASURED COMMIT rather than perf-baselines:
 # bench-update.yml rewrites perf-baselines on every perf-path push to main, so a
-# regression can be absorbed into the baseline before any scheduled job compares
-# against it. Benching the merged commit against its own parent, both built and
-# run in the same job on the same runner, compares before that ratchet and
-# removes cross-run baseline drift. Merges are squashed, so the parent is the
-# previous main tip and the diff under test is exactly one PR.
+# regression can be absorbed before a scheduled comparison. This lane instead
+# advances one lightweight branch per architecture only after its own A/B
+# succeeds. If GitHub drops an intermediate pending run, the next run widens its
+# range back to that recorded commit instead of putting the skipped change in
+# both arms. The first run falls back to the event parent and says so.
 
 on:
   push:
@@ -51,20 +51,9 @@ on:
       # trigger this lane.
       - 'Cargo.toml'
       - '.cargo/**'
-      - 'scripts/bench-compare.sh'
-      - 'scripts/perf-bench-gate.py'
-      # Helpers bench-compare.sh invokes: a change in them changes the run.
-      # bench-compare-impl.sh is the measurement body itself — the entry point
-      # only takes the locks, so a change confined to the body would otherwise
-      # not trigger this lane at all.
-      - 'scripts/lib/bench-compare-impl.sh'
-      - 'scripts/lib/bench-locks.py'
-      - 'scripts/lib/quiet-probe.py'
-      - 'scripts/lib/bench-informational-groups.sh'
-      - 'scripts/lib/bench-quick-informational-targets.txt'
-      - 'scripts/lib/resolve-informational-groups.sh'
-      - 'scripts/lib/ensure-noindex-marker.sh'
-      - '.github/workflows/perf-postmerge-gate.yml'
+      # Harness-only changes are validated before merge and deliberately do not
+      # trigger this lane: the head harness drives both A/B arms, so such a run
+      # cannot attribute a measured delta to the merged diff.
   workflow_dispatch:
     inputs:
       base_ref:
@@ -77,23 +66,20 @@ on:
         default: ''
 
 permissions:
-  contents: read
+  # Each successful push run fast-forwards its architecture's lightweight
+  # progression branch. workflow_dispatch is ad hoc and never updates it.
+  contents: write
 
 concurrency:
   # One post-merge A/B run at a time for this ref. The group is ref-scoped, NOT
   # arch-scoped: the two matrix legs belong to the same run and use different
   # runner pools, so they are free to proceed together.
   #
-  # KNOWN GAP, stated rather than hidden: GitHub keeps only ONE pending run per
-  # concurrency group. If commits B and C land while a run is in flight, B's
-  # pending run is replaced by C's, and C compares against B (github.event.before),
-  # so a regression introduced by B sits in both arms of C's A/B and is invisible.
-  # Rapid-fire merges to main can therefore skip a commit's measurement entirely.
-  # Closing this needs a queue that retains runs, or comparing against the last
-  # SUCCESSFULLY MEASURED commit rather than the immediate parent; either is a
-  # follow-up. Until then, treat a quiet lane during a merge burst as unproven,
-  # not as evidence of no regression, and use workflow_dispatch with explicit
-  # base_ref/head_ref to measure a commit that was skipped.
+  # GitHub keeps only one pending run per group, so a newer push can replace an
+  # intermediate pending run. The per-architecture progression branch closes
+  # that gap: the surviving run spans from the last successful measurement
+  # through every skipped commit. This serial group also keeps two runs from
+  # racing an update to the same architecture records.
   group: perf-postmerge-${{ github.ref }}
   cancel-in-progress: false
 
@@ -136,65 +122,32 @@ jobs:
           IN_BASE: ${{ github.event.inputs.base_ref }}
           IN_HEAD: ${{ github.event.inputs.head_ref }}
           EVENT_BEFORE: ${{ github.event.before }}
+          STATE_BRANCH: perf-postmerge-measured-${{ matrix.arch }}
         run: |
           set -euo pipefail
-          # --verify --end-of-options on the two FREE-FORM inputs only.
-          # workflow_dispatch hands these straight from the user, and git accepts
-          # refnames beginning with a dash, so without the terminator a valid ref
-          # like `-perf-baseline-refresh` is read as an option.
-          #
-          # --verify is load-bearing, not decoration: `git rev-parse
-          # --end-of-options <ref>` ECHOES the literal string `--end-of-options`
-          # as an output line alongside the SHA, so command substitution would
-          # capture a two-line value and hand a corrupted ref downstream. Verified
-          # against a real dash-led branch. --verify selects the single-object
-          # output mode (as --short does in bench-compare.sh) and additionally
-          # fails closed on an unresolvable input instead of echoing it back.
-          #
-          # The two rev-parse calls below consume a github-supplied SHA and a
-          # derived SHA, which cannot take that shape, so they are deliberately
-          # left alone. bench-compare.sh protects its own four ref-consuming call
-          # sites; this step resolves these inputs before reaching the script.
-          HEAD_REF="${IN_HEAD:-HEAD}"
-          HEAD_SHA=$(git rev-parse --verify --end-of-options "$HEAD_REF")
-
-          if [ -n "$IN_BASE" ]; then
-            BASE_SHA=$(git rev-parse --verify --end-of-options "$IN_BASE")
-          elif [ -n "${EVENT_BEFORE:-}" ] \
-               && [ "$EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
-               && git cat-file -e "${EVENT_BEFORE}^{commit}" 2>/dev/null; then
-            BASE_SHA=$(git rev-parse "$EVENT_BEFORE")
-          else
-            # Force-push, branch creation, or an unavailable before-SHA. Fall
-            # back to the first parent, which for a squashed merge is the
-            # previous main tip.
-            BASE_SHA=$(git rev-parse "${HEAD_SHA}^")
-          fi
-
-          # Fail closed on a degenerate pair rather than measuring a commit
-          # against itself and reporting the resulting silence as a pass.
-          if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
-            echo "base and head resolve to the same commit ($BASE_SHA); nothing to compare" >&2
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"; then
-            echo "base $BASE_SHA is not an ancestor of head $HEAD_SHA" >&2
-            exit 1
-          fi
-
-          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
-          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          echo "A/B endpoints: $BASE_SHA -> $HEAD_SHA"
+          python3 scripts/perf-postmerge-base.py \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-before "$EVENT_BEFORE" \
+            --base-ref "$IN_BASE" \
+            --head-ref "$IN_HEAD" \
+            --state-branch "$STATE_BRANCH" \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Declare scope and resolution ceiling
         env:
           BASE: ${{ steps.refs.outputs.base }}
           HEAD: ${{ steps.refs.outputs.head }}
+          BASE_SOURCE: ${{ steps.refs.outputs.base_source }}
+          SPAN_COUNT: ${{ steps.refs.outputs.span_count }}
+          STATE_BRANCH: ${{ steps.refs.outputs.state_branch }}
+          STATE_BEFORE: ${{ steps.refs.outputs.state_before }}
         run: |
           {
             echo "### perf post-merge A/B (${{ matrix.arch }})"
             echo
             echo "\`$BASE\` -> \`$HEAD\`, full-mode Criterion."
+            echo "Base source: \`$BASE_SOURCE\`; commit span: \`$SPAN_COUNT\`."
+            echo "Progression branch: \`$STATE_BRANCH\` (prior: \`$STATE_BEFORE\`)."
             echo
             echo "**Coverage.** Every group of the two benched targets"
             echo "(\`lattice-inference:elementwise_cpu_bench\`, \`lattice-embed:simd\`)"
@@ -228,15 +181,39 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           exit "$rc"
 
+      - name: Record the successfully measured head
+        id: record
+        if: ${{ success() && github.event_name == 'push' }}
+        env:
+          HEAD: ${{ steps.refs.outputs.head }}
+          STATE_BRANCH: ${{ steps.refs.outputs.state_branch }}
+        run: |
+          set -euo pipefail
+          git push origin "$HEAD:refs/heads/$STATE_BRANCH"
+          echo "recorded=true" >> "$GITHUB_OUTPUT"
+
       - name: Record the outcome honestly
         if: always()
         env:
           JOB_STATUS: ${{ job.status }}
           AB_RC: ${{ steps.ab.outputs.rc }}
+          EVENT_NAME: ${{ github.event_name }}
+          STATE_BRANCH: ${{ steps.refs.outputs.state_branch }}
+          HEAD: ${{ steps.refs.outputs.head }}
         run: |
           {
             if [ "$JOB_STATUS" = "success" ]; then
               echo "No gross regression detected (see ceiling above)."
+              if [ "$EVENT_NAME" = "push" ]; then
+                echo "Recorded \`$HEAD\` as the last successful measurement on"
+                echo "\`$STATE_BRANCH\`."
+              else
+                echo "Ad-hoc workflow_dispatch run: progression state was not updated."
+              fi
+            elif [ "$AB_RC" = "0" ]; then
+              echo "The A/B passed, but its successful-head record was not published."
+              echo "This run is not progression evidence; the next run will retry from"
+              echo "the prior recorded base. Inspect the state-publication step."
             elif [ "$AB_RC" = "1" ]; then
               echo "FAILED, exit 1 — a confirmed regression. Check the flagged groups"
               echo "are reachable from the merged diff, then revert or justify."
