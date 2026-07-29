@@ -112,8 +112,9 @@ vectors. The test reports mean Recall@10 and full-corpus pairwise ranking agreem
 
 The floors leave margin below the deterministic aarch64 snapshot for backend reduction
 rounding while still detecting material ranking regressions. Representation, tier identity,
-lossy conversion, and distance divergence assertions ensure an f32 bypass or tier misrouting
-cannot satisfy the quality checks accidentally.
+lossy-conversion, and distance-divergence assertions ensure a storage-conversion bypass or tier
+misrouting cannot satisfy the quality checks accidentally. The ranking gate does not prove which
+internal distance kernel produced the scores.
 
 This fixture is synthetic regression evidence, not a model benchmark. It neither establishes
 quality on production embedding distributions nor identifies acceptable end-user recall.
