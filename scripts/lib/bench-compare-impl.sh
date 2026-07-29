@@ -21,7 +21,7 @@
 # Unset filters run all groups in the default bench targets:
 #   lattice-inference: elementwise_cpu_bench
 #   lattice-embed: simd
-# Uses a git worktree for the base ref so your working tree stays untouched.
+# Uses detached git worktrees for both refs so your working tree stays untouched.
 #
 # VOCABULARY, because these four are separate and get conflated. A group is
 # MEASURED if the bench ran and produced numbers; REPORTED if those numbers
@@ -104,7 +104,15 @@ set -euo pipefail
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
+QUICK_FLAGS="--quick"  # adaptive two-point sample, ~2 min total
+RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+if [ -n "${BENCH_HOST_ID:-}" ]; then
+  RUN_HOST_ID="configured:${BENCH_HOST_ID}"
+else
+  RUN_HOST_ID="$(python3 "$REPO/scripts/lib/bench-host-id.py")"
+fi
+RUN_OS="$(uname -srm)"
+PROVENANCE_FILE="$REPO/.cache/bench-run-provenance.txt"
 
 # --- Refuse to measure unless the recorded supervisor is one of our ancestors ---
 # scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
@@ -186,12 +194,27 @@ verify_locks
 # machine after the head phase invalidates numbers that were already taken,
 # which is exactly when the temptation to keep them is strongest.
 QUIET_SAMPLES=""
+MACHINE_STATE_SAMPLES=""
+machine_state_probe() {
+  local label="$1" record
+  if ! record="$(
+    python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
+  )"; then
+    echo "bench-compare: machine-state probe failed at '$label' — refusing." >&2
+    exit 2
+  fi
+  echo "[state] $label: $record"
+  MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
+}$record"
+}
+
 quiet_gate() {
   local label="$1" line rc=0
   line="$(python3 "$REPO/scripts/lib/quiet-probe.py" --label "$label")" || rc=$?
   echo "$line"
   QUIET_SAMPLES="${QUIET_SAMPLES}${QUIET_SAMPLES:+
 }$line"
+  machine_state_probe "$label"
   if [ "$rc" -ne 0 ]; then
     echo "bench-compare: machine was not quiet at '$label' — refusing to" \
          "certify this A/B. Set BENCH_IDLE_FLOOR to judge against a" \
@@ -220,7 +243,7 @@ AFTER_DDASH=0
 while [ $# -gt 0 ]; do
   case "${1:-}" in
     --full)
-      QUICK_FLAGS=""  # 100 samples, ~15 min total
+      QUICK_FLAGS=""  # configured sample size (normally 100), ~15 min total
       shift
       ;;
     --fail-on-regression)
@@ -273,33 +296,73 @@ if [ "$#" -gt 2 ]; then
   exit 2
 fi
 
-# Resolve to short SHAs for display
-BASE_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
-HEAD_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$HEAD_REF" 2>/dev/null || echo "$HEAD_REF")
+# Resolve both display and audit identities before measuring.
+if ! BASE_FULL_SHA="$(
+  git -C "$REPO" rev-parse --verify --end-of-options "${BASE_REF}^{commit}" 2>/dev/null
+)"; then
+  echo "bench-compare: base ref '$BASE_REF' is not a commit — refusing." >&2
+  exit 2
+fi
+if ! HEAD_FULL_SHA="$(
+  git -C "$REPO" rev-parse --verify --end-of-options "${HEAD_REF}^{commit}" 2>/dev/null
+)"; then
+  echo "bench-compare: head ref '$HEAD_REF' is not a commit — refusing." >&2
+  exit 2
+fi
+BASE_SHA="${BASE_FULL_SHA:0:10}"
+HEAD_SHA="${HEAD_FULL_SHA:0:10}"
 
 HEAD_WT="$REPO/.cache/bench-compare-head"
 if [ "$HEAD_REF" = "HEAD" ]; then
-  HEAD_MODE="in-place"
-  HEAD_DIR="$REPO"
+  HEAD_MODE="detached snapshot worktree"
 else
   HEAD_MODE="detached worktree"
-  HEAD_DIR="$HEAD_WT"
 fi
+HEAD_DIR="$HEAD_WT"
 GATE_SCRIPT="$REPO/scripts/perf-bench-gate.py"
 
 print_execution_provenance() {
-  echo "  head arm: $HEAD_MODE at $HEAD_DIR"
-  echo "  gate: $GATE_SCRIPT"
+  echo "  head arm: $HEAD_MODE"
+  echo "  gate: scripts/perf-bench-gate.py from the invoking checkout"
+}
+
+require_commit_clean_head() {
+  if [ "$HEAD_REF" != "HEAD" ]; then
+    return
+  fi
+  local current_head status
+  if ! current_head="$(
+    git -C "$REPO" rev-parse --verify --end-of-options 'HEAD^{commit}' 2>/dev/null
+  )"; then
+    echo "bench-compare: cannot resolve the invoking HEAD commit — refusing." >&2
+    exit 2
+  fi
+  if [ "$current_head" != "$HEAD_FULL_SHA" ]; then
+    echo "bench-compare: the invoking HEAD commit changed during the run — refusing." >&2
+    echo "  expected $HEAD_FULL_SHA" >&2
+    echo "  observed $current_head" >&2
+    exit 2
+  fi
+  if ! status="$(git -C "$REPO" status --porcelain=v1 --untracked-files=normal)"; then
+    echo "bench-compare: cannot inspect the invoking HEAD worktree — refusing." >&2
+    exit 2
+  fi
+  if [ -n "$status" ]; then
+    echo "bench-compare: the invoking HEAD worktree is not commit-clean — refusing." >&2
+    echo "  Commit or remove tracked, staged, and untracked changes so the measured" >&2
+    echo "  source is exactly reconstructible from the recorded head SHA." >&2
+    exit 2
+  fi
 }
 
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
 print_execution_provenance
+require_commit_clean_head
 quiet_gate "before base"
 
 # --- Keep Spotlight out of the benchmark build trees ---
 # .cache protects the detached base/head worktrees. The separate target marker
-# protects the default in-place HEAD arm: without it the base is excluded while
-# the head build dirties thousands of indexed files immediately before timing.
+# protects build artifacts created by callers outside these detached worktrees.
 # Recreate both every run because deleting either tree deletes its own marker.
 # Inert on non-macOS. Fail-closed: refuse to measure without the protection
 # rather than emit numbers that look trustworthy and are not.
@@ -313,8 +376,43 @@ if [ -d "$WT" ]; then
 fi
 git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_REF" 2>&1 | tail -1
 
+command_version() {
+  local directory="$1"; shift
+  local output
+  if ! output="$(cd "$directory" && "$@" 2>&1)" || [ -z "$output" ]; then
+    printf '%s' "unavailable"
+    return
+  fi
+  printf '%s' "$output" | tr '\n' ';'
+}
+
+criterion_version() {
+  local lockfile="$1/Cargo.lock"
+  if [ ! -f "$lockfile" ]; then
+    printf '%s' "unavailable"
+    return
+  fi
+  awk '
+    $0 == "name = \"criterion\"" { in_criterion = 1; next }
+    in_criterion && /^version = "/ {
+      value = $0
+      sub(/^version = "/, "", value)
+      sub(/"$/, "", value)
+      print value
+      exit
+    }
+    in_criterion && /^\[\[package\]\]/ { exit }
+  ' "$lockfile"
+}
+
+BASE_RUSTC="$(command_version "$WT" rustc --version)"
+BASE_CARGO="$(command_version "$WT" cargo --version)"
+BASE_CRITERION="$(criterion_version "$WT")"
+[ -n "$BASE_CRITERION" ] || BASE_CRITERION="unavailable"
+
 cleanup() {
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
+  git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -431,14 +529,16 @@ quiet_gate "between phases"
 echo ""
 echo "--- Building + benching HEAD ($HEAD_SHA) ---"
 
-if [ "$HEAD_MODE" = "detached worktree" ]; then
-  if [ -d "$HEAD_WT" ]; then
-    git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
-  fi
-  git -C "$REPO" worktree add --detach --end-of-options "$HEAD_WT" "$HEAD_REF" 2>&1 | tail -1
-  # Update cleanup to also remove head worktree
-  trap 'git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true; cleanup' EXIT
+if [ -d "$HEAD_WT" ]; then
+  git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
 fi
+git -C "$REPO" worktree add --detach --end-of-options \
+  "$HEAD_WT" "$HEAD_FULL_SHA" 2>&1 | tail -1
+
+HEAD_RUSTC="$(command_version "$HEAD_DIR" rustc --version)"
+HEAD_CARGO="$(command_version "$HEAD_DIR" cargo --version)"
+HEAD_CRITERION="$(criterion_version "$HEAD_DIR")"
+[ -n "$HEAD_CRITERION" ] || HEAD_CRITERION="unavailable"
 
 copy_base_artifacts() {
   local what="$1"; shift
@@ -489,6 +589,61 @@ HEAD_PHASE_RC=0
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
 
 quiet_gate "after head"
+require_commit_clean_head
+
+write_run_provenance() {
+  local finished_utc criterion_mode enforcement
+  finished_utc="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if [ -n "$QUICK_FLAGS" ]; then
+    criterion_mode="quick"
+  else
+    criterion_mode="full"
+  fi
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    enforcement="fail-on-regression"
+  else
+    enforcement="report-only"
+  fi
+
+  mkdir -p "$(dirname "$PROVENANCE_FILE")"
+  {
+    printf 'schema=lattice-bench-provenance-v1\n'
+    printf 'started_utc=%s\n' "$RUN_STARTED_UTC"
+    printf 'finished_utc=%s\n' "$finished_utc"
+    printf 'host_id=%s\n' "$RUN_HOST_ID"
+    printf 'os=%s\n' "$RUN_OS"
+    printf 'base_ref=%s\n' "$BASE_REF"
+    printf 'base_sha=%s\n' "$BASE_FULL_SHA"
+    printf 'head_ref=%s\n' "$HEAD_REF"
+    printf 'head_sha=%s\n' "$HEAD_FULL_SHA"
+    printf 'head_mode=detached-worktree\n'
+    printf 'base_rustc=%s\n' "$BASE_RUSTC"
+    printf 'head_rustc=%s\n' "$HEAD_RUSTC"
+    printf 'base_cargo=%s\n' "$BASE_CARGO"
+    printf 'head_cargo=%s\n' "$HEAD_CARGO"
+    printf 'base_criterion=%s\n' "$BASE_CRITERION"
+    printf 'head_criterion=%s\n' "$HEAD_CRITERION"
+    printf 'criterion_mode=%s\n' "$criterion_mode"
+    printf 'baseline_name=%s\n' "$BENCH_BASELINE_NAME"
+    printf 'targets=lattice-inference:%s, lattice-embed:%s\n' \
+      "$BENCHES_INFERENCE" "$BENCHES_EMBED"
+    printf 'inference_features=%s\n' "${CARGO_FEATURES_INFERENCE:-<none>}"
+    printf "filters=inference='%s' embed='%s'\n" \
+      "${BENCH_GROUPS_INFERENCE:-<all>}" "${BENCH_GROUPS_EMBED:-<all>}"
+    printf 'enforcement=%s\n' "$enforcement"
+    while IFS= read -r line; do
+      [ -n "$line" ] && printf 'lock=%s\n' "$line"
+    done <<< "$LOCK_SUMMARY"
+    while IFS= read -r line; do
+      [ -n "$line" ] && printf 'ambient=%s\n' "$line"
+    done <<< "$QUIET_SAMPLES"
+    while IFS= read -r line; do
+      [ -n "$line" ] && printf 'machine_state=%s\n' "$line"
+    done <<< "$MACHINE_STATE_SAMPLES"
+  } > "$PROVENANCE_FILE"
+}
+
+write_run_provenance
 
 # --- Report ---
 # The conditions go in the report, not just in the log. A number that does not
@@ -510,6 +665,8 @@ echo "  locks:"
 echo "$LOCK_SUMMARY"
 echo "  ambient load:"
 echo "$QUIET_SAMPLES" | sed 's/^/    /'
+echo "  thermal/power:"
+echo "$MACHINE_STATE_SAMPLES" | sed 's/^/    /'
 
 echo ""
 echo "=== Target-qualified gate reports ==="
@@ -517,7 +674,11 @@ GATE_RC=0
 run_target_gate() {
   local target="$1" criterion_root="$2"
   local gate_rc=0 policy_rc=0 policy_invalid=0
-  local gate_args=(--baseline-name compare-base --target "$target")
+  local gate_args=(
+    --baseline-name compare-base
+    --target "$target"
+    --provenance-file "$PROVENANCE_FILE"
+  )
 
   if [ -n "$QUICK_FLAGS" ]; then
     if "$REPO/scripts/lib/bench-informational-targets.sh" \
@@ -537,6 +698,7 @@ run_target_gate() {
     # target rather than inferred from whichever comparisons survived in a
     # shared tree.
     gate_args+=(--require-measurements)
+    gate_args+=(--require-provenance)
   fi
 
   if [ -d "$criterion_root" ]; then

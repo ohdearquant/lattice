@@ -31,6 +31,7 @@ carry them.
 """
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -46,6 +47,8 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
 LIB = REPO / "scripts" / "lib"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
+STATE_PROBE = LIB / "machine-state-probe.py"
+HOST_ID = LIB / "bench-host-id.py"
 
 STUB_CARGO = """#!/usr/bin/env bash
 exit 0
@@ -68,6 +71,7 @@ class _Sandbox:
         shutil.copy2(SCRIPT, self.root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, self.root / "scripts" / GATE.name)
         shutil.copytree(LIB, self.root / "scripts" / "lib")
+        shutil.copy2(REPO / ".gitignore", self.root / ".gitignore")
         quiet_probe = self.root / "scripts" / "lib" / "quiet-probe.py"
         quiet_probe.write_text(
             "#!/usr/bin/env python3\n"
@@ -83,10 +87,32 @@ class _Sandbox:
             "      f'{\"ok\" if ok else \"BELOW FLOOR\"} | top: fixture 0.0%')\n"
             "raise SystemExit(0 if ok else 1)\n"
         )
+        machine_probe = self.root / "scripts" / "lib" / "machine-state-probe.py"
+        machine_probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import datetime, json, sys\n"
+            "label = sys.argv[sys.argv.index('--label') + 1]\n"
+            "print(json.dumps({'schema':'lattice-machine-state-v1','label':label,"
+            "'captured_at_utc':datetime.datetime.now(datetime.UTC)"
+            ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
+            "'power':{'status':'unavailable','reason':'fixture'},"
+            "'thermal':{'status':'unavailable','reason':'fixture'}},"
+            "separators=(',', ':'), sort_keys=True))\n"
+        )
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
         subprocess.run([*GIT, "init", "-q", "-b", "main", str(self.root)], check=True)
+        (self.root / "Cargo.lock").write_text(
+            'version = 4\n\n'
+            '[[package]]\n'
+            'name = "criterion"\n'
+            'version = "0.5.1"\n'
+        )
+        subprocess.run(
+            [*GIT, "-C", str(self.root), "add", "-f", "Cargo.lock"],
+            check=True,
+        )
         for i in range(2):
             (self.root / f"f{i}.txt").write_text(str(i))
             subprocess.run([*GIT, "-C", str(self.root), "add", "-A"], check=True)
@@ -99,13 +125,26 @@ class _Sandbox:
             src = re.sub(rf'^{const} = "[^"]*"$', f'{const} = "{tmp}/{const.lower()}"',
                          src, flags=re.M)
         locks.write_text(src)
+        subprocess.run(
+            [*GIT, "-C", str(self.root), "add", "scripts/lib/bench-locks.py"],
+            check=True,
+        )
+        subprocess.run(
+            [*GIT, "-C", str(self.root), "commit", "-qm", "fixture lock paths"],
+            check=True,
+            env=env_git,
+        )
 
         bindir = Path(tmp) / "bin"
         bindir.mkdir()
         cargo = bindir / "cargo"
         cargo.write_text(STUB_CARGO)
         cargo.chmod(0o755)
-        self.env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+        self.env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+        }
         return self
 
     def __exit__(self, *exc):
@@ -246,10 +285,10 @@ class HeadModeReporting(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assert_provenance_in_header_and_report(
                 r.stdout,
-                f"  head arm: in-place at {sb.root}",
-                f"  gate: {sb.root}/scripts/perf-bench-gate.py",
+                "  head arm: detached snapshot worktree",
+                "  gate: scripts/perf-bench-gate.py from the invoking checkout",
             )
-            self.assertNotIn("head arm: detached worktree", r.stdout)
+            self.assertNotIn("head arm: in-place", r.stdout)
 
     def test_explicit_head_ref_uses_and_reports_a_detached_worktree(self):
         """Mutation-sensitive: collapsing the mode selection to in-place makes
@@ -264,10 +303,258 @@ class HeadModeReporting(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assert_provenance_in_header_and_report(
                 r.stdout,
-                f"  head arm: detached worktree at {sb.root}/.cache/bench-compare-head",
-                f"  gate: {sb.root}/scripts/perf-bench-gate.py",
+                "  head arm: detached worktree",
+                "  gate: scripts/perf-bench-gate.py from the invoking checkout",
             )
             self.assertNotIn("head arm: in-place", r.stdout)
+
+    def test_in_place_head_refuses_uncommitted_source(self):
+        with _Sandbox() as sb:
+            (sb.root / "f1.txt").write_text("dirty")
+            r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("not commit-clean", r.stderr)
+
+    def test_detached_head_ignores_dirty_invoking_worktree(self):
+        with _Sandbox() as sb:
+            (sb.root / "f1.txt").write_text("dirty")
+            r = sb.run(
+                [sb.entry],
+                base_ref="HEAD~1",
+                head_ref="HEAD~1",
+                BENCH_IDLE_FLOOR="0",
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("head arm: detached worktree", r.stdout)
+
+    def test_in_place_head_refuses_source_changed_during_measurement(self):
+        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
+            cargo = Path(shim) / "cargo"
+            cargo.write_text(
+                "#!/usr/bin/env bash\n"
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]]; then\n'
+                f'  printf "%s\\n" changed > "{sb.root}/f1.txt"\n'
+                "fi\n"
+                "exit 0\n"
+            )
+            cargo.chmod(0o755)
+            r = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                PATH=f"{shim}:{sb.env['PATH']}",
+            )
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("not commit-clean", r.stderr)
+
+    def test_restored_source_race_cannot_change_snapshot_measurement(self):
+        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
+            cargo = Path(shim) / "cargo"
+            observed = Path(shim) / "observed"
+            cargo.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]] '
+                '&& [ "${1:-}" != "--version" ]; then\n'
+                f'  printf "%s:%s\\n" "$PWD" "$(cat f1.txt)" >> "{observed}"\n'
+                f'  original="$(cat "{sb.root}/f1.txt")"\n'
+                f'  printf "%s" mutated-during-run > "{sb.root}/f1.txt"\n'
+                f'  printf "%s" "$original" > "{sb.root}/f1.txt"\n'
+                "fi\n"
+                "exit 0\n"
+            )
+            cargo.chmod(0o755)
+            r = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                PATH=f"{shim}:{sb.env['PATH']}",
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual((sb.root / "f1.txt").read_text(), "1")
+            lines = observed.read_text().splitlines()
+            self.assertTrue(lines, r.stdout)
+            self.assertTrue(
+                all(line.endswith(":1") for line in lines),
+                "\n".join(lines),
+            )
+
+    def test_in_place_head_refuses_commit_changed_during_measurement(self):
+        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
+            cargo = Path(shim) / "cargo"
+            cargo.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]] '
+                '&& [ "${1:-}" != "--version" ] '
+                f'&& [ "$(cat "{sb.root}/f1.txt")" != "committed-during-run" ]; then\n'
+                f'  printf "%s\\n" committed-during-run > "{sb.root}/f1.txt"\n'
+                f'  cd "{sb.root}"\n'
+                "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
+                "add f1.txt\n"
+                "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
+                "commit -qm committed-during-run\n"
+                "fi\n"
+                "exit 0\n"
+            )
+            cargo.chmod(0o755)
+            r = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                PATH=f"{shim}:{sb.env['PATH']}",
+            )
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("HEAD commit changed during the run", r.stderr)
+
+
+class RunProvenanceHandoff(unittest.TestCase):
+    def test_supervised_run_writes_complete_three_phase_handoff(self):
+        """The Markdown gate receives auditable machine and phase conditions."""
+        with _Sandbox() as sb:
+            r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
+            self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
+            provenance = sb.root / ".cache" / "bench-run-provenance.txt"
+            self.assertTrue(provenance.is_file(), r.stdout)
+            lines = provenance.read_text().splitlines()
+
+            for prefix in (
+                "schema=lattice-bench-provenance-v1",
+                "started_utc=",
+                "finished_utc=",
+                "host_id=local-random:",
+                "os=",
+                "base_ref=HEAD~1",
+                "base_sha=",
+                "head_ref=HEAD",
+                "head_sha=",
+                "head_mode=detached-worktree",
+                "base_rustc=",
+                "head_rustc=",
+                "base_cargo=",
+                "head_cargo=",
+                "base_criterion=",
+                "head_criterion=",
+                "criterion_mode=quick",
+                "baseline_name=compare-base",
+                "targets=lattice-inference:elementwise_cpu_bench, lattice-embed:simd",
+                "inference_features=<none>",
+                "filters=inference='<all>' embed='<all>'",
+                "enforcement=report-only",
+                "lock=",
+            ):
+                self.assertTrue(
+                    any(line.startswith(prefix) for line in lines),
+                    f"missing provenance prefix {prefix!r}:\n"
+                    + "\n".join(lines),
+                )
+            self.assertEqual(
+                sum(line.startswith("ambient=") for line in lines),
+                3,
+                "\n".join(lines),
+            )
+            self.assertEqual(
+                sum(line.startswith("machine_state=") for line in lines),
+                3,
+                "\n".join(lines),
+            )
+            states = [
+                json.loads(line.removeprefix("machine_state="))
+                for line in lines
+                if line.startswith("machine_state=")
+            ]
+            self.assertEqual(
+                [state["label"] for state in states],
+                ["before base", "between phases", "after head"],
+            )
+            self.assertTrue(
+                all(
+                    state["power"]["status"] in ("measured", "unavailable")
+                    and state["thermal"]["status"] in ("measured", "unavailable")
+                    for state in states
+                )
+            )
+            self.assertNotIn(os.uname().nodename, provenance.read_text())
+            head_mode = next(
+                line for line in lines if line.startswith("head_mode=")
+            )
+            self.assertNotIn(" at ", head_mode)
+            self.assertIn("<summary>Run provenance</summary>", r.stdout)
+            self.assertIn("host_id=local-random:", r.stdout)
+            self.assertNotIn("unsuitable as benchmark evidence", r.stdout)
+
+
+class HostIdentifier(unittest.TestCase):
+    def test_random_identifier_is_stable_and_contains_no_hostname(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "host-id"
+            env = {**os.environ, "LATTICE_BENCH_HOST_ID_FILE": str(path)}
+            first = subprocess.run(
+                ["python3", str(HOST_ID)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            ).stdout.strip()
+            second = subprocess.run(
+                ["python3", str(HOST_ID)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            ).stdout.strip()
+            self.assertRegex(first, r"^local-random:[0-9a-f]{32}$")
+            self.assertEqual(first, second)
+            self.assertNotIn(os.uname().nodename, first)
+
+    def test_malformed_persisted_identifier_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "host-id"
+            path.write_text("not-a-valid-id\n")
+            result = subprocess.run(
+                ["python3", str(HOST_ID)],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LATTICE_BENCH_HOST_ID_FILE": str(path)},
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("does not contain one 32-hex", result.stderr)
+
+
+class MachineStateParsers(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location(
+            "machine_state_probe", str(STATE_PROBE)
+        )
+        self.probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.probe)
+
+    def test_power_source_is_measured_only_when_pmset_names_it(self):
+        ac = self.probe.parse_macos_power("Now drawing from 'AC Power'\n")
+        battery = self.probe.parse_macos_power("Now drawing from 'Battery Power'\n")
+        missing = self.probe.parse_macos_power("Battery information unavailable\n")
+        self.assertEqual(ac["state"], "ac")
+        self.assertEqual(battery["state"], "battery")
+        self.assertEqual(missing["status"], "unavailable")
+
+    def test_thermal_error_text_is_not_reported_as_nominal(self):
+        result = self.probe.parse_macos_thermal(
+            "Error: Failed to get thermal warning level with error code 0xe00002bc\n"
+        )
+        self.assertEqual(result["status"], "unavailable")
+        self.assertNotEqual(result.get("state"), "nominal")
+
+    def test_cpu_speed_limit_distinguishes_nominal_and_throttled(self):
+        nominal = self.probe.parse_macos_thermal("CPU_Speed_Limit = 100\n")
+        throttled = self.probe.parse_macos_thermal("CPU_Speed_Limit = 75\n")
+        self.assertEqual(nominal["state"], "nominal")
+        self.assertEqual(throttled["state"], "throttled")
+        self.assertEqual(throttled["cpu_speed_limit_percent"], 75)
+
+    def test_explicit_no_warning_pair_is_nominal(self):
+        result = self.probe.parse_macos_thermal(
+            "Note: No thermal warning level has been recorded\n"
+            "Note: No performance warning level has been recorded\n"
+        )
+        self.assertEqual(result["status"], "measured")
+        self.assertEqual(result["state"], "nominal")
 
 
 class ContentionDiagnostics(unittest.TestCase):
