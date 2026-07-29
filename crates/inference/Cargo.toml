@@ -68,6 +68,7 @@ rustc-hash = "2"
 rayon = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+base64.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 clap = { workspace = true }
@@ -132,6 +133,10 @@ required-features = ["f16", "metal-gpu"]
 name = "lattice_serve"
 path = "src/bin/lattice_serve.rs"
 required-features = ["f16", "metal-gpu", "serve"]
+
+[[test]]
+name = "vision_serve_e2e_test"
+required-features = ["download", "f16", "metal-gpu", "serve"]
 
 [[bin]]
 name = "bench_decode_ab"

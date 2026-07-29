@@ -27,7 +27,7 @@ use super::VisionError;
 use super::checkpoint::Qwen35VisionWeights;
 use super::vit::{batch_matvec, gelu, layer_norm, softmax_inplace};
 use crate::model::qwen35_config::VisionModelConfig;
-use image::{DynamicImage, ImageReader};
+use image::ImageReader;
 use std::io::Cursor;
 
 /// Per-channel rescale-then-normalize constants for the real Qwen3.5-0.8B
@@ -39,6 +39,9 @@ use std::io::Cursor;
 /// ADR-049 7B scaffold.
 const QWEN35_IMAGE_MEAN: f32 = 0.5;
 const QWEN35_IMAGE_STD: f32 = 0.5;
+const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
+const MAX_SERVE_VISION_PATCHES: usize = 256;
+const MAX_SERVE_PREPROCESSED_BYTES: usize = 16 * 1024 * 1024;
 
 /// The temporal/height/width patch-grid shape for one image (`grid_thw` in
 /// the HF reference). `t` is always 1 for a still image (video is out of
@@ -77,19 +80,95 @@ pub fn preprocess_qwen35_image(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
-    let reader = ImageReader::new(Cursor::new(image_bytes))
-        .with_guessed_format()
-        .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
-    let img: DynamicImage = reader
-        .decode()
-        .map_err(|e| VisionError::ImageDecode(format!("decode failed: {e}")))?;
+    preprocess_qwen35_image_inner(image_bytes, cfg, None)
+}
+
+/// Decode and preprocess one serving image under a bounded patch budget.
+///
+/// The Qwen vision tower uses full attention, so compressed request bytes do
+/// not bound either decoded allocation or quadratic attention work. This
+/// serving-specific entry point rejects dimensions above 2048 pixels and
+/// grids above 256 pre-merge patches, and caps the preprocessed f32 patch
+/// buffer at 16 MiB, before decoding pixel data. The public embedding entry
+/// point above keeps its existing, checkpoint-defined scope.
+pub fn preprocess_qwen35_image_for_serve(
+    image_bytes: &[u8],
+    cfg: &VisionModelConfig,
+) -> Result<(Vec<f32>, GridThw), VisionError> {
+    preprocess_qwen35_image_inner(image_bytes, cfg, Some(MAX_SERVE_VISION_PATCHES))
+}
+
+fn preprocess_qwen35_image_inner(
+    image_bytes: &[u8],
+    cfg: &VisionModelConfig,
+    max_patches: Option<usize>,
+) -> Result<(Vec<f32>, GridThw), VisionError> {
+    let img = if let Some(max_patches) = max_patches {
+        if cfg.patch_size == 0 {
+            return Err(VisionError::InvalidConfig(
+                "patch_size must be > 0".to_string(),
+            ));
+        }
+
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_IMAGE_DIMENSION_PIXELS);
+        limits.max_image_height = Some(MAX_IMAGE_DIMENSION_PIXELS);
+        let mut header_reader = ImageReader::new(Cursor::new(image_bytes))
+            .with_guessed_format()
+            .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
+        header_reader.limits(limits.clone());
+        let (header_width, header_height) = header_reader
+            .into_dimensions()
+            .map_err(|e| VisionError::ImageDecode(format!("dimension read failed: {e}")))?;
+        let patches = (header_width as usize)
+            .div_ceil(cfg.patch_size)
+            .checked_mul((header_height as usize).div_ceil(cfg.patch_size))
+            .ok_or_else(|| {
+                VisionError::InvalidConfig("serving image patch count overflowed".to_string())
+            })?;
+        if patches > max_patches {
+            return Err(VisionError::InvalidConfig(format!(
+                "image {header_width}x{header_height} produces {patches} patches; serving \
+                 maximum is {max_patches}"
+            )));
+        }
+        let preprocessed_bytes = preprocessed_f32_len(patches, cfg)?
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                VisionError::InvalidConfig(
+                    "serving image preprocessing byte count overflowed".to_string(),
+                )
+            })?;
+        if preprocessed_bytes > MAX_SERVE_PREPROCESSED_BYTES {
+            return Err(VisionError::InvalidConfig(format!(
+                "serving image preprocessing requires {preprocessed_bytes} bytes; maximum is \
+                 {MAX_SERVE_PREPROCESSED_BYTES}"
+            )));
+        }
+
+        let mut reader = ImageReader::new(Cursor::new(image_bytes))
+            .with_guessed_format()
+            .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
+        reader.limits(limits);
+        reader
+            .decode()
+            .map_err(|e| VisionError::ImageDecode(format!("decode failed: {e}")))?
+    } else {
+        ImageReader::new(Cursor::new(image_bytes))
+            .with_guessed_format()
+            .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?
+            .decode()
+            .map_err(|e| VisionError::ImageDecode(format!("decode failed: {e}")))?
+    };
     let rgb = img.into_rgb8();
     let (width, height) = (rgb.width() as usize, rgb.height() as usize);
 
     let patch_size = cfg.patch_size;
     let merge = cfg.spatial_merge_size;
-    let factor = patch_size * merge;
-    if patch_size == 0 || merge == 0 || factor == 0 {
+    let factor = patch_size.checked_mul(merge).ok_or_else(|| {
+        VisionError::InvalidConfig("patch_size * spatial_merge_size overflowed".to_string())
+    })?;
+    if patch_size == 0 || merge == 0 {
         return Err(VisionError::InvalidConfig(
             "patch_size and spatial_merge_size must be > 0".into(),
         ));
@@ -111,9 +190,10 @@ pub fn preprocess_qwen35_image(
 
     let in_channels = cfg.in_channels;
     let temporal = cfg.temporal_patch_size;
-    let patch_len = in_channels * temporal * patch_size * patch_size;
     let num_patches = grid.num_patches();
-    let mut out = vec![0.0f32; num_patches * patch_len];
+    let patch_len = preprocessed_f32_len(1, cfg)?;
+    let output_len = preprocessed_f32_len(num_patches, cfg)?;
+    let mut out = vec![0.0f32; output_len];
 
     let blocks_h = grid_h / merge;
     let blocks_w = grid_w / merge;
@@ -148,6 +228,17 @@ pub fn preprocess_qwen35_image(
     }
 
     Ok((out, grid))
+}
+
+fn preprocessed_f32_len(num_patches: usize, cfg: &VisionModelConfig) -> Result<usize, VisionError> {
+    cfg.in_channels
+        .checked_mul(cfg.temporal_patch_size)
+        .and_then(|value| value.checked_mul(cfg.patch_size))
+        .and_then(|value| value.checked_mul(cfg.patch_size))
+        .and_then(|patch_len| num_patches.checked_mul(patch_len))
+        .ok_or_else(|| {
+            VisionError::InvalidConfig("image preprocessing element count overflowed".to_string())
+        })
 }
 
 /// Bilinear-interpolate the learned `pos_embed` table (`[num_position_embeddings,
@@ -547,6 +638,36 @@ mod tests {
         let patch_len = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
         assert_eq!(patches.len(), grid.num_patches() * patch_len);
         assert!(patches.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn serving_preprocess_enforces_patch_budget_without_narrowing_embedding_path() {
+        let cfg = tiny_cfg();
+        let boundary = make_test_png(32, 32); // 16 * 16 = 256 patches
+        assert!(preprocess_qwen35_image_for_serve(&boundary, &cfg).is_ok());
+
+        let over = make_test_png(36, 32); // 18 * 16 = 288 patches
+        let err = preprocess_qwen35_image_for_serve(&over, &cfg).unwrap_err();
+        assert!(
+            matches!(err, VisionError::InvalidConfig(message) if message.contains("serving maximum is 256"))
+        );
+        assert!(
+            preprocess_qwen35_image(&over, &cfg).is_ok(),
+            "the serving-only latency budget must not narrow the embedding API"
+        );
+    }
+
+    #[test]
+    fn serving_preprocess_caps_output_allocation_for_pathological_config() {
+        let mut cfg = tiny_cfg();
+        cfg.patch_size = 8;
+        cfg.spatial_merge_size = 1;
+        cfg.temporal_patch_size = 128;
+        let image = make_test_png(128, 128);
+        let err = preprocess_qwen35_image_for_serve(&image, &cfg).unwrap_err();
+        assert!(
+            matches!(err, VisionError::InvalidConfig(message) if message.contains("preprocessing requires"))
+        );
     }
 
     fn make_test_weights(cfg: &VisionModelConfig) -> Qwen35VisionWeights {

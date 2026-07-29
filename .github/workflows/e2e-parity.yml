@@ -133,7 +133,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/inference/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -875,7 +875,7 @@ jobs:
     needs: [changes, quarot-artifact]
     if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
-    timeout-minutes: 60
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -966,6 +966,25 @@ jobs:
             --test quarot_q4_composed_golden \
             --features "f16,metal-gpu" \
             -- --nocapture
+
+      - name: Run HTTP vision serve Metal gate (fail-closed)
+        if: ${{ !cancelled() }}
+        env:
+          LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
+          LATTICE_VISION_S3_GATE_ENFORCE: '1'
+        run: |
+          if cargo test --release -p lattice-inference --features f16,metal-gpu \
+            --test vision_serve_e2e_test \
+            serve_chat_completions_reaches_vision_forward_path \
+            -- --exact --nocapture > vision-serve-metal-gate.log 2>&1
+          then
+            cat vision-serve-metal-gate.log
+          else
+            status=$?
+            cat vision-serve-metal-gate.log
+            exit "$status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-serve-metal-gate.log
 
       # MP2+MP3 Metal injection gate: `forward_step_injected_logits_differ_by_row_content`,
       # `generate_multimodal_vision_injection_is_mutation_sensitive`,
@@ -1200,7 +1219,7 @@ jobs:
             exit 1
           fi
           if [ "$Q4VISION_RESULT" != "success" ]; then
-            echo "::error::Engine changed and the q4 + macOS vision gates job did not succeed (result=$Q4VISION_RESULT). This one result covers the QuaRot composed golden, S5b, Metal injection gate and Q4 PPL regression gate; open the job log to see which step failed."
+            echo "::error::Engine changed and the q4 + macOS vision gates job did not succeed (result=$Q4VISION_RESULT). This one result covers the QuaRot composed golden, S5b, HTTP vision serve Metal, Metal injection and Q4 PPL regression gates; open the job log to see which step failed."
             exit 1
           fi
           if [ "$PPL_SELFTEST_RESULT" != "success" ]; then

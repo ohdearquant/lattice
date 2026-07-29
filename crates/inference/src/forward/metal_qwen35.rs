@@ -979,7 +979,7 @@ pub enum ChatRole {
 }
 
 impl ChatRole {
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             ChatRole::System => "system",
             ChatRole::User => "user",
@@ -995,6 +995,18 @@ impl ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Inline image carried by a normalized chat content part.
+    pub image: Option<ChatImage>,
+}
+
+/// **Unstable**: one inline image attached to a chat message.
+#[derive(Debug, Clone)]
+pub struct ChatImage {
+    /// Base64-decoded PNG or JPEG file bytes.
+    pub bytes: Vec<u8>,
+    /// UTF-8 byte offset into [`ChatMessage::content`] where the image part
+    /// appeared.
+    pub text_offset: usize,
 }
 
 impl ChatMessage {
@@ -1003,6 +1015,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content: content.into(),
+            image: None,
         }
     }
     /// **Unstable**: construct a user message.
@@ -1010,6 +1023,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: content.into(),
+            image: None,
         }
     }
     /// **Unstable**: construct an assistant message.
@@ -1017,6 +1031,23 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content: content.into(),
+            image: None,
+        }
+    }
+
+    /// **Unstable**: construct a user message with one inline image.
+    pub fn user_with_image(
+        content: impl Into<String>,
+        image_bytes: Vec<u8>,
+        text_offset: usize,
+    ) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: content.into(),
+            image: Some(ChatImage {
+                bytes: image_bytes,
+                text_offset,
+            }),
         }
     }
 }
@@ -1026,6 +1057,10 @@ impl ChatMessage {
 /// Format messages into Qwen3.5 chat template.
 /// Template: <|im_start|>{role}\n{content}<|im_end|>\n
 /// Final assistant turn left open for generation.
+///
+/// This formatter emits text turns only. Inline image payloads require the
+/// multimodal vision generation path; the public text-chat generation entry
+/// points reject such messages before calling this formatter.
 pub fn format_chat_template(messages: &[ChatMessage]) -> String {
     format_chat_template_parts(
         messages
@@ -1039,15 +1074,23 @@ pub(crate) fn format_chat_template_parts<'a>(
 ) -> String {
     let mut prompt = String::new();
     for (role, content) in messages {
-        prompt.push_str("<|im_start|>");
-        prompt.push_str(role);
-        prompt.push('\n');
+        push_chat_turn_open(&mut prompt, role);
         prompt.push_str(content);
-        prompt.push_str("<|im_end|>\n");
+        push_chat_turn_close(&mut prompt);
     }
     // Open assistant turn for generation
     prompt.push_str("<|im_start|>assistant\n");
     prompt
+}
+
+pub(crate) fn push_chat_turn_open(prompt: &mut String, role: &str) {
+    prompt.push_str("<|im_start|>");
+    prompt.push_str(role);
+    prompt.push('\n');
+}
+
+pub(crate) fn push_chat_turn_close(prompt: &mut String) {
+    prompt.push_str("<|im_end|>\n");
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -9562,7 +9605,52 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
-            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None)
+            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None, None)
+        }
+
+        /// Generate from one vision request while polling caller cancellation.
+        ///
+        /// Cancellation is checked before prefill, before every prefill token,
+        /// after prefill, and before every decode step. The returned output
+        /// carries [`StopReason::Interrupt`] when cancellation wins.
+        pub fn generate_multimodal_vision_with_cancel<C>(
+            &mut self,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            mut should_cancel: C,
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
+        where
+            C: FnMut() -> bool,
+        {
+            self.generate_multimodal_vision_impl(
+                request,
+                tokenizer,
+                gen_cfg,
+                None,
+                Some(&mut should_cancel),
+            )
+        }
+
+        fn multimodal_cancel_requested(
+            should_cancel: &mut Option<&mut dyn FnMut() -> bool>,
+        ) -> bool {
+            match should_cancel {
+                Some(callback) => callback(),
+                None => false,
+            }
+        }
+
+        fn cancelled_multimodal_output(prompt_tokens: usize) -> GenerateOutput {
+            GenerateOutput {
+                text: String::new(),
+                token_ids: Vec::new(),
+                prompt_tokens,
+                generated_tokens: 0,
+                stopped: false,
+                stop_reason: Some(StopReason::Interrupt),
+                token_logprobs: Vec::new(),
+            }
         }
 
         /// Body of [`Self::generate_multimodal_vision`] with an optional
@@ -9581,6 +9669,7 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut decode_logits_probe: Option<&mut Vec<Vec<f32>>>,
+            mut should_cancel: Option<&mut dyn FnMut() -> bool>,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
 
@@ -9691,6 +9780,10 @@ mod inner {
                 self.max_context(),
             )?;
 
+            if Self::multimodal_cancel_requested(&mut should_cancel) {
+                return Ok(Self::cancelled_multimodal_output(prompt_len));
+            }
+
             // Reset recurrent state for a clean generation.
             self.reset_state();
 
@@ -9725,6 +9818,9 @@ mod inner {
             let mut visual_row = 0usize;
             let mut last_logits = Vec::new();
             for (pos, &token_id) in prompt_ids.iter().enumerate() {
+                if Self::multimodal_cancel_requested(&mut should_cancel) {
+                    return Ok(Self::cancelled_multimodal_output(prompt_len));
+                }
                 let cos_sin = if has_image {
                     Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()))
                 } else {
@@ -9757,6 +9853,9 @@ mod inner {
                         crate::forward::signpost::Scope::NotDecode,
                     );
                 }
+            }
+            if Self::multimodal_cancel_requested(&mut should_cancel) {
+                return Ok(Self::cancelled_multimodal_output(prompt_len));
             }
 
             let mut all_ids = prompt_ids.clone();
@@ -9799,6 +9898,10 @@ mod inner {
             // `decode_axis = physical_pos + rope_delta`, recomputed into a single
             // cos/sin row via the same `build_decode_cos_sin` the CPU oracle uses.
             while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
+                if Self::multimodal_cancel_requested(&mut should_cancel) {
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -13696,6 +13799,20 @@ mod inner {
     // Chat Completion API
     // -----------------------------------------------------------------------
 
+    const TEXT_CHAT_IMAGE_ERROR: &str =
+        "inline image messages require the multimodal vision generation path";
+
+    fn reject_inline_images_for_text_chat(
+        messages: &[ChatMessage],
+    ) -> Result<(), crate::error::InferenceError> {
+        if messages.iter().any(|message| message.image.is_some()) {
+            return Err(crate::error::InferenceError::InvalidInput(
+                TEXT_CHAT_IMAGE_ERROR.to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// **Unstable**: output from chat completion; fields may expand with streaming and usage stats.
     ///
     /// Output from chat completion.
@@ -13723,14 +13840,17 @@ mod inner {
         ///
         /// # Errors
         ///
-        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
-        /// blocks every token — propagated from [`Self::generate`] (#611).
+        /// Returns `InferenceError::InvalidInput` if `messages` contains an
+        /// inline image, which requires the multimodal vision entry point, or
+        /// if grammar-constrained decoding blocks every token — propagated
+        /// from [`Self::generate`] (#611).
         pub fn chat_completion(
             &mut self,
             messages: &[ChatMessage],
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<ChatCompletionOutput, crate::error::InferenceError> {
+            reject_inline_images_for_text_chat(messages)?;
             let prompt = format_chat_template(messages);
             // Add <|im_end|> as stop token
             let mut cfg = gen_cfg.clone();
@@ -15895,8 +16015,10 @@ mod inner {
         ///
         /// # Errors
         ///
-        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
-        /// blocks every token — propagated from [`Self::generate_streaming_with_cancel`] (#611).
+        /// Returns `InferenceError::InvalidInput` if `messages` contains an
+        /// inline image, which requires the multimodal vision entry point, or
+        /// if grammar-constrained decoding blocks every token — propagated
+        /// from [`Self::generate_streaming_with_cancel`] (#611).
         pub fn chat_completion_streaming_with_cancel<F, C>(
             &mut self,
             messages: &[ChatMessage],
@@ -15909,6 +16031,7 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            reject_inline_images_for_text_chat(messages)?;
             let prompt = format_chat_template(messages);
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -17451,6 +17574,12 @@ mod inner {
         /// of `generate_streaming_with_prefix_cache`. See
         /// [`Self::chat_completion_streaming_with_cancel`] for the analogous
         /// non-cache entry point this mirrors.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if `messages` contains an
+        /// inline image, which requires the multimodal vision entry point, or
+        /// if the delegated generation path rejects the input.
         pub fn chat_completion_streaming_with_prefix_cache_and_cancel<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
@@ -17464,6 +17593,7 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            reject_inline_images_for_text_chat(messages)?;
             let prompt = format_chat_template(messages);
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -19673,6 +19803,101 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 layers: vec![(AttentionWeights::Full(full), common)],
             };
             (cfg, weights)
+        }
+
+        fn tiny_metal_qwen35_vision_fixture() -> (Qwen35Config, ModelWeights) {
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.rope_parameters = Some(crate::model::qwen35_config::RopeParams {
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: Some(0.25),
+                mrope_section: Some(vec![11, 11, 10]),
+                mrope_interleaved: Some(true),
+            });
+            cfg.vision_config = Some(crate::model::qwen35_config::VisionModelConfig {
+                depth: 1,
+                hidden_size: 4,
+                num_heads: 1,
+                patch_size: 1,
+                spatial_merge_size: 2,
+                out_hidden_size: cfg.hidden_size,
+                temporal_patch_size: 1,
+                num_position_embeddings: 4,
+                in_channels: 3,
+                deepstack_visual_indexes: Vec::new(),
+                intermediate_size: Some(8),
+            });
+            cfg.image_token_id = Some(5);
+            cfg.video_token_id = Some(6);
+            cfg.vision_start_token_id = Some(7);
+            cfg.vision_end_token_id = Some(8);
+            (cfg, weights)
+        }
+
+        fn assert_text_chat_image_rejected<T>(result: Result<T, crate::error::InferenceError>) {
+            match result {
+                Err(crate::error::InferenceError::InvalidInput(message)) => {
+                    assert_eq!(message, TEXT_CHAT_IMAGE_ERROR);
+                }
+                Err(error) => panic!("inline image returned the wrong error: {error}"),
+                Ok(_) => panic!("text-only chat entry point silently accepted an inline image"),
+            }
+        }
+
+        #[test]
+        fn text_chat_image_guard_rejects_without_a_metal_device() {
+            assert_text_chat_image_rejected(reject_inline_images_for_text_chat(&[
+                ChatMessage::user_with_image("beforeafter", vec![1, 2, 3], "before".len()),
+            ]));
+        }
+
+        #[test]
+        fn text_chat_entrypoints_reject_inline_images_before_generation() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny Metal chat state");
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig::default();
+            let messages = [ChatMessage::user_with_image(
+                "beforeafter",
+                vec![0x89, b'P', b'N', b'G'],
+                "before".len(),
+            )];
+
+            assert_text_chat_image_rejected(state.chat_completion(&messages, &tokenizer, &gen_cfg));
+            assert_text_chat_image_rejected(state.chat_completion_streaming(
+                &messages,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            ));
+            assert_text_chat_image_rejected(state.chat_completion_streaming_with_cancel(
+                &messages,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+                || false,
+            ));
+            assert_text_chat_image_rejected(state.chat_completion_streaming_with_prefix_cache(
+                crate::kv_cache::CrossTurnSlotId::DEFAULT,
+                &messages,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            ));
+            assert_text_chat_image_rejected(
+                state.chat_completion_streaming_with_prefix_cache_and_cancel(
+                    crate::kv_cache::CrossTurnSlotId::DEFAULT,
+                    &messages,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                ),
+            );
         }
 
         fn rotate_embedding_rows_for_test(
@@ -26664,6 +26889,167 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
+        fn assert_vision_state_reusable_after_cancel(
+            state: &mut MetalQwen35State,
+            weights: &ModelWeights,
+            cfg: &Qwen35Config,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+        ) {
+            let resumed = state
+                .generate_multimodal_vision(request, tokenizer, gen_cfg)
+                .expect("same state must remain usable after cancellation");
+            let mut fresh =
+                MetalQwen35State::new(weights, cfg, 32).expect("fresh tiny vision state");
+            let expected = fresh
+                .generate_multimodal_vision(request, tokenizer, gen_cfg)
+                .expect("fresh reference generation succeeds");
+            assert_eq!(
+                resumed.token_ids, expected.token_ids,
+                "generation after cancellation must match a fresh state"
+            );
+            assert_eq!(
+                resumed.stop_reason, expected.stop_reason,
+                "generation after cancellation must preserve the fresh stop reason"
+            );
+        }
+
+        #[test]
+        fn generate_multimodal_vision_cancel_immediate_preserves_and_reuses_state() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
+            let request = vision_gate_fixture(&cfg, 0.01);
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
+
+            let _ = state.forward_step(3, 0);
+            let retained_seq_len = state.session.kv_cache.seq_len;
+            assert!(retained_seq_len > 0, "precondition: state carries live KV");
+
+            let mut polls = 0usize;
+            let out = state
+                .generate_multimodal_vision_with_cancel(&request, &tokenizer, &gen_cfg, || {
+                    polls += 1;
+                    true
+                })
+                .expect("immediate cancellation returns an output");
+            assert_eq!(
+                polls, 1,
+                "immediate cancellation must stop at the first poll"
+            );
+            assert_eq!(out.stop_reason, Some(StopReason::Interrupt));
+            assert_eq!(out.generated_tokens, 0);
+            assert!(
+                !out.stopped,
+                "client cancellation is not an OpenAI stop condition"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len, retained_seq_len,
+                "immediate cancellation must happen before reset or prefill mutates state"
+            );
+
+            assert_vision_state_reusable_after_cancel(
+                &mut state, &weights, &cfg, &request, &tokenizer, &gen_cfg,
+            );
+        }
+
+        #[test]
+        fn generate_multimodal_vision_cancel_during_prefill_stops_before_next_token() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
+            let request = vision_gate_fixture(&cfg, 0.01);
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
+
+            let mut polls = 0usize;
+            let out = state
+                .generate_multimodal_vision_with_cancel(&request, &tokenizer, &gen_cfg, || {
+                    polls += 1;
+                    polls == 3
+                })
+                .expect("prefill cancellation returns an output");
+            assert_eq!(polls, 3);
+            assert_eq!(out.stop_reason, Some(StopReason::Interrupt));
+            assert_eq!(out.generated_tokens, 0);
+            assert_eq!(
+                state.session.kv_cache.seq_len, 1,
+                "only the first prompt token may reach the decoder"
+            );
+
+            assert_vision_state_reusable_after_cancel(
+                &mut state, &weights, &cfg, &request, &tokenizer, &gen_cfg,
+            );
+        }
+
+        #[test]
+        fn generate_multimodal_vision_cancel_mid_decode_is_bounded_and_reuses_state() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
+            let request = vision_gate_fixture(&cfg, 0.01);
+            let prompt_len = request.input_ids.len();
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
+
+            let cancel_poll = prompt_len + 4;
+            let mut polls = 0usize;
+            let out = state
+                .generate_multimodal_vision_with_cancel(&request, &tokenizer, &gen_cfg, || {
+                    polls += 1;
+                    polls == cancel_poll
+                })
+                .expect("mid-decode cancellation returns an output");
+            assert_eq!(polls, cancel_poll);
+            assert_eq!(out.stop_reason, Some(StopReason::Interrupt));
+            assert_eq!(
+                out.generated_tokens, 2,
+                "one sampled token and one decoded token must precede cancellation"
+            );
+            assert!(out.generated_tokens < gen_cfg.max_new_tokens);
+            assert_eq!(
+                state.session.kv_cache.seq_len,
+                prompt_len + 1,
+                "only one autoregressive decode step may reach the decoder"
+            );
+
+            assert_vision_state_reusable_after_cancel(
+                &mut state, &weights, &cfg, &request, &tokenizer, &gen_cfg,
+            );
+        }
+
         /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): isolates `forward_step_injected`
         /// from the KV-cache history / decode-loop / sampling machinery entirely by
         /// calling it once at position 0 on a freshly reset state, so any
@@ -27482,7 +27868,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("real-checkpoint state");
             let mut probed: Vec<Vec<f32>> = Vec::new();
             let out = state_fn
-                .generate_multimodal_vision_impl(&request, &tokenizer, &gen_cfg, Some(&mut probed))
+                .generate_multimodal_vision_impl(
+                    &request,
+                    &tokenizer,
+                    &gen_cfg,
+                    Some(&mut probed),
+                    None,
+                )
                 .expect("fixture multimodal generate succeeds");
             assert_eq!(
                 out.generated_tokens, 2,

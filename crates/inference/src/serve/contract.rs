@@ -1,5 +1,6 @@
 //! Shared OpenAI chat-completions request parsing and normalization.
 
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
@@ -26,6 +27,19 @@ pub const MAX_MESSAGE_COUNT: usize = 4096;
 /// the current body-size cap and of which content encoding (a plain string
 /// vs. typed content parts) a client uses.
 pub const MAX_CUMULATIVE_CONTENT_BYTES: usize = REQUEST_BODY_LIMIT_BYTES;
+
+/// Maximum decoded bytes accepted for one inline chat image.
+///
+/// The daemon's existing validate-before-materialize preflight limits any
+/// content-part string to 65,536 bytes. A 48,000-byte binary payload expands
+/// to exactly 64,000 base64 bytes, leaving room for the longest accepted
+/// `data:image/*;base64,` prefix while keeping both HTTP binaries on the same
+/// effective image limit.
+pub const MAX_DECODED_IMAGE_BYTES: usize = 48_000;
+
+/// Maximum base64 payload length corresponding to
+/// [`MAX_DECODED_IMAGE_BYTES`].
+const MAX_ENCODED_IMAGE_BYTES: usize = 4 * MAX_DECODED_IMAGE_BYTES.div_ceil(3);
 
 /// Maximum byte length of a single stop string, enforced in
 /// [`parse_stop_strings`] before the string is stored in a
@@ -162,6 +176,19 @@ pub struct NormalizedChatMessage {
     pub role: NormalizedChatRole,
     /// Plain text content after typed text parts are concatenated.
     pub content: String,
+    /// One inline image, preserving its position among the concatenated text
+    /// parts. Only user messages may carry an image.
+    pub image: Option<NormalizedChatImage>,
+}
+
+/// Validated inline image carried across the shared request contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedChatImage {
+    /// Base64-decoded PNG or JPEG file bytes after strict data-URI validation.
+    pub bytes: Vec<u8>,
+    /// UTF-8 byte offset into [`NormalizedChatMessage::content`] where the
+    /// image part appeared.
+    pub text_offset: usize,
 }
 
 /// Message content represented as a string or a list of typed parts.
@@ -320,6 +347,7 @@ pub struct ServeProfile<'a> {
     reasoning_budget_supported: bool,
     structured_output_supported: bool,
     logprobs_supported: bool,
+    vision_supported: bool,
     /// Whether a conflicting `max_tokens`/`max_completion_tokens` pair is
     /// rejected ahead of the served-model check (matching each binary's
     /// pre-shared-contract precedence for this one check): `true` on the
@@ -342,6 +370,7 @@ impl<'a> ServeProfile<'a> {
             reasoning_budget_supported: false,
             structured_output_supported: false,
             logprobs_supported: true,
+            vision_supported: false,
             max_tokens_conflict_checked_early: false,
         }
     }
@@ -359,8 +388,18 @@ impl<'a> ServeProfile<'a> {
             reasoning_budget_supported: true,
             structured_output_supported: true,
             logprobs_supported: false,
+            vision_supported: false,
             max_tokens_conflict_checked_early: true,
         }
+    }
+
+    /// Declare whether the loaded checkpoint can execute the vision path.
+    ///
+    /// Profiles default to text-only so callers must opt in from concrete
+    /// loaded-model metadata rather than from the requested model name.
+    pub const fn with_vision_support(mut self, supported: bool) -> Self {
+        self.vision_supported = supported;
+        self
     }
 }
 
@@ -450,7 +489,22 @@ fn normalize_request_inner<C>(
     let temperature = validate_temperature(req.temperature.unwrap_or(defaults.temperature))?;
     let top_p = validate_top_p(req.top_p.unwrap_or(defaults.top_p))?;
     let logprobs = normalize_logprobs(req)?;
-    let messages = normalize_messages(&req.messages)?;
+    let messages = normalize_messages_with_vision(&req.messages, profile.vision_supported)?;
+    let has_image = messages.iter().any(|message| message.image.is_some());
+    if has_image && logprobs.is_some() {
+        unsupported("logprobs are not supported for image requests")?;
+    }
+    if has_image && req.stream.unwrap_or(false) {
+        unsupported("streaming is not supported for image requests")?;
+    }
+    if has_image
+        && req
+            .response_format
+            .as_ref()
+            .is_some_and(|format| format.r#type == "json_schema")
+    {
+        unsupported("json_schema response format is not supported for image requests")?;
+    }
     let context = check_context(&messages, max_tokens)?;
     let stop_strings = if profile.stop_supported {
         parse_stop_strings(&req.stop)?
@@ -481,6 +535,9 @@ fn normalize_request_inner<C>(
         reasoning_budget = reasoning_budget
             .map(|value| value.min(reasoning_room))
             .filter(|&value| value > 0);
+    }
+    if has_image && reasoning_budget.is_some() {
+        unsupported("reasoning_budget is not supported for image requests")?;
     }
 
     Ok((
@@ -841,64 +898,163 @@ fn normalize_logprobs(req: &ChatRequest) -> Result<Option<usize>, ApiError> {
 
 /// Validate and convert wire messages into backend-independent chat messages.
 pub fn normalize_messages(messages: &[Message]) -> Result<Vec<NormalizedChatMessage>, ApiError> {
-    messages
-        .iter()
-        .map(|message| {
-            let content = message_text(&message.content)?;
-            match message.role.as_str() {
-                "system" => Ok(NormalizedChatMessage {
-                    role: NormalizedChatRole::System,
-                    content,
-                }),
-                "user" => Ok(NormalizedChatMessage {
-                    role: NormalizedChatRole::User,
-                    content,
-                }),
-                "assistant" => Ok(NormalizedChatMessage {
-                    role: NormalizedChatRole::Assistant,
-                    content,
-                }),
-                "tool" | "developer" => Err(ApiError::BadRequest {
+    normalize_messages_with_vision(messages, false)
+}
+
+fn normalize_messages_with_vision(
+    messages: &[Message],
+    vision_supported: bool,
+) -> Result<Vec<NormalizedChatMessage>, ApiError> {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut request_has_image = false;
+    for message in messages {
+        let (content, image) =
+            normalize_message_content(&message.content, vision_supported, &mut request_has_image)?;
+        let role = match message.role.as_str() {
+            "system" => NormalizedChatRole::System,
+            "user" => NormalizedChatRole::User,
+            "assistant" => NormalizedChatRole::Assistant,
+            "tool" | "developer" => {
+                return Err(ApiError::BadRequest {
                     message: format!("role '{}' is not supported by this server", message.role),
                     code: "unsupported_feature",
-                }),
-                role => Err(ApiError::BadRequest {
+                });
+            }
+            role => {
+                return Err(ApiError::BadRequest {
                     message: format!(
                         "unsupported role '{role}'; must be 'system', 'user', or 'assistant'"
                     ),
                     code: "invalid_role",
-                }),
+                });
             }
-        })
-        .collect()
+        };
+        if image.is_some() && role != NormalizedChatRole::User {
+            return Err(ApiError::BadRequest {
+                message: "image content parts are supported only on user messages".to_string(),
+                code: "invalid_image_role",
+            });
+        }
+        normalized.push(NormalizedChatMessage {
+            role,
+            content,
+            image,
+        });
+    }
+    Ok(normalized)
 }
 
-fn message_text(content: &MessageContent) -> Result<String, ApiError> {
+fn normalize_message_content(
+    content: &MessageContent,
+    vision_supported: bool,
+    request_has_image: &mut bool,
+) -> Result<(String, Option<NormalizedChatImage>), ApiError> {
     match content {
-        MessageContent::Text(text) => Ok(text.clone()),
+        MessageContent::Text(text) => Ok((text.clone(), None)),
         MessageContent::Parts(parts) => {
             let mut output = String::new();
+            let mut image = None;
             for part in parts {
                 match part {
                     ContentPart::Text { text } => output.push_str(text),
-                    ContentPart::ImageUrl { .. } => {
-                        return Err(ApiError::BadRequest {
-                            message: "image input requires a vision-capable model".to_string(),
-                            code: "unsupported_feature",
+                    ContentPart::ImageUrl { image_url } => {
+                        if !vision_supported {
+                            return Err(ApiError::BadRequest {
+                                message: "image input requires a vision-capable model".to_string(),
+                                code: "vision_unsupported",
+                            });
+                        }
+                        if *request_has_image {
+                            return Err(ApiError::BadRequest {
+                                message: "only one image is supported per request".to_string(),
+                                code: "multiple_images_unsupported",
+                            });
+                        }
+                        let bytes = decode_inline_image(&image_url.url)?;
+                        *request_has_image = true;
+                        image = Some(NormalizedChatImage {
+                            bytes,
+                            text_offset: output.len(),
                         });
                     }
                     ContentPart::Unsupported { kind } => {
                         return Err(ApiError::BadRequest {
                             message: format!(
-                                "content part type '{kind}' is not supported; only 'text' parts are accepted"
+                                "content part type '{kind}' is not supported; only 'text' and \
+                                 'image_url' parts are accepted"
                             ),
                             code: "unsupported_feature",
                         });
                     }
                 }
             }
-            Ok(output)
+            Ok((output, image))
         }
+    }
+}
+
+fn decode_inline_image(url: &str) -> Result<Vec<u8>, ApiError> {
+    let Some(data) = url.strip_prefix("data:") else {
+        return Err(ApiError::BadRequest {
+            message: "image_url.url must be an inline data URI; remote URLs are not accepted"
+                .to_string(),
+            code: "unsupported_image_url_scheme",
+        });
+    };
+    let Some((metadata, payload)) = data.split_once(',') else {
+        return Err(invalid_image(
+            "image data URI is missing its comma separator",
+        ));
+    };
+    let Some(media_type) = metadata.strip_suffix(";base64") else {
+        return Err(invalid_image(
+            "image data URI must use the ';base64' encoding marker",
+        ));
+    };
+    let expected_format = match media_type {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        _ => {
+            return Err(invalid_image(
+                "image data URI media type must be 'image/png' or 'image/jpeg'",
+            ));
+        }
+    };
+    if payload.is_empty() {
+        return Err(invalid_image("image data URI payload must not be empty"));
+    }
+    if payload.len() > MAX_ENCODED_IMAGE_BYTES {
+        return Err(invalid_image(format!(
+            "image data URI payload has {} base64 bytes; maximum is {MAX_ENCODED_IMAGE_BYTES}",
+            payload.len()
+        )));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| invalid_image("image data URI contains invalid base64"))?;
+    if bytes.is_empty() {
+        return Err(invalid_image("decoded image must not be empty"));
+    }
+    if bytes.len() > MAX_DECODED_IMAGE_BYTES {
+        return Err(invalid_image(format!(
+            "decoded image has {} bytes; maximum is {MAX_DECODED_IMAGE_BYTES}",
+            bytes.len()
+        )));
+    }
+    let actual_format = image::guess_format(&bytes)
+        .map_err(|_| invalid_image("decoded payload is not a recognized PNG or JPEG image"))?;
+    if actual_format != expected_format {
+        return Err(invalid_image(format!(
+            "image data URI declares {media_type} but payload is {actual_format:?}"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn invalid_image(message: impl Into<String>) -> ApiError {
+    ApiError::BadRequest {
+        message: message.into(),
+        code: "invalid_image",
     }
 }
 
@@ -1004,6 +1160,35 @@ mod tests {
         GenerationDefaults::standard(16)
     }
 
+    fn inline_image_request(role: &str, url: &str) -> ChatRequest {
+        request(&format!(
+            r#"{{"model":"model","messages":[{{"role":"{role}","content":[
+                {{"type":"text","text":"before"}},
+                {{"type":"image_url","image_url":{{"url":"{url}"}}}},
+                {{"type":"text","text":"after"}}
+            ]}}]}}"#
+        ))
+    }
+
+    fn valid_png_data_uri() -> String {
+        let image = image::RgbImage::new(1, 1);
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("PNG fixture must encode");
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    fn vision_profile() -> ServeProfile<'static> {
+        ServeProfile::lattice("model", 32).with_vision_support(true)
+    }
+
     #[test]
     fn standard_generation_defaults_snapshot() {
         let defaults = GenerationDefaults::standard(123);
@@ -1019,6 +1204,148 @@ mod tests {
     fn contract_source_has_no_backend_message_dependency() {
         let source = include_str!("contract.rs");
         assert!(!source.contains(concat!("crate::", "forward")));
+    }
+
+    #[test]
+    fn vision_profile_preserves_inline_image_and_text_position() {
+        let req = inline_image_request("user", &valid_png_data_uri());
+        let validated = normalize_request(&req, defaults(), vision_profile()).unwrap();
+        let message = &validated.messages[0];
+        assert_eq!(message.content, "beforeafter");
+        let image = message
+            .image
+            .as_ref()
+            .expect("image must survive normalization");
+        assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(image.text_offset, "before".len());
+    }
+
+    #[test]
+    fn text_only_profile_rejects_image_by_loaded_capability() {
+        let req = inline_image_request("user", &valid_png_data_uri());
+        let err =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap_err();
+        assert_eq!(err.code(), "vision_unsupported");
+        assert_eq!(err.message(), "image input requires a vision-capable model");
+    }
+
+    #[test]
+    fn vision_profile_rejects_remote_image_urls() {
+        let req = inline_image_request("user", "https://example.com/image.png");
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "unsupported_image_url_scheme");
+    }
+
+    #[test]
+    fn vision_profile_rejects_malformed_or_empty_data_uris() {
+        for url in [
+            "data:image/png;base64",
+            "data:image/png,AAAA",
+            "data:text/plain;base64,cG5n",
+            "data:image/png;base64,",
+            "data:image/png;base64,***",
+            "data:image/png;base64,cG5n",
+        ] {
+            let req = inline_image_request("user", url);
+            let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+            assert_eq!(err.code(), "invalid_image", "url={url}");
+        }
+    }
+
+    #[test]
+    fn vision_profile_rejects_media_type_payload_mismatch() {
+        let uri = valid_png_data_uri().replacen("image/png", "image/jpeg", 1);
+        let req = inline_image_request("user", &uri);
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "invalid_image");
+        assert!(err.message().contains("declares image/jpeg"));
+    }
+
+    #[test]
+    fn vision_profile_rejects_oversized_decoded_image_before_allocation() {
+        let payload = "A".repeat(MAX_ENCODED_IMAGE_BYTES + 4);
+        let req = inline_image_request("user", &format!("data:image/png;base64,{payload}"));
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "invalid_image");
+        assert!(err.message().contains("base64 bytes; maximum"));
+    }
+
+    #[test]
+    fn vision_profile_rejects_multiple_images_across_messages() {
+        let uri = valid_png_data_uri();
+        let req = request(&format!(
+            r#"{{"model":"model","messages":[
+                {{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]}},
+                {{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]}}
+            ]}}"#
+        ));
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "multiple_images_unsupported");
+    }
+
+    #[test]
+    fn vision_profile_rejects_image_on_non_user_role() {
+        let uri = valid_png_data_uri();
+        let req = request(&format!(
+            r#"{{"model":"model","messages":[
+                {{"role":"system","content":[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]}},
+                {{"role":"user","content":"question"}}
+            ]}}"#
+        ));
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "invalid_image_role");
+    }
+
+    #[test]
+    fn image_requests_reject_unwired_generation_extensions() {
+        let uri = valid_png_data_uri();
+        let mut req = inline_image_request("user", &uri);
+        req.stream = Some(true);
+        assert_eq!(
+            normalize_request(&req, defaults(), vision_profile())
+                .unwrap_err()
+                .code(),
+            "unsupported_feature"
+        );
+
+        let mut req = inline_image_request("user", &uri);
+        req.logprobs = Some(true);
+        assert_eq!(
+            normalize_request(&req, defaults(), vision_profile())
+                .unwrap_err()
+                .code(),
+            "unsupported_feature"
+        );
+
+        let mut req = inline_image_request("user", &uri);
+        req.reasoning_budget =
+            Some(serde_json::value::RawValue::from_string("4".to_string()).unwrap());
+        assert_eq!(
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice_serve("model", 32).with_vision_support(true),
+            )
+            .unwrap_err()
+            .code(),
+            "unsupported_feature"
+        );
+
+        let mut req = inline_image_request("user", &uri);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".to_string(),
+            json_schema: None,
+        });
+        assert_eq!(
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice_serve("model", 32).with_vision_support(true),
+            )
+            .unwrap_err()
+            .code(),
+            "unsupported_feature"
+        );
     }
 
     #[test]

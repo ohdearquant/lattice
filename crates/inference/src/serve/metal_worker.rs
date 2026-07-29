@@ -47,13 +47,27 @@
 //! on `metal_qwen35.rs`'s own exhaustive Device-gated tests for the
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
-use crate::forward::metal_qwen35::{ChatMessage, MetalQwen35State, format_chat_template};
+use crate::forward::metal_qwen35::{
+    ChatMessage, MetalQwen35State, format_chat_template, push_chat_turn_close, push_chat_turn_open,
+};
 use crate::kv_cache::CrossTurnSlotId;
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
+use crate::model::qwen35_config::{
+    GenerateConfig, GenerateOutput, Qwen35Config, VisionModelConfig,
+};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
+use crate::vision::checkpoint::{
+    Qwen35VisionWeights, load_qwen35_vision_weights_with_cancel,
+    validate_qwen35_vision_weight_inventory,
+};
+use crate::vision::multimodal::Qwen35VisionRequest;
+use crate::vision::qwen35_merger::qwen35_merger_forward_with_cancel;
+use crate::vision::qwen35_vit::preprocess_qwen35_image_for_serve;
+use crate::vision::qwen35_vit_metal::qwen35_vit_forward_metal_with_cancel;
 use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
@@ -144,6 +158,7 @@ pub enum WorkerEvent {
 /// `Rejected` vs. `Failed` distinction (#656 vs. #611) at the type level
 /// instead of `lattice_serve.rs`'s prior string-prefix-sniffing convention
 /// (`PROMPT_EXCEEDS_WINDOW_PREFIX`).
+#[derive(Debug)]
 enum WorkerFailure {
     Rejected(ApiError),
     Failed(String),
@@ -349,6 +364,7 @@ pub struct MetalWorkerClient {
     /// until `run_worker_loop` is done with it). `Arc`-shared with every
     /// clone of this client so the cap is process-wide, not per-clone.
     admission: Arc<Semaphore>,
+    vision_supported: Arc<AtomicBool>,
     /// Keeps the worker join owner alive for exactly as long as the queue
     /// can accept jobs. Test-only clients without a worker carry an owner
     /// whose join slot is already empty.
@@ -359,11 +375,13 @@ impl MetalWorkerClient {
     fn with_owner(
         jobs: mpsc::UnboundedSender<WorkerJob>,
         admission: Arc<Semaphore>,
+        vision_supported: Arc<AtomicBool>,
         owner: MetalWorkerOwner,
     ) -> Self {
         Self {
             jobs,
             admission,
+            vision_supported,
             _owner: owner,
         }
     }
@@ -373,7 +391,12 @@ impl MetalWorkerClient {
         jobs: mpsc::UnboundedSender<WorkerJob>,
         admission: Arc<Semaphore>,
     ) -> Self {
-        Self::with_owner(jobs, admission, MetalWorkerOwner::unattached_for_test())
+        Self::with_owner(
+            jobs,
+            admission,
+            Arc::new(AtomicBool::new(false)),
+            MetalWorkerOwner::unattached_for_test(),
+        )
     }
 
     /// Submit one generation request; the worker thread processes jobs
@@ -432,6 +455,15 @@ impl MetalWorkerClient {
     /// the actual admission state.
     pub fn available_permits(&self) -> usize {
         self.admission.available_permits()
+    }
+
+    /// Whether this worker currently accepts image content.
+    ///
+    /// Starts `true` only for a concrete vision-capable checkpoint and
+    /// flips to `false` if its first lazy vision-weight load fails
+    /// terminally.
+    pub fn supports_vision(&self) -> bool {
+        self.vision_supported.load(Ordering::Acquire)
     }
 }
 
@@ -575,6 +607,364 @@ fn run_worker_loop(
     }
 }
 
+enum VisionState {
+    Unsupported,
+    Pending {
+        model_dir: PathBuf,
+        config: VisionModelConfig,
+    },
+    Loaded(Qwen35VisionWeights),
+    Failed(String),
+}
+
+#[derive(Debug)]
+enum VisionRuntimeLoad<'a> {
+    Ready(&'a Qwen35VisionWeights),
+    Unsupported,
+    Cancelled,
+}
+
+/// Worker-local vision capability and lazily loaded vision weights.
+///
+/// Loading stays on the same dedicated thread that owns the Metal decoder
+/// and happens only for the first admitted image request. Text-only servers
+/// and text-only traffic retain the pre-vision startup and memory profile.
+pub struct VisionRuntime {
+    state: VisionState,
+    vision_supported: Arc<AtomicBool>,
+}
+
+impl VisionRuntime {
+    /// Resolve a runtime from concrete checkpoint metadata.
+    pub fn from_model_config(model_dir: PathBuf, config: &Qwen35Config) -> Self {
+        let token_metadata_present = match (
+            config.image_token_id,
+            config.vision_start_token_id,
+            config.vision_end_token_id,
+        ) {
+            (Some(image), Some(start), Some(end)) => {
+                [image, start, end]
+                    .into_iter()
+                    .all(|token| (token as usize) < config.vocab_size)
+                    && image != start
+                    && image != end
+                    && start != end
+            }
+            _ => false,
+        };
+        let supported_weight_source = token_metadata_present
+            && config.vision_config.as_ref().is_some_and(|vision_config| {
+                validate_qwen35_vision_weight_inventory(&model_dir, vision_config).is_ok()
+            });
+        let state = match (
+            &config.vision_config,
+            token_metadata_present,
+            supported_weight_source,
+        ) {
+            (Some(vision_config), true, true) => VisionState::Pending {
+                model_dir,
+                config: vision_config.clone(),
+            },
+            _ => VisionState::Unsupported,
+        };
+        let vision_supported =
+            matches!(&state, VisionState::Pending { .. } | VisionState::Loaded(_));
+        Self {
+            state,
+            vision_supported: Arc::new(AtomicBool::new(vision_supported)),
+        }
+    }
+
+    /// Text-only runtime used by the compatibility [`MetalWorker::spawn`]
+    /// entry point and GPU-free worker tests.
+    pub fn unsupported() -> Self {
+        Self {
+            state: VisionState::Unsupported,
+            vision_supported: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether request normalization may admit image content parts.
+    pub fn is_supported(&self) -> bool {
+        self.vision_supported.load(Ordering::Acquire)
+    }
+
+    fn shared_capability(&self) -> Arc<AtomicBool> {
+        self.vision_supported.clone()
+    }
+
+    fn get_or_load(
+        &mut self,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<VisionRuntimeLoad<'_>, String> {
+        if let VisionState::Pending { model_dir, config } = &self.state {
+            let model_dir = model_dir.clone();
+            let config = config.clone();
+            match load_qwen35_vision_weights_with_cancel(&model_dir, &config, should_cancel) {
+                Ok(Some(weights)) => self.state = VisionState::Loaded(weights),
+                Ok(None) => return Ok(VisionRuntimeLoad::Cancelled),
+                Err(err) => {
+                    let message = format!("vision weights failed to load: {err}");
+                    self.state = VisionState::Failed(message.clone());
+                    self.vision_supported.store(false, Ordering::Release);
+                    return Err(message);
+                }
+            }
+        }
+        match &self.state {
+            VisionState::Unsupported => Ok(VisionRuntimeLoad::Unsupported),
+            VisionState::Loaded(weights) => Ok(VisionRuntimeLoad::Ready(weights)),
+            VisionState::Failed(message) => Err(message.clone()),
+            VisionState::Pending { .. } => {
+                self.vision_supported.store(false, Ordering::Release);
+                Err("vision weights remained pending after a load attempt".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn tokenize_text(tokenizer: &BpeTokenizer, text: &str) -> Vec<u32> {
+    let encoded = tokenizer.tokenize(text);
+    encoded.input_ids[..encoded.real_length].to_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_vision_prompt_ids(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    tokenizer: &BpeTokenizer,
+    vision_start_token_id: u32,
+    vision_end_token_id: u32,
+    image_token_id: u32,
+    image_pad_count: usize,
+) -> Result<Vec<u32>, WorkerFailure> {
+    let image_message = &messages[image_message_index];
+    let image = image_message
+        .image
+        .as_ref()
+        .ok_or_else(|| WorkerFailure::Failed("vision dispatch lost its image payload".into()))?;
+    if image.text_offset > image_message.content.len()
+        || !image_message.content.is_char_boundary(image.text_offset)
+    {
+        return Err(WorkerFailure::Failed(
+            "normalized image text offset is not a UTF-8 boundary".into(),
+        ));
+    }
+
+    let mut before = String::new();
+    for message in &messages[..image_message_index] {
+        push_chat_turn_open(&mut before, message.role.as_str());
+        before.push_str(&message.content);
+        push_chat_turn_close(&mut before);
+    }
+    push_chat_turn_open(&mut before, image_message.role.as_str());
+    before.push_str(&image_message.content[..image.text_offset]);
+
+    let mut after = String::new();
+    after.push_str(&image_message.content[image.text_offset..]);
+    push_chat_turn_close(&mut after);
+    for message in &messages[image_message_index + 1..] {
+        push_chat_turn_open(&mut after, message.role.as_str());
+        after.push_str(&message.content);
+        push_chat_turn_close(&mut after);
+    }
+    after.push_str("<|im_start|>assistant\n");
+
+    let mut inserted_ids = Vec::with_capacity(image_pad_count.saturating_add(2));
+    inserted_ids.push(vision_start_token_id);
+    inserted_ids.extend(std::iter::repeat_n(image_token_id, image_pad_count));
+    inserted_ids.push(vision_end_token_id);
+    let ids = tokenizer.tokenize_fragments_with_inserted_ids(&before, &inserted_ids, &after);
+    if ids.iter().filter(|&&id| id == image_token_id).count() != image_pad_count {
+        return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "message text must not contain the checkpoint's reserved image token"
+                .to_string(),
+            code: "invalid_messages",
+        }));
+    }
+    Ok(ids)
+}
+
+enum VisionRequestBuild {
+    Ready {
+        request: Qwen35VisionRequest,
+        metal_dispatches: usize,
+        gemm_calls: usize,
+    },
+    Cancelled,
+}
+
+fn build_vision_request(
+    runtime: &mut VisionRuntime,
+    config: &Qwen35Config,
+    tokenizer: &BpeTokenizer,
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    should_cancel: &mut dyn FnMut() -> bool,
+    window_preflight: impl FnOnce(usize) -> Result<(), ApiError>,
+) -> Result<VisionRequestBuild, WorkerFailure> {
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+    let vision_config = config.vision_config.as_ref().ok_or_else(|| {
+        WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "image input requires a vision-capable model".to_string(),
+            code: "vision_unsupported",
+        })
+    })?;
+    let image_token_id = config.image_token_id.ok_or_else(|| {
+        WorkerFailure::Failed("vision checkpoint has no image_token_id".to_string())
+    })?;
+    let vision_start_token_id = config.vision_start_token_id.ok_or_else(|| {
+        WorkerFailure::Failed("vision checkpoint has no vision_start_token_id".to_string())
+    })?;
+    let vision_end_token_id = config.vision_end_token_id.ok_or_else(|| {
+        WorkerFailure::Failed("vision checkpoint has no vision_end_token_id".to_string())
+    })?;
+    let image = messages[image_message_index]
+        .image
+        .as_ref()
+        .ok_or_else(|| WorkerFailure::Failed("vision dispatch lost its image payload".into()))?;
+
+    let (pixel_values, grid) = preprocess_qwen35_image_for_serve(&image.bytes, vision_config)
+        .map_err(|err| {
+            WorkerFailure::Rejected(ApiError::BadRequest {
+                message: format!("image preprocessing failed: {err}"),
+                code: "invalid_image",
+            })
+        })?;
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+    let merge_area = vision_config
+        .spatial_merge_size
+        .checked_mul(vision_config.spatial_merge_size)
+        .filter(|&area| area > 0)
+        .ok_or_else(|| WorkerFailure::Failed("vision spatial_merge_size is invalid".to_string()))?;
+    if !grid.num_patches().is_multiple_of(merge_area) {
+        return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "image patch grid is incompatible with the checkpoint merge size".to_string(),
+            code: "invalid_image",
+        }));
+    }
+    let image_pad_count = grid.num_patches() / merge_area;
+    let input_ids = build_vision_prompt_ids(
+        messages,
+        image_message_index,
+        tokenizer,
+        vision_start_token_id,
+        vision_end_token_id,
+        image_token_id,
+        image_pad_count,
+    )?;
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+    window_preflight(input_ids.len()).map_err(WorkerFailure::Rejected)?;
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+
+    let weights = match runtime
+        .get_or_load(should_cancel)
+        .map_err(WorkerFailure::Failed)?
+    {
+        VisionRuntimeLoad::Ready(weights) => weights,
+        VisionRuntimeLoad::Unsupported => {
+            return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                message: "image input requires a vision-capable model".to_string(),
+                code: "vision_unsupported",
+            }));
+        }
+        VisionRuntimeLoad::Cancelled => return Ok(VisionRequestBuild::Cancelled),
+    };
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+    let Some(vit_output) = qwen35_vit_forward_metal_with_cancel(
+        weights,
+        vision_config,
+        &pixel_values,
+        grid,
+        should_cancel,
+    )
+    .map_err(|err| WorkerFailure::Failed(format!("vision forward failed: {err}")))?
+    else {
+        return Ok(VisionRequestBuild::Cancelled);
+    };
+    let Some(post_merger) = qwen35_merger_forward_with_cancel(
+        &weights.merger,
+        vision_config,
+        &vit_output.hidden_states,
+        should_cancel,
+    )
+    .map_err(|err| WorkerFailure::Failed(format!("vision merger failed: {err}")))?
+    else {
+        return Ok(VisionRequestBuild::Cancelled);
+    };
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+
+    Ok(VisionRequestBuild::Ready {
+        request: Qwen35VisionRequest {
+            input_ids,
+            image_grids: vec![grid],
+            post_merger_rows: post_merger,
+            image_token_id,
+            spatial_merge_size: vision_config.spatial_merge_size,
+            decoder_hidden_size: config.hidden_size,
+        },
+        metal_dispatches: vit_output.metal_dispatches,
+        gemm_calls: vit_output.gemm_calls,
+    })
+}
+
+fn cancelled_output() -> GenerateOutput {
+    GenerateOutput {
+        text: String::new(),
+        token_ids: Vec::new(),
+        prompt_tokens: 0,
+        generated_tokens: 0,
+        stopped: false,
+        stop_reason: Some(crate::StopReason::Interrupt),
+        token_logprobs: Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobRoute {
+    Text,
+    Vision { message_index: usize },
+}
+
+fn classify_job(messages: &[ChatMessage]) -> Result<JobRoute, WorkerFailure> {
+    let mut image_positions = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.image.is_some());
+    let first = image_positions.next();
+    if image_positions.next().is_some() {
+        return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "only one image is supported per request".to_string(),
+            code: "multiple_images_unsupported",
+        }));
+    }
+    Ok(match first {
+        Some((_message_index, message))
+            if message.role != crate::forward::metal_qwen35::ChatRole::User =>
+        {
+            return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                message: "image content is supported only on user messages".to_string(),
+                code: "invalid_image_role",
+            }));
+        }
+        Some((message_index, _)) => JobRoute::Vision { message_index },
+        None => JobRoute::Text,
+    })
+}
+
 /// Namespace for [`MetalWorker::spawn`] -- a zero-sized marker type (never
 /// constructed) so the shared worker's entry point reads as
 /// `MetalWorker::spawn(..)` at every call site, matching the association
@@ -609,6 +999,22 @@ impl MetalWorker {
         + 'static,
         max_pending: usize,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
+        Self::spawn_with_vision(loader, VisionRuntime::unsupported(), max_pending)
+    }
+
+    /// Vision-capable sibling of [`Self::spawn`].
+    ///
+    /// `vision_runtime` is derived from the same concrete checkpoint config
+    /// as `loader`. It remains worker-local and loads vision tensors only
+    /// when the first image-bearing job is actually dispatched.
+    pub fn spawn_with_vision(
+        loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
+        + Send
+        + 'static,
+        mut vision_runtime: VisionRuntime,
+        max_pending: usize,
+    ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
+        let vision_supported = vision_runtime.shared_capability();
         // #939: validate BEFORE `Semaphore::new`, which panics outright for
         // `max_pending > Semaphore::MAX_PERMITS` and would otherwise let
         // `max_pending == 0` silently build a worker that admits nothing.
@@ -623,6 +1029,59 @@ impl MetalWorker {
             Ok((mut state, tokenizer, meta)) => {
                 let _ = ready_tx.send(Ok(meta.clone()));
                 run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
+                    if let JobRoute::Vision {
+                        message_index: image_message_index,
+                    } = classify_job(messages)?
+                    {
+                        if should_cancel() {
+                            return Ok(cancelled_output());
+                        }
+                        let config = state.engine.config.clone();
+                        let (request, metal_dispatches, gemm_calls) = match build_vision_request(
+                            &mut vision_runtime,
+                            &config,
+                            &tokenizer,
+                            messages,
+                            image_message_index,
+                            should_cancel,
+                            |prompt_len| {
+                                check_prompt_fits_window(
+                                    meta.context_window_policy,
+                                    meta.model_max_context,
+                                    prompt_len,
+                                    cfg,
+                                )
+                            },
+                        )? {
+                            VisionRequestBuild::Ready {
+                                request,
+                                metal_dispatches,
+                                gemm_calls,
+                            } => (request, metal_dispatches, gemm_calls),
+                            VisionRequestBuild::Cancelled => return Ok(cancelled_output()),
+                        };
+                        if should_cancel() {
+                            return Ok(cancelled_output());
+                        }
+                        eprintln!(
+                            "[metal-worker] route=vision dispatch=multimodal \
+                             metal_gemm_dispatches={metal_dispatches} \
+                             metal_gemm_calls={gemm_calls}"
+                        );
+                        let output = state
+                            .generate_multimodal_vision_with_cancel(
+                                &request,
+                                &tokenizer,
+                                cfg,
+                                should_cancel,
+                            )
+                            .map_err(WorkerFailure::from)?;
+                        if !output.text.is_empty() {
+                            let _ = on_token(&output.text, 0);
+                        }
+                        return Ok(output);
+                    }
+
                     // Render the ChatML prompt exactly once (#828/#832: the
                     // prior `lattice_serve.rs` path rendered it a second
                     // time inside its own window preflight); reused for
@@ -690,7 +1149,12 @@ impl MetalWorker {
         let owner = MetalWorkerOwner::from_handle(join_handle);
         match ready_rx.recv() {
             Ok(Ok(meta)) => {
-                let client = MetalWorkerClient::with_owner(job_tx, admission, owner.clone());
+                let client = MetalWorkerClient::with_owner(
+                    job_tx,
+                    admission,
+                    vision_supported,
+                    owner.clone(),
+                );
                 Ok((owner, client, meta))
             }
             Ok(Err(e)) => Err(StartupError::Load(e)),
@@ -820,6 +1284,65 @@ pub fn spawn_fake_with_cap(
     context_window_policy: ContextWindowPolicy,
     model_max_context: usize,
     tokenizer: BpeTokenizer,
+    generate: impl FnMut(
+        &[ChatMessage],
+        &GenerateConfig,
+        usize,
+        &mut dyn FnMut(&str, u32) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, String>
+    + Send
+    + 'static,
+) -> MetalWorkerClient {
+    spawn_fake_with_capability(
+        max_pending,
+        context_window_policy,
+        model_max_context,
+        tokenizer,
+        false,
+        generate,
+    )
+}
+
+/// Vision-admitting sibling of [`spawn_fake`] for cross-binary HTTP tests.
+///
+/// The fake still substitutes only the terminal Metal call, but advertises
+/// vision capability so request normalization can prove that an admitted
+/// image survives both binary adapters and reaches their common worker job.
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::type_complexity)]
+pub fn spawn_fake_with_vision(
+    context_window_policy: ContextWindowPolicy,
+    model_max_context: usize,
+    tokenizer: BpeTokenizer,
+    generate: impl FnMut(
+        &[ChatMessage],
+        &GenerateConfig,
+        usize,
+        &mut dyn FnMut(&str, u32) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, String>
+    + Send
+    + 'static,
+) -> MetalWorkerClient {
+    spawn_fake_with_capability(
+        TEST_EFFECTIVELY_UNBOUNDED_CAP,
+        context_window_policy,
+        model_max_context,
+        tokenizer,
+        true,
+        generate,
+    )
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::type_complexity)]
+fn spawn_fake_with_capability(
+    max_pending: usize,
+    context_window_policy: ContextWindowPolicy,
+    model_max_context: usize,
+    tokenizer: BpeTokenizer,
+    vision_supported: bool,
     mut generate: impl FnMut(
         &[ChatMessage],
         &GenerateConfig,
@@ -842,12 +1365,18 @@ pub fn spawn_fake_with_cap(
         });
     });
     let owner = MetalWorkerOwner::from_handle(join_handle);
-    MetalWorkerClient::with_owner(job_tx, Arc::new(Semaphore::new(max_pending)), owner)
+    MetalWorkerClient::with_owner(
+        job_tx,
+        Arc::new(Semaphore::new(max_pending)),
+        Arc::new(AtomicBool::new(vision_supported)),
+        owner,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -857,6 +1386,343 @@ mod tests {
         drop_timeout: Duration,
     ) -> MetalWorkerOwner {
         MetalWorkerOwner::from_handle_with_timeout(join_handle, drop_timeout)
+    }
+
+    fn tiny_tokenizer() -> BpeTokenizer {
+        BpeTokenizer::from_vocab_and_merges(
+            HashMap::from([
+                ("a".to_string(), 0),
+                ("b".to_string(), 1),
+                ("e".to_string(), 2),
+                ("f".to_string(), 3),
+                ("o".to_string(), 4),
+                ("r".to_string(), 5),
+            ]),
+            Vec::new(),
+        )
+        .expect("tiny tokenizer must construct")
+    }
+
+    fn tiny_vision_config(out_hidden_size: usize) -> VisionModelConfig {
+        VisionModelConfig {
+            depth: 1,
+            hidden_size: 8,
+            num_heads: 2,
+            patch_size: 2,
+            spatial_merge_size: 2,
+            out_hidden_size,
+            temporal_patch_size: 1,
+            num_position_embeddings: 16,
+            in_channels: 3,
+            deepstack_visual_indexes: Vec::new(),
+            intermediate_size: None,
+        }
+    }
+
+    fn make_test_png(width: u32, height: u32) -> Vec<u8> {
+        let mut image = image::RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let value = ((x + y) % 256) as u8;
+                image.put_pixel(x, y, image::Rgb([value, value, value]));
+            }
+        }
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("test PNG encode");
+        bytes
+    }
+
+    #[test]
+    fn image_job_classification_enforces_role_and_multiplicity() {
+        assert_eq!(
+            classify_job(&[ChatMessage::user("hello")]).expect("text job"),
+            JobRoute::Text
+        );
+        let image = ChatMessage::user_with_image("beforeafter", vec![1, 2, 3], 6);
+        assert_eq!(
+            classify_job(&[ChatMessage::system("policy"), image.clone()]).expect("one image job"),
+            JobRoute::Vision { message_index: 1 }
+        );
+        let err = classify_job(&[image.clone(), image]).expect_err("two images must fail");
+        assert!(matches!(
+            err,
+            WorkerFailure::Rejected(ApiError::BadRequest {
+                code: "multiple_images_unsupported",
+                ..
+            })
+        ));
+        for role in [
+            crate::forward::metal_qwen35::ChatRole::System,
+            crate::forward::metal_qwen35::ChatRole::Assistant,
+        ] {
+            let mut non_user_image = ChatMessage::user_with_image("beforeafter", vec![1, 2, 3], 6);
+            non_user_image.role = role;
+            let err = classify_job(&[non_user_image]).expect_err("non-user image role must fail");
+            assert!(matches!(
+                err,
+                WorkerFailure::Rejected(ApiError::BadRequest {
+                    code: "invalid_image_role",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn vision_prompt_splices_tokens_at_original_content_part_position() {
+        let tokenizer = tiny_tokenizer();
+        let messages = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::user_with_image("beforeafter", vec![1], "before".len()),
+            ChatMessage::assistant("prior"),
+        ];
+        let actual = build_vision_prompt_ids(&messages, 1, &tokenizer, 90, 91, 92, 3)
+            .expect("vision prompt");
+
+        let before = "<|im_start|>system\npolicy<|im_end|>\n<|im_start|>user\nbefore";
+        let after =
+            "after<|im_end|>\n<|im_start|>assistant\nprior<|im_end|>\n<|im_start|>assistant\n";
+        let mut expected = tokenize_text(&tokenizer, before);
+        expected.extend([90, 92, 92, 92, 91]);
+        expected.extend(tokenize_text(&tokenizer, after));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn vision_prompt_tokenizes_the_complete_sequence_before_window_validation() {
+        let capped = tiny_tokenizer().with_max_seq_len(4);
+        let unbounded = capped.with_max_seq_len(usize::MAX);
+        let before = "before".repeat(64);
+        let messages = vec![ChatMessage::user_with_image(
+            format!("{before}after"),
+            vec![1],
+            before.len(),
+        )];
+        let actual = build_vision_prompt_ids(&messages, 0, &capped, 90, 91, 92, 3)
+            .expect("capped tokenizer must not truncate prompt fragments");
+        let expected = build_vision_prompt_ids(&messages, 0, &unbounded, 90, 91, 92, 3)
+            .expect("unbounded tokenizer");
+        assert_eq!(actual, expected);
+        assert!(actual.len() > 4);
+    }
+
+    fn vision_build_config() -> Qwen35Config {
+        let mut config = Qwen35Config::qwen35_0_8b();
+        config.vision_config = Some(tiny_vision_config(config.hidden_size));
+        config.image_token_id = Some(90);
+        config.vision_start_token_id = Some(91);
+        config.vision_end_token_id = Some(92);
+        config
+    }
+
+    #[test]
+    fn vision_request_build_cancels_before_image_preprocessing() {
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            b"not an image".to_vec(),
+            "before".len(),
+        )];
+        let mut polls = 0;
+        let result = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || {
+                polls += 1;
+                true
+            },
+            |_| panic!("window preflight must not run after cancellation"),
+        )
+        .expect("cancellation is not a worker failure");
+        assert!(matches!(result, VisionRequestBuild::Cancelled));
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn vision_request_build_cancels_after_preprocess_and_prompt_before_window_check() {
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            make_test_png(8, 8),
+            "before".len(),
+        )];
+        let mut polls = 0;
+        let mut window_checked = false;
+        let result = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || {
+                polls += 1;
+                polls == 3
+            },
+            |_| {
+                window_checked = true;
+                Ok(())
+            },
+        )
+        .expect("cancellation is not a worker failure");
+        assert!(matches!(result, VisionRequestBuild::Cancelled));
+        assert_eq!(polls, 3);
+        assert!(!window_checked);
+    }
+
+    #[test]
+    fn vision_request_build_cancels_after_window_check_before_lazy_load() {
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            make_test_png(8, 8),
+            "before".len(),
+        )];
+        let mut polls = 0;
+        let mut window_checked = false;
+        let result = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || {
+                polls += 1;
+                polls == 4
+            },
+            |_| {
+                window_checked = true;
+                Ok(())
+            },
+        )
+        .expect("cancellation is not a worker failure");
+        assert!(matches!(result, VisionRequestBuild::Cancelled));
+        assert_eq!(polls, 4);
+        assert!(window_checked);
+    }
+
+    #[test]
+    fn vision_runtime_capability_requires_config_token_metadata_and_weight_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("quantize_index.json"), "[]")
+            .expect("weight-source marker");
+        let mut config = Qwen35Config::qwen35_0_8b();
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &config).is_supported()
+        );
+        config.vision_config = Some(tiny_vision_config(config.hidden_size));
+        config.image_token_id = Some(10);
+        config.vision_start_token_id = Some(11);
+        config.vision_end_token_id = Some(12);
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &config).is_supported(),
+            "an empty manifest must not advertise vision capability"
+        );
+
+        let mut names = vec![
+            "model.visual.patch_embed.proj.weight".to_string(),
+            "model.visual.patch_embed.proj.bias".to_string(),
+            "model.visual.pos_embed.weight".to_string(),
+            "model.visual.merger.linear_fc1.weight".to_string(),
+            "model.visual.merger.linear_fc1.bias".to_string(),
+            "model.visual.merger.linear_fc2.weight".to_string(),
+            "model.visual.merger.linear_fc2.bias".to_string(),
+            "model.visual.merger.norm.weight".to_string(),
+            "model.visual.merger.norm.bias".to_string(),
+        ];
+        for suffix in [
+            "attn.qkv.weight",
+            "attn.qkv.bias",
+            "attn.proj.weight",
+            "attn.proj.bias",
+            "mlp.linear_fc1.weight",
+            "mlp.linear_fc1.bias",
+            "mlp.linear_fc2.weight",
+            "mlp.linear_fc2.bias",
+            "norm1.weight",
+            "norm1.bias",
+            "norm2.weight",
+            "norm2.bias",
+        ] {
+            names.push(format!("model.visual.blocks.0.{suffix}"));
+        }
+        std::fs::write(temp.path().join("visual.bin"), b"inventory preflight")
+            .expect("visual tensor marker");
+        let entries: Vec<_> = names
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "file": "visual.bin"}))
+            .collect();
+        std::fs::write(
+            temp.path().join("quantize_index.json"),
+            serde_json::to_vec(&entries).expect("manifest fixture"),
+        )
+        .expect("complete vision manifest");
+        let mut invalid_tokens = config.clone();
+        invalid_tokens.image_token_id = Some(config.vocab_size as u32);
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &invalid_tokens)
+                .is_supported(),
+            "out-of-vocabulary image metadata must not advertise capability"
+        );
+        invalid_tokens.image_token_id = invalid_tokens.vision_start_token_id;
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &invalid_tokens)
+                .is_supported(),
+            "aliased vision token metadata must not advertise capability"
+        );
+        let mut runtime = VisionRuntime::from_model_config(temp.path().to_path_buf(), &config);
+        assert!(runtime.is_supported());
+        let (job_tx, _job_rx) = mpsc::unbounded_channel();
+        let client = MetalWorkerClient::with_owner(
+            job_tx,
+            Arc::new(Semaphore::new(1)),
+            runtime.shared_capability(),
+            MetalWorkerOwner::unattached_for_test(),
+        );
+        assert!(client.supports_vision());
+        let cancelled = runtime
+            .get_or_load(&mut || true)
+            .expect("cancellation is not a lazy-load failure");
+        assert!(matches!(cancelled, VisionRuntimeLoad::Cancelled));
+        assert!(runtime.is_supported());
+        assert!(
+            client.supports_vision(),
+            "cancellation must preserve Pending capability for a later retry"
+        );
+        let mut never_cancel = || false;
+        let first_error = runtime
+            .get_or_load(&mut never_cancel)
+            .expect_err("junk tensor payload must fail its first lazy load");
+        assert!(first_error.contains("vision weights failed to load"));
+        assert!(!runtime.is_supported());
+        assert!(
+            !client.supports_vision(),
+            "terminal lazy-load failure must revoke the shared client capability"
+        );
+        std::fs::remove_file(temp.path().join("visual.bin"))
+            .expect("remove source after the first attempt");
+        let second_error = runtime
+            .get_or_load(&mut never_cancel)
+            .expect_err("terminal failure must be returned, not retried");
+        assert_eq!(second_error, first_error);
+        assert!(
+            !VisionRuntime::from_model_config(PathBuf::from("/unused"), &config).is_supported(),
+            "config metadata alone must not advertise vision without a supported weight source"
+        );
+        config.vision_end_token_id = None;
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &config).is_supported()
+        );
     }
 
     // ── GPU-free fakes, ported from lattice_serve.rs's pre-existing
@@ -1372,8 +2238,12 @@ mod tests {
             let _ = allow_exit_rx.recv();
         });
         let owner = test_owner(join_handle, Duration::from_secs(1));
-        let client =
-            MetalWorkerClient::with_owner(job_tx, Arc::new(Semaphore::new(1)), owner.clone());
+        let client = MetalWorkerClient::with_owner(
+            job_tx,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            owner.clone(),
+        );
         drop(owner);
 
         let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
@@ -1417,8 +2287,12 @@ mod tests {
             .expect("the worker must reach its stuck-backend stand-in");
         let owner = test_owner(join_handle, Duration::from_millis(20));
         let (job_tx, _job_rx) = mpsc::unbounded_channel::<WorkerJob>();
-        let client =
-            MetalWorkerClient::with_owner(job_tx, Arc::new(Semaphore::new(1)), owner.clone());
+        let client = MetalWorkerClient::with_owner(
+            job_tx,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            owner.clone(),
+        );
         drop(owner);
 
         let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
