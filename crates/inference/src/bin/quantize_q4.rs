@@ -13,6 +13,7 @@
 //! At any point only one tensor's decoded `f64` values are live in RAM
 //! alongside its `f32` downcast and Q4 output.
 
+use lattice_inference::quant::q4_manifest::write_q4_source_provenance;
 use lattice_inference::quant::quarot::QuarotTensorReader;
 use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, quantize_f32_to_q4, save_q4_file};
 use std::fs;
@@ -403,6 +404,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("failed to serialize index: {e}"))?;
         fs::write(&index_path, index_json)
             .map_err(|e| format!("failed to write {}: {e}", index_path.display()))?;
+        write_q4_source_provenance(&model_dir, &output_dir)?;
         eprintln!("Index written: {}", index_path.display());
     }
 

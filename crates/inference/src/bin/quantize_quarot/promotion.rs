@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use lattice_inference::quant::q4_manifest::{
-    ManifestFlavor, load_manifest, read_manifest_bytes_bounded,
+    ManifestFlavor, load_manifest, read_manifest_bytes_bounded, verify_q4_source_provenance,
 };
 
 pub const ACCEPTANCE_RECEIPT_FILE: &str = "quarot_ppl_acceptance.json";
@@ -18,6 +18,7 @@ static NEXT_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
 pub struct PplGateConfig {
     pub evaluator: PathBuf,
+    pub source_model_dir: PathBuf,
     pub baseline_q4_dir: PathBuf,
     pub tokenizer_dir: PathBuf,
     pub corpus_file: PathBuf,
@@ -192,6 +193,7 @@ fn validate_gate_config(config: &PplGateConfig) -> Result<(), String> {
             config.baseline_q4_dir.display()
         ));
     }
+    verify_q4_source_provenance(&config.source_model_dir, &config.baseline_q4_dir)?;
     let tokenizer_path = config.tokenizer_dir.join("tokenizer.json");
     if !tokenizer_path.is_file() {
         return Err(format!(
@@ -554,13 +556,22 @@ mod tests {
 
     fn gate_config(root: &Path) -> PplGateConfig {
         fs::create_dir_all(root.join("baseline")).unwrap();
+        fs::create_dir_all(root.join("model")).unwrap();
         fs::create_dir_all(root.join("tokenizer")).unwrap();
         fs::write(root.join("eval_perplexity"), b"stub evaluator").unwrap();
         fs::write(root.join("baseline/quantize_index.json"), b"[]").unwrap();
+        fs::write(root.join("model/config.json"), b"{}").unwrap();
+        fs::write(root.join("model/model.safetensors"), b"source checkpoint").unwrap();
+        lattice_inference::quant::q4_manifest::write_q4_source_provenance(
+            &root.join("model"),
+            &root.join("baseline"),
+        )
+        .unwrap();
         fs::write(root.join("tokenizer/tokenizer.json"), b"{}").unwrap();
         fs::write(root.join("corpus.txt"), b"held out corpus").unwrap();
         PplGateConfig {
             evaluator: root.join("eval_perplexity"),
+            source_model_dir: root.join("model"),
             baseline_q4_dir: root.join("baseline"),
             tokenizer_dir: root.join("tokenizer"),
             corpus_file: root.join("corpus.txt"),
@@ -714,6 +725,43 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("must be an unrotated quantize_q4 artifact"));
+        assert!(!*converted.borrow());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn valid_q4_baseline_from_different_source_is_rejected_before_conversion() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("never-converted");
+        let config = gate_config(temp.path());
+        let other_source = temp.path().join("other-model");
+        fs::create_dir_all(&other_source).unwrap();
+        fs::write(other_source.join("config.json"), b"{}").unwrap();
+        fs::write(
+            other_source.join("model.safetensors"),
+            b"different source checkpoint",
+        )
+        .unwrap();
+        lattice_inference::quant::q4_manifest::write_q4_source_provenance(
+            &other_source,
+            &config.baseline_q4_dir,
+        )
+        .unwrap();
+        let converted = RefCell::new(false);
+
+        let error = promote_with_gate(
+            &output,
+            false,
+            &config,
+            |_| {
+                *converted.borrow_mut() = true;
+                Ok(())
+            },
+            |_, _| Ok(passing_evidence()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("was produced from a different source checkpoint"));
         assert!(!*converted.borrow());
         assert!(!output.exists());
     }

@@ -41,11 +41,148 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use sha2::{Digest, Sha256};
+
 /// Bounded size cap for `quantize_index.json` reads (#504 remaining slice
 /// 2). The index is a small per-tensor manifest (name/file/quantized/
 /// shape/numel per output tensor, plus an optional rotation seed); even a
 /// multi-thousand-tensor checkpoint stays well under this cap.
 pub const MAX_QUANTIZE_INDEX_LEN: u64 = 16 * 1024 * 1024; // 16 MiB
+
+/// Provenance sidecar written by `quantize_q4`.
+pub const Q4_SOURCE_PROVENANCE_FILE: &str = "q4_source_provenance.json";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct Q4SourceProvenance {
+    schema_version: u32,
+    source_checkpoint_sha256: String,
+}
+
+/// Hash the config and SafeTensors files that identify a source checkpoint.
+pub fn source_checkpoint_sha256(source_dir: &Path) -> Result<String, String> {
+    let mut paths = vec![source_dir.join("config.json")];
+    let entries = fs::read_dir(source_dir).map_err(|error| {
+        format!(
+            "failed to enumerate source checkpoint {}: {error}",
+            source_dir.display()
+        )
+    })?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                format!(
+                    "failed to enumerate source checkpoint {}: {error}",
+                    source_dir.display()
+                )
+            })?
+            .path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "safetensors")
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    if paths.len() == 1 {
+        return Err(format!(
+            "source checkpoint has no SafeTensors files: {}",
+            source_dir.display()
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| {
+                format!(
+                    "source checkpoint path is not valid UTF-8: {}",
+                    path.display()
+                )
+            })?;
+        let mut file = fs::File::open(&path).map_err(|error| {
+            format!(
+                "failed to hash source checkpoint {}: {error}",
+                path.display()
+            )
+        })?;
+        hasher.update((name.len() as u64).to_le_bytes());
+        hasher.update(name.as_bytes());
+        let size = file
+            .metadata()
+            .map_err(|error| {
+                format!(
+                    "failed to stat source checkpoint {}: {error}",
+                    path.display()
+                )
+            })?
+            .len();
+        hasher.update(size.to_le_bytes());
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).map_err(|error| {
+                format!(
+                    "failed to hash source checkpoint {}: {error}",
+                    path.display()
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Write provenance binding a Q4 artifact to its source checkpoint.
+pub fn write_q4_source_provenance(source_dir: &Path, output_dir: &Path) -> Result<String, String> {
+    let source_checkpoint_sha256 = source_checkpoint_sha256(source_dir)?;
+    let provenance = Q4SourceProvenance {
+        schema_version: 1,
+        source_checkpoint_sha256: source_checkpoint_sha256.clone(),
+    };
+    let bytes = serde_json::to_vec_pretty(&provenance)
+        .map_err(|error| format!("failed to serialize Q4 source provenance: {error}"))?;
+    let path = output_dir.join(Q4_SOURCE_PROVENANCE_FILE);
+    fs::write(&path, bytes).map_err(|error| {
+        format!(
+            "failed to write Q4 source provenance {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(source_checkpoint_sha256)
+}
+
+/// Verify that a Q4 artifact was produced from the expected source checkpoint.
+pub fn verify_q4_source_provenance(source_dir: &Path, q4_dir: &Path) -> Result<String, String> {
+    let path = q4_dir.join(Q4_SOURCE_PROVENANCE_FILE);
+    let bytes = fs::read(&path).map_err(|error| {
+        format!(
+            "failed to read Q4 source provenance {}: {error}",
+            path.display()
+        )
+    })?;
+    let provenance: Q4SourceProvenance = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid Q4 source provenance {}: {error}", path.display()))?;
+    if provenance.schema_version != 1 {
+        return Err(format!(
+            "unsupported Q4 source provenance schema {} in {}",
+            provenance.schema_version,
+            path.display()
+        ));
+    }
+    let expected = source_checkpoint_sha256(source_dir)?;
+    if provenance.source_checkpoint_sha256 != expected {
+        return Err(format!(
+            "Q4 artifact {} was produced from a different source checkpoint",
+            q4_dir.display()
+        ));
+    }
+    Ok(expected)
+}
 
 /// Error surface for [`read_manifest_bytes_bounded`] / [`parse_manifest`] /
 /// [`load_manifest`]. Each variant is a distinct failure class so tests

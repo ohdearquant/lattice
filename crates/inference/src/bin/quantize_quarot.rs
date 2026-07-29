@@ -235,6 +235,7 @@ fn main() -> ExitCode {
     };
     let gate = PplGateConfig {
         evaluator: ppl_evaluator,
+        source_model_dir: model_dir.clone(),
         baseline_q4_dir,
         tokenizer_dir,
         corpus_file,
