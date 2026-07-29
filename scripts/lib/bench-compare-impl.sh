@@ -311,6 +311,7 @@ CARGO_FEATURES_INFERENCE="${CARGO_FEATURES_INFERENCE:-}"
 BENCHES_EMBED="simd"
 BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
+BENCH_BASELINE_NAME="compare-base"
 
 # --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
 # `cargo bench ... | grep -E "time:" || true` discards cargo's status TWICE: a
@@ -377,13 +378,13 @@ BASE_PHASE_RC=0
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
   # same channel and one of them silently deletes half the comparison.
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline compare-base --noplot $QUICK_FLAGS
+    run_bench "time:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
-  run_bench "time:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline compare-base --noplot $QUICK_FLAGS
+  run_bench "time:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_PHASE_RC=$?
 # `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
@@ -407,24 +408,59 @@ fi
 
 # Copy base's criterion baseline into head's target/criterion
 mkdir -p "$HEAD_DIR/target/criterion"
+# The enforcing path removes only prior compare-base artifacts before the fresh
+# base set is copied. Otherwise an unrelated benchmark from an older
+# filtered/alternate-target run becomes part of today's selected set and
+# produces a false missing-head error. Reporter mode keeps its tolerant,
+# non-destructive handling of an arbitrary local Criterion tree.
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  python3 "$GATE_SCRIPT" "$HEAD_DIR/target/criterion" \
+    --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+fi
+
+copy_base_artifacts() {
+  local what="$1"; shift
+  local rc=0
+  rsync "$@" 2>/dev/null || rc=$?
+  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    echo "bench-compare: $what failed (rsync exit $rc) — refusing to certify a partial A/B." >&2
+    return 2
+  fi
+  return 0
+}
+
 if [ -d "$WT/target/criterion" ]; then
   # Copy the baseline data (compare-base dirs)
-  rsync -a "$WT/target/criterion/" "$HEAD_DIR/target/criterion/" --include='**/compare-base/**' --include='*/' --exclude='*' 2>/dev/null || true
+  copy_base_artifacts "selected baseline copy" \
+    -a "$WT/target/criterion/" "$HEAD_DIR/target/criterion/" \
+    --include="**/$BENCH_BASELINE_NAME/**" --include='*/' --exclude='*'
   # Also copy the raw estimates for comparison
-  rsync -a "$WT/target/criterion/" "$HEAD_DIR/target/criterion/" 2>/dev/null || true
+  copy_base_artifacts "Criterion artifact copy" \
+    -a "$WT/target/criterion/" "$HEAD_DIR/target/criterion/"
+fi
+
+# HEAD may run in-place against a Criterion tree left by an earlier A/B. A
+# removed or renamed benchmark would otherwise leave its old change/ result
+# beside the freshly copied compare-base/ result, making the completeness gate
+# mistake stale output for a head measurement. Derive the cleanup scope from
+# the exact selected baseline files and remove only their new/change siblings;
+# the helper refuses paths outside an invariant-checked criterion/ root.
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  python3 "$GATE_SCRIPT" "$HEAD_DIR/target/criterion" \
+    --baseline-name "$BENCH_BASELINE_NAME" --prepare-head
 fi
 
 HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:|change:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline compare-base --noplot $QUICK_FLAGS
+    run_bench "time:|change:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  run_bench "time:|change:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline compare-base --noplot $QUICK_FLAGS
+  run_bench "time:|change:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
@@ -521,7 +557,7 @@ echo "$QUIET_SAMPLES" | sed 's/^/    /'
 
 echo ""
 echo "=== Full gate report ==="
-GATE_ARGS=(--baseline-name compare-base)
+GATE_ARGS=(--baseline-name "$BENCH_BASELINE_NAME")
 if [ -s "$INFO_GROUPS_FILE" ]; then
   GATE_ARGS+=(--informational-groups-file "$INFO_GROUPS_FILE")
 fi

@@ -42,6 +42,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
 LIB = REPO / "scripts" / "lib"
+GATE = REPO / "scripts" / "perf-bench-gate.py"
 
 STUB_CARGO = """#!/usr/bin/env bash
 exit 0
@@ -59,6 +60,7 @@ class _Sandbox:
         self.root = Path(tmp) / "repo"
         (self.root / "scripts").mkdir(parents=True)
         shutil.copy2(SCRIPT, self.root / "scripts" / SCRIPT.name)
+        shutil.copy2(GATE, self.root / "scripts" / GATE.name)
         shutil.copytree(LIB, self.root / "scripts" / "lib")
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
