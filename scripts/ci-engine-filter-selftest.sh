@@ -83,6 +83,17 @@ check "embed source -> engine" true \
   "$(classify "$ENGINE_RE" <<<'crates/embed/src/simd/mod.rs')"
 check "Cargo.lock -> engine" true \
   "$(classify "$ENGINE_RE" <<<'Cargo.lock')"
+check "shared Rust setup action -> engine" true \
+  "$(classify "$ENGINE_RE" <<<'.github/actions/rust-setup/action.yml')"
+
+# A push to main is filtered before the classifier job exists, so the action
+# path must also be present in the workflow trigger. Keeping this assertion in
+# the same owning test makes either half of the routing contract fail closed.
+PUSH_ROUTES_RUST_SETUP=false
+sed -n '1,45p' "$WF" \
+  | grep -qF "      - '.github/actions/rust-setup/**'" \
+  && PUSH_ROUTES_RUST_SETUP=true
+check "shared Rust setup action -> push workflow" true "$PUSH_ROUTES_RUST_SETUP"
 
 # ── the over-exclusion guard ────────────────────────────────────────────────
 # Stripping .md must not stop fixture DATA under the same directory from firing.
