@@ -22,6 +22,9 @@
   normalized message/role types, both servers use one contract-to-engine adapter
   and non-generic normalization entry points, and standard generation defaults
   have one canonical constructor across production and test adapters.
+- C2 lifecycle amendment (#833) — the shared Metal worker owner performs one
+  bounded join after the last job sender closes; see "Amendment: bounded shared
+  Metal-worker shutdown" below.
 
 The cluster defect tickets (#739–#741, resolved by C1; #744–#746, resolved by C2) are
 closed against the merged PRs above. The non-cluster audit items from the same sweep
@@ -310,6 +313,40 @@ are unaffected. See `detect_format_prefers_safetensors_index_over_q4_files` in
 **Resolves**: #829 — one canonical model-format detector, zero remaining local
 re-implementations in `lattice.rs`, `lattice_serve.rs`, `chat_metal.rs`, or the three
 benchmark binaries.
+
+### Amendment (2026-07-29): bounded shared Metal-worker shutdown (#833)
+
+The C2 serving consolidation subsequently moved both binaries' Metal requests onto one
+`MetalWorkerClient`/`MetalWorkerOwner` implementation. The initial extraction retained the
+previous detached-thread shutdown behavior so that request/cancellation correctness and process
+lifecycle did not change in the same PR. This amendment closes that deliberate lifecycle gap.
+
+Every production client retains a clone of the shared owner. Its job sender is declared before
+the owner clone, so dropping the final client closes the queue before dropping the final owner.
+The final owner takes the worker's sole join handle, waits up to two seconds for
+`JoinHandle::is_finished`, and joins only after the thread is known to have exited. A completed
+panic is joined and reported distinctly. If the deadline expires, the handle is detached and
+shutdown continues; a backend call that stops polling cancellation therefore cannot hang process
+shutdown indefinitely. Last-client/last-owner drop is the sole production trigger: the bounded
+wait helper is private so a caller cannot detach the sole join handle while another client still
+keeps the queue open.
+
+Both binaries use this one lifecycle. `lattice serve` drops its redundant explicit owner after
+startup because its client in router state retains the same owner. `lattice_serve` retains the
+explicit owner for the server future's lifetime, while its client clone independently prevents an
+early join. Both servers run through the shared `serve_until_shutdown` entry point, which turns
+SIGINT and Unix SIGTERM into one tracked-connection drain. Existing HTTP/1 connections receive a
+five-second graceful interval. If that interval expires, the runner aborts every tracked connection
+task and waits up to three seconds for cancellation cleanup before returning a timeout error.
+Cooperative cancellation releases request-held client clones before the worker deadline begins.
+Both binaries then hard-exit on the timeout; this is the final bounded fallback if runtime-owned
+upgraded work or a non-cooperative task outlives the cleanup interval. Neither binary has
+signal-specific worker state or a second shutdown loop. Healthy outstanding jobs may finish during
+the graceful interval; a stuck request is cancelled rather than allowed to keep router state alive
+indefinitely.
+
+**Resolves**: #833 — graceful queue-close and join on the normal path, with a documented,
+observable timeout-to-cancel and worker timeout-to-detach fallback.
 
 ## What we are NOT doing
 

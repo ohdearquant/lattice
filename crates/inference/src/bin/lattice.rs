@@ -2930,20 +2930,11 @@ mod serve {
                 // other future `spawn_metal` caller.
                 err @ StartupError::InvalidMaxPending { .. } => err.to_string(),
             })?;
-            // `owner` (and the `JoinHandle` it carries) is dropped here,
-            // immediately: this binary's prior `MetalHandle::spawn` never
-            // captured `std::thread::spawn`'s return value either, so the
-            // worker thread was already detached rather than joined.
-            // Dropping a `JoinHandle` only detaches it (does not stop the
-            // thread), so the worker keeps running until process exit
-            // either way -- today's behavior is unchanged. Unlike
-            // `lattice_serve.rs`'s `run()` (which blocks for the server's
-            // whole lifetime and so has a natural place to hold the owner
-            // for issue #833's future join-on-shutdown seam), this function
-            // returns before `lattice serve`'s listener ever binds; #833
-            // would need to thread `owner` into `AppState`/
-            // `ModelBackend::Metal` instead if it wants an explicit join
-            // point on this binary.
+            // The explicit owner is not needed by this binary: every
+            // production `MetalWorkerClient` retains an owner clone. The
+            // clone held by `client` keeps the worker alive through the
+            // router's lifetime; dropping the last client closes the queue
+            // before the last owner performs its bounded join.
             drop(owner);
             Ok((
                 ModelBackend::Metal {
@@ -6696,6 +6687,7 @@ async fn main() {
             let listener = match tokio::net::TcpListener::bind(&addr).await {
                 Ok(l) => l,
                 Err(e) => {
+                    drop(app);
                     eprintln!("Error: failed to bind to {addr}: {e}");
                     std::process::exit(1);
                 }
@@ -6706,17 +6698,7 @@ async fn main() {
             eprintln!("  POST /v1/chat/completions");
             eprintln!("  GET  /health");
 
-            let shutdown = async {
-                if let Err(e) = tokio::signal::ctrl_c().await {
-                    eprintln!("Error waiting for shutdown signal: {e}");
-                }
-                eprintln!("Shutdown signal received, draining connections...");
-            };
-
-            if let Err(e) = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown)
-                .await
-            {
+            if let Err(e) = lattice_inference::serve::serve_until_shutdown(listener, app).await {
                 eprintln!("Server error: {e}");
                 std::process::exit(1);
             }

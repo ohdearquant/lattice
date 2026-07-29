@@ -2852,13 +2852,10 @@ mod imp {
                 return Err(err.to_string().into());
             }
         };
-        // Retains the worker thread's `JoinHandle` for the life of the
-        // server (issue #833's seam: a future graceful-shutdown path has an
-        // obvious place to join it). Neither this binary's prior bare
-        // `mpsc::UnboundedSender<Job>` nor `lattice.rs`'s prior `MetalHandle`
-        // ever joined or explicitly shut down their worker thread either --
-        // the process exits and the OS reaps the detached thread -- so
-        // today's behavior is unchanged.
+        // Retain the explicit owner through the server lifetime. Every
+        // production client also retains an owner clone, so whichever
+        // reference is dropped last performs the same bounded join after
+        // the final job sender closes.
         let _owner = owner;
 
         let model_id: Arc<str> = model_dir
@@ -2925,9 +2922,12 @@ mod imp {
                 "[lattice_serve]   POST /v1/chat/completions   GET /v1/models   GET /health   GET /metrics"
             );
             println!("@@lattice {}", json!({"ev": "ready", "port": port}));
-            axum::serve(listener, app)
-                .await
-                .map_err(|e| format!("serve error: {e}"))?;
+            if let Err(error) =
+                lattice_inference::serve::serve_until_shutdown(listener, app).await
+            {
+                eprintln!("Server error: {error}");
+                std::process::exit(1);
+            }
             Ok::<(), String>(())
         })?;
 

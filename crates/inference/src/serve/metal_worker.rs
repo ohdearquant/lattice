@@ -20,17 +20,15 @@
 //! ONE contract -- an explicit [`WorkerEvent::Cancelled`] terminal event --
 //! and both binaries now go through the exact same loop to get it.
 //!
-//! # Shutdown scope (explicitly out of scope here -- see the companion
-//! lifecycle issue in this cluster, #833)
+//! # Bounded shutdown
 //!
-//! [`MetalWorkerOwner`] retains the worker thread's `JoinHandle` so a future
-//! graceful-shutdown PR has an obvious place to add a join/shutdown method,
-//! but this module does not add one: neither `lattice.rs`'s prior
-//! `MetalHandle` nor `lattice_serve.rs`'s prior bare
-//! `mpsc::UnboundedSender<Job>` ever joined or explicitly shut down their
-//! worker thread either (the process exits and the OS reaps the detached
-//! thread), so today's behavior is preserved exactly rather than replaced
-//! with a new, ad hoc shutdown state machine.
+//! Every production [`MetalWorkerClient`] retains a clone of
+//! [`MetalWorkerOwner`]. Dropping the last client first closes the job
+//! queue, then dropping the last owner waits for the worker to exit and
+//! joins it. The wait has a two-second deadline: a backend call that stops
+//! polling cancellation can delay the worker, but cannot hang process
+//! shutdown indefinitely. On timeout the join handle is detached and the
+//! process remains free to exit.
 //!
 //! # Testability without a GPU
 //!
@@ -55,7 +53,9 @@ use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
-use std::sync::Arc;
+use std::io::Write as _;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 /// Default cap on outstanding (queued + in-flight) jobs a [`MetalWorkerClient`]
@@ -68,6 +68,17 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 /// sooner. Both binaries expose this as an overridable `--max-pending` flag;
 /// this constant is only the default when that flag is omitted.
 pub const DEFAULT_MAX_PENDING_JOBS: usize = 32;
+
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum WorkerShutdown {
+    Joined,
+    AlreadyStopped,
+    TimedOut,
+    Panicked,
+}
 
 /// Selects the context-window formula enforced before Metal generation.
 /// Each serve adapter supplies the policy matching its pre-worker contract.
@@ -220,13 +231,107 @@ pub struct WorkerJob {
     _admission_permit: OwnedSemaphorePermit,
 }
 
-/// Owns the dedicated worker thread's `JoinHandle`. See the module docs'
-/// "Shutdown scope" section: intentionally inert today beyond retaining the
-/// handle -- issue #833 is where a join/shutdown method belongs.
-#[derive(Debug)]
+/// Shared owner for the dedicated worker thread.
+///
+/// Production [`MetalWorkerClient`] values retain an owner clone. Because
+/// the client's queue sender is declared before that clone, dropping the
+/// final client closes the queue before the final owner begins its bounded
+/// join. The last owner's `Drop` is the sole production shutdown trigger;
+/// there is no explicit method that can detach the join handle while a
+/// client still keeps the queue open.
+#[derive(Debug, Clone)]
 pub struct MetalWorkerOwner {
-    #[allow(dead_code)]
-    join_handle: Option<std::thread::JoinHandle<()>>,
+    _inner: Arc<MetalWorkerOwnerInner>,
+}
+
+#[derive(Debug)]
+struct MetalWorkerOwnerInner {
+    join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    drop_timeout: Duration,
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl MetalWorkerOwnerInner {
+    fn wait_for_exit(&self, timeout: Duration) -> WorkerShutdown {
+        let handle = {
+            let mut join_handle = lock_unpoisoned(&self.join_handle);
+            let Some(handle) = join_handle.take() else {
+                return WorkerShutdown::AlreadyStopped;
+            };
+            handle
+        };
+
+        let started = Instant::now();
+        while !handle.is_finished() {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                drop(handle);
+                return WorkerShutdown::TimedOut;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+
+        if handle.join().is_ok() {
+            WorkerShutdown::Joined
+        } else {
+            WorkerShutdown::Panicked
+        }
+    }
+}
+
+impl Drop for MetalWorkerOwnerInner {
+    fn drop(&mut self) {
+        match self.wait_for_exit(self.drop_timeout) {
+            WorkerShutdown::Joined | WorkerShutdown::AlreadyStopped => {}
+            WorkerShutdown::TimedOut => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[metal-worker] shutdown timed out after {} ms; detaching worker thread",
+                    self.drop_timeout.as_millis()
+                );
+            }
+            WorkerShutdown::Panicked => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[metal-worker] worker thread panicked during shutdown"
+                );
+            }
+        }
+    }
+}
+
+impl MetalWorkerOwner {
+    fn from_handle(join_handle: std::thread::JoinHandle<()>) -> Self {
+        Self::from_handle_with_timeout(join_handle, WORKER_SHUTDOWN_TIMEOUT)
+    }
+
+    fn from_handle_with_timeout(
+        join_handle: std::thread::JoinHandle<()>,
+        drop_timeout: Duration,
+    ) -> Self {
+        Self {
+            _inner: Arc::new(MetalWorkerOwnerInner {
+                join_handle: Mutex::new(Some(join_handle)),
+                drop_timeout,
+            }),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn unattached_for_test() -> Self {
+        Self {
+            _inner: Arc::new(MetalWorkerOwnerInner {
+                join_handle: Mutex::new(None),
+                drop_timeout: WORKER_SHUTDOWN_TIMEOUT,
+            }),
+        }
+    }
 }
 
 /// Cheaply `Clone` (an `mpsc` sender) handle used to submit generation
@@ -236,15 +341,41 @@ pub struct MetalWorkerOwner {
 /// confined to that thread.
 #[derive(Debug, Clone)]
 pub struct MetalWorkerClient {
+    // Field order is the shutdown contract: the final sender closes before
+    // the final owner clone starts its bounded join.
     jobs: mpsc::UnboundedSender<WorkerJob>,
     /// Bounded-admission cap (issue #932): `Semaphore::new(max_pending)`, one
     /// permit per outstanding job (queued + in-flight, i.e. from `submit`
     /// until `run_worker_loop` is done with it). `Arc`-shared with every
     /// clone of this client so the cap is process-wide, not per-clone.
     admission: Arc<Semaphore>,
+    /// Keeps the worker join owner alive for exactly as long as the queue
+    /// can accept jobs. Test-only clients without a worker carry an owner
+    /// whose join slot is already empty.
+    _owner: MetalWorkerOwner,
 }
 
 impl MetalWorkerClient {
+    fn with_owner(
+        jobs: mpsc::UnboundedSender<WorkerJob>,
+        admission: Arc<Semaphore>,
+        owner: MetalWorkerOwner,
+    ) -> Self {
+        Self {
+            jobs,
+            admission,
+            _owner: owner,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn unattached_for_test(
+        jobs: mpsc::UnboundedSender<WorkerJob>,
+        admission: Arc<Semaphore>,
+    ) -> Self {
+        Self::with_owner(jobs, admission, MetalWorkerOwner::unattached_for_test())
+    }
+
     /// Submit one generation request; the worker thread processes jobs
     /// strictly FIFO. Returns the event receiver on success -- if the
     /// worker thread is no longer running, the returned receiver closes
@@ -556,17 +687,12 @@ impl MetalWorker {
             }
         });
 
+        let owner = MetalWorkerOwner::from_handle(join_handle);
         match ready_rx.recv() {
-            Ok(Ok(meta)) => Ok((
-                MetalWorkerOwner {
-                    join_handle: Some(join_handle),
-                },
-                MetalWorkerClient {
-                    jobs: job_tx,
-                    admission,
-                },
-                meta,
-            )),
+            Ok(Ok(meta)) => {
+                let client = MetalWorkerClient::with_owner(job_tx, admission, owner.clone());
+                Ok((owner, client, meta))
+            }
             Ok(Err(e)) => Err(StartupError::Load(e)),
             Err(_) => Err(StartupError::ThreadExited),
         }
@@ -627,10 +753,7 @@ pub fn test_client_and_jobs_with_cap(
 ) -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerJob>) {
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
     (
-        MetalWorkerClient {
-            jobs: job_tx,
-            admission: Arc::new(Semaphore::new(max_pending)),
-        },
+        MetalWorkerClient::unattached_for_test(job_tx, Arc::new(Semaphore::new(max_pending))),
         job_rx,
     )
 }
@@ -708,7 +831,7 @@ pub fn spawn_fake_with_cap(
     + 'static,
 ) -> MetalWorkerClient {
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
-    std::thread::spawn(move || {
+    let join_handle = std::thread::spawn(move || {
         run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
             let prompt = format_chat_template(messages);
             let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
@@ -718,10 +841,8 @@ pub fn spawn_fake_with_cap(
                 .map_err(WorkerFailure::Failed)
         });
     });
-    MetalWorkerClient {
-        jobs: job_tx,
-        admission: Arc::new(Semaphore::new(max_pending)),
-    }
+    let owner = MetalWorkerOwner::from_handle(join_handle);
+    MetalWorkerClient::with_owner(job_tx, Arc::new(Semaphore::new(max_pending)), owner)
 }
 
 #[cfg(test)]
@@ -730,6 +851,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    fn test_owner(
+        join_handle: std::thread::JoinHandle<()>,
+        drop_timeout: Duration,
+    ) -> MetalWorkerOwner {
+        MetalWorkerOwner::from_handle_with_timeout(join_handle, drop_timeout)
+    }
 
     // ── GPU-free fakes, ported from lattice_serve.rs's pre-existing
     //    `run_worker_loop` test suite (#832 migrates them here) ──────────
@@ -1211,28 +1339,123 @@ mod tests {
 
     #[test]
     fn owner_shutdown_joins_cleanly_once_the_queue_closes() {
-        // "Owner shutdown" without going through the real `MetalWorker::spawn`
-        // (which needs a real Metal device to reach `Ok`): builds a
-        // `MetalWorkerOwner` directly around a `run_worker_loop` thread, the
-        // same shape `MetalWorker::spawn` constructs internally.
         let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
         let started = Arc::new(AtomicUsize::new(0));
         let ran_tokens = Arc::new(AtomicUsize::new(0));
         let started2 = started.clone();
         let ran2 = ran_tokens.clone();
-        let join_handle =
-            std::thread::spawn(move || run_worker_loop(job_rx, fake_generate(1, started2, ran2)));
-        let mut owner = MetalWorkerOwner {
-            join_handle: Some(join_handle),
-        };
+        let join_handle = std::thread::spawn(move || {
+            run_worker_loop(job_rx, fake_generate(1, started2, ran2));
+        });
+        let owner = test_owner(join_handle, Duration::from_secs(1));
         drop(job_tx);
-        let handle = owner
-            .join_handle
-            .take()
-            .expect("owner must retain the join handle (issue #833's seam)");
-        handle
+        assert_eq!(
+            owner._inner.wait_for_exit(Duration::from_secs(1)),
+            WorkerShutdown::Joined
+        );
+        assert_eq!(
+            owner._inner.wait_for_exit(Duration::ZERO),
+            WorkerShutdown::AlreadyStopped,
+            "the join handle must be claimed exactly once"
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn final_client_drop_closes_queue_before_owner_joins() {
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (queue_closed_tx, queue_closed_rx) = std::sync::mpsc::sync_channel(1);
+        let (allow_exit_tx, allow_exit_rx) = std::sync::mpsc::sync_channel(1);
+        let join_handle = std::thread::spawn(move || {
+            while job_rx.blocking_recv().is_some() {}
+            let _ = queue_closed_tx.send(());
+            let _ = allow_exit_rx.recv();
+        });
+        let owner = test_owner(join_handle, Duration::from_secs(1));
+        let client =
+            MetalWorkerClient::with_owner(job_tx, Arc::new(Semaphore::new(1)), owner.clone());
+        drop(owner);
+
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
+        let drop_thread = std::thread::spawn(move || {
+            drop(client);
+            let _ = drop_done_tx.send(());
+        });
+        queue_closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping the last client must close the queue");
+        assert!(
+            matches!(
+                drop_done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "last client drop must still be waiting while the worker is live"
+        );
+        allow_exit_tx
+            .send(())
+            .expect("the worker must still be waiting for the exit release");
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("last client drop must finish after the worker exits");
+        drop_thread
             .join()
-            .expect("owner's worker thread must join cleanly once the queue closes");
+            .expect("client drop thread must not panic");
+    }
+
+    #[test]
+    fn final_client_drop_timeout_detaches_instead_of_blocking() {
+        let (worker_started_tx, worker_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_worker_tx, release_worker_rx) = std::sync::mpsc::sync_channel(1);
+        let (worker_done_tx, worker_done_rx) = std::sync::mpsc::sync_channel(1);
+        let join_handle = std::thread::spawn(move || {
+            let _ = worker_started_tx.send(());
+            let _ = release_worker_rx.recv();
+            let _ = worker_done_tx.send(());
+        });
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the worker must reach its stuck-backend stand-in");
+        let owner = test_owner(join_handle, Duration::from_millis(20));
+        let (job_tx, _job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let client =
+            MetalWorkerClient::with_owner(job_tx, Arc::new(Semaphore::new(1)), owner.clone());
+        drop(owner);
+
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
+        let drop_thread = std::thread::spawn(move || {
+            drop(client);
+            let _ = drop_done_tx.send(());
+        });
+        let returned_before_watchdog = drop_done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+
+        release_worker_tx
+            .send(())
+            .expect("detached worker must still accept the cleanup release");
+        worker_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached worker must exit after the cleanup release");
+        drop_thread
+            .join()
+            .expect("timed-out client drop thread must not panic");
+        assert!(
+            returned_before_watchdog,
+            "last client Drop must honor its configured deadline instead of joining a stuck worker"
+        );
+    }
+
+    #[test]
+    fn owner_shutdown_reports_worker_panic_after_join() {
+        let join_handle = std::thread::spawn(move || {
+            panic!("simulated worker panic");
+        });
+        let owner = test_owner(join_handle, Duration::from_secs(1));
+
+        assert_eq!(
+            owner._inner.wait_for_exit(Duration::from_secs(1)),
+            WorkerShutdown::Panicked
+        );
     }
 
     #[test]
