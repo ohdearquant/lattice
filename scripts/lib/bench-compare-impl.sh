@@ -21,7 +21,7 @@
 # Unset filters run all groups in the default bench targets:
 #   lattice-inference: elementwise_cpu_bench
 #   lattice-embed: simd
-# Uses a git worktree for the base ref so your working tree stays untouched.
+# Uses detached git worktrees for both refs so your working tree stays untouched.
 #
 # VOCABULARY, because these four are separate and get conflated. A group is
 # MEASURED if the bench ran and produced numbers; REPORTED if those numbers
@@ -43,11 +43,20 @@
 # quick-mode resolution, so per-group exemptions were a treadmill. Demoted
 # targets are named in ONE validated manifest,
 # scripts/lib/bench-quick-informational-targets.txt (validated by
-# scripts/perf-bench-gate.py --selftest); their groups are still fully
+# scripts/perf-bench-gate.py --selftest); their benchmarks are still fully
 # measured and rendered — the informational section plus the
 # all-measurements table record every number — but classified informational,
 # so they cannot produce a FAIL verdict. Every non-demoted target this script
 # benches (the lattice-inference one) is classified gating in --quick.
+#
+# Criterion 0.5 permits `/` in group names and uses the same character to join
+# group/function/parameter in `--list`, so a flat listing cannot recover the
+# group boundary. It also stores every target under one target/criterion tree
+# by default. This script instead assigns each bench target a separate
+# CRITERION_HOME and passes the exact `<crate>:<bench-target>` key to the gate.
+# Classification therefore follows a real target boundary rather than a
+# guessed string prefix, and same-named groups in different targets cannot
+# affect one another.
 #
 # --full applies no informational demotion: every group it benches is
 # classified gating, simd included, because full resolution is tight enough
@@ -321,12 +330,11 @@ HEAD_SHA="${HEAD_FULL_SHA:0:10}"
 
 HEAD_WT="$REPO/.cache/bench-compare-head"
 if [ "$HEAD_REF" = "HEAD" ]; then
-  HEAD_MODE="in-place"
-  HEAD_DIR="$REPO"
+  HEAD_MODE="detached snapshot worktree"
 else
   HEAD_MODE="detached worktree"
-  HEAD_DIR="$HEAD_WT"
 fi
+HEAD_DIR="$HEAD_WT"
 GATE_SCRIPT="$REPO/scripts/perf-bench-gate.py"
 
 print_execution_provenance() {
@@ -335,28 +343,28 @@ print_execution_provenance() {
 }
 
 require_commit_clean_head() {
-  if [ "$HEAD_MODE" != "in-place" ]; then
+  if [ "$HEAD_REF" != "HEAD" ]; then
     return
   fi
   local current_head status
   if ! current_head="$(
     git -C "$REPO" rev-parse --verify --end-of-options 'HEAD^{commit}' 2>/dev/null
   )"; then
-    echo "bench-compare: cannot resolve the in-place HEAD commit — refusing." >&2
+    echo "bench-compare: cannot resolve the invoking HEAD commit — refusing." >&2
     exit 2
   fi
   if [ "$current_head" != "$HEAD_FULL_SHA" ]; then
-    echo "bench-compare: the in-place HEAD commit changed during the run — refusing." >&2
+    echo "bench-compare: the invoking HEAD commit changed during the run — refusing." >&2
     echo "  expected $HEAD_FULL_SHA" >&2
     echo "  observed $current_head" >&2
     exit 2
   fi
   if ! status="$(git -C "$REPO" status --porcelain=v1 --untracked-files=normal)"; then
-    echo "bench-compare: cannot inspect the in-place HEAD worktree — refusing." >&2
+    echo "bench-compare: cannot inspect the invoking HEAD worktree — refusing." >&2
     exit 2
   fi
   if [ -n "$status" ]; then
-    echo "bench-compare: the in-place HEAD worktree is not commit-clean — refusing." >&2
+    echo "bench-compare: the invoking HEAD worktree is not commit-clean — refusing." >&2
     echo "  Commit or remove tracked, staged, and untracked changes so the measured" >&2
     echo "  source is exactly reconstructible from the recorded head SHA." >&2
     exit 2
@@ -370,8 +378,7 @@ quiet_gate "before base"
 
 # --- Keep Spotlight out of the benchmark build trees ---
 # .cache protects the detached base/head worktrees. The separate target marker
-# protects the default in-place HEAD arm: without it the base is excluded while
-# the head build dirties thousands of indexed files immediately before timing.
+# protects build artifacts created by callers outside these detached worktrees.
 # Recreate both every run because deleting either tree deletes its own marker.
 # Inert on non-macOS. Fail-closed: refuse to measure without the protection
 # rather than emit numbers that look trustworthy and are not.
@@ -421,6 +428,7 @@ BASE_CRITERION="$(criterion_version "$WT")"
 
 cleanup() {
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || true
+  git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -435,6 +443,24 @@ BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
 BENCH_BASELINE_NAME="compare-base"
 
+# Keep Criterion evidence target-qualified without giving up Cargo's shared
+# compilation target. CRITERION_HOME controls only Criterion's report/baseline
+# tree; Cargo continues to use each worktree's normal target directory.
+BENCH_CRITERION_ROOT="$REPO/.cache/bench-compare-criterion"
+BASE_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/inference/criterion"
+BASE_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/embed/criterion"
+INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/inference/criterion"
+EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/embed/criterion"
+mkdir -p \
+  "$BASE_INFERENCE_CRITERION_ROOT" "$BASE_EMBED_CRITERION_ROOT" \
+  "$INFERENCE_CRITERION_ROOT" "$EMBED_CRITERION_ROOT"
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  python3 "$GATE_SCRIPT" "$BASE_INFERENCE_CRITERION_ROOT" \
+    --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+  python3 "$GATE_SCRIPT" "$BASE_EMBED_CRITERION_ROOT" \
+    --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+fi
+
 # --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
 # `cargo bench ... | grep -E "time:" || true` discards cargo's status TWICE: a
 # pipeline reports its LAST command (grep), and `|| true` then resets
@@ -448,9 +474,9 @@ BENCH_BASELINE_NAME="compare-base"
 # target that emits no Criterion output contributes no comparison for the gate
 # to reconcile — absence leaves no artifact to be found missing. So each
 # invocation also reports how many measurement lines it actually printed:
-# that is the only per-target evidence available at the point where the run's
-# INTENT is known. Downstream, `perf-bench-gate.py` sees a directory tree and
-# cannot know a second target was ever supposed to be in it.
+# that is the only evidence available at the point where the run's INTENT is
+# known. Downstream, each target has its own Criterion root, but an empty root
+# still cannot prove a benchmark was supposed to populate it.
 BENCH_RC=0
 BENCH_LINES=0
 run_bench() {
@@ -500,13 +526,13 @@ BASE_PHASE_RC=0
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
   # same channel and one of them silently deletes half the comparison.
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
-  run_bench "time:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:" env CRITERION_HOME="$BASE_EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_PHASE_RC=$?
 # `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
@@ -519,31 +545,16 @@ quiet_gate "between phases"
 echo ""
 echo "--- Building + benching HEAD ($HEAD_SHA) ---"
 
-if [ "$HEAD_MODE" = "detached worktree" ]; then
-  if [ -d "$HEAD_WT" ]; then
-    git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
-  fi
-  git -C "$REPO" worktree add --detach --end-of-options "$HEAD_WT" "$HEAD_REF" 2>&1 | tail -1
-  # Update cleanup to also remove head worktree
-  trap 'git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true; cleanup' EXIT
+if [ -d "$HEAD_WT" ]; then
+  git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
 fi
+git -C "$REPO" worktree add --detach --end-of-options \
+  "$HEAD_WT" "$HEAD_FULL_SHA" 2>&1 | tail -1
 
 HEAD_RUSTC="$(command_version "$HEAD_DIR" rustc --version)"
 HEAD_CARGO="$(command_version "$HEAD_DIR" cargo --version)"
 HEAD_CRITERION="$(criterion_version "$HEAD_DIR")"
 [ -n "$HEAD_CRITERION" ] || HEAD_CRITERION="unavailable"
-
-# Copy base's criterion baseline into head's target/criterion
-mkdir -p "$HEAD_DIR/target/criterion"
-# The enforcing path removes only prior compare-base artifacts before the fresh
-# base set is copied. Otherwise an unrelated benchmark from an older
-# filtered/alternate-target run becomes part of today's selected set and
-# produces a false missing-head error. Reporter mode keeps its tolerant,
-# non-destructive handling of an arbitrary local Criterion tree.
-if [ "$FAIL_ON_REGRESSION" = "1" ]; then
-  python3 "$GATE_SCRIPT" "$HEAD_DIR/target/criterion" \
-    --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
-fi
 
 copy_base_artifacts() {
   local what="$1"; shift
@@ -556,111 +567,45 @@ copy_base_artifacts() {
   return 0
 }
 
-if [ -d "$WT/target/criterion" ]; then
-  # Copy the baseline data (compare-base dirs)
-  copy_base_artifacts "selected baseline copy" \
-    -a "$WT/target/criterion/" "$HEAD_DIR/target/criterion/" \
+prepare_target_root() {
+  local target="$1" base_root="$2" head_root="$3"
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    python3 "$GATE_SCRIPT" "$head_root" \
+      --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+  fi
+  copy_base_artifacts "$target selected baseline copy" \
+    -a "$base_root/" "$head_root/" \
     --include="**/$BENCH_BASELINE_NAME/**" --include='*/' --exclude='*'
-  # Also copy the raw estimates for comparison
-  copy_base_artifacts "Criterion artifact copy" \
-    -a "$WT/target/criterion/" "$HEAD_DIR/target/criterion/"
-fi
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    python3 "$GATE_SCRIPT" "$head_root" \
+      --baseline-name "$BENCH_BASELINE_NAME" --prepare-head
+  fi
+}
 
-# HEAD may run in-place against a Criterion tree left by an earlier A/B. A
-# removed or renamed benchmark would otherwise leave its old change/ result
-# beside the freshly copied compare-base/ result, making the completeness gate
-# mistake stale output for a head measurement. Derive the cleanup scope from
-# the exact selected baseline files and remove only their new/change siblings;
-# the helper refuses paths outside an invariant-checked criterion/ root.
-if [ "$FAIL_ON_REGRESSION" = "1" ]; then
-  python3 "$GATE_SCRIPT" "$HEAD_DIR/target/criterion" \
-    --baseline-name "$BENCH_BASELINE_NAME" --prepare-head
-fi
+prepare_target_root \
+  "lattice-inference:$BENCHES_INFERENCE" \
+  "$BASE_INFERENCE_CRITERION_ROOT" "$INFERENCE_CRITERION_ROOT"
+prepare_target_root \
+  "lattice-embed:$BENCHES_EMBED" \
+  "$BASE_EMBED_CRITERION_ROOT" "$EMBED_CRITERION_ROOT"
 
 HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
   if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:|change:" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  run_bench "time:|change:" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
 
 quiet_gate "after head"
 require_commit_clean_head
-
-# --- Quick-mode informational demotion (lattice#714 / lattice#1060) ---
-# Target-level policy: the demoted-target set lives in ONE validated
-# manifest, scripts/lib/bench-quick-informational-targets.txt. For each
-# bench target this script ran, the helper below is given the target key
-# (`<crate>:<bench-target>`) and that target's Criterion `--list` output;
-# it prints every top-level group of a demoted target and nothing for any
-# other target. Deriving the group set from the listing is deliberate
-# under target semantics — the demotion covers the target, so a group
-# added to a demoted target later is informational by policy, while every
-# non-demoted target stays gated because its key is absent from the
-# manifest.
-#
-# Criterion group names are bare strings once they leave the helper, with
-# no target attribution — so before folding a demoted target's groups into
-# the flat informational set, resolve-informational-groups.sh checks them
-# against every gated target's own listing and drops (gates) any name that
-# collides, warning loudly on stderr. This is the composed-path guard: a
-# group demoted for lattice-embed:simd must never silently exempt an
-# identically-named lattice-inference group from the gate.
-#
-# Both the helper and the resolver live in scripts/lib/ (rather than inline
-# here) so scripts/perf-bench-gate.py --selftest can run the exact same
-# shell code against controlled listings and catch a shell-only
-# regression, not just a Python-classifier one. --full skips this block
-# entirely: every group of every target gates at full resolution.
-INFO_GROUPS_FILE="$REPO/.cache/bench-compare-informational-groups.txt"
-rm -f "$INFO_GROUPS_FILE"
-if [ -n "$QUICK_FLAGS" ]; then
-  (
-    cd "$HEAD_DIR"
-    DEMOTED_GROUPS_FILE="$REPO/.cache/bench-compare-demoted-groups.txt"
-    GATED_GROUPS_FILE="$REPO/.cache/bench-compare-gated-groups.txt"
-    : > "$DEMOTED_GROUPS_FILE"
-    : > "$GATED_GROUPS_FILE"
-    DEMOTED_TARGETS=""
-    GATED_TARGETS=""
-
-    # --list reflects both the built binary and any BENCH_GROUPS_* filter
-    # already applied. Every target's groups go into the demoted-set file
-    # or the gated-set file depending on manifest membership; the resolver
-    # then reconciles the two before anything is treated as informational.
-    route_target_groups() {
-      local target="$1" listing="$2"
-      if "$REPO/scripts/lib/bench-informational-groups.sh" --print-targets | grep -qxF "$target"; then
-        "$REPO/scripts/lib/bench-informational-groups.sh" --list-groups "$listing" >> "$DEMOTED_GROUPS_FILE"
-        DEMOTED_TARGETS="${DEMOTED_TARGETS:+$DEMOTED_TARGETS,}$target"
-      else
-        "$REPO/scripts/lib/bench-informational-groups.sh" --list-groups "$listing" >> "$GATED_GROUPS_FILE"
-        GATED_TARGETS="${GATED_TARGETS:+$GATED_TARGETS,}$target"
-      fi
-    }
-
-    EMBED_LISTING="$REPO/.cache/bench-compare-embed-list.txt"
-    cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --list 2>/dev/null > "$EMBED_LISTING" || true
-    route_target_groups "lattice-embed:$BENCHES_EMBED" "$EMBED_LISTING"
-
-    INFERENCE_LISTING="$REPO/.cache/bench-compare-inference-list.txt"
-    cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --list 2>/dev/null > "$INFERENCE_LISTING" || true
-    route_target_groups "lattice-inference:$BENCHES_INFERENCE" "$INFERENCE_LISTING"
-
-    "$REPO/scripts/lib/resolve-informational-groups.sh" \
-      "$DEMOTED_GROUPS_FILE" "${DEMOTED_TARGETS:-none}" \
-      "$GATED_GROUPS_FILE" "${GATED_TARGETS:-none}" \
-      > "$INFO_GROUPS_FILE"
-  )
-fi
 
 write_run_provenance() {
   local finished_utc criterion_mode enforcement
@@ -687,7 +632,7 @@ write_run_provenance() {
     printf 'base_sha=%s\n' "$BASE_FULL_SHA"
     printf 'head_ref=%s\n' "$HEAD_REF"
     printf 'head_sha=%s\n' "$HEAD_FULL_SHA"
-    printf 'head_mode=%s\n' "${HEAD_MODE// /-}"
+    printf 'head_mode=detached-worktree\n'
     printf 'base_rustc=%s\n' "$BASE_RUSTC"
     printf 'head_rustc=%s\n' "$HEAD_RUSTC"
     printf 'base_cargo=%s\n' "$BASE_CARGO"
@@ -740,38 +685,66 @@ echo "  machine state:"
 echo "$MACHINE_STATE_SAMPLES" | sed 's/^/    /'
 
 echo ""
-echo "=== Full gate report ==="
-GATE_ARGS=(
-  --baseline-name "$BENCH_BASELINE_NAME"
-  --provenance-file "$PROVENANCE_FILE"
-)
-if [ -s "$INFO_GROUPS_FILE" ]; then
-  GATE_ARGS+=(--informational-groups-file "$INFO_GROUPS_FILE")
-fi
-if [ "$FAIL_ON_REGRESSION" = "1" ]; then
-  # Ask the gate to distinguish "nothing regressed" from "nothing was
-  # measured". It is the only party that can: it parses the comparisons and
-  # knows how many were judgeable. Testing for the criterion DIRECTORY here
-  # cannot work — this script creates that directory itself before benching.
-  GATE_ARGS+=(--require-measurements)
-  GATE_ARGS+=(--require-provenance)
-fi
-
+echo "=== Target-qualified gate reports ==="
 GATE_RC=0
-if [ -d "$HEAD_DIR/target/criterion" ]; then
-  python3 "$GATE_SCRIPT" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || GATE_RC=$?
-else
-  # Cannot happen via the normal path (the directory is created above), but a
-  # missing root must not read as a pass under --fail-on-regression.
-  GATE_RC=2
-fi
+run_target_gate() {
+  local target="$1" criterion_root="$2"
+  local gate_rc=0 policy_rc=0 policy_invalid=0
+  local gate_args=(
+    --baseline-name compare-base
+    --target "$target"
+    --provenance-file "$PROVENANCE_FILE"
+  )
+
+  if [ -n "$QUICK_FLAGS" ]; then
+    if "$REPO/scripts/lib/bench-informational-targets.sh" \
+         --is-informational "$target"; then
+      gate_args+=(--informational-target "$target")
+    else
+      policy_rc=$?
+      if [ "$policy_rc" -ne 1 ]; then
+        echo "bench-compare: informational-target policy could not classify '$target'." >&2
+        policy_invalid=1
+      fi
+    fi
+  fi
+
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    # Each target has its own root, so completeness is checked per intended
+    # target rather than inferred from whichever comparisons survived in a
+    # shared tree.
+    gate_args+=(--require-measurements)
+    gate_args+=(--require-provenance)
+  fi
+
+  if [ -d "$criterion_root" ]; then
+    python3 "$GATE_SCRIPT" \
+      "$criterion_root" "local-compare/$target" "${gate_args[@]}" 2>&1 || gate_rc=$?
+  else
+    gate_rc=2
+  fi
+  if [ "$policy_invalid" -eq 1 ]; then
+    gate_rc=2
+  fi
+
+  if [ "$gate_rc" -eq 2 ]; then
+    GATE_RC=2
+  elif [ "$gate_rc" -ne 0 ] && [ "$GATE_RC" -eq 0 ]; then
+    GATE_RC="$gate_rc"
+  fi
+}
+
+run_target_gate \
+  "lattice-inference:$BENCHES_INFERENCE" "$INFERENCE_CRITERION_ROOT"
+run_target_gate \
+  "lattice-embed:$BENCHES_EMBED" "$EMBED_CRITERION_ROOT"
 
 echo ""
 echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
 
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is the gate refusing to certify a
-  # run it could not judge (no comparison data, or nothing gating). Both must
+  # run it could not judge (no usable comparison data or invalid policy). Both must
   # fail the caller: a green exit standing in for evidence that was never
   # produced is the exact defect this flag exists to remove.
   if [ "$GATE_RC" = "2" ]; then

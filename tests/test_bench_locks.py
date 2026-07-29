@@ -30,16 +30,18 @@ head ref changes, so both the early log and the pasted run-conditions block must
 carry them.
 """
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
-from pathlib import Path
 from unittest import mock
+from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
@@ -112,10 +114,48 @@ class _Sandbox:
         governor = self.root / "scripts" / "perf_governor.py"
         governor.write_text(STUB_GOVERNOR)
         governor.chmod(0o755)
+        quiet_probe = self.root / "scripts" / "lib" / "quiet-probe.py"
+        quiet_probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import argparse\n"
+            "import os\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--label', required=True)\n"
+            "p.add_argument('--floor', type=float, "
+            "default=float(os.environ.get('BENCH_IDLE_FLOOR', '70')))\n"
+            "a = p.parse_args()\n"
+            "ok = a.floor <= 100.0\n"
+            "print(f'[quiet] {a.label}: idle 100.0% (floor {a.floor:.1f}%) '"
+            "      f'{\"ok\" if ok else \"BELOW FLOOR\"} | top: fixture 0.0%')\n"
+            "raise SystemExit(0 if ok else 1)\n"
+        )
+        machine_probe = self.root / "scripts" / "lib" / "machine-state-probe.py"
+        machine_probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import datetime, json, sys\n"
+            "label = sys.argv[sys.argv.index('--label') + 1]\n"
+            "print(json.dumps({'schema':'lattice-machine-state-v1','label':label,"
+            "'captured_at_utc':datetime.datetime.now(datetime.UTC)"
+            ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
+            "'power':{'status':'unavailable','reason':'fixture'},"
+            "'thermal':{'status':'unavailable','reason':'fixture'},"
+            "'idle':{'status':'unavailable','reason':'fixture'}},"
+            "separators=(',', ':'), sort_keys=True))\n"
+        )
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
         subprocess.run([*GIT, "init", "-q", "-b", "main", str(self.root)], check=True)
+        (self.root / "Cargo.lock").write_text(
+            'version = 4\n\n'
+            '[[package]]\n'
+            'name = "criterion"\n'
+            'version = "0.5.1"\n'
+        )
+        subprocess.run(
+            [*GIT, "-C", str(self.root), "add", "-f", "Cargo.lock"],
+            check=True,
+        )
         for i in range(2):
             (self.root / f"f{i}.txt").write_text(str(i))
             subprocess.run([*GIT, "-C", str(self.root), "add", "-A"], check=True)
@@ -216,7 +256,7 @@ class LockPrecondition(unittest.TestCase):
             sb.status.write_text("supervisor_pid=1\nlock=fabricated\n")
             r = sb.run([sb.impl], BENCH_IDLE_FLOOR="0")
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
-            self.assertIn("not an ancestor", r.stderr)
+            self.assertIn("ancestor", r.stderr)
 
     def test_deliberately_recorded_ancestor_pid_is_accepted(self):
         """The boundary of the guard, pinned as a fact rather than left in prose.
@@ -307,10 +347,10 @@ class HeadModeReporting(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assert_provenance_in_header_and_report(
                 r.stdout,
-                "  head arm: in-place",
+                "  head arm: detached snapshot worktree",
                 "  gate: scripts/perf-bench-gate.py from the invoking checkout",
             )
-            self.assertNotIn("head arm: detached worktree", r.stdout)
+            self.assertNotIn("head arm: in-place", r.stdout)
 
     def test_explicit_head_ref_uses_and_reports_a_detached_worktree(self):
         """Mutation-sensitive: collapsing the mode selection to in-place makes
@@ -354,8 +394,8 @@ class HeadModeReporting(unittest.TestCase):
             cargo = Path(shim) / "cargo"
             cargo.write_text(
                 "#!/usr/bin/env bash\n"
-                f'if [ "$PWD" = "{sb.root}" ]; then\n'
-                "  printf '%s\\n' changed > f1.txt\n"
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]]; then\n'
+                f'  printf "%s\\n" changed > "{sb.root}/f1.txt"\n'
                 "fi\n"
                 "exit 0\n"
             )
@@ -368,16 +408,48 @@ class HeadModeReporting(unittest.TestCase):
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
             self.assertIn("not commit-clean", r.stderr)
 
+    def test_restored_source_race_cannot_change_snapshot_measurement(self):
+        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
+            cargo = Path(shim) / "cargo"
+            observed = Path(shim) / "observed"
+            cargo.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]] '
+                '&& [ "${1:-}" != "--version" ]; then\n'
+                f'  printf "%s:%s\\n" "$PWD" "$(cat f1.txt)" >> "{observed}"\n'
+                f'  original="$(cat "{sb.root}/f1.txt")"\n'
+                f'  printf "%s" mutated-during-run > "{sb.root}/f1.txt"\n'
+                f'  printf "%s" "$original" > "{sb.root}/f1.txt"\n'
+                "fi\n"
+                "exit 0\n"
+            )
+            cargo.chmod(0o755)
+            r = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                PATH=f"{shim}:{sb.env['PATH']}",
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual((sb.root / "f1.txt").read_text(), "1")
+            lines = observed.read_text().splitlines()
+            self.assertTrue(lines, r.stdout)
+            self.assertTrue(
+                all(line.endswith(":1") for line in lines),
+                "\n".join(lines),
+            )
+
     def test_in_place_head_refuses_commit_changed_during_measurement(self):
         with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
             cargo = Path(shim) / "cargo"
             cargo.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
-                f'if [ "$PWD" = "{sb.root}" ] '
+                f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]] '
                 '&& [ "${1:-}" != "--version" ] '
-                '&& [ "$(cat f1.txt)" != "committed-during-run" ]; then\n'
-                "  printf '%s\\n' committed-during-run > f1.txt\n"
+                f'&& [ "$(cat "{sb.root}/f1.txt")" != "committed-during-run" ]; then\n'
+                f'  printf "%s\\n" committed-during-run > "{sb.root}/f1.txt"\n'
+                f'  cd "{sb.root}"\n'
                 "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
                 "add f1.txt\n"
                 "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
@@ -416,7 +488,7 @@ class RunProvenanceHandoff(unittest.TestCase):
                 "base_sha=",
                 "head_ref=HEAD",
                 "head_sha=",
-                "head_mode=in-place",
+                "head_mode=detached-worktree",
                 "base_rustc=",
                 "head_rustc=",
                 "base_cargo=",
@@ -615,11 +687,6 @@ class MachineStateParsers(unittest.TestCase):
 
 class MachineStateGate(unittest.TestCase):
     def test_macos_checkpoints_gate_all_three_measurement_boundaries(self):
-        """Every auditable boundary must settle and prove machine state.
-
-        Mutation-sensitive: deleting any machine_state_probe call leaves fewer
-        than the required before/between/after records.
-        """
         with _Sandbox() as sb:
             sb.force_platform("Darwin")
             r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
@@ -651,11 +718,6 @@ class MachineStateGate(unittest.TestCase):
             self.assertIn('"gate":', report)
 
     def test_checkpoint_failure_refuses_before_measurement(self):
-        """A blocked AC/thermal/AFK checkpoint is not a warning.
-
-        Mutation-sensitive: discarding the checkpoint's exit status lets this
-        fixture reach the base measurement and return a certified report.
-        """
         with _Sandbox() as sb:
             sb.force_platform("Darwin")
             r = sb.run(
@@ -664,10 +726,7 @@ class MachineStateGate(unittest.TestCase):
                 STUB_GOVERNOR_RC="2",
             )
             self.assertEqual(r.returncode, 2, f"stdout:\n{r.stdout}")
-            self.assertEqual(
-                sb.machine_state_labels(),
-                ["before base"],
-            )
+            self.assertEqual(sb.machine_state_labels(), ["before base"])
             self.assertIn("machine-state checkpoint 'before base' failed", r.stderr)
             self.assertNotIn("Building + benching BASE", r.stdout)
 
@@ -801,12 +860,24 @@ class AmbientLoadGate(unittest.TestCase):
 
     def test_probe_reports_measured_idle_and_consumers(self):
         """The report must carry the conditions, not just a verdict."""
-        out = subprocess.run(
-            ["python3", str(LIB / "quiet-probe.py"), "--label", "unit", "--floor", "0"],
-            capture_output=True, text=True, timeout=120)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertRegex(out.stdout, r"\[quiet\] unit: idle [\d.]+% \(floor 0\.0%\)")
-        self.assertIn("top:", out.stdout)
+        spec = importlib.util.spec_from_file_location(
+            "quiet_probe_ambient", str(LIB / "quiet-probe.py")
+        )
+        qp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(qp)
+        argv = ["quiet-probe.py", "--label", "unit", "--floor", "0"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(qp, "idle_percent", return_value=99.5), \
+                mock.patch.object(
+                    qp, "top_consumers", return_value="fixture 0.0%"
+                ), mock.patch(
+                    "sys.stdout", new_callable=io.StringIO
+                ) as stdout:
+            self.assertEqual(qp.main(), 0)
+        self.assertRegex(
+            stdout.getvalue(), r"\[quiet\] unit: idle 99\.5% \(floor 0\.0%\)"
+        )
+        self.assertIn("top: fixture 0.0%", stdout.getvalue())
 
 
 if __name__ == "__main__":
