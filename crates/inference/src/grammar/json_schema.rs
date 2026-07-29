@@ -644,12 +644,9 @@ impl<'a> CompileCtx<'a> {
     /// Prove every narrowing sibling redundant against the resolved target,
     /// then compile that target alone.
     ///
-    /// A target `const`/`enum` value set and its declared `type` names are
-    /// upper bounds on its language: every other assertion on the target can
-    /// only shrink that language. Proving one of those bounds is a subset of a
-    /// sibling therefore proves that compiling the target without the sibling
-    /// removes nothing. This check never reasons about the target's other
-    /// keywords.
+    /// A target `const`/`enum` value set and its declared scalar `type` are
+    /// upper bounds on its emitted language. The proof is available only for
+    /// the small target shapes modeled below.
     ///
     /// Kept out of [`Self::compile_ref_with_siblings`] because that function is
     /// re-entered once per `$ref` chain link and must retain a small stack
@@ -680,33 +677,35 @@ impl<'a> CompileCtx<'a> {
         }
 
         let target = self.resolve_ref_chain_target(ref_str)?;
+        let target_shape_is_modeled = target.as_object().is_some_and(|object| {
+            !object.is_empty()
+                && object
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "const" | "enum" | "type"))
+                && !(object.contains_key("const") && object.contains_key("enum"))
+                && object.get("enum").is_none_or(Value::is_array)
+                && object.get("type").is_none_or(Value::is_string)
+        });
+        // This is intentionally an allow-list rather than a list of known
+        // compiler dispatch keywords. A newly supported keyword must make the
+        // proof unavailable by default: rejecting a redundant schema is safer
+        // than silently widening constrained decoding through an unmodeled
+        // early return.
+        if !target_shape_is_modeled {
+            return Err(unrepresentable_ref_narrowing(narrowing_key));
+        }
+
         let target_const = target.get("const");
         let target_enum = target.get("enum").and_then(Value::as_array);
 
-        // The redundancy proof must bound the grammar emitted for the target,
-        // not the full JSON Schema intersection. `compile_schema_inner`
-        // dispatches `enum` before `const`, and both before `type`. Refuse
-        // combinations where those early returns can emit a value outside the
-        // later assertion rather than duplicating that dispatch here.
-        if target_const.is_some() && target_enum.is_some() {
-            return Err(unrepresentable_ref_narrowing(narrowing_key));
-        }
-        if let Some(target_type) = target.get("type") {
-            match target_type {
-                Value::String(name) => {
-                    if target_const.is_some_and(|value| !value_matches_type(value, name)) {
-                        return Err(unrepresentable_ref_narrowing(narrowing_key));
-                    }
-                    if target_enum.is_some_and(|values| {
-                        values.iter().any(|value| !value_matches_type(value, name))
-                    }) {
-                        return Err(unrepresentable_ref_narrowing(narrowing_key));
-                    }
-                }
-                Value::Array(_) => {
-                    return Err(unrepresentable_ref_narrowing(narrowing_key));
-                }
-                _ => {}
+        if let Some(Value::String(name)) = target.get("type") {
+            if target_const.is_some_and(|value| !value_matches_type(value, name)) {
+                return Err(unrepresentable_ref_narrowing(narrowing_key));
+            }
+            if target_enum
+                .is_some_and(|values| values.iter().any(|value| !value_matches_type(value, name)))
+            {
+                return Err(unrepresentable_ref_narrowing(narrowing_key));
             }
         }
 

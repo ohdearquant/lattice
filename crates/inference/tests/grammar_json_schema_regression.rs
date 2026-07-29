@@ -207,6 +207,86 @@ fn redundant_ref_narrowing_siblings_compile_target_language() {
     }
 }
 
+fn assert_unmodeled_target_ref_narrowing_fails_closed(
+    shape: &str,
+    target: serde_json::Value,
+    accepted_by_target: &[u8],
+    rejected_by_target: &[u8],
+) {
+    let target_grammar = compile_json_schema(&target)
+        .unwrap_or_else(|err| panic!("{shape} target should compile independently: {err}"));
+    assert!(
+        full_accept(&target_grammar, accepted_by_target),
+        "{shape} must pin the target grammar's accepted language"
+    );
+    assert!(
+        !full_accept(&target_grammar, rejected_by_target),
+        "{shape} must pin the target grammar's rejected language"
+    );
+
+    let schema = serde_json::json!({
+        "$defs": { "V": target },
+        "$ref": "#/$defs/V",
+        "type": "string"
+    });
+    let Err(err) = compile_json_schema(&schema) else {
+        panic!("{shape} must fail closed");
+    };
+    assert!(
+        err.0.contains("$ref"),
+        "{shape} error should identify the unsupported `$ref` intersection: {err}"
+    );
+}
+
+#[test]
+fn ref_narrowing_target_with_any_of_fails_closed() {
+    assert_unmodeled_target_ref_narrowing_fails_closed(
+        "target anyOf alongside scalar type",
+        serde_json::json!({
+            "anyOf": [{ "type": "number" }],
+            "type": "string"
+        }),
+        b"1",
+        br#""x""#,
+    );
+}
+
+#[test]
+fn ref_narrowing_target_with_one_of_fails_closed() {
+    assert_unmodeled_target_ref_narrowing_fails_closed(
+        "target oneOf alongside scalar type",
+        serde_json::json!({
+            "oneOf": [{ "type": "number" }],
+            "type": "string"
+        }),
+        b"1",
+        br#""x""#,
+    );
+}
+
+#[test]
+fn ref_narrowing_target_with_all_of_fails_closed() {
+    assert_unmodeled_target_ref_narrowing_fails_closed(
+        "target allOf alongside scalar type",
+        serde_json::json!({
+            "allOf": [{ "type": "number" }],
+            "type": "string"
+        }),
+        br#""x""#,
+        b"1",
+    );
+}
+
+#[test]
+fn ref_narrowing_target_with_non_schema_type_fails_closed() {
+    assert_unmodeled_target_ref_narrowing_fails_closed(
+        "target type is neither string nor array",
+        serde_json::json!({ "type": 7 }),
+        b"1",
+        b"not-json",
+    );
+}
+
 #[test]
 fn unproven_ref_narrowing_siblings_fail_closed() {
     let cases = [
