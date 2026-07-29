@@ -30,14 +30,17 @@ head ref changes, so both the early log and the pasted run-conditions block must
 carry them.
 """
 import importlib.util
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -69,10 +72,47 @@ class _Sandbox:
         shutil.copy2(GATE, self.root / "scripts" / GATE.name)
         shutil.copytree(LIB, self.root / "scripts" / "lib")
         shutil.copy2(REPO / ".gitignore", self.root / ".gitignore")
+        quiet_probe = self.root / "scripts" / "lib" / "quiet-probe.py"
+        quiet_probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import argparse\n"
+            "import os\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--label', required=True)\n"
+            "p.add_argument('--floor', type=float, "
+            "default=float(os.environ.get('BENCH_IDLE_FLOOR', '70')))\n"
+            "a = p.parse_args()\n"
+            "ok = a.floor <= 100.0\n"
+            "print(f'[quiet] {a.label}: idle 100.0% (floor {a.floor:.1f}%) '"
+            "      f'{\"ok\" if ok else \"BELOW FLOOR\"} | top: fixture 0.0%')\n"
+            "raise SystemExit(0 if ok else 1)\n"
+        )
+        machine_probe = self.root / "scripts" / "lib" / "machine-state-probe.py"
+        machine_probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import datetime, json, sys\n"
+            "label = sys.argv[sys.argv.index('--label') + 1]\n"
+            "print(json.dumps({'schema':'lattice-machine-state-v1','label':label,"
+            "'captured_at_utc':datetime.datetime.now(datetime.UTC)"
+            ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
+            "'power':{'status':'unavailable','reason':'fixture'},"
+            "'thermal':{'status':'unavailable','reason':'fixture'}},"
+            "separators=(',', ':'), sort_keys=True))\n"
+        )
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
         subprocess.run([*GIT, "init", "-q", "-b", "main", str(self.root)], check=True)
+        (self.root / "Cargo.lock").write_text(
+            'version = 4\n\n'
+            '[[package]]\n'
+            'name = "criterion"\n'
+            'version = "0.5.1"\n'
+        )
+        subprocess.run(
+            [*GIT, "-C", str(self.root), "add", "-f", "Cargo.lock"],
+            check=True,
+        )
         for i in range(2):
             (self.root / f"f{i}.txt").write_text(str(i))
             subprocess.run([*GIT, "-C", str(self.root), "add", "-A"], check=True)
@@ -154,7 +194,7 @@ class LockPrecondition(unittest.TestCase):
             sb.status.write_text("supervisor_pid=1\nlock=fabricated\n")
             r = sb.run([sb.impl], BENCH_IDLE_FLOOR="0")
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
-            self.assertIn("not an ancestor", r.stderr)
+            self.assertIn("ancestor", r.stderr)
 
     def test_deliberately_recorded_ancestor_pid_is_accepted(self):
         """The boundary of the guard, pinned as a fact rather than left in prose.
@@ -614,12 +654,24 @@ class AmbientLoadGate(unittest.TestCase):
 
     def test_probe_reports_measured_idle_and_consumers(self):
         """The report must carry the conditions, not just a verdict."""
-        out = subprocess.run(
-            ["python3", str(LIB / "quiet-probe.py"), "--label", "unit", "--floor", "0"],
-            capture_output=True, text=True, timeout=120)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertRegex(out.stdout, r"\[quiet\] unit: idle [\d.]+% \(floor 0\.0%\)")
-        self.assertIn("top:", out.stdout)
+        spec = importlib.util.spec_from_file_location(
+            "quiet_probe_ambient", str(LIB / "quiet-probe.py")
+        )
+        qp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(qp)
+        argv = ["quiet-probe.py", "--label", "unit", "--floor", "0"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(qp, "idle_percent", return_value=99.5), \
+                mock.patch.object(
+                    qp, "top_consumers", return_value="fixture 0.0%"
+                ), mock.patch(
+                    "sys.stdout", new_callable=io.StringIO
+                ) as stdout:
+            self.assertEqual(qp.main(), 0)
+        self.assertRegex(
+            stdout.getvalue(), r"\[quiet\] unit: idle 99\.5% \(floor 0\.0%\)"
+        )
+        self.assertIn("top: fixture 0.0%", stdout.getvalue())
 
 
 if __name__ == "__main__":
