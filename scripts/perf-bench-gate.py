@@ -270,11 +270,13 @@ def load_run_provenance(path: Path) -> RunProvenance:
     if finished < started:
         raise ValueError(f"{path}: finished_utc precedes started_utc")
     if not re.fullmatch(
-        r"(?:hostname-sha256:[0-9a-f]{16}|configured:[A-Za-z0-9._:-]+)",
+        r"(?:local-random:[0-9a-f]{32}|hostname-sha256:[0-9a-f]{16}|"
+        r"configured:[A-Za-z0-9._:-]+)",
         fields["host_id"],
     ):
         raise ValueError(
-            f"{path}: host_id must be a configured label or a 16-hex hostname digest"
+            f"{path}: host_id must be a local random identifier, configured label, "
+            "or legacy hostname digest"
         )
     for field in ("base_sha", "head_sha"):
         if not re.fullmatch(r"[0-9a-f]{40}", fields[field]):

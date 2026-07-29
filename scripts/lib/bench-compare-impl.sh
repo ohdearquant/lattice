@@ -100,9 +100,7 @@ RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 if [ -n "${BENCH_HOST_ID:-}" ]; then
   RUN_HOST_ID="configured:${BENCH_HOST_ID}"
 else
-  RUN_HOST_ID="$(
-    python3 -c 'import hashlib,socket; print("hostname-sha256:" + hashlib.sha256(socket.gethostname().encode()).hexdigest()[:16])'
-  )"
+  RUN_HOST_ID="$(python3 "$REPO/scripts/lib/bench-host-id.py")"
 fi
 RUN_OS="$(uname -srm)"
 PROVENANCE_FILE="$REPO/.cache/bench-run-provenance.txt"
@@ -320,8 +318,38 @@ print_execution_provenance() {
   echo "  gate: scripts/perf-bench-gate.py from the invoking checkout"
 }
 
+require_commit_clean_head() {
+  if [ "$HEAD_MODE" != "in-place" ]; then
+    return
+  fi
+  local current_head status
+  if ! current_head="$(
+    git -C "$REPO" rev-parse --verify --end-of-options 'HEAD^{commit}' 2>/dev/null
+  )"; then
+    echo "bench-compare: cannot resolve the in-place HEAD commit — refusing." >&2
+    exit 2
+  fi
+  if [ "$current_head" != "$HEAD_FULL_SHA" ]; then
+    echo "bench-compare: the in-place HEAD commit changed during the run — refusing." >&2
+    echo "  expected $HEAD_FULL_SHA" >&2
+    echo "  observed $current_head" >&2
+    exit 2
+  fi
+  if ! status="$(git -C "$REPO" status --porcelain=v1 --untracked-files=normal)"; then
+    echo "bench-compare: cannot inspect the in-place HEAD worktree — refusing." >&2
+    exit 2
+  fi
+  if [ -n "$status" ]; then
+    echo "bench-compare: the in-place HEAD worktree is not commit-clean — refusing." >&2
+    echo "  Commit or remove tracked, staged, and untracked changes so the measured" >&2
+    echo "  source is exactly reconstructible from the recorded head SHA." >&2
+    exit 2
+  fi
+}
+
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
 print_execution_provenance
+require_commit_clean_head
 quiet_gate "before base"
 
 # --- Keep Spotlight out of the benchmark build trees ---
@@ -549,6 +577,7 @@ HEAD_PHASE_RC=0
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
 
 quiet_gate "after head"
+require_commit_clean_head
 
 # --- Quick-mode informational demotion (lattice#714 / lattice#1060) ---
 # Target-level policy: the demoted-target set lives in ONE validated

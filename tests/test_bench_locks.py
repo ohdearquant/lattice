@@ -45,6 +45,7 @@ SCRIPT = REPO / "scripts" / "bench-compare.sh"
 LIB = REPO / "scripts" / "lib"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
 STATE_PROBE = LIB / "machine-state-probe.py"
+HOST_ID = LIB / "bench-host-id.py"
 
 STUB_CARGO = """#!/usr/bin/env bash
 exit 0
@@ -67,6 +68,7 @@ class _Sandbox:
         shutil.copy2(SCRIPT, self.root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, self.root / "scripts" / GATE.name)
         shutil.copytree(LIB, self.root / "scripts" / "lib")
+        shutil.copy2(REPO / ".gitignore", self.root / ".gitignore")
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -83,13 +85,26 @@ class _Sandbox:
             src = re.sub(rf'^{const} = "[^"]*"$', f'{const} = "{tmp}/{const.lower()}"',
                          src, flags=re.M)
         locks.write_text(src)
+        subprocess.run(
+            [*GIT, "-C", str(self.root), "add", "scripts/lib/bench-locks.py"],
+            check=True,
+        )
+        subprocess.run(
+            [*GIT, "-C", str(self.root), "commit", "-qm", "fixture lock paths"],
+            check=True,
+            env=env_git,
+        )
 
         bindir = Path(tmp) / "bin"
         bindir.mkdir()
         cargo = bindir / "cargo"
         cargo.write_text(STUB_CARGO)
         cargo.chmod(0o755)
-        self.env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+        self.env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+        }
         return self
 
     def __exit__(self, *exc):
@@ -253,6 +268,70 @@ class HeadModeReporting(unittest.TestCase):
             )
             self.assertNotIn("head arm: in-place", r.stdout)
 
+    def test_in_place_head_refuses_uncommitted_source(self):
+        with _Sandbox() as sb:
+            (sb.root / "f1.txt").write_text("dirty")
+            r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("not commit-clean", r.stderr)
+
+    def test_detached_head_ignores_dirty_invoking_worktree(self):
+        with _Sandbox() as sb:
+            (sb.root / "f1.txt").write_text("dirty")
+            r = sb.run(
+                [sb.entry],
+                base_ref="HEAD~1",
+                head_ref="HEAD~1",
+                BENCH_IDLE_FLOOR="0",
+            )
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("head arm: detached worktree", r.stdout)
+
+    def test_in_place_head_refuses_source_changed_during_measurement(self):
+        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
+            cargo = Path(shim) / "cargo"
+            cargo.write_text(
+                "#!/usr/bin/env bash\n"
+                f'if [ "$PWD" = "{sb.root}" ]; then\n'
+                "  printf '%s\\n' changed > f1.txt\n"
+                "fi\n"
+                "exit 0\n"
+            )
+            cargo.chmod(0o755)
+            r = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                PATH=f"{shim}:{sb.env['PATH']}",
+            )
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("not commit-clean", r.stderr)
+
+    def test_in_place_head_refuses_commit_changed_during_measurement(self):
+        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
+            cargo = Path(shim) / "cargo"
+            cargo.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f'if [ "$PWD" = "{sb.root}" ] '
+                '&& [ "${1:-}" != "--version" ] '
+                '&& [ "$(cat f1.txt)" != "committed-during-run" ]; then\n'
+                "  printf '%s\\n' committed-during-run > f1.txt\n"
+                "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
+                "add f1.txt\n"
+                "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
+                "commit -qm committed-during-run\n"
+                "fi\n"
+                "exit 0\n"
+            )
+            cargo.chmod(0o755)
+            r = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                PATH=f"{shim}:{sb.env['PATH']}",
+            )
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("HEAD commit changed during the run", r.stderr)
+
 
 class RunProvenanceHandoff(unittest.TestCase):
     def test_supervised_run_writes_complete_three_phase_handoff(self):
@@ -268,7 +347,7 @@ class RunProvenanceHandoff(unittest.TestCase):
                 "schema=lattice-bench-provenance-v1",
                 "started_utc=",
                 "finished_utc=",
-                "host_id=hostname-sha256:",
+                "host_id=local-random:",
                 "os=",
                 "base_ref=HEAD~1",
                 "base_sha=",
@@ -326,8 +405,45 @@ class RunProvenanceHandoff(unittest.TestCase):
             )
             self.assertNotIn(" at ", head_mode)
             self.assertIn("<summary>Run provenance</summary>", r.stdout)
-            self.assertIn("host_id=hostname-sha256:", r.stdout)
+            self.assertIn("host_id=local-random:", r.stdout)
             self.assertNotIn("unsuitable as benchmark evidence", r.stdout)
+
+
+class HostIdentifier(unittest.TestCase):
+    def test_random_identifier_is_stable_and_contains_no_hostname(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "host-id"
+            env = {**os.environ, "LATTICE_BENCH_HOST_ID_FILE": str(path)}
+            first = subprocess.run(
+                ["python3", str(HOST_ID)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            ).stdout.strip()
+            second = subprocess.run(
+                ["python3", str(HOST_ID)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            ).stdout.strip()
+            self.assertRegex(first, r"^local-random:[0-9a-f]{32}$")
+            self.assertEqual(first, second)
+            self.assertNotIn(os.uname().nodename, first)
+
+    def test_malformed_persisted_identifier_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "host-id"
+            path.write_text("not-a-valid-id\n")
+            result = subprocess.run(
+                ["python3", str(HOST_ID)],
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LATTICE_BENCH_HOST_ID_FILE": str(path)},
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("does not contain one 32-hex", result.stderr)
 
 
 class MachineStateParsers(unittest.TestCase):

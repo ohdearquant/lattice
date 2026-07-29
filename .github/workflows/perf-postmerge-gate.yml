@@ -58,6 +58,7 @@ on:
       # only takes the locks, so a change confined to the body would otherwise
       # not trigger this lane at all.
       - 'scripts/lib/bench-compare-impl.sh'
+      - 'scripts/lib/bench-host-id.py'
       - 'scripts/lib/bench-locks.py'
       - 'scripts/lib/quiet-probe.py'
       - 'scripts/lib/machine-state-probe.py'

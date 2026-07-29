@@ -135,6 +135,7 @@ def _run(
         shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, root / "scripts" / GATE.name)
         shutil.copytree(LIB, root / "scripts" / "lib")
+        shutil.copy2(REPO / ".gitignore", root / ".gitignore")
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -144,6 +145,10 @@ def _run(
             '[[package]]\n'
             'name = "criterion"\n'
             'version = "0.5.1"\n'
+        )
+        subprocess.run(
+            [*GIT, "-C", str(root), "add", "-f", "Cargo.lock"],
+            check=True,
         )
         for i in range(2):
             (root / f"f{i}.txt").write_text(str(i))
@@ -174,6 +179,15 @@ def _run(
             )
             assert src != before, f"{const} constant not found to redirect"
         locks.write_text(src)
+        subprocess.run(
+            [*GIT, "-C", str(root), "add", "scripts/lib/bench-locks.py"],
+            check=True,
+        )
+        subprocess.run(
+            [*GIT, "-C", str(root), "commit", "-qm", "fixture lock paths"],
+            check=True,
+            env=env_git,
+        )
 
         bindir = Path(tmp) / "bin"
         bindir.mkdir()
@@ -194,6 +208,7 @@ def _run(
             **os.environ,
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
+            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
             **(extra_env or {}),
         }
         return subprocess.run(
