@@ -758,7 +758,7 @@ class ValidateRunRecordRoundTripTest(unittest.TestCase):
 
     def setUp(self):
         self.policy = gate_math.load_policy()
-        self.policy_sha = "d" * 64  # arbitrary fixed sha for this test's provenance
+        self.policy_sha = gate_math.policy_sha()
 
     def _provenance(self) -> harness.ProvenanceRecord:
         return harness.parse_provenance(
@@ -845,8 +845,13 @@ class ValidateRunRecordRoundTripTest(unittest.TestCase):
         values = [200.0, 200.1, 199.9, 200.2, 199.8, 200.0, 200.1]
         session = _fake_session(values, values)
         record = self._record_from_session(session)
+        stale_policy_sha = f"{gate_math.POLICY_SHA_PREFIX}{'e' * 64}"
         with self.assertRaises(harness.RunRecordValidationError):
-            harness.validate_run_record(record, expected_repo_sha="a" * 40, current_policy_sha="stale" * 16)
+            harness.validate_run_record(
+                record,
+                expected_repo_sha="a" * 40,
+                current_policy_sha=stale_policy_sha,
+            )
 
 
 class HardwareFingerprintAndHashTest(unittest.TestCase):
