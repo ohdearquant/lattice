@@ -1,0 +1,144 @@
+schema = 1
+
+# This inventory covers local script and Make entry points. Raw Rust Metal
+# benches/examples are owned by #1115 / PR #1195, where the harness itself
+# takes the GPU lock; wrapping those a second time here would deadlock on flock.
+# Hosted workflow measurements are intentionally outside this local-machine
+# convention. In particular, issue #1121 explicitly excludes bench-update.yml.
+
+[[entry]]
+path = "scripts/adr064-gpu-decode-gate.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench-ci.sh"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench-command.sh"
+role = "supervisor"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/bench-compare.sh"
+role = "measurement"
+supervision = "both-locks+three-phase-quiet"
+
+[[entry]]
+path = "scripts/bench-gate.sh"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_context_scaling_chart.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_cpu_flagship_supervisor.py"
+role = "measurement"
+supervision = "both-locks+quiet-baseline"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_agentic.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_apples_precise.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_apples_to_apples.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_context_scaling.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_q4_apples.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_harness.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_slopefit.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_decode_slopefit.sh"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_disposition_check.sh"
+role = "policy-check"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_gate_math.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_linkedin_post.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_quality.sh"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_wasm_simd.mjs"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/compare_logits.py"
+role = "measurement"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/e2e-parity-local.sh"
+role = "measurement"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/e2e_parity_check.py"
+role = "measurement"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/fake_quant_pilot.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+# Only `--run` is a measurement entry point and self-supervises. `--checkpoint`
+# is a bench-compare-internal gate that inherits bench-compare's held locks.
+[[entry]]
+path = "scripts/perf_governor.py"
+role = "measurement"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/perf-bench-gate.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/ppl_gate_check.py"
+role = "consumer"
+supervision = "none"

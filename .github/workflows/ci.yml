@@ -733,6 +733,10 @@ jobs:
       # the lock the guard replaced.
       - name: python3 tests/test_bench_locks.py
         run: python3 tests/test_bench_locks.py -v
+      # Local measurement inventory + fail-closed lock/idle supervision.
+      # Uses disposable lock paths and stub commands; no benchmark runs.
+      - name: python3 tests/test_bench_measurement_supervision.py
+        run: python3 tests/test_bench_measurement_supervision.py -v
       - name: python3 tests/test_perf_governor.py
         run: python3 tests/test_perf_governor.py -v
 

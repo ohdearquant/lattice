@@ -12,6 +12,9 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO/scripts/lib/bench-supervision.sh"
+bench_supervise_entry "decode-slopefit" durable "$@"
+
 BIN="$REPO/target/release/bench_decode_slopefit"
 PY="$REPO/scripts/bench_decode_slopefit.py"
 

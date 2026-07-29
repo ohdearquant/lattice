@@ -33,14 +33,65 @@
 //   - Timing uses `process.hrtime.bigint()` (nanosecond resolution). A
 //     warmup phase runs before the timed reps to let V8 JIT the call site.
 
-import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { closeSync, existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import os from 'node:os';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
+const SUPERVISION = path.join(REPO, 'scripts', 'lib', 'bench_supervision.py');
+const LOCK_FDS = (process.env.LATTICE_BENCH_LOCK_FDS ?? '')
+  .split(',')
+  .filter(Boolean)
+  .map(Number);
+
+function supervisionStdio() {
+  const stdio = ['inherit', 'inherit', 'inherit'];
+  for (const fd of LOCK_FDS) {
+    if (!Number.isInteger(fd) || fd < 3) continue;
+    while (stdio.length <= fd) stdio.push('ignore');
+    stdio[fd] = fd;
+  }
+  return stdio;
+}
+
+if (!process.env.LATTICE_BENCH_LOCK_STATUS) {
+  const child = spawnSync(
+    'python3',
+    [
+      SUPERVISION,
+      'run',
+      '--label',
+      'wasm-simd',
+      '--quiet',
+      '--entrypoint',
+      '--',
+      process.execPath,
+      ...process.argv.slice(1),
+    ],
+    { stdio: 'inherit', env: process.env },
+  );
+  if (child.error) {
+    console.error(`bench_wasm_simd: supervisor failed: ${child.error.message}`);
+    process.exit(2);
+  }
+  process.exit(child.status ?? 2);
+}
+
+const receipt = spawnSync('python3', [SUPERVISION, 'verify', '--require-quiet'], {
+  // Node closes non-stdio descriptors by default. Preserve the two inherited
+  // lock capabilities for the verifier instead of degrading to an env claim.
+  stdio: supervisionStdio(),
+  env: process.env,
+});
+if (receipt.error || receipt.status !== 0) {
+  console.error('bench_wasm_simd: invalid machine-wide lock receipt');
+  process.exit(2);
+}
+for (const fd of LOCK_FDS) closeSync(fd);
+delete process.env.LATTICE_BENCH_LOCK_FDS;
 
 // ---------------------------------------------------------------------------
 // CLI args

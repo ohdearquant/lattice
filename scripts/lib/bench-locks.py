@@ -30,12 +30,17 @@ habit ships something that is silently absent on the machine that matters, and
 command-not-found inside a backgrounded leg is invisible. This uses fcntl.flock
 directly, which is what the fleet bench-window helper already does.
 
-THE LOCK FDS ARE NOT INHERITED by <cmd> or its descendants (subprocess's
-close_fds default). A leaked lock fd in a long-lived build daemon holds the
-window open machine-wide long after the run that took it, because a flock is
-released only when every descriptor referring to that open file description is
-closed. Children that must hold a lock get the descriptor passed on purpose;
-none do today.
+THE LOCK FDS ARE NOT INHERITED by default (subprocess's close_fds default). A
+leaked lock fd in a long-lived build daemon holds the window open machine-wide
+long after the run that took it, because a flock is released only when every
+descriptor referring to that open file description is closed.
+
+``--pass-lock-fds`` is the narrow exception for the local measurement
+entry-point convention. It passes both descriptors to the immediate command
+as an unforgeable-by-accident capability so that command can prove the locks
+are really held. ``scripts/lib/bench_supervision.py`` passes them only to a
+self-verifying measurement entry point, which closes its copies before doing
+work. Arbitrary commands and build descendants never receive them.
 
 WHY lsof IS ONLY A DIAGNOSTIC HERE. lsof lists processes that have the lock
 file OPEN, which is a superset of those holding a flock on it, and it does not
@@ -204,6 +209,11 @@ def main() -> int:
         required=True,
         help="where to record this supervisor's PID and lock dispositions",
     )
+    ap.add_argument(
+        "--pass-lock-fds",
+        action="store_true",
+        help="pass both acquired lock descriptors to the immediate command",
+    )
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args()
 
@@ -229,6 +239,15 @@ def main() -> int:
             fh.write(f"supervisor_pid={os.getpid()}\n")
             for line in dispositions:
                 fh.write(f"lock={line}\n")
+
+        if args.pass_lock_fds:
+            child_env = os.environ.copy()
+            child_env["LATTICE_BENCH_LOCK_FDS"] = ",".join(str(fd) for fd in fds)
+            return subprocess.call(
+                cmd,
+                env=child_env,
+                pass_fds=tuple(fds),
+            )
 
         # close_fds defaults True, so neither lock fd reaches cmd or anything
         # cmd spawns. Both stay held here for cmd's whole lifetime.

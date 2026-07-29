@@ -18,6 +18,9 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO/scripts/lib/bench-supervision.sh"
+bench_supervise_entry "quality-perplexity" durable "$@"
+
 EVAL_BIN="$REPO/target/release/eval_perplexity"
 Q4_DIR="${Q4_DIR:-$HOME/.lattice/models/qwen3.5-0.8b-q4}"
 QUAROT_DIR="${QUAROT_DIR:-$HOME/.lattice/models/qwen3.5-0.8b-q4-quarot}"
