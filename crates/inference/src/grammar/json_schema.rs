@@ -586,9 +586,10 @@ impl<'a> CompileCtx<'a> {
     /// Scope: `required`/`properties` siblings on a `$ref` to an object-typed
     /// target are merged — the common "extend a base object" pattern.
     /// Supported value/type assertions (`const`, `enum`, and `type`) are
-    /// rejected when their conjunction is not handled by the specialized
-    /// `anyOf` string fold: compiling the target alone would silently widen the
-    /// schema. Other deferred keywords retain the plain `$ref` fallback.
+    /// compiled away only when the resolved target's language is provably a
+    /// subset of each sibling assertion. Otherwise their conjunction is
+    /// rejected: compiling the target alone would silently widen the schema.
+    /// Other deferred keywords retain the plain `$ref` fallback.
     ///
     /// Kept deliberately tiny (only the sibling-key scan, no merge locals) and
     /// out of the merge body (`merge_ref_with_siblings`, `#[inline(never)]`):
@@ -608,13 +609,11 @@ impl<'a> CompileCtx<'a> {
         ref_str: &str,
         schema: &'a Value,
     ) -> Result<Vec<Alt>, SchemaError> {
-        if let Some(key) = schema.as_object().and_then(|m| {
+        if schema.as_object().is_some_and(|m| {
             m.keys()
-                .find(|key| REF_NARROWING_SIBLING_KEYS.contains(&key.as_str()))
+                .any(|key| REF_NARROWING_SIBLING_KEYS.contains(&key.as_str()))
         }) {
-            return Err(SchemaError(format!(
-                "unsupported schema: `{key}` sibling alongside `$ref` requires an intersection with the referenced schema that this grammar cannot represent safely"
-            )));
+            return self.compile_ref_with_redundant_narrowing(ref_str, schema);
         }
 
         let mergeable = schema.as_object().is_some_and(|m| {
@@ -640,6 +639,98 @@ impl<'a> CompileCtx<'a> {
             return self.compile_ref(ref_str);
         }
         self.merge_ref_with_siblings(ref_str, schema)
+    }
+
+    /// Prove every narrowing sibling redundant against the resolved target,
+    /// then compile that target alone.
+    ///
+    /// A target `const`/`enum` value set and its declared `type` names are
+    /// upper bounds on its language: every other assertion on the target can
+    /// only shrink that language. Proving one of those bounds is a subset of a
+    /// sibling therefore proves that compiling the target without the sibling
+    /// removes nothing. This check never reasons about the target's other
+    /// keywords.
+    ///
+    /// Kept out of [`Self::compile_ref_with_siblings`] because that function is
+    /// re-entered once per `$ref` chain link and must retain a small stack
+    /// frame.
+    #[inline(never)]
+    fn compile_ref_with_redundant_narrowing(
+        &mut self,
+        ref_str: &str,
+        schema: &'a Value,
+    ) -> Result<Vec<Alt>, SchemaError> {
+        let siblings = schema
+            .as_object()
+            .ok_or_else(|| SchemaError("schema containing `$ref` must be an object".to_string()))?;
+        let narrowing_key = siblings
+            .keys()
+            .find(|key| REF_NARROWING_SIBLING_KEYS.contains(&key.as_str()))
+            .map(String::as_str)
+            .ok_or_else(|| SchemaError("missing narrowing `$ref` sibling".to_string()))?;
+
+        // Compiling the target alone drops every sibling, not just the one
+        // proven redundant. Mixing this exemption with another assertion such
+        // as `required` would therefore silently widen through that assertion.
+        if siblings.keys().any(|key| {
+            !REF_IGNORED_SIBLING_KEYS.contains(&key.as_str())
+                && !REF_NARROWING_SIBLING_KEYS.contains(&key.as_str())
+        }) {
+            return Err(unrepresentable_ref_narrowing(narrowing_key));
+        }
+
+        let target = self.resolve_ref_chain_target(ref_str)?;
+        let target_values: Option<Vec<&Value>> = if let Some(value) = target.get("const") {
+            // `Value` equality distinguishes 1 from 1.0 more strictly than
+            // JSON Schema. That can refuse a proof, but cannot create one.
+            Some(vec![value])
+        } else {
+            target
+                .get("enum")
+                .and_then(Value::as_array)
+                .filter(|values| !values.is_empty())
+                .map(|values| values.iter().collect())
+        };
+
+        for key in REF_NARROWING_SIBLING_KEYS {
+            let Some(sibling) = siblings.get(*key) else {
+                continue;
+            };
+            let redundant = match *key {
+                "const" => target_values
+                    .as_ref()
+                    .is_some_and(|values| values.iter().all(|value| *value == sibling)),
+                "enum" => sibling.as_array().is_some_and(|allowed| {
+                    target_values
+                        .as_ref()
+                        .is_some_and(|values| values.iter().all(|value| allowed.contains(value)))
+                }),
+                "type" => {
+                    let sibling_types = schema_type_names(sibling)?;
+                    match target.get("type") {
+                        Some(Value::String(name)) => sibling_types.contains(&name.as_str()),
+                        // The normal compiler does not currently materialize
+                        // target-side type arrays, so compiling that target
+                        // alone would widen even without considering the
+                        // sibling. Do not use such an unrepresented bound.
+                        Some(_) => false,
+                        None => target_values.as_ref().is_some_and(|values| {
+                            values.iter().all(|value| {
+                                sibling_types
+                                    .iter()
+                                    .any(|name| value_matches_type(value, name))
+                            })
+                        }),
+                    }
+                }
+                _ => unreachable!("narrowing keys are a closed constant"),
+            };
+            if !redundant {
+                return Err(unrepresentable_ref_narrowing(key));
+            }
+        }
+
+        self.compile_ref(ref_str)
     }
 
     /// The actual `required`/`properties` conjunction merge for
@@ -2806,6 +2897,33 @@ fn value_matches_type(v: &Value, t: &str) -> bool {
     }
 }
 
+/// Parse a non-empty JSON Schema `type` assertion without applying a subtype
+/// lattice. Literal name membership is the only proof used for `$ref` sibling
+/// redundancy.
+fn schema_type_names(value: &Value) -> Result<Vec<&str>, SchemaError> {
+    match value {
+        Value::String(name) => Ok(vec![name]),
+        Value::Array(names) if !names.is_empty() => names
+            .iter()
+            .map(|name| {
+                name.as_str().ok_or_else(|| {
+                    SchemaError(
+                        "unsupported schema: `type` alongside `$ref` must contain only type names"
+                            .to_string(),
+                    )
+                })
+            })
+            .collect(),
+        _ => Err(unrepresentable_ref_narrowing("type")),
+    }
+}
+
+fn unrepresentable_ref_narrowing(key: &str) -> SchemaError {
+    SchemaError(format!(
+        "unsupported schema: `{key}` sibling alongside `$ref` requires an intersection with the referenced schema that this grammar cannot represent safely"
+    ))
+}
+
 /// Reject a `oneOf` whose branches provably overlap on a literal value (issue
 /// #1077). Only branches that reduce to a closed `const`/`enum` value set are
 /// decidable here. An open-ended branch (`closed_form_values` returns `None`)
@@ -4020,11 +4138,11 @@ mod tests {
         );
     }
 
-    /// A mixed `type` array cannot use the specialized string intersection:
-    /// the branch may accept a non-string value, so it reaches the generic
-    /// `$ref` path and fails closed rather than dropping the sibling.
+    /// A mixed sibling `type` array that covers the target's declared type is
+    /// redundant. The generic `$ref` path may therefore compile the integer
+    /// target alone, while the peer branch remains intact.
     #[test]
-    fn anyof_ref_type_array_with_nonstring_member_fails_closed() {
+    fn anyof_ref_type_array_covering_target_preserves_target() {
         let schema = serde_json::json!({
             "$defs": { "N": { "type": "integer" } },
             "anyOf": [
@@ -4032,8 +4150,31 @@ mod tests {
                 { "$ref": "#/$defs/N", "type": ["string", "integer"] }
             ]
         });
+        let g = compile(&schema).expect("the sibling type array covers the target type");
+        assert!(accepts(&g, b"7"), "the referenced integer must be accepted");
+        assert!(
+            accepts(&g, b"\"ok\""),
+            "the peer const branch must remain accepted"
+        );
+        assert!(
+            rejects(&g, b"\"other\""),
+            "dropping the redundant sibling must not drop the integer target"
+        );
+    }
+
+    /// A sibling type array that omits the target's declared type is not
+    /// redundant and must continue to fail closed.
+    #[test]
+    fn anyof_ref_type_array_not_covering_target_fails_closed() {
+        let schema = serde_json::json!({
+            "$defs": { "N": { "type": "integer" } },
+            "anyOf": [
+                { "const": "ok" },
+                { "$ref": "#/$defs/N", "type": ["string", "null"] }
+            ]
+        });
         let err = compile(&schema)
-            .expect_err("an unrepresentable type sibling inside anyOf must fail closed");
+            .expect_err("a sibling type array that omits the target type must fail closed");
         assert!(
             err.0.contains("`type` sibling"),
             "error should name the unrepresentable type sibling, got: {}",

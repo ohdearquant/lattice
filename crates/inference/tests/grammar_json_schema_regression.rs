@@ -137,48 +137,150 @@ fn user_defs_does_not_clobber_builtin_rule() {
 }
 
 #[test]
-fn ref_narrowing_siblings_never_widen_public_compiler() {
-    let cases: [(&str, serde_json::Value, &[u8]); 3] = [
+fn redundant_ref_narrowing_siblings_compile_target_language() {
+    let cases: [(&str, serde_json::Value, &[u8], &[u8]); 5] = [
         (
-            "const",
+            "identical const",
             serde_json::json!({
-                "$defs": { "S": { "type": "string" } },
+                "$defs": { "S": { "const": "a" } },
                 "$ref": "#/$defs/S",
                 "const": "a"
             }),
+            b"\"a\"",
             b"\"b\"",
         ),
         (
-            "enum",
+            "target enum subset of sibling enum",
+            serde_json::json!({
+                "$defs": { "S": { "enum": [1, 2] } },
+                "$ref": "#/$defs/S",
+                "enum": [0, 1, 2, 3]
+            }),
+            b"2",
+            b"3",
+        ),
+        (
+            "identical declared type",
+            serde_json::json!({
+                "$defs": { "S": { "type": "string" } },
+                "$ref": "#/$defs/S",
+                "type": "string"
+            }),
+            b"\"ok\"",
+            b"7",
+        ),
+        (
+            "pinned values imply sibling type",
+            serde_json::json!({
+                "$defs": { "V": { "enum": ["ok", "err"] } },
+                "$ref": "#/$defs/V",
+                "type": ["string", "null"]
+            }),
+            b"\"ok\"",
+            b"null",
+        ),
+        (
+            "all narrowing siblings independently redundant",
+            serde_json::json!({
+                "$defs": { "V": { "type": "string", "const": "ok" } },
+                "$ref": "#/$defs/V",
+                "const": "ok",
+                "enum": ["ok", "other"],
+                "type": ["string", "null"]
+            }),
+            b"\"ok\"",
+            b"\"other\"",
+        ),
+    ];
+
+    for (shape, schema, accepted, target_excludes) in cases {
+        let grammar = compile_json_schema(&schema)
+            .unwrap_or_else(|err| panic!("{shape} should be proven redundant: {err}"));
+        assert!(
+            full_accept(&grammar, accepted),
+            "{shape} must preserve a value accepted by the target"
+        );
+        assert!(
+            !full_accept(&grammar, target_excludes),
+            "{shape} must not drop the referenced target"
+        );
+    }
+}
+
+#[test]
+fn unproven_ref_narrowing_siblings_fail_closed() {
+    let cases = [
+        (
+            "value sibling without target value bound",
             serde_json::json!({
                 "$defs": { "S": { "type": "string" } },
                 "$ref": "#/$defs/S",
                 "enum": ["a"]
             }),
-            b"\"b\"",
         ),
         (
-            "type",
+            "type sibling without target bound",
             serde_json::json!({
-                "$defs": { "N": { "type": "number" } },
-                "$ref": "#/$defs/N",
-                "type": "integer"
+                "$defs": { "V": {} },
+                "$ref": "#/$defs/V",
+                "type": "string"
             }),
-            b"1.5",
+        ),
+        (
+            "cross-type integer subset number",
+            serde_json::json!({
+                "$defs": { "N": { "type": "integer" } },
+                "$ref": "#/$defs/N",
+                "type": "number"
+            }),
+        ),
+        (
+            "required mixed with redundant type",
+            serde_json::json!({
+                "$defs": {
+                    "O": {
+                        "type": "object",
+                        "properties": { "x": { "type": "integer" } }
+                    }
+                },
+                "$ref": "#/$defs/O",
+                "type": "object",
+                "required": ["x"]
+            }),
+        ),
+        (
+            "empty target type array",
+            serde_json::json!({
+                "$defs": { "V": { "type": [] } },
+                "$ref": "#/$defs/V",
+                "type": "string"
+            }),
+        ),
+        (
+            "non-empty target type array is not representable by this compiler",
+            serde_json::json!({
+                "$defs": { "V": { "type": ["string", "null"] } },
+                "$ref": "#/$defs/V",
+                "type": ["string", "null"]
+            }),
+        ),
+        (
+            "empty target enum",
+            serde_json::json!({
+                "$defs": { "V": { "enum": [] } },
+                "$ref": "#/$defs/V",
+                "enum": ["a"]
+            }),
         ),
     ];
 
-    for (keyword, schema, forbidden) in cases {
-        match compile_json_schema(&schema) {
-            Ok(grammar) => assert!(
-                !full_accept(&grammar, forbidden),
-                "`{keyword}` sibling must narrow the referenced schema"
-            ),
-            Err(err) => assert!(
-                err.0.contains(keyword) && err.0.contains("$ref"),
-                "fail-closed error should name `{keyword}` and `$ref`, got: {}",
-                err.0
-            ),
-        }
+    for (shape, schema) in cases {
+        let Err(err) = compile_json_schema(&schema) else {
+            panic!("{shape} must fail closed");
+        };
+        assert!(
+            err.0.contains("$ref"),
+            "{shape} error should identify the unsupported `$ref` intersection: {err}"
+        );
     }
 }
