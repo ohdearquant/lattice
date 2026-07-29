@@ -16,6 +16,11 @@ use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
 
+#[cfg(test)]
+std::thread_local! {
+    static VALIDATE_TEXTS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // Re-exports
 #[cfg(feature = "native")]
 pub use cached::CachedEmbeddingService;
@@ -88,7 +93,19 @@ impl EmbeddingRole {
 /// preparation are memory backstops and size themselves with
 /// [`EmbeddingModel::max_instruction_bytes`]; they are not this check.
 pub(crate) fn validate_texts(texts: &[String]) -> Result<()> {
+    #[cfg(test)]
+    VALIDATE_TEXTS_CALLS.set(VALIDATE_TEXTS_CALLS.get() + 1);
     validate_texts_bounded(texts, MAX_TEXT_BYTES)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_validate_texts_calls() {
+    VALIDATE_TEXTS_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn validate_texts_calls() -> usize {
+    VALIDATE_TEXTS_CALLS.get()
 }
 
 /// Shared body of the caller-text contract check and the prepared-text backstop.
@@ -97,7 +114,7 @@ pub(crate) fn validate_texts(texts: &[String]) -> Result<()> {
 /// model's longest instruction on text that has already been prepared. The
 /// reported `max` is `max_bytes` so an error names the bound that actually
 /// rejected the input rather than a constant the caller cannot relate to.
-pub(crate) fn validate_texts_bounded(texts: &[String], max_bytes: usize) -> Result<()> {
+pub(crate) fn validate_texts_bounded<T: AsRef<str>>(texts: &[T], max_bytes: usize) -> Result<()> {
     if texts.is_empty() {
         return Err(EmbedError::InvalidInput("no texts provided".into()));
     }
@@ -109,6 +126,7 @@ pub(crate) fn validate_texts_bounded(texts: &[String], max_bytes: usize) -> Resu
         )));
     }
     for text in texts {
+        let text = text.as_ref();
         if text.len() > max_bytes {
             return Err(EmbedError::TextTooLong {
                 length: text.len(),
@@ -117,6 +135,83 @@ pub(crate) fn validate_texts_bounded(texts: &[String], max_bytes: usize) -> Resu
         }
     }
     Ok(())
+}
+
+enum ValidatedTextBatchInner<'a> {
+    Contiguous(&'a [String]),
+    Borrowed(&'a [&'a str]),
+}
+
+/// Internal capability proving the caller-text request bounds were checked.
+///
+/// The constructors are crate-private, so external callers cannot manufacture
+/// this capability to bypass [`EmbeddingService`] input validation.
+#[doc(hidden)]
+pub struct ValidatedTextBatch<'a> {
+    inner: ValidatedTextBatchInner<'a>,
+}
+
+impl<'a> ValidatedTextBatch<'a> {
+    pub(in crate::service) fn new(texts: &'a [String]) -> Result<Self> {
+        validate_texts(texts)?;
+        Ok(Self {
+            inner: ValidatedTextBatchInner::Contiguous(texts),
+        })
+    }
+
+    pub(in crate::service) fn borrowed_subset<'b>(
+        &'b self,
+        texts: &'b [&'b str],
+    ) -> ValidatedTextBatch<'b> {
+        ValidatedTextBatch {
+            inner: ValidatedTextBatchInner::Borrowed(texts),
+        }
+    }
+
+    pub(in crate::service) fn len(&self) -> usize {
+        match self.inner {
+            ValidatedTextBatchInner::Contiguous(texts) => texts.len(),
+            ValidatedTextBatchInner::Borrowed(texts) => texts.len(),
+        }
+    }
+
+    pub(in crate::service) fn get(&self, index: usize) -> &str {
+        match self.inner {
+            ValidatedTextBatchInner::Contiguous(texts) => texts[index].as_str(),
+            ValidatedTextBatchInner::Borrowed(texts) => texts[index],
+        }
+    }
+
+    fn contiguous(&self) -> Option<&'a [String]> {
+        match self.inner {
+            ValidatedTextBatchInner::Contiguous(texts) => Some(texts),
+            ValidatedTextBatchInner::Borrowed(_) => None,
+        }
+    }
+
+    pub(in crate::service) fn borrowed(&self) -> Option<&'a [&'a str]> {
+        match self.inner {
+            ValidatedTextBatchInner::Contiguous(_) => None,
+            ValidatedTextBatchInner::Borrowed(texts) => Some(texts),
+        }
+    }
+
+    pub(in crate::service) fn to_owned_with_prefix(&self, prefix: Option<&str>) -> Vec<String> {
+        (0..self.len())
+            .map(|index| {
+                let text = self.get(index);
+                match prefix {
+                    None => text.to_owned(),
+                    Some(prefix) => {
+                        let mut prepared = String::with_capacity(prefix.len() + text.len());
+                        prepared.push_str(prefix);
+                        prepared.push_str(text);
+                        prepared
+                    }
+                }
+            })
+            .collect()
+    }
 }
 
 /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
@@ -167,6 +262,25 @@ pub trait EmbeddingService: Send + Sync {
         validate_texts(texts)?;
         let prepared = apply_prefix(texts, role.instruction(model));
         self.embed(&prepared, model).await
+    }
+
+    /// Internal delegation hook for caller text already checked against the public bounds.
+    ///
+    /// External callers cannot construct [`ValidatedTextBatch`]. The default
+    /// preserves external implementors' role overrides by delegating through
+    /// [`EmbeddingService::embed_with_role`].
+    #[doc(hidden)]
+    async fn embed_with_role_prevalidated(
+        &self,
+        texts: ValidatedTextBatch<'_>,
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<Vec<f32>>> {
+        if let Some(contiguous) = texts.contiguous() {
+            return self.embed_with_role(contiguous, model, role).await;
+        }
+        let owned = texts.to_owned_with_prefix(None);
+        self.embed_with_role(&owned, model, role).await
     }
 
     /// **Stable**: embed query texts after applying the model's query instruction.

@@ -145,7 +145,7 @@ fn main() {
     );
 
     // ── Hidden-readback overhead measurement ─────────────────────────────────
-    // TODO(i2): When MetalQwen35State::forward_step_with_hidden and
+    // TODO(#1186): When MetalQwen35State::forward_step_with_hidden and
     //   forward_prefill_with_hidden are implemented, replace this section with:
     //
     //   let n_measure = 5;

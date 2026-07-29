@@ -87,6 +87,13 @@
 # is what makes a confirmed regression stop something.
 set -euo pipefail
 
+# A caller may hand us an inherited git environment (git exports GIT_INDEX_FILE to
+# hooks as a RELATIVE path, and GIT_DIR/GIT_WORK_TREE arrive empty). The worktree
+# add/remove calls below write a git index, so an inherited relative GIT_INDEX_FILE
+# would resolve against our cwd and hit the caller's real index instead. Nothing in
+# this script needs the caller's index state.
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
+
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 QUICK_FLAGS="--quick"  # ~10 samples, ~2 min total
 
@@ -261,18 +268,34 @@ fi
 BASE_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$BASE_REF" 2>/dev/null || echo "$BASE_REF")
 HEAD_SHA=$(git -C "$REPO" rev-parse --short --end-of-options "$HEAD_REF" 2>/dev/null || echo "$HEAD_REF")
 
+HEAD_WT="$REPO/.cache/bench-compare-head"
+if [ "$HEAD_REF" = "HEAD" ]; then
+  HEAD_MODE="in-place"
+  HEAD_DIR="$REPO"
+else
+  HEAD_MODE="detached worktree"
+  HEAD_DIR="$HEAD_WT"
+fi
+GATE_SCRIPT="$REPO/scripts/perf-bench-gate.py"
+
+print_execution_provenance() {
+  echo "  head arm: $HEAD_MODE at $HEAD_DIR"
+  echo "  gate: $GATE_SCRIPT"
+}
+
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
+print_execution_provenance
 quiet_gate "before base"
 
-# --- Keep Spotlight out of the bench worktrees ---
-# The worktrees created below are full repository checkouts. Indexing them
-# produces filesystem churn that lands asymmetrically in whichever measurement
-# phase it overlaps, and a base-then-head run turns that asymmetry into an
-# apparent code delta. The marker suppresses indexing for the whole directory.
-# Recreated every run so a wiped .cache does not silently lose the protection.
+# --- Keep Spotlight out of the benchmark build trees ---
+# .cache protects the detached base/head worktrees. The separate target marker
+# protects the default in-place HEAD arm: without it the base is excluded while
+# the head build dirties thousands of indexed files immediately before timing.
+# Recreate both every run because deleting either tree deletes its own marker.
 # Inert on non-macOS. Fail-closed: refuse to measure without the protection
 # rather than emit numbers that look trustworthy and are not.
 "$REPO/scripts/lib/ensure-noindex-marker.sh" "$REPO/.cache"
+"$REPO/scripts/lib/ensure-noindex-marker.sh" "$REPO/target"
 
 # --- Worktree for base ref ---
 WT="$REPO/.cache/bench-compare-base"
@@ -380,16 +403,11 @@ quiet_gate "between phases"
 echo ""
 echo "--- Building + benching HEAD ($HEAD_SHA) ---"
 
-# Determine head working dir — if HEAD_REF is HEAD, use $REPO directly
-if [ "$HEAD_REF" = "HEAD" ]; then
-  HEAD_DIR="$REPO"
-else
-  HEAD_WT="$REPO/.cache/bench-compare-head"
+if [ "$HEAD_MODE" = "detached worktree" ]; then
   if [ -d "$HEAD_WT" ]; then
     git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || rm -rf "$HEAD_WT"
   fi
   git -C "$REPO" worktree add --detach --end-of-options "$HEAD_WT" "$HEAD_REF" 2>&1 | tail -1
-  HEAD_DIR="$HEAD_WT"
   # Update cleanup to also remove head worktree
   trap 'git -C "$REPO" worktree remove --force "$HEAD_WT" 2>/dev/null || true; cleanup' EXIT
 fi
@@ -497,6 +515,7 @@ fi
 echo ""
 echo "=== Run conditions ==="
 echo "  base: $BASE_REF ($BASE_SHA)   head: $HEAD_REF ($HEAD_SHA)"
+print_execution_provenance
 echo "  resolution: ${QUICK_FLAGS:---full}"
 echo "  targets: lattice-inference:$BENCHES_INFERENCE, lattice-embed:$BENCHES_EMBED"
 echo "  inference features: ${CARGO_FEATURES_INFERENCE:-<none>}"
@@ -523,7 +542,7 @@ fi
 
 GATE_RC=0
 if [ -d "$HEAD_DIR/target/criterion" ]; then
-  python3 "$REPO/scripts/perf-bench-gate.py" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || GATE_RC=$?
+  python3 "$GATE_SCRIPT" "$HEAD_DIR/target/criterion" "local-compare" "${GATE_ARGS[@]}" 2>&1 || GATE_RC=$?
 else
   # Cannot happen via the normal path (the directory is created above), but a
   # missing root must not read as a pass under --fail-on-regression.

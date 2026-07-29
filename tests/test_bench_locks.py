@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Regression tests for the bench-compare locking and ambient-load gates.
+"""Regression tests for bench-compare isolation and execution provenance.
 
-Two properties are pinned here, and both are about refusing rather than about
+The locking and ambient-load properties are about refusing rather than about
 measuring.
 
 The body refuses to measure unless the PID recorded in the lock status is one of
@@ -23,6 +23,11 @@ The ambient-load gate REFUSES. A lock excludes peers on this machine; it says
 nothing about how busy the machine is. A warning printed on a bench report is
 read by nobody at the moment it matters, which is weeks later when someone
 quotes the number.
+
+The execution-provenance checks pin which source tree supplies the head arm and
+which invoking-checkout gate grades it. Those facts differ when the positional
+head ref changes, so both the early log and the pasted run-conditions block must
+carry them.
 """
 import importlib.util
 import os
@@ -42,6 +47,9 @@ STUB_CARGO = """#!/usr/bin/env bash
 exit 0
 """
 
+# Test helpers invoking real Git must disable repository hooks.
+GIT = ("git", "-c", "core.hooksPath=/dev/null")
+
 
 class _Sandbox:
     """A throwaway repo holding the shipping scripts, with locks redirected."""
@@ -58,11 +66,11 @@ class _Sandbox:
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.root)], check=True)
+        subprocess.run([*GIT, "init", "-q", "-b", "main", str(self.root)], check=True)
         for i in range(2):
             (self.root / f"f{i}.txt").write_text(str(i))
-            subprocess.run(["git", "-C", str(self.root), "add", "-A"], check=True)
-            subprocess.run(["git", "-C", str(self.root), "commit", "-qm", f"c{i}"],
+            subprocess.run([*GIT, "-C", str(self.root), "add", "-A"], check=True)
+            subprocess.run([*GIT, "-C", str(self.root), "commit", "-qm", f"c{i}"],
                            check=True, env=env_git)
 
         locks = self.root / "scripts" / "lib" / "bench-locks.py"
@@ -84,9 +92,9 @@ class _Sandbox:
         self._tmp.cleanup()
         return False
 
-    def run(self, argv, **env):
+    def run(self, argv, *, base_ref="HEAD~1", head_ref="HEAD", **env):
         return subprocess.run(
-            ["bash", *argv, "HEAD~1", "HEAD"],
+            ["bash", *argv, base_ref, head_ref],
             capture_output=True, text=True, env={**self.env, **env}, timeout=300)
 
     @property
@@ -198,6 +206,48 @@ class LockPrecondition(unittest.TestCase):
             r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
             self.assertIn("Run conditions", r.stdout, f"stdout:\n{r.stdout}")
             self.assertIn("bench-window", r.stdout)
+
+
+class HeadModeReporting(unittest.TestCase):
+    """The log and pasted run-conditions block identify the resolved head arm."""
+
+    def assert_provenance_in_header_and_report(self, stdout, head_line, gate_line):
+        header, separator, report = stdout.partition("=== Run conditions ===")
+        self.assertTrue(separator, stdout)
+        for section in (header, report):
+            self.assertIn(head_line, section)
+            self.assertIn(gate_line, section)
+
+    def test_head_ref_uses_and_reports_the_invoking_checkout(self):
+        """Mutation-sensitive: removing either provenance emission leaves one
+        half of this header/report assertion without the in-place mode."""
+        with _Sandbox() as sb:
+            r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
+            self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
+            self.assert_provenance_in_header_and_report(
+                r.stdout,
+                f"  head arm: in-place at {sb.root}",
+                f"  gate: {sb.root}/scripts/perf-bench-gate.py",
+            )
+            self.assertNotIn("head arm: detached worktree", r.stdout)
+
+    def test_explicit_head_ref_uses_and_reports_a_detached_worktree(self):
+        """Mutation-sensitive: collapsing the mode selection to in-place makes
+        the expected worktree provenance disappear from both report locations."""
+        with _Sandbox() as sb:
+            r = sb.run(
+                [sb.entry],
+                base_ref="HEAD~1",
+                head_ref="HEAD~1",
+                BENCH_IDLE_FLOOR="0",
+            )
+            self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
+            self.assert_provenance_in_header_and_report(
+                r.stdout,
+                f"  head arm: detached worktree at {sb.root}/.cache/bench-compare-head",
+                f"  gate: {sb.root}/scripts/perf-bench-gate.py",
+            )
+            self.assertNotIn("head arm: in-place", r.stdout)
 
 
 class ContentionDiagnostics(unittest.TestCase):
