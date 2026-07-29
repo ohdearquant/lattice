@@ -19,10 +19,10 @@ use std::path::Path;
 use crate::error::InferenceError;
 use crate::model::qwen35_config::VisionModelConfig;
 use crate::quant::q4_manifest;
-use crate::weights::f32_weights::{ShardedSafetensors, TensorSource};
+use crate::weights::f32_weights::{ShardedSafetensors, TensorSource, open_manifest_entry_once};
 use crate::weights::q4_weights::{
-    F16LoadError, dequantize_q4_to_f32, load_f16_tensor_file, load_f16_tensor_file_expecting,
-    load_q4_file,
+    F16LoadError, dequantize_q4_to_f32, load_f16_tensor_from_open_file,
+    load_f16_tensor_from_open_file_expecting, load_q4_from_open_file,
 };
 
 /// Tensor name to its dequantized data paired with the shape it was declared with.
@@ -279,6 +279,24 @@ fn fetch_expected_tensors<T: TensorSource + ?Sized>(
                 actual: declared,
             });
         }
+        // `get_f32_tensor` (reached via `get_f32_tensor_owned`) fully decodes and copies
+        // the tensor -- including FP16->F32 expansion -- before `assemble`'s `take` ever
+        // sees it. Not every expected name has a config-derived shape to compare above,
+        // so budget the *declared* header shape (a cheap lookup, no decode) against
+        // `MAX_VISION_TENSOR_BYTES` as well, mirroring the budget-before-materialize
+        // pattern used on the q4 side, so an oversized declared tensor is rejected before
+        // its expansion rather than after.
+        if let Some(declared_shape) = source.tensor_shape(&name)? {
+            let declared_elems: u128 = declared_shape.iter().map(|&d| d as u128).product();
+            let declared_bytes = declared_elems * 4;
+            if declared_bytes > crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES {
+                return Err(InferenceError::Inference(format!(
+                    "vision checkpoint tensor {name}: declared size ({declared_bytes} bytes) \
+                     exceeds MAX_VISION_TENSOR_BYTES ({}) -- rejected before decoding",
+                    crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES
+                )));
+            }
+        }
         let (data, shape) = source.get_f32_tensor_owned(&name)?;
         tensors.insert(name, (data, shape));
     }
@@ -303,12 +321,35 @@ fn load_from_q4_dir(
             ))
         })?;
 
+    // FIX 4: `expected_names` is the exact, bounded (<= 12 * MAX_VISION_DEPTH + 9) set of
+    // `model.visual.*` tensors `vision_cfg` implies. Previously every visual-prefixed
+    // manifest entry was dequantized/decoded up front, and only *afterward* did
+    // `assemble`'s leftover check reject names it didn't expect -- so a manifest with
+    // many extra `model.visual.*` entries drove unbounded aggregate dequant memory
+    // despite each individual tensor's own `MAX_VISION_TENSOR_BYTES` cap. Reject an
+    // unexpected name before touching its file at all, and track a running aggregate
+    // budget across the (now-bounded) set of tensors this loop can ever process.
+    let expected_names: std::collections::HashSet<String> =
+        tensor_names(vision_cfg).into_iter().collect();
+    let aggregate_budget_bytes: u128 =
+        expected_names.len() as u128 * crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES;
+    let mut aggregate_bytes: u128 = 0;
+
     let mut tensors = HashMap::new();
     for entry in manifest
         .tensors
         .iter()
         .filter(|e| e.name.starts_with("model.visual."))
     {
+        if !expected_names.contains(&entry.name) {
+            return Err(InferenceError::Inference(format!(
+                "vision checkpoint manifest in {}: unexpected tensor {} not accounted for \
+                 by vision_config (depth={}) -- rejected before dequantizing/decoding",
+                model_dir.display(),
+                entry.name,
+                vision_cfg.depth,
+            )));
+        }
         // `HashMap::insert` below would silently let a later duplicate-named entry
         // overwrite an earlier one, making `tensors.is_empty()` (the inventory-exactness
         // check in `assemble`) blind to a manifest that names the same tensor twice.
@@ -327,7 +368,7 @@ fn load_from_q4_dir(
         // implies BEFORE the tensor's file is opened, so a checkpoint that disagrees with
         // the config is rejected without reading or allocating it. This sits ahead of the
         // branch below because BOTH arms materialize: the q4 arm through
-        // `dequantize_q4_to_f32` and the f16 arm inside `load_f16_tensor_file`.
+        // `dequantize_q4_to_f32` and the f16 arm inside the `.f16` loader.
         if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg)
             && let Some(declared) = &entry.shape
             && declared != &expected
@@ -338,15 +379,16 @@ fn load_from_q4_dir(
                 actual: declared.clone(),
             });
         }
-        // Manifest-declared file names are untrusted checkpoint content;
-        // containment-check before reading (#1069).
-        let file_path = crate::weights::contained_shard_path(model_dir, &entry.file)?;
+        // PATH CONTAINMENT -- `entry.file` comes from `quantize_index.json`, part of the
+        // untrusted checkpoint directory, so it is validated before the join. The file is
+        // opened exactly once and read from that fd rather than reopened by path.
+        let (file, real_path) = open_manifest_entry_once(model_dir, &entry.file)?;
         let (data, shape) = if entry.quantized.unwrap_or(false) {
-            let q4 = load_q4_file(&file_path).map_err(|e| {
+            let q4 = load_q4_from_open_file(file, &real_path, None).map_err(|e| {
                 InferenceError::InvalidSafetensors(format!(
                     "failed to load q4 tensor {} from {}: {e}",
                     entry.name,
-                    file_path.display()
+                    real_path.display()
                 ))
             })?;
             // The manifest's own recorded shape (when present) must agree with the
@@ -375,40 +417,71 @@ fn load_from_q4_dir(
                     actual: q4.shape.clone(),
                 });
             }
+            // ORDERING: `dequantize_q4_to_f32` expands the packed q4
+            // buffer into a full f32 `Vec` sized by `q4.shape`'s product -- a value read
+            // from the on-disk tensor header, independent of `vision_cfg` and not yet
+            // checked against any expected shape at this point. Budget that product
+            // BEFORE dequantizing (materializing) rather than after, so a hostile
+            // declared shape is rejected before the allocation, not once `assemble`'s
+            // per-tensor shape check runs on the already-materialized buffer.
+            let q4_elems: u128 = q4.shape.iter().map(|&d| d as u128).product();
+            let q4_bytes = q4_elems * 4;
+            if q4_bytes > crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES {
+                return Err(InferenceError::Inference(format!(
+                    "vision checkpoint tensor {} in {}: dequantized size ({q4_bytes} bytes) \
+                     exceeds MAX_VISION_TENSOR_BYTES ({}) -- rejected before dequantizing",
+                    entry.name,
+                    real_path.display(),
+                    crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES
+                )));
+            }
+            aggregate_bytes += q4_bytes;
+            if aggregate_bytes > aggregate_budget_bytes {
+                return Err(InferenceError::Inference(format!(
+                    "vision checkpoint manifest in {}: aggregate dequantized size \
+                     ({aggregate_bytes} bytes) exceeds the aggregate budget \
+                     ({aggregate_budget_bytes} bytes) for {} expected tensor(s)",
+                    model_dir.display(),
+                    expected_names.len(),
+                )));
+            }
             let shape = q4.shape.clone();
             (dequantize_q4_to_f32(&q4), shape)
         } else if let Some(expected) = expected_visual_tensor_shape(&entry.name, vision_cfg) {
             // Same reasoning as the `.q4` header check above, for the arm that reads an
-            // `.f16` companion: when the manifest omits `shape`, the preflight before
-            // `contained_shard_path` had nothing to compare, and this arm would otherwise
-            // materialize the whole tensor before `assemble` noticed the disagreement.
+            // `.f16` companion: when the manifest omits `shape`, the preflight before the
+            // open had nothing to compare, and this arm would otherwise materialize the
+            // whole tensor before `assemble` noticed the disagreement.
             //
-            // The check and the payload read happen inside ONE open handle rather than
-            // here around two calls. Checking a shape through one open and materializing
-            // through a second leaves nothing binding the validated header to the bytes
-            // actually read, since the pathname can be replaced in between, and the
-            // checkpoint directory is untrusted input (see the containment check above).
-            let loaded = load_f16_tensor_file_expecting(&file_path, &expected);
-            loaded.map_err(|e| match e {
-                F16LoadError::ShapeMismatch { declared } => InferenceError::ShapeMismatch {
-                    name: entry.name.clone(),
-                    expected,
-                    actual: declared,
+            // The check and the payload read happen inside the ONE handle opened and
+            // identity-verified above. Checking a shape through one open and
+            // materializing through a second leaves nothing binding the validated header
+            // to the bytes actually read, since the pathname can be replaced in between,
+            // and the checkpoint directory is untrusted input.
+            let display_path = real_path.display().to_string();
+            load_f16_tensor_from_open_file_expecting(file, &display_path, &expected).map_err(
+                |e| match e {
+                    F16LoadError::ShapeMismatch { declared } => InferenceError::ShapeMismatch {
+                        name: entry.name.clone(),
+                        expected,
+                        actual: declared,
+                    },
+                    F16LoadError::Other(e) => InferenceError::InvalidSafetensors(format!(
+                        "failed to load f16 tensor {} from {display_path}: {e}",
+                        entry.name,
+                    )),
                 },
-                F16LoadError::Other(e) => InferenceError::InvalidSafetensors(format!(
-                    "failed to load f16 tensor {} from {}: {e}",
-                    entry.name,
-                    file_path.display()
-                )),
-            })?
+            )?
         } else {
-            load_f16_tensor_file(&file_path).map_err(|e| {
-                InferenceError::InvalidSafetensors(format!(
-                    "failed to load f16 tensor {} from {}: {e}",
-                    entry.name,
-                    file_path.display()
-                ))
-            })?
+            load_f16_tensor_from_open_file(file, &real_path.display().to_string(), None).map_err(
+                |e| {
+                    InferenceError::InvalidSafetensors(format!(
+                        "failed to load f16 tensor {} from {}: {e}",
+                        entry.name,
+                        real_path.display()
+                    ))
+                },
+            )?
         };
         tensors.insert(entry.name.clone(), (data, shape));
     }
@@ -425,11 +498,11 @@ fn assemble(
 ) -> Result<Qwen35VisionWeights, InferenceError> {
     let hidden = vision_cfg.hidden_size;
     let qkv_out = 3 * hidden;
-    // The real checkpoint's MLP intermediate size is 4 * hidden_size (3072 == 4 * 768
-    // for the 0.8B ViT) — vision_config.json also carries an explicit
-    // `intermediate_size` field, but ADR-069 S1 intentionally does not parse it, so it
-    // is derived here instead.
-    let mlp_intermediate = 4 * hidden;
+    // FIX 16: use the checkpoint's own `intermediate_size` when `config.json` carries one
+    // (official Qwen3.5-VL: hidden_size=1152, intermediate_size=4304, NOT 4*1152=4608);
+    // fall back to `4 * hidden_size` only when the field is absent, matching HF default
+    // semantics for architectures that omit an explicit vision MLP width.
+    let mlp_intermediate = vision_cfg.intermediate_size.unwrap_or(4 * hidden);
     let merge_in = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size * hidden;
     let out_hidden = vision_cfg.out_hidden_size;
 
@@ -561,6 +634,7 @@ mod tests {
             num_position_embeddings: 2304,
             in_channels: 3,
             deepstack_visual_indexes: vec![],
+            intermediate_size: None,
         }
     }
 
@@ -650,9 +724,10 @@ mod tests {
             spatial_merge_size: 1,
             out_hidden_size: 4,
             temporal_patch_size: 1,
-            num_position_embeddings: 2,
-            in_channels: 1,
+            num_position_embeddings: 4,
+            in_channels: 3,
             deepstack_visual_indexes: vec![],
+            intermediate_size: None,
         }
     }
 
@@ -667,14 +742,15 @@ mod tests {
         let out_hidden = 4;
         let mut v = vec![
             (
+                // [hidden, in_channels, temporal_patch_size, patch_size, patch_size]
                 "model.visual.patch_embed.proj.weight".to_string(),
-                vec![hidden, 1, 1, 2, 2],
+                vec![hidden, 3, 1, 2, 2],
             ),
             (
                 "model.visual.patch_embed.proj.bias".to_string(),
                 vec![hidden],
             ),
-            ("model.visual.pos_embed.weight".to_string(), vec![2, hidden]),
+            ("model.visual.pos_embed.weight".to_string(), vec![4, hidden]),
             (
                 "model.visual.merger.linear_fc1.weight".to_string(),
                 vec![merge_in, merge_in],
@@ -924,15 +1000,16 @@ mod tests {
             .expect("test setup: write q4 file");
         std::fs::write(
             model_dir.join("quantize_index.json"),
-            r#"[{"name":"model.visual.evil","file":"../evil.q4","quantized":true}]"#,
+            r#"[{"name":"model.visual.patch_embed.proj.weight","file":"../evil.q4","quantized":true}]"#,
         )
         .expect("test setup: write manifest");
 
         let err = load_qwen35_vision_weights(&model_dir, &tiny_vision_cfg())
             .expect_err("escaping manifest entry must be rejected");
+        let msg = err.to_string();
         assert!(
-            err.to_string()
-                .contains("must stay within the model directory"),
+            msg.contains("must stay within the model directory")
+                || msg.contains("escapes model root"),
             "unexpected error: {err}"
         );
     }
@@ -1194,6 +1271,68 @@ mod tests {
     }
 
     #[test]
+    fn q4_manifest_unexpected_visual_tensor_rejected_before_dequantizing() {
+        // FIX 4 regression: a manifest entry whose name is NOT in the set
+        // `vision_cfg` expects must be rejected before its file is even opened -- not
+        // decoded and only caught afterward by `assemble`'s "unconsumed leftover" check.
+        // A valid tiny inventory plus one hostile extra entry proves the new pre-decode
+        // name check fires; the assertion on the error text ("unexpected" + naming the
+        // rejected tensor, not "unconsumed") distinguishes this from the old ordering.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tiny_vision_cfg();
+        let shapes = tiny_expected_shapes();
+
+        let mut manifest_entries = Vec::new();
+        for (i, (name, shape)) in shapes.iter().enumerate() {
+            let numel: usize = shape.iter().product();
+            let data: Vec<f64> = vec![0.25_f64; numel];
+            let q4 = crate::weights::q4_weights::quantize_f64_to_q4(&data, shape)
+                .expect("quantize succeeds");
+            let file_name = format!("t{i}.q4");
+            crate::weights::q4_weights::save_q4_file(&tmp.path().join(&file_name), &q4)
+                .expect("test setup: write q4 file");
+            manifest_entries.push(format!(
+                r#"{{"name":"{name}","file":"{file_name}","quantized":true}}"#
+            ));
+        }
+        // An extra, valid, individually in-budget q4 tensor whose name `vision_cfg`
+        // (depth=1) never asks for. Deliberately does NOT contain the substring
+        // "unexpected" -- the post-decode "unconsumed leftover" fallback check (see
+        // `assemble`) also names the rejected tensor in its error text, so asserting on
+        // "unexpected" + the raw name alone would pass via either code path and fail to
+        // discriminate a pre-decode rejection from a post-decode one.
+        let hostile_name = "model.visual.blocks.0.rogue_injected_tensor";
+        let hostile_q4 = crate::weights::q4_weights::quantize_f64_to_q4(&[0.5_f64; 4], &[4])
+            .expect("quantize succeeds");
+        let hostile_file_name = "hostile.q4";
+        crate::weights::q4_weights::save_q4_file(&tmp.path().join(hostile_file_name), &hostile_q4)
+            .expect("test setup: write hostile q4 file");
+        manifest_entries.push(format!(
+            r#"{{"name":"{hostile_name}","file":"{hostile_file_name}","quantized":true}}"#
+        ));
+
+        std::fs::write(
+            tmp.path().join("quantize_index.json"),
+            format!("[{}]", manifest_entries.join(",")),
+        )
+        .expect("test setup: write manifest");
+
+        let err = load_qwen35_vision_weights(tmp.path(), &cfg)
+            .expect_err("an unexpected model.visual.* manifest entry must be rejected");
+        match err {
+            InferenceError::Inference(msg) => {
+                assert!(
+                    msg.contains("rejected before dequantizing/decoding")
+                        && msg.contains(hostile_name),
+                    "expected a pre-decode unexpected-tensor error naming {hostile_name}, \
+                     got: {msg}"
+                );
+            }
+            other => panic!("expected InferenceError::Inference, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn fp16_sharded_index_duplicate_raw_weight_map_key_is_rejected() {
         // A raw `weight_map` JSON object can name the same tensor twice, mapped to two
         // different shards. Ordinary map deserialization collapses that to one
@@ -1318,6 +1457,57 @@ mod tests {
             }
             other => panic!("expected InferenceError::Inference, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn assemble_accepts_official_qwen35_vl_vision_mlp_dims() {
+        // FIX 16 regression: official Qwen3.5-VL vision tower dims are hidden_size=1152,
+        // intermediate_size=4304 (NOT 4*1152=4608). Before this fix, `assemble` hardcoded
+        // `mlp_intermediate = 4 * hidden_size`, so a real checkpoint carrying a
+        // [4304, 1152] `mlp.linear_fc1.weight` would be rejected as a shape mismatch
+        // against the loader's wrongly-derived [4608, 1152] expectation.
+        let mut cfg = tiny_vision_cfg();
+        cfg.hidden_size = 1152;
+        cfg.num_heads = 1; // must divide hidden_size; head geometry is irrelevant here
+        cfg.intermediate_size = Some(4304);
+
+        let hidden = cfg.hidden_size;
+        let mlp_intermediate = cfg.intermediate_size.unwrap();
+        let qkv_out = 3 * hidden;
+        let merge_in = cfg.spatial_merge_size * cfg.spatial_merge_size * hidden;
+        let out_hidden = cfg.out_hidden_size;
+        let shape_for = |name: &str| -> Vec<usize> {
+            match name {
+                "model.visual.patch_embed.proj.weight" => vec![
+                    hidden,
+                    cfg.in_channels,
+                    cfg.temporal_patch_size,
+                    cfg.patch_size,
+                    cfg.patch_size,
+                ],
+                "model.visual.pos_embed.weight" => vec![cfg.num_position_embeddings, hidden],
+                "model.visual.merger.linear_fc1.weight" => vec![merge_in, merge_in],
+                "model.visual.merger.linear_fc1.bias" => vec![merge_in],
+                "model.visual.merger.linear_fc2.weight" => vec![out_hidden, merge_in],
+                "model.visual.merger.linear_fc2.bias" => vec![out_hidden],
+                n if n.ends_with("attn.qkv.weight") => vec![qkv_out, hidden],
+                n if n.ends_with("attn.qkv.bias") => vec![qkv_out],
+                n if n.ends_with("attn.proj.weight") => vec![hidden, hidden],
+                n if n.ends_with("mlp.linear_fc1.weight") => vec![mlp_intermediate, hidden],
+                n if n.ends_with("mlp.linear_fc1.bias") => vec![mlp_intermediate],
+                n if n.ends_with("mlp.linear_fc2.weight") => vec![hidden, mlp_intermediate],
+                _ => vec![hidden], // *.bias, norm1/2.*, merger.norm.*
+            }
+        };
+        let mut tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = HashMap::new();
+        for name in tensor_names(&cfg) {
+            let shape = shape_for(&name);
+            let numel: usize = shape.iter().product();
+            tensors.insert(name, (vec![0.0_f32; numel], shape));
+        }
+
+        assemble(tensors, &cfg)
+            .expect("official Qwen3.5-VL vision dims (1152/4304) must be accepted");
     }
 
     // Reading BF16/F16 safetensors tensors requires the `f16` feature (not default);

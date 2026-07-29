@@ -5,7 +5,7 @@ name: CI
 # workflow never even runs leaves a PR or queue entry stuck on "Expected,
 # waiting for status to be reported" forever. So this workflow always
 # triggers on both. Docs-only changes are instead handled by gating `ci`,
-# `feature-matrix`, `bench-compile`, and `msrv` on the `changes` job below.
+# `feature-matrix`, and `msrv` on the `changes` job below.
 #
 # `ci` and `feature-matrix` are matrix jobs, so their required-check contexts
 # come from matrix expansion ("CI (macos-latest)", "feature-matrix
@@ -30,13 +30,26 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # `ready_for_review` is load-bearing, not decorative. The macOS legs of
+    # `ci` and `feature-matrix` are dropped from the matrix while a PR is a
+    # draft (see the `oslist` step in `changes`), and the DEFAULT type set is
+    # [opened, synchronize, reopened] — it contains no event for the
+    # draft-to-ready transition. Without this line, a PR marked ready that
+    # never pushes again would keep its draft-shaped run forever and could
+    # never report macOS coverage, wedging the PR.
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     branches: [main]
     types: [checks_requested]
 
 # Cancel a PR's own superseded runs so they stop occupying the shared
-# macOS runner pool (~5 concurrent, account-wide) while a newer push on the
-# same PR waits behind them. Never cancel a push to main: main has no "next
+# macOS runner pool while a newer push on the same PR waits behind them.
+# An earlier revision of this comment put the pool at "~5 concurrent,
+# account-wide". That figure was inherited and never measured. Measured
+# instead over a 39.6 h window on this repo: median macOS queue 0.0 min,
+# p90 32.5 min, max 87.8 min, against an ubuntu control at p90 5.7 min.
+# Contention is bursty rather than a fixed slot cap, so the reason to cancel
+# superseded runs is the tail, not a slot count. Never cancel a push to main: main has no "next
 # push" to fall back on if a run is killed mid-flight. The event_name segment
 # keeps a push run and a workflow_dispatch run on the same ref out of each
 # other's queue: GitHub cancels a PENDING run whenever another run enters its
@@ -60,6 +73,8 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      oslist: ${{ steps.oslist.outputs.oslist }}
+      featureoslist: ${{ steps.oslist.outputs.featureoslist }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -100,6 +115,42 @@ jobs:
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "→ docs-only change: full matrix skipped"
           fi
+      # Measured on a real run: `CI (macos-latest)` takes 9.5 min and
+      # `feature-matrix (macos-latest)` 6.6 min, so each run of this workflow
+      # spends 16.1 minutes on the macOS pool. Every other leg is Linux and
+      # finishes in a fraction of that. A draft PR cannot merge, so paying
+      # those 16.1 minutes on every draft push buys nothing the ready-flip does
+      # not buy again, while the runs that CAN merge queue behind them.
+      #
+      # The matrix is computed here rather than guarded with a job-level `if`
+      # because `jobs.<id>.if` is evaluated BEFORE matrix expansion and cannot
+      # see `matrix.os`. A job-level condition would therefore skip the whole
+      # matrix, taking the Linux legs with it — and those must keep running on
+      # drafts, since they are what catches ordinary compile breakage early.
+      #
+      # Dropping a combination is safe for branch protection because the
+      # required context is `ci-gate`, not the matrix-expanded names; see the
+      # rollout note at the top of this file. `ci-gate` fails closed on drafts
+      # so a draft is never reported as fully verified.
+      #
+      # `= "true"` against an empty default rather than a `== false`
+      # comparison: on push, merge_group and workflow_dispatch there is no
+      # pull_request object at all, so the value arrives empty and the full
+      # matrix must run. Empty is the arm that must not be skipped.
+      - id: oslist
+        env:
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo 'oslist=["ubuntu-latest","ubuntu-24.04-arm"]' >> "$GITHUB_OUTPUT"
+            echo 'featureoslist=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+            echo "→ draft PR: macOS legs deferred until ready for review"
+          else
+            echo 'oslist=["ubuntu-latest","macos-latest","ubuntu-24.04-arm"]' >> "$GITHUB_OUTPUT"
+            echo 'featureoslist=["ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
+            echo "→ full matrix including macOS"
+          fi
 
   ci:
     name: CI
@@ -109,7 +160,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
+        os: ${{ fromJSON(needs.changes.outputs.oslist) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
@@ -134,6 +185,18 @@ jobs:
           cargo clean -p lattice-tune 2>/dev/null || true
           cargo clean -p lattice-transport 2>/dev/null || true
       - run: ./scripts/ci.sh
+      # Bench compilation, folded in from the former standalone `bench-compile`
+      # job. It only ever ran on macOS (metal-gpu), so it maps onto this matrix
+      # leg exactly. Folding it here costs one fewer macOS runner slot per PR
+      # and reuses this job's already-warm dependency build instead of paying
+      # for a second cold one under its own cache key. The commands are
+      # unchanged, and a failure still propagates to `ci-gate` through this job.
+      - name: inference benches (bench-internals) — macOS only
+        if: matrix.os == 'macos-latest'
+        run: cargo bench -p lattice-inference --features bench-internals,metal-gpu,f16 --no-run
+      - name: embed benches — macOS only
+        if: matrix.os == 'macos-latest'
+        run: cargo bench -p lattice-embed --no-run
 
   # The default `cargo test/clippy --workspace` only ever compiles DEFAULT
   # features. Feature-gated code (safetensors serialization, the inference-hook
@@ -150,7 +213,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.changes.outputs.featureoslist) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
@@ -439,24 +502,6 @@ jobs:
   # with `quarot_rotation_seed`) only surfaces when the benches are compiled.
   # Runs on Apple Silicon because the inference benches are NEON (aarch64) code;
   # on x86 they are cfg'd out and the gate would be vacuous.
-  bench-compile:
-    name: bench-compile
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          shared-key: bench-compile
-          cache-on-failure: true
-      - name: inference benches (bench-internals)
-        run: cargo bench -p lattice-inference --features bench-internals,metal-gpu,f16 --no-run
-      - name: embed benches
-        run: cargo bench -p lattice-embed --no-run
 
   # MSRV gate (#568). Every other job pins 1.94.1, so an API that stabilized in
   # 1.94 compiles green across all of CI while breaking every user on an older
@@ -470,7 +515,12 @@ jobs:
   msrv:
     name: msrv (1.93, f16+metal-gpu)
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # This job is macOS and is NOT matrix-driven, so the oslist selector that
+    # defers `ci` and `feature-matrix` on drafts does not reach it. It carries
+    # the draft condition directly, matching the form the parity workflow uses
+    # on its own single-runner macOS jobs. ci-gate's draft branch exits before
+    # it reads this job's result, so skipping here cannot produce a false green.
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     # RUSTUP_TOOLCHAIN pins every rustup-mediated invocation in this job to 1.93.1.
     # Without it, rustup's checked-in rust-toolchain.toml (1.94.1, repo dev/CI pin)
@@ -638,9 +688,17 @@ jobs:
         run: python3 tests/test_bench_decode_adapters_agentic.py -v
       # bench-compare's Spotlight-exclusion guard. Same "harness plumbing only"
       # scope as the steps above: it asserts the guard's exit codes and the
-      # bench-compare.sh call site, and runs no benchmark.
+      # benchmark measurement call sites, and runs no benchmark.
       - name: bash scripts/ensure-noindex-marker-selftest.sh
         run: bash scripts/ensure-noindex-marker-selftest.sh
+      # e2e-parity's engine/tune change classifier. Same "harness plumbing only"
+      # scope: it extracts the live regexes out of e2e-parity.yml and asserts
+      # their verdicts on fixture path lists, running no parity job. It belongs
+      # in THIS workflow rather than e2e-parity's own, because the classification
+      # it grades is what decides whether e2e-parity's jobs run at all — a test
+      # gated on the decision it is testing cannot observe the false-negative.
+      - name: bash scripts/ci-engine-filter-selftest.sh
+        run: bash scripts/ci-engine-filter-selftest.sh
       - name: python3 tests/test_bench_disposition.py
         run: python3 tests/test_bench_disposition.py -v
       # perf-bench-gate's own fixture self-test. Same "harness plumbing only"
@@ -693,8 +751,8 @@ jobs:
           feature-group: default-features
 
   # REQUIRED status check (see the rollout note at the top of this file).
-  # Always runs, always reports. `ci`, `feature-matrix`, `bench-compile`, and
-  # `msrv` are matrix and/or docs-gated, so none of them is individually a
+  # Always runs, always reports. `ci`, `feature-matrix`, and `msrv` are matrix
+  # and/or docs-gated, so none of them is individually a
   # safe required context: a matrix job skipped at job level never creates
   # its per-combination check runs at all, and a plain gated job that skips
   # reports success even if `changes` itself blew up. This job passes when
@@ -703,7 +761,7 @@ jobs:
   # `app-binaries-gate` in app-binaries.yml.
   ci-gate:
     name: ci-gate
-    needs: [changes, ci, feature-matrix, bench-compile, msrv, semver-checks]
+    needs: [changes, ci, feature-matrix, msrv, semver-checks]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -713,10 +771,9 @@ jobs:
           CODE="${{ needs.changes.outputs.code }}"
           CI_RESULT="${{ needs.ci.result }}"
           FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
-          BENCH_COMPILE_RESULT="${{ needs.bench-compile.result }}"
           MSRV_RESULT="${{ needs.msrv.result }}"
           SEMVER_RESULT="${{ needs.semver-checks.result }}"
-          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT bench-compile=$BENCH_COMPILE_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed, failing closed."
             exit 1
@@ -725,16 +782,22 @@ jobs:
             echo "Docs-only change, heavy compile jobs not required. PASS."
             exit 0
           fi
+          # Fail closed on drafts. The macOS legs are dropped from the matrix
+          # while a PR is a draft, so `ci` and `feature-matrix` report success
+          # off their Linux legs alone. Without this branch the gate would read
+          # green while macOS was never compiled — a pass in the shape of a
+          # verdict, which is the failure mode this gate exists to prevent.
+          DRAFT="${{ github.event.pull_request.draft }}"
+          if [ "$DRAFT" = "true" ]; then
+            echo "::error::Draft PR: the macOS legs of ci and feature-matrix, and the macOS msrv job, are deferred while this PR is a draft, so macOS coverage is UNVERIFIED and this gate fails by design. Mark the PR ready for review and they run automatically on the ready_for_review event."
+            exit 1
+          fi
           if [ "$CI_RESULT" != "success" ]; then
             echo "::error::ci did not succeed (result=$CI_RESULT)."
             exit 1
           fi
           if [ "$FEATURE_MATRIX_RESULT" != "success" ]; then
             echo "::error::feature-matrix did not succeed (result=$FEATURE_MATRIX_RESULT)."
-            exit 1
-          fi
-          if [ "$BENCH_COMPILE_RESULT" != "success" ]; then
-            echo "::error::bench-compile did not succeed (result=$BENCH_COMPILE_RESULT)."
             exit 1
           fi
           if [ "$MSRV_RESULT" != "success" ]; then
@@ -745,5 +808,5 @@ jobs:
             echo "::error::semver-checks did not succeed (result=$SEMVER_RESULT)."
             exit 1
           fi
-          echo "Code changed; ci, feature-matrix, bench-compile, msrv, and semver-checks all PASSED."
+          echo "Code changed; ci, feature-matrix, msrv, and semver-checks all PASSED."
           exit 0

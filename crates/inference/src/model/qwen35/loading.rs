@@ -1,4 +1,4 @@
-//! Qwen3.5 tensor-name requirements, validation, owned tensor loaders, layer-specific weight loaders, and `load_weights`.
+//! Qwen3.5 tensor-name requirements, shape-checked owned tensor loading, layer-specific weight loaders, and `load_weights`.
 use super::weights::{
     AttentionWeights, CommonLayerWeights, DenseFfnWeights, FeedForwardWeights,
     FullAttentionLayerWeights, ModelWeights, MoeLayerWeights, MoeRouter, RoutedExperts,
@@ -6,7 +6,7 @@ use super::weights::{
 };
 use crate::attention::gdn::GatedDeltaNetWeights;
 use crate::error::InferenceError;
-use crate::model::qwen35_config::Qwen35Config;
+use crate::model::qwen35_config::{Qwen35Config, ValidatedQwen35Config};
 use crate::weights::TensorSource;
 
 /// Canonical per-layer tensor-name prefix for a Qwen3.5 checkpoint
@@ -71,10 +71,14 @@ pub fn qwen_required_tensor_names(cfg: &Qwen35Config) -> Vec<String> {
     names
 }
 
+/// CLASS C ingress: takes `&ValidatedQwen35Config` rather than a raw `&Qwen35Config`, so an
+/// unvalidated config cannot reach the required-tensor-name derivation for a checkpoint on
+/// this (non-Metal) load path. See the CLASS C ingress table in the PR body.
 pub(super) fn validate_required_tensor_names<T: TensorSource + ?Sized>(
     source: &mut T,
-    cfg: &Qwen35Config,
+    validated_cfg: &ValidatedQwen35Config,
 ) -> Result<(), InferenceError> {
+    let cfg: &Qwen35Config = validated_cfg;
     for name in qwen_required_tensor_names(cfg) {
         if !source.has_tensor(&name)? {
             return Err(InferenceError::MissingTensor(name));
@@ -83,6 +87,13 @@ pub(super) fn validate_required_tensor_names<T: TensorSource + ?Sized>(
     Ok(())
 }
 
+/// Loads and shape-checks a tensor, validating the declared shape against
+/// `expected` *before* materializing the owned buffer. Rejecting a mismatch
+/// at the metadata stage (via [`TensorSource::tensor_shape`]) avoids decoding
+/// and copying a tensor the caller is about to discard, which matters for a
+/// checkpoint carrying an oversized mismatched tensor. A tensor absent from
+/// the source (`tensor_shape` returns `Ok(None)`) falls through to
+/// `get_f32_tensor_owned`, which reports the missing-tensor error.
 fn load_owned_tensor_checked<T: TensorSource + ?Sized>(
     source: &mut T,
     name: &str,
@@ -112,6 +123,79 @@ fn load_owned_tensor_checked<T: TensorSource + ?Sized>(
     Ok(data)
 }
 
+/// Doubles `value`, returning a typed error instead of panicking (debug) or wrapping
+/// (release) when the config-derived dimension is too large for `usize`.
+fn checked_double(value: usize, what: &str) -> Result<usize, InferenceError> {
+    value
+        .checked_mul(2)
+        .ok_or_else(|| InferenceError::InvalidInput(format!("{what} overflows usize: 2 * {value}")))
+}
+
+/// Full-attention Q projection row count (`num_attention_heads * head_dim`), computed
+/// with checked arithmetic so an attacker-controlled config.json cannot overflow it.
+fn checked_full_q_dim(cfg: &Qwen35Config) -> Result<usize, InferenceError> {
+    cfg.num_attention_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "full attention q_dim overflows usize: num_attention_heads({}) * head_dim({})",
+                cfg.num_attention_heads, cfg.head_dim
+            ))
+        })
+}
+
+/// Full-attention KV projection row count (`num_key_value_heads * head_dim`), checked.
+fn checked_full_kv_dim(cfg: &Qwen35Config) -> Result<usize, InferenceError> {
+    cfg.num_key_value_heads
+        .checked_mul(cfg.head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "full attention kv_dim overflows usize: num_key_value_heads({}) * head_dim({})",
+                cfg.num_key_value_heads, cfg.head_dim
+            ))
+        })
+}
+
+/// GatedDeltaNet combined QKV projection row count (`Q + K + V`), checked. Mirrors
+/// `Qwen35Config::linear_qkv_dim`'s formula but rejects overflow with a typed error
+/// instead of panicking (debug) or wrapping (release).
+fn checked_linear_qkv_dim(cfg: &Qwen35Config) -> Result<usize, InferenceError> {
+    let k = cfg
+        .linear_num_key_heads
+        .checked_mul(cfg.linear_key_head_dim)
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "linear attention k dim overflows usize: linear_num_key_heads({}) * linear_key_head_dim({})",
+                cfg.linear_num_key_heads, cfg.linear_key_head_dim
+            ))
+        })?;
+    let value_heads = cfg.linear_num_value_heads();
+    let v = value_heads.checked_mul(cfg.linear_value_head_dim).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "linear attention v dim overflows usize: linear_num_value_heads({}) * linear_value_head_dim({})",
+            value_heads, cfg.linear_value_head_dim
+        ))
+    })?;
+    k.checked_add(k)
+        .and_then(|qk| qk.checked_add(v))
+        .ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "linear attention qkv_dim overflows usize: q({k}) + k({k}) + v({v})"
+            ))
+        })
+}
+
+/// GatedDeltaNet output projection row count (`linear_num_value_heads * linear_value_head_dim`), checked.
+fn checked_linear_output_dim(cfg: &Qwen35Config) -> Result<usize, InferenceError> {
+    let value_heads = cfg.linear_num_value_heads();
+    value_heads.checked_mul(cfg.linear_value_head_dim).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "linear attention output_dim overflows usize: linear_num_value_heads({}) * linear_value_head_dim({})",
+            value_heads, cfg.linear_value_head_dim
+        ))
+    })
+}
+
 fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
     source: &mut T,
     cfg: &Qwen35Config,
@@ -126,11 +210,10 @@ fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
     })?;
     let moe_inter = cfg.moe_intermediate_size();
     let shared_inter = cfg.shared_expert_intermediate_size();
-    let gate_up_rows = moe_inter.checked_mul(2).ok_or_else(|| {
-        InferenceError::InvalidInput(format!(
-            "moe_intermediate_size {moe_inter} overflows usize when doubled for gate_up_proj shape"
-        ))
-    })?;
+    let doubled_moe_inter = checked_double(
+        moe_inter,
+        "MoE gate_up_proj row count (2 * moe_intermediate_size)",
+    )?;
 
     let router = MoeRouter::new(
         load_owned_tensor_checked(
@@ -147,7 +230,7 @@ fn load_moe_ffn_weights<T: TensorSource + ?Sized>(
         load_owned_tensor_checked(
             source,
             &format!("{prefix}.mlp.experts.gate_up_proj"),
-            &[num_experts, gate_up_rows, hidden],
+            &[num_experts, doubled_moe_inter, hidden],
         )?,
         load_owned_tensor_checked(
             source,
@@ -230,21 +313,16 @@ fn load_full_attention_weights<T: TensorSource + ?Sized>(
 ) -> Result<AttentionWeights, InferenceError> {
     let hidden = cfg.hidden_size;
     let head_dim = cfg.head_dim;
-    // `config.json` is untrusted input: use the checked accessors so a pathological
-    // `num_attention_heads` / `num_key_value_heads` overflows into a typed error here
-    // instead of wrapping to an undersized `q_dim`/`kv_dim` that later passes a
-    // small-tensor shape check and panics or corrupts state once the forward pass
-    // indexes by the original, unwrapped head count.
-    let q_dim = cfg.checked_full_q_dim()?;
-    let kv_dim = cfg.checked_full_kv_dim()?;
-    let q_rows = crate::model::qwen35_config::checked_double(q_dim, "full_q_dim")?;
-    // Checked against the declared safetensors axis shape (not just the flattened
-    // element count) so a transposed tensor with the same element count — which would
-    // otherwise be silently reinterpreted as row-major — is rejected here.
+    let q_dim = checked_full_q_dim(cfg)?;
+    let kv_dim = checked_full_kv_dim(cfg)?;
+    let doubled_q_dim = checked_double(
+        q_dim,
+        "full attention q_proj row count (2 * q_dim, fused sigmoid gate)",
+    )?;
     let qw = load_owned_tensor_checked(
         source,
         &format!("{prefix}.self_attn.q_proj.weight"),
-        &[q_rows, hidden],
+        &[doubled_q_dim, hidden],
     )?;
     let kw = load_owned_tensor_checked(
         source,
@@ -285,13 +363,13 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
     source: &mut T,
     cfg: &Qwen35Config,
     prefix: &str,
-    hidden: usize,
-    _num_heads: usize,
-    qkv_dim: usize,
-    output_dim: usize,
-    kernel_size: usize,
 ) -> Result<AttentionWeights, InferenceError> {
+    let hidden = cfg.hidden_size;
+    let qkv_dim = checked_linear_qkv_dim(cfg)?;
+    let output_dim = checked_linear_output_dim(cfg)?;
+    let kernel_size = cfg.linear_conv_kernel_dim;
     let value_heads = cfg.linear_num_value_heads();
+    let value_dim = cfg.linear_value_head_dim;
     // Checked against the declared safetensors axis shape (not just the flattened
     // element count) so a transposed tensor with the same element count — which would
     // otherwise be silently reinterpreted as row-major — is rejected here.
@@ -335,7 +413,7 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
     let nw = load_owned_tensor_checked(
         source,
         &format!("{prefix}.linear_attn.norm.weight"),
-        &[cfg.linear_value_head_dim],
+        &[value_dim],
     )?;
     let op = load_owned_tensor_checked(
         source,
@@ -369,19 +447,20 @@ fn load_linear_attention_weights<T: TensorSource + ?Sized>(
     }))
 }
 
+/// Load all per-model and per-layer tensors, shape-validating each one against a
+/// config-derived expected shape via [`load_owned_tensor_checked`]. A checkpoint
+/// tensor whose shape does not match returns `Err(InferenceError::ShapeMismatch)`
+/// rather than being accepted and later panicking downstream (e.g. in a GEMM
+/// bounds assertion during the forward pass).
+/// CLASS C ingress: takes `&ValidatedQwen35Config` rather than a raw `&Qwen35Config`, so an
+/// unvalidated config cannot reach tensor materialization on this (non-Metal) load path.
+/// See the CLASS C ingress table in the PR body.
 pub(super) fn load_weights<T: TensorSource + ?Sized>(
     source: &mut T,
-    cfg: &Qwen35Config,
+    validated_cfg: &ValidatedQwen35Config,
 ) -> Result<ModelWeights, InferenceError> {
+    let cfg: &Qwen35Config = validated_cfg;
     let hidden = cfg.hidden_size;
-    let num_heads = cfg.linear_num_key_heads;
-    // `config.json` is untrusted input: use the checked accessors so a pathological
-    // linear-attention head/dim combination overflows into a typed error here instead
-    // of wrapping into an undersized `qkv_dim`/`output_dim` that later reaches the
-    // forward pass under the original, unwrapped config.
-    let qkv_dim = cfg.checked_linear_qkv_dim()?;
-    let output_dim = cfg.checked_linear_output_dim()?;
-    let kernel_size = cfg.linear_conv_kernel_dim;
 
     let embed_tokens = load_owned_tensor_checked(
         source,
@@ -433,16 +512,7 @@ pub(super) fn load_weights<T: TensorSource + ?Sized>(
         let attn = if cfg.is_full_attention(i) {
             load_full_attention_weights(source, cfg, &prefix)?
         } else {
-            load_linear_attention_weights(
-                source,
-                cfg,
-                &prefix,
-                hidden,
-                num_heads,
-                qkv_dim,
-                output_dim,
-                kernel_size,
-            )?
+            load_linear_attention_weights(source, cfg, &prefix)?
         };
 
         layers.push((attn, common));
@@ -479,6 +549,36 @@ mod tests {
             &mut self,
             name: &str,
         ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.tensors
+                .get(name)
+                .map(|(d, s)| (d.clone(), s.clone()))
+                .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
+    /// A mock tensor source whose declared metadata shape (`tensor_shape`) can differ
+    /// from the actual stored tensor shape, and which counts calls to
+    /// `get_f32_tensor_owned`. Used to prove the shape preflight in
+    /// `load_owned_tensor_checked` rejects a mismatch from metadata alone, without
+    /// ever materializing the owned buffer.
+    struct CallCountingMockTensorSource {
+        /// name -> (data, declared shape returned by `tensor_shape`)
+        tensors: std::collections::HashMap<String, (Vec<f32>, Vec<usize>)>,
+        owned_get_calls: std::cell::Cell<usize>,
+    }
+
+    impl TensorSource for CallCountingMockTensorSource {
+        fn has_tensor(&mut self, name: &str) -> Result<bool, InferenceError> {
+            Ok(self.tensors.contains_key(name))
+        }
+        fn tensor_shape(&mut self, name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(self.tensors.get(name).map(|(_, s)| s.clone()))
+        }
+        fn get_f32_tensor_owned(
+            &mut self,
+            name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.owned_get_calls.set(self.owned_get_calls.get() + 1);
             self.tensors
                 .get(name)
                 .map(|(d, s)| (d.clone(), s.clone()))
@@ -540,7 +640,6 @@ mod tests {
         let value_heads = cfg.linear_num_value_heads(); // 32
         let qkv_dim = cfg.linear_qkv_dim();
         let output_dim = cfg.linear_output_dim();
-        let kernel_size = cfg.linear_conv_kernel_dim;
 
         assert_ne!(
             key_heads, value_heads,
@@ -550,8 +649,8 @@ mod tests {
         let prefix = "layers.0";
         let mut src = MockTensorSource {
             tensors: [
-                // qkv and z are correctly cfg-shaped; the point of this test is the
-                // in_proj_b mismatch below, not these tensors.
+                // qkv and z are correctly-shaped so the in_proj_b mismatch below is the
+                // first (and only) error load_linear_attention_weights should surface.
                 (
                     format!("{prefix}.linear_attn.in_proj_qkv.weight"),
                     (vec![0.0f32; qkv_dim * hidden], vec![qkv_dim, hidden]),
@@ -571,16 +670,7 @@ mod tests {
             .collect(),
         };
 
-        let result = load_linear_attention_weights(
-            &mut src,
-            &cfg,
-            prefix,
-            hidden,
-            key_heads,
-            qkv_dim,
-            output_dim,
-            kernel_size,
-        );
+        let result = load_linear_attention_weights(&mut src, &cfg, prefix);
 
         match result {
             Err(InferenceError::ShapeMismatch {
@@ -605,6 +695,47 @@ mod tests {
             }
             Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
             Ok(_) => panic!("expected Err for key-head-shaped decay tensor, got Ok"),
+        }
+    }
+
+    /// A finite but undersized dense-FFN `gate_proj` tensor must be rejected during
+    /// loading (`Err(ShapeMismatch)`), not accepted and left to panic downstream in
+    /// the GEMM bounds assertion during the forward pass.
+    #[test]
+    fn dense_ffn_undersized_gate_proj_shape_rejected() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let hidden = cfg.hidden_size;
+        let intermediate = cfg.intermediate_size;
+        let prefix = "layers.0";
+        let undersized_rows = intermediate / 2;
+
+        let mut src = MockTensorSource {
+            tensors: [(
+                format!("{prefix}.mlp.gate_proj.weight"),
+                (
+                    vec![0.0f32; undersized_rows * hidden],
+                    vec![undersized_rows, hidden],
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        match load_dense_ffn_weights(&mut src, &cfg, prefix) {
+            Err(InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            }) => {
+                assert!(
+                    name.contains("gate_proj"),
+                    "mismatch should name the gate_proj tensor, got: {name}"
+                );
+                assert_eq!(expected, vec![intermediate, hidden]);
+                assert_eq!(actual, vec![undersized_rows, hidden]);
+            }
+            Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
+            Ok(_) => panic!("expected Err for undersized gate_proj, got Ok"),
         }
     }
 
@@ -661,6 +792,91 @@ mod tests {
             }
             Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
             Ok(_) => panic!("expected Err for transposed gate_proj, got Ok"),
+        }
+    }
+
+    /// A finite but undersized full-attention `q_proj` tensor (half the required
+    /// `2*q_dim` rows for the attn_output_gate=true fused Q+gate projection) must be
+    /// rejected during loading, not accepted and left to panic downstream.
+    #[test]
+    fn full_attention_undersized_q_proj_shape_rejected() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let hidden = cfg.hidden_size;
+        let q_dim = cfg.full_q_dim();
+        let prefix = "layers.0";
+        let undersized_rows = q_dim; // expected 2*q_dim; supply only q_dim rows
+
+        let mut src = MockTensorSource {
+            tensors: [(
+                format!("{prefix}.self_attn.q_proj.weight"),
+                (
+                    vec![0.0f32; undersized_rows * hidden],
+                    vec![undersized_rows, hidden],
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let result = load_full_attention_weights(&mut src, &cfg, prefix);
+
+        match result {
+            Err(InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            }) => {
+                assert!(
+                    name.contains("q_proj"),
+                    "mismatch should name the q_proj tensor, got: {name}"
+                );
+                assert_eq!(expected, vec![2 * q_dim, hidden]);
+                assert_eq!(actual, vec![undersized_rows, hidden]);
+            }
+            Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
+            Ok(_) => panic!("expected Err for undersized q_proj, got Ok"),
+        }
+    }
+
+    /// A finite but undersized GDN `in_proj_qkv` tensor must be rejected during
+    /// loading, not accepted and left to panic downstream.
+    #[test]
+    fn gdn_undersized_in_proj_qkv_shape_rejected() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let hidden = cfg.hidden_size;
+        let qkv_dim = cfg.linear_qkv_dim();
+        let prefix = "layers.0";
+        let undersized_rows = qkv_dim / 2;
+
+        let mut src = MockTensorSource {
+            tensors: [(
+                format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+                (
+                    vec![0.0f32; undersized_rows * hidden],
+                    vec![undersized_rows, hidden],
+                ),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let result = load_linear_attention_weights(&mut src, &cfg, prefix);
+
+        match result {
+            Err(InferenceError::ShapeMismatch {
+                name,
+                expected,
+                actual,
+            }) => {
+                assert!(
+                    name.contains("in_proj_qkv"),
+                    "mismatch should name the in_proj_qkv tensor, got: {name}"
+                );
+                assert_eq!(expected, vec![qkv_dim, hidden]);
+                assert_eq!(actual, vec![undersized_rows, hidden]);
+            }
+            Err(e) => panic!("expected ShapeMismatch, got a different error: {e}"),
+            Ok(_) => panic!("expected Err for undersized in_proj_qkv, got Ok"),
         }
     }
 
@@ -722,6 +938,152 @@ mod tests {
             Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
             Ok(_) => panic!("expected Err, got Ok"),
         }
+    }
+
+    // ── checked_* overflow-guard boundary tests ─────────────────────────────────────
+    //
+    // These dimension products are derived from config.json fields (an untrusted
+    // checkpoint directory). A config with maliciously large but individually
+    // in-range `usize` fields (e.g. num_attention_heads and head_dim each valid
+    // on their own) can make the *product* overflow usize, which would silently
+    // wrap to a small value in release builds and load a shape-incompatible
+    // (undersized) tensor buffer, or panic in debug builds. `checked_*` must
+    // reject the overflowing case with a typed `InvalidInput` error and accept a
+    // large-but-non-overflowing product.
+
+    #[test]
+    fn checked_double_accepts_large_valid_and_rejects_overflow() {
+        assert_eq!(checked_double(usize::MAX / 2, "x").unwrap(), usize::MAX - 1);
+        assert!(checked_double(usize::MAX, "x").is_err());
+    }
+
+    #[test]
+    fn checked_full_q_dim_accepts_large_valid_and_rejects_overflow() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_attention_heads = 1 << 40;
+        cfg.head_dim = 1 << 20;
+        assert_eq!(checked_full_q_dim(&cfg).unwrap(), 1 << 60);
+
+        cfg.num_attention_heads = usize::MAX;
+        cfg.head_dim = 2;
+        match checked_full_q_dim(&cfg) {
+            Err(InferenceError::InvalidInput(msg)) => assert!(msg.contains("q_dim")),
+            other => panic!("expected InvalidInput overflow error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checked_full_kv_dim_accepts_large_valid_and_rejects_overflow() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.num_key_value_heads = 1 << 40;
+        cfg.head_dim = 1 << 20;
+        assert_eq!(checked_full_kv_dim(&cfg).unwrap(), 1 << 60);
+
+        cfg.num_key_value_heads = usize::MAX;
+        cfg.head_dim = 2;
+        match checked_full_kv_dim(&cfg) {
+            Err(InferenceError::InvalidInput(msg)) => assert!(msg.contains("kv_dim")),
+            other => panic!("expected InvalidInput overflow error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checked_linear_qkv_dim_accepts_large_valid_and_rejects_overflow() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.linear_num_key_heads = 1 << 20;
+        cfg.linear_key_head_dim = 1 << 20;
+        cfg.linear_num_value_heads = Some(1 << 20);
+        cfg.linear_value_head_dim = 1 << 20;
+        // k = v = 1<<40, qkv = k + k + v = 3<<40 -- large but well within usize range.
+        assert_eq!(checked_linear_qkv_dim(&cfg).unwrap(), 3 * (1usize << 40));
+
+        cfg.linear_num_key_heads = usize::MAX;
+        cfg.linear_key_head_dim = 2;
+        match checked_linear_qkv_dim(&cfg) {
+            Err(InferenceError::InvalidInput(msg)) => assert!(msg.contains("overflows usize")),
+            other => panic!("expected InvalidInput overflow error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checked_linear_output_dim_accepts_large_valid_and_rejects_overflow() {
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.linear_num_value_heads = Some(1 << 40);
+        cfg.linear_value_head_dim = 1 << 20;
+        assert_eq!(checked_linear_output_dim(&cfg).unwrap(), 1 << 60);
+
+        cfg.linear_num_value_heads = Some(usize::MAX);
+        cfg.linear_value_head_dim = 2;
+        match checked_linear_output_dim(&cfg) {
+            Err(InferenceError::InvalidInput(msg)) => assert!(msg.contains("output_dim")),
+            other => panic!("expected InvalidInput overflow error, got {other:?}"),
+        }
+    }
+
+    // ── shape-preflight-before-materialization tests ───────────────────────────────
+    //
+    // `load_owned_tensor_checked` must reject a shape mismatch using only the
+    // metadata `tensor_shape` returns, before ever calling `get_f32_tensor_owned`.
+    // A checkpoint tensor whose declared shape is oversized should not pay the cost
+    // of decoding/copying the owned buffer just to be rejected afterward.
+
+    #[test]
+    fn mismatched_shape_rejected_without_materializing_owned_buffer() {
+        let name = "layers.0.mlp.gate_proj.weight";
+        // Declared (metadata) shape is huge and mismatched; the actual stored data is
+        // tiny, so if the preflight were skipped and get_f32_tensor_owned were called,
+        // it would return this tiny buffer paired with the huge declared shape below.
+        let declared_mismatched_shape = vec![1 << 20, 1 << 20];
+        let mut src = CallCountingMockTensorSource {
+            tensors: [(
+                name.to_string(),
+                (vec![0.0f32; 4], declared_mismatched_shape.clone()),
+            )]
+            .into_iter()
+            .collect(),
+            owned_get_calls: std::cell::Cell::new(0),
+        };
+
+        let result = load_owned_tensor_checked(&mut src, name, &[4, 4]);
+
+        match result {
+            Err(InferenceError::ShapeMismatch {
+                name: got_name,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(got_name, name);
+                assert_eq!(expected, vec![4, 4]);
+                assert_eq!(actual, declared_mismatched_shape);
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            src.owned_get_calls.get(),
+            0,
+            "a mismatched tensor must be rejected via the metadata preflight \
+             without ever materializing the owned buffer"
+        );
+    }
+
+    #[test]
+    fn correctly_shaped_tensor_still_loads() {
+        let name = "layers.0.mlp.gate_proj.weight";
+        let mut src = CallCountingMockTensorSource {
+            tensors: [(name.to_string(), (vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]))]
+                .into_iter()
+                .collect(),
+            owned_get_calls: std::cell::Cell::new(0),
+        };
+
+        let result = load_owned_tensor_checked(&mut src, name, &[2, 2]);
+
+        assert_eq!(result.unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(
+            src.owned_get_calls.get(),
+            1,
+            "a correctly-shaped tensor must still be materialized exactly once"
+        );
     }
 
     #[test]
@@ -886,7 +1248,8 @@ mod tests {
         let cfg = tiny_linear_layer_cfg();
         let hidden = cfg.hidden_size;
         let mut src = tiny_linear_layer_tensors(&cfg, hidden - 1, hidden);
-        match load_weights(&mut src, &cfg) {
+        let validated = cfg.clone().validate().expect("tiny cfg must validate");
+        match load_weights(&mut src, &validated) {
             Err(InferenceError::ShapeMismatch { name, .. }) => {
                 assert!(
                     name.contains("input_layernorm"),
@@ -904,7 +1267,8 @@ mod tests {
         let cfg = tiny_linear_layer_cfg();
         let hidden = cfg.hidden_size;
         let mut src = tiny_linear_layer_tensors(&cfg, hidden, hidden - 1);
-        match load_weights(&mut src, &cfg) {
+        let validated = cfg.clone().validate().expect("tiny cfg must validate");
+        match load_weights(&mut src, &validated) {
             Err(InferenceError::ShapeMismatch { name, .. }) => {
                 assert!(
                     name.contains("post_attention_layernorm"),
@@ -921,7 +1285,8 @@ mod tests {
         let cfg = tiny_linear_layer_cfg();
         let hidden = cfg.hidden_size;
         let mut src = tiny_linear_layer_tensors(&cfg, hidden, hidden);
-        load_weights(&mut src, &cfg).expect("correctly shaped layernorms must load");
+        let validated = cfg.clone().validate().expect("tiny cfg must validate");
+        load_weights(&mut src, &validated).expect("correctly shaped layernorms must load");
     }
 
     /// Regression for #1035: a finite, undersized dense-FFN tensor must cause
@@ -941,7 +1306,8 @@ mod tests {
             (vec![0.0f32; hidden * (inter - 1)], vec![hidden, inter - 1]),
         );
 
-        match load_weights(&mut src, &cfg) {
+        let validated = cfg.clone().validate().expect("tiny cfg must validate");
+        match load_weights(&mut src, &validated) {
             Err(InferenceError::ShapeMismatch { name, .. }) => {
                 assert!(
                     name.contains("down_proj"),
@@ -1001,20 +1367,18 @@ mod tests {
             linear_value_head_dim: 2,
             ..Qwen35Config::qwen35_2b()
         };
-        let mut src = NullTensorSource;
-
-        match load_weights(&mut src, &cfg) {
-            Err(InferenceError::InvalidInput(msg)) => {
-                assert!(
-                    msg.contains("overflow"),
-                    "error must describe the overflow, got: {msg}"
-                );
-            }
-            Err(e) => panic!("expected InvalidInput, got a different error: {e}"),
-            Ok(_) => panic!(
-                "expected Err for overflowing linear-attention config, got Ok (would derive \
-                 wrapped dimensions and panic downstream)"
-            ),
-        }
+        // `load_weights` only accepts a validated config, so the pathological combination
+        // is rejected before it can reach the loader at all -- the contract this test
+        // guards (no wrapped `qkv_dim`/`output_dim` ever reaches tensor assembly) now
+        // holds one layer earlier. The per-helper loader guard is covered directly by
+        // `load_linear_attention_weights_rejects_overflowing_config`.
+        let err = cfg
+            .validate()
+            .expect_err("overflowing linear-attention config must not validate")
+            .to_string();
+        assert!(
+            !err.is_empty(),
+            "rejection must carry a diagnostic, got an empty message"
+        );
     }
 }

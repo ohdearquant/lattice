@@ -61,6 +61,9 @@ pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_n
 // (forward::metal_qwen35) calls this instead of its own inline
 // `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
 pub(crate) use generation::check_prompt_not_empty;
+// Shared prompt-token admission guard for standalone CPU drivers whose
+// tokenizer and model config are supplied independently (#1083).
+pub(crate) use generation::check_prompt_ids_in_vocab;
 // Shared total-context admission bound (#922): every Metal generation entry
 // point (forward::metal_qwen35) calls this after check_prompt_not_empty to
 // mirror the CPU `generate`/`generate_streaming` total bound

@@ -278,36 +278,20 @@ impl ExpertByteTable {
     /// PLAN.md §3 proves holds for every Q4 MoE checkpoint this loader
     /// writes; it is re-verified here, not just assumed, via the
     /// block-alignment check below.
-    ///
-    /// Same open+trust-boundary gate + post-map fstat recheck as
-    /// `MetalQwen35State::mmap_q4_weight` (#1037): this table's `mmap` is
-    /// kept alive for the cache's entire lifetime and re-read lazily on
-    /// every cache miss via [`Self::expert_bytes`], long after this `open`
-    /// call returns — a strictly *wider* truncate-after-validate window
-    /// than a loader that dequantizes immediately, so it needs the same two
-    /// guards: [`open_trusted_mmap_file`] (regular-file/O_NONBLOCK +
-    /// mode/uid/ACL, before the file is even parsed) and
-    /// [`verify_mmap_target_unchanged`]'s real post-map fstat recheck on the
-    /// still-open fd, rather than only the pre-map `stat` length.
     fn open(path: &Path, expected_shape: &[usize]) -> Result<Self, String> {
-        use crate::weights::mmap_trust::{open_trusted_mmap_file, verify_mmap_target_unchanged};
-        use crate::weights::q4_weights::{read_q4_header, validate_q4_header_payload_bounds};
+        use crate::weights::q4_weights::{Q4BlockCheck, open_and_mmap_q4_file};
 
-        let (file, metadata) = open_trusted_mmap_file(path)?;
-        let header = read_q4_header(&file)
-            .map_err(|e| format!("failed to parse Q4 header {}: {e}", path.display()))?;
-        if header.shape != expected_shape {
-            return Err(format!(
-                "{}: MoE expert-cache tensor has shape {:?}, expected {expected_shape:?} — \
-                 refusing to build a lazy per-expert byte table over a mismatched/transposed \
-                 layout (same hazard the eager `load_q4_mmap_dequant_f16` path guards against)",
-                path.display(),
-                header.shape
-            ));
-        }
-        let file_len = metadata.len();
-        validate_q4_header_payload_bounds(&header, file_len, path)
-            .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
+        // Scale/bias is validated per expert in `dequant_expert_f16`, which
+        // already walks that expert's blocks; an expert routing never selects
+        // is never read at all, so an eager whole-file scan here would defeat
+        // the point of the cache.
+        let (header, mmap, _) = open_and_mmap_q4_file(
+            path,
+            Some(expected_shape),
+            Q4BlockCheck::InCallerTraversal {
+                traversal: "ExpertByteTable::dequant_expert_f16 per-expert loop",
+            },
+        )?;
 
         let num_experts = expected_shape[0];
         if num_experts == 0 {
@@ -336,7 +320,7 @@ impl ExpertByteTable {
         // multiples of 32), but asserted here — not just claimed in a
         // comment — because a violation would silently corrupt or overrun
         // neighboring experts' bytes instead of failing to load.
-        if !per_expert_elems.is_multiple_of(32) {
+        if !per_expert_elems.is_multiple_of(crate::weights::q4_weights::Q4_BLOCK_WEIGHTS) {
             return Err(format!(
                 "{}: per-expert element count {per_expert_elems} is not a multiple of the Q4 \
                  block size (32) — an expert's byte range would not be block-aligned within \
@@ -347,24 +331,8 @@ impl ExpertByteTable {
                 path.display()
             ));
         }
-        let per_expert_blocks = per_expert_elems / 32;
+        let per_expert_blocks = per_expert_elems / crate::weights::q4_weights::Q4_BLOCK_WEIGHTS;
         let per_expert_bytes = per_expert_blocks * 20;
-
-        // SAFETY: read-only mmap of a file this process does not mutate
-        // while running (same invariant as `mmap_q4_weight` /
-        // `load_q4_mmap_dequant_f16`).
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
-        // Post-map integrity recheck (#1037) -- mirrors
-        // `mmap_q4_weight`'s: a writer that truncates the file between the
-        // pre-map stat and this `mmap()` call would otherwise let a
-        // now-too-short mapping back this table, and every subsequent
-        // `expert_bytes` read (for the rest of this cache's lifetime) would
-        // read past the end of a too-short mapping instead of failing to
-        // load in the first place. See `verify_mmap_target_unchanged`'s doc
-        // comment for why this fstats the fd again rather than trusting
-        // `mmap.len()`.
-        verify_mmap_target_unchanged(&file, &metadata, path)?;
 
         Ok(Self {
             mmap,
@@ -395,14 +363,33 @@ impl ExpertByteTable {
     /// Dequantize exactly one expert's Q4 blocks to f16 (same per-block
     /// scale/bias/nibble math as `load_q4_mmap_dequant_f16`, scoped to one
     /// expert's byte range instead of the whole tensor).
+    ///
+    /// Scale/bias metadata is validated here, in the same pass that already
+    /// walks this expert's block bytes — `ExpertByteTable::open` only
+    /// validates header/geometry/extent up front (see `validate_q4_file`'s
+    /// doc comment), so no expert's bytes are scanned twice, and an expert
+    /// that is never selected by routing is never scanned at all.
     fn dequant_expert_f16(&self, expert_id: usize) -> Result<Vec<u16>, String> {
-        use crate::weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
+        use crate::weights::q4_weights::{
+            q4_f16_to_f32, q4_f32_to_f16, validate_q4_block_metadata,
+        };
 
         let bytes = self.expert_bytes(expert_id)?;
+        let tensor_name = format!("moe expert {expert_id}");
         let mut out: Vec<u16> = Vec::with_capacity(self.per_expert_elems);
-        for chunk in bytes.chunks_exact(20) {
-            let scale = q4_f16_to_f32(u16::from_ne_bytes([chunk[0], chunk[1]]));
-            let bias = q4_f16_to_f32(u16::from_ne_bytes([chunk[2], chunk[3]]));
+        for (index, chunk) in bytes.chunks_exact(20).enumerate() {
+            let scale_bits = u16::from_ne_bytes([chunk[0], chunk[1]]);
+            let bias_bits = u16::from_ne_bytes([chunk[2], chunk[3]]);
+            validate_q4_block_metadata(
+                "moe expert cache",
+                &tensor_name,
+                index,
+                scale_bits,
+                bias_bits,
+            )
+            .map_err(|e| e.to_string())?;
+            let scale = q4_f16_to_f32(scale_bits);
+            let bias = q4_f16_to_f32(bias_bits);
             for b in 0..16 {
                 let byte_val = chunk[4 + b];
                 out.push(q4_f32_to_f16((byte_val & 0x0f) as f32 * scale + bias));

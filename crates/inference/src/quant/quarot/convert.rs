@@ -1431,7 +1431,7 @@ mod tests {
             convert_quarot_qwen35(&input, &output, &ConversionOptions::default()).unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("exceeds the maximum supported value"),
+            msg.contains("hidden_size") && msg.contains("exceeds"),
             "unexpected error: {msg}"
         );
         assert!(!output.exists());

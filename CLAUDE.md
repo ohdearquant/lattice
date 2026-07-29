@@ -96,7 +96,7 @@ A regression test that passes with the fix reverted is decoration. Before claimi
 
 When a harness or guard fix lands in one invocation path, grep the same file for sibling paths that construct the same operation independently: a second subprocess command builder, a second workflow step calling the same script, a reimplementation of a guarded method. Any fix expressible as "add flag X to the call" has an unguarded copy-paste sibling until proven otherwise, and the fix's own description ("mirror the CPU path") is the grep query.
 
-This class recurred three times in one week before becoming a rule — most recently a greedy-decoding sampler flag added to the CPU parity harness path while the Metal-path command builder in the same file went without it, surfacing only on that leg's first live CI run.
+This class recurs. It became a rule after a greedy-decoding sampler flag was added to the CPU parity harness path while the Metal-path command builder in the same file went without it, surfacing only on that leg's first live CI run. No count is given deliberately: a recurrence tally in guidance is a claim that no reader ever re-measures, so it can only go stale, and the invariant carries the rule without it.
 
 ### E2E Parity Gate
 
