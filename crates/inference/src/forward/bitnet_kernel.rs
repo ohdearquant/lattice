@@ -38,6 +38,8 @@
 //!
 //! The final output is: `y = alpha * gamma * dot(x_q, w_ternary)`
 
+use crate::error::InferenceError;
+
 // ---------------------------------------------------------------------------
 // I2_S weight encoding
 // ---------------------------------------------------------------------------
@@ -86,7 +88,13 @@ pub fn packed_row_bytes(k: usize) -> usize {
 ///   w_ternary = RoundClip(w / alpha, -1, 1)
 ///
 /// Returns `(packed_bytes, alpha)` where `alpha` is the per-row scale factor.
-fn pack_row(row: &[f32]) -> (Vec<u8>, f32) {
+fn pack_row(row: &[f32]) -> Result<(Vec<u8>, f32), InferenceError> {
+    if let Some((index, value)) = row.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+        return Err(InferenceError::InvalidInput(format!(
+            "BitNet weight row contains non-finite value {value} at index {index}"
+        )));
+    }
+
     // Compute alpha = mean(|w|)
     let abs_sum: f32 = row.iter().map(|v| v.abs()).sum();
     let alpha = if row.is_empty() {
@@ -110,7 +118,7 @@ fn pack_row(row: &[f32]) -> (Vec<u8>, f32) {
         }
     }
 
-    (packed, alpha)
+    Ok((packed, alpha))
 }
 
 /// **Unstable**: pack float weights into I2_S ternary format; packing convention may change.
@@ -120,21 +128,43 @@ fn pack_row(row: &[f32]) -> (Vec<u8>, f32) {
 /// Returns `(packed_bytes, alphas)` where:
 /// - `packed_bytes`: length `n * packed_row_bytes(k)`, rows stored contiguously
 /// - `alphas`: per-row scale factors, length `n`
-pub fn pack_ternary(weights: &[f32], n: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
-    assert_eq!(weights.len(), n * k, "weights length must be n*k");
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] when the matrix geometry does not
+/// match `weights` or any weight is non-finite.
+pub fn pack_ternary(
+    weights: &[f32],
+    n: usize,
+    k: usize,
+) -> Result<(Vec<u8>, Vec<f32>), InferenceError> {
+    let expected_len = n.checked_mul(k).ok_or_else(|| {
+        InferenceError::InvalidInput(format!("BitNet weight geometry overflows: n={n}, k={k}"))
+    })?;
+    if weights.len() != expected_len {
+        return Err(InferenceError::InvalidInput(format!(
+            "BitNet weights length {} does not match n*k ({n}*{k}={expected_len})",
+            weights.len()
+        )));
+    }
 
     let row_bytes = packed_row_bytes(k);
-    let mut packed = vec![0u8; n * row_bytes];
+    let packed_len = n.checked_mul(row_bytes).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "BitNet packed geometry overflows: n={n}, row_bytes={row_bytes}"
+        ))
+    })?;
+    let mut packed = vec![0u8; packed_len];
     let mut alphas = vec![0.0f32; n];
 
     for row_idx in 0..n {
         let row = &weights[row_idx * k..(row_idx + 1) * k];
-        let (row_packed, alpha) = pack_row(row);
+        let (row_packed, alpha) = pack_row(row)?;
         packed[row_idx * row_bytes..(row_idx + 1) * row_bytes].copy_from_slice(&row_packed);
         alphas[row_idx] = alpha;
     }
 
-    (packed, alphas)
+    Ok((packed, alphas))
 }
 
 /// **Unstable**: unpack a single I2_S ternary weight; for debugging and testing only.
@@ -516,7 +546,7 @@ mod tests {
             weights[k + i] = t as f32 * alpha;
         }
 
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
         // Alpha should be close to the mean absolute value.
         // Row 0: 6 nonzero * alpha / 8 = 0.375
@@ -554,7 +584,7 @@ mod tests {
         let n = 1;
         // All +1 weights.
         let weights = vec![1.0f32; k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
         assert!(alphas[0] > 0.0);
         assert_eq!(packed.len(), packed_row_bytes(k)); // ceil(7/4) = 2 bytes
@@ -562,6 +592,26 @@ mod tests {
         for j in 0..k {
             assert_eq!(unpack_weight(&packed, k, 0, j), 1, "col={j}");
         }
+    }
+
+    #[test]
+    fn pack_ternary_rejects_non_finite_weights() {
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let result = pack_ternary(&[0.25, non_finite, -0.5, 1.0], 1, 4);
+            assert!(
+                matches!(result, Err(InferenceError::InvalidInput(_))),
+                "non-finite weight {non_finite} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn pack_ternary_rejects_mismatched_geometry() {
+        let result = pack_ternary(&[0.25, -0.5, 1.0], 1, 4);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(_))),
+            "weights whose length differs from n*k must be rejected"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -639,7 +689,7 @@ mod tests {
         let n = 2;
         let k = 4;
         let weights = vec![1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
         // Activation: [1.0, 2.0, 3.0, 4.0]
         let x = vec![1.0, 2.0, 3.0, 4.0];
@@ -675,7 +725,7 @@ mod tests {
         for i in 0..n {
             weights[i * k + i] = 1.0;
         }
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
         let x = vec![10.0, 20.0, 30.0, 40.0];
         let (x_q, gamma) = quantize_activation(&x);
@@ -713,7 +763,7 @@ mod tests {
         let n = 3;
         let k = 8;
         let weights = vec![0.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let (x_q, gamma) = quantize_activation(&x);
@@ -732,7 +782,7 @@ mod tests {
         let n = 1;
         let k = 8;
         let weights = vec![-1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
         let x = vec![1.0; k]; // sum = 8.0
         let (x_q, gamma) = quantize_activation(&x);
@@ -777,11 +827,11 @@ mod tests {
         let ternary_output = matmul_ternary(
             &x,
             &{
-                let (p, _) = pack_ternary(&weights, n, k);
+                let (p, _) = pack_ternary(&weights, n, k).expect("finite test weights");
                 p
             },
             &{
-                let (_, a) = pack_ternary(&weights, n, k);
+                let (_, a) = pack_ternary(&weights, n, k).expect("finite test weights");
                 a
             },
             n,
@@ -810,7 +860,7 @@ mod tests {
         let n = 2;
         let k = 7;
         let weights = vec![1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
         let x: Vec<f32> = (0..k).map(|i| (i + 1) as f32).collect(); // [1..7]
         let (x_q, gamma) = quantize_activation(&x);
@@ -849,7 +899,7 @@ mod tests {
                     _ => 0.0,
                 };
             }
-            let (packed, alphas) = pack_ternary(&weights, n, k);
+            let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
             let x: Vec<f32> = (0..k).map(|i| (i as f32 - 16.0) * 0.1).collect();
             let (x_q, gamma) = quantize_activation(&x);
@@ -891,7 +941,7 @@ mod tests {
                     _ => 0.0,
                 };
             }
-            let (packed, alphas) = pack_ternary(&weights, n, k);
+            let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
             let x: Vec<f32> = (0..k)
                 .map(|i| ((i * 13 % 100) as f32 - 50.0) * 0.01)
@@ -932,7 +982,7 @@ mod tests {
                     _ => 0.4,
                 })
                 .collect();
-            let (packed, alphas) = pack_ternary(&weights, n, k);
+            let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
             let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.01) - 0.5).collect();
             let (x_q, gamma) = quantize_activation(&x);
@@ -968,7 +1018,7 @@ mod tests {
             let n = 2;
             let k = 32;
             let weights = vec![1.0f32; n * k];
-            let (packed, alphas) = pack_ternary(&weights, n, k);
+            let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
             let x_q = vec![1i8; k - 1]; // too short
             let mut output = vec![0.0f32; n];
             // SAFETY: never reached — the validator panics before any `get_unchecked` read.
@@ -982,7 +1032,7 @@ mod tests {
             let n = 2;
             let k = 64;
             let weights = vec![0.0f32; n * k];
-            let (packed, alphas) = pack_ternary(&weights, n, k);
+            let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
             let x = vec![5.0f32; k];
             let (x_q, gamma) = quantize_activation(&x);
@@ -1004,7 +1054,7 @@ mod tests {
             let n = 1;
             let k = 64;
             let weights = vec![1.0f32; n * k]; // all +1
-            let (packed, alphas) = pack_ternary(&weights, n, k);
+            let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
             let x = vec![1.0f32; k]; // sum = 64
             let (x_q, gamma) = quantize_activation(&x);
@@ -1033,7 +1083,7 @@ mod tests {
         let n = 4;
         let k = 32;
         let weights = vec![1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
 
         let x = vec![1.0f32; k];
         let output = matmul_ternary(&x, &packed, &alphas, n, k);
@@ -1062,7 +1112,7 @@ mod tests {
         let n = 2;
         let k = 32;
         let weights = vec![1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
         let x = vec![1.0f32; k - 1]; // too short
         let _ = matmul_ternary(&x, &packed, &alphas, n, k);
     }
@@ -1073,7 +1123,7 @@ mod tests {
         let n = 2;
         let k = 32;
         let weights = vec![1.0f32; n * k];
-        let (packed, _alphas) = pack_ternary(&weights, n, k);
+        let (packed, _alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
         let x = vec![1.0f32; k];
         let short_alphas = vec![1.0f32; n - 1];
         let _ = matmul_ternary(&x, &packed, &short_alphas, n, k);
@@ -1085,7 +1135,7 @@ mod tests {
         let n = 2;
         let k = 32;
         let weights = vec![1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
         let short_packed = &packed[..packed.len() - 1];
         let x = vec![1.0f32; k];
         let _ = matmul_ternary(&x, short_packed, &alphas, n, k);
@@ -1097,7 +1147,7 @@ mod tests {
         let n = 2;
         let k = 32;
         let weights = vec![1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
         let x_q = vec![1i8; k - 1]; // too short
         let mut output = vec![0.0f32; n];
         matvec_ternary_scalar(&x_q, 1.0, &packed, &alphas, n, k, &mut output);
@@ -1116,7 +1166,7 @@ mod tests {
         let n = 2;
         let k = 5;
         let weights = vec![1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
         let x_q = vec![1i8; k - 1]; // too short, ends inside the remainder range
         let mut output = vec![0.0f32; n];
         matvec_ternary_scalar(&x_q, 1.0, &packed, &alphas, n, k, &mut output);
@@ -1127,7 +1177,7 @@ mod tests {
         let n = 2;
         let k = 32;
         let weights = vec![1.0f32; n * k];
-        let (packed, alphas) = pack_ternary(&weights, n, k);
+        let (packed, alphas) = pack_ternary(&weights, n, k).expect("finite test weights");
         let x_q = vec![1i8; k + 4]; // oversized
         let mut output = vec![0.0f32; n + 4]; // oversized
         matvec_ternary_scalar(&x_q, 1.0, &packed, &alphas, n, k, &mut output);

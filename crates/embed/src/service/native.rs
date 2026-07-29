@@ -3,7 +3,7 @@
 //! Model loading is lazy and cancellation-safe; BERT-family and Qwen models take different
 //! loading and batching paths. See `docs/service.md` for lifecycle and persistence details.
 
-use super::{EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES};
+use super::{EmbeddingRole, EmbeddingService, MAX_TEXT_BYTES, ValidatedTextBatch};
 use crate::error::{EmbedError, Result};
 use crate::model::{EmbeddingModel, ModelConfig};
 use async_trait::async_trait;
@@ -185,7 +185,7 @@ impl NativeEmbeddingService {
     /// prepends, which is zero bytes for symmetric models.
     async fn encode_prepared(
         &self,
-        texts: &[String],
+        texts: &[&str],
         model: EmbeddingModel,
     ) -> Result<Vec<Vec<f32>>> {
         if model != self.model_config.model {
@@ -200,10 +200,34 @@ impl NativeEmbeddingService {
         )?;
 
         let loaded = self.ensure_model().await?;
-        let text_refs = texts.iter().map(String::as_str).collect::<Vec<_>>();
         loaded
-            .encode_batch(&text_refs)
+            .encode_batch(texts)
             .map_err(EmbedError::InferenceFailed)
+    }
+
+    async fn encode_prevalidated_with_role(
+        &self,
+        texts: ValidatedTextBatch<'_>,
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<Vec<f32>>> {
+        let prefix = role.instruction(model);
+        if prefix.is_none()
+            && let Some(borrowed) = texts.borrowed()
+        {
+            return self.encode_prepared(borrowed, model).await;
+        }
+
+        if prefix.is_none() {
+            let borrowed = (0..texts.len())
+                .map(|index| texts.get(index))
+                .collect::<Vec<_>>();
+            return self.encode_prepared(&borrowed, model).await;
+        }
+
+        let prepared = texts.to_owned_with_prefix(prefix);
+        let borrowed = prepared.iter().map(String::as_str).collect::<Vec<_>>();
+        self.encode_prepared(&borrowed, model).await
     }
 }
 
@@ -321,9 +345,9 @@ fn qwen_model_dir(model_type: EmbeddingModel) -> Result<std::path::PathBuf> {
 #[async_trait]
 impl EmbeddingService for NativeEmbeddingService {
     async fn embed(&self, texts: &[String], model: EmbeddingModel) -> Result<Vec<Vec<f32>>> {
-        // Caller text, so the published cap applies exactly.
-        super::validate_texts(texts)?;
-        self.encode_prepared(texts, model).await
+        let texts = ValidatedTextBatch::new(texts)?;
+        self.encode_prevalidated_with_role(texts, model, EmbeddingRole::Generic)
+            .await
     }
 
     async fn embed_with_role(
@@ -332,12 +356,17 @@ impl EmbeddingService for NativeEmbeddingService {
         model: EmbeddingModel,
         role: EmbeddingRole,
     ) -> Result<Vec<Vec<f32>>> {
-        // Validate what the caller passed, then prepare. Routing the prepared
-        // text back through `embed` would re-check it against the caller-text
-        // cap and reject input the caller kept within the documented limit.
-        super::validate_texts(texts)?;
-        let prepared = super::apply_prefix(texts, role.instruction(model));
-        self.encode_prepared(&prepared, model).await
+        let texts = ValidatedTextBatch::new(texts)?;
+        self.encode_prevalidated_with_role(texts, model, role).await
+    }
+
+    async fn embed_with_role_prevalidated(
+        &self,
+        texts: ValidatedTextBatch<'_>,
+        model: EmbeddingModel,
+        role: EmbeddingRole,
+    ) -> Result<Vec<Vec<f32>>> {
+        self.encode_prevalidated_with_role(texts, model, role).await
     }
 
     fn model_config(&self, model: EmbeddingModel) -> ModelConfig {

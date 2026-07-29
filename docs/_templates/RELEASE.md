@@ -6,15 +6,19 @@
 ## Changelog
 
 ### Breaking Changes
+
 - (none, or list)
 
 ### New Features
+
 - feat(crate): description — PR #N
 
 ### Fixes
+
 - fix(crate): description — PR #N
 
 ### Internal
+
 - chore/docs/refactor items that affect maintainers
 
 ## Pre-release
@@ -59,6 +63,7 @@ gh release create v{VERSION} --title "v{VERSION}" --notes-file docs/releases/v{V
 ## Rollback
 
 If a crate publish is broken, yank and patch:
+
 ```sh
 cargo yank lattice-{crate} --version {VERSION}
 # fix, bump to {VERSION+patch}, re-publish
