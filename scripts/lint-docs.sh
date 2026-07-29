@@ -5,7 +5,17 @@ script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 script_path="$script_dir/lint-docs.sh"
 mode=${1:-}
 
-run_discovery_selftest() {
+clear_local_git_environment() {
+    git_local_env_names=$(git rev-parse --local-env-vars)
+    if [ -n "$git_local_env_names" ]; then
+        # Git emits only variable names; word splitting supplies them to unset.
+        unset $git_local_env_names
+    fi
+}
+
+run_discovery_selftest() (
+    clear_local_git_environment
+
     sandbox=$(mktemp -d "${TMPDIR:-/tmp}/lattice-lint-docs.XXXXXX")
     case "$sandbox" in
         "${TMPDIR:-/tmp}"/lattice-lint-docs.*) ;;
@@ -78,11 +88,70 @@ EOF
         exit 1
     fi
     echo "lint-docs: recursive tracked-Markdown selftest OK"
-}
+)
+
+run_index_isolation_selftest() (
+    clear_local_git_environment
+
+    sandbox=$(mktemp -d "${TMPDIR:-/tmp}/lattice-lint-docs-index.XXXXXX")
+    case "$sandbox" in
+        "${TMPDIR:-/tmp}"/lattice-lint-docs-index.*) ;;
+        *)
+            echo "lint-docs index selftest: unexpected sandbox path: $sandbox" >&2
+            exit 1
+            ;;
+    esac
+    trap 'rm -rf "$sandbox"' 0 1 2 3 15
+
+    repo="$sandbox/repo"
+    before_index="$sandbox/before-index"
+    after_index="$sandbox/after-index"
+    tracked_files="$sandbox/tracked-files"
+    committed_files="$sandbox/committed-files"
+    mkdir -p "$repo/sentinel"
+    printf '%s\n' '# outer repository' >"$repo/README.md"
+    printf '%s\n' 'keep one' >"$repo/sentinel/one.txt"
+    printf '%s\n' 'keep two' >"$repo/sentinel/two.md"
+    git -C "$repo" init -q
+    git -C "$repo" add README.md sentinel
+    git -C "$repo" ls-files --stage -z >"$before_index"
+
+    cat >"$repo/.git/hooks/pre-commit" <<'EOF'
+#!/bin/sh
+set -e
+LATTICE_LINT_DOCS_INDEX_PROBE=1 \
+    "${LATTICE_LINT_DOCS_SELFTEST_SCRIPT:?}" --selftest
+EOF
+    chmod +x "$repo/.git/hooks/pre-commit"
+    (
+        cd "$repo"
+        LATTICE_LINT_DOCS_SELFTEST_SCRIPT="$script_path" \
+            GIT_INDEX_FILE="$repo/.git/index" \
+            git -c user.name=selftest -c user.email=selftest@example.invalid \
+            commit -qm "lint-docs hook index isolation probe"
+    )
+
+    git -C "$repo" ls-files --stage -z >"$after_index"
+    if ! cmp -s "$before_index" "$after_index"; then
+        echo "lint-docs index selftest: staged entries changed under hook context" >&2
+        exit 1
+    fi
+    git -C "$repo" ls-files -z >"$tracked_files"
+    git -C "$repo" ls-tree -r --name-only -z HEAD >"$committed_files"
+    if ! cmp -s "$tracked_files" "$committed_files"; then
+        echo "lint-docs index selftest: committed files differ from the index" >&2
+        exit 1
+    fi
+    echo "lint-docs: hook-index isolation selftest OK"
+)
 
 case "$mode" in
     --selftest)
-        run_discovery_selftest
+        if [ "${LATTICE_LINT_DOCS_INDEX_PROBE:-}" = "1" ]; then
+            run_discovery_selftest
+        else
+            run_index_isolation_selftest
+        fi
         exit 0
         ;;
     "" | --format | --markdown-only) ;;
