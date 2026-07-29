@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -423,6 +424,39 @@ class NonFiniteMetricTest(unittest.TestCase):
         record = _cell_record(aggregate=agg)
         with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*not finite"):
             harness.validate_run_record(record)
+
+
+class MeasuredCvValidationTest(unittest.TestCase):
+    def test_parse_rejects_non_positive_and_non_finite_cv(self):
+        for measured_cv in (-0.01, -0.0, 0.0, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(measured_cv=measured_cv):
+                with self.assertRaisesRegex(harness.RunRecordValidationError, "positive finite"):
+                    _aggregate(measured_cv=measured_cv)
+
+    def test_parse_accepts_tiny_positive_cv(self):
+        measured_cv = math.nextafter(0.0, math.inf)
+        self.assertEqual(_aggregate(measured_cv=measured_cv).measured_cv, measured_cv)
+
+    def test_hand_built_invalid_cv_fails_before_class_c_exemption(self):
+        for measured_cv in (False, True, 0.0, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(measured_cv=measured_cv):
+                aggregate = harness.CellAggregate(
+                    point_estimate=0.02,
+                    ci_low=-0.01,
+                    ci_high=0.05,
+                    corrected_lower_bound=0.01,
+                    n_valid=7,
+                    n_invalid=0,
+                    measured_cv=measured_cv,
+                    required_n=None,
+                )
+                record = _cell_record(
+                    metric_family="memory",
+                    metric_name="model_load_time",
+                    aggregate=aggregate,
+                )
+                with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*positive finite"):
+                    harness.validate_run_record(record)
 
 
 class LowValidNTest(unittest.TestCase):
