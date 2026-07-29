@@ -5650,57 +5650,52 @@ mod tests {
         );
     }
 
-    /// The panic this guard exists to prevent, pinned at the boundary that matters:
-    /// `in_channels: 4` is shape-consistent everywhere else, so before this validation it
-    /// parsed cleanly and failed only when a request reached `pixel[3]`.
+    /// Every rejected value on both sides of 3, so the guard is pinned as an equality rather
+    /// than as a one-sided bound.
+    ///
+    /// The cases matter individually. `4` is the panic this guard exists to prevent: it is
+    /// shape-consistent everywhere else, so before this validation it parsed cleanly and
+    /// failed only when a request reached `pixel[3]`. `0` was previously rejected by its own
+    /// `> 0` check, which the RGB bound subsumes, so it pins that the zero case is still
+    /// refused rather than falling through. `1` and `2` are the interior values that panic
+    /// nothing and are therefore the easiest to lose: `pixel[0]` and `pixel[1]` are in bounds
+    /// for a 3-element `Rgb<u8>`, so an under-wide `in_channels` silently produces a
+    /// channel-truncated tensor that disagrees with the checkpoint's `patch_embed` weights
+    /// instead of failing loudly.
+    ///
+    /// Without `1` and `2` the suite is not mutation-sensitive: rewriting the predicate as
+    /// `self.in_channels == 0 || self.in_channels > 3` passes every other case in this file
+    /// while letting both slip through. That mutation was executed against this tree, not
+    /// reasoned about — it passed 5/5 before these cases existed.
     #[test]
-    fn parser_rejects_present_vision_config_with_in_channels_four() {
-        let json = config_json_with_vision(
-            r#"{
-                "depth": 4,
-                "hidden_size": 768,
-                "num_heads": 12,
-                "patch_size": 16,
-                "spatial_merge_size": 2,
-                "out_hidden_size": 1024,
-                "temporal_patch_size": 2,
-                "num_position_embeddings": 2304,
-                "in_channels": 4
-            }"#,
-        );
-        let err = Qwen35Config::from_config_json_str(&json)
-            .expect_err("in_channels: 4 vision_config must be rejected at parse time")
-            .to_string();
-        assert!(
-            err.contains("in_channels must be 3"),
-            "wrong guard fired: {err}"
-        );
-    }
-
-    /// `in_channels: 0` was previously rejected by its own `> 0` check; the RGB bound subsumes
-    /// it, and this pins that the zero case is still refused rather than falling through.
-    #[test]
-    fn parser_rejects_present_vision_config_with_in_channels_zero() {
-        let json = config_json_with_vision(
-            r#"{
-                "depth": 4,
-                "hidden_size": 768,
-                "num_heads": 12,
-                "patch_size": 16,
-                "spatial_merge_size": 2,
-                "out_hidden_size": 1024,
-                "temporal_patch_size": 2,
-                "num_position_embeddings": 2304,
-                "in_channels": 0
-            }"#,
-        );
-        let err = Qwen35Config::from_config_json_str(&json)
-            .expect_err("in_channels: 0 vision_config must be rejected at parse time")
-            .to_string();
-        assert!(
-            err.contains("in_channels must be 3"),
-            "wrong guard fired: {err}"
-        );
+    fn parser_rejects_present_vision_config_with_any_in_channels_but_three() {
+        for in_channels in [0_usize, 1, 2, 4] {
+            let json = config_json_with_vision(&format!(
+                r#"{{
+                    "depth": 4,
+                    "hidden_size": 768,
+                    "num_heads": 12,
+                    "patch_size": 16,
+                    "spatial_merge_size": 2,
+                    "out_hidden_size": 1024,
+                    "temporal_patch_size": 2,
+                    "num_position_embeddings": 2304,
+                    "in_channels": {in_channels}
+                }}"#
+            ));
+            let err = match Qwen35Config::from_config_json_str(&json) {
+                Ok(_) => {
+                    panic!(
+                        "in_channels: {in_channels} vision_config must be rejected at parse time"
+                    )
+                }
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                err.contains("in_channels must be 3"),
+                "in_channels: {in_channels} -- wrong guard fired: {err}"
+            );
+        }
     }
 
     // ── CLASS A2: aggregate GDN session-buffer budget ───────────────────────────────
