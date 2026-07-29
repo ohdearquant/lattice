@@ -19,7 +19,7 @@ test-timing:
 
 fmt:
 	cargo fmt --all
-	deno fmt **/*.md
+	./scripts/lint-docs.sh --format
 
 fmt-check:
 	cargo fmt --all -- --check
