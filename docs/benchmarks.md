@@ -6,6 +6,20 @@ this document — hardware varies. Run the benchmarks on your target machine.
 
 ## Running the Benchmarks
 
+### Regression gate modes
+
+The quick comparison and full-resolution gates deliberately classify targets differently:
+
+| Command                                                              | Comparison                                                                | Classification                                                                                                                    | Enforcement                                                          |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `make bench-compare`                                                 | `origin/main` against `HEAD`, quick resolution                            | Targets listed in `scripts/lib/bench-quick-informational-targets.txt` are reported as informational; every other target is gating | Report-only unless the script is invoked with `--fail-on-regression` |
+| `scripts/bench-compare.sh --full --fail-on-regression <base> <head>` | Two explicit refs, full resolution                                        | Every measured target is gating; the quick informational manifest is ignored                                                      | A confirmed regression exits nonzero                                 |
+| `make bench-gate`                                                    | The current checkout against the `perf-baselines` branch, full resolution | Every measured result is gating; the quick informational manifest is ignored                                                      | A confirmed regression exits nonzero                                 |
+
+Informational classification does not skip measurement or remove results from the report. It only
+excludes a quick-mode target from the regression verdict. Use a full-resolution command when a
+quick-mode informational target must contribute to an enforcing decision.
+
 ### Embedding SIMD operations (no model download required)
 
 ```sh
