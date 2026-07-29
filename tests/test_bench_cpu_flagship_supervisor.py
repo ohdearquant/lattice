@@ -759,6 +759,7 @@ class ValidateRunRecordRoundTripTest(unittest.TestCase):
     def setUp(self):
         self.policy = gate_math.load_policy()
         self.policy_sha = gate_math.policy_sha()
+        self.policy_file_sha = gate_math.policy_file_sha()
 
     def _provenance(self) -> harness.ProvenanceRecord:
         return harness.parse_provenance(
@@ -772,6 +773,7 @@ class ValidateRunRecordRoundTripTest(unittest.TestCase):
                 "profile_sha": "c" * 64,
                 "policy_version": self.policy["policy_version"],
                 "policy_sha": self.policy_sha,
+                "policy_file_sha": self.policy_file_sha,
                 "script_sha": "e" * 40,
                 "hardware_fingerprint": "Darwin-arm64-test",
                 "collected_at": "2026-07-11T00:00:00+00:00",
