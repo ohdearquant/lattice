@@ -53,8 +53,15 @@ pub struct MRopeTables {
 /// Text runs advance all three axes together, one position per token. Each
 /// image run consumes the next entry in `grids`, starts all axes at the
 /// current position, sweeps the merged `(T, H/m, W/m)` grid row-major, and
-/// advances the shared position counter by `max(T, H/m, W/m)` afterward —
-/// not by the number of image-pad tokens consumed.
+/// advances the shared position counter by `max(H/m, W/m)` afterward — not
+/// by the number of image-pad tokens consumed.
+///
+/// The advance is spatial-only. HF (v5.12.1) splits a video into `t = 1`
+/// frame grids *before* position assignment and then advances by the spatial
+/// maximum, so folding `T` into the advance here would diverge from the
+/// reference on the very path it appears to serve. This API is image-only;
+/// video re-enters with the video path, implemented against those semantics
+/// and accepted on HF numeric parity.
 ///
 /// Fails closed (`InvalidInput`) on: empty `input_ids`, zero merge size,
 /// zero-dimension grids, grids not divisible by the merge size, image runs
@@ -152,7 +159,7 @@ pub fn build_position_ids(
                 }
             }
 
-            current_pos = advance(current_pos, lt.max(lh).max(lw), "post-image position")?;
+            current_pos = advance(current_pos, lh.max(lw), "post-image position")?;
             i = run_end;
         } else {
             positions.push((current_pos, current_pos, current_pos));
@@ -394,7 +401,16 @@ mod tests {
     }
 
     #[test]
-    fn post_image_advance_accounts_for_temporal_axis() {
+    fn post_image_advance_is_spatial_only_even_when_t_is_largest() {
+        // t=3 is deliberately larger than the merged spatial extents
+        // (h/m = w/m = 2) so the two conventions give different answers:
+        // spatial-only lands the next text token at 5 + max(2, 2) = 7,
+        // folding T in would land it at 5 + max(3, 2, 2) = 8.
+        //
+        // HF (v5.12.1) splits a video into t = 1 frame grids *before*
+        // assigning positions and then advances by the spatial maximum, so
+        // spatial-only is the reference-aligned answer. This asserts the
+        // discriminating case, not merely a case both conventions satisfy.
         let mut input_ids = vec![TOKEN_A; 5];
         input_ids.extend(std::iter::repeat_n(IMAGE_PAD, 12));
         input_ids.push(TOKEN_B);
@@ -403,8 +419,10 @@ mod tests {
         let result = build_position_ids(&input_ids, IMAGE_PAD, &grids, 2).unwrap();
 
         assert_eq!(result.positions[5], (5, 5, 5));
+        // last image-pad token: inside the sweep, unaffected by the advance
         assert_eq!(result.positions[16], (7, 6, 6));
-        assert_eq!(result.positions[17], (8, 8, 8));
+        // the token after the image run: this is the discriminator
+        assert_eq!(result.positions[17], (7, 7, 7));
     }
 
     fn assert_hf_lane_schedule(section: [usize; 3], rope_half: usize, expected_counts: [usize; 3]) {
