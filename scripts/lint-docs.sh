@@ -132,4 +132,8 @@ echo "=== Capability Matrix Fixture Check (#654) ==="
 "$script_dir/check-capability-matrix.sh" --selftest
 "$script_dir/check-capability-matrix.sh"
 
+echo "=== Absolute Developer Path Check (#1102) ==="
+"$script_dir/lint-absolute-paths.sh" --selftest
+"$script_dir/lint-absolute-paths.sh"
+
 echo "=== Doc Lint Passed ==="
