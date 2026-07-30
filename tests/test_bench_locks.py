@@ -57,6 +57,45 @@ exit 0
 # Test helpers invoking real Git must disable repository hooks.
 GIT = ("git", "-c", "core.hooksPath=/dev/null")
 
+STUB_GOVERNOR = """#!/usr/bin/env python3
+import json
+import os
+import sys
+from datetime import UTC, datetime
+
+label = sys.argv[sys.argv.index("--label") + 1]
+calls = os.environ.get("MACHINE_STATE_CALLS_FILE")
+if calls:
+    with open(calls, "a") as handle:
+        handle.write(label + "\\n")
+rc = int(os.environ.get("STUB_GOVERNOR_RC", "0"))
+print(json.dumps({
+    "schema": "lattice-machine-state-v1",
+    "label": label,
+    "captured_at_utc": datetime.now(UTC).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z"),
+    "power": {"status": "measured", "source": "fixture", "state": "ac"},
+    "thermal": {
+        "status": "measured",
+        "source": "fixture",
+        "state": "nominal" if rc == 0 else "serious",
+    },
+    "idle": {
+        "status": "measured",
+        "source": "fixture",
+        "seconds": 30.0,
+    },
+    "gate": {
+        "status": "passed" if rc == 0 else "blocked",
+        "cooldown_seconds": 30.0,
+        "afk_threshold_seconds": 30.0,
+        **({"kill_switch": "clear"} if rc == 0 else {"reason": "fixture block"}),
+    },
+}, separators=(",", ":"), sort_keys=True))
+raise SystemExit(rc)
+"""
+
 
 class _Sandbox:
     """A throwaway repo holding the shipping scripts, with locks redirected."""
@@ -72,6 +111,9 @@ class _Sandbox:
         shutil.copy2(GATE, self.root / "scripts" / GATE.name)
         shutil.copytree(LIB, self.root / "scripts" / "lib")
         shutil.copy2(REPO / ".gitignore", self.root / ".gitignore")
+        governor = self.root / "scripts" / "perf_governor.py"
+        governor.write_text(STUB_GOVERNOR)
+        governor.chmod(0o755)
         quiet_probe = self.root / "scripts" / "lib" / "quiet-probe.py"
         quiet_probe.write_text(
             "#!/usr/bin/env python3\n"
@@ -96,7 +138,8 @@ class _Sandbox:
             "'captured_at_utc':datetime.datetime.now(datetime.UTC)"
             ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
             "'power':{'status':'unavailable','reason':'fixture'},"
-            "'thermal':{'status':'unavailable','reason':'fixture'}},"
+            "'thermal':{'status':'unavailable','reason':'fixture'},"
+            "'idle':{'status':'unavailable','reason':'fixture'}},"
             "separators=(',', ':'), sort_keys=True))\n"
         )
 
@@ -135,15 +178,17 @@ class _Sandbox:
             env=env_git,
         )
 
-        bindir = Path(tmp) / "bin"
-        bindir.mkdir()
-        cargo = bindir / "cargo"
+        self.bindir = Path(tmp) / "bin"
+        self.bindir.mkdir()
+        cargo = self.bindir / "cargo"
         cargo.write_text(STUB_CARGO)
         cargo.chmod(0o755)
+        self.machine_calls = Path(tmp) / "machine-state-calls.txt"
         self.env = {
             **os.environ,
-            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "PATH": f"{self.bindir}:{os.environ['PATH']}",
             "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+            "MACHINE_STATE_CALLS_FILE": str(self.machine_calls),
         }
         return self
 
@@ -155,6 +200,23 @@ class _Sandbox:
         return subprocess.run(
             ["bash", *argv, base_ref, head_ref],
             capture_output=True, text=True, env={**self.env, **env}, timeout=300)
+
+    def force_platform(self, name):
+        uname = self.bindir / "uname"
+        uname.write_text(
+            "#!/usr/bin/env bash\n"
+            'if [ "$#" -eq 0 ] || [ "${1:-}" = "-s" ]; then\n'
+            f"  echo {name}\n"
+            "else\n"
+            '  exec /usr/bin/uname "$@"\n'
+            "fi\n"
+        )
+        uname.chmod(0o755)
+
+    def machine_state_labels(self):
+        if not self.machine_calls.exists():
+            return []
+        return self.machine_calls.read_text().splitlines()
 
     @property
     def entry(self):
@@ -409,6 +471,7 @@ class RunProvenanceHandoff(unittest.TestCase):
     def test_supervised_run_writes_complete_three_phase_handoff(self):
         """The Markdown gate receives auditable machine and phase conditions."""
         with _Sandbox() as sb:
+            sb.force_platform("Darwin")
             r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             provenance = sb.root / ".cache" / "bench-run-provenance.txt"
@@ -468,6 +531,7 @@ class RunProvenanceHandoff(unittest.TestCase):
                 all(
                     state["power"]["status"] in ("measured", "unavailable")
                     and state["thermal"]["status"] in ("measured", "unavailable")
+                    and state["idle"]["status"] in ("measured", "unavailable")
                     for state in states
                 )
             )
@@ -478,6 +542,12 @@ class RunProvenanceHandoff(unittest.TestCase):
             self.assertNotIn(" at ", head_mode)
             self.assertIn("<summary>Run provenance</summary>", r.stdout)
             self.assertIn("host_id=local-random:", r.stdout)
+            self.assertIn("HID idle 30.0s via fixture", r.stdout)
+            self.assertIn(
+                "gate passed (cooldown 30.0s, AFK floor 30.0s, "
+                "kill-switch clear)",
+                r.stdout,
+            )
             self.assertNotIn("unsuitable as benchmark evidence", r.stdout)
 
 
@@ -555,6 +625,156 @@ class MachineStateParsers(unittest.TestCase):
         )
         self.assertEqual(result["status"], "measured")
         self.assertEqual(result["state"], "nominal")
+
+    def test_current_pmset_error_falls_back_to_process_info(self):
+        pmset_error = (
+            "Error:Failed to get thermal warning level with error code 0xe00002bc\n"
+            "Error: Failed to get performance warning level with error code 0xe00002bc\n"
+            "Error: No CPU power status with error code 0xe00002bc\n"
+        )
+        with mock.patch.object(
+            self.probe, "run_pmset", return_value=(0, pmset_error)
+        ):
+            with mock.patch.object(
+                self.probe,
+                "read_process_info_thermal",
+                return_value={
+                    "status": "measured",
+                    "source": "ProcessInfo.thermalState",
+                    "state": "nominal",
+                },
+            ):
+                state = self.probe.read_macos_thermal()
+        self.assertEqual(state["status"], "measured")
+        self.assertEqual(state["state"], "nominal")
+        self.assertEqual(state["source"], "ProcessInfo.thermalState")
+        self.assertIn("fallback_reason", state)
+
+    def test_two_unavailable_thermal_sources_remain_unavailable(self):
+        with mock.patch.object(
+            self.probe, "run_pmset", return_value=(1, "")
+        ):
+            with mock.patch.object(
+                self.probe,
+                "read_process_info_thermal",
+                return_value=self.probe.unavailable("Foundation unavailable"),
+            ):
+                state = self.probe.read_macos_thermal()
+        self.assertEqual(state["status"], "unavailable")
+        self.assertNotEqual(state.get("state"), "nominal")
+
+    def test_process_info_only_accepts_nominal_enum_as_nominal(self):
+        self.assertEqual(
+            self.probe.thermal_state_from_raw(0)["state"], "nominal"
+        )
+        for raw, state in ((1, "fair"), (2, "serious"), (3, "critical")):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    self.probe.thermal_state_from_raw(raw)["state"], state
+                )
+        self.assertEqual(
+            self.probe.thermal_state_from_raw(4)["status"], "unavailable"
+        )
+
+    def test_hid_idle_parser_is_fail_closed(self):
+        measured = self.probe.parse_macos_idle(
+            '    | |   "HIDIdleTime" = 31250000000\n'
+        )
+        missing = self.probe.parse_macos_idle("IOHIDSystem unavailable\n")
+        self.assertEqual(measured["seconds"], 31.25)
+        self.assertEqual(missing["status"], "unavailable")
+
+
+class MachineStateGate(unittest.TestCase):
+    def test_macos_checkpoints_gate_all_three_measurement_boundaries(self):
+        with _Sandbox() as sb:
+            sb.force_platform("Darwin")
+            r = sb.run([sb.entry], BENCH_IDLE_FLOOR="0")
+            self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
+            self.assertEqual(
+                sb.machine_state_labels(),
+                ["before base", "between phases", "after head"],
+            )
+            _, separator, report = r.stdout.partition("=== Run conditions ===")
+            self.assertTrue(separator, r.stdout)
+            provenance = sb.root / ".cache" / "bench-run-provenance.txt"
+            states = [
+                json.loads(line.removeprefix("machine_state="))
+                for line in provenance.read_text().splitlines()
+                if line.startswith("machine_state=")
+            ]
+            self.assertEqual(
+                [state["label"] for state in states],
+                ["before base", "between phases", "after head"],
+            )
+            self.assertTrue(
+                all(
+                    state["gate"]["status"] == "passed"
+                    and state["gate"]["cooldown_seconds"] == 30.0
+                    and state["gate"]["afk_threshold_seconds"] == 30.0
+                    for state in states
+                )
+            )
+            self.assertIn('"gate":', report)
+
+    def test_checkpoint_failure_refuses_before_measurement(self):
+        with _Sandbox() as sb:
+            sb.force_platform("Darwin")
+            r = sb.run(
+                [sb.entry, "--fail-on-regression"],
+                BENCH_IDLE_FLOOR="0",
+                STUB_GOVERNOR_RC="2",
+            )
+            self.assertEqual(r.returncode, 2, f"stdout:\n{r.stdout}")
+            self.assertEqual(sb.machine_state_labels(), ["before base"])
+            self.assertIn("machine-state checkpoint 'before base' failed", r.stderr)
+            self.assertNotIn("Building + benching BASE", r.stdout)
+
+    def test_blocked_macos_checkpoint_reports_or_refuses_by_enforcement_mode(self):
+        with _Sandbox() as sb:
+            sb.force_platform("Darwin")
+            report_only = sb.run(
+                [sb.entry],
+                BENCH_IDLE_FLOOR="0",
+                STUB_GOVERNOR_RC="2",
+            )
+            self.assertEqual(
+                report_only.returncode,
+                0,
+                f"stdout:\n{report_only.stdout}\nstderr:\n{report_only.stderr}",
+            )
+            self.assertIn("Building + benching BASE", report_only.stdout)
+            self.assertIn("=== Run conditions ===", report_only.stdout)
+            self.assertIn("gate blocked (fixture block)", report_only.stdout)
+            self.assertIn(
+                "unsuitable as benchmark evidence",
+                report_only.stdout,
+            )
+            provenance = sb.root / ".cache" / "bench-run-provenance.txt"
+            states = [
+                json.loads(line.removeprefix("machine_state="))
+                for line in provenance.read_text().splitlines()
+                if line.startswith("machine_state=")
+            ]
+            self.assertEqual(len(states), 3)
+            self.assertTrue(
+                all(state["gate"]["status"] == "blocked" for state in states)
+            )
+
+        with _Sandbox() as sb:
+            sb.force_platform("Darwin")
+            enforcing = sb.run(
+                [sb.entry, "--fail-on-regression"],
+                BENCH_IDLE_FLOOR="0",
+                STUB_GOVERNOR_RC="2",
+            )
+            self.assertEqual(enforcing.returncode, 2, enforcing.stdout)
+            self.assertEqual(sb.machine_state_labels(), ["before base"])
+            self.assertIn(
+                "machine-state checkpoint 'before base' failed",
+                enforcing.stderr,
+            )
+            self.assertNotIn("Building + benching BASE", enforcing.stdout)
 
 
 class ContentionDiagnostics(unittest.TestCase):

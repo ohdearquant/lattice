@@ -114,6 +114,39 @@ fi
 RUN_OS="$(uname -srm)"
 PROVENANCE_FILE="$REPO/.cache/bench-run-provenance.txt"
 
+# Parse flags before any enforcement-sensitive setup. Both are optional and may
+# appear in either order, but they must precede the positional BASE/HEAD pair:
+# the first non-flag argument ends flag parsing. A flag written AFTER a ref is
+# rejected rather than silently taken as a ref. Use `--` to pass a ref that
+# legitimately begins with a dash.
+FAIL_ON_REGRESSION=0
+AFTER_DDASH=0
+while [ $# -gt 0 ]; do
+  case "${1:-}" in
+    --full)
+      QUICK_FLAGS=""
+      shift
+      ;;
+    --fail-on-regression)
+      FAIL_ON_REGRESSION=1
+      shift
+      ;;
+    --)
+      AFTER_DDASH=1
+      shift
+      break
+      ;;
+    -*)
+      echo "bench-compare.sh: unknown flag '$1'" >&2
+      echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
 # --- Refuse to measure unless the recorded supervisor is one of our ancestors ---
 # scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
 # which records its own PID here after taking both locks. This requires that PID
@@ -187,34 +220,50 @@ verify_locks() {
 }
 verify_locks
 
-# --- Ambient load gate ---
-# A lock excludes peers; it says nothing about ambient load. Both are needed.
-# Sampled at three points and refused at each: an unquiet machine before the
-# base phase invalidates the run before it costs anything, and an unquiet
-# machine after the head phase invalidates numbers that were already taken,
-# which is exactly when the temptation to keep them is strongest.
+# --- Machine-state and ambient-load gates ---
+# A lock excludes peers; it says nothing about ambient load, thermal pressure,
+# power source, or an operator actively using the machine. These checkpoints
+# settle the macOS host before every sample, then gate AC power, thermal state,
+# HID idle time, and current CPU idle. Linux CI runners have no repository
+# equivalent for the macOS hardware probes, so that limitation is recorded
+# explicitly while the portable CPU-idle gate still applies.
 QUIET_SAMPLES=""
 MACHINE_STATE_SAMPLES=""
 machine_state_probe() {
-  local label="$1" record
-  if ! record="$(
-    python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
-  )"; then
-    echo "bench-compare: machine-state probe failed at '$label' — refusing." >&2
+  local label="$1" platform record rc=0
+  if ! platform="$(uname -s)"; then
+    echo "bench-compare: could not identify the host platform — refusing." >&2
     exit 2
+  fi
+  if [ "$platform" = "Darwin" ]; then
+    record="$(
+      python3 "$REPO/scripts/perf_governor.py" \
+        --checkpoint \
+        --label "$label" \
+        --cooldown 30 \
+        --afk-threshold 30
+    )" || rc=$?
+  else
+    record="$(
+      python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
+    )" || rc=$?
   fi
   echo "[state] $label: $record"
   MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
 }$record"
+  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    echo "bench-compare: machine-state checkpoint '$label' failed — refusing to certify this A/B." >&2
+    exit 2
+  fi
 }
 
 quiet_gate() {
   local label="$1" line rc=0
+  machine_state_probe "$label"
   line="$(python3 "$REPO/scripts/lib/quiet-probe.py" --label "$label")" || rc=$?
   echo "$line"
   QUIET_SAMPLES="${QUIET_SAMPLES}${QUIET_SAMPLES:+
 }$line"
-  machine_state_probe "$label"
   if [ "$rc" -ne 0 ]; then
     echo "bench-compare: machine was not quiet at '$label' — refusing to" \
          "certify this A/B. Set BENCH_IDLE_FLOOR to judge against a" \
@@ -222,49 +271,6 @@ quiet_gate() {
     exit 2
   fi
 }
-
-# Parse flags. Both are optional and may appear in either order, but they must
-# precede the positional BASE/HEAD pair: the first non-flag argument ends flag
-# parsing. A flag written AFTER a ref is rejected rather than silently taken as
-# a ref — `bench-compare.sh HEAD~1 --full` used to resolve "--full" as HEAD_REF
-# and bench against nonsense. Use `--` to pass a ref that legitimately begins
-# with a dash.
-#
-# --fail-on-regression exists because this script is a REPORTER by default: the
-# gate invocation at the bottom captures its status into GATE_RC and re-raises
-# it only under this flag, so a confirmed regression is rendered in the report
-# while the script still exits 0. That is correct for a
-# human reading an A/B, and completely wrong for an automated lane, where a
-# green exit beside a printed FAIL means the job passes on a real regression.
-# Opt in to propagate the gate's exit code instead. Default behavior is
-# unchanged so existing callers keep their current semantics.
-FAIL_ON_REGRESSION=0
-AFTER_DDASH=0
-while [ $# -gt 0 ]; do
-  case "${1:-}" in
-    --full)
-      QUICK_FLAGS=""  # configured sample size (normally 100), ~15 min total
-      shift
-      ;;
-    --fail-on-regression)
-      FAIL_ON_REGRESSION=1
-      shift
-      ;;
-    --)
-      AFTER_DDASH=1
-      shift
-      break
-      ;;
-    -*)
-      echo "bench-compare.sh: unknown flag '$1'" >&2
-      echo "usage: bench-compare.sh [--full] [--fail-on-regression] [BASE_REF] [HEAD_REF]" >&2
-      exit 2
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
 
 BASE_REF="${1:-origin/main}"
 HEAD_REF="${2:-HEAD}"
@@ -665,7 +671,7 @@ echo "  locks:"
 echo "$LOCK_SUMMARY"
 echo "  ambient load:"
 echo "$QUIET_SAMPLES" | sed 's/^/    /'
-echo "  thermal/power:"
+echo "  machine state:"
 echo "$MACHINE_STATE_SAMPLES" | sed 's/^/    /'
 
 echo ""
