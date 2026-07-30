@@ -55,6 +55,19 @@ def _workflow_step(job: str, step_name: str) -> str:
     return job[start:end]
 
 
+def _engine_change_pattern(contents: str) -> re.Pattern[str]:
+    changes = _workflow_job(contents, "changes")
+    match = re.search(
+        r"""if\ grep\ -E\ '([^']+)'\ <<<"\$CHANGED"\ >/dev/null;\ then
+            \s+echo\ "engine=true" """,
+        changes,
+        re.VERBOSE,
+    )
+    if match is None:
+        raise AssertionError("changes job engine classifier is missing")
+    return re.compile(match.group(1))
+
+
 class ChangedFilesTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tempdir = tempfile.TemporaryDirectory()
@@ -240,6 +253,26 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             with self.subTest(workflow=relative_path):
                 contents = (_ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertIn(trigger, contents)
+
+
+class E2eParityChangeClassificationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        contents = _E2E_PARITY_WORKFLOW.read_text(encoding="utf-8")
+        cls.engine_pattern = _engine_change_pattern(contents)
+
+    def test_frozen_reference_fixture_change_is_an_engine_change(self) -> None:
+        path = (
+            "crates/inference/tests/fixtures/"
+            "e2e_parity_reference_v1/reference.json"
+        )
+
+        self.assertIsNotNone(self.engine_pattern.search(path))
+
+    def test_frozen_reference_contract_test_change_is_an_engine_change(self) -> None:
+        self.assertIsNotNone(
+            self.engine_pattern.search("tests/test_e2e_parity_reference.py")
+        )
 
 
 class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):

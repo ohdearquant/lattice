@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
-  "purpose": "Pre-committed candidate pool and selection rule for replacing parity prompts with unstable greedy decisions.",
+  "purpose": "Candidate pool and measured selection outcome for replacing parity prompts with unstable greedy decisions.",
+  "provenance_limit": "The preserved measurement outputs did not record model revision, package versions, or measurement date.",
   "measurement": {
     "thread_counts": [
       1,
@@ -19,9 +20,90 @@
     "tie_breaker": "If candidates have equal minimum margins, select the lexicographically smallest candidate id.",
     "failure": "If a pool has no eligible candidate, do not replace that prompt and do not change the margin floor or match window."
   },
+  "measurements": {
+    "short-01": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.25,
+          "15_tokens": 0.25
+        },
+        "4": {
+          "4_tokens": 0.25,
+          "15_tokens": 0.25
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "short-02": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.5,
+          "15_tokens": 0.25
+        },
+        "4": {
+          "4_tokens": 0.5,
+          "15_tokens": 0.25
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "short-03": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.1875,
+          "15_tokens": 0.1875
+        },
+        "4": {
+          "4_tokens": 0.1875,
+          "15_tokens": 0.1875
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "long-01": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 1.375,
+          "15_tokens": 1.0
+        },
+        "4": {
+          "4_tokens": 1.375,
+          "15_tokens": 1.0
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "long-02": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.25,
+          "15_tokens": 0.125
+        },
+        "4": {
+          "4_tokens": 0.25,
+          "15_tokens": 0.125
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "long-03": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.875,
+          "15_tokens": 0.875
+        },
+        "4": {
+          "4_tokens": 0.875,
+          "15_tokens": 0.875
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    }
+  },
   "pools": [
     {
       "id": "short-general-prose",
+      "selected_candidate": "short-01",
       "replaces_prompt": "In the year 2024, artificial intelligence",
       "required_property": "A short, non-code prose continuation with match_window 3.",
       "candidates": [
@@ -44,6 +126,7 @@
     },
     {
       "id": "long-prefill-python",
+      "selected_candidate": "long-01",
       "replaces_prompt_prefix": "def merge_sort(arr):",
       "required_property": "The existing approximately 816-token Python corpus followed by a fixed new-function task, with match_window 2.",
       "base_prompt_source": "LONG_PREFILL_BASE in scripts/e2e_parity_check.py",

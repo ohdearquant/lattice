@@ -1075,7 +1075,10 @@ def main() -> int:
     parser.add_argument(
         "--regenerate",
         action="store_true",
-        help="run HF live and rewrite the frozen reference fixture",
+        help=(
+            "run HF live and rewrite the frozen reference fixture; follow "
+            "docs/e2e-parity-frozen-reference.md"
+        ),
     )
     parser.add_argument(
         "--hf-reference-worker",

@@ -10,6 +10,13 @@ from pathlib import Path
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts/e2e_parity_check.py"
+ROOT = SCRIPT_PATH.parent.parent
+CANDIDATE_SELECTION_PATH = (
+    ROOT
+    / "crates/inference/tests/fixtures/e2e_parity_reference_v1/"
+    "candidate_selection.json"
+)
+RUNBOOK_PATH = ROOT / "docs/e2e-parity-frozen-reference.md"
 SPEC = importlib.util.spec_from_file_location("e2e_parity_check", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 PARITY = importlib.util.module_from_spec(SPEC)
@@ -71,6 +78,50 @@ class RegenerationDeterminismTest(unittest.TestCase):
                     PARITY.validate_regeneration_outputs(
                         runs, ["prompt"], 0.5
                     )
+
+
+class CandidateSelectionEvidenceTest(unittest.TestCase):
+    def test_every_candidate_has_thread_measurements_and_selected_winners(self):
+        selection = json.loads(CANDIDATE_SELECTION_PATH.read_text())
+        measurements = selection["measurements"]
+
+        self.assertEqual(
+            selection["provenance_limit"],
+            (
+                "The preserved measurement outputs did not record model revision, "
+                "package versions, or measurement date."
+            ),
+        )
+        candidates = {
+            candidate["id"]
+            for pool in selection["pools"]
+            for candidate in pool["candidates"]
+        }
+        self.assertEqual(set(measurements), candidates)
+        for candidate_id, measurement in measurements.items():
+            with self.subTest(candidate=candidate_id):
+                self.assertEqual(set(measurement["minimum_margin"]), {"1", "4"})
+                self.assertTrue(measurement["generated_ids_agree_across_threads"])
+                for minima in measurement["minimum_margin"].values():
+                    self.assertEqual(set(minima), {"4_tokens", "15_tokens"})
+
+        self.assertEqual(
+            {
+                pool["id"]: pool["selected_candidate"]
+                for pool in selection["pools"]
+            },
+            {
+                "short-general-prose": "short-01",
+                "long-prefill-python": "long-01",
+            },
+        )
+
+    def test_regeneration_help_and_workflow_link_to_the_runbook(self):
+        runbook = "docs/e2e-parity-frozen-reference.md"
+        self.assertTrue(RUNBOOK_PATH.is_file())
+        self.assertIn(runbook, SCRIPT_PATH.read_text())
+        workflow = (ROOT / ".github/workflows/e2e-parity.yml").read_text()
+        self.assertIn(runbook, workflow)
 
 
 if __name__ == "__main__":
