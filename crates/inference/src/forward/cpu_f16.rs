@@ -921,18 +921,7 @@ pub fn generate_f16(
     // `check_prompt_not_empty` (model::qwen35::generation).
     crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
 
-    // Sibling of `generate_multimodal_f16`'s input-id guard: tokenizer
-    // output is bounded by the tokenizer's own vocabulary, but this driver accepts
-    // `cfg` and `tokenizer` as independent parameters, so a mismatched pair can still
-    // produce a prompt id at or past `cfg.vocab_size` and panic in `forward_step_f16`'s
-    // embedding-table slice. Fail closed here, once, before any decoder state is
-    // allocated.
-    if let Some(&bad_id) = prompt_ids.iter().find(|&&id| id as usize >= cfg.vocab_size) {
-        return Err(crate::error::InferenceError::InvalidInput(format!(
-            "prompt contains out-of-vocabulary token id {bad_id} (vocab_size={})",
-            cfg.vocab_size
-        )));
-    }
+    crate::model::qwen35::check_prompt_ids_in_vocab(&prompt_ids, cfg.vocab_size)?;
 
     // max_new_tokens == 0 means "generate nothing": return before sampling so
     // we never emit a token the caller did not ask for. Mirrors the guard in
@@ -3380,7 +3369,7 @@ mod tests {
             out_hidden_size: cfg.hidden_size,
             temporal_patch_size: 1,
             num_position_embeddings: 1,
-            in_channels: 1,
+            in_channels: 3,
             deepstack_visual_indexes: vec![],
             intermediate_size: None,
         });

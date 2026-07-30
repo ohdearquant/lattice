@@ -89,6 +89,42 @@ jobs:
           CHANGED=$(./scripts/ci-changed-files.sh)
           echo "Changed files:"
           echo "$CHANGED"
+          # Markdown is stripped BEFORE classification, and the reason is that
+          # several alternations below are DIRECTORY PREFIXES rather than file
+          # patterns: tests/fixtures/vision/, crates/embed/tests/wasm/,
+          # crates/inference/tests/fixtures/{quarot_q4_composed_v1,ppl_gate_v1}/,
+          # crates/embed/tests/fixtures/{embed_parity_v1,embed_drift_baseline_v1}/,
+          # .github/actions/provision-qwen35-0-8b/ and crates/*/src/. A prefix
+          # matches ANY file placed under it, so a README inside a fixture
+          # directory classifies a documentation change as an engine change.
+          # That is not hypothetical: PR #1159 touched 50 files, ZERO of them
+          # under crates/*/src, and was classified engine=true by exactly one
+          # path — tests/fixtures/vision/README.md. It then sat BLOCKED behind
+          # the full macOS parity battery (parity, wasm, wasm-simd128, q4+vision,
+          # ppl self-test, metal ratchet) that its diff could not reach.
+          # Safe because documentation carries no compiled behaviour: no test
+          # consumes a .md as data (zero include_str! of any .md across crates/,
+          # against a control confirming include_str! is live in 9 files), and
+          # the only .md under any fixture directory is that vision README,
+          # referenced from comments rather than read.
+          # `|| true` because grep -v exits 1 when a docs-ONLY diff leaves no
+          # lines, which under `set -e` would abort the job instead of correctly
+          # classifying it as no-engine-change.
+          # Both the engine and tune classifiers read $CHANGED below, so this one
+          # reassignment covers both; crates/tune/(src|tests)/ is a directory
+          # prefix with the identical exposure.
+          DOCS_ONLY=$(grep '\.md$' <<<"$CHANGED" || true)
+          CHANGED=$(grep -v '\.md$' <<<"$CHANGED" || true)
+          # Disclose the exclusion. Without this the log prints the FULL changed
+          # list and then reports engine=false, and a reader diagnosing a skipped
+          # gate would see a fixture path in the list with no indication it was
+          # never classified.
+          if [ -n "$DOCS_ONLY" ]; then
+            echo "Excluded from classification (documentation, no compiled behaviour):"
+            echo "$DOCS_ONLY"
+          fi
+          echo "Classified against:"
+          echo "${CHANGED:-(nothing — documentation-only diff)}"
           # here-string, not `echo | grep -q`: -q exits at first match, echo gets
           # SIGPIPE, and under pipefail the pipeline reports 141 → the else branch
           # would silently skip the gate on large diffs (fail-open).
@@ -596,10 +632,10 @@ jobs:
   # own f64 forward-equivalence check (quant/quarot/forward_equivalence.rs) gates
   # the rotation-fusion math PRE-quantization; nothing previously exercised the
   # runtime consumer of a QuaRot+Q4 artifact — MetalQwen35State::from_q4_dir
-  # followed by greedy decode. This job regenerates an EPHEMERAL QuaRot+Q4
-  # artifact from the real Qwen3.5-0.8B weights, then asserts exact first-8
-  # greedy token IDs per prompt against the committed frozen lattice-self golden
-  # (crates/inference/tests/fixtures/quarot_q4_composed_v1/).
+  # followed by greedy decode. This workflow regenerates an EPHEMERAL QuaRot+Q4
+  # artifact from the real Qwen3.5-0.8B weights, hands it to macOS, then asserts
+  # exact first-8 greedy token IDs per prompt against the committed frozen
+  # lattice-self golden (crates/inference/tests/fixtures/quarot_q4_composed_v1/).
   #
   # Tolerance is exact token-ID agreement, NOT a logit tolerance: the golden is
   # generated FROM the Q4 artifact, so quantization error is already baked in and
@@ -642,25 +678,189 @@ jobs:
   # to overwrite without --update-golden). Updating it is a reviewable source
   # change that must carry rationale + mutation evidence.
   #
+  # ADR-069 S3a/S4 are portable CPU-reference gates. They used to run inside the
+  # macOS q4 job below even though their command enables only `f16`. Keep the
+  # exact fail-closed invocation and proof markers, but run it concurrently on
+  # hosted ARM Linux, whose runner pool has materially lower queue latency.
+  # S5b deliberately stays on macOS below: its f16 matmul backend is
+  # platform-specific, so Linux ARM would add coverage rather than preserve it.
+  vision-cpu-gates:
+    name: vision S3a + S4 CPU gates (ARM Linux)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: vision-cpu-pip-${{ runner.os }}-${{ runner.arch }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
+
+      - name: Install Python deps
+        run: pip install "huggingface_hub==1.20.1"
+
+      - name: Provision Qwen3.5-0.8B
+        id: provision
+        uses: ./.github/actions/provision-qwen35-0-8b
+
+      - name: Setup lattice model dir
+        run: |
+          mkdir -p ~/.lattice/models
+          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
+
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: vision-cpu-gates
+
+      - name: Run S3a + S4 CPU gates (fail-closed)
+        env:
+          LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
+          LATTICE_VISION_S3_GATE_ENFORCE: '1'
+        run: |
+          ARCH=$(uname -m)
+          echo "LATTICE_VISION_CPU_RUNNER arch=$ARCH"
+          test "$ARCH" = "aarch64"
+          # Capture to a file, then always print it while preserving cargo's
+          # status. A pipeline would let the reporter mask a gating failure.
+          if cargo test --release -p lattice-inference --features f16 \
+            --test vision_s3_vit_forward_test \
+            --test vision_s4_merger_test -- --nocapture > vision-s3-gate.log 2>&1
+          then
+            cat vision-s3-gate.log
+          else
+            status=$?
+            cat vision-s3-gate.log
+            exit "$status"
+          fi
+          grep -q 'LATTICE_VISION_S3_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S3_MUTATION_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S4_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S4_MUTATION_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S4_E2E_COSINE' vision-s3-gate.log
+          grep -q 'LATTICE_VISION_S4_E2E_MUTATION_COSINE' vision-s3-gate.log
+
+  # The QuaRot converter and its refuse-on-fail forward-equivalence check are
+  # pure f64 CPU work. Generating the 0.62 GB artifact on the macOS runner held
+  # the scarce pool for 14-18 minutes before any Metal assertion ran. Generate
+  # it on hosted ARM Linux, preserve it byte-for-byte in an uncompressed tar,
+  # and checksum the handoff. The macOS job remains the acceptance point: it
+  # loads this exact artifact through the production Metal Q4 path and compares
+  # exact greedy tokens against the frozen golden.
+  quarot-artifact:
+    name: QuaRot Q4 artifact (ARM Linux)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: quarot-artifact-pip-${{ runner.os }}-${{ runner.arch }}-py311-v1
+
+      - name: Cache HF model weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B
+          key: hf-qwen35-0.8b-${{ hashFiles('.github/actions/provision-qwen35-0-8b/action.yml') }}
+
+      - name: Install Python deps
+        run: pip install "huggingface_hub==1.20.1"
+
+      - name: Provision Qwen3.5-0.8B
+        id: provision
+        uses: ./.github/actions/provision-qwen35-0-8b
+
+      - name: Setup lattice model dir
+        run: |
+          mkdir -p ~/.lattice/models
+          ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
+
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: quarot-artifact
+
+      - name: Build QuaRot converter
+        run: cargo build --release -p lattice-inference --bin quantize_quarot --features f16
+
+      - name: Generate and verify QuaRot Q4 artifact
+        run: |
+          ARCH=$(uname -m)
+          echo "LATTICE_QUAROT_ARTIFACT_RUNNER arch=$ARCH"
+          test "$ARCH" = "aarch64"
+          if target/release/quantize_quarot \
+            --model-dir ~/.lattice/models/qwen3.5-0.8b \
+            --output-dir "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4" \
+            --seed 0xCAFE_BABE_DEAD_BEEF \
+            --num-probe-tokens 4 > quarot-convert.log 2>&1
+          then
+            cat quarot-convert.log
+          else
+            status=$?
+            cat quarot-convert.log
+            exit "$status"
+          fi
+          grep -q '^Forward-equiv:' quarot-convert.log
+          test -s "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4/quantize_index.json"
+          test -s "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4/config.json"
+          echo "LATTICE_QUAROT_ARTIFACT_READY"
+
+      - name: Package checksummed handoff
+        run: |
+          tar -C "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4" \
+            -cf "$RUNNER_TEMP/quarot-q4.tar" .
+          (
+            cd "$RUNNER_TEMP"
+            shasum -a 256 quarot-q4.tar > quarot-q4.tar.sha256
+          )
+          test -s "$RUNNER_TEMP/quarot-q4.tar"
+          test -s "$RUNNER_TEMP/quarot-q4.tar.sha256"
+
+      - name: Upload QuaRot handoff
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quarot-q4-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/quarot-q4.tar
+            ${{ runner.temp }}/quarot-q4.tar.sha256
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
   # NOTE: once this job has gone green on CI once, add "q4-composed" to the
   # repository's required status checks alongside embed-drift. That
   # governance step is intentionally not automated here.
-  # FOLDED JOB. q4-composed, vision-s3-gate and q4-ppl-quality were three
-  # separate macOS jobs whose 9-step preambles were byte-identical: checkout,
-  # python, pip cache, HF weight cache, deps, Qwen3.5-0.8B provision, model dir,
-  # toolchain, rust-cache. Each also kept its OWN rust-cache shared-key, so the
-  # same crate was built and cached three separate times. They are one job now:
-  # one model provision, one dep install, one cache, and the crate compiled
-  # twice instead of six times.
+  # FOLDED MAC JOB. q4-composed and q4-ppl-quality retain one macOS model
+  # provision, one dependency install and one cache. Portable S3a/S4 and the
+  # f64 QuaRot conversion run on ARM Linux above; S5b, the composed golden and
+  # the Metal injection/PPL gates remain here because their exercised backends
+  # are macOS-specific.
   #
-  # Twice, not once, and the reason is deliberate: the QuaRot converter is built
-  # f16-only while the other gates need f16,metal-gpu. STEP ORDER IS THEREFORE
-  # LOAD-BEARING -- the f16-only build comes first and the f16,metal-gpu build
-  # adds the feature on top; reversing them makes cargo compile a third time.
-  # The converter's feature set is NOT unified to metal-gpu on purpose. It
-  # produces the ephemeral artifact the frozen golden was generated from, so
-  # changing how it is built could change the artifact and silently move what
-  # the golden proves.
+  # STEP ORDER IS LOAD-BEARING: S5b builds f16 first, then the composed golden
+  # adds metal-gpu. Reversing them makes cargo compile a third feature set.
   #
   # metal-parity is deliberately NOT folded in: it carries a merge_group
   # exclusion the other three do not, and folding it would push that condition
@@ -671,13 +871,29 @@ jobs:
   # the fold would hide every gate after the first red one and an agent would
   # fix them one slow round-trip at a time.
   q4-vision-gates:
-    name: q4 + vision gates
-    needs: changes
+    name: q4 + macOS vision gates
+    needs: [changes, quarot-artifact]
     if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download QuaRot handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: quarot-q4-${{ github.run_id }}
+          path: ${{ runner.temp }}/quarot-handoff
+
+      - name: Verify and extract QuaRot handoff
+        run: |
+          cd "$RUNNER_TEMP/quarot-handoff"
+          shasum -a 256 -c quarot-q4.tar.sha256
+          mkdir -p "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4"
+          tar -xf quarot-q4.tar -C "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4"
+          test -s "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4/quantize_index.json"
+          test -s "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4/config.json"
+          echo "LATTICE_QUAROT_ARTIFACT_CONSUMED"
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -719,20 +935,25 @@ jobs:
         with:
           shared-key: q4-vision-gates
 
-
-      - name: Build QuaRot converter
-        run: cargo build --release -p lattice-inference --bin quantize_quarot --features f16
-
-      # Regenerate the ephemeral QuaRot+Q4 artifact (NOT committed). The frozen
-      # golden the test asserts against WAS produced from this exact conversion
-      # (same seed), so a green run proves the runtime composed path still matches.
-      - name: Generate ephemeral QuaRot Q4 artifact
+      # Keep S5b on macOS. `generate_multimodal_f16` reaches the Accelerate/AMX
+      # f16 matmul backend here, while Linux aarch64 dispatches to its scalar
+      # fallback; moving it would silently replace existing backend coverage.
+      - name: Run S5b macOS f16 gate (fail-closed)
+        if: ${{ !cancelled() }}
+        env:
+          LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
+          LATTICE_VISION_S3_GATE_ENFORCE: '1'
         run: |
-          target/release/quantize_quarot \
-            --model-dir ~/.lattice/models/qwen3.5-0.8b \
-            --output-dir "$RUNNER_TEMP/qwen3.5-0.8b-quarot-q4" \
-            --seed 0xCAFE_BABE_DEAD_BEEF \
-            --num-probe-tokens 4
+          if cargo test --release -p lattice-inference --features f16 \
+            --test vision_s5b_e2e_gate_test -- --nocapture > vision-s5b-gate.log 2>&1
+          then
+            cat vision-s5b-gate.log
+          else
+            status=$?
+            cat vision-s5b-gate.log
+            exit "$status"
+          fi
+          grep -q 'LATTICE_VISION_S5B_GREEDY_TOKENS' vision-s5b-gate.log
 
       - name: Run QuaRot Q4 composed golden gate
         if: ${{ !cancelled() }}
@@ -745,68 +966,6 @@ jobs:
             --test quarot_q4_composed_golden \
             --features "f16,metal-gpu" \
             -- --nocapture
-
-  # ADR-069 S3a + S4 required gate: real Qwen3.5-0.8B ViT forward (CPU
-  # reference) and patch-merger/projection vs the committed HF differential
-  # goldens (cosine > 0.999 each). Closes the gap a static review found: the
-  # checkpoint-gated test only ran locally, never in CI, so a
-  # patch-fold/RoPE/normalization/activation regression could land while
-  # every required check stayed green (skip-as-green gate failure).
-  # LATTICE_VISION_S3_GATE_ENFORCE=1 makes both tests panic (not skip) if the
-  # model dir is missing or invalid — same fail-closed shape as embed-drift
-  # and q4-composed. The gating `cargo test` writes directly to a log file
-  # (no pipeline), so its own non-zero exit aborts the `bash -e` step before
-  # the log is printed; the grep assertions below additionally prove the
-  # real numerical path executed for both stages (not just that the process
-  # exited 0), so a future control-flow change that turns either computation
-  # into an early return cannot silently pass this job.
-  #
-  # S4 shares this job with S3a (same checkpoint, same env, one extra
-  # `--test` binary) rather than a separate job: it reuses the checkpoint
-  # this job already downloads, so a second full checkout+download job would
-  # only add ~2 min of duplicated setup for a step that runs in seconds.
-  #
-  # S3a/S4 are the CPU-reference stages; S3b (Metal port vs the S3a CPU
-  # reference under the GPU lock) is a separate fast-follow gate. S5b
-  # (decoder injection + M-RoPE, `vision_s5b_e2e_gate_test`) shares this same
-  # job/checkpoint/env below rather than a separate job, for the same reason
-  # S4 does.
-  #
-  # NOTE: once this job has gone green on CI once, add "vision-s3-gate" to
-  # the repository's required status checks alongside embed-drift and
-  # q4-composed. That governance step is intentionally not automated here.
-
-      - name: Run S3a + S4 cosine gates (fail-closed)
-        if: ${{ !cancelled() }}
-        env:
-          LATTICE_VISION_S3_MODEL_DIR: ~/.lattice/models/qwen3.5-0.8b
-          LATTICE_VISION_S3_GATE_ENFORCE: '1'
-        run: |
-          # Capture to a file, then always print it — but preserve cargo's exit
-          # status so a test failure fails the step. A `... | tee` pipeline would
-          # NOT work here: this step sets no `shell:`, so it runs under GitHub's
-          # default `bash -e {0}` (no `pipefail`), where the pipeline takes tee's
-          # zero exit and the failure is masked. The old `> file` + bare `cat`
-          # was the opposite bug: `-e` aborted before the `cat`, hiding the
-          # output. This if/else does both — visible output AND fail-closed.
-          if cargo test --release -p lattice-inference --features f16 \
-            --test vision_s3_vit_forward_test \
-            --test vision_s4_merger_test \
-            --test vision_s5b_e2e_gate_test -- --nocapture > vision-s3-gate.log 2>&1
-          then
-            cat vision-s3-gate.log
-          else
-            status=$?
-            cat vision-s3-gate.log
-            exit "$status"
-          fi
-          grep -q 'LATTICE_VISION_S3_COSINE' vision-s3-gate.log
-          grep -q 'LATTICE_VISION_S3_MUTATION_COSINE' vision-s3-gate.log
-          grep -q 'LATTICE_VISION_S4_COSINE' vision-s3-gate.log
-          grep -q 'LATTICE_VISION_S4_MUTATION_COSINE' vision-s3-gate.log
-          grep -q 'LATTICE_VISION_S4_E2E_COSINE' vision-s3-gate.log
-          grep -q 'LATTICE_VISION_S4_E2E_MUTATION_COSINE' vision-s3-gate.log
-          grep -q 'LATTICE_VISION_S5B_GREEDY_TOKENS' vision-s3-gate.log
 
       # MP2+MP3 Metal injection gate: `forward_step_injected_logits_differ_by_row_content`,
       # `generate_multimodal_vision_injection_is_mutation_sensitive`,
@@ -896,7 +1055,7 @@ jobs:
 
   # REQUIRED status check. Always runs, always reports. Passes when the engine
   # did not change (nothing to verify); mirrors the parity, embed-drift,
-  # wasm-parity, wasm-simd128-parity, q4-composed, vision-s3-gate,
+  # wasm-parity, wasm-simd128-parity, q4-composed, S3a/S4 CPU gates,
   # ppl-gate-selftest, q4-ppl-quality, and metal-parity verdicts when it did.
   # Fails closed if change-detection itself errored. metal-parity (the metal
   # parity RATCHET — #535 is deliberately waived in the script; see the job
@@ -961,6 +1120,8 @@ jobs:
         embed-drift,
         wasm-parity,
         wasm-simd128-parity,
+        vision-cpu-gates,
+        quarot-artifact,
         q4-vision-gates,
         ppl-gate-selftest,
         metal-parity,
@@ -978,12 +1139,10 @@ jobs:
           DRIFT_RESULT="${{ needs.embed-drift.result }}"
           WASM_RESULT="${{ needs.wasm-parity.result }}"
           WASM_SIMD128_RESULT="${{ needs.wasm-simd128-parity.result }}"
-          # One variable where there were three: the QuaRot golden, the vision
-          # S3a/S4 cosine gates and the Q4 PPL regression gate now run as steps
-          # of a single job, so they report one result. Granularity is not lost
-          # in practice — each step still names itself in the job log, and the
-          # steps carry an if-not-cancelled guard so a red one does not mask the
-          # others.
+          VISION_CPU_RESULT="${{ needs.vision-cpu-gates.result }}"
+          QUAROT_ARTIFACT_RESULT="${{ needs.quarot-artifact.result }}"
+          # The QuaRot golden, S5b, Metal injection gate and Q4 PPL regression
+          # gate remain steps of one macOS job and report one result.
           Q4VISION_RESULT="${{ needs.q4-vision-gates.result }}"
           PPL_SELFTEST_RESULT="${{ needs.ppl-gate-selftest.result }}"
           METAL_RESULT="${{ needs.metal-parity.result }}"
@@ -993,19 +1152,19 @@ jobs:
           # draft branch below must never fire on merge_group, push, schedule,
           # or workflow_dispatch.
           DRAFT="${{ github.event.pull_request.draft }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT q4-vision-gates=$Q4VISION_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT vision-cpu-gates=$VISION_CPU_RESULT quarot-artifact=$QUAROT_ARTIFACT_RESULT q4-vision-gates=$Q4VISION_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
           fi
-          # Drafts skip the macOS parity jobs to keep the ~5-concurrent runner
-          # pool available to PRs that are ready to merge. Those skips reach the
-          # arm checks below as result=skipped, which is correctly not "success",
+          # Drafts skip the resource-intensive parity jobs to keep hosted runner
+          # capacity available to PRs that are ready to merge. Those skips reach
+          # the arm checks below as result=skipped, which is correctly not "success",
           # so this gate would fail anyway. It short-circuits here only so the
           # failure explains itself instead of reading as a parity regression.
           # This stays a FAILURE on purpose: a green gate has to mean parity ran.
           if [ "$DRAFT" = "true" ] && { [ "$ENGINE" = "true" ] || [ "$TUNE" = "true" ]; }; then
-            echo "::error::Draft PR: macOS parity jobs are deferred while this PR is a draft, so parity is UNVERIFIED and this gate fails by design. Mark the PR ready for review and these jobs run automatically on the ready_for_review event."
+            echo "::error::Draft PR: resource-intensive parity jobs are deferred while this PR is a draft, so parity is UNVERIFIED and this gate fails by design. Mark the PR ready for review and these jobs run automatically on the ready_for_review event."
             exit 1
           fi
           if [ "$TUNE" = "true" ] && [ "$LAYER23_RESULT" != "success" ]; then
@@ -1032,8 +1191,16 @@ jobs:
             echo "::error::Engine changed and wasm-simd128-parity gate did not succeed (result=$WASM_SIMD128_RESULT)."
             exit 1
           fi
+          if [ "$VISION_CPU_RESULT" != "success" ]; then
+            echo "::error::Engine changed and the ARM Linux S3a/S4 CPU gates did not succeed (result=$VISION_CPU_RESULT)."
+            exit 1
+          fi
+          if [ "$QUAROT_ARTIFACT_RESULT" != "success" ]; then
+            echo "::error::Engine changed and the ARM Linux QuaRot artifact job did not succeed (result=$QUAROT_ARTIFACT_RESULT)."
+            exit 1
+          fi
           if [ "$Q4VISION_RESULT" != "success" ]; then
-            echo "::error::Engine changed and the q4 + vision gates job did not succeed (result=$Q4VISION_RESULT). This one result covers the QuaRot composed golden, the vision S3a/S4 cosine gates and the Q4 PPL regression gate; open the job log to see which step failed."
+            echo "::error::Engine changed and the q4 + macOS vision gates job did not succeed (result=$Q4VISION_RESULT). This one result covers the QuaRot composed golden, S5b, Metal injection gate and Q4 PPL regression gate; open the job log to see which step failed."
             exit 1
           fi
           if [ "$PPL_SELFTEST_RESULT" != "success" ]; then
@@ -1048,5 +1215,5 @@ jobs:
               exit 1
             fi
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, q4-vision-gates, ppl-gate-selftest, and metal-parity all PASSED."
+          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, vision-cpu-gates, quarot-artifact, q4-vision-gates, ppl-gate-selftest, and metal-parity all PASSED."
           exit 0
