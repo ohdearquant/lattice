@@ -8,17 +8,23 @@ this document — hardware varies. Run the benchmarks on your target machine.
 
 ### Regression gate modes
 
-The quick comparison and full-resolution gates deliberately classify targets differently:
+Target classification and enforcement are separate:
 
-| Command                                                              | Comparison                                                                | Classification                                                                                                                    | Enforcement                                                          |
-| -------------------------------------------------------------------- | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `make bench-compare`                                                 | `origin/main` against `HEAD`, quick resolution                            | Targets listed in `scripts/lib/bench-quick-informational-targets.txt` are reported as informational; every other target is gating | Report-only unless the script is invoked with `--fail-on-regression` |
-| `scripts/bench-compare.sh --full --fail-on-regression <base> <head>` | Two explicit refs, full resolution                                        | Every measured target is gating; the quick informational manifest is ignored                                                      | A confirmed regression exits nonzero                                 |
-| `make bench-gate`                                                    | The current checkout against the `perf-baselines` branch, full resolution | Every measured result is gating; the quick informational manifest is ignored                                                      | A confirmed regression exits nonzero                                 |
+| Command                                                              | Comparison                                                                | Target classification                                                                                                          | Enforcement                                                                                                     |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `make bench-compare`                                                 | `origin/main` against `HEAD`, quick resolution                            | Targets listed in `scripts/lib/bench-quick-informational-targets.txt` are informational; every other measured target is gating | Report-only                                                                                                     |
+| `scripts/bench-compare.sh --full --fail-on-regression <base> <head>` | Two explicit refs, full resolution                                        | Every measured target is gating; the quick informational manifest is ignored                                                   | Propagates the aggregate gate status                                                                            |
+| `make bench-gate`                                                    | The current checkout against the `perf-baselines` branch, full resolution | Every measured result is gating; the quick informational manifest is ignored                                                   | Exits `1` for a missing baseline or regression, `2` when the gate cannot judge, and `0` only for a genuine pass |
 
-Informational classification does not skip measurement or remove results from the report. It only
-excludes a quick-mode target from the regression verdict. Use a full-resolution command when a
-quick-mode informational target must contribute to an enforcing decision.
+Informational classification does not skip measurement or remove results from the report. It
+excludes that quick-mode target from the regression verdict. `scripts/bench-compare.sh` is
+report-only in either resolution unless `--fail-on-regression` is supplied.
+
+Exit `2` outranks not-measurable `3`, reserved for valid ambient samples below the idle floor. The
+gate script allows first-run exit `0` only without `--require-measurements`; `make bench-gate` always
+passes it and never creates a baseline. `make bench-ci` saves one locally, and `bench-update.yml`
+updates `perf-baselines` on `main`. This closes the exact fail-open: expecting a green first run
+makes legitimate exit `2` look like tooling breakage—a lane can then go green having measured nothing.
 
 ### Embedding SIMD operations (no model download required)
 
