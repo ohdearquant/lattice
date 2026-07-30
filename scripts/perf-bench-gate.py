@@ -1020,7 +1020,8 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
                   informational_target: str | None = None,
                   provenance: RunProvenance | None = None,
                   resolution: str = "full") -> str:
-    assert results, "classifier requires at least one measured row"
+    if not results:
+        raise ValueError("classifier requires at least one measured row")
     if resolution not in ("quick", "full"):
         raise ValueError(f"unsupported benchmark resolution: {resolution}")
 
@@ -2589,7 +2590,7 @@ def main() -> int:
         )
         return finish("not_measurable", EXIT_NOT_MEASURABLE, reason)
 
-    fails = sum(1 for r in gating if r.verdict() == "FAIL")
+    fails = sum(1 for r in gating if r.verdict(args.resolution) == "FAIL")
     if fails:
         return finish(
             "regression",

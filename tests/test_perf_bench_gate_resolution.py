@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -59,7 +60,7 @@ class PerfBenchGateResolutionTests(unittest.TestCase):
                 self.assertIn("❌ FAIL", report)
                 self.assertNotIn("UNATTRIBUTABLE", report)
 
-    def test_clean_row_passes_at_both_resolutions_and_empty_refuses(self) -> None:
+    def test_clean_row_passes_at_both_resolutions(self) -> None:
         for resolution in ("quick", "full"):
             with self.subTest(resolution=resolution):
                 report = GATE.render_report(
@@ -68,8 +69,31 @@ class PerfBenchGateResolutionTests(unittest.TestCase):
                 self.assertIn("All 1 gated benches within noise band", report)
                 self.assertNotIn("WARN", report)
                 self.assertNotIn("FAIL", report)
-        with self.assertRaisesRegex(AssertionError, "at least one measured row"):
-            GATE.render_report([], "test-arch", resolution="quick")
+
+    def test_empty_results_refuse_with_and_without_optimization(self) -> None:
+        program = f"""
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("perf_bench_gate", {str(GATE_PATH)!r})
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+module.render_report([], "test-arch", resolution="quick")
+"""
+        for flags in ([], ["-O"]):
+            with self.subTest(optimized=bool(flags)):
+                completed = subprocess.run(
+                    [sys.executable, *flags, "-c", program],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertIn(
+                    "ValueError: classifier requires at least one measured row",
+                    completed.stderr,
+                )
 
 
 if __name__ == "__main__":
