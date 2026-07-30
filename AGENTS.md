@@ -221,9 +221,12 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 
 ### Bench-Compare Disposition
 
-Every PR that touches `crates/inference/` or `crates/embed/` must include a bench-compare
-disposition in its description. By default, run `make bench-compare` and paste its A/B table into
-the PR body. If the result shows no change, state that as the disposition.
+Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include a
+bench-compare disposition in its description. By default, run `make bench-compare` and paste its
+A/B table into the PR body. If the result shows no change, state that as the disposition.
+`crates/fann/` is covered because it feeds inference through the optional `mixture` feature; a
+fann-only diff that the bench build compiles out qualifies for the structural waiver below, on
+the same terms as any other diff.
 
 The only structural waiver is a diff compiled out of the bench binaries by a `cfg` gate. A waiver
 must name the gate, name the bench build's feature set, and state that the base and head bench
