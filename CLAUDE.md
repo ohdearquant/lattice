@@ -6,7 +6,7 @@ Read `AGENTS.md` first for coding conventions, crate structure, and design princ
 
 ### Measure First, Code Second
 
-Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like.
+Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like. One honesty note on `crates/fann/`: the default bench build does not enable the optional `mixture` feature, so a fann-only diff is usually compiled out of the bench binaries and its disposition will correctly be the structural waiver below — the gate still requires stating that explicitly. A fann change whose effects reach the default bench binaries (or any future mixture-enabled bench target) runs the A/B like everyone else.
 
 ```bash
 make bench-compare                         # origin/main vs HEAD (~2 min, default)
