@@ -127,6 +127,9 @@ class PerfBenchGateStatusTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 3, result.stderr)
                     payload = json.loads(status.read_text())
                     self.assertEqual(payload["verdict"], "not_measurable")
+                    self.assertEqual(
+                        payload["ambient"]["assessment"], "not_measurable"
+                    )
                     self.assertEqual(payload["ambient"]["samples"]["between"], 12.0)
                     self.assertNotIn("measurement_count", payload)
 
@@ -154,11 +157,59 @@ class PerfBenchGateStatusTests(unittest.TestCase):
                     result = _run(
                         criterion, samples, status, "lattice-inference:fixture"
                     )
-                    self.assertEqual(result.returncode, 3, result.stderr)
-                    self.assertEqual(
-                        json.loads(status.read_text())["verdict"],
-                        "not_measurable",
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    payload = json.loads(status.read_text())
+                    self.assertEqual(payload["verdict"], "error")
+                    self.assertEqual(payload["ambient"]["assessment"], "invalid")
+
+    def test_invalid_ambient_sample_streams_are_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "pass", 0.0)
+            cases = {
+                "malformed": "{not-json}\n",
+                "wrong-schema": "".join(
+                    json.dumps(
+                        {
+                            "schema": "perf-ambient-sample/v2",
+                            "phase": phase,
+                            "idle_pct": 95.0,
+                        }
                     )
+                    + "\n"
+                    for phase in PHASES
+                ),
+                "empty": "",
+            }
+            for name, contents in cases.items():
+                with self.subTest(name=name):
+                    samples = root / f"{name}.jsonl"
+                    samples.write_text(contents)
+                    status = root / f"{name}.json"
+                    result = _run(
+                        criterion, samples, status, "lattice-inference:fixture"
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    payload = json.loads(status.read_text())
+                    self.assertEqual(payload["verdict"], "error")
+                    self.assertEqual(payload["exit_code"], 2)
+                    self.assertEqual(payload["ambient"]["assessment"], "invalid")
+
+    def test_missing_ambient_sample_file_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            status = root / "status.json"
+            result = _run(
+                _criterion_root(root, "pass", 0.0),
+                root / "missing.jsonl",
+                status,
+                "lattice-inference:fixture",
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "error")
+            self.assertEqual(payload["exit_code"], 2)
+            self.assertEqual(payload["ambient"]["assessment"], "invalid")
 
     def test_non_voting_phase_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -177,7 +228,9 @@ class PerfBenchGateStatusTests(unittest.TestCase):
                 "lattice-inference:fixture",
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(status.read_text())["verdict"], "pass")
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "pass")
+            self.assertEqual(payload["ambient"]["assessment"], "valid")
 
 
 if __name__ == "__main__":

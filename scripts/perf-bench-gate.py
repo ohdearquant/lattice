@@ -124,11 +124,16 @@ DEFAULT_IDLE_FLOOR = 70.0
 class AmbientAssessment:
     samples: dict[str, float]
     floor_pct: float
+    outcome: str
     reason: str | None = None
 
     @property
     def measurable(self) -> bool:
-        return self.reason is None
+        return self.outcome == "valid"
+
+    @property
+    def instrumentation_valid(self) -> bool:
+        return self.outcome != "invalid"
 
     @property
     def minimum_pct(self) -> float | None:
@@ -155,16 +160,21 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
     """Validate the three voting ambient samples for an automated run."""
     if path is None:
         return AmbientAssessment(
-            {}, floor_pct, "ambient sample input was not provided"
+            {}, floor_pct, "invalid", "ambient sample input was not provided"
         )
     try:
         records = [line for line in path.read_text().splitlines() if line.strip()]
     except OSError as error:
         return AmbientAssessment(
-            {}, floor_pct, f"ambient sample input could not be read: {error}"
+            {},
+            floor_pct,
+            "invalid",
+            f"ambient sample input could not be read: {error}",
         )
     if not records:
-        return AmbientAssessment({}, floor_pct, "ambient sample input was empty")
+        return AmbientAssessment(
+            {}, floor_pct, "invalid", "ambient sample input was empty"
+        )
 
     samples: dict[str, float] = {}
     for line_number, line in enumerate(records, start=1):
@@ -174,18 +184,21 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
             return AmbientAssessment(
                 samples,
                 floor_pct,
+                "invalid",
                 f"ambient sample line {line_number} is malformed JSON: {error.msg}",
             )
         if not isinstance(record, dict):
             return AmbientAssessment(
                 samples,
                 floor_pct,
+                "invalid",
                 f"ambient sample line {line_number} must be a JSON object",
             )
         if record.get("schema") != AMBIENT_SAMPLE_SCHEMA:
             return AmbientAssessment(
                 samples,
                 floor_pct,
+                "invalid",
                 f"ambient sample line {line_number} has an unsupported schema",
             )
         phase = record.get("phase")
@@ -193,6 +206,7 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
             return AmbientAssessment(
                 samples,
                 floor_pct,
+                "invalid",
                 f"ambient sample line {line_number} has no valid phase",
             )
         idle_pct = record.get("idle_pct")
@@ -205,6 +219,7 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
             return AmbientAssessment(
                 samples,
                 floor_pct,
+                "invalid",
                 f"ambient sample line {line_number} has no valid idle_pct",
             )
         phase = phase.strip()
@@ -214,6 +229,7 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
             return AmbientAssessment(
                 samples,
                 floor_pct,
+                "invalid",
                 f"ambient sample phase {phase!r} was recorded more than once",
             )
         samples[phase] = float(idle_pct)
@@ -223,6 +239,7 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
         return AmbientAssessment(
             samples,
             floor_pct,
+            "invalid",
             "ambient sample input is incomplete; missing " + ", ".join(missing),
         )
     busy = [
@@ -234,10 +251,11 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
         return AmbientAssessment(
             samples,
             floor_pct,
+            "not_measurable",
             f"ambient idle was below the {floor_pct:.1f}% floor at "
             + ", ".join(busy),
         )
-    return AmbientAssessment(samples, floor_pct)
+    return AmbientAssessment(samples, floor_pct, "valid")
 
 
 def write_gate_status(
@@ -264,6 +282,7 @@ def write_gate_status(
     if ambient is not None:
         payload["ambient"] = {
             "schema": AMBIENT_SAMPLE_SCHEMA,
+            "assessment": ambient.outcome,
             "floor_pct": ambient.floor_pct,
             "minimum_idle_pct": ambient.minimum_pct,
             "samples": {
@@ -2502,6 +2521,11 @@ def main() -> int:
             EXIT_ERROR,
             f"{len(unjudged)} of {len(change_files)} comparisons could not be judged",
         )
+
+    if ambient is not None and not ambient.instrumentation_valid:
+        reason = ambient.reason or "ambient instrumentation was invalid"
+        print(f"error: {reason}", file=sys.stderr)
+        return finish("error", EXIT_ERROR, reason)
 
     if ambient is not None and not ambient.measurable:
         reason = ambient.reason or "ambient load could not be assessed"
