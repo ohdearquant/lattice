@@ -438,6 +438,6 @@ Files: `AppStore.swift`, `ChatScreen.swift`, `FaderToggle.swift`, `DomainModels.
 
 ---
 
-_Document generated from source reads. All file paths are relative to the lattice repository
-root. No build was run. All claims cite specific file and line numbers verified in the research
-phase._
+_Document generated from source reads. All file paths are absolute within the lattice repo at
+`/Users/lion/projects/khive/lattice/`. No build was run. All claims cite specific file and
+line numbers verified in the research phase._

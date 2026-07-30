@@ -8,11 +8,11 @@
 /// `model.safetensors` → f16 weights.
 ///
 /// Usage (f16):
-///   LATTICE_MODEL_DIR="${LATTICE_MODEL_CACHE:-$HOME/.lattice/models}/qwen3.5-0.8b" \
+///   LATTICE_MODEL_DIR=/Users/lion/.lattice/models/qwen3.5-0.8b \
 ///   cargo run --release --example decode_profile -p lattice-inference --features "f16,metal-gpu"
 ///
 /// Usage (Q4):
-///   LATTICE_MODEL_DIR="${LATTICE_MODEL_CACHE:-$HOME/.lattice/models}/qwen3.5-0.8b-q4" \
+///   LATTICE_MODEL_DIR=/Users/lion/.lattice/models/qwen3.5-0.8b-q4 \
 ///   cargo run --release --example decode_profile -p lattice-inference --features "f16,metal-gpu"
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]

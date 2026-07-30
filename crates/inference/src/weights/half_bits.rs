@@ -14,8 +14,6 @@
 //! F16/BF16 model loading* is gated behind the crate's `f16` feature. Only
 //! the loading permission is feature-gated, never this bit conversion math.
 
-pub(crate) use super::f16_encode::{f32_to_f16_bits, f32_to_finite_f16_bits};
-
 /// Widen an IEEE-754 binary16 (f16) bit pattern to `f32`, exactly.
 ///
 /// Handles signed zero, subnormals, infinities, and NaN (NaN payload is
@@ -50,6 +48,100 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     };
 
     f32::from_bits(f32_bits)
+}
+
+/// Round-to-nearest-even right shift used for mantissa truncation in the
+/// f32-to-f16 direction.
+#[inline]
+fn round_shift_right_even(value: u32, shift: u32) -> u32 {
+    if shift == 0 {
+        return value;
+    }
+    if shift >= 32 {
+        return 0;
+    }
+
+    let base = value >> shift;
+    let mask = (1u32 << shift) - 1;
+    let remainder = value & mask;
+    let half = 1u32 << (shift - 1);
+
+    if remainder > half || (remainder == half && (base & 1) != 0) {
+        base + 1
+    } else {
+        base
+    }
+}
+
+/// Convert `f32` to an IEEE-754 binary16 (f16) bit pattern using
+/// round-to-nearest-even.
+///
+/// Handles ±0, ±∞, NaN (payload preserved, quiet bit forced set, guaranteed
+/// non-zero mantissa), subnormals, and overflow (rounds up to ±∞).
+#[inline]
+pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) as u16) & 0x8000;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x007f_ffff;
+
+    // Inf or NaN
+    if exp == 0xff {
+        if frac == 0 {
+            return sign | 0x7c00;
+        }
+        let mut payload = (frac >> 13) as u16;
+        if payload == 0 {
+            payload = 1;
+        }
+        payload |= 0x0200;
+        return sign | 0x7c00 | (payload & 0x03ff);
+    }
+
+    // Zero or f32 subnormal (underflows to f16 zero)
+    if exp == 0 {
+        return sign;
+    }
+
+    let exp32 = exp - 127;
+
+    // Overflow to infinity
+    if exp32 > 15 {
+        return sign | 0x7c00;
+    }
+
+    // Normal f16 range
+    if exp32 >= -14 {
+        let mut exp16 = (exp32 + 15) as u16;
+        let mut frac16 = round_shift_right_even(frac, 13) as u16;
+
+        if frac16 == 0x0400 {
+            frac16 = 0;
+            exp16 += 1;
+            if exp16 >= 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+
+        return sign | (exp16 << 10) | frac16;
+    }
+
+    // Subnormal f16 range
+    let mant = frac | 0x0080_0000;
+    let shift = (-exp32 - 1) as u32;
+    if shift >= 32 {
+        return sign;
+    }
+
+    let frac16 = round_shift_right_even(mant, shift) as u16;
+    if frac16 == 0 {
+        return sign;
+    }
+    if frac16 == 0x0400 {
+        return sign | 0x0400;
+    }
+
+    sign | frac16
 }
 
 /// Widen a bfloat16 bit pattern to `f32`.

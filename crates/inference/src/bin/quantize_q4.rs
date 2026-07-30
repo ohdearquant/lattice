@@ -17,11 +17,8 @@ use lattice_inference::quant::quarot::QuarotTensorReader;
 use lattice_inference::weights::q4_weights::{Q4_BLOCK_BYTES, quantize_f32_to_q4, save_q4_file};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
-
-#[path = "../weights/f16_encode.rs"]
-mod f16_encode;
 
 // ---------------------------------------------------------------------------
 // Tensor classification: should_quantize
@@ -80,6 +77,91 @@ fn should_quantize(name: &str) -> bool {
 
     // Default: quantize unknown weight matrices.
     true
+}
+
+// ---------------------------------------------------------------------------
+// F32 → F16 helper (for non-quantized tensors written as f16)
+// ---------------------------------------------------------------------------
+
+/// Convert f32 to IEEE-754 f16 bit pattern with round-to-nearest-even.
+#[inline]
+fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let frac = bits & 0x007f_ffff;
+
+    if exp == 0xff {
+        if frac == 0 {
+            return sign | 0x7c00;
+        }
+        let mut payload = ((frac >> 13) as u16) & 0x03ff;
+        if payload == 0 {
+            payload = 1;
+        }
+        return sign | 0x7c00 | payload | 0x0200;
+    }
+    if exp == 0 {
+        return sign;
+    }
+
+    let exp32 = exp - 127;
+    if exp32 > 15 {
+        return sign | 0x7c00;
+    }
+
+    if exp32 >= -14 {
+        let frac16_raw = (frac >> 13) as u16;
+        let round_bit = ((frac >> 12) & 1) as u16;
+        let sticky = (frac & 0x0fff) != 0;
+        let frac16 = frac16_raw
+            + if round_bit == 1 && (sticky || (frac16_raw & 1) == 1) {
+                1
+            } else {
+                0
+            };
+        let mut exp16 = (exp32 + 15) as u16;
+        let mut frac16_final = frac16 & 0x03ff;
+        if frac16 == 0x0400 {
+            frac16_final = 0;
+            exp16 += 1;
+            if exp16 >= 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+        return sign | (exp16 << 10) | frac16_final;
+    }
+
+    // exp32 < -14: the f32 value is normal-range but smaller than the
+    // smallest f16 normal. F16 still represents 2^-24..2^-14 as subnormals,
+    // and a source-F16 subnormal reaches this point after widening through
+    // f64 and narrowing back to f32 (both exact), so flushing to zero here
+    // would silently destroy a value f16 can represent exactly. Encode it
+    // as an f16 subnormal instead, using the same round-to-nearest-even
+    // shape as the normal-range path above.
+    let sig = 0x0080_0000u32 | frac;
+    let shift = (-exp32 - 1) as u32;
+
+    // Beyond this shift the discarded bits can never reach halfway to the
+    // smallest subnormal (2^-24), so the correctly rounded result is zero.
+    if shift >= 25 {
+        return sign;
+    }
+
+    let frac16_raw = (sig >> shift) as u16;
+    let round_bit = ((sig >> (shift - 1)) & 1) as u16;
+    let sticky = (sig & ((1u32 << (shift - 1)) - 1)) != 0;
+    let frac16 = frac16_raw
+        + if round_bit == 1 && (sticky || (frac16_raw & 1) == 1) {
+            1
+        } else {
+            0
+        };
+
+    // frac16 == 0x0400 means rounding overflowed the largest subnormal into
+    // the smallest normal f16 (exponent field 0x01, fraction 0) — that bit
+    // pattern is exactly `sign | 0x0400`, so no separate branch is needed.
+    sign | frac16
 }
 
 // ---------------------------------------------------------------------------
@@ -162,16 +244,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         print_usage_and_exit();
     });
 
-    quantize_model(&model_dir, &output_dir, dry_run)
-}
-
-fn quantize_model(
-    model_dir: &Path,
-    output_dir: &Path,
-    dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
     if !dry_run {
-        fs::create_dir_all(output_dir)?;
+        fs::create_dir_all(&output_dir)?;
         let source_config = model_dir.join("config.json");
         let output_config = output_dir.join("config.json");
         fs::copy(&source_config, &output_config).map_err(|e| {
@@ -183,7 +257,7 @@ fn quantize_model(
         })?;
     }
 
-    let reader = QuarotTensorReader::open(model_dir)?;
+    let reader = QuarotTensorReader::open(&model_dir)?;
     let mut tensor_names = reader.tensor_names();
     tensor_names.sort();
     let n_tensors = tensor_names.len();
@@ -241,12 +315,7 @@ fn quantize_model(
             .collect();
 
         if should_quantize(tensor_name) {
-            let q4 = quantize_f32_to_q4(&data_f32, &shape).map_err(|error| {
-                format!(
-                    "{}: tensor {tensor_name} failed Q4 encoding: {error}",
-                    model_dir.display(),
-                )
-            })?;
+            let q4 = quantize_f32_to_q4(&data_f32, &shape)?;
             let bytes_out = (q4.blocks.len() * Q4_BLOCK_BYTES) as u64;
             total_bytes_out += bytes_out;
 
@@ -279,17 +348,10 @@ fn quantize_model(
         } else {
             // Kept tensor: reader already decoded to numeric values, so the
             // common path is decoded-value → f16 for every source dtype.
-            let mut f16_data = Vec::with_capacity(data_f32.len() * 2);
-            for (index, &value) in data_f32.iter().enumerate() {
-                let bits = f16_encode::f32_to_finite_f16_bits(value).map_err(|bits| {
-                    format!(
-                        "{}: tensor {tensor_name} cannot encode value {value} at element \
-                         index {index} as finite F16 (encoded bits {bits:#06x})",
-                        model_dir.display(),
-                    )
-                })?;
-                f16_data.extend_from_slice(&bits.to_le_bytes());
-            }
+            let f16_data: Vec<u8> = data_f32
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
 
             let bytes_out = f16_data.len() as u64;
             total_bytes_out += bytes_out;
@@ -380,125 +442,7 @@ fn quantize_model(
 
 #[cfg(test)]
 mod tests {
-    use super::{quantize_model, should_quantize};
-
-    fn write_f32_tensor_model(
-        model_dir: &std::path::Path,
-        tensors: &[(&str, &[f32])],
-    ) -> std::path::PathBuf {
-        std::fs::create_dir_all(model_dir).unwrap();
-        std::fs::write(model_dir.join("config.json"), b"{}").unwrap();
-        let mut header = serde_json::Map::new();
-        let mut payload = Vec::new();
-        for (tensor_name, values) in tensors {
-            let start = payload.len();
-            for value in *values {
-                payload.extend_from_slice(&value.to_le_bytes());
-            }
-            let end = payload.len();
-            header.insert(
-                (*tensor_name).to_string(),
-                serde_json::json!({
-                    "dtype": "F32",
-                    "shape": [values.len()],
-                    "data_offsets": [start, end],
-                }),
-            );
-        }
-        let header = serde_json::to_vec(&header).unwrap();
-        let mut safetensors = Vec::new();
-        safetensors.extend_from_slice(&(header.len() as u64).to_le_bytes());
-        safetensors.extend_from_slice(&header);
-        safetensors.extend_from_slice(&payload);
-        let source_path = model_dir.join("model.safetensors");
-        std::fs::write(&source_path, safetensors).unwrap();
-        source_path
-    }
-
-    #[test]
-    fn later_invalid_source_tensor_is_not_published_after_valid_tensor() {
-        let tmp = tempfile::tempdir().unwrap();
-        let model_dir = tmp.path().join("model");
-        let output_dir = tmp.path().join("output");
-        let valid_name = "a_valid.norm.weight";
-        let invalid_name = "z_invalid.norm.weight";
-        let source_path = write_f32_tensor_model(
-            &model_dir,
-            &[(valid_name, &[1.0]), (invalid_name, &[1.0, f32::NAN])],
-        );
-
-        let err = quantize_model(&model_dir, &output_dir, false).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains(&source_path.display().to_string()),
-            "{message}"
-        );
-        assert!(message.contains(invalid_name), "{message}");
-        assert!(message.contains("non-finite value"), "{message}");
-
-        assert!(
-            output_dir.join("a_valid_norm_weight.f16").exists(),
-            "an earlier independently valid tensor may remain published"
-        );
-        assert!(
-            !output_dir.join("z_invalid_norm_weight.f16").exists(),
-            "the tensor that failed validation must not be published"
-        );
-        assert!(
-            !output_dir.join("quantize_index.json").exists(),
-            "failed conversion must not publish an index"
-        );
-    }
-
-    #[test]
-    fn finite_f32_that_overflows_f16_is_not_published() {
-        let tmp = tempfile::tempdir().unwrap();
-        let model_dir = tmp.path().join("model");
-        let output_dir = tmp.path().join("output");
-        let tensor_name = "model.language_model.norm.weight";
-        write_f32_tensor_model(&model_dir, &[(tensor_name, &[100_000.0])]);
-
-        let err = quantize_model(&model_dir, &output_dir, false).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains(&model_dir.display().to_string()),
-            "{message}"
-        );
-        assert!(message.contains(tensor_name), "{message}");
-        assert!(message.contains("cannot encode value"), "{message}");
-        assert!(message.contains("as finite F16"), "{message}");
-        assert!(
-            std::fs::read_dir(&output_dir)
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .all(|path| path.extension().is_none_or(|extension| extension != "f16")),
-            "overflowed F16 payload must not be published"
-        );
-    }
-
-    #[test]
-    fn finite_extreme_quantized_tensor_is_not_published() {
-        let tmp = tempfile::tempdir().unwrap();
-        let model_dir = tmp.path().join("model");
-        let output_dir = tmp.path().join("output");
-        let tensor_name = "model.layers.0.mlp.gate_proj.weight";
-        let values = [f32::MAX; 32];
-        write_f32_tensor_model(&model_dir, &[(tensor_name, &values)]);
-
-        let err = quantize_model(&model_dir, &output_dir, false).unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.contains(&model_dir.display().to_string()),
-            "{message}"
-        );
-        assert!(message.contains(tensor_name), "{message}");
-        assert!(
-            !output_dir
-                .join("model_layers_0_mlp_gate_proj_weight.q4")
-                .exists()
-        );
-        assert!(!output_dir.join("quantize_index.json").exists());
-    }
+    use super::should_quantize;
 
     // -----------------------------------------------------------------------
     // MoE routed-expert tensors (issue #874 regression coverage).

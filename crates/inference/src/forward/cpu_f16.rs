@@ -14,8 +14,8 @@ use crate::attention::gdn_fused::{
 };
 use crate::forward::cpu::{elementwise_mul, silu_inplace};
 use crate::model::qwen35::{
-    ForwardScratch, GenerationEntryContract, GenerationPlan, GenerationPreparation, KvCache,
-    decode_tokens, prepare_generation, qwen35_rms_norm, resize, sample_token, should_stop_token,
+    ForwardScratch, KvCache, decode_tokens, qwen35_rms_norm, resize, sample_token,
+    should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::rope::RopeTable;
@@ -892,23 +892,79 @@ pub fn generate_f16(
     prompt: &str,
     gen_cfg: &GenerateConfig,
 ) -> Result<GenerateOutput, crate::error::InferenceError> {
-    let plan = match prepare_generation(
-        tokenizer,
-        prompt,
-        gen_cfg,
-        cfg.vocab_size,
-        rope.max_positions(),
-        GenerationEntryContract::StandaloneCpu,
-    )? {
-        GenerationPreparation::Ready(plan) => plan,
-        GenerationPreparation::Complete(output) => return Ok(output),
+    // Initialize RNG
+    let mut rng_state = match gen_cfg.seed {
+        Some(s) => {
+            if s == 0 {
+                1
+            } else {
+                s
+            }
+        }
+        None => {
+            use std::time::SystemTime;
+            let t = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x12345678_9abcdef0);
+            if t == 0 { 1 } else { t }
+        }
     };
-    let GenerationPlan {
-        mut rng_state,
-        prompt_ids,
-        prompt_len,
-        ..
-    } = plan;
+
+    // Tokenize prompt
+    let input = tokenizer.tokenize(prompt);
+    let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+    let prompt_len = prompt_ids.len();
+
+    // #856: single shared preflight, unified with the Metal paths (which
+    // used to accept an empty prompt and return an empty Ok) — see
+    // `check_prompt_not_empty` (model::qwen35::generation).
+    crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
+
+    crate::model::qwen35::check_prompt_ids_in_vocab(&prompt_ids, cfg.vocab_size)?;
+
+    // max_new_tokens == 0 means "generate nothing": return before sampling so
+    // we never emit a token the caller did not ask for. Mirrors the guard in
+    // Qwen35Model::generate (crates/inference/src/model/qwen35/generation.rs).
+    if gen_cfg.max_new_tokens == 0 {
+        return Ok(GenerateOutput {
+            text: String::new(),
+            token_ids: vec![],
+            prompt_tokens: prompt_len,
+            generated_tokens: 0,
+            stopped: false,
+            stop_reason: Some(StopReason::Length),
+            token_logprobs: vec![],
+        });
+    }
+
+    // Reject grammar configs before allocating any state. Grammar masking
+    // (`mask_logits` + `advance`) is not wired into this generate loop; without
+    // the guard the grammar field would be silently ignored, producing
+    // unconstrained output despite a grammar being set (#397/#398).
+    crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
+    // Same rationale for logprobs capture, which is also not wired into this
+    // generate loop (#585).
+    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
+    // Same rationale for stop_strings matching and reasoning-budget forcing,
+    // neither of which is wired into this generate loop (ADR-080 C3, #783).
+    crate::model::qwen35::check_stop_strings_not_set(gen_cfg)?;
+    crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
+
+    // Context preflight. The RoPE cos/sin tables are indexed unchecked in
+    // forward_step_f16 (`rope.cos_at(base + i)`), so a position at or past the
+    // table capacity is an out-of-bounds slice access — a release panic, not a
+    // clean error. Mirror Qwen35Model::generate's total-token policy
+    // (prompt_len + max_new_tokens <= max_context) so direct and HTTP generation
+    // agree on when a request is too long.
+    let max_context = rope.max_positions();
+    if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+        return Err(crate::error::InferenceError::Inference(format!(
+            "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+             model context window ({max_context})",
+            gen_cfg.max_new_tokens
+        )));
+    }
 
     // Initialize states
     let num_linear = cfg.num_linear_attention_layers();
@@ -2545,8 +2601,8 @@ mod tests {
     /// are sufficient (mirrors `generate_f16_rejects_grammar_config_before_sampling`
     /// below).
     ///
-    /// Mutation sensitivity: bypassing the shared preparation at this entry
-    /// point makes the function proceed past the guard with a
+    /// Mutation sensitivity: reverting the `check_prompt_not_empty` call at
+    /// this call site makes the function proceed past the guard with a
     /// zero-length prompt, either panicking in the prefill/decode loop
     /// (`all_ids.last()` on an empty vec) or producing a non-`Inference`
     /// error — this assert fails either way.

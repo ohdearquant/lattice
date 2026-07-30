@@ -732,6 +732,17 @@ kernel void copy_buf(
     dst[gid] = src[gid];
 }
 
+// ===== Add: dst += src =====
+kernel void add_buf(
+    device const float* src [[buffer(0)]],
+    device float* dst       [[buffer(1)]],
+    constant uint& count    [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= count) return;
+    dst[gid] += src[gid];
+}
+
 // ===== Fused residual add + RMS norm =====
 // Combines: residual_out = base + delta; normed_out = rms_norm(residual_out) * (1+gamma)
 // Replaces 4 dispatches (copy+add+copy+rms_norm) with 1.

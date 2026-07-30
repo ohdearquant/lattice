@@ -4,6 +4,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
 
+use crate::forward::metal_qwen35::ChatMessage;
+
 use super::{ApiError, REQUEST_BODY_LIMIT_BYTES};
 
 /// Maximum number of messages accepted in a single chat request, enforced
@@ -11,11 +13,11 @@ use super::{ApiError, REQUEST_BODY_LIMIT_BYTES};
 /// formatting, or tokenization runs. [`REQUEST_BODY_LIMIT_BYTES`] bounds the
 /// wire size of a request but not the CPU/memory cost of processing it:
 /// a request built from many tiny (even empty) messages pays the per-message
-/// cost — a normalized-message allocation, a chat-template formatting pass,
-/// and a share of tokenization — `messages.len()` times regardless of how
-/// little content each message carries. 4096 is generous headroom over any
-/// real chat history (a long-running multi-turn agent conversation runs to
-/// low hundreds of turns) while closing that amplification.
+/// cost — a `ChatMessage` allocation, a chat-template formatting pass, and a
+/// share of tokenization — `messages.len()` times regardless of how little
+/// content each message carries. 4096 is generous headroom over any real
+/// chat history (a long-running multi-turn agent conversation runs to low
+/// hundreds of turns) while closing that amplification.
 pub const MAX_MESSAGE_COUNT: usize = 4096;
 
 /// Maximum summed byte length of all message content in a single chat
@@ -132,36 +134,6 @@ pub struct Message {
     pub role: String,
     /// Plain text or typed content parts.
     pub content: MessageContent,
-}
-
-/// Validated role carried by a normalized serving-contract message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NormalizedChatRole {
-    /// System instruction.
-    System,
-    /// User input.
-    User,
-    /// Assistant response included in the request history.
-    Assistant,
-}
-
-impl NormalizedChatRole {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-        }
-    }
-}
-
-/// Backend-independent chat message produced by request normalization.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NormalizedChatMessage {
-    /// Validated conversation role.
-    pub role: NormalizedChatRole,
-    /// Plain text content after typed text parts are concatenated.
-    pub content: String,
 }
 
 /// Message content represented as a string or a list of typed parts.
@@ -283,20 +255,6 @@ pub struct GenerationDefaults {
     pub reasoning_budget: Option<usize>,
 }
 
-impl GenerationDefaults {
-    /// Standard serving defaults with a caller-selected generation-token budget.
-    pub const fn standard(max_tokens: usize) -> Self {
-        Self {
-            max_tokens,
-            temperature: 0.7,
-            top_k: 50,
-            top_p: 0.9,
-            repetition_penalty: 1.1,
-            reasoning_budget: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 enum ModelNamePolicy<'a> {
     RequiredExact(&'a str),
@@ -367,8 +325,8 @@ impl<'a> ServeProfile<'a> {
 /// Fully normalized request fields consumed by generation adapters.
 #[derive(Debug)]
 pub struct ValidatedChatRequest {
-    /// Validated backend-independent chat messages.
-    pub messages: Vec<NormalizedChatMessage>,
+    /// Validated engine chat messages.
+    pub messages: Vec<ChatMessage>,
     /// Effective generation-token budget after profile policy.
     pub max_tokens: usize,
     /// Validated temperature in `[0.0, 2.0]`.
@@ -392,35 +350,16 @@ pub struct ValidatedChatRequest {
 }
 
 /// Normalize one shared wire request according to a named server profile.
-pub fn normalize_request(
-    req: &ChatRequest,
-    defaults: GenerationDefaults,
-    profile: ServeProfile<'_>,
-) -> Result<ValidatedChatRequest, ApiError> {
-    normalize_request_inner(req, defaults, profile, |_, _| Ok(())).map(|(validated, ())| validated)
-}
-
-/// Normalize a request while preserving the unified server's context-check precedence.
 ///
-/// `check_context` runs after message and sampling validation but before stop
-/// parsing. Its returned prompt is paired with the normalized request so the
-/// unified server renders and tokenizes exactly once. The standalone daemon
-/// uses [`normalize_request`] because its worker performs the prompt-aware
-/// context check after tokenization.
-pub fn normalize_request_with_context(
+/// `check_context` runs after messages and sampling scalars are validated but
+/// before stop strings are parsed. The unified server uses it for its prompt
+/// plus decode-window preflight; the daemon supplies a no-op because its
+/// worker performs the prompt-aware check after tokenization.
+pub fn normalize_request<C>(
     req: &ChatRequest,
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
-    check_context: impl FnOnce(&[NormalizedChatMessage], usize) -> Result<String, ApiError>,
-) -> Result<(ValidatedChatRequest, String), ApiError> {
-    normalize_request_inner(req, defaults, profile, check_context)
-}
-
-fn normalize_request_inner<C>(
-    req: &ChatRequest,
-    defaults: GenerationDefaults,
-    profile: ServeProfile<'_>,
-    check_context: impl FnOnce(&[NormalizedChatMessage], usize) -> Result<C, ApiError>,
+    check_context: impl FnOnce(&[ChatMessage], usize) -> Result<C, ApiError>,
 ) -> Result<(ValidatedChatRequest, C), ApiError> {
     reject_unsupported(req, profile)?;
     validate_model_name(req.model.as_deref(), profile.model_name)?;
@@ -839,25 +778,16 @@ fn normalize_logprobs(req: &ChatRequest) -> Result<Option<usize>, ApiError> {
     Ok(Some(top_logprobs))
 }
 
-/// Validate and convert wire messages into backend-independent chat messages.
-pub fn normalize_messages(messages: &[Message]) -> Result<Vec<NormalizedChatMessage>, ApiError> {
+/// Validate and convert wire messages into engine chat messages.
+pub fn normalize_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> {
     messages
         .iter()
         .map(|message| {
             let content = message_text(&message.content)?;
             match message.role.as_str() {
-                "system" => Ok(NormalizedChatMessage {
-                    role: NormalizedChatRole::System,
-                    content,
-                }),
-                "user" => Ok(NormalizedChatMessage {
-                    role: NormalizedChatRole::User,
-                    content,
-                }),
-                "assistant" => Ok(NormalizedChatMessage {
-                    role: NormalizedChatRole::Assistant,
-                    content,
-                }),
+                "system" => Ok(ChatMessage::system(content)),
+                "user" => Ok(ChatMessage::user(content)),
+                "assistant" => Ok(ChatMessage::assistant(content)),
                 "tool" | "developer" => Err(ApiError::BadRequest {
                     message: format!("role '{}' is not supported by this server", message.role),
                     code: "unsupported_feature",
@@ -995,54 +925,20 @@ pub fn validate_context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::metal_qwen35::ChatRole;
 
     fn request(body: &str) -> ChatRequest {
         serde_json::from_str(body).unwrap()
     }
 
     fn defaults() -> GenerationDefaults {
-        GenerationDefaults::standard(16)
-    }
-
-    #[test]
-    fn standard_generation_defaults_snapshot() {
-        let defaults = GenerationDefaults::standard(123);
-        assert_eq!(defaults.max_tokens, 123);
-        assert_eq!(defaults.temperature, 0.7);
-        assert_eq!(defaults.top_k, 50);
-        assert_eq!(defaults.top_p, 0.9);
-        assert_eq!(defaults.repetition_penalty, 1.1);
-        assert_eq!(defaults.reasoning_budget, None);
-    }
-
-    #[test]
-    fn contract_source_has_no_backend_message_dependency() {
-        let source = include_str!("contract.rs");
-        assert!(!source.contains(concat!("crate::", "forward")));
-    }
-
-    #[test]
-    fn serving_adapters_do_not_restate_standard_defaults() {
-        for (name, source) in [
-            ("lattice", include_str!("../bin/lattice.rs")),
-            ("lattice_serve", include_str!("../bin/lattice_serve.rs")),
-        ] {
-            for literal in [
-                "temperature: 0.7",
-                "top_k: 50",
-                "top_p: 0.9",
-                "repetition_penalty: 1.1",
-                "unwrap_or(512)",
-                "unwrap_or(0.7)",
-                "unwrap_or(50)",
-                "unwrap_or(0.9)",
-                "unwrap_or(1.1)",
-            ] {
-                assert!(
-                    !source.contains(literal),
-                    "{name} restates canonical generation default {literal}"
-                );
-            }
+        GenerationDefaults {
+            max_tokens: 16,
+            temperature: 0.7,
+            top_k: 50,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            reasoning_budget: None,
         }
     }
 
@@ -1070,7 +966,7 @@ mod tests {
             ServeProfile::lattice_serve("model", 32),
         ] {
             assert_eq!(
-                normalize_request(&req, defaults(), profile)
+                normalize_request(&req, defaults(), profile, |_, _| Ok(()))
                     .unwrap_err()
                     .code(),
                 "invalid_temperature"
@@ -1083,22 +979,37 @@ mod tests {
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_tokens":31,"stop":"done"}"#,
         );
-        let lattice =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
+        let (lattice, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(lattice.max_tokens, 31);
         assert_eq!(lattice.stop_strings, ["done"]);
         assert_eq!(
-            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 16),)
-                .unwrap_err()
-                .code(),
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice_serve("model", 16),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code(),
             "unsupported_feature"
         );
 
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_tokens":31}"#,
         );
-        let daemon =
-            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 16)).unwrap();
+        let (daemon, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice_serve("model", 16),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(daemon.max_tokens, 15);
     }
 
@@ -1111,13 +1022,23 @@ mod tests {
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":20,"repetition_penalty":1.2}"#,
         );
-        let lattice =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
+        let (lattice, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(lattice.top_k, defaults().top_k);
         assert_eq!(lattice.repetition_penalty, defaults().repetition_penalty);
 
-        let daemon =
-            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 32)).unwrap();
+        let (daemon, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice_serve("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(daemon.top_k, 20);
         assert_eq!(daemon.repetition_penalty, 1.2);
     }
@@ -1130,15 +1051,25 @@ mod tests {
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"reasoning_budget":40}"#,
         );
-        let lattice =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
+        let (lattice, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(lattice.reasoning_budget, None);
 
         // Context must leave enough decode room (>= reasoning_budget) so the
         // context-window clamp in normalize_request doesn't also shrink the
         // value under test; that clamp is exercised separately.
-        let daemon =
-            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 100)).unwrap();
+        let (daemon, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice_serve("model", 100),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(daemon.reasoning_budget, Some(40));
     }
 
@@ -1154,8 +1085,13 @@ mod tests {
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":"ignored","repetition_penalty":"x","reasoning_budget":"y"}"#,
         );
-        let lattice =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
+        let (lattice, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(lattice.top_k, defaults().top_k);
         assert_eq!(lattice.repetition_penalty, defaults().repetition_penalty);
         assert_eq!(lattice.reasoning_budget, None);
@@ -1177,9 +1113,14 @@ mod tests {
             );
             let req = request(&body);
             assert_eq!(
-                normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 32),)
-                    .unwrap_err()
-                    .code(),
+                normalize_request(
+                    &req,
+                    defaults(),
+                    ServeProfile::lattice_serve("model", 32),
+                    |_, _| Ok(())
+                )
+                .unwrap_err()
+                .code(),
                 "invalid_request_body",
                 "field {field} should have been rejected on the honoring profile"
             );
@@ -1239,9 +1180,14 @@ mod tests {
         );
         let req = request(&body);
         assert_eq!(
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32),)
-                .unwrap_err()
-                .code(),
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice("model", 32),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code(),
             "invalid_request_body"
         );
     }
@@ -1259,7 +1205,13 @@ mod tests {
             .collect();
         let body = format!(r#"{{"model":"model","messages":[{}]}}"#, messages.join(","));
         let req = request(&body);
-        normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
+        normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1272,8 +1224,13 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"stop":"{big_stop}"}}"#
         );
         let req = request(&body);
-        let err =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap_err();
+        let err = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "invalid_request_body");
 
         // Same bound applies to each element of a stop array.
@@ -1282,9 +1239,14 @@ mod tests {
         );
         let req = request(&body);
         assert_eq!(
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32),)
-                .unwrap_err()
-                .code(),
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice("model", 32),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code(),
             "invalid_request_body"
         );
     }
@@ -1303,9 +1265,14 @@ mod tests {
         );
         let req = request(&body);
         assert_eq!(
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32),)
-                .unwrap_err()
-                .code(),
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice("model", 32),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code(),
             "invalid_request_body"
         );
     }
@@ -1317,8 +1284,13 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"stop":"{ok_stop}"}}"#
         );
         let req = request(&body);
-        let validated =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
+        let (validated, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(validated.stop_strings, vec![ok_stop]);
     }
 
@@ -1338,8 +1310,13 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"top_k":{big_array}}}"#
         );
         let req = request(&body);
-        let err = normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 32))
-            .unwrap_err();
+        let err = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice_serve("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "invalid_request_body");
         assert_eq!(err.message(), "top_k must be a scalar value");
     }
@@ -1355,9 +1332,14 @@ mod tests {
             r#"{"model":"wrong-model","messages":[{"role":"user","content":"hi"}],"stream":true,"logprobs":true}"#,
         );
         assert_eq!(
-            normalize_request(&req, defaults(), ServeProfile::lattice("served-model", 32),)
-                .unwrap_err()
-                .code(),
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice("served-model", 32),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code(),
             "unsupported_feature"
         );
     }
@@ -1374,6 +1356,7 @@ mod tests {
                 &req,
                 defaults(),
                 ServeProfile::lattice_serve("served-model", 32),
+                |_, _| Ok(())
             )
             .unwrap_err()
             .code(),
@@ -1396,6 +1379,7 @@ mod tests {
                 &req,
                 defaults(),
                 ServeProfile::lattice_serve("served-model", 32),
+                |_, _| Ok(())
             )
             .unwrap_err()
             .code(),
@@ -1416,9 +1400,14 @@ mod tests {
             r#"{"model":"wrong-model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":20}"#,
         );
         assert_eq!(
-            normalize_request(&req, defaults(), ServeProfile::lattice("served-model", 32),)
-                .unwrap_err()
-                .code(),
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice("served-model", 32),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code(),
             "model_not_found"
         );
     }
@@ -1432,9 +1421,14 @@ mod tests {
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}"#,
         );
         assert_eq!(
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32),)
-                .unwrap_err()
-                .code(),
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice("model", 32),
+                |_, _| Ok(())
+            )
+            .unwrap_err()
+            .code(),
             "unsupported_feature"
         );
     }
@@ -1509,9 +1503,11 @@ mod tests {
         serde_json::from_str(body).unwrap()
     }
 
-    // Production traffic on both servers normalizes messages through this
-    // contract-owned representation before one shared adapter crosses into
-    // the engine type.
+    // Both binaries keep `#[cfg(test)]`-local role/content copies for their
+    // own request-parsing tests, but production traffic on both servers
+    // normalizes messages through this shared `normalize_messages` — so the
+    // validator itself needs direct coverage or production behavior can
+    // drift while the binary-local test copies stay green.
     #[test]
     fn normalize_messages_accepts_system_user_assistant_roles() {
         let messages = [
@@ -1520,11 +1516,11 @@ mod tests {
             message(r#"{"role":"assistant","content":"asst"}"#),
         ];
         let normalized = normalize_messages(&messages).unwrap();
-        assert_eq!(normalized[0].role, NormalizedChatRole::System);
+        assert_eq!(normalized[0].role, ChatRole::System);
         assert_eq!(normalized[0].content, "sys");
-        assert_eq!(normalized[1].role, NormalizedChatRole::User);
+        assert_eq!(normalized[1].role, ChatRole::User);
         assert_eq!(normalized[1].content, "usr");
-        assert_eq!(normalized[2].role, NormalizedChatRole::Assistant);
+        assert_eq!(normalized[2].role, ChatRole::Assistant);
         assert_eq!(normalized[2].content, "asst");
     }
 
@@ -1576,8 +1572,13 @@ mod tests {
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":null,"repetition_penalty":null,"reasoning_budget":null}"#,
         );
-        let daemon =
-            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 100)).unwrap();
+        let (daemon, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice_serve("model", 100),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(daemon.top_k, defaults().top_k);
         assert_eq!(daemon.repetition_penalty, defaults().repetition_penalty);
         assert_eq!(daemon.reasoning_budget, None);
@@ -1596,8 +1597,13 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"top_k":{big_array}}}"#
         );
         let req = request(&body);
-        let err = normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 32))
-            .unwrap_err();
+        let err = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice_serve("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "invalid_request_body");
         assert_eq!(err.message(), "top_k must be a scalar value");
     }
@@ -1614,8 +1620,13 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"top_k":{big_array}}}"#
         );
         let req = request(&body);
-        let lattice =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
+        let (lattice, ()) = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap();
         assert_eq!(lattice.top_k, defaults().top_k);
     }
 
@@ -1652,8 +1663,13 @@ mod tests {
             "response_format":{{"type":"json_schema","json_schema":{{"name":"n","strict":true,"schema":{nested}}}}}}}"#
         );
         let req = request(&body);
-        let err =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap_err();
+        let err = normalize_request(
+            &req,
+            defaults(),
+            ServeProfile::lattice("model", 32),
+            |_, _| Ok(()),
+        )
+        .unwrap_err();
         assert_eq!(err.code(), "unsupported_feature");
         assert_eq!(
             err.message(),

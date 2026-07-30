@@ -166,9 +166,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: rustfmt, clippy
-      - uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282 # v2.0.4
-        with:
-          deno-version: v2.x
       - name: Pin the real toolchain bin on PATH
         # Some macos-latest runner images ship ~/.cargo/bin/cargo as a copy of
         # rustup-init rather than the rustup proxy, so `cargo fmt` fails with

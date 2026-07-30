@@ -88,7 +88,6 @@ mod imp {
     use lattice_inference::serve::contract::{
         ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, normalize_messages,
     };
-    use lattice_inference::serve::into_engine_chat_messages;
     use lattice_inference::serve::metal_worker::{
         ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
         WorkerMetadata,
@@ -147,11 +146,22 @@ mod imp {
         }
     }
 
+    /// Server-side sampling defaults, overridable per-request.
+    #[derive(Clone)]
+    struct Defaults {
+        max_tokens: usize,
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        repetition_penalty: f32,
+        reasoning_budget: Option<usize>,
+    }
+
     #[derive(Clone)]
     pub struct AppState {
         jobs: MetalWorkerClient,
         model_id: Arc<str>,
-        defaults: GenerationDefaults,
+        defaults: Defaults,
         /// Runtime context window derived from the loaded model (#551): the
         /// exact KV cache length `load_model` allocated, never a hard-coded
         /// constant. See `model_context_from_config` and `build_cfg`.
@@ -1072,11 +1082,12 @@ mod imp {
 
     #[cfg(test)]
     impl MessageRole {
-        /// ADR-080 C2: mirrors the shared contract's role classification:
-        /// `tool`/`developer` are real OpenAI roles this server does not
-        /// implement (`unsupported_feature`), while anything else is not an
-        /// OpenAI chat role at all (`invalid_role`). Previously both collapsed
-        /// to one generic message with no code differentiation.
+        /// ADR-080 C2: differentiates the same
+        /// two cases `lattice.rs`'s `ValidatedRole::parse` does -- `tool`/
+        /// `developer` are real OpenAI roles this server does not implement
+        /// (`unsupported_feature`), while anything else is not an OpenAI
+        /// chat role at all (`invalid_role`). Previously both collapsed to
+        /// one generic message with no code differentiation.
         fn parse(raw: &str) -> Result<Self, RequestError> {
             match raw {
                 "system" => Ok(Self::System),
@@ -1923,10 +1934,19 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
-        let validated = match normalize_request(
+        let defaults = GenerationDefaults {
+            max_tokens: s.defaults.max_tokens,
+            temperature: s.defaults.temperature,
+            top_k: s.defaults.top_k,
+            top_p: s.defaults.top_p,
+            repetition_penalty: s.defaults.repetition_penalty,
+            reasoning_budget: s.defaults.reasoning_budget,
+        };
+        let (validated, ()) = match normalize_request(
             &req,
-            s.defaults,
+            defaults,
             ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context),
+            |_, _| Ok(()),
         ) {
             Ok(validated) => validated,
             Err(err) => {
@@ -1983,7 +2003,7 @@ mod imp {
             cfg.enable_thinking = false;
         }
         let streaming = validated.stream;
-        let messages = into_engine_chat_messages(validated.messages);
+        let messages = validated.messages;
         let cfg = cfg;
         let model_id = s.model_id.to_string();
         let id = format!("chatcmpl-{}", unix_nanos());
@@ -2765,23 +2785,22 @@ mod imp {
             })
             .unwrap_or(11435);
 
-        let standard_defaults = GenerationDefaults::standard(512);
-        let defaults = GenerationDefaults {
+        let defaults = Defaults {
             max_tokens: parse_arg(&args, "--max-tokens")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.max_tokens),
+                .unwrap_or(512),
             temperature: parse_arg(&args, "--temperature")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.temperature),
+                .unwrap_or(0.7),
             top_k: parse_arg(&args, "--top-k")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.top_k),
+                .unwrap_or(50),
             top_p: parse_arg(&args, "--top-p")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.top_p),
+                .unwrap_or(0.9),
             repetition_penalty: parse_arg(&args, "--repetition-penalty")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(standard_defaults.repetition_penalty),
+                .unwrap_or(1.1),
             reasoning_budget: parse_arg(&args, "--reasoning-budget")
                 .and_then(|s| s.parse().ok())
                 .filter(|&n| n > 0),
@@ -2964,15 +2983,24 @@ mod imp {
 
         fn normalize_for_cfg(
             req: &ChatReq,
-            defaults: &GenerationDefaults,
+            defaults: &Defaults,
             model_max_context: usize,
         ) -> ValidatedChatRequest {
             normalize_request(
                 req,
-                *defaults,
+                GenerationDefaults {
+                    max_tokens: defaults.max_tokens,
+                    temperature: defaults.temperature,
+                    top_k: defaults.top_k,
+                    top_p: defaults.top_p,
+                    repetition_penalty: defaults.repetition_penalty,
+                    reasoning_budget: defaults.reasoning_budget,
+                },
                 ServeProfile::lattice_serve("", model_max_context),
+                |_, _| Ok(()),
             )
             .unwrap()
+            .0
         }
 
         // NOTE (issue #832): the FIFO/cancellation/window-check worker-loop
@@ -3016,7 +3044,14 @@ mod imp {
                 AppState {
                     jobs,
                     model_id: Arc::from("marker-test-model"),
-                    defaults: GenerationDefaults::standard(100),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
                     model_max_context: 4096,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -3031,7 +3066,7 @@ mod imp {
         // ── #641 / #649 request parsing and clamp tests ──────────────────
 
         #[test]
-        fn message_content_plain_string_normalizes() {
+        fn message_content_plain_string_to_chat_message() {
             let msg = InMsg {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
@@ -3040,7 +3075,7 @@ mod imp {
                 .expect("plain string content must parse");
             assert_eq!(
                 chat_message[0].role,
-                lattice_inference::serve::contract::NormalizedChatRole::User
+                lattice_inference::forward::metal_qwen35::ChatRole::User
             );
             assert_eq!(chat_message[0].content, "hi");
         }
@@ -3100,8 +3135,8 @@ mod imp {
 
         #[test]
         fn message_role_unknown_rejected() {
-            // Not an OpenAI chat role at all -- `invalid_role`, matching the
-            // shared contract's production normalization for the same case.
+            // Not an OpenAI chat role at all -- `invalid_role`, matching
+            // `lattice.rs`'s `ValidatedRole::parse` for the same case.
             let err = MessageRole::parse("moderator").unwrap_err();
             assert_eq!(
                 err.message(),
@@ -3166,9 +3201,13 @@ mod imp {
 
         #[test]
         fn build_cfg_clamps_to_runtime_context() {
-            let defaults = GenerationDefaults {
+            let defaults = Defaults {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 0.9,
+                repetition_penalty: 1.1,
                 reasoning_budget: Some(50),
-                ..GenerationDefaults::standard(100)
             };
             let req = ChatReq {
                 model: None,
@@ -3306,7 +3345,14 @@ mod imp {
             AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: GenerationDefaults::standard(100),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3718,7 +3764,14 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: GenerationDefaults::standard(100),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3765,7 +3818,14 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: GenerationDefaults::standard(100),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3804,7 +3864,14 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: GenerationDefaults::standard(100),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3846,7 +3913,14 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: GenerationDefaults::standard(100),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3893,7 +3967,14 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: GenerationDefaults::standard(100),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -4610,7 +4691,14 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: GenerationDefaults::standard(100),
+                defaults: Defaults {
+                    max_tokens: 100,
+                    temperature: 0.7,
+                    top_k: 50,
+                    top_p: 0.9,
+                    repetition_penalty: 1.1,
+                    reasoning_budget: None,
+                },
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -5042,7 +5130,14 @@ mod imp {
                 AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
-                    defaults: GenerationDefaults::standard(100),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -5141,7 +5236,14 @@ mod imp {
                 let state = AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
-                    defaults: GenerationDefaults::standard(100),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
                     model_max_context: 4096,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -5232,7 +5334,14 @@ mod imp {
 
         #[test]
         fn build_cfg_aliases_max_completion_tokens_when_max_tokens_absent() {
-            let defaults = GenerationDefaults::standard(100);
+            let defaults = Defaults {
+                max_tokens: 100,
+                temperature: 0.7,
+                top_k: 50,
+                top_p: 0.9,
+                repetition_penalty: 1.1,
+                reasoning_budget: None,
+            };
             let req = ChatReq {
                 model: None,
                 messages: vec![InMsg {
@@ -5369,7 +5478,14 @@ mod imp {
                 AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
-                    defaults: GenerationDefaults::standard(100),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -5556,7 +5672,14 @@ mod imp {
                 let state = AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
-                    defaults: GenerationDefaults::standard(100),
+                    defaults: Defaults {
+                        max_tokens: 100,
+                        temperature: 0.7,
+                        top_k: 50,
+                        top_p: 0.9,
+                        repetition_penalty: 1.1,
+                        reasoning_budget: None,
+                    },
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -5579,7 +5702,7 @@ mod imp {
 
             /// The `GenerateConfig` `lattice_serve.rs`'s real `build_cfg` must
             /// produce for the fixed request `run_observed` sends, given
-            /// `run_observed`'s `GenerationDefaults` above: every explicitly-set field
+            /// `run_observed`'s `Defaults` above: every explicitly-set field
             /// mirrors the request; `build_cfg` always sets the remaining
             /// fields (`stop_token_ids`, `enable_thinking`, `enable_mtp`,
             /// `grammar`, `reasoning_budget`, `logprobs`, `stop_strings`) to

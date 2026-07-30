@@ -109,7 +109,6 @@ PROVENANCE_FIELDS = (
 WARN_PCT = 3.0   # CI-lower above this => warning
 FAIL_PCT = 7.0   # CI-lower above this => FAIL
 CELEBRATE_PCT = -3.0  # point estimate below this AND CI-upper<0 => celebrate
-QUICK_UNATTRIBUTABLE = "UNATTRIBUTABLE (quick resolution)"
 
 EXIT_PASS = 0
 EXIT_REGRESSION = 1
@@ -331,12 +330,10 @@ class BenchResult:
     def is_informational(self, target: str | None, informational_target: str | None) -> bool:
         return target is not None and target == informational_target
 
-    def verdict(self, resolution: str = "full") -> str:
+    def verdict(self) -> str:
         if self.ci_low_pct > FAIL_PCT:
             return "FAIL"
         if self.ci_low_pct > WARN_PCT:
-            if resolution == "quick":
-                return QUICK_UNATTRIBUTABLE
             return "WARN"
         if self.point_pct < CELEBRATE_PCT and self.ci_high_pct < 0:
             return "WIN"
@@ -1018,13 +1015,7 @@ def render_run_provenance(
 
 def render_report(results: list[BenchResult], arch: str, target: str | None = None,
                   informational_target: str | None = None,
-                  provenance: RunProvenance | None = None,
-                  resolution: str = "full") -> str:
-    if not results:
-        raise ValueError("classifier requires at least one measured row")
-    if resolution not in ("quick", "full"):
-        raise ValueError(f"unsupported benchmark resolution: {resolution}")
-
+                  provenance: RunProvenance | None = None) -> str:
     gated = [
         r for r in results
         if not r.is_informational(target, informational_target)
@@ -1034,19 +1025,13 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
         if r.is_informational(target, informational_target)
     ]
 
-    fails = [r for r in gated if r.verdict(resolution) == "FAIL"]
-    warns = [r for r in gated if r.verdict(resolution) == "WARN"]
-    unattributable = [
-        r for r in gated if r.verdict(resolution) == QUICK_UNATTRIBUTABLE
-    ]
-    wins = [r for r in gated if r.verdict(resolution) == "WIN"]
+    fails = [r for r in gated if r.verdict() == "FAIL"]
+    warns = [r for r in gated if r.verdict() == "WARN"]
+    wins = [r for r in gated if r.verdict() == "WIN"]
 
-    info_fails = [r for r in info if r.verdict(resolution) == "FAIL"]
-    info_warns = [r for r in info if r.verdict(resolution) == "WARN"]
-    info_unattributable = [
-        r for r in info if r.verdict(resolution) == QUICK_UNATTRIBUTABLE
-    ]
-    info_wins = [r for r in info if r.verdict(resolution) == "WIN"]
+    info_fails = [r for r in info if r.verdict() == "FAIL"]
+    info_warns = [r for r in info if r.verdict() == "WARN"]
+    info_wins = [r for r in info if r.verdict() == "WIN"]
 
     lines = [f"### `{arch}` — perf regression report\n"]
     if fails:
@@ -1059,39 +1044,25 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% by the same "
             "two-sided-95%-CI lower bound)"
         )
-    if unattributable:
-        lines.append(
-            f"**◻ {len(unattributable)} UNATTRIBUTABLE** (quick-resolution "
-            f"{WARN_PCT}-{FAIL_PCT}% warn band is narrower than the harness's "
-            "measured arm-order bias)"
-        )
     if wins:
         lines.append(f"**🚀 {len(wins)} confirmed improvement**")
-    if not (fails or warns or unattributable or wins):
+    if not (fails or warns or wins):
         lines.append(f"✅ All {len(gated)} gated benches within noise band (±{WARN_PCT}%)")
     lines.append("")
     lines.extend(render_run_provenance(provenance, results))
 
-    if fails or warns or unattributable or wins:
+    if fails or warns or wins:
         lines.append(
             "| Bench | Δ point | 95% CI | new ns | base ns | base n/mode | "
             "head n/mode | verdict |"
         )
         lines.append("|---|---:|---|---:|---:|---|---|---|")
-        for r in sorted(
-            fails + warns + unattributable + wins, key=lambda r: -r.ci_low_pct
-        ):
-            verdict = r.verdict(resolution)
-            icon = {
-                "FAIL": "❌",
-                "WARN": "⚠",
-                QUICK_UNATTRIBUTABLE: "◻",
-                "WIN": "🚀",
-            }[verdict]
+        for r in sorted(fails + warns + wins, key=lambda r: -r.ci_low_pct):
+            icon = {"FAIL": "❌", "WARN": "⚠", "WIN": "🚀"}[r.verdict()]
             lines.append(
                 f"| `{r.name}` | {r.point_pct:+.2f}% | [{r.ci_low_pct:+.2f}%, {r.ci_high_pct:+.2f}%] "
                 f"| {r.new_ns:.1f} | {r.old_ns:.1f} | {sample_cell(r, 'base')} "
-                f"| {sample_cell(r, 'head')} | {icon} {verdict} |"
+                f"| {sample_cell(r, 'head')} | {icon} {r.verdict()} |"
             )
         lines.append("")
 
@@ -1101,27 +1072,18 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             f"lattice-embed SIMD micro-benches, tracked in #714; not gated here, "
             f"re-run `--full` for a gated verdict)"
         )
-        if info_fails or info_warns or info_unattributable or info_wins:
+        if info_fails or info_warns or info_wins:
             lines.append(
                 "| Bench | Δ point | 95% CI | new ns | base ns | base n/mode | "
                 "head n/mode | (would-be verdict) |"
             )
             lines.append("|---|---:|---|---:|---:|---|---|---|")
-            for r in sorted(
-                info_fails + info_warns + info_unattributable + info_wins,
-                key=lambda r: -r.ci_low_pct,
-            ):
-                verdict = r.verdict(resolution)
-                icon = {
-                    "FAIL": "❌",
-                    "WARN": "⚠",
-                    QUICK_UNATTRIBUTABLE: "◻",
-                    "WIN": "🚀",
-                }[verdict]
+            for r in sorted(info_fails + info_warns + info_wins, key=lambda r: -r.ci_low_pct):
+                icon = {"FAIL": "❌", "WARN": "⚠", "WIN": "🚀"}[r.verdict()]
                 lines.append(
                     f"| `{r.name}` | {r.point_pct:+.2f}% | [{r.ci_low_pct:+.2f}%, {r.ci_high_pct:+.2f}%] "
                     f"| {r.new_ns:.1f} | {r.old_ns:.1f} | {sample_cell(r, 'base')} "
-                    f"| {sample_cell(r, 'head')} | {icon} {verdict} (informational) |"
+                    f"| {sample_cell(r, 'head')} | {icon} {r.verdict()} (informational) |"
                 )
         lines.append("")
 
@@ -1137,18 +1099,10 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             f"| {sample_cell(r, 'head')} |"
         )
     lines.append("\n</details>\n")
-    if resolution == "quick":
-        lines.append(
-            f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
-            f"({WARN_PCT}%, {FAIL_PCT}%] is unattributable at quick resolution "
-            "because measured arm-order bias is wider than this band; "
-            f">{FAIL_PCT}% fails._"
-        )
-    else:
-        lines.append(
-            f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
-            f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
-        )
+    lines.append(
+        f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
+        f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
+    )
     if informational_target is not None:
         lines.append(
             f"_Target `{informational_target}` classified informational-only in quick mode "
@@ -2183,9 +2137,6 @@ def main() -> int:
     ap.add_argument("--informational-target",
                     help="Classify this exact target as informational-only. Must equal --target; "
                          "omit for gating/full-mode runs.")
-    ap.add_argument("--resolution", choices=("quick", "full"), default="full",
-                    help="Measurement resolution used for verdict classification "
-                         "(default: full).")
     ap.add_argument("--require-measurements", action="store_true",
                     help="Fail (exit 2) instead of passing when the run produced no gating "
                          "comparison to judge or a selected-base benchmark has no head "
@@ -2538,13 +2489,7 @@ def main() -> int:
             )
 
     report = render_report(
-        results,
-        args.arch,
-        args.target,
-        args.informational_target,
-        provenance,
-        args.resolution,
-    )
+        results, args.arch, args.target, args.informational_target, provenance)
     print(report)
     if args.out:
         args.out.write_text(report)
@@ -2590,7 +2535,7 @@ def main() -> int:
         )
         return finish("not_measurable", EXIT_NOT_MEASURABLE, reason)
 
-    fails = sum(1 for r in gating if r.verdict(args.resolution) == "FAIL")
+    fails = sum(1 for r in gating if r.verdict() == "FAIL")
     if fails:
         return finish(
             "regression",

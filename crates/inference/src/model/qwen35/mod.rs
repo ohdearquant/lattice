@@ -15,7 +15,6 @@ pub(crate) mod detokenize;
 mod eval;
 mod forward;
 mod generation;
-mod generation_setup;
 mod loading;
 mod model;
 mod moe;
@@ -57,22 +56,23 @@ pub(crate) use generation::check_logprobs_not_set;
 // Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
 // paths (ADR-080 C3, #783).
 pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
-pub(crate) use generation_setup::{
-    GenerationEntryContract, GenerationPlan, GenerationPreparation, prepare_generation,
-};
 // Shared empty-prompt preflight (#856): every CPU forward path (cpu_q8,
 // cpu_f16, neon_forward) and every Metal generation entry point
 // (forward::metal_qwen35) calls this instead of its own inline
 // `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
 pub(crate) use generation::check_prompt_not_empty;
+// Shared prompt-token admission guard for standalone CPU drivers whose
+// tokenizer and model config are supplied independently (#1083).
+pub(crate) use generation::check_prompt_ids_in_vocab;
 // Shared total-context admission bound (#922): every Metal generation entry
 // point (forward::metal_qwen35) calls this after check_prompt_not_empty to
 // mirror the CPU `generate`/`generate_streaming` total bound
 // (prompt_len + decode budget <= max_context), instead of only bounding the
 // prompt alone. Only the Metal (`mod inner`, gated identically) consumer
-// needs the re-export; the standalone CPU paths (cpu_f16, cpu_q8,
-// neon_forward) enforce the same bound through `prepare_generation`, and
-// `generation.rs` uses `check_context_budget` directly within its own module.
+// needs the re-export; the CPU forward paths (cpu_f16, cpu_q8, neon_forward)
+// already enforce this same bound with their own inline check and
+// `generation.rs` itself uses `check_context_budget` directly within its own
+// module.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::check_context_budget;
 // Shared backend-neutral decode-policy struct (reasoning-budget accounting +

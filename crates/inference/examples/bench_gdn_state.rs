@@ -18,12 +18,12 @@
 /// `model.safetensors` → f16 weights.
 ///
 /// Usage (f16):
-///   LATTICE_MODEL_DIR="${LATTICE_MODEL_CACHE:-$HOME/.lattice/models}/qwen3.5-0.8b" \
+///   LATTICE_MODEL_DIR=/Users/lion/.lattice/models/qwen3.5-0.8b \
 ///   cargo run --release --example bench_gdn_state -p lattice-inference \
 ///     --features "f16,metal-gpu,gdn-state-counters"
 ///
 /// Usage (Q4):
-///   LATTICE_MODEL_DIR="${LATTICE_MODEL_CACHE:-$HOME/.lattice/models}/qwen3.5-0.8b-q4" \
+///   LATTICE_MODEL_DIR=/Users/lion/.lattice/models/qwen3.5-0.8b-q4 \
 ///   cargo run --release --example bench_gdn_state -p lattice-inference \
 ///     --features "f16,metal-gpu,gdn-state-counters"
 ///

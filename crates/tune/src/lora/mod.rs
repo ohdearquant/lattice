@@ -159,7 +159,7 @@ impl LoraAdapter {
     /// length mismatch. This is the single construction chokepoint
     /// (safetensors loading, blending, and training all route through it),
     /// so downstream code — including
-    /// `validate_against` and `apply` — can rely
+    /// [`validate_against`](Self::validate_against) and `apply` — can rely
     /// on the invariant without re-checking it. `apply_lora` itself also
     /// verifies its input against the layer's declared geometry before
     /// indexing, as a second boundary for adapter data built by other means.

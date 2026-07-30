@@ -696,7 +696,6 @@ run_target_gate() {
     --baseline-name compare-base
     --target "$target"
     --provenance-file "$PROVENANCE_FILE"
-    --resolution "$([ -n "$QUICK_FLAGS" ] && echo quick || echo full)"
   )
 
   if [ -n "$QUICK_FLAGS" ]; then
