@@ -258,13 +258,20 @@ machine_state_probe() {
 }
 
 quiet_gate() {
-  local label="$1" line rc=0
+  local label="$1" phase="$2" line rc=0
+  local probe_args=(--label "$label")
   machine_state_probe "$label"
-  line="$(python3 "$REPO/scripts/lib/quiet-probe.py" --label "$label")" || rc=$?
+  if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
+    probe_args+=(--phase "$phase" --jsonl-out "$AMBIENT_SAMPLES_FILE")
+  fi
+  line="$(python3 "$REPO/scripts/lib/quiet-probe.py" "${probe_args[@]}")" || rc=$?
   echo "$line"
   QUIET_SAMPLES="${QUIET_SAMPLES}${QUIET_SAMPLES:+
 }$line"
   if [ "$rc" -ne 0 ]; then
+    if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
+      return 0
+    fi
     echo "bench-compare: machine was not quiet at '$label' — refusing to" \
          "certify this A/B. Set BENCH_IDLE_FLOOR to judge against a" \
          "different floor, and say so wherever the numbers are quoted." >&2
@@ -272,6 +279,11 @@ quiet_gate() {
   fi
 }
 
+if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
+  mkdir -p "$PERF_POSTMERGE_STATUS_DIR"
+  AMBIENT_SAMPLES_FILE="$PERF_POSTMERGE_STATUS_DIR/ambient-samples.jsonl"
+  : > "$AMBIENT_SAMPLES_FILE"
+fi
 BASE_REF="${1:-origin/main}"
 HEAD_REF="${2:-HEAD}"
 
@@ -364,7 +376,7 @@ require_commit_clean_head() {
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
 print_execution_provenance
 require_commit_clean_head
-quiet_gate "before base"
+quiet_gate "before base" "before"
 
 # --- Keep Spotlight out of the benchmark build trees ---
 # .cache protects the detached base/head worktrees. The separate target marker
@@ -529,7 +541,7 @@ BASE_PHASE_RC=0
 # and re-raised here or the refusal above is itself swallowed.
 if [ "$BASE_PHASE_RC" -ne 0 ]; then exit "$BASE_PHASE_RC"; fi
 
-quiet_gate "between phases"
+quiet_gate "between phases" "between"
 
 # --- Copy base criterion data to HEAD's target ---
 echo ""
@@ -594,7 +606,7 @@ HEAD_PHASE_RC=0
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
 
-quiet_gate "after head"
+quiet_gate "after head" "after"
 require_commit_clean_head
 
 write_run_provenance() {
@@ -684,6 +696,7 @@ run_target_gate() {
     --baseline-name compare-base
     --target "$target"
     --provenance-file "$PROVENANCE_FILE"
+    --resolution "$([ -n "$QUICK_FLAGS" ] && echo quick || echo full)"
   )
 
   if [ -n "$QUICK_FLAGS" ]; then
@@ -703,8 +716,14 @@ run_target_gate() {
     # Each target has its own root, so completeness is checked per intended
     # target rather than inferred from whichever comparisons survived in a
     # shared tree.
-    gate_args+=(--require-measurements)
-    gate_args+=(--require-provenance)
+    gate_args+=(--require-measurements --require-provenance)
+    if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
+      local status_name="${target//[:\\/]/-}"
+      gate_args+=(
+        --ambient-samples "$AMBIENT_SAMPLES_FILE"
+        --status-out "$PERF_POSTMERGE_STATUS_DIR/$status_name.json"
+      )
+    fi
   fi
 
   if [ -d "$criterion_root" ]; then
@@ -719,6 +738,8 @@ run_target_gate() {
 
   if [ "$gate_rc" -eq 2 ]; then
     GATE_RC=2
+  elif [ "$gate_rc" -eq 3 ] && [ "$GATE_RC" -ne 2 ]; then
+    GATE_RC=3
   elif [ "$gate_rc" -ne 0 ] && [ "$GATE_RC" -eq 0 ]; then
     GATE_RC="$gate_rc"
   fi
@@ -733,12 +754,14 @@ echo ""
 echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
 
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
-  # Exit 1 is a confirmed regression; exit 2 is the gate refusing to certify a
-  # run it could not judge (no usable comparison data or invalid policy). Both must
+  # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;
+  # exit 3 is a run whose ambient conditions make it unmeasurable. All must
   # fail the caller: a green exit standing in for evidence that was never
   # produced is the exact defect this flag exists to remove.
   if [ "$GATE_RC" = "2" ]; then
     echo "bench-compare: gate could not judge this run — no usable measurements." >&2
+  elif [ "$GATE_RC" = "3" ]; then
+    echo "bench-compare: ambient conditions made this run not measurable." >&2
   else
     echo "bench-compare: gate reported a confirmed regression (exit $GATE_RC)." >&2
   fi
