@@ -1,7 +1,7 @@
 //! Regression harness for GitHub issue #310 (grammar-constrained decoding, ADR-046).
 //!
 //! Status per finding:
-//!   f1 (object optional-member separators)     — FIXED by #380
+//!   f1 (object optional-member separators)     — pins PDA consumed-frame guard
 //!   f2 (array cardinality minItems/maxItems)   — FIXED by #321
 //!   f3 (prefixItems tuple arrays)              — FIXED by #321
 //!   f4 (string enum rule-name collision)       — FIXED by #311
