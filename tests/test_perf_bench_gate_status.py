@@ -16,12 +16,18 @@ SCHEMA = "perf-ambient-sample/v1"
 PHASES = ("before", "between", "after")
 
 
-def _criterion_root(parent: Path, name: str, ci_low: float) -> Path:
+def _criterion_root(
+    parent: Path,
+    name: str,
+    ci_low: float,
+    *,
+    baseline_name: str = "compare-base",
+) -> Path:
     root = parent / name / "criterion"
     bench = root / "group" / "bench"
-    for artifact in ("compare-base", "new", "change"):
+    for artifact in (baseline_name, "new", "change"):
         (bench / artifact).mkdir(parents=True)
-    (bench / "compare-base" / "estimates.json").write_text(
+    (bench / baseline_name / "estimates.json").write_text(
         '{"mean":{"point_estimate":100.0}}\n'
     )
     (bench / "new" / "estimates.json").write_text(
@@ -69,6 +75,136 @@ def _run(root: Path, samples: Path, status: Path, target: str) -> subprocess.Com
 
 
 class PerfBenchGateStatusTests(unittest.TestCase):
+    def test_malformed_reverse_numbers_are_input_errors_with_status(self) -> None:
+        cases = (
+            ("string point", ("point_estimate",), "corrupt"),
+            ("boolean CI", ("confidence_interval", "lower_bound"), True),
+        )
+        for label, path, invalid_value in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                criterion = _criterion_root(root, "forward", 0.095)
+                control = _criterion_root(
+                    root,
+                    "reverse",
+                    0.095,
+                    baseline_name="compare-head",
+                )
+                change_path = control / "group" / "bench" / "change" / "estimates.json"
+                change = json.loads(change_path.read_text())
+                destination = change["mean"]
+                for key in path[:-1]:
+                    destination = destination[key]
+                destination[path[-1]] = invalid_value
+                change_path.write_text(json.dumps(change))
+
+                samples = root / "ambient.jsonl"
+                _samples(samples, {phase: 95.0 for phase in PHASES})
+                status = root / "status.json"
+                target = "lattice-inference:elementwise_cpu_bench"
+                result = subprocess.run(
+                    [
+                        "python3",
+                        str(GATE),
+                        str(criterion),
+                        "fixture/malformed-order-control",
+                        "--target",
+                        target,
+                        "--require-measurements",
+                        "--require-order-balance",
+                        "--order-control-root",
+                        str(control),
+                        "--ambient-samples",
+                        str(samples),
+                        "--status-out",
+                        str(status),
+                    ],
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                payload = json.loads(status.read_text())
+                self.assertEqual(payload["verdict"], "error")
+                self.assertEqual(payload["exit_code"], 2)
+                self.assertIn("invalid order-control evidence", payload["reason"])
+
+    def test_required_order_balance_without_control_writes_error_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "forward", 0.095)
+            samples = root / "ambient.jsonl"
+            _samples(samples, {phase: 95.0 for phase in PHASES})
+            status = root / "status.json"
+            target = "lattice-inference:elementwise_cpu_bench"
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(GATE),
+                    str(criterion),
+                    "fixture/missing-order-control",
+                    "--target",
+                    target,
+                    "--require-measurements",
+                    "--require-order-balance",
+                    "--ambient-samples",
+                    str(samples),
+                    "--status-out",
+                    str(status),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "error")
+            self.assertEqual(payload["exit_code"], 2)
+            self.assertIn("needs --order-control-root", payload["reason"])
+
+    def test_gate_sized_order_bias_is_not_measurable_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "forward", 0.095)
+            control = _criterion_root(
+                root,
+                "reverse",
+                0.095,
+                baseline_name="compare-head",
+            )
+            samples = root / "ambient.jsonl"
+            _samples(samples, {phase: 95.0 for phase in PHASES})
+            status = root / "status.json"
+            target = "lattice-inference:elementwise_cpu_bench"
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(GATE),
+                    str(criterion),
+                    "fixture/order-bias",
+                    "--target",
+                    target,
+                    "--require-measurements",
+                    "--require-order-balance",
+                    "--order-control-root",
+                    str(control),
+                    "--ambient-samples",
+                    str(samples),
+                    "--status-out",
+                    str(status),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn("**⏸ NOT MEASURABLE**", result.stdout)
+            self.assertNotIn("✅ All 1 gated benches", result.stdout)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "not_measurable")
+            self.assertEqual(payload["exit_code"], 3)
+            self.assertIn("order-bias bound above", payload["reason"])
+            self.assertEqual(payload["measurement_count"], 1)
+            self.assertEqual(payload["ambient"]["assessment"], "valid")
+
     def test_completeness_error_outranks_not_measurable_for_informational_target(
         self,
     ) -> None:

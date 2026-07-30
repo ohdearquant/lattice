@@ -2,12 +2,18 @@
 """Parse Criterion change reports and apply the ADR-058 regression gate.
 
 For every Criterion bench under target/criterion/, read change/estimates.json
-(produced when running with --baseline <name>). Apply the rule:
+(produced when running with --baseline <name>). A caller may also supply the
+reverse-order half of an ABBA comparison. In that mode the gate combines the
+forward and reverse ratios in log space and widens the resulting interval by
+the measured order-bias envelope before applying the rule:
 
-  CI-lower of change in (-inf, +3%]    : pass silently
-  CI-lower of change in (+3%, +7%]     : warn (PR-comment only, no fail)
-  CI-lower of change in (+7%, +inf)    : FAIL
+  decision lower bound in (-inf, +3%]  : pass silently
+  decision lower bound in (+3%, +7%]   : warn (PR-comment only, no fail)
+  decision lower bound in (+7%, +inf)  : FAIL
   Point estimate < -3% AND CI-upper<0% : celebrate
+
+The decision bound is Criterion's two-sided-95%-CI lower endpoint in raw
+two-arm mode and the order-bias-widened ABBA lower bound in balanced mode.
 
 Usage:
   perf-bench-gate.py <criterion_root> <arch_label> [--out report.md]
@@ -17,26 +23,29 @@ Usage:
                       [--informational-target <crate>:<bench-target>]
   perf-bench-gate.py <criterion_root> <arch_label> --target <crate>:<bench-target>
                       --ambient-samples <jsonl> --status-out <json>
+                      --order-control-root <criterion_root>
+                      --require-order-balance
 
 Exit codes:
   0 — pass (no gated FAILs)
-  1 — at least one gated FAIL (regression > 7%, using the LOWER bound of
-      Criterion's two-sided 95% CI as a one-sided cutoff — see the
-      WARN_PCT/FAIL_PCT note below for the actual one-sided confidence
-      level this implies, which is tighter than "95%")
+  1 — at least one gated FAIL (regression > 7% by the selected decision
+      lower bound; see the WARN_PCT/FAIL_PCT note below for raw Criterion
+      mode, and the ABBA note above for balanced mode)
   2 — parse error / bad input, or (with --require-measurements) the gate
       refusing to certify a run it could not judge: no comparison data, or
       no gating comparison among the parsed results, or a benchmark in the
       selected baseline set with no head comparison. An automated lane must not
       read "nothing was measured" as "nothing regressed".
   3 — not measurable: the automated lane's before/between/after ambient sample
-      stream is missing, malformed, duplicated, or below BENCH_IDLE_FLOOR.
+      stream is missing, malformed, duplicated, or below BENCH_IDLE_FLOOR; or
+      the measured AB/BA order-bias envelope is itself larger than the FAIL
+      margin, so the run cannot distinguish a gate-sized source effect.
 
 Status mode is opt-in. It requires exactly one perf-ambient-sample/v1 record for
 each voting phase (before, between, after), ignores other phase labels, and
 writes an atomic perf-bench-gate-status/v1 document. Ambient refusal is checked
-before Criterion verdict rendering, so exit 3 outranks pass or regression for
-every target in the run.
+before the final exit/status verdict, so exit 3 outranks pass or regression for
+every target in the run. Excessive order bias is the other exit-3 cause.
 
 --informational-target (lattice#714): quick-mode Criterion runs on
 sub-microsecond micro-benches (lattice-embed's `simd` bench target) are
@@ -65,7 +74,7 @@ from pathlib import Path
 
 PROVENANCE_SCHEMA = "lattice-bench-provenance-v1"
 MACHINE_STATE_SCHEMA = "lattice-machine-state-v1"
-PHASE_LABELS = ("before base", "between phases", "after head")
+PHASE_LABELS = ("before first arm", "between order strata", "after final arm")
 PROVENANCE_FIELDS = (
     "started_utc",
     "finished_utc",
@@ -320,6 +329,7 @@ class BenchResult:
     head_sampling_mode: str | None = None
     base_sample_count: int | None = None
     base_sampling_mode: str | None = None
+    order_bias_bound: float | None = None
 
     @property
     def point_pct(self) -> float: return self.point * 100.0
@@ -327,6 +337,11 @@ class BenchResult:
     def ci_low_pct(self) -> float: return self.ci_low * 100.0
     @property
     def ci_high_pct(self) -> float: return self.ci_high * 100.0
+    @property
+    def order_bias_bound_pct(self) -> float | None:
+        if self.order_bias_bound is None:
+            return None
+        return self.order_bias_bound * 100.0
     def is_informational(self, target: str | None, informational_target: str | None) -> bool:
         return target is not None and target == informational_target
 
@@ -338,6 +353,139 @@ class BenchResult:
         if self.point_pct < CELEBRATE_PCT and self.ci_high_pct < 0:
             return "WIN"
         return "PASS"
+
+
+def _checked_relative_log(value: float, field: str) -> float:
+    """Return log(1 + relative change), rejecting malformed Criterion evidence."""
+    if not math.isfinite(value) or value <= -1.0:
+        raise ValueError(f"{field} must be finite and greater than -1, got {value!r}")
+    return math.log1p(value)
+
+
+def _combined_sample_count(first: int | None, second: int | None) -> int | None:
+    if first is None or second is None:
+        return None
+    return first + second
+
+
+def _combined_sampling_mode(first: str | None, second: str | None) -> str | None:
+    if first is None or second is None:
+        return None
+    if first == second:
+        return first
+    return f"{first}+{second}"
+
+
+def _geometric_mean(first: float, second: float) -> float:
+    """Compute a positive geometric mean without overflowing the product."""
+    mean = math.exp((math.log(first) + math.log(second)) / 2.0)
+    if not math.isfinite(mean) or mean <= 0.0:
+        raise ValueError("order-balanced timing mean is not positive and finite")
+    return mean
+
+
+def order_balance_pair(forward: BenchResult, reverse: BenchResult) -> BenchResult:
+    """Combine A→B and B→A Criterion comparisons from an ABBA run.
+
+    `forward` is head₁/base₁. `reverse` is base₂/head₂. In log-ratio space,
+    half their difference estimates the source effect while half their sum
+    estimates the directional order effect. The Criterion endpoint envelope
+    is transformed the same way, then widened by the complete order-effect
+    envelope so within-run CIs cannot hide the run-order term.
+    """
+    if forward.name != reverse.name:
+        raise ValueError(
+            f"order-balance benchmark mismatch: {forward.name!r} != {reverse.name!r}"
+        )
+
+    for result_name, result in (("forward", forward), ("reverse", reverse)):
+        if not result.ci_low <= result.point <= result.ci_high:
+            raise ValueError(
+                f"{forward.name}: {result_name} change interval does not contain "
+                f"its point estimate"
+            )
+        for field_name, value in (
+            ("new_ns", result.new_ns),
+            ("old_ns", result.old_ns),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(
+                    f"{forward.name}: {result_name} {field_name} must be positive "
+                    f"and finite, got {value!r}"
+                )
+
+    f_point = _checked_relative_log(forward.point, "forward point")
+    f_low = _checked_relative_log(forward.ci_low, "forward CI lower")
+    f_high = _checked_relative_log(forward.ci_high, "forward CI upper")
+    r_point = _checked_relative_log(reverse.point, "reverse point")
+    r_low = _checked_relative_log(reverse.ci_low, "reverse CI lower")
+    r_high = _checked_relative_log(reverse.ci_high, "reverse CI upper")
+
+    effect_point_log = (f_point - r_point) / 2.0
+    effect_low_log = (f_low - r_high) / 2.0
+    effect_high_log = (f_high - r_low) / 2.0
+
+    order_low_log = (f_low + r_low) / 2.0
+    order_high_log = (f_high + r_high) / 2.0
+    order_bias_log_bound = max(abs(order_low_log), abs(order_high_log))
+
+    effect_point = math.expm1(effect_point_log)
+    effect_low = math.expm1(effect_low_log - order_bias_log_bound)
+    effect_high = math.expm1(effect_high_log + order_bias_log_bound)
+    order_bias_bound = math.expm1(order_bias_log_bound)
+    if not all(
+        math.isfinite(value)
+        for value in (effect_point, effect_low, effect_high, order_bias_bound)
+    ):
+        raise ValueError(f"{forward.name}: order-balanced result is not finite")
+
+    return BenchResult(
+        name=forward.name,
+        point=effect_point,
+        ci_low=effect_low,
+        ci_high=effect_high,
+        new_ns=_geometric_mean(forward.new_ns, reverse.old_ns),
+        old_ns=_geometric_mean(forward.old_ns, reverse.new_ns),
+        # Forward base is A₁; reverse candidate/new is A₂.
+        base_sample_count=_combined_sample_count(
+            forward.base_sample_count, reverse.head_sample_count
+        ),
+        base_sampling_mode=_combined_sampling_mode(
+            forward.base_sampling_mode, reverse.head_sampling_mode
+        ),
+        # Forward head is B₁; reverse baseline/old is B₂.
+        head_sample_count=_combined_sample_count(
+            forward.head_sample_count, reverse.base_sample_count
+        ),
+        head_sampling_mode=_combined_sampling_mode(
+            forward.head_sampling_mode, reverse.base_sampling_mode
+        ),
+        order_bias_bound=order_bias_bound,
+    )
+
+
+def order_balance_results(
+    forward_results: list[BenchResult],
+    reverse_results: list[BenchResult],
+) -> list[BenchResult]:
+    """Reconcile exact benchmark identities, then order-balance every pair."""
+    forward = {result.name: result for result in forward_results}
+    reverse = {result.name: result for result in reverse_results}
+    if len(forward) != len(forward_results):
+        raise ValueError("forward Criterion root contains duplicate benchmark identities")
+    if len(reverse) != len(reverse_results):
+        raise ValueError("reverse Criterion root contains duplicate benchmark identities")
+    if forward.keys() != reverse.keys():
+        missing = sorted(forward.keys() - reverse.keys())
+        extra = sorted(reverse.keys() - forward.keys())
+        raise ValueError(
+            "order-control benchmark set differs from the forward set: "
+            f"missing={missing}, extra={extra}"
+        )
+    return [
+        order_balance_pair(forward[name], reverse[name])
+        for name in sorted(forward)
+    ]
 
 @dataclass(frozen=True)
 class RunProvenance:
@@ -857,6 +1005,21 @@ def load_sample_metadata(path: Path, bench_name: str, arm: str) -> tuple[str, in
     return mode, len(times)
 
 
+def criterion_number(value: object, field: str, *, positive: bool = False) -> float:
+    """Validate one numeric Criterion field without accepting JSON booleans."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a JSON number, got {value!r}")
+    try:
+        number = float(value)
+    except OverflowError as error:
+        raise ValueError(f"{field} is outside the finite float range") from error
+    if not math.isfinite(number):
+        raise ValueError(f"{field} must be finite, got {value!r}")
+    if positive and number <= 0.0:
+        raise ValueError(f"{field} must be positive, got {value!r}")
+    return number
+
+
 def parse_bench(change_file: Path, root: Path, baseline_name: str) -> BenchResult | None:
     """Parse one change/estimates.json + sibling new/estimates.json + baseline estimates.json.
 
@@ -868,12 +1031,28 @@ def parse_bench(change_file: Path, root: Path, baseline_name: str) -> BenchResul
     try:
         change = json.loads(change_file.read_text())
         mean = change["mean"]
-        point = mean["point_estimate"]
-        ci_low = mean["confidence_interval"]["lower_bound"]
-        ci_high = mean["confidence_interval"]["upper_bound"]
+        point = criterion_number(
+            mean["point_estimate"], f"{name} change point estimate"
+        )
+        ci_low = criterion_number(
+            mean["confidence_interval"]["lower_bound"],
+            f"{name} change CI lower bound",
+        )
+        ci_high = criterion_number(
+            mean["confidence_interval"]["upper_bound"],
+            f"{name} change CI upper bound",
+        )
+        if ci_low <= -1.0 or point <= -1.0 or ci_high <= -1.0:
+            raise ValueError(f"{name} relative-change estimates must be greater than -1")
+        if not ci_low <= point <= ci_high:
+            raise ValueError(f"{name} change interval does not contain its point estimate")
 
         new_path = bench_dir / "new" / "estimates.json"
-        new_ns = json.loads(new_path.read_text())["mean"]["point_estimate"]
+        new_ns = criterion_number(
+            json.loads(new_path.read_text())["mean"]["point_estimate"],
+            f"{name} head mean",
+            positive=True,
+        )
 
         base_path = find_baseline_estimates(bench_dir, baseline_name)
         if base_path is None:
@@ -881,8 +1060,18 @@ def parse_bench(change_file: Path, root: Path, baseline_name: str) -> BenchResul
                   f"baseline dir (tried base/, {baseline_name}/, and other siblings) "
                   f"— skipping", file=sys.stderr)
             return None
-        old_ns = json.loads(base_path.read_text())["mean"]["point_estimate"]
-    except (KeyError, FileNotFoundError, json.JSONDecodeError) as e:
+        old_ns = criterion_number(
+            json.loads(base_path.read_text())["mean"]["point_estimate"],
+            f"{name} base mean",
+            positive=True,
+        )
+    except (
+        KeyError,
+        OSError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as e:
         print(f"warn: skipping {name}: {e}", file=sys.stderr)
         return None
 
@@ -894,6 +1083,71 @@ def parse_bench(change_file: Path, root: Path, baseline_name: str) -> BenchResul
                        head_sampling_mode=head_sample[0] if head_sample else None,
                        base_sample_count=base_sample[1] if base_sample else None,
                        base_sampling_mode=base_sample[0] if base_sample else None)
+
+
+def parse_order_control(
+    root: Path,
+    baseline_name: str,
+    expected_ids: set[str],
+    *,
+    require_samples: bool,
+) -> list[BenchResult]:
+    """Parse the B→A half of an enforcing ABBA run, refusing partial evidence."""
+    if not root.exists():
+        raise ValueError(f"order-control Criterion root does not exist: {root}")
+
+    selected_ids = selected_baseline_bench_ids(root, baseline_name)
+    if selected_ids != expected_ids:
+        missing = sorted(expected_ids - selected_ids)
+        extra = sorted(selected_ids - expected_ids)
+        raise ValueError(
+            "order-control selected-baseline set differs from the forward set: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    change_files = find_change_files(root)
+    change_by_id = {}
+    for change_file in change_files:
+        bench_id = artifact_bench_id(change_file, root, artifact_parts=1)
+        if bench_id in expected_ids:
+            change_by_id[bench_id] = change_file
+    if change_by_id.keys() != expected_ids:
+        missing = sorted(expected_ids - change_by_id.keys())
+        extra = sorted(change_by_id.keys() - expected_ids)
+        raise ValueError(
+            "order-control comparison set differs from the forward set: "
+            f"missing={missing}, extra={extra}"
+        )
+
+    results = []
+    unjudged = []
+    for bench_id in sorted(expected_ids):
+        result = parse_bench(change_by_id[bench_id], root, baseline_name)
+        if result is None:
+            unjudged.append(bench_id)
+        else:
+            results.append(result)
+    if unjudged:
+        raise ValueError(
+            f"{len(unjudged)} order-control comparison(s) could not be judged: "
+            + ", ".join(unjudged)
+        )
+
+    if require_samples:
+        incomplete = [
+            result.name
+            for result in results
+            if result.base_sample_count is None
+            or result.base_sampling_mode is None
+            or result.head_sample_count is None
+            or result.head_sampling_mode is None
+        ]
+        if incomplete:
+            raise ValueError(
+                f"{len(incomplete)} order-control comparison(s) lack Criterion "
+                f"sample metadata: {', '.join(incomplete[:5])}"
+            )
+    return results
 
 
 def sample_shape_summary(results: list[BenchResult], arm: str) -> str:
@@ -1015,7 +1269,10 @@ def render_run_provenance(
 
 def render_report(results: list[BenchResult], arch: str, target: str | None = None,
                   informational_target: str | None = None,
-                  provenance: RunProvenance | None = None) -> str:
+                  provenance: RunProvenance | None = None,
+                  decision_suppressed_reason: str | None = None) -> str:
+    order_balanced = any(r.order_bias_bound is not None for r in results)
+    interval_label = "ABBA bound" if order_balanced else "95% CI"
     gated = [
         r for r in results
         if not r.is_informational(target, informational_target)
@@ -1034,34 +1291,62 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
     info_wins = [r for r in info if r.verdict() == "WIN"]
 
     lines = [f"### `{arch}` — perf regression report\n"]
-    if fails:
+    if decision_suppressed_reason is not None:
         lines.append(
-            f"**❌ {len(fails)} FAIL** (regression >{FAIL_PCT}% — lower bound of Criterion's "
-            "two-sided 95% CI, i.e. about a 97.5% one-sided level, not a calibrated one-sided 95% test)"
+            "**⏸ NOT MEASURABLE** — "
+            f"{decision_suppressed_reason}. No source-performance verdict was rendered."
         )
-    if warns:
+    elif fails:
+        if order_balanced:
+            lines.append(
+                f"**❌ {len(fails)} FAIL** (regression >{FAIL_PCT}% — lower bound "
+                "of the ABBA log-ratio effect after widening by the measured "
+                "order-bias envelope)"
+            )
+        else:
+            lines.append(
+                f"**❌ {len(fails)} FAIL** (regression >{FAIL_PCT}% — lower bound "
+                "of Criterion's two-sided 95% CI, i.e. about a 97.5% one-sided "
+                "level, not a calibrated one-sided 95% test)"
+            )
+    if decision_suppressed_reason is None and warns:
+        qualifier = (
+            "order-bias-widened ABBA lower bound"
+            if order_balanced
+            else "two-sided-95%-CI lower bound"
+        )
         lines.append(
-            f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% by the same "
-            "two-sided-95%-CI lower bound)"
+            f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% by "
+            f"the same {qualifier})"
         )
-    if wins:
+    if decision_suppressed_reason is None and wins:
         lines.append(f"**🚀 {len(wins)} confirmed improvement**")
-    if not (fails or warns or wins):
+    if decision_suppressed_reason is None and not (fails or warns or wins):
         lines.append(f"✅ All {len(gated)} gated benches within noise band (±{WARN_PCT}%)")
     lines.append("")
     lines.extend(render_run_provenance(provenance, results))
 
-    if fails or warns or wins:
+    if decision_suppressed_reason is None and (fails or warns or wins):
+        bias_column = " | order bias ≤" if order_balanced else ""
         lines.append(
-            "| Bench | Δ point | 95% CI | new ns | base ns | base n/mode | "
-            "head n/mode | verdict |"
+            f"| Bench | Δ point | {interval_label}{bias_column} | new ns | "
+            "base ns | base n/mode | head n/mode | verdict |"
         )
-        lines.append("|---|---:|---|---:|---:|---|---|---|")
+        lines.append(
+            "|---|---:|---|---:|---:|---:|---|---|---|"
+            if order_balanced
+            else "|---|---:|---|---:|---:|---|---|---|"
+        )
         for r in sorted(fails + warns + wins, key=lambda r: -r.ci_low_pct):
             icon = {"FAIL": "❌", "WARN": "⚠", "WIN": "🚀"}[r.verdict()]
+            bias_cell = (
+                f"| {r.order_bias_bound_pct:+.2f}% "
+                if r.order_bias_bound_pct is not None
+                else ""
+            )
             lines.append(
                 f"| `{r.name}` | {r.point_pct:+.2f}% | [{r.ci_low_pct:+.2f}%, {r.ci_high_pct:+.2f}%] "
-                f"| {r.new_ns:.1f} | {r.old_ns:.1f} | {sample_cell(r, 'base')} "
+                f"{bias_cell}| {r.new_ns:.1f} | {r.old_ns:.1f} | {sample_cell(r, 'base')} "
                 f"| {sample_cell(r, 'head')} | {icon} {r.verdict()} |"
             )
         lines.append("")
@@ -1073,36 +1358,67 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             f"re-run `--full` for a gated verdict)"
         )
         if info_fails or info_warns or info_wins:
+            bias_column = " | order bias ≤" if order_balanced else ""
             lines.append(
-                "| Bench | Δ point | 95% CI | new ns | base ns | base n/mode | "
-                "head n/mode | (would-be verdict) |"
+                f"| Bench | Δ point | {interval_label}{bias_column} | new ns | "
+                "base ns | base n/mode | head n/mode | (would-be verdict) |"
             )
-            lines.append("|---|---:|---|---:|---:|---|---|---|")
+            lines.append(
+                "|---|---:|---|---:|---:|---:|---|---|---|"
+                if order_balanced
+                else "|---|---:|---|---:|---:|---|---|---|"
+            )
             for r in sorted(info_fails + info_warns + info_wins, key=lambda r: -r.ci_low_pct):
                 icon = {"FAIL": "❌", "WARN": "⚠", "WIN": "🚀"}[r.verdict()]
+                bias_cell = (
+                    f"| {r.order_bias_bound_pct:+.2f}% "
+                    if r.order_bias_bound_pct is not None
+                    else ""
+                )
                 lines.append(
                     f"| `{r.name}` | {r.point_pct:+.2f}% | [{r.ci_low_pct:+.2f}%, {r.ci_high_pct:+.2f}%] "
-                    f"| {r.new_ns:.1f} | {r.old_ns:.1f} | {sample_cell(r, 'base')} "
+                    f"{bias_cell}| {r.new_ns:.1f} | {r.old_ns:.1f} | {sample_cell(r, 'base')} "
                     f"| {sample_cell(r, 'head')} | {icon} {r.verdict()} (informational) |"
                 )
         lines.append("")
 
     lines.append(
         f"<details><summary>All {len(results)} measurements</summary>\n\n"
-        "| Bench | Δ point | CI-lower | CI-upper | base n/mode | head n/mode |\n"
-        "|---|---:|---:|---:|---|---|"
+        f"| Bench | Δ point | bound-lower | bound-upper"
+        f"{' | order bias ≤' if order_balanced else ''} | base n/mode | head n/mode |\n"
+        + (
+            "|---|---:|---:|---:|---:|---|---|"
+            if order_balanced
+            else "|---|---:|---:|---:|---|---|"
+        )
     )
     for r in sorted(results, key=lambda r: r.name):
+        bias_cell = (
+            f"| {r.order_bias_bound_pct:+.2f}% "
+            if r.order_bias_bound_pct is not None
+            else ""
+        )
         lines.append(
             f"| `{r.name}` | {r.point_pct:+.2f}% | {r.ci_low_pct:+.2f}% "
-            f"| {r.ci_high_pct:+.2f}% | {sample_cell(r, 'base')} "
+            f"| {r.ci_high_pct:+.2f}% {bias_cell}| {sample_cell(r, 'base')} "
             f"| {sample_cell(r, 'head')} |"
         )
     lines.append("\n</details>\n")
-    lines.append(
-        f"_Rule: CI-lower of change ≤{WARN_PCT}% passes silently; "
-        f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
+    lower_bound_name = (
+        "order-bias-widened ABBA lower bound"
+        if order_balanced
+        else "CI-lower of change"
     )
+    if decision_suppressed_reason is None:
+        lines.append(
+            f"_Rule: {lower_bound_name} ≤{WARN_PCT}% passes silently; "
+            f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
+        )
+    else:
+        lines.append(
+            "_The measurements are shown for diagnosis only; WARN/FAIL "
+            "classification was suppressed._"
+        )
     if informational_target is not None:
         lines.append(
             f"_Target `{informational_target}` classified informational-only in quick mode "
@@ -1165,6 +1481,94 @@ def run_selftest() -> int:
     import tempfile
 
     failures: list[str] = []
+
+    # lattice#1137: a fixed-order single Criterion pair can report a narrow,
+    # gate-crossing regression on byte-identical source when both arms drift in
+    # the same direction. ABBA supplies the mirrored B→A ratio. The balanced
+    # source effect must collapse to zero while retaining the observed order
+    # term as an explicit uncertainty bound.
+    directional_drift = BenchResult(
+        name="softmax_attention/512",
+        point=0.10,
+        ci_low=0.095,
+        ci_high=0.105,
+        new_ns=110.0,
+        old_ns=100.0,
+        head_sample_count=20,
+        head_sampling_mode="Flat",
+        base_sample_count=20,
+        base_sampling_mode="Flat",
+    )
+    reverse_directional_drift = BenchResult(
+        name="softmax_attention/512",
+        point=0.10,
+        ci_low=0.095,
+        ci_high=0.105,
+        new_ns=133.1,
+        old_ns=121.0,
+        head_sample_count=20,
+        head_sampling_mode="Flat",
+        base_sample_count=20,
+        base_sampling_mode="Flat",
+    )
+    if directional_drift.verdict() != "FAIL":
+        failures.append(
+            "order-balance fixture no longer reproduces the old fixed-order false FAIL"
+        )
+    balanced_drift = order_balance_pair(
+        directional_drift, reverse_directional_drift
+    )
+    if balanced_drift.verdict() == "FAIL" or abs(balanced_drift.point) > 1e-12:
+        failures.append(
+            "order-balance: identical-source directional drift still produced "
+            f"{balanced_drift.verdict()} at {balanced_drift.point_pct:+.6f}%"
+        )
+    if (
+        balanced_drift.order_bias_bound_pct is None
+        or balanced_drift.order_bias_bound_pct <= FAIL_PCT
+    ):
+        failures.append(
+            "order-balance: gate-sized directional drift was not retained as "
+            "a fail-closed order-bias bound"
+        )
+
+    # A real 20% source slowdown under a 2% directional drift remains
+    # distinguishable after the same correction. This prevents the control
+    # envelope from becoming an unconditional regression exemption.
+    true_regression_forward = BenchResult(
+        name="softmax_attention/512",
+        point=0.224,
+        ci_low=0.222,
+        ci_high=0.226,
+        new_ns=122.4,
+        old_ns=100.0,
+        head_sample_count=20,
+        head_sampling_mode="Flat",
+        base_sample_count=20,
+        base_sampling_mode="Flat",
+    )
+    true_regression_reverse = BenchResult(
+        name="softmax_attention/512",
+        point=-0.15,
+        ci_low=-0.152,
+        ci_high=-0.148,
+        new_ns=106.1208,
+        old_ns=124.848,
+        head_sample_count=20,
+        head_sampling_mode="Flat",
+        base_sample_count=20,
+        base_sampling_mode="Flat",
+    )
+    balanced_regression = order_balance_pair(
+        true_regression_forward, true_regression_reverse
+    )
+    if balanced_regression.verdict() != "FAIL":
+        failures.append(
+            "order-balance: a true 20% regression under 2% drift did not remain "
+            f"a FAIL: point={balanced_regression.point_pct:+.2f}%, "
+            f"bound=[{balanced_regression.ci_low_pct:+.2f}%, "
+            f"{balanced_regression.ci_high_pct:+.2f}%]"
+        )
 
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -1468,6 +1872,156 @@ def run_selftest() -> int:
         if _run(ok_root, "--require-measurements").returncode != 0:
             failures.append("require-measurements: a parsed gating comparison "
                             "was rejected — the flag over-fails")
+        missing_order_control = _run(
+            ok_root,
+            "--require-measurements",
+            "--require-order-balance",
+        )
+        if (
+            missing_order_control.returncode != EXIT_ERROR
+            or "needs --order-control-root" not in missing_order_control.stderr
+        ):
+            failures.append(
+                "order-balance: enforcing request without reverse evidence did "
+                "not fail closed"
+            )
+
+        drift_root = Path(td) / "directional-drift" / "criterion"
+        drift_control = Path(td) / "directional-drift-control" / "criterion"
+        _fabricate_bench(
+            drift_root / "softmax_attention" / "512",
+            "compare-base",
+            point=0.10,
+            ci_low=0.095,
+            ci_high=0.105,
+            new_ns=110.0,
+            base_ns=100.0,
+        )
+        _fabricate_bench(
+            drift_control / "softmax_attention" / "512",
+            "compare-head",
+            point=0.10,
+            ci_low=0.095,
+            ci_high=0.105,
+            new_ns=133.1,
+            base_ns=121.0,
+        )
+        drift_gate = _run(
+            drift_root,
+            "--require-measurements",
+            "--require-order-balance",
+            "--order-control-root",
+            str(drift_control),
+        )
+        if drift_gate.returncode != EXIT_NOT_MEASURABLE:
+            failures.append(
+                "order-balance: identical-source directional drift exited "
+                f"{drift_gate.returncode}, expected NOT_MEASURABLE (3)"
+            )
+        if "order-bias bound above" not in drift_gate.stderr:
+            failures.append(
+                "order-balance: directional-drift refusal did not identify the "
+                "order-bias evidence"
+            )
+
+        regression_root = Path(td) / "true-regression" / "criterion"
+        regression_control = (
+            Path(td) / "true-regression-control" / "criterion"
+        )
+        _fabricate_bench(
+            regression_root / "softmax_attention" / "512",
+            "compare-base",
+            point=0.224,
+            ci_low=0.222,
+            ci_high=0.226,
+            new_ns=122.4,
+            base_ns=100.0,
+        )
+        _fabricate_bench(
+            regression_control / "softmax_attention" / "512",
+            "compare-head",
+            point=-0.15,
+            ci_low=-0.152,
+            ci_high=-0.148,
+            new_ns=106.1208,
+            base_ns=124.848,
+        )
+        regression_gate = _run(
+            regression_root,
+            "--require-measurements",
+            "--require-order-balance",
+            "--order-control-root",
+            str(regression_control),
+        )
+        if regression_gate.returncode != EXIT_REGRESSION:
+            failures.append(
+                "order-balance: true 20% regression under 2% drift exited "
+                f"{regression_gate.returncode}, expected regression (1)"
+            )
+
+        incomplete_control = (
+            Path(td) / "incomplete-order-control" / "criterion"
+        )
+        _fabricate_bench(
+            incomplete_control / "different_bench",
+            "compare-head",
+        )
+        incomplete_order = _run(
+            drift_root,
+            "--require-measurements",
+            "--require-order-balance",
+            "--order-control-root",
+            str(incomplete_control),
+        )
+        if incomplete_order.returncode != EXIT_ERROR:
+            failures.append(
+                "order-balance: mismatched reverse benchmark set did not fail "
+                "closed with exit 2"
+            )
+
+        for malformed_name, malformed_value, malformed_field in (
+            ("string-point", "corrupt", "point_estimate"),
+            ("boolean-ci", True, "lower_bound"),
+        ):
+            malformed_control = (
+                Path(td) / f"malformed-order-control-{malformed_name}" / "criterion"
+            )
+            malformed_bench = malformed_control / "softmax_attention" / "512"
+            _fabricate_bench(
+                malformed_bench,
+                "compare-head",
+                point=0.10,
+                ci_low=0.095,
+                ci_high=0.105,
+                new_ns=133.1,
+                base_ns=121.0,
+            )
+            malformed_change = malformed_bench / "change" / "estimates.json"
+            malformed_payload = json.loads(malformed_change.read_text())
+            if malformed_field == "point_estimate":
+                malformed_payload["mean"]["point_estimate"] = malformed_value
+            else:
+                malformed_payload["mean"]["confidence_interval"][
+                    malformed_field
+                ] = malformed_value
+            malformed_change.write_text(json.dumps(malformed_payload))
+            malformed_order = _run(
+                drift_root,
+                "--require-measurements",
+                "--require-order-balance",
+                "--order-control-root",
+                str(malformed_control),
+            )
+            if malformed_order.returncode != EXIT_ERROR:
+                failures.append(
+                    f"order-balance: malformed reverse {malformed_name} exited "
+                    f"{malformed_order.returncode}, expected input error (2)"
+                )
+            if "Traceback" in malformed_order.stderr:
+                failures.append(
+                    f"order-balance: malformed reverse {malformed_name} escaped "
+                    "as an uncaught exception"
+                )
 
         # A target can be intentionally all-informational only when the exact
         # target key accompanies both the root and the demotion. This remains a
@@ -1811,7 +2365,7 @@ def run_selftest() -> int:
         machine_states = [
             {
                 "schema": MACHINE_STATE_SCHEMA,
-                "label": "before base",
+                "label": "before first arm",
                 "captured_at_utc": "2026-07-29T12:00:10Z",
                 "power": {"status": "measured", "source": "pmset", "state": "ac"},
                 "thermal": {
@@ -1828,7 +2382,7 @@ def run_selftest() -> int:
             },
             {
                 "schema": MACHINE_STATE_SCHEMA,
-                "label": "between phases",
+                "label": "between order strata",
                 "captured_at_utc": "2026-07-29T12:00:20Z",
                 "power": {"status": "unavailable", "reason": "fixture unsupported"},
                 "thermal": {
@@ -1842,7 +2396,7 @@ def run_selftest() -> int:
             },
             {
                 "schema": MACHINE_STATE_SCHEMA,
-                "label": "after head",
+                "label": "after final arm",
                 "captured_at_utc": "2026-07-29T12:00:30Z",
                 "power": {
                     "status": "measured",
@@ -1867,9 +2421,9 @@ def run_selftest() -> int:
             *[f"{field}={provenance_fields[field]}" for field in PROVENANCE_FIELDS],
             "lock=bench-window: acquired",
             "lock=Metal GPU: acquired",
-            "ambient=[quiet] before base: idle 99.0% (floor 70.0%) ok | top: none",
-            "ambient=[quiet] between phases: idle 98.0% (floor 70.0%) ok | top: none",
-            "ambient=[quiet] after head: idle 97.0% (floor 70.0%) ok | top: none",
+            "ambient=[quiet] before first arm: idle 99.0% (floor 70.0%) ok | top: none",
+            "ambient=[quiet] between order strata: idle 98.0% (floor 70.0%) ok | top: none",
+            "ambient=[quiet] after final arm: idle 97.0% (floor 70.0%) ok | top: none",
             *[
                 f"machine_state={json.dumps(state, separators=(',', ':'), sort_keys=True)}"
                 for state in machine_states
@@ -1899,8 +2453,8 @@ def run_selftest() -> int:
             "host_id=hostname-sha256:0123456789abcdef",
             "criterion_base_samples=4 Linear (1 benchmark)",
             "criterion_head_samples=2 Flat (1 benchmark)",
-            "ambient=[quiet] after head",
-            "machine_state[between phases]=captured",
+            "ambient=[quiet] after final arm",
+            "machine_state[between order strata]=captured",
             "power unavailable (fixture unsupported)",
             "HID idle unavailable (fixture unsupported)",
             "gate not enforced on this platform",
@@ -2023,7 +2577,7 @@ def run_selftest() -> int:
         out_of_order_provenance.write_text(
             "\n".join(
                 f"machine_state={json.dumps(out_of_order_state, separators=(',', ':'), sort_keys=True)}"
-                if '"label":"between phases"' in line
+                if '"label":"between order strata"' in line
                 else line
                 for line in provenance_lines
             )
@@ -2053,7 +2607,7 @@ def run_selftest() -> int:
         invalid_state_provenance.write_text(
             "\n".join(
                 f"machine_state={json.dumps(unknown_state, separators=(',', ':'), sort_keys=True)}"
-                if '"label":"before base"' in line
+                if '"label":"before first arm"' in line
                 else line
                 for line in provenance_lines
             )
@@ -2116,8 +2670,9 @@ def run_selftest() -> int:
           "multi-sibling-refusal, target-qualified manifest handoff (CRLF/whitespace/C-sort, "
           "slash-bearing group, demoted target informational, non-demoted target gated), "
           "require-measurements (empty root, gating pass, explicit informational target, "
-          "mismatch refusal, partial-run refusal), selected-baseline completeness, "
-          "and stale-head freshness all correct")
+          "mismatch refusal, partial-run refusal), ABBA directional-drift correction, "
+          "malformed reverse-number refusal, selected-baseline completeness, and "
+          "stale-head freshness all correct")
     return 0
 
 
@@ -2162,6 +2717,15 @@ def main() -> int:
     ap.add_argument("--require-provenance", action="store_true",
                     help="Fail (exit 2) unless complete run provenance and actual Criterion "
                          "base/head sample metadata are available.")
+    ap.add_argument("--order-control-root", type=Path,
+                    help="Criterion root for the reverse B→A half of an ABBA run. "
+                         "The selected baseline is head₂ and the new arm is base₂; "
+                         "benchmark identities must exactly match the forward root.")
+    ap.add_argument("--order-control-baseline-name", default="compare-head",
+                    help="Named baseline in --order-control-root (default: compare-head).")
+    ap.add_argument("--require-order-balance", action="store_true",
+                    help="Fail (exit 2) unless --order-control-root supplies a complete "
+                         "reverse-order comparison for every forward benchmark.")
     ap.add_argument("--selftest", action="store_true",
                     help="Run the fixture self-test (no criterion_root/arch needed) and exit")
     args = ap.parse_args()
@@ -2263,6 +2827,14 @@ def main() -> int:
         ambient = assess_ambient_samples(args.ambient_samples, floor_pct)
 
     require_measurements = args.require_measurements or args.status_out is not None
+
+    if args.require_order_balance and args.order_control_root is None:
+        reason = (
+            "--require-order-balance needs --order-control-root; a single "
+            "fixed-order Criterion comparison cannot be enforced"
+        )
+        print(f"error: {reason}.", file=sys.stderr)
+        return finish("error", EXIT_ERROR, reason)
 
     if args.informational_target is not None:
         if args.target is None:
@@ -2488,23 +3060,9 @@ def main() -> int:
                 f"{len(incomplete_samples)} comparison(s) lack sample metadata",
             )
 
-    report = render_report(
-        results, args.arch, args.target, args.informational_target, provenance)
-    print(report)
-    if args.out:
-        args.out.write_text(report)
-
-    gating = [
-        r for r in results
-        if not r.is_informational(args.target, args.informational_target)
-    ]
-
-    # Completeness, not existence. The first version of this guard asked whether
-    # ANY judgeable comparison existed, which passes a run where one target built
-    # a clean comparison and the other produced an unresolvable or malformed one:
-    # the failed target is exactly the one nobody measured, so a green exit is a
-    # claim about code that was never benched. Reconcile what the run intended
-    # (change files on disk) against what was actually judged.
+    # Completeness, not existence. Reconcile the selected base set against the
+    # comparisons that were actually judged before attempting to pair them
+    # with the reverse-order control.
     if require_measurements and missing_head_ids:
         return refuse_missing_head()
 
@@ -2522,6 +3080,58 @@ def main() -> int:
             f"{len(unjudged)} of {len(change_files)} comparisons could not be judged",
         )
 
+    if args.order_control_root is not None:
+        try:
+            reverse_results = parse_order_control(
+                args.order_control_root,
+                args.order_control_baseline_name,
+                {result.name for result in results},
+                require_samples=args.require_provenance,
+            )
+            results = order_balance_results(results, reverse_results)
+        except (ArithmeticError, OSError, TypeError, ValueError) as error:
+            print(f"error: invalid order-control evidence: {error}", file=sys.stderr)
+            return finish(
+                "error",
+                EXIT_ERROR,
+                f"invalid order-control evidence: {error}",
+            )
+
+    gating = [
+        r for r in results
+        if not r.is_informational(args.target, args.informational_target)
+    ]
+
+    excessive_order_bias = [
+        result
+        for result in gating
+        if result.order_bias_bound_pct is not None
+        and result.order_bias_bound_pct > FAIL_PCT
+    ]
+    order_bias_reason = None
+    if excessive_order_bias:
+        worst = max(
+            excessive_order_bias,
+            key=lambda result: result.order_bias_bound_pct or 0.0,
+        )
+        order_bias_reason = (
+            f"{len(excessive_order_bias)} gated benchmark(s) have an AB/BA "
+            f"order-bias bound above the {FAIL_PCT:.1f}% fail margin; worst is "
+            f"{worst.name} at {worst.order_bias_bound_pct:.2f}%"
+        )
+
+    report = render_report(
+        results,
+        args.arch,
+        args.target,
+        args.informational_target,
+        provenance,
+        decision_suppressed_reason=order_bias_reason,
+    )
+    print(report)
+    if args.out:
+        args.out.write_text(report)
+
     if ambient is not None and not ambient.instrumentation_valid:
         reason = ambient.reason or "ambient instrumentation was invalid"
         print(f"error: {reason}", file=sys.stderr)
@@ -2534,6 +3144,18 @@ def main() -> int:
             file=sys.stderr,
         )
         return finish("not_measurable", EXIT_NOT_MEASURABLE, reason)
+
+    if order_bias_reason is not None:
+        print(
+            f"NOT MEASURABLE: {order_bias_reason}; no performance verdict rendered",
+            file=sys.stderr,
+        )
+        return finish(
+            "not_measurable",
+            EXIT_NOT_MEASURABLE,
+            order_bias_reason,
+            measurement_count=len(results),
+        )
 
     fails = sum(1 for r in gating if r.verdict() == "FAIL")
     if fails:

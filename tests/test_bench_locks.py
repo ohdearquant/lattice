@@ -525,7 +525,7 @@ class RunProvenanceHandoff(unittest.TestCase):
             ]
             self.assertEqual(
                 [state["label"] for state in states],
-                ["before base", "between phases", "after head"],
+                ["before first arm", "between order strata", "after final arm"],
             )
             self.assertTrue(
                 all(
@@ -693,7 +693,7 @@ class MachineStateGate(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assertEqual(
                 sb.machine_state_labels(),
-                ["before base", "between phases", "after head"],
+                ["before first arm", "between order strata", "after final arm"],
             )
             _, separator, report = r.stdout.partition("=== Run conditions ===")
             self.assertTrue(separator, r.stdout)
@@ -705,7 +705,7 @@ class MachineStateGate(unittest.TestCase):
             ]
             self.assertEqual(
                 [state["label"] for state in states],
-                ["before base", "between phases", "after head"],
+                ["before first arm", "between order strata", "after final arm"],
             )
             self.assertTrue(
                 all(
@@ -726,8 +726,10 @@ class MachineStateGate(unittest.TestCase):
                 STUB_GOVERNOR_RC="2",
             )
             self.assertEqual(r.returncode, 2, f"stdout:\n{r.stdout}")
-            self.assertEqual(sb.machine_state_labels(), ["before base"])
-            self.assertIn("machine-state checkpoint 'before base' failed", r.stderr)
+            self.assertEqual(sb.machine_state_labels(), ["before first arm"])
+            self.assertIn(
+                "machine-state checkpoint 'before first arm' failed", r.stderr
+            )
             self.assertNotIn("Building + benching BASE", r.stdout)
 
     def test_blocked_macos_checkpoint_reports_or_refuses_by_enforcement_mode(self):
@@ -769,9 +771,9 @@ class MachineStateGate(unittest.TestCase):
                 STUB_GOVERNOR_RC="2",
             )
             self.assertEqual(enforcing.returncode, 2, enforcing.stdout)
-            self.assertEqual(sb.machine_state_labels(), ["before base"])
+            self.assertEqual(sb.machine_state_labels(), ["before first arm"])
             self.assertIn(
-                "machine-state checkpoint 'before base' failed",
+                "machine-state checkpoint 'before first arm' failed",
                 enforcing.stderr,
             )
             self.assertNotIn("Building + benching BASE", enforcing.stdout)

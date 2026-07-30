@@ -6,7 +6,8 @@
 # Creates <dir>/.metadata_never_index so macOS does not index the directory.
 # Benchmark entry points call this before creating or building their measurement
 # trees. Indexing the resulting filesystem churn can overlap a timing phase, and
-# a base-then-head A/B turns asymmetric overlap into an apparent code delta.
+# an asymmetric overlap can become an apparent code delta (or make the
+# order-balanced enforcing run honestly refuse as not measurable).
 #
 # FAIL-CLOSED BY DESIGN. This guards measurement integrity, so it must never
 # report success without the marker actually being in place. A silently absent

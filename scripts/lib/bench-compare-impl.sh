@@ -14,7 +14,9 @@
 #   scripts/bench-compare.sh --full main pr/embed    # full Criterion (slow, tight CIs)
 #   scripts/bench-compare.sh HEAD~3                  # HEAD~3 vs HEAD
 #
-# Defaults to --quick (~2 min). Use --full (~15 min) for tight confidence intervals.
+# Defaults to report-only --quick (~2 min). Enforcing ABBA runs approximately
+# double the two-arm measurement time. Use --full for tighter within-arm
+# Criterion intervals.
 # Optional Criterion filters:
 #   BENCH_GROUPS_INFERENCE="rms_norm|gelu" scripts/bench-compare.sh
 #   BENCH_GROUPS_EMBED="simd_dot_product|int8_raw" scripts/bench-compare.sh
@@ -59,15 +61,21 @@
 # affect one another.
 #
 # --full applies no informational demotion: every group it benches is
-# classified gating, simd included, because full resolution is tight enough
-# to distinguish a real simd regression from machine noise. Three caveats
-# keep that from meaning "a regression cannot get past this".
+# classified gating, simd included. An ENFORCING invocation brackets those
+# measurements in ABBA order (base₁, head₁, head₂, base₂); the gate combines
+# the forward and reverse ratios in log space and widens the result by the
+# measured order-bias envelope. Report-only invocations retain the two-arm AB
+# path so contributor feedback remains fast. Three caveats keep full mode from
+# meaning "a regression cannot get past this".
 #
 # Enforcement: neither mode enforces BY DEFAULT. The gate's exit status is
 # captured into GATE_RC at the bottom and re-raised only under
 # --fail-on-regression, so by default a FAIL verdict is printed and the script
 # still exits 0 — which is why the demotion below is a resolution split rather
-# than a coverage hole in the default path. Two
+# than a coverage hole in the default path. The enforcing path also refuses a
+# single fixed-order comparison: incomplete reverse evidence exits 2, and an
+# order-bias envelope above the existing 7% FAIL margin exits 3
+# (NOT_MEASURABLE), keeping the lane red without accusing the source. Two
 # callers do enforce: --fail-on-regression propagates the gate's status (exit
 # 1 confirmed regression, exit 2 the measurement itself is broken), and
 # `make bench-gate` runs the same two default targets unfiltered against the
@@ -104,7 +112,7 @@ set -euo pipefail
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
 
 REPO="$(cd "$(dirname "$0")/../.." && pwd)"
-QUICK_FLAGS="--quick"  # adaptive two-point sample, ~2 min total
+QUICK_FLAGS="--quick"  # adaptive two-point sample; enforcing ABBA runs four arms
 RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 if [ -n "${BENCH_HOST_ID:-}" ]; then
   RUN_HOST_ID="configured:${BENCH_HOST_ID}"
@@ -376,7 +384,7 @@ require_commit_clean_head() {
 echo "=== bench-compare: $BASE_REF ($BASE_SHA) vs $HEAD_REF ($HEAD_SHA) ==="
 print_execution_provenance
 require_commit_clean_head
-quiet_gate "before base" "before"
+quiet_gate "before first arm" "before"
 
 # --- Keep Spotlight out of the benchmark build trees ---
 # .cache protects the detached base/head worktrees. The separate target marker
@@ -444,6 +452,7 @@ BENCHES_EMBED="simd"
 BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
 BENCH_BASELINE_NAME="compare-base"
+BENCH_HEAD_BASELINE_NAME="compare-head"
 
 # Keep Criterion evidence target-qualified without giving up Cargo's shared
 # compilation target. CRITERION_HOME controls only Criterion's report/baseline
@@ -453,14 +462,29 @@ BASE_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/inference/criterion"
 BASE_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/embed/criterion"
 INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/inference/criterion"
 EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/embed/criterion"
+HEAD_CONTROL_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/head/inference/criterion"
+HEAD_CONTROL_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/head/embed/criterion"
+BASE_CONTROL_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/base/inference/criterion"
+BASE_CONTROL_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/base/embed/criterion"
 mkdir -p \
   "$BASE_INFERENCE_CRITERION_ROOT" "$BASE_EMBED_CRITERION_ROOT" \
   "$INFERENCE_CRITERION_ROOT" "$EMBED_CRITERION_ROOT"
 if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  mkdir -p \
+    "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" "$HEAD_CONTROL_EMBED_CRITERION_ROOT" \
+    "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" "$BASE_CONTROL_EMBED_CRITERION_ROOT"
   python3 "$GATE_SCRIPT" "$BASE_INFERENCE_CRITERION_ROOT" \
     --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
   python3 "$GATE_SCRIPT" "$BASE_EMBED_CRITERION_ROOT" \
     --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+  python3 "$GATE_SCRIPT" "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
+    --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
+  python3 "$GATE_SCRIPT" "$HEAD_CONTROL_EMBED_CRITERION_ROOT" \
+    --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
+  python3 "$GATE_SCRIPT" "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
+    --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
+  python3 "$GATE_SCRIPT" "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
+    --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
 fi
 
 # --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
@@ -541,7 +565,9 @@ BASE_PHASE_RC=0
 # and re-raised here or the refusal above is itself swallowed.
 if [ "$BASE_PHASE_RC" -ne 0 ]; then exit "$BASE_PHASE_RC"; fi
 
-quiet_gate "between phases" "between"
+if [ "$FAIL_ON_REGRESSION" != "1" ]; then
+  quiet_gate "between order strata" "between"
+fi
 
 # --- Copy base criterion data to HEAD's target ---
 echo ""
@@ -570,26 +596,28 @@ copy_base_artifacts() {
 }
 
 prepare_target_root() {
-  local target="$1" base_root="$2" head_root="$3"
+  local target="$1" base_root="$2" head_root="$3" baseline_name="$4"
   if [ "$FAIL_ON_REGRESSION" = "1" ]; then
     python3 "$GATE_SCRIPT" "$head_root" \
-      --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+      --baseline-name "$baseline_name" --prepare-baseline-copy
   fi
   copy_base_artifacts "$target selected baseline copy" \
     -a "$base_root/" "$head_root/" \
-    --include="**/$BENCH_BASELINE_NAME/**" --include='*/' --exclude='*'
+    --include="**/$baseline_name/**" --include='*/' --exclude='*'
   if [ "$FAIL_ON_REGRESSION" = "1" ]; then
     python3 "$GATE_SCRIPT" "$head_root" \
-      --baseline-name "$BENCH_BASELINE_NAME" --prepare-head
+      --baseline-name "$baseline_name" --prepare-head
   fi
 }
 
 prepare_target_root \
   "lattice-inference:$BENCHES_INFERENCE" \
-  "$BASE_INFERENCE_CRITERION_ROOT" "$INFERENCE_CRITERION_ROOT"
+  "$BASE_INFERENCE_CRITERION_ROOT" "$INFERENCE_CRITERION_ROOT" \
+  "$BENCH_BASELINE_NAME"
 prepare_target_root \
   "lattice-embed:$BENCHES_EMBED" \
-  "$BASE_EMBED_CRITERION_ROOT" "$EMBED_CRITERION_ROOT"
+  "$BASE_EMBED_CRITERION_ROOT" "$EMBED_CRITERION_ROOT" \
+  "$BENCH_BASELINE_NAME"
 
 HEAD_PHASE_RC=0
 (
@@ -606,7 +634,48 @@ HEAD_PHASE_RC=0
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
 
-quiet_gate "after head" "after"
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  # The midpoint probe separates the two order strata. The enclosing lock
+  # remains held throughout all four arms.
+  quiet_gate "between order strata" "between"
+
+  echo ""
+  echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
+  HEAD_CONTROL_PHASE_RC=0
+  (
+    cd "$HEAD_DIR"
+    run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+    require_measured "head control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
+    run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+    require_measured "head control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
+  ) || HEAD_CONTROL_PHASE_RC=$?
+  if [ "$HEAD_CONTROL_PHASE_RC" -ne 0 ]; then exit "$HEAD_CONTROL_PHASE_RC"; fi
+
+  prepare_target_root \
+    "lattice-inference:$BENCHES_INFERENCE reverse-order control" \
+    "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
+    "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
+    "$BENCH_HEAD_BASELINE_NAME"
+  prepare_target_root \
+    "lattice-embed:$BENCHES_EMBED reverse-order control" \
+    "$HEAD_CONTROL_EMBED_CRITERION_ROOT" \
+    "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
+    "$BENCH_HEAD_BASELINE_NAME"
+
+  echo ""
+  echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
+  BASE_CONTROL_PHASE_RC=0
+  (
+    cd "$WT"
+    run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+    require_measured "base control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
+    run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+    require_measured "base control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
+  ) || BASE_CONTROL_PHASE_RC=$?
+  if [ "$BASE_CONTROL_PHASE_RC" -ne 0 ]; then exit "$BASE_CONTROL_PHASE_RC"; fi
+fi
+
+quiet_gate "after final arm" "after"
 require_commit_clean_head
 
 write_run_provenance() {
@@ -679,6 +748,7 @@ echo "  targets: lattice-inference:$BENCHES_INFERENCE, lattice-embed:$BENCHES_EM
 echo "  inference features: ${CARGO_FEATURES_INFERENCE:-<none>}"
 echo "  filters: inference='${BENCH_GROUPS_INFERENCE:-<all>}' embed='${BENCH_GROUPS_EMBED:-<all>}'"
 echo "  enforcement: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "--fail-on-regression (gate status propagated)" || echo "report-only (gate status printed, exit 0)")"
+echo "  arm order: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "ABBA (base₁ → head₁ → head₂ → base₂)" || echo "AB (base → head)")"
 echo "  locks:"
 echo "$LOCK_SUMMARY"
 echo "  ambient load:"
@@ -690,7 +760,7 @@ echo ""
 echo "=== Target-qualified gate reports ==="
 GATE_RC=0
 run_target_gate() {
-  local target="$1" criterion_root="$2"
+  local target="$1" criterion_root="$2" order_control_root="$3"
   local gate_rc=0 policy_rc=0 policy_invalid=0
   local gate_args=(
     --baseline-name compare-base
@@ -715,7 +785,13 @@ run_target_gate() {
     # Each target has its own root, so completeness is checked per intended
     # target rather than inferred from whichever comparisons survived in a
     # shared tree.
-    gate_args+=(--require-measurements --require-provenance)
+    gate_args+=(
+      --require-measurements
+      --require-provenance
+      --require-order-balance
+      --order-control-root "$order_control_root"
+      --order-control-baseline-name "$BENCH_HEAD_BASELINE_NAME"
+    )
     if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
       local status_name="${target//[:\\/]/-}"
       gate_args+=(
@@ -745,22 +821,26 @@ run_target_gate() {
 }
 
 run_target_gate \
-  "lattice-inference:$BENCHES_INFERENCE" "$INFERENCE_CRITERION_ROOT"
+  "lattice-inference:$BENCHES_INFERENCE" \
+  "$INFERENCE_CRITERION_ROOT" \
+  "$BASE_CONTROL_INFERENCE_CRITERION_ROOT"
 run_target_gate \
-  "lattice-embed:$BENCHES_EMBED" "$EMBED_CRITERION_ROOT"
+  "lattice-embed:$BENCHES_EMBED" \
+  "$EMBED_CRITERION_ROOT" \
+  "$BASE_CONTROL_EMBED_CRITERION_ROOT"
 
 echo ""
 echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
 
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;
-  # exit 3 is a run whose ambient conditions make it unmeasurable. All must
-  # fail the caller: a green exit standing in for evidence that was never
-  # produced is the exact defect this flag exists to remove.
+  # exit 3 is a run whose ambient or order-bias evidence makes it unmeasurable.
+  # All must fail the caller: a green exit standing in for evidence that was
+  # never produced is the exact defect this flag exists to remove.
   if [ "$GATE_RC" = "2" ]; then
     echo "bench-compare: gate could not judge this run — no usable measurements." >&2
   elif [ "$GATE_RC" = "3" ]; then
-    echo "bench-compare: ambient conditions made this run not measurable." >&2
+    echo "bench-compare: measurement conditions made this run not measurable." >&2
   else
     echo "bench-compare: gate reported a confirmed regression (exit $GATE_RC)." >&2
   fi

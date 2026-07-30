@@ -87,12 +87,13 @@ fi
 
 write_baseline() {
   local bench="$1"
-  mkdir -p "$CRITERION_HOME/$bench/compare-base"
+  local baseline_name="$2"
+  mkdir -p "$CRITERION_HOME/$bench/$baseline_name"
   printf '%s\n' '{"mean":{"point_estimate":90.0}}' \
-    > "$CRITERION_HOME/$bench/compare-base/estimates.json"
+    > "$CRITERION_HOME/$bench/$baseline_name/estimates.json"
   printf '%s\n' \
     '{"sampling_mode":"Linear","iters":[1.0,2.0],"times":[1.0,2.0]}' \
-    > "$CRITERION_HOME/$bench/compare-base/sample.json"
+    > "$CRITERION_HOME/$bench/$baseline_name/sample.json"
 }
 
 write_head() {
@@ -123,11 +124,13 @@ if [[ "$args" == *" --list "* ]]; then
 fi
 
 if [[ "$args" == *" --save-baseline "* ]]; then
+  baseline_name="${args#* --save-baseline }"
+  baseline_name="${baseline_name%% *}"
   if [[ "$args" == *" lattice-inference "* ]]; then
-    write_baseline "rms_norm/896"
-    write_baseline "rms_norm/4096"
+    write_baseline "rms_norm/896" "$baseline_name"
+    write_baseline "rms_norm/4096" "$baseline_name"
   else
-    write_baseline "simd_dot_product/scalar/384"
+    write_baseline "simd_dot_product/scalar/384" "$baseline_name"
   fi
 else
   if [[ "$args" == *" lattice-inference "* ]]; then
@@ -156,6 +159,115 @@ for bench in rms_norm/896 simd_dot_product/scalar/384; do
   fi
 done
 exit 23
+"""
+
+ORDER_BALANCE_CARGO = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+  exit 0
+fi
+
+args=" $* "
+if [[ "$args" == *" --no-run "* ]]; then
+  exit 0
+fi
+
+if [[ "$args" == *" lattice-inference "* ]]; then
+  bench="softmax_attention/512"
+  target="inference"
+else
+  bench="simd_dot_product/scalar/384"
+  target="embed"
+fi
+
+if [[ "$PWD" == *"/.cache/bench-compare-base" ]]; then
+  arm="A"
+else
+  arm="B"
+fi
+printf '%s\n' "$target:$arm" >> "$STUB_ORDER_FILE"
+
+write_estimate() {
+  local artifact="$1"
+  local ns="$2"
+  mkdir -p "$CRITERION_HOME/$bench/$artifact"
+  printf '{"mean":{"point_estimate":%s}}\n' "$ns" \
+    > "$CRITERION_HOME/$bench/$artifact/estimates.json"
+  printf '%s\n' \
+    '{"sampling_mode":"Flat","iters":[1.0,2.0],"times":[1.0,2.0]}' \
+    > "$CRITERION_HOME/$bench/$artifact/sample.json"
+}
+
+write_change() {
+  local point="$1"
+  local low="$2"
+  local high="$3"
+  mkdir -p "$CRITERION_HOME/$bench/change"
+  printf '{"mean":{"point_estimate":%s,"confidence_interval":{"lower_bound":%s,"upper_bound":%s}}}\n' \
+    "$point" "$low" "$high" \
+    > "$CRITERION_HOME/$bench/change/estimates.json"
+}
+
+scenario="${STUB_SCENARIO:-directional-drift}"
+if [[ "$scenario" == "directional-drift" ]]; then
+  a1="100.0"
+  b1="110.0"
+  b2="121.0"
+  a2="133.1"
+  forward_point="0.10"
+  forward_low="0.095"
+  forward_high="0.105"
+  reverse_point="0.10"
+  reverse_low="0.095"
+  reverse_high="0.105"
+elif [[ "$scenario" == "true-regression" ]]; then
+  a1="100.0"
+  b1="122.4"
+  b2="124.848"
+  a2="106.1208"
+  forward_point="0.224"
+  forward_low="0.222"
+  forward_high="0.226"
+  reverse_point="-0.15"
+  reverse_low="-0.152"
+  reverse_high="-0.148"
+else
+  printf 'unknown STUB_SCENARIO=%s\n' "$scenario" >&2
+  exit 9
+fi
+
+if [[ "$args" == *" --save-baseline "* ]]; then
+  baseline_name="${args#* --save-baseline }"
+  baseline_name="${baseline_name%% *}"
+  if [[ "$baseline_name" == "compare-base" ]]; then
+    write_estimate "$baseline_name" "$a1"
+  elif [[ "$baseline_name" == "compare-head" ]]; then
+    write_estimate "$baseline_name" "$b2"
+  else
+    printf 'unexpected save baseline %s\n' "$baseline_name" >&2
+    exit 9
+  fi
+else
+  baseline_name="${args#* --baseline }"
+  baseline_name="${baseline_name%% *}"
+  if [[ "$baseline_name" == "compare-base" && "$arm" == "B" ]]; then
+    write_estimate "new" "$b1"
+    write_change "$forward_point" "$forward_low" "$forward_high"
+  elif [[ "$baseline_name" == "compare-head" && "$arm" == "A" ]]; then
+    write_estimate "new" "$a2"
+    write_change "$reverse_point" "$reverse_low" "$reverse_high"
+  else
+    printf 'unexpected comparison baseline=%s arm=%s\n' "$baseline_name" "$arm" >&2
+    exit 9
+  fi
+fi
+
+printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
+if [[ "$args" == *" --baseline "* ]]; then
+  printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
+fi
 """
 
 
@@ -305,6 +417,96 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"reporter mode must not exit 2\nstdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}")
         self.assertNotIn("produced no measurements", result.stderr)
+
+    def test_reporter_mode_keeps_the_two_arm_order(self):
+        """Report-only feedback remains the fast raw A→B comparison."""
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                [],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_SCENARIO": "directional-drift",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observations = order_file.read_text().splitlines()
+            for target in ("inference", "embed"):
+                self.assertEqual(
+                    [
+                        observation.split(":", 1)[1]
+                        for observation in observations
+                        if observation.startswith(f"{target}:")
+                    ],
+                    ["A", "B"],
+                    observations,
+                )
+            self.assertIn("arm order: AB (base → head)", result.stdout)
+            self.assertNotIn("ABBA bound", result.stdout)
+
+    def test_enforcing_abba_refuses_identical_source_directional_drift(self):
+        """A gate-sized second-arm drift is NOT_MEASURABLE, never regression.
+
+        Mutation-sensitive in two independent ways: remove the reverse-order
+        arms and the old forward +10% interval exits 1; combine the two ratios
+        without retaining the order-effect envelope and the run exits 0 instead
+        of failing closed with 3.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_SCENARIO": "directional-drift",
+                },
+            )
+            self.assertEqual(
+                result.returncode,
+                3,
+                f"expected NOT_MEASURABLE (3), got {result.returncode}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("order-bias bound above", result.stdout)
+            self.assertIn("**⏸ NOT MEASURABLE**", result.stdout)
+            self.assertNotIn("✅ All 1 gated benches", result.stdout)
+            observations = order_file.read_text().splitlines()
+            for target in ("inference", "embed"):
+                self.assertEqual(
+                    [
+                        observation.split(":", 1)[1]
+                        for observation in observations
+                        if observation.startswith(f"{target}:")
+                    ],
+                    ["A", "B", "B", "A"],
+                    observations,
+                )
+            self.assertIn(
+                "arm order: ABBA (base₁ → head₁ → head₂ → base₂)",
+                result.stdout,
+            )
+
+    def test_enforcing_abba_retains_distinguishable_regression(self):
+        """A true 20% source regression under 2% drift still exits 1."""
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_SCENARIO": "true-regression",
+                },
+            )
+            self.assertEqual(
+                result.returncode,
+                1,
+                f"expected regression (1), got {result.returncode}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("gate reported a confirmed regression", result.stderr)
 
     def test_stale_change_cannot_mask_a_benchmark_removed_on_head(self):
         """A stale same-path comparison must not satisfy head completeness.

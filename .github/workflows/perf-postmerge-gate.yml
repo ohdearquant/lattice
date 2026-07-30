@@ -145,7 +145,7 @@ jobs:
           {
             echo "### perf post-merge A/B (${{ matrix.arch }})"
             echo
-            echo "\`$BASE\` -> \`$HEAD\`, full-mode Criterion."
+            echo "\`$BASE\` -> \`$HEAD\`, full-mode order-balanced Criterion."
             echo "Base source: \`$BASE_SOURCE\`; commit span: \`$SPAN_COUNT\`."
             echo "Progression branch: \`$STATE_BRANCH\` (prior: \`$STATE_BEFORE\`)."
             echo
@@ -154,6 +154,11 @@ jobs:
             echo "gates: the quick-mode informational demotion does not apply in full"
             echo "mode, and this job sets no \`BENCH_GROUPS_*\` filter. The workspace's"
             echo "other bench targets are not run here."
+            echo
+            echo "**Order control.** Enforcement runs \`base₁ → head₁ → head₂ →"
+            echo "base₂\`. The gate combines both order strata in log space and"
+            echo "returns NOT_MEASURABLE if the observed order-bias envelope"
+            echo "alone exceeds the unchanged 7% FAIL margin."
             echo
             echo "**Scope.** This lane DETECTS post-merge; it cannot gate the merge"
             echo "that introduced a regression, and it is not a required check."
@@ -228,10 +233,14 @@ jobs:
               for phase, idle in ambient["samples"].items()
               if idle < floor
           ]
-          detail = ", ".join(failing) or status["reason"]
+          detail = (
+              f"{', '.join(failing)}; floor={floor:.1f}%"
+              if failing
+              else status["reason"]
+          )
           print(
               "::warning title=Performance run not measurable::"
-              f"verdict=not_measurable; {detail}; floor={floor:.1f}%"
+              f"verdict=not_measurable; {detail}"
           )
           PY
             exit 0
@@ -251,7 +260,7 @@ jobs:
         run: |
           {
             if [ "$AB_RC" = "3" ]; then
-              echo "GAP, exit 3 — verdict \`not_measurable\`. Ambient load"
+              echo "GAP, exit 3 — verdict \`not_measurable\`. Measurement conditions"
               echo "invalidated this run, so it produced no performance data point"
               echo "and did not advance \`$STATE_BRANCH\`. See the warning and"
               echo "\`perf-postmerge-status-${{ matrix.arch }}\` artifact."
