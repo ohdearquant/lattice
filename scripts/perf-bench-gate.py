@@ -118,6 +118,7 @@ PROVENANCE_FIELDS = (
 WARN_PCT = 3.0   # CI-lower above this => warning
 FAIL_PCT = 7.0   # CI-lower above this => FAIL
 CELEBRATE_PCT = -3.0  # point estimate below this AND CI-upper<0 => celebrate
+QUICK_UNATTRIBUTABLE = "UNATTRIBUTABLE (quick resolution)"
 
 EXIT_PASS = 0
 EXIT_REGRESSION = 1
@@ -345,10 +346,12 @@ class BenchResult:
     def is_informational(self, target: str | None, informational_target: str | None) -> bool:
         return target is not None and target == informational_target
 
-    def verdict(self) -> str:
+    def verdict(self, resolution: str = "full") -> str:
         if self.ci_low_pct > FAIL_PCT:
             return "FAIL"
         if self.ci_low_pct > WARN_PCT:
+            if resolution == "quick":
+                return QUICK_UNATTRIBUTABLE
             return "WARN"
         if self.point_pct < CELEBRATE_PCT and self.ci_high_pct < 0:
             return "WIN"
@@ -1270,7 +1273,13 @@ def render_run_provenance(
 def render_report(results: list[BenchResult], arch: str, target: str | None = None,
                   informational_target: str | None = None,
                   provenance: RunProvenance | None = None,
+                  resolution: str = "full",
                   decision_suppressed_reason: str | None = None) -> str:
+    if not results:
+        raise ValueError("classifier requires at least one measured row")
+    if resolution not in ("quick", "full"):
+        raise ValueError(f"unsupported benchmark resolution: {resolution}")
+
     order_balanced = any(r.order_bias_bound is not None for r in results)
     interval_label = "ABBA bound" if order_balanced else "95% CI"
     gated = [
@@ -1282,13 +1291,19 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
         if r.is_informational(target, informational_target)
     ]
 
-    fails = [r for r in gated if r.verdict() == "FAIL"]
-    warns = [r for r in gated if r.verdict() == "WARN"]
-    wins = [r for r in gated if r.verdict() == "WIN"]
+    fails = [r for r in gated if r.verdict(resolution) == "FAIL"]
+    warns = [r for r in gated if r.verdict(resolution) == "WARN"]
+    unattributable = [
+        r for r in gated if r.verdict(resolution) == QUICK_UNATTRIBUTABLE
+    ]
+    wins = [r for r in gated if r.verdict(resolution) == "WIN"]
 
-    info_fails = [r for r in info if r.verdict() == "FAIL"]
-    info_warns = [r for r in info if r.verdict() == "WARN"]
-    info_wins = [r for r in info if r.verdict() == "WIN"]
+    info_fails = [r for r in info if r.verdict(resolution) == "FAIL"]
+    info_warns = [r for r in info if r.verdict(resolution) == "WARN"]
+    info_unattributable = [
+        r for r in info if r.verdict(resolution) == QUICK_UNATTRIBUTABLE
+    ]
+    info_wins = [r for r in info if r.verdict(resolution) == "WIN"]
 
     lines = [f"### `{arch}` — perf regression report\n"]
     if decision_suppressed_reason is not None:
@@ -1319,14 +1334,24 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% by "
             f"the same {qualifier})"
         )
+    if decision_suppressed_reason is None and unattributable:
+        lines.append(
+            f"**◻ {len(unattributable)} UNATTRIBUTABLE** (quick-resolution "
+            f"{WARN_PCT}-{FAIL_PCT}% warn band is narrower than the harness's "
+            "measured arm-order bias)"
+        )
     if decision_suppressed_reason is None and wins:
         lines.append(f"**🚀 {len(wins)} confirmed improvement**")
-    if decision_suppressed_reason is None and not (fails or warns or wins):
+    if decision_suppressed_reason is None and not (
+        fails or warns or unattributable or wins
+    ):
         lines.append(f"✅ All {len(gated)} gated benches within noise band (±{WARN_PCT}%)")
     lines.append("")
     lines.extend(render_run_provenance(provenance, results))
 
-    if decision_suppressed_reason is None and (fails or warns or wins):
+    if decision_suppressed_reason is None and (
+        fails or warns or unattributable or wins
+    ):
         bias_column = " | order bias ≤" if order_balanced else ""
         lines.append(
             f"| Bench | Δ point | {interval_label}{bias_column} | new ns | "
@@ -1337,8 +1362,16 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             if order_balanced
             else "|---|---:|---|---:|---:|---|---|---|"
         )
-        for r in sorted(fails + warns + wins, key=lambda r: -r.ci_low_pct):
-            icon = {"FAIL": "❌", "WARN": "⚠", "WIN": "🚀"}[r.verdict()]
+        for r in sorted(
+            fails + warns + unattributable + wins, key=lambda r: -r.ci_low_pct
+        ):
+            verdict = r.verdict(resolution)
+            icon = {
+                "FAIL": "❌",
+                "WARN": "⚠",
+                QUICK_UNATTRIBUTABLE: "◻",
+                "WIN": "🚀",
+            }[verdict]
             bias_cell = (
                 f"| {r.order_bias_bound_pct:+.2f}% "
                 if r.order_bias_bound_pct is not None
@@ -1347,7 +1380,7 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             lines.append(
                 f"| `{r.name}` | {r.point_pct:+.2f}% | [{r.ci_low_pct:+.2f}%, {r.ci_high_pct:+.2f}%] "
                 f"{bias_cell}| {r.new_ns:.1f} | {r.old_ns:.1f} | {sample_cell(r, 'base')} "
-                f"| {sample_cell(r, 'head')} | {icon} {r.verdict()} |"
+                f"| {sample_cell(r, 'head')} | {icon} {verdict} |"
             )
         lines.append("")
 
@@ -1357,7 +1390,9 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             f"lattice-embed SIMD micro-benches, tracked in #714; not gated here, "
             f"re-run `--full` for a gated verdict)"
         )
-        if info_fails or info_warns or info_wins:
+        if decision_suppressed_reason is None and (
+            info_fails or info_warns or info_unattributable or info_wins
+        ):
             bias_column = " | order bias ≤" if order_balanced else ""
             lines.append(
                 f"| Bench | Δ point | {interval_label}{bias_column} | new ns | "
@@ -1368,8 +1403,17 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
                 if order_balanced
                 else "|---|---:|---|---:|---:|---|---|---|"
             )
-            for r in sorted(info_fails + info_warns + info_wins, key=lambda r: -r.ci_low_pct):
-                icon = {"FAIL": "❌", "WARN": "⚠", "WIN": "🚀"}[r.verdict()]
+            for r in sorted(
+                info_fails + info_warns + info_unattributable + info_wins,
+                key=lambda r: -r.ci_low_pct,
+            ):
+                verdict = r.verdict(resolution)
+                icon = {
+                    "FAIL": "❌",
+                    "WARN": "⚠",
+                    QUICK_UNATTRIBUTABLE: "◻",
+                    "WIN": "🚀",
+                }[verdict]
                 bias_cell = (
                     f"| {r.order_bias_bound_pct:+.2f}% "
                     if r.order_bias_bound_pct is not None
@@ -1378,7 +1422,7 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
                 lines.append(
                     f"| `{r.name}` | {r.point_pct:+.2f}% | [{r.ci_low_pct:+.2f}%, {r.ci_high_pct:+.2f}%] "
                     f"{bias_cell}| {r.new_ns:.1f} | {r.old_ns:.1f} | {sample_cell(r, 'base')} "
-                    f"| {sample_cell(r, 'head')} | {icon} {r.verdict()} (informational) |"
+                    f"| {sample_cell(r, 'head')} | {icon} {verdict} (informational) |"
                 )
         lines.append("")
 
@@ -1410,10 +1454,18 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
         else "CI-lower of change"
     )
     if decision_suppressed_reason is None:
-        lines.append(
-            f"_Rule: {lower_bound_name} ≤{WARN_PCT}% passes silently; "
-            f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
-        )
+        if resolution == "quick":
+            lines.append(
+                f"_Rule: {lower_bound_name} ≤{WARN_PCT}% passes silently; "
+                f"({WARN_PCT}%, {FAIL_PCT}%] is unattributable at quick resolution "
+                "because measured arm-order bias is wider than this band; "
+                f">{FAIL_PCT}% fails._"
+            )
+        else:
+            lines.append(
+                f"_Rule: {lower_bound_name} ≤{WARN_PCT}% passes silently; "
+                f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
+            )
     else:
         lines.append(
             "_The measurements are shown for diagnosis only; WARN/FAIL "
@@ -2692,6 +2744,9 @@ def main() -> int:
     ap.add_argument("--informational-target",
                     help="Classify this exact target as informational-only. Must equal --target; "
                          "omit for gating/full-mode runs.")
+    ap.add_argument("--resolution", choices=("quick", "full"), default="full",
+                    help="Measurement resolution used for verdict classification "
+                         "(default: full).")
     ap.add_argument("--require-measurements", action="store_true",
                     help="Fail (exit 2) instead of passing when the run produced no gating "
                          "comparison to judge or a selected-base benchmark has no head "
@@ -3126,6 +3181,7 @@ def main() -> int:
         args.target,
         args.informational_target,
         provenance,
+        args.resolution,
         decision_suppressed_reason=order_bias_reason,
     )
     print(report)
@@ -3157,7 +3213,7 @@ def main() -> int:
             measurement_count=len(results),
         )
 
-    fails = sum(1 for r in gating if r.verdict() == "FAIL")
+    fails = sum(1 for r in gating if r.verdict(args.resolution) == "FAIL")
     if fails:
         return finish(
             "regression",
