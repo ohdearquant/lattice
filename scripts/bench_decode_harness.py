@@ -1471,8 +1471,11 @@ class ProvenanceRecord:
     cell record to the exact code, config, and machine that produced it.
     `profile_sha` is the SHA-256 digest of the exact profile bytes.
     `policy_sha` is a tagged `bench_gate_math.policy_sha` identity over
-    canonical parsed policy values; legacy records may carry an untagged
-    raw-byte digest, which validation never aliases to the canonical scheme."""
+    canonical parsed policy values. `policy_file_sha` retains the exact
+    policy bytes for audit without making prose part of the gating identity.
+    Legacy records may carry an untagged raw-byte `policy_sha` and omit
+    `policy_file_sha`; validation never aliases that legacy scheme to the
+    canonical scheme."""
 
     repo_sha: str
     candidate_sha: str
@@ -1483,6 +1486,7 @@ class ProvenanceRecord:
     profile_sha: str
     policy_version: int
     policy_sha: str
+    policy_file_sha: str | None
     script_sha: str
     hardware_fingerprint: str
     collected_at: str
@@ -1501,10 +1505,11 @@ class CellAggregate:
     corrected gate bound, n_valid, n_invalid, order balance, and raw-
     artifact digest" (order balance / raw-artifact digest live on
     `CellRecord`, not here). `measured_cv` and `required_n` are
-    correction 1's fields: a cell with `measured_cv is None` can never be
-    promoted (see `validate_run_record`'s low-valid-n / missing-CV
-    check) -- `required_n` is what `bench_gate_math.required_n` returned
-    for that measured CV at record time, so a later re-derivation can be
+    correction 1's fields: a recorded CV is either a positive finite
+    number or `None`, and a cell with `measured_cv is None` can never be
+    promoted (see `validate_run_record`'s low-valid-n / missing-CV check).
+    `required_n` is what `bench_gate_math.required_n` returned for that
+    measured CV at record time, so a later re-derivation can be
     cross-checked without re-running `bench_gate_math`."""
 
     point_estimate: float
@@ -1669,13 +1674,16 @@ _PROVENANCE_KEYS = frozenset(
         "profile_sha",
         "policy_version",
         "policy_sha",
+        "policy_file_sha",
         "script_sha",
         "hardware_fingerprint",
         "collected_at",
         "workflow_run_id",
     }
 )
-_PROVENANCE_REQUIRED = _PROVENANCE_KEYS - frozenset({"workflow_run_id", "base_sha"})
+_PROVENANCE_REQUIRED = _PROVENANCE_KEYS - frozenset(
+    {"workflow_run_id", "base_sha", "policy_file_sha"}
+)
 
 
 def parse_provenance(d: dict) -> ProvenanceRecord:
@@ -1696,9 +1704,31 @@ def parse_provenance(d: dict) -> ProvenanceRecord:
         if isinstance(val, bool) or not isinstance(val, int) or val < 1:
             raise RunRecordValidationError(f"provenance: {key} must be a positive int")
     try:
-        bench_gate_math.policy_sha_scheme(d["policy_sha"])
+        policy_scheme = bench_gate_math.policy_sha_scheme(d["policy_sha"])
     except bench_gate_math.PolicyConfigError as exc:
         raise RunRecordValidationError(f"provenance: {exc}") from exc
+    policy_file_sha = d.get("policy_file_sha")
+    if policy_file_sha is not None and (
+        not isinstance(policy_file_sha, str)
+        or len(policy_file_sha) != 64
+        or any(char not in "0123456789abcdef" for char in policy_file_sha)
+    ):
+        raise RunRecordValidationError(
+            "provenance: policy_file_sha must be a 64-character lowercase SHA-256 or null"
+        )
+    if policy_scheme == bench_gate_math.POLICY_SHA_SCHEME and policy_file_sha is None:
+        raise RunRecordValidationError(
+            "provenance: canonical policy_sha requires policy_file_sha so exact policy bytes "
+            "remain auditable"
+        )
+    if (
+        policy_scheme == bench_gate_math.LEGACY_POLICY_SHA_SCHEME
+        and policy_file_sha is not None
+        and policy_file_sha != d["policy_sha"]
+    ):
+        raise RunRecordValidationError(
+            "provenance: legacy policy_sha and policy_file_sha must match"
+        )
     workflow_run_id = d.get("workflow_run_id")
     if workflow_run_id is not None and (not isinstance(workflow_run_id, str) or not workflow_run_id):
         raise RunRecordValidationError("provenance: workflow_run_id must be a non-empty string or null")
@@ -1712,6 +1742,7 @@ def parse_provenance(d: dict) -> ProvenanceRecord:
         profile_sha=d["profile_sha"],
         policy_version=d["policy_version"],
         policy_sha=d["policy_sha"],
+        policy_file_sha=policy_file_sha,
         script_sha=d["script_sha"],
         hardware_fingerprint=d["hardware_fingerprint"],
         collected_at=d["collected_at"],
@@ -1750,8 +1781,15 @@ def parse_cell_aggregate(d: dict) -> CellAggregate:
             raise RunRecordValidationError(f"cell_aggregate: {key} must be a non-negative int")
     measured_cv = d.get("measured_cv")
     if measured_cv is not None:
-        if isinstance(measured_cv, bool) or not isinstance(measured_cv, (int, float)) or measured_cv < 0:
-            raise RunRecordValidationError("cell_aggregate: measured_cv must be a non-negative number or null")
+        if (
+            isinstance(measured_cv, bool)
+            or not isinstance(measured_cv, (int, float))
+            or not math.isfinite(float(measured_cv))
+            or measured_cv <= 0
+        ):
+            raise RunRecordValidationError(
+                "cell_aggregate: measured_cv must be a positive finite number or null"
+            )
     required_n_val = d.get("required_n")
     if required_n_val is not None:
         if isinstance(required_n_val, bool) or not isinstance(required_n_val, int) or required_n_val < 1:
@@ -2163,9 +2201,9 @@ def validate_run_record(
         prefill_start -> prefill_end -> token_available(+)` sequence (see
         `_validate_phase_sequence`) -- the measurement boundary must be
         proven, not assumed.
-      - non-finite metric: enforced already at `parse_cell_aggregate`
-        (kept here as a defense-in-depth re-check for records built by
-        hand rather than parsed from JSON).
+      - non-finite metric or non-positive/non-finite measured CV: enforced
+        already at `parse_cell_aggregate` (kept here as a defense-in-depth
+        re-check for records built by hand rather than parsed from JSON).
       - low valid-n / missing measured-CV / submitter-controlled
         required_n (correction 1): a `PASS`/`WARN`/`FAIL` cell (not
         `unsupported`) must carry `measured_cv`; the cell's noise class is
@@ -2220,6 +2258,16 @@ def validate_run_record(
     for label, val in (("point_estimate", agg.point_estimate), ("ci_low", agg.ci_low), ("ci_high", agg.ci_high)):
         if not math.isfinite(val):
             raise RunRecordValidationError(f"INFRA-FAIL: cell {record.cell_id!r} {label}={val!r} is not finite")
+    if agg.measured_cv is not None and (
+        isinstance(agg.measured_cv, bool)
+        or not isinstance(agg.measured_cv, (int, float))
+        or not math.isfinite(float(agg.measured_cv))
+        or agg.measured_cv <= 0
+    ):
+        raise RunRecordValidationError(
+            f"INFRA-FAIL: cell {record.cell_id!r} measured_cv={agg.measured_cv!r} "
+            "must be a positive finite number"
+        )
 
     if record.verdict != "unsupported":
         if agg.measured_cv is None:

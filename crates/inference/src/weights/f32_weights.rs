@@ -1,5 +1,8 @@
 //! Safetensors metadata and f32 weight structs, including tensor, transformer-layer, BERT, cross-encoder, safetensors-file, and Qwen layer weights.
 use crate::error::InferenceError;
+use crate::weights::safetensors_layout::{
+    SafetensorsLayoutEntry, safetensors_dtype, validate_safetensors_layout,
+};
 use memmap2::Mmap;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -19,19 +22,10 @@ enum DType {
     /// via `get_f32_tensor` (lattice#800).
     Other {
         label: &'static str,
-        size_bytes: usize,
     },
 }
 
 impl DType {
-    fn size_bytes(self) -> usize {
-        match self {
-            Self::F32 => 4,
-            Self::F16 | Self::BF16 => 2,
-            Self::Other { size_bytes, .. } => size_bytes,
-        }
-    }
-
     fn name(self) -> &'static str {
         match self {
             Self::F32 => "F32",
@@ -53,69 +47,10 @@ fn dtype_from_str(s: &str) -> Option<DType> {
         "F32" => DType::F32,
         "F16" => DType::F16,
         "BF16" => DType::BF16,
-        "F64" => DType::Other {
-            label: "F64",
-            size_bytes: 8,
-        },
-        "I64" => DType::Other {
-            label: "I64",
-            size_bytes: 8,
-        },
-        "U64" => DType::Other {
-            label: "U64",
-            size_bytes: 8,
-        },
-        "I32" => DType::Other {
-            label: "I32",
-            size_bytes: 4,
-        },
-        "U32" => DType::Other {
-            label: "U32",
-            size_bytes: 4,
-        },
-        "I16" => DType::Other {
-            label: "I16",
-            size_bytes: 2,
-        },
-        "U16" => DType::Other {
-            label: "U16",
-            size_bytes: 2,
-        },
-        "I8" => DType::Other {
-            label: "I8",
-            size_bytes: 1,
-        },
-        "U8" => DType::Other {
-            label: "U8",
-            size_bytes: 1,
-        },
-        "BOOL" => DType::Other {
-            label: "BOOL",
-            size_bytes: 1,
-        },
-        "F8_E4M3" => DType::Other {
-            label: "F8_E4M3",
-            size_bytes: 1,
-        },
-        "F8_E5M2" => DType::Other {
-            label: "F8_E5M2",
-            size_bytes: 1,
-        },
-        "F8_E8M0" => DType::Other {
-            label: "F8_E8M0",
-            size_bytes: 1,
-        },
-        "C64" => DType::Other {
-            label: "C64",
-            size_bytes: 8,
-        },
-        // Sub-byte dtypes (F4: 4 bits/elem, F6_E2M3 / F6_E3M2: 6 bits/elem)
-        // do not fit this crate's whole-byte-per-element extent model and
-        // are treated as unrecognized here; see
-        // `crate::quant::quarot::io::safetensors_bits_per_elem` for the
-        // bit-level table used by the QuaRot converter, which does support
-        // sub-byte dtypes.
-        _ => return None,
+        _ => {
+            let dtype = safetensors_dtype(s)?;
+            DType::Other { label: dtype.name }
+        }
     })
 }
 
@@ -337,63 +272,17 @@ impl SafetensorsFile {
         let tensors = parse_safetensors_header(header)?;
 
         let data_len = bytes.len() - data_offset;
-        for (name, meta) in &tensors {
-            if meta.start > meta.end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} has invalid offsets [{}, {})",
-                    meta.start, meta.end
-                )));
-            }
-            if meta.end > data_len {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} points past data section: end={}, data_len={}",
-                    meta.end, data_len
-                )));
-            }
-            let numel = meta.shape.iter().try_fold(1usize, |acc, &dim| {
-                acc.checked_mul(dim).ok_or_else(|| {
-                    InferenceError::InvalidSafetensors(format!(
-                        "tensor {name} shape {:?} overflows usize",
-                        meta.shape
-                    ))
-                })
-            })?;
-            let expected = numel.checked_mul(meta.dtype.size_bytes()).ok_or_else(|| {
-                InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} byte length overflows usize"
-                ))
-            })?;
-            let actual = meta.end - meta.start;
-            if actual != expected {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} byte length mismatch for dtype {} and shape {:?}: \
-                     expected {expected}, got {actual}",
-                    meta.dtype.name(),
-                    meta.shape
-                )));
-            }
-        }
-
-        let mut ranges: Vec<_> = tensors
+        let layout: Vec<_> = tensors
             .iter()
-            .map(|(name, meta)| (meta.start, meta.end, name.as_str()))
+            .map(|(name, meta)| SafetensorsLayoutEntry {
+                name,
+                dtype: meta.dtype.name(),
+                shape: &meta.shape,
+                start: meta.start,
+                end: meta.end,
+            })
             .collect();
-        ranges.sort_unstable();
-        let mut previous_end = 0usize;
-        for &(start, end, name) in &ranges {
-            if start != previous_end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name} has non-contiguous data offsets: expected start={previous_end}, \
-                     got [{start}, {end})"
-                )));
-            }
-            previous_end = end;
-        }
-        if previous_end != data_len {
-            return Err(InferenceError::InvalidSafetensors(format!(
-                "data section is {data_len} bytes but tensors cover {previous_end} bytes"
-            )));
-        }
+        validate_safetensors_layout(&source, data_len, &layout)?;
 
         Ok(Self {
             data,
@@ -2293,6 +2182,84 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    #[test]
+    fn test_rejects_leading_hole_in_data_section() {
+        let path = temp_path("lattice_weights_leading_hole");
+        let header = r#"{"t":{"dtype":"F32","shape":[1],"data_offsets":[4,8]}}"#;
+        write_raw_safetensors(&path, header, &[0; 8]);
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("the first tensor must start at data-section offset zero");
+        assert!(
+            err.to_string().contains("non-contiguous"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_rejects_internal_hole_in_data_section() {
+        let path = temp_path("lattice_weights_internal_hole");
+        let header = r#"{
+            "a":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},
+            "b":{"dtype":"F32","shape":[1],"data_offsets":[8,12]}
+        }"#
+        .replace(['\n', ' '], "");
+        write_raw_safetensors(&path, &header, &[0; 12]);
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("tensor ranges must cover the data section contiguously");
+        assert!(
+            err.to_string().contains("non-contiguous"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_rejects_trailing_payload_outside_tensor_ranges() {
+        let path = temp_path("lattice_weights_trailing_payload");
+        let header = r#"{"t":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        write_raw_safetensors(&path, header, &[0; 8]);
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("tensor ranges must exhaust the complete data section");
+        assert!(
+            err.to_string().contains("trailing or missing payload"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_rejects_reversed_tensor_range() {
+        let path = temp_path("lattice_weights_reversed_range");
+        let header = r#"{"t":{"dtype":"F32","shape":[1],"data_offsets":[4,0]}}"#;
+        write_raw_safetensors(&path, header, &[0; 4]);
+
+        let err =
+            SafetensorsFile::open(&path).expect_err("a tensor range must not end before it starts");
+        assert!(
+            err.to_string().contains("invalid data_offsets"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    fn write_raw_safetensors(path: &std::path::Path, header: &str, raw: &[u8]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(raw);
+        let mut file = File::create(path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+    }
+
     /// Write a single raw tensor entry (arbitrary dtype/bytes) to a fresh
     /// safetensors file, for fixtures that need control over the exact
     /// on-disk bit pattern (NaN/Inf bit patterns, non-float dtypes, ...).
@@ -2315,13 +2282,7 @@ mod tests {
             r#"{{"{name}":{{"dtype":"{dtype}","shape":{shape_str},"data_offsets":[0,{}]}}}}"#,
             raw.len()
         );
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
-        bytes.extend_from_slice(header.as_bytes());
-        bytes.extend_from_slice(raw);
-        let mut file = File::create(path).expect("test setup: create safetensors file");
-        file.write_all(&bytes)
-            .expect("test setup: write safetensors bytes");
+        write_raw_safetensors(path, &header, raw);
     }
 
     #[test]
@@ -2452,6 +2413,66 @@ mod tests {
         assert!(
             !matches!(err, InferenceError::MissingTensor(_)),
             "must not be reported as a missing tensor: {err:?}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_standard_sub_byte_and_fnuz_dtypes_are_tracked_structurally() {
+        let cases = [
+            ("F4", 2usize, 1usize),
+            ("F6_E2M3", 4, 3),
+            ("F6_E3M2", 4, 3),
+            ("F8_E4M3FNUZ", 1, 1),
+            ("F8_E5M2FNUZ", 1, 1),
+        ];
+
+        for (dtype, elements, bytes) in cases {
+            let path = temp_path(&format!("lattice_weights_{dtype}"));
+            write_raw_tensor(&path, "t", dtype, &[elements], &vec![0; bytes]);
+
+            let sf = SafetensorsFile::open(&path)
+                .unwrap_or_else(|err| panic!("{dtype} with valid extent must open: {err}"));
+            assert!(sf.has_tensor("t"), "{dtype} tensor must remain tracked");
+            assert_eq!(sf.tensor_dtype("t"), Some(dtype));
+            let err = sf
+                .get_f32_tensor("t")
+                .expect_err("unsupported dtype must not materialize as f32");
+            assert!(
+                err.to_string().contains("unsupported dtype"),
+                "unexpected {dtype} materialization error: {err}"
+            );
+
+            fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn test_sub_byte_dtype_requires_byte_aligned_shape() {
+        let path = temp_path("lattice_weights_f4_unaligned");
+        write_raw_tensor(&path, "t", "F4", &[1], &[]);
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("a one-element F4 tensor must not round down to zero bytes");
+        assert!(
+            err.to_string().contains("not byte-aligned"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_sub_byte_dtype_rejects_wrong_byte_extent() {
+        let path = temp_path("lattice_weights_f4_bad_extent");
+        write_raw_tensor(&path, "t", "F4", &[4], &[0]);
+
+        let err =
+            SafetensorsFile::open(&path).expect_err("four F4 elements require two payload bytes");
+        assert!(
+            err.to_string().contains("byte length mismatch"),
+            "unexpected error: {err}"
         );
 
         fs::remove_file(&path).ok();

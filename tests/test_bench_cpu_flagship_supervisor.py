@@ -29,6 +29,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -668,6 +669,25 @@ class BuildDecodeCellAggregateTest(unittest.TestCase):
         self.assertIsNotNone(aggregate.required_n)
         self.assertLess(aggregate.n_valid, aggregate.required_n)
 
+    def test_identical_measurements_reject_zero_cv(self):
+        values = [200.0, 200.0]
+        session = _fake_session(values, values)
+        with self.assertRaisesRegex(supervisor.gate_math.GateMathError, "positive finite"):
+            supervisor.build_decode_cell_aggregate(session, self.policy, rng_seed=1)
+
+    def test_supervisor_rejects_signed_zero_cv_before_required_n_lookup(self):
+        values = [200.0, 200.0]
+        session = _fake_session(values, values)
+        for measured_cv in (0.0, -0.0):
+            with self.subTest(measured_cv=repr(measured_cv)):
+                with (
+                    mock.patch.object(supervisor.statistics, "stdev", return_value=measured_cv),
+                    mock.patch.object(supervisor.gate_math, "required_n", return_value=(7, 1.0)) as required_n,
+                    self.assertRaisesRegex(supervisor.gate_math.GateMathError, "positive finite"),
+                ):
+                    supervisor.build_decode_cell_aggregate(session, self.policy, rng_seed=1)
+                required_n.assert_not_called()
+
     def test_missing_decode_rate_raises(self):
         session = _fake_session([200.0], [200.0])
         session["arm_a"][0]["decode_tok_s"] = None
@@ -759,6 +779,7 @@ class ValidateRunRecordRoundTripTest(unittest.TestCase):
     def setUp(self):
         self.policy = gate_math.load_policy()
         self.policy_sha = gate_math.policy_sha()
+        self.policy_file_sha = gate_math.policy_file_sha()
 
     def _provenance(self) -> harness.ProvenanceRecord:
         return harness.parse_provenance(
@@ -772,6 +793,7 @@ class ValidateRunRecordRoundTripTest(unittest.TestCase):
                 "profile_sha": "c" * 64,
                 "policy_version": self.policy["policy_version"],
                 "policy_sha": self.policy_sha,
+                "policy_file_sha": self.policy_file_sha,
                 "script_sha": "e" * 40,
                 "hardware_fingerprint": "Darwin-arm64-test",
                 "collected_at": "2026-07-11T00:00:00+00:00",

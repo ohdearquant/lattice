@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 import tempfile
 import tomllib
 import unittest
@@ -70,9 +73,20 @@ class BenchTargetPolicyTests(unittest.TestCase):
         return manifest
 
     def test_workspace_bench_targets_are_executable(self) -> None:
+        manifests = sorted((ROOT / "crates").glob("*/Cargo.toml"))
+        self.assertGreater(
+            len(manifests),
+            0,
+            "bench-target sweep found zero crate manifests; this is an instrument defect, not a clean result",
+        )
+        self.assertIn(
+            ROOT / "crates" / "inference" / "Cargo.toml",
+            manifests,
+            "bench-target sweep did not reach crates/inference/Cargo.toml; check the workspace root and manifest glob",
+        )
         errors = [
             error
-            for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml"))
+            for manifest in manifests
             for error in bench_target_errors(manifest)
         ]
         self.assertEqual(errors, [])
@@ -101,6 +115,46 @@ class BenchTargetPolicyTests(unittest.TestCase):
             self.assertIn(
                 "bench source must have an explicit [[bench]] entry",
                 bench_target_errors(manifest)[0],
+            )
+
+    def test_make_bench_gate_refuses_empty_target_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copy2(ROOT / "Makefile", root / "Makefile")
+            (root / "scripts").mkdir()
+            shutil.copy2(
+                ROOT / "scripts" / "perf-bench-gate.py",
+                root / "scripts" / "perf-bench-gate.py",
+            )
+            baseline = root / ".cache" / "perf-baselines" / "testarch-testos"
+            baseline.mkdir(parents=True)
+            bindir = root / "bin"
+            bindir.mkdir()
+            for name, body in {
+                "uname": (
+                    "#!/usr/bin/env bash\n"
+                    'if [ "${1:-}" = "-m" ]; then echo testarch; else echo testos; fi\n'
+                ),
+                "git": "#!/usr/bin/env bash\nexit 0\n",
+                "cargo": "#!/usr/bin/env bash\nexit 0\n",
+            }.items():
+                script = bindir / name
+                script.write_text(body)
+                script.chmod(0o755)
+            result = subprocess.run(
+                ["make", "bench-gate"],
+                cwd=root,
+                env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("UNSUITABLE AS BENCHMARK EVIDENCE", result.stdout)
+            self.assertEqual(
+                result.stderr.count("contains no benchmark estimates"),
+                2,
+                result.stdout + result.stderr,
             )
 
 
