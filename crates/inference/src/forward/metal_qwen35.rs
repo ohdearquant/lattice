@@ -716,9 +716,14 @@ fn self_spec_route_active(
         && num_active_linear_attention_layers > 0
 }
 
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+fn compact_top_n_sigma_compatible(gen_cfg: &crate::model::qwen35_config::GenerateConfig) -> bool {
+    !crate::sampling::top_n_sigma_active(gen_cfg.top_n_sigma)
+}
+
 #[cfg(test)]
 mod route_predicate_tests {
-    use super::{mtp_route_active, self_spec_route_active};
+    use super::{compact_top_n_sigma_compatible, mtp_route_active, self_spec_route_active};
     use crate::model::qwen35_config::GenerateConfig;
 
     fn greedy_gen_cfg(stop_strings: Vec<String>) -> GenerateConfig {
@@ -728,6 +733,7 @@ mod route_predicate_tests {
             top_k: 1,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             seed: Some(42),
             stop_token_ids: vec![],
@@ -738,6 +744,40 @@ mod route_predicate_tests {
             reasoning_budget: None,
             logprobs: None,
         }
+    }
+
+    #[test]
+    fn top_n_sigma_requires_the_full_logit_metal_route() {
+        let mut cfg = greedy_gen_cfg(vec![]);
+        for disabled in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            cfg.top_n_sigma = disabled;
+            assert!(compact_top_n_sigma_compatible(&cfg));
+        }
+
+        cfg.top_n_sigma = 1.0;
+        assert!(
+            !compact_top_n_sigma_compatible(&cfg),
+            "top-n-sigma statistics must cover the full adjusted vocabulary"
+        );
+
+        let source = include_str!("metal_qwen35.rs");
+        let route_guard = ["&& compact_top_n_sigma_", "compatible(gen_cfg)"].concat();
+        let compact_route = [
+            "let use_",
+            "compact = route != GpuTopkRoute::",
+            "CpuFallback",
+        ]
+        .concat();
+        let compact_route_count = source.matches(&compact_route).count();
+        assert!(
+            compact_route_count > 0,
+            "the mutation guard must find the production compact routes"
+        );
+        assert_eq!(
+            source.matches(&route_guard).count(),
+            compact_route_count,
+            "every compact Metal generation route must consult the full-logit guard"
+        );
     }
 
     /// Baseline: with every other precondition satisfied and NO stop strings,
@@ -1043,7 +1083,7 @@ pub fn format_chat_template(messages: &[ChatMessage]) -> String {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
-    use super::GdnStateTrafficScope;
+    use super::{GdnStateTrafficScope, compact_top_n_sigma_compatible};
     // Chat message types + the shared ChatML renderer (#668) live at the file
     // top level (module-scope, above `mod inner`) so CPU-only builds can
     // render through the same `format_chat_template` this Metal path uses,
@@ -8894,11 +8934,12 @@ mod inner {
                     std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
                 )
             };
-            // Repetition penalty requires full logits — disable compact mode when active.
-            // Grammar-constrained decoding also requires full logits (CpuFallback).
+            // Repetition penalty, grammar constraints, and top-n-sigma
+            // statistics require full logits.
             let use_compact = route != GpuTopkRoute::CpuFallback
                 && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none();
+                && gen_cfg.grammar.is_none()
+                && compact_top_n_sigma_compatible(gen_cfg);
             if use_compact {
                 self.session.compact_route = route;
                 self.session.compact_topk = match route {
@@ -13586,7 +13627,8 @@ mod inner {
     /// The candidates have already been selected by the GPU (no full-vocab
     /// scan needed).  Repetition penalty is applied CPU-side to the compact
     /// set as a round-0 approximation (accurate when recently-repeated tokens
-    /// are not ranked far below the top-k boundary).
+    /// are not ranked far below the top-k boundary). Active top-n-sigma never
+    /// enters this helper because its standard deviation requires full logits.
     fn sample_from_candidates(
         candidates: &[crate::sampling::Candidate],
         cfg: &GenerateConfig,
@@ -13636,6 +13678,7 @@ mod inner {
                 temperature: 1.0,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 ..Default::default()
             };
@@ -13938,7 +13981,8 @@ mod inner {
             let use_compact = route != GpuTopkRoute::CpuFallback
                 && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
                 && gen_cfg.grammar.is_none()
-                && gen_cfg.logprobs.is_none();
+                && gen_cfg.logprobs.is_none()
+                && compact_top_n_sigma_compatible(gen_cfg);
             if use_compact {
                 self.session.compact_route = route;
                 self.session.compact_topk = match route {
@@ -16955,7 +16999,8 @@ mod inner {
             let use_compact = route != GpuTopkRoute::CpuFallback
                 && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
                 && gen_cfg.grammar.is_none()
-                && gen_cfg.logprobs.is_none();
+                && gen_cfg.logprobs.is_none()
+                && compact_top_n_sigma_compatible(gen_cfg);
             if use_compact {
                 self.session.compact_route = route;
                 self.session.compact_topk = match route {
@@ -28464,6 +28509,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28504,6 +28550,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28536,6 +28583,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..32u32).collect(),
@@ -28582,6 +28630,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28625,6 +28674,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28680,6 +28730,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28730,6 +28781,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -28877,6 +28929,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -28954,6 +29007,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29034,6 +29088,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(7),
                 stop_token_ids: vec![],
@@ -29113,6 +29168,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29206,6 +29262,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29300,6 +29357,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29403,6 +29461,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29692,6 +29751,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -29761,6 +29821,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 logprobs: None,
@@ -29843,6 +29904,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 logprobs: None,
@@ -29928,6 +29990,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -30004,6 +30067,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -30053,6 +30117,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -30101,6 +30166,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -30158,6 +30224,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -30215,6 +30282,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -30280,6 +30348,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -30379,6 +30448,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(7),
                 stop_token_ids: vec![],
@@ -33192,6 +33262,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(seed),
                 stop_token_ids: vec![],
@@ -34905,6 +34976,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -34963,6 +35035,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -35035,6 +35108,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -35107,6 +35181,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -35391,6 +35466,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -35987,6 +36063,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36033,6 +36110,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36090,6 +36168,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36155,6 +36234,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36449,6 +36529,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36504,6 +36585,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36570,6 +36652,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 top_k: 1,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],

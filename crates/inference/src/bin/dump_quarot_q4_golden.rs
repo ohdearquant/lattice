@@ -119,6 +119,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         top_k: 1,
         top_p: 1.0,
         min_p: 0.0,
+        top_n_sigma: 0.0,
         repetition_penalty: 1.0,
         seed: Some(1),
         stop_token_ids: vec![],

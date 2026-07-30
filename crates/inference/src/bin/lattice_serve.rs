@@ -1655,6 +1655,7 @@ mod imp {
             top_k: req.top_k,
             top_p: req.top_p,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: req.repetition_penalty,
             seed: req.seed,
             stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],

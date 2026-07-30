@@ -810,6 +810,7 @@ pub struct GenerateConfigSnapshot {
     pub top_k: usize,
     pub top_p: f32,
     pub min_p: f32,
+    pub top_n_sigma: f32,
     pub repetition_penalty: f32,
     pub seed: Option<u64>,
     pub stop_token_ids: Vec<u32>,
@@ -829,6 +830,7 @@ impl From<&GenerateConfig> for GenerateConfigSnapshot {
             top_k: cfg.top_k,
             top_p: cfg.top_p,
             min_p: cfg.min_p,
+            top_n_sigma: cfg.top_n_sigma,
             repetition_penalty: cfg.repetition_penalty,
             seed: cfg.seed,
             stop_token_ids: cfg.stop_token_ids.clone(),
@@ -1745,6 +1747,7 @@ mod tests {
             top_k: 7,
             top_p: 0.55,
             min_p: 0.2,
+            top_n_sigma: 1.25,
             repetition_penalty: 1.05,
             seed: Some(9),
             stop_token_ids: vec![100],
@@ -1761,6 +1764,7 @@ mod tests {
         assert_eq!(snapshot.top_k, 7);
         assert_eq!(snapshot.top_p, 0.55);
         assert_eq!(snapshot.min_p, 0.2);
+        assert_eq!(snapshot.top_n_sigma, 1.25);
         assert_eq!(snapshot.repetition_penalty, 1.05);
         assert_eq!(snapshot.seed, Some(9));
         assert_eq!(snapshot.stop_token_ids, vec![100]);

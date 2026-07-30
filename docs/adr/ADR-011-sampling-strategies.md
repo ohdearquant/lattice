@@ -11,7 +11,7 @@
 Token generation requires selecting the next token from a vocabulary distribution. Different use cases have different requirements:
 
 - **Deterministic embedding generation**: Greedy argmax; must be fast; must not allocate.
-- **Creative text generation**: Temperature + top-k + min-p + top-p sampling; must handle repetition.
+- **Creative text generation**: Top-n-sigma + temperature + top-k + min-p + top-p sampling; must handle repetition.
 - **Speculative decoding verification**: Greedy comparison of draft vs target logits (see ADR-006).
 
 The vocabulary size for Qwen3 is 151,669 tokens. A naive approach to top-k sampling copies the full logit vector (993 KB), sorts it, and samples — suitable for batch sizes of 1 but wasteful when run at every autoregressive step.
@@ -24,6 +24,7 @@ pub struct SamplingConfig {
     pub top_k: usize,       // default 50
     pub top_p: f32,         // default 0.9
     pub min_p: f32,         // default 0.0 (disabled)
+    pub top_n_sigma: f32,   // default 0.0 (disabled)
     pub repetition_penalty: f32, // default 1.1
 }
 // SamplingConfig::greedy() factory: temperature=0, top_k=1
@@ -53,7 +54,7 @@ Key fast paths:
 
 ## Decision
 
-Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** and a `CandidateSet` intermediate that separates penalty/temperature/top-k/min-p/top-p stages. Use **Xorshift64** as the PRNG. Use a **NEON threshold gate** to skip ~95% of the vocabulary before heap allocation in top-k. Provide a **greedy fast path** that avoids all allocation when argmax is not in the repetition window.
+Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** and a `CandidateSet` intermediate. The canonical order is repetition penalty → top-n-sigma → temperature → top-k → min-p → top-p. Use **Xorshift64** as the PRNG. Use a **NEON threshold gate** to skip ~95% of the vocabulary before heap allocation in top-k. Provide a **greedy fast path** that avoids all allocation when argmax is not in the repetition window.
 
 ---
 
@@ -66,7 +67,8 @@ Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** 
 5. **Repetition penalty applied to logit space**: `apply_repetition_penalty()` divides positive logits and multiplies negative logits (not a simple additive penalty). This is the standard HuggingFace convention: dividing by 1.1 for a token that appeared recently reduces its probability without creating negative infinity for tokens with positive logits.
 6. **Greedy fast path criteria**: The fast path skips when `temperature <= 0` OR `top_k == 1`, AND the argmax token is not in `recent_tokens`. If the argmax is in `recent_tokens`, repetition penalty must be applied, which requires the logit copy. The check is O(64) (linear scan of recent_tokens) — faster than the 993 KB clone.
 7. **`recent_tokens` window = 64**: 64 tokens at one per auto-regressive step is ~40–80 words of context. This is sufficient to prevent immediate n-gram repetition in generated text without excessive memory overhead.
-8. **Min-p precedes top-p**: after repetition penalty, temperature, and top-k, discard candidates whose probability is below `min_p * max_probability`, renormalize, then apply top-p. Since softmax weights share one denominator, the implementation compares `exp(logit - max_logit)` directly with `min_p`; this avoids an extra normalization pass. A default of `0.0` preserves the pre-min-p distribution exactly.
+8. **Top-n-sigma precedes temperature and probability filters**: after repetition penalty, compute the population standard deviation over every finite adjusted logit, excluding `-∞` masks, and keep logits at least `max_logit - nσ`. The implementation uses f64 Welford accumulation without allocating. Non-finite or non-positive `n` disables the filter. Because the full vocabulary defines `σ`, an active filter routes Metal generation around compact top-k readback to the existing full-logit host sampler.
+9. **Min-p precedes top-p**: after top-n-sigma, temperature, and top-k, discard candidates whose probability is below `min_p * max_probability`, renormalize, then apply top-p. Since softmax weights share one denominator, the implementation compares `exp(logit - max_logit)` directly with `min_p`; this avoids an extra normalization pass. A default of `0.0` preserves the pre-min-p distribution exactly.
 
 ---
 
@@ -89,7 +91,7 @@ Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** 
 
 - Zero allocation in the greedy path when argmax is not in `recent_tokens` — the dominant case for embedding generation.
 - NEON gate reduces the top-k candidate set to ~100 tokens before any heap write, enabling O(100) sort instead of O(151,669).
-- `CandidateSet` API separates penalty, temperature, top-k, min-p, and top-p as composable pipeline stages.
+- CPU and Metal full-logit routes share one repetition/top-n-sigma/temperature/top-k/min-p/top-p pipeline.
 - Xorshift64 generates uniform samples in ~3 cycles; negligible overhead vs logit processing.
 
 **Negative**:
@@ -97,6 +99,7 @@ Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** 
 - The NEON threshold gate is an approximation: it uses a streaming min-heap to estimate the k-th logit, which may be slightly off due to heap imprecision. In practice, this means the gate may pass slightly more or fewer than exactly `top_k` candidates, with the exact top-k enforced by `retain_top_k()` afterward.
 - The greedy fast path only activates when the argmax is not in `recent_tokens`. An adversarial input that forces the model to always predict a recent token (e.g., a degenerate attractor) will always take the slow path.
 - `recent_tokens` is a fixed-size Vec<u32> cleared at `Sampler::new()`. Multi-session use requires resetting between sessions or using per-session `Sampler` instances.
+- Active top-n-sigma requires a vocabulary-wide host scan, so the Metal compact top-k route falls back to full-logit readback until a future exact GPU reduction can provide the same statistics.
 
 **Risks**:
 
@@ -113,3 +116,5 @@ Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** 
 - HuggingFace `transformers` — `RepetitionPenaltyLogitsProcessor` convention
 - Holtzman et al. 2019 — "The Curious Case of Neural Text Degeneration" (nucleus/top-p sampling) — https://arxiv.org/abs/1904.09751
 - Nguyen et al. 2024 — "Turning Up the Heat: Min-p Sampling for Creative and Coherent LLM Outputs" — https://arxiv.org/abs/2407.01082
+- Tang et al. 2025 — "Top-nσ: Eliminating Noise in Logit Space for Robust Token Sampling of LLM" — https://aclanthology.org/2025.acl-long.528/
+- llama.cpp default sampler chain and population-standard-deviation implementation — https://github.com/ggml-org/llama.cpp
