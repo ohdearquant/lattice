@@ -368,11 +368,18 @@ class CvBandsTest(unittest.TestCase):
 
 
 class LoadPolicyTest(unittest.TestCase):
+    def _path_for_text(self, directory: str, text: str) -> Path:
+        path = Path(directory) / "perf-policy.toml"
+        path.write_text(text)
+        return path
+
     def _sha_for_text(self, text: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "perf-policy.toml"
-            path.write_text(text)
-            return gm.policy_sha(path)
+            return gm.policy_sha(self._path_for_text(tmp, text))
+
+    def _file_sha_for_text(self, text: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            return gm.policy_file_sha(self._path_for_text(tmp, text))
 
     def test_shipped_policy_file_loads(self):
         doc = gm.load_policy()
@@ -403,6 +410,13 @@ class LoadPolicyTest(unittest.TestCase):
         )
         self.assertNotEqual(changed, original)
         self.assertEqual(self._sha_for_text(changed), gm.policy_sha())
+        self.assertNotEqual(self._file_sha_for_text(changed), gm.policy_file_sha())
+
+    def test_policy_file_sha_is_exact_lowercase_digest(self):
+        digest = gm.policy_file_sha()
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, digest.lower())
+        int(digest, 16)
 
     def test_policy_sha_detects_band_and_threshold_tampering(self):
         original = gm.DEFAULT_POLICY_FILE.read_text()
@@ -447,6 +461,8 @@ class LoadPolicyTest(unittest.TestCase):
     def test_missing_file_rejected(self):
         with self.assertRaises(gm.PolicyConfigError):
             gm.load_policy(Path("/nonexistent/perf-policy.toml"))
+        with self.assertRaises(gm.PolicyConfigError):
+            gm.policy_file_sha(Path("/nonexistent/perf-policy.toml"))
 
 
 # --------------------------------------------------------------------------

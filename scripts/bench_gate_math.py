@@ -934,3 +934,11 @@ def policy_sha(path: Path = DEFAULT_POLICY_FILE) -> str:
         raise PolicyConfigError(f"{path}: policy values cannot be canonicalized: {exc}") from exc
     digest = hashlib.sha256(payload).hexdigest()
     return f"{POLICY_SHA_PREFIX}{digest}"
+
+
+def policy_file_sha(path: Path = DEFAULT_POLICY_FILE) -> str:
+    """SHA-256 of the exact policy file bytes retained for provenance."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise PolicyConfigError(f"{path}: cannot read policy bytes: {exc}") from exc

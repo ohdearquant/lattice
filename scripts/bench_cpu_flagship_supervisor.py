@@ -1082,6 +1082,7 @@ def main(argv: list[str] | None = None) -> int:
 
     policy = gate_math.load_policy()
     policy_sha = gate_math.policy_sha()
+    policy_file_sha = gate_math.policy_file_sha()
 
     session = run_paired_sessions(
         binary=args.binary,
@@ -1130,6 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
             ).hexdigest(),
             "policy_version": policy["policy_version"],
             "policy_sha": policy_sha,
+            "policy_file_sha": policy_file_sha,
             "script_sha": sha256_file(Path(__file__)),
             "hardware_fingerprint": hardware_fingerprint(),
             "collected_at": datetime.now(UTC).isoformat(),
@@ -1241,6 +1243,7 @@ def main(argv: list[str] | None = None) -> int:
             "dirty": provenance.dirty,
             "policy_version": provenance.policy_version,
             "policy_sha": provenance.policy_sha,
+            "policy_file_sha": provenance.policy_file_sha,
             "hardware_fingerprint": provenance.hardware_fingerprint,
             "collected_at": provenance.collected_at,
         },
