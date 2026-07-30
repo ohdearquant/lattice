@@ -176,4 +176,4 @@ lattice/
 
 ## License
 
-Apache-2.0. All contributions must be submitted under the same license.
+MIT OR Apache-2.0. All contributions must be submitted under the same dual license.
