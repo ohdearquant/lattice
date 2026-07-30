@@ -1095,7 +1095,7 @@ pub(crate) fn format_chat_template_parts<'a>(
 /// expected is just as much a mismatched-checkpoint signal as fewer,
 /// and silently accepting it would let a wrong-config/wrong-checkpoint
 /// pairing through undetected.
-#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn validate_q4_tensor_shape(
     header_shape: &[usize],
     expected: &[usize],
@@ -1286,15 +1286,13 @@ mod inner {
     // MTP Q4/F16 flavor + shape resolution (#630, #636) now lives at the file
     // top level (module-scope, above `mod inner`) so it compiles and is
     // unit-testable without the `metal-gpu` feature at all.
+    #[cfg(test)]
+    use super::validate_q4_tensor_shape;
     #[cfg(feature = "gdn-state-counters")]
     use super::{
         GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficShape,
     };
     use super::{MtpLoadErr, MtpTensorSource, resolve_mtp_norm, resolve_mtp_projection};
-    // Device-free Q4 mmap trust-boundary + shape validation (#1037) lives
-    // at the file top level (module-scope, above `mod inner`) so it and its
-    // unit tests compile and run without the `metal-gpu` feature at all.
-    use super::validate_q4_tensor_shape;
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
@@ -14006,7 +14004,7 @@ mod inner {
                 std::slice::from_raw_parts(tensor.blocks.as_ptr().cast::<u8>(), n_blocks * 20)
                     .to_vec()
             };
-            Ok(raw)
+            Ok((raw, tensor.original_len))
         }
 
         /// Mmap a `.q4` file and dequantize its payload directly into an f16
@@ -15007,8 +15005,6 @@ mod inner {
                         dur_b_cell.set(dur_b_cell.get() + t.elapsed());
                         Ok(buf)
                     };
-                    let num_vh = cfg.linear_num_value_heads();
-
                     MetalLayerAttnWeights::Linear(MetalGdnLayerWeights {
                         in_proj_qkv: load_q4_buf(
                             &format!("{prefix}.linear_attn.in_proj_qkv.weight"),
@@ -20373,8 +20369,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             crate::weights::q4_weights::save_q4_file(&path, &tensor)
                 .expect("save transposed .q4 fixture");
 
-            let result =
-                MetalQwen35State::load_q4_raw_bytes(&path, "gate_proj.weight", &expected_shape);
+            let result = MetalQwen35State::load_q4_raw_bytes(&path, &expected_shape);
             assert!(
                 result.is_err(),
                 "load_q4_raw_bytes must reject a self-consistent but transposed \
@@ -20383,7 +20378,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
             let msg = result.expect_err("checked is_err above");
             assert!(
-                msg.contains("gate_proj.weight")
+                msg.contains("transposed_gate_proj.q4")
                     && msg.contains("[768, 512]")
                     && msg.contains("[512, 768]"),
                 "error must name the tensor label and both the found (transposed) \
@@ -20401,21 +20396,23 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let good_path = tmp.path().join("correct_gate_proj.q4");
             crate::weights::q4_weights::save_q4_file(&good_path, &good_tensor)
                 .expect("save correctly-shaped .q4 fixture");
-            let good_result = MetalQwen35State::load_q4_raw_bytes(
-                &good_path,
-                "gate_proj.weight",
-                &expected_shape,
-            );
+            let good_result = MetalQwen35State::load_q4_raw_bytes(&good_path, &expected_shape);
             assert!(
                 good_result.is_ok(),
                 "a correctly-shaped tensor must be accepted: {:?}",
                 good_result.err()
             );
             let expected_byte_len = good_numel.div_ceil(32) * 20;
+            let (raw_block_bytes, original_weight_count) =
+                good_result.expect("checked is_ok above");
             assert_eq!(
-                good_result.expect("checked is_ok above").len(),
+                raw_block_bytes.len(),
                 expected_byte_len,
                 "returned raw bytes must cover every Q4 block (20 bytes each)"
+            );
+            assert_eq!(
+                original_weight_count, good_numel,
+                "returned original length must report valid weights, excluding block padding"
             );
         }
 
