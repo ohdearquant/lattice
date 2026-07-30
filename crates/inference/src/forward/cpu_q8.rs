@@ -16,14 +16,13 @@ use crate::attention::gdn_fused::{
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{
-    ForwardScratch, KvCache, decode_tokens, qwen35_rms_norm, resize, sample_token,
-    should_stop_token,
+    ForwardScratch, GenerationEntryContract, GenerationPlan, GenerationPreparation, KvCache,
+    decode_tokens, prepare_generation, qwen35_rms_norm, resize, sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::rope::RopeTable;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
-use crate::tokenizer::common::Tokenizer;
 use crate::weights::q8_weights::{
     Q8AttentionWeights, Q8CommonLayerWeights, Q8FullAttentionLayerWeights, Q8GatedDeltaNetWeights,
     Q8ModelWeights, matmul_bt_q8,
@@ -691,77 +690,23 @@ pub fn generate_q8(
     prompt: &str,
     gen_cfg: &GenerateConfig,
 ) -> Result<GenerateOutput, crate::error::InferenceError> {
-    // Initialize RNG
-    let mut rng_state = match gen_cfg.seed {
-        Some(s) => {
-            if s == 0 {
-                1
-            } else {
-                s
-            }
-        }
-        None => {
-            use std::time::SystemTime;
-            let t = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x12345678_9abcdef0);
-            if t == 0 { 1 } else { t }
-        }
+    let plan = match prepare_generation(
+        tokenizer,
+        prompt,
+        gen_cfg,
+        cfg.vocab_size,
+        rope.max_positions(),
+        GenerationEntryContract::StandaloneCpu,
+    )? {
+        GenerationPreparation::Ready(plan) => plan,
+        GenerationPreparation::Complete(output) => return Ok(output),
     };
-
-    // Tokenize prompt
-    let input = tokenizer.tokenize(prompt);
-    let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-    let prompt_len = prompt_ids.len();
-
-    // #856: single shared preflight, unified with the Metal paths (which
-    // used to accept an empty prompt and return an empty Ok) — see
-    // `check_prompt_not_empty` (model::qwen35::generation).
-    crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
-    crate::model::qwen35::check_prompt_ids_in_vocab(&prompt_ids, cfg.vocab_size)?;
-
-    // max_new_tokens == 0 is a valid request: "score this prompt, return no tokens".
-    // Guard here so the decode loop (`for _ in 1..0`) never accidentally samples one
-    // token from the prefill logits before realising the budget is exhausted.
-    if gen_cfg.max_new_tokens == 0 {
-        return Ok(GenerateOutput {
-            text: String::new(),
-            token_ids: vec![],
-            prompt_tokens: prompt_len,
-            generated_tokens: 0,
-            stopped: false,
-            stop_reason: Some(StopReason::Length),
-            token_logprobs: vec![],
-        });
-    }
-    // Reject grammar configs before allocating any state. Grammar masking
-    // (`mask_logits` + `advance`) is not wired into this generate loop; without
-    // the guard the grammar field would be silently ignored, producing
-    // unconstrained output despite a grammar being set (#397/#398).
-    crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
-    // Same rationale for logprobs capture, which is also not wired into this
-    // generate loop (#585).
-    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-    // Same rationale for stop_strings matching and reasoning-budget forcing,
-    // neither of which is wired into this generate loop (ADR-080 C3, #783).
-    crate::model::qwen35::check_stop_strings_not_set(gen_cfg)?;
-    crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
-
-    // Context preflight. The RoPE cos/sin tables are indexed unchecked in
-    // full_attention_step_q8 (`rope.cos_at(position * half + i)`), so a position
-    // at or past the table capacity is an out-of-bounds slice access — a release
-    // panic, not a clean error. Mirror Qwen35Model::generate's total-token policy
-    // (prompt_len + max_new_tokens <= max_context) so direct and HTTP generation
-    // agree on when a request is too long.
-    let max_context = rope.max_positions();
-    if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
-        return Err(crate::error::InferenceError::Inference(format!(
-            "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
-             model context window ({max_context})",
-            gen_cfg.max_new_tokens
-        )));
-    }
+    let GenerationPlan {
+        mut rng_state,
+        prompt_ids,
+        prompt_len,
+        ..
+    } = plan;
 
     // Initialize states
     let num_linear = cfg.num_linear_attention_layers();
@@ -1571,8 +1516,8 @@ mod tests {
     /// Metal paths, which used to silently accept an empty prompt and
     /// return an empty `Ok`. See docs/generation-entrypoint-matrix.md row 2.
     ///
-    /// Mutation sensitivity: reverting the `check_prompt_not_empty` call at
-    /// this call site makes the function proceed past the guard with a
+    /// Mutation sensitivity: bypassing the shared preparation at this entry
+    /// point makes the function proceed past the guard with a
     /// zero-length prompt, either panicking in the prefill/decode loop or
     /// producing a non-`Inference` error — this assert fails either way.
     #[test]
@@ -1611,8 +1556,8 @@ mod tests {
     /// larger than the supplied model config. The boundary ID `vocab_size`
     /// must be rejected before `forward_step_q8` slices the embedding table.
     ///
-    /// Mutation sensitivity: removing only the Q8 call to
-    /// `check_prompt_ids_in_vocab` lets this request reach the unchecked
+    /// Mutation sensitivity: removing the shared setup's
+    /// `check_prompt_ids_in_vocab` call lets this request reach the unchecked
     /// embedding slice and panic instead of returning `InvalidInput`.
     #[test]
     fn generate_q8_rejects_out_of_vocab_prompt_id() {
