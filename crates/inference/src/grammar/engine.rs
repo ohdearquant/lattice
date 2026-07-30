@@ -29,7 +29,7 @@
 //! # Performance
 //!
 //! - `mask_logits`: O(vocab_size / 64) bitmask scan + O(k × stack_depth) for
-//!   context-dependent tokens, where k ≈ 1% of vocab_size.
+//!   context-dependent tokens in the current grammar state.
 //! - `advance`: O(stack_depth) PDA step; typical depth 2–8.
 //! - `new`: O(|states| × vocab_size × max_token_len) — called once.
 
@@ -64,6 +64,22 @@ thread_local! {
         const { std::cell::RefCell::new(MaskProfile::new()) };
     static BUILD_PROFILE: std::cell::RefCell<BuildProfile> =
         const { std::cell::RefCell::new(BuildProfile::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTEXT_RECHECK_CANDIDATES_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_context_recheck_candidates_for_test() {
+    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn take_context_recheck_candidates_for_test() -> u64 {
+    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// Aggregated per-decode-step grammar-masking cost, accumulated across every
@@ -393,7 +409,8 @@ impl GrammarEngine {
     /// The hot path is a bitmask scan over `vocab_size / 64` words (~3,880
     /// iterations for Qwen3's 248,320 tokens), taking under 40 µs on modern
     /// Apple Silicon.  Context-dependent tokens add O(k × stack_depth)
-    /// overhead (k ≈ 1% of vocab).
+    /// overhead, where k is the precomputed candidate count for this grammar
+    /// state rather than the union across every state.
     pub fn mask_logits(
         &self,
         state: &mut GrammarState,
@@ -423,7 +440,9 @@ impl GrammarEngine {
 
                 // Re-check context-dependent tokens at runtime.
                 let t1 = profiling.then(std::time::Instant::now);
-                for &token_id in self.partition.context_dependent_ids() {
+                for &token_id in self.partition.context_dependent_ids_for_state(state_id) {
+                    #[cfg(test)]
+                    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(|count| count.set(count.get() + 1));
                     if token_id >= self.vocab_size {
                         continue;
                     }
@@ -953,6 +972,41 @@ mod tests {
             .expect_err("the public simulation path must reject the same mismatch");
         assert!(simulation_error.0.contains("logits length 1"));
         assert!(simulation_error.0.contains("vocabulary size 2"));
+    }
+
+    #[test]
+    fn mask_logits_rechecks_only_the_current_states_candidates() {
+        let spec = GrammarSpec::Gbnf("root ::= \"abcd\"\n".to_string());
+        let vocab = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"ax".to_vec(),
+            b"bx".to_vec(),
+            b"cx".to_vec(),
+            b"dx".to_vec(),
+        ];
+        let engine = GrammarEngine::new(&spec, vocab).expect("fixture grammar must compile");
+        let mut state = engine.initial_state();
+        assert!(engine.advance(&mut state, 0), "token 'a' must advance");
+
+        reset_context_recheck_candidates_for_test();
+        let mut actual = vec![0.0; 8];
+        engine
+            .mask_logits(&mut state, &mut actual)
+            .expect("fixture logits match the vocabulary");
+        assert_eq!(
+            take_context_recheck_candidates_for_test(),
+            1,
+            "state after 'a' must inspect only the 'bx' partial token"
+        );
+
+        let mut oracle = vec![0.0; 8];
+        engine
+            .mask_by_simulation(&state, &mut oracle)
+            .expect("fixture logits match the vocabulary");
+        assert_eq!(actual, oracle);
     }
 
     #[test]
