@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Self-test for scripts/lib/ensure-noindex-marker.sh.
 #
-# The marker suppresses Spotlight indexing of the bench worktrees. Indexing
-# churn lands asymmetrically across a base-then-head A/B and reads as a code
-# delta, so a silently absent marker does not fail the run: it corrupts the
-# numbers while they still look trustworthy. That makes the guard fail-closed
-# infrastructure, and this proves each branch's exit code in a sandbox:
+# The marker suppresses Spotlight indexing of benchmark worktrees and in-place
+# target directories. Indexing churn can overlap a timing phase and read as a
+# code delta, so a silently absent marker does not fail the run: it corrupts
+# the numbers while they still look trustworthy. That makes the guard
+# fail-closed infrastructure, and this proves each branch's exit code in a
+# sandbox:
 #   bash scripts/ensure-noindex-marker-selftest.sh
 #
 # The invariant under test, stated once: WHEN THE GUARD EXITS 0, A REGULAR
@@ -16,15 +17,17 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$REPO/scripts/lib/ensure-noindex-marker.sh"
 # The measurement body, not the entry point: scripts/bench-compare.sh only
-# takes the machine-wide locks and execs this. Naming a file by path is how a
-# check like this goes stale, so the existence assertion below is what turns a
-# future move into a loud failure instead of a silently-skipped call-site test.
-CALLER="$REPO/scripts/lib/bench-compare-impl.sh"
-if [ ! -f "$CALLER" ]; then
-  echo "FATAL: expected caller $CALLER does not exist — the call-site assertions" >&2
-  echo "  below would vacuously pass against a moved or renamed file." >&2
-  exit 1
-fi
+# takes the machine-wide locks and execs this. The slopefit driver is the build
+# path used by the scheduled macOS measurement workflow.
+COMPARE_CALLER="$REPO/scripts/lib/bench-compare-impl.sh"
+SLOPEFIT_CALLER="$REPO/scripts/bench_decode_slopefit.sh"
+for caller in "$COMPARE_CALLER" "$SLOPEFIT_CALLER"; do
+  if [ ! -f "$caller" ]; then
+    echo "FATAL: expected caller $caller does not exist — the call-site assertions" >&2
+    echo "  below would vacuously pass against a moved or renamed file." >&2
+    exit 1
+  fi
+done
 SB="$(mktemp -d)"
 trap 'chmod -R u+w "$SB" 2>/dev/null; rm -rf "$SB"' EXIT
 
@@ -72,7 +75,20 @@ else
   echo "  FAIL:   -> existing marker was truncated"; fail=$((fail+1))
 fi
 
-# 4. THE REVIEWED DEFECT (#1089 round 1). A dangling marker symlink is the case
+# 4. Build-tree cleanup removes the marker with the guarded resource. A caller
+#    that reapplies the helper before every build must recreate both.
+D="$SB/recreated/target"
+run "$D"; first_rc=$?
+rm -rf "$D"
+run "$D"; second_rc=$?
+if [ "$first_rc" -eq 0 ] && [ "$second_rc" -eq 0 ]; then
+  echo "  PASS: marker is recreated after target cleanup"; pass=$((pass+1))
+else
+  echo "  FAIL: marker recreation failed (first=$first_rc second=$second_rc)"; fail=$((fail+1))
+fi
+check_marker "  -> recreated marker is a regular file" "$D" file
+
+# 5. THE REVIEWED DEFECT (#1089 round 1). A dangling marker symlink is the case
 #    the fail-open form got wrong: `test -e` is FALSE for a dangling link, the
 #    redirect then followed it to an uncreatable target and failed, and the
 #    trailing `|| true` reported success anyway — so the A/B ran unprotected.
@@ -84,18 +100,18 @@ ln -s "$SB/dangling/no-such-dir/target" "$D/.metadata_never_index"
 run "$D"; check "dangling marker symlink is repaired" 0 $?
 check_marker "  -> replaced by a regular file" "$D" file
 
-# 5. Symlink pointing at an existing file elsewhere: still not a real marker in
+# 6. Symlink pointing at an existing file elsewhere: still not a real marker in
 #    this directory (Spotlight reads the directory), so it is replaced.
 D="$SB/livelink/.cache"; mkdir -p "$D"; : > "$SB/livelink/elsewhere"
 ln -s "$SB/livelink/elsewhere" "$D/.metadata_never_index"
 run "$D"; check "live marker symlink is replaced" 0 $?
 check_marker "  -> replaced by a regular file" "$D" file
 
-# 6. Marker path occupied by a directory: cannot become a file, must not proceed.
+# 7. Marker path occupied by a directory: cannot become a file, must not proceed.
 D="$SB/isdir/.cache"; mkdir -p "$D/.metadata_never_index/occupied"
 run "$D"; check "non-empty dir at marker path fails closed" 1 $?
 
-# 7. FAIL-CLOSED PROOF. An unwritable .cache cannot hold a marker at all, so the
+# 8. FAIL-CLOSED PROOF. An unwritable .cache cannot hold a marker at all, so the
 #    guard must refuse rather than let an unprotected A/B proceed. This is the
 #    case that fails if the trailing `|| true` ever comes back.
 if [ "$(id -u)" -eq 0 ]; then
@@ -111,21 +127,53 @@ else
   chmod u+w "$D"
 fi
 
-# 8. CALL-SITE ASSERTION. Testing the helper in isolation would still pass if
-#    the measurement body stopped calling it, so assert the wiring too.
-if grep -q 'scripts/lib/ensure-noindex-marker.sh' "$CALLER"; then
-  echo "  PASS: the measurement body invokes the guard"; pass=$((pass+1))
+# 9. CALL-SITE ASSERTIONS. Testing the helper in isolation would still pass if
+#    a measurement body stopped calling it, so pin the exact protected trees.
+cache_call="\"\$REPO/scripts/lib/ensure-noindex-marker.sh\" \"\$REPO/.cache\""
+target_call="\"\$REPO/scripts/lib/ensure-noindex-marker.sh\" \"\$REPO/target\""
+
+if grep -qF "$cache_call" "$COMPARE_CALLER"; then
+  echo "  PASS: bench-compare protects its worktree parent"; pass=$((pass+1))
 else
-  echo "  FAIL: the measurement body no longer invokes the guard"; fail=$((fail+1))
+  echo "  FAIL: bench-compare no longer protects its worktree parent"; fail=$((fail+1))
 fi
 
-# 9. The guard must run BEFORE the worktrees it protects are created.
-guard_ln=$(grep -n 'ensure-noindex-marker.sh' "$CALLER" | head -1 | cut -d: -f1)
-wt_ln=$(grep -n 'worktree add' "$CALLER" | head -1 | cut -d: -f1)
-if [ -n "$guard_ln" ] && [ -n "$wt_ln" ] && [ "$guard_ln" -lt "$wt_ln" ]; then
-  echo "  PASS: guard precedes worktree creation (line $guard_ln < $wt_ln)"; pass=$((pass+1))
+if grep -qF "$target_call" "$COMPARE_CALLER"; then
+  echo "  PASS: bench-compare protects its in-place target"; pass=$((pass+1))
 else
-  echo "  FAIL: guard does not precede worktree creation (guard=$guard_ln wt=$wt_ln)"; fail=$((fail+1))
+  echo "  FAIL: bench-compare no longer protects its in-place target"; fail=$((fail+1))
+fi
+
+if grep -qF "$target_call" "$SLOPEFIT_CALLER"; then
+  echo "  PASS: slopefit protects its in-place target"; pass=$((pass+1))
+else
+  echo "  FAIL: slopefit no longer protects its in-place target"; fail=$((fail+1))
+fi
+
+# 10. Each marker must exist before the operation that creates or builds the
+#     protected resource. These ordering checks fail if a call drifts too late.
+cache_guard_ln=$(grep -nF "$cache_call" "$COMPARE_CALLER" | head -1 | cut -d: -f1)
+wt_ln=$(grep -n 'worktree add' "$COMPARE_CALLER" | head -1 | cut -d: -f1)
+if [ -n "$cache_guard_ln" ] && [ -n "$wt_ln" ] && [ "$cache_guard_ln" -lt "$wt_ln" ]; then
+  echo "  PASS: cache guard precedes worktree creation (line $cache_guard_ln < $wt_ln)"; pass=$((pass+1))
+else
+  echo "  FAIL: cache guard does not precede worktree creation (guard=$cache_guard_ln wt=$wt_ln)"; fail=$((fail+1))
+fi
+
+target_guard_ln=$(grep -nF "$target_call" "$COMPARE_CALLER" | head -1 | cut -d: -f1)
+compare_build_ln=$(grep -nE '^[[:space:]]*(if[[:space:]]+)?cargo bench[[:space:]]' "$COMPARE_CALLER" | head -1 | cut -d: -f1)
+if [ -n "$target_guard_ln" ] && [ -n "$compare_build_ln" ] && [ "$target_guard_ln" -lt "$compare_build_ln" ]; then
+  echo "  PASS: target guard precedes bench-compare build (line $target_guard_ln < $compare_build_ln)"; pass=$((pass+1))
+else
+  echo "  FAIL: target guard does not precede bench-compare build (guard=$target_guard_ln build=$compare_build_ln)"; fail=$((fail+1))
+fi
+
+slopefit_guard_ln=$(grep -nF "$target_call" "$SLOPEFIT_CALLER" | head -1 | cut -d: -f1)
+slopefit_build_ln=$(grep -n '^cargo build' "$SLOPEFIT_CALLER" | head -1 | cut -d: -f1)
+if [ -n "$slopefit_guard_ln" ] && [ -n "$slopefit_build_ln" ] && [ "$slopefit_guard_ln" -lt "$slopefit_build_ln" ]; then
+  echo "  PASS: target guard precedes slopefit build (line $slopefit_guard_ln < $slopefit_build_ln)"; pass=$((pass+1))
+else
+  echo "  FAIL: target guard does not precede slopefit build (guard=$slopefit_guard_ln build=$slopefit_build_ln)"; fail=$((fail+1))
 fi
 
 echo "=== $pass passed, $fail failed ==="

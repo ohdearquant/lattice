@@ -7,7 +7,10 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use super::simd_config;
 
 /// **Unstable**: INT4 quantization internals; scale/bias scheme may change.
@@ -27,12 +30,7 @@ pub struct Int4Params {
 impl Int4Params {
     /// **Unstable**: quantization parameter computation; may be folded into `Int4Vector::from_f32`.
     pub fn from_vector(vector: &[f32]) -> Self {
-        let mut max_abs: f32 = 0.0;
-        for &v in vector {
-            if v.is_finite() {
-                max_abs = max_abs.max(v.abs());
-            }
-        }
+        let max_abs = max_abs_finite(vector);
 
         // Epsilon guard: avoid division by near-zero
         let scale = if max_abs > 1e-10 {
@@ -43,6 +41,93 @@ impl Int4Params {
 
         Self { scale, max_abs }
     }
+}
+
+fn max_abs_finite(vector: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd_config().avx2_enabled {
+            // SAFETY: AVX2 was detected at runtime; the kernel bounds every load.
+            return unsafe { max_abs_finite_avx2(vector) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if simd_config().neon_enabled {
+            // SAFETY: NEON was detected at runtime; the kernel bounds every load.
+            return unsafe { max_abs_finite_neon(vector) };
+        }
+    }
+    max_abs_finite_scalar(vector)
+}
+
+fn max_abs_finite_scalar(vector: &[f32]) -> f32 {
+    vector
+        .iter()
+        .filter(|value| value.is_finite())
+        .map(|value| value.abs())
+        .fold(0.0, f32::max)
+}
+
+#[cfg(test)]
+thread_local! {
+    static INT4_MAX_ABS_SIMD_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn max_abs_finite_avx2(vector: &[f32]) -> f32 {
+    #[cfg(test)]
+    INT4_MAX_ABS_SIMD_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    let chunks = vector.len() / 8;
+    let sign = _mm256_set1_ps(-0.0);
+    let inf = _mm256_set1_ps(f32::INFINITY);
+    let mut maximum = _mm256_setzero_ps();
+
+    for i in 0..chunks {
+        let input = _mm256_loadu_ps(vector.as_ptr().add(i * 8));
+        let abs = _mm256_andnot_ps(sign, input);
+        let finite = _mm256_cmp_ps(abs, inf, _CMP_LT_OQ);
+        maximum = _mm256_max_ps(maximum, _mm256_and_ps(abs, finite));
+    }
+
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), maximum);
+    let mut max_abs = lanes.into_iter().fold(0.0f32, f32::max);
+    for &value in &vector[chunks * 8..] {
+        if value.is_finite() {
+            max_abs = max_abs.max(value.abs());
+        }
+    }
+    max_abs
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn max_abs_finite_neon(vector: &[f32]) -> f32 {
+    #[cfg(test)]
+    INT4_MAX_ABS_SIMD_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    let chunks = vector.len() / 4;
+    let inf = vdupq_n_f32(f32::INFINITY);
+    let zero = vdupq_n_f32(0.0);
+    let mut maximum = zero;
+
+    for i in 0..chunks {
+        let input = vld1q_f32(vector.as_ptr().add(i * 4));
+        let abs = vabsq_f32(input);
+        let finite = vcltq_f32(abs, inf);
+        maximum = vmaxq_f32(maximum, vbslq_f32(finite, abs, zero));
+    }
+
+    let mut max_abs = vmaxvq_f32(maximum);
+    for &value in &vector[chunks * 4..] {
+        if value.is_finite() {
+            max_abs = max_abs.max(value.abs());
+        }
+    }
+    max_abs
 }
 
 /// **Unstable**: INT4 quantization format is under active design; struct layout may change.
@@ -79,26 +164,7 @@ impl Int4Vector {
         }
         let norm = norm_sq.sqrt();
 
-        // Quantize each value to [0, 15] and pack pairs into bytes
-        let packed_len = dims.div_ceil(2);
-        let mut data = vec![0u8; packed_len];
-
-        for (i, &elem) in vector[..dims].iter().enumerate() {
-            let v = if elem.is_finite() { elem } else { 0.0 };
-            // Map [-max_abs, max_abs] -> [0, 15]
-            let q = ((v + params.max_abs) * params.scale)
-                .round()
-                .clamp(0.0, 15.0) as u8;
-
-            let byte_idx = i / 2;
-            if i % 2 == 0 {
-                // Even index -> high nibble
-                data[byte_idx] |= q << 4;
-            } else {
-                // Odd index -> low nibble
-                data[byte_idx] |= q;
-            }
-        }
+        let data = quantize_int4(vector, params);
 
         Self {
             data,
@@ -159,6 +225,126 @@ impl Int4Vector {
     pub fn cosine_distance(&self, other: &Int4Vector) -> f32 {
         1.0 - self.cosine_similarity(other)
     }
+}
+
+fn quantize_int4(vector: &[f32], params: Int4Params) -> Vec<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if simd_config().avx2_enabled {
+            // SAFETY: AVX2 was detected at runtime; the kernel bounds every load and store.
+            return unsafe { quantize_int4_avx2(vector, params) };
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if simd_config().neon_enabled {
+            // SAFETY: NEON was detected at runtime; the kernel bounds every load and store.
+            return unsafe { quantize_int4_neon(vector, params) };
+        }
+    }
+    quantize_int4_scalar(vector, params)
+}
+
+fn quantize_int4_scalar(vector: &[f32], params: Int4Params) -> Vec<u8> {
+    let mut data = vec![0u8; vector.len().div_ceil(2)];
+    quantize_int4_scalar_tail(vector, params, &mut data, 0);
+    data
+}
+
+fn quantize_int4_scalar_tail(vector: &[f32], params: Int4Params, data: &mut [u8], start: usize) {
+    for (i, &value) in vector.iter().enumerate().skip(start) {
+        let quantized = quantize_int4_value(value, params);
+        if i % 2 == 0 {
+            data[i / 2] |= quantized << 4;
+        } else {
+            data[i / 2] |= quantized;
+        }
+    }
+}
+
+#[inline]
+fn quantize_int4_value(value: f32, params: Int4Params) -> u8 {
+    let finite_value = if value.is_finite() { value } else { 0.0 };
+    ((finite_value + params.max_abs) * params.scale)
+        .round()
+        .clamp(0.0, 15.0) as u8
+}
+
+#[cfg(test)]
+thread_local! {
+    static INT4_QUANTIZE_SIMD_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn quantize_int4_avx2(vector: &[f32], params: Int4Params) -> Vec<u8> {
+    #[cfg(test)]
+    INT4_QUANTIZE_SIMD_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    let mut data = vec![0u8; vector.len().div_ceil(2)];
+    let chunks = vector.len() / 8;
+    let sign = _mm256_set1_ps(-0.0);
+    let inf = _mm256_set1_ps(f32::INFINITY);
+    let max_abs = _mm256_set1_ps(params.max_abs);
+    let scale = _mm256_set1_ps(params.scale);
+    let zero = _mm256_setzero_ps();
+    let high = _mm256_set1_ps(15.0);
+    let half = _mm256_set1_ps(0.5);
+    let one = _mm256_set1_epi32(1);
+
+    for i in 0..chunks {
+        let base = i * 8;
+        let input = _mm256_loadu_ps(vector.as_ptr().add(base));
+        let abs = _mm256_andnot_ps(sign, input);
+        let finite = _mm256_cmp_ps(abs, inf, _CMP_LT_OQ);
+        let values = _mm256_and_ps(input, finite);
+        let scaled = _mm256_mul_ps(_mm256_add_ps(values, max_abs), scale);
+        let clamped = _mm256_min_ps(_mm256_max_ps(scaled, zero), high);
+        let truncated = _mm256_cvttps_epi32(clamped);
+        let fraction = _mm256_sub_ps(clamped, _mm256_cvtepi32_ps(truncated));
+        let round_up = _mm256_castps_si256(_mm256_cmp_ps(fraction, half, _CMP_GE_OQ));
+        let rounded = _mm256_add_epi32(truncated, _mm256_and_si256(round_up, one));
+        let mut lanes = [0i32; 8];
+        _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), rounded);
+        for pair in 0..4 {
+            data[base / 2 + pair] = ((lanes[pair * 2] as u8) << 4) | lanes[pair * 2 + 1] as u8;
+        }
+    }
+
+    quantize_int4_scalar_tail(vector, params, &mut data, chunks * 8);
+    data
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_int4_neon(vector: &[f32], params: Int4Params) -> Vec<u8> {
+    #[cfg(test)]
+    INT4_QUANTIZE_SIMD_HITS.with(|hits| hits.set(hits.get() + 1));
+
+    let mut data = vec![0u8; vector.len().div_ceil(2)];
+    let chunks = vector.len() / 4;
+    let inf = vdupq_n_f32(f32::INFINITY);
+    let zero = vdupq_n_f32(0.0);
+    let max_abs = vdupq_n_f32(params.max_abs);
+    let scale = vdupq_n_f32(params.scale);
+    let high = vdupq_n_f32(15.0);
+
+    for i in 0..chunks {
+        let base = i * 4;
+        let input = vld1q_f32(vector.as_ptr().add(base));
+        let finite = vcaltq_f32(input, inf);
+        let values = vbslq_f32(finite, input, zero);
+        let scaled = vmulq_f32(vaddq_f32(values, max_abs), scale);
+        let clamped = vminq_f32(vmaxq_f32(scaled, zero), high);
+        let rounded = vcvtaq_s32_f32(clamped);
+        let mut lanes = [0i32; 4];
+        vst1q_s32(lanes.as_mut_ptr(), rounded);
+        data[base / 2] = ((lanes[0] as u8) << 4) | lanes[1] as u8;
+        data[base / 2 + 1] = ((lanes[2] as u8) << 4) | lanes[3] as u8;
+    }
+
+    quantize_int4_scalar_tail(vector, params, &mut data, chunks * 4);
+    data
 }
 
 /// **Unstable**: dequantized INT4 dot product; dispatch may change.
@@ -355,6 +541,123 @@ mod tests {
                 unit * 2.0 - 1.0
             })
             .collect()
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn test_int4_quantize_explicit_simd_matches_scalar_and_is_dispatched() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let params = Int4Params {
+            scale: 7.5,
+            max_abs: 1.0,
+        };
+        let tie_params = Int4Params {
+            scale: 1.0,
+            max_abs: 7.5,
+        };
+        let tie_input = [-7.5, -1.0, 1.0, 7.5, -1.0, 1.0, 0.0, -0.0];
+        let scalar_ties = quantize_int4_scalar(&tie_input, tie_params);
+        assert_eq!(scalar_ties, [0x07, 0x9f, 0x79, 0x88]);
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: baseline aarch64 provides NEON; the kernel bounds every access.
+        let simd_ties = unsafe { quantize_int4_neon(&tie_input, tie_params) };
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: AVX2 was detected above; the kernel bounds every access.
+        let simd_ties = unsafe { quantize_int4_avx2(&tie_input, tie_params) };
+        assert_eq!(
+            simd_ties, scalar_ties,
+            "explicit SIMD must preserve ties-away rounding"
+        );
+
+        for dim in [0usize, 1, 3, 4, 7, 8, 9, 31, 32, 33, 383, 384, 385] {
+            let mut input = generate_vector(dim, 900 + dim as u64);
+            if dim > 0 {
+                input[0] = f32::NAN;
+            }
+            if dim > 1 {
+                input[1] = f32::INFINITY;
+            }
+            if dim > 2 {
+                input[2] = f32::NEG_INFINITY;
+            }
+            if dim > 3 {
+                let boundary = -1.0 + 0.5 / params.scale;
+                input[3] = f32::from_bits(boundary.to_bits() - 1);
+            }
+            if dim > 4 {
+                let boundary = -1.0 + 0.5 / params.scale;
+                input[4] = f32::from_bits(boundary.to_bits() + 1);
+            }
+
+            let scalar = quantize_int4_scalar(&input, params);
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: baseline aarch64 provides NEON; the kernel bounds every access.
+            let simd = unsafe { quantize_int4_neon(&input, params) };
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: AVX2 was detected above; the kernel bounds every access.
+            let simd = unsafe { quantize_int4_avx2(&input, params) };
+            assert_eq!(simd, scalar, "explicit SIMD mismatch at dim={dim}");
+        }
+
+        let input = generate_vector(385, 1_063);
+        let before = INT4_QUANTIZE_SIMD_HITS.with(std::cell::Cell::get);
+        let quantized = Int4Vector::from_f32(&input);
+        let after = INT4_QUANTIZE_SIMD_HITS.with(std::cell::Cell::get);
+        assert_eq!(
+            after,
+            before + 1,
+            "Int4Vector::from_f32 did not execute its explicit SIMD quantizer"
+        );
+        assert_eq!(
+            quantized.data,
+            quantize_int4_scalar(&input, quantized.params)
+        );
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn test_int4_max_abs_explicit_simd_matches_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        for dim in [0usize, 1, 3, 4, 7, 8, 9, 31, 32, 33, 383, 384, 385] {
+            let mut input = generate_vector(dim, 1_100 + dim as u64);
+            if dim > 0 {
+                input[0] = f32::NAN;
+            }
+            if dim > 1 {
+                input[1] = f32::INFINITY;
+            }
+            if dim > 2 {
+                input[2] = f32::NEG_INFINITY;
+            }
+
+            let scalar = max_abs_finite_scalar(&input);
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: baseline aarch64 provides NEON; the kernel bounds every access.
+            let simd = unsafe { max_abs_finite_neon(&input) };
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: AVX2 was detected above; the kernel bounds every access.
+            let simd = unsafe { max_abs_finite_avx2(&input) };
+            assert_eq!(simd, scalar, "finite max-abs mismatch at dim={dim}");
+        }
+
+        let input = generate_vector(385, 1_063);
+        let before = INT4_MAX_ABS_SIMD_HITS.with(std::cell::Cell::get);
+        let params = Int4Params::from_vector(&input);
+        let after = INT4_MAX_ABS_SIMD_HITS.with(std::cell::Cell::get);
+        assert_eq!(
+            after,
+            before + 1,
+            "Int4Params::from_vector did not execute its explicit SIMD reducer"
+        );
+        assert_eq!(params.max_abs, max_abs_finite_scalar(&input));
     }
 
     #[test]

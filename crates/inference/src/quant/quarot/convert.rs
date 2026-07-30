@@ -46,7 +46,8 @@ use crate::quant::quarot::pipeline::{
 };
 use crate::quant::quarot::plan::RotationPlan;
 use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use crate::weights::q4_weights::{q4_f32_to_f16, quantize_f64_to_q4, save_q4_file};
+use crate::weights::ingress::DecodedTensorValidator;
+use crate::weights::q4_weights::{q4_f32_to_finite_f16, quantize_f64_to_q4, save_q4_file};
 
 /// Upper bound on `hidden_size` accepted by [`convert_quarot_qwen35`], well above any
 /// real Qwen3.5 checkpoint, guarding `RandomizedHadamard::new`'s config-sized allocation
@@ -339,6 +340,7 @@ fn f16_file_byte_count(data_len: usize, shape_len: usize) -> u64 {
 
 fn write_mtp_weights_quarot(
     reader: &QuarotTensorReader,
+    source: &str,
     output_dir: &Path,
     dry_run: bool,
     index_entries: &mut Vec<IndexEntry>,
@@ -385,7 +387,7 @@ fn write_mtp_weights_quarot(
         *total_bytes_out += f16_file_byte_count(data.len(), shape.len());
         if !dry_run {
             let out_path = output_dir.join(&file_name);
-            write_f16_file(&out_path, &data, &shape)?;
+            write_f16_file(&out_path, source, name, &data, &shape)?;
         }
         *kept_f16 += 1;
         index_entries.push(IndexEntry {
@@ -497,6 +499,7 @@ pub fn convert_quarot_qwen35(
     }
 
     let reader = QuarotTensorReader::open(input_dir)?;
+    let input_source = input_dir.display().to_string();
     let required_names = qwen_required_tensor_names(&cfg);
     // Measure the on-disk footprint of the language-model tensors the pipeline
     // reads and writes, using SafeTensors header byte spans
@@ -640,7 +643,7 @@ pub fn convert_quarot_qwen35(
             if !opts.dry_run {
                 let file_name = format!("{sanitized}.f16");
                 let out_path = output_dir.join(&file_name);
-                write_f16_file(&out_path, &entry.data, &entry.shape)?;
+                write_f16_file(&out_path, &input_source, name, &entry.data, &entry.shape)?;
                 index_entries.push(IndexEntry {
                     name: name.clone(),
                     file: file_name,
@@ -656,6 +659,7 @@ pub fn convert_quarot_qwen35(
     if cfg.mtp_num_hidden_layers > 0 {
         write_mtp_weights_quarot(
             &reader,
+            &input_source,
             output_dir,
             opts.dry_run,
             &mut index_entries,
@@ -801,7 +805,26 @@ fn sanitize_tensor_name(name: &str) -> String {
 /// Returns the total number of bytes written. f64 → f16 goes through
 /// f32 to share the existing converter (rounding-aware) — sufficient
 /// for the runtime's f16 fast path.
-fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, InferenceError> {
+fn write_f16_file(
+    path: &Path,
+    source: &str,
+    tensor_name: &str,
+    data: &[f64],
+    shape: &[usize],
+) -> Result<usize, InferenceError> {
+    // Delay file creation until narrowing is proven finite so a rejected
+    // tensor cannot look like a completed KHF1 artifact.
+    let mut validator =
+        DecodedTensorValidator::decoded_input(source, tensor_name, shape, "F16", data.len())?;
+    let mut payload = Vec::with_capacity(data.len() * 2);
+    for &value in data {
+        let bits =
+            q4_f32_to_finite_f16(value as f32).map_err(|bits| validator.reject_f16_bits(bits))?;
+        validator.observe_finite();
+        payload.extend_from_slice(&bits.to_le_bytes());
+    }
+    validator.finish()?;
+
     let mut file = fs::File::create(path).map_err(|e| {
         InferenceError::Inference(format!(
             "write_f16_file: failed to create {}: {e}",
@@ -832,18 +855,6 @@ fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, I
     write_all(&(data.len() as u64).to_le_bytes())?;
     bytes_written += 8;
 
-    let mut payload = Vec::with_capacity(data.len() * 2);
-    for &v in data {
-        // Use the subnormal-aware helper from `weights::q4_weights`. The
-        // hand-rolled flush-to-zero variant in `bin/quantize_q4.rs`
-        // silently rounds f16-subnormal-but-f32-normal values
-        // (~1e-7 range) to zero — relevant here because every kept
-        // tensor (norms, A_log, dt_bias, conv1d, etc.) passes through
-        // this path. `q4_f32_to_f16` round-trips through the f16
-        // subnormal range correctly.
-        let h = q4_f32_to_f16(v as f32);
-        payload.extend_from_slice(&h.to_le_bytes());
-    }
     write_all(&payload)?;
     bytes_written += payload.len();
 
@@ -854,6 +865,7 @@ fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, I
 mod tests {
     use super::*;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
+    use crate::weights::q4_weights::q4_f32_to_f16;
     use serde_json::Value;
     use std::path::PathBuf;
 
@@ -1666,7 +1678,8 @@ mod tests {
         let p = tmp.path().join("test.f16");
         let data = vec![1.5_f64, -2.5, 0.25, -0.125];
         let shape = vec![2_usize, 2];
-        let bytes_written = write_f16_file(&p, &data, &shape).unwrap();
+        let bytes_written =
+            write_f16_file(&p, "fixture.safetensors", "fixture.weight", &data, &shape).unwrap();
         let raw = fs::read(&p).unwrap();
         assert_eq!(&raw[0..4], b"KHF1");
         assert_eq!(u32::from_le_bytes(raw[4..8].try_into().unwrap()), 1);
@@ -1679,7 +1692,43 @@ mod tests {
         assert_eq!(bytes_written, raw.len());
     }
 
-    /// Smoke check on `q4_f32_to_f16` (used by `write_f16_file`).
+    /// Mutation-sensitive lattice#801 output gate: accepting every encoded
+    /// bit pattern makes each case create a KHF1 file and return Ok.
+    #[test]
+    fn f16_writer_rejects_non_finite_or_overflowed_encoding_before_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (label, value) in [
+            ("nan", f64::NAN),
+            ("positive-infinity", f64::INFINITY),
+            ("negative-infinity", f64::NEG_INFINITY),
+            ("f32-overflow", f64::MAX),
+            ("f16-overflow", 100_000.0_f64),
+        ] {
+            let path = tmp.path().join(format!("{label}.f16"));
+            let err = write_f16_file(
+                &path,
+                "fixture.safetensors",
+                "fixture.weight",
+                &[value],
+                &[1],
+            )
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, InferenceError::InvalidInput(_)),
+                "{label}: got {err:?}"
+            );
+            assert!(message.contains("non-finite value"), "{label}: got {err}");
+            assert!(message.contains("fixture.safetensors"));
+            assert!(message.contains("fixture.weight"));
+            assert!(
+                !path.exists(),
+                "{label}: invalid f16 encoding must be rejected before file creation"
+            );
+        }
+    }
+
+    /// Smoke check on the canonical encoder underlying `write_f16_file`.
     /// Includes an f16-subnormal regression, since fixed: the old local
     /// helper flushed every value below f16's smallest
     /// normal to zero, silently corrupting small-magnitude weights in
