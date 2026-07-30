@@ -257,7 +257,9 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
 
         let frame_idx = stack.len() - 1;
         let frame = &stack[frame_idx];
-        let rule = &grammar.rules[frame.rule_id];
+        let Some(rule) = grammar.rules.get(frame.rule_id) else {
+            return false;
+        };
 
         // Rule with no alternatives: dead end → reject via next-alt or backtrack.
         if rule.alts.is_empty() {
@@ -321,7 +323,10 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
                 let rid = *rule_id;
                 // Push a new frame for the non-terminal's first alt.
                 // Before pushing, check if the referenced rule has any alts.
-                if grammar.rules[rid].alts.is_empty() {
+                let Some(referenced_rule) = grammar.rules.get(rid) else {
+                    return false;
+                };
+                if referenced_rule.alts.is_empty() {
                     // Empty rule = epsilon; advance past the non-terminal.
                     stack[frame_idx].sym_pos += 1;
                     continue;
@@ -1074,5 +1079,69 @@ mod tests {
         let id1 = builder.reserve("foo");
         let id2 = builder.reserve("foo");
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn missing_root_rule_id_rejects_without_panicking() {
+        let grammar = CompiledGrammar { rules: Vec::new() };
+        let mut state = GrammarState::initial();
+        let before = state.clone();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Rejected
+        );
+        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
+    }
+
+    #[test]
+    fn out_of_range_state_rule_id_rejects_without_panicking() {
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![vec![Symbol::Terminal(b'x')]],
+            }],
+        };
+        let mut state = GrammarState {
+            stack: vec![StackFrame {
+                rule_id: 1,
+                alt_idx: 0,
+                sym_pos: 0,
+                consumed: false,
+            }],
+            partial_token_bytes: Vec::new(),
+            complete: false,
+        };
+        let before = state.clone();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Rejected
+        );
+        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
+    }
+
+    #[test]
+    fn out_of_range_non_terminal_rule_id_rejects_without_panicking() {
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![vec![Symbol::NonTerminal(1)]],
+            }],
+        };
+        let mut state = GrammarState::initial();
+        let before = state.clone();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Rejected
+        );
+        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
     }
 }
