@@ -82,7 +82,7 @@ jobs:
           mkdir -p "$STAGE"
           cp target/release/lattice "$STAGE/"
           strip "$STAGE/lattice" || echo "::warning::strip failed or unavailable, shipping unstripped binary"
-          cp README.md LICENSE "$STAGE/" 2>/dev/null || true
+          cp README.md LICENSE-APACHE LICENSE-MIT "$STAGE/" 2>/dev/null || true
           ARCHIVE="${STAGE}.tar.gz"
           tar -czf "$ARCHIVE" "$STAGE"
           shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"

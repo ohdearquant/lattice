@@ -33,6 +33,7 @@ Add LoRA serving integration tests **inside** the `inference` crate (`src/model/
 Add `qwen35_0_8b()` to `Qwen35Config` alongside `qwen35_2b()`. Include the real HuggingFace `config.json` as a test fixture (`tests/fixtures/qwen35_0_8b_config.json`) with a parse test asserting `from_config_json` produces the correct config.
 
 Notable 0.8B specifics vs. 2B:
+
 - `mtp_num_hidden_layers: 1` (2B has 0) — MTP weights present in safetensors but ignored by the loader since the main loop only iterates `num_hidden_layers`
 - `rope_theta` and `partial_rotary_factor` are nested under `rope_parameters` in the config.json; `from_config_json` still produces correct values because the container-level `#[serde(default)]` backfills from `Qwen35Config::default()` which happens to match
 
@@ -56,23 +57,25 @@ Both `qwen35_generate` and `generate_lora` binaries now default to `qwen3.5-0.8b
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why Not |
-|---|---|---|---|
-| E2e test with real weights in CI | Tests the actual model | ~1.6GB download in CI; non-hermetic; slow | CI should be fast and hermetic; e2e verified manually |
-| External integration test in `tests/` | Standard Rust test location | `Qwen35Model` has no public constructor; would need `tune` dep (circular) | Dependency direction forbids it |
-| Test only in `tune` crate | Where `LoraAdapter` lives | Only tests `tune`'s math, not that `inference` actually calls the hook | Misses the integration gap that was the actual risk |
-| `#[cfg(test)]` public constructor | Enables external tests | Leaks test-only API surface; `#[cfg(test)]` on a lib item is fragile | Internal tests avoid the need entirely |
+| Alternative                           | Pros                        | Cons                                                                      | Why Not                                               |
+| ------------------------------------- | --------------------------- | ------------------------------------------------------------------------- | ----------------------------------------------------- |
+| E2e test with real weights in CI      | Tests the actual model      | ~1.6GB download in CI; non-hermetic; slow                                 | CI should be fast and hermetic; e2e verified manually |
+| External integration test in `tests/` | Standard Rust test location | `Qwen35Model` has no public constructor; would need `tune` dep (circular) | Dependency direction forbids it                       |
+| Test only in `tune` crate             | Where `LoraAdapter` lives   | Only tests `tune`'s math, not that `inference` actually calls the hook    | Misses the integration gap that was the actual risk   |
+| `#[cfg(test)]` public constructor     | Enables external tests      | Leaks test-only API surface; `#[cfg(test)]` on a lib item is fragile      | Internal tests avoid the need entirely                |
 
 ---
 
 ## Consequences
 
 **Positive**:
+
 - CI now catches regressions in LoRA hook invocation (new projection sites forgotten, wrong buffer sizes, broken module name strings).
 - 0.8B model is usable out of the box — 3x smaller download, same architecture, adequate for development and adapter testing.
 - The spy/delta pattern is reusable for future hook traits.
 
 **Negative**:
+
 - The `serde(default)` coincidence for `rope_theta`/`partial_rotary_factor` is fragile — if `Qwen35Config::default()` changes to a different model's values, the 0.8B fixture parse test will catch it, but silently loading wrong rope parameters in production (without the fixture test) would produce degraded output, not an error.
 - The synthetic-weight tests do not verify numerical correctness of LoRA + real model weights (only that the pipeline runs and the hook fires). Real-weight verification is manual.
 
