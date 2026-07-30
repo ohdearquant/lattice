@@ -102,31 +102,50 @@ esac
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
-markdown_list=$(mktemp "${TMPDIR:-/tmp}/lattice-markdown-files.XXXXXX")
-trap 'rm -f "$markdown_list"' 0 1 2 3 15
-git ls-files -z -- '*.md' >"$markdown_list"
-markdown_count=$(tr -cd '\000' <"$markdown_list" | wc -c | tr -d '[:space:]')
-if [ "$markdown_count" -eq 0 ]; then
-    echo "lint-docs: tracked Markdown discovery returned zero files" >&2
-    exit 1
-fi
 
 if [ "$mode" = "--format" ]; then
+    if ! command -v deno >/dev/null 2>&1; then
+        echo "lint-docs: deno not found; cannot format Markdown" >&2
+        exit 127
+    fi
+    markdown_list=$(mktemp "${TMPDIR:-/tmp}/lattice-markdown-files.XXXXXX")
+    trap 'rm -f "$markdown_list"' 0 1 2 3 15
+    git ls-files -z -- '*.md' >"$markdown_list"
+    markdown_count=$(tr -cd '\000' <"$markdown_list" | wc -c | tr -d '[:space:]')
+    if [ "$markdown_count" -eq 0 ]; then
+        echo "lint-docs: tracked Markdown discovery returned zero files" >&2
+        exit 1
+    fi
     echo "=== Formatting $markdown_count tracked Markdown files (deno) ==="
     xargs -0 deno fmt <"$markdown_list"
     exit 0
 fi
 
-echo "=== Doc Linting $markdown_count tracked Markdown files (deno) ==="
-xargs -0 deno fmt --check <"$markdown_list"
-xargs -0 deno lint <"$markdown_list" 2>/dev/null || true
+if command -v deno >/dev/null 2>&1; then
+    markdown_list=$(mktemp "${TMPDIR:-/tmp}/lattice-markdown-files.XXXXXX")
+    trap 'rm -f "$markdown_list"' 0 1 2 3 15
+    git ls-files -z -- '*.md' >"$markdown_list"
+    markdown_count=$(tr -cd '\000' <"$markdown_list" | wc -c | tr -d '[:space:]')
+    if [ "$markdown_count" -eq 0 ]; then
+        echo "lint-docs: tracked Markdown discovery returned zero files" >&2
+        exit 1
+    fi
+    echo "=== Doc Linting $markdown_count tracked Markdown files (deno) ==="
+    xargs -0 deno fmt --check <"$markdown_list"
+    xargs -0 deno lint <"$markdown_list" 2>/dev/null || true
 
-if [ "$mode" = "--markdown-only" ]; then
-    exit 0
+    if [ "$mode" = "--markdown-only" ]; then
+        exit 0
+    fi
+
+    echo "=== Recursive Markdown Discovery Self-Test (#1148) ==="
+    "$script_path" --selftest
+elif [ "$mode" = "--markdown-only" ]; then
+    echo "lint-docs: deno not found; cannot lint Markdown" >&2
+    exit 127
+else
+    echo "lint-docs: deno not found; skipping Markdown format, lint, and discovery self-test"
 fi
-
-echo "=== Recursive Markdown Discovery Self-Test (#1148) ==="
-"$script_path" --selftest
 
 echo "=== Capability Matrix Fixture Check (#654) ==="
 "$script_dir/check-capability-matrix.sh" --selftest
