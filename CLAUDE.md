@@ -6,7 +6,7 @@ Read `AGENTS.md` first for coding conventions, crate structure, and design princ
 
 ### Measure First, Code Second
 
-Every PR that touches `crates/inference/` or `crates/embed/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like.
+Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like. One honesty note on `crates/fann/`: the default bench build does not enable the optional `mixture` feature, so a fann-only diff is usually compiled out of the bench binaries and its disposition will correctly be the structural waiver below — the gate still requires stating that explicitly. A fann change whose effects reach the default bench binaries (or any future mixture-enabled bench target) runs the A/B like everyone else.
 
 ```bash
 make bench-compare                         # origin/main vs HEAD (~2 min, default)
@@ -28,7 +28,7 @@ What the locks and the probe cannot see is disk activity, so the rest of this se
 
 Before re-running a corrupted A/B, check structural reachability first: is the changed code even compiled into the bench binaries? A diff confined to a `cfg`-gated module (e.g. `#[cfg(all(target_os = "macos", feature = "metal-gpu"))]`) is compiled out of a default-feature bench build entirely — base and head binaries are then built from identical effective source, and no rerun can attribute any delta to the diff.
 
-To be precise about how this interacts with the "no exceptions" rule above: the bench-compare disposition section of the PR is still mandatory for every `crates/inference/` or `crates/embed/` PR. The compiled-out proof is the one narrow case where that section may contain the structural argument (name the `cfg` gate, name the bench build's feature set, state that base and head bench binaries have identical effective source) instead of an A/B table. If any changed line is compiled into the bench binaries — even an additive field or a cold-path function — the proof does not apply and you run the A/B, in a quiet window, like always.
+To be precise about how this interacts with the "no exceptions" rule above: the bench-compare disposition section of the PR is still mandatory for every `crates/inference/`, `crates/embed/`, or `crates/fann/` PR. The compiled-out proof is the one narrow case where that section may contain the structural argument (name the `cfg` gate, name the bench build's feature set, state that base and head bench binaries have identical effective source) instead of an A/B table. If any changed line is compiled into the bench binaries — even an additive field or a cold-path function — the proof does not apply and you run the A/B, in a quiet window, like always.
 
 ### Bench by Group, Not All at Once
 

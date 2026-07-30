@@ -133,7 +133,7 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^crates/inference/tests/fixtures/e2e_parity_reference_v1/|^tests/test_e2e_parity_reference\.py$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
@@ -274,8 +274,9 @@ jobs:
       # produced the current passing parity baseline (extracted from a green
       # `e2e parity` run). An unpinned `pip install` lets a new transformers
       # release silently change greedy-generation behavior and flip the parity
-      # verdict on borderline prompts (issue #236). To bump: change a pin, let
-      # this gate re-run, and re-baseline the committed goldens if it moves.
+      # verdict on borderline prompts (issue #236). Dependency and model bumps
+      # follow docs/e2e-parity-frozen-reference.md, including reviewed fixture
+      # regeneration and matching workflow-pin updates.
       - name: Install Python deps
         run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
 
@@ -501,6 +502,58 @@ jobs:
         run: |
           cargo test --release -p lattice-embed --test embed_drift_baseline \
             -- --nocapture
+
+  # x86_64 counterpart to embed-drift. This starts as an observation job rather
+  # than a required parity-gate dependency: the frozen threshold has live
+  # evidence on aarch64, but no measured x86_64 distribution yet. Keeping this
+  # job outside parity-gate and allowing it to fail makes that policy explicit:
+  # missing prerequisites and numerical regressions remain visible without
+  # turning an observation into a required gate.
+  embed-drift-x86:
+    name: embed drift gate (x86_64 observation)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assert x86_64 runner
+        run: test "$(uname -m)" = 'x86_64'
+
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: embed-drift-x86
+
+      - name: Cache BGE-small weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/bge-small-en-v1.5
+          key: bge-small-en-v1.5-v1
+
+      - name: Provision bge-small-en-v1.5 weights
+        run: |
+          cargo run --release -p lattice-embed --bin embed \
+            -- --model bge-small-en-v1.5 --download-only
+
+      - name: Run x86_64 embedding-drift observation (fail-closed)
+        env:
+          LATTICE_DRIFT_GATE_ENFORCE: '1'
+        run: |
+          if cargo test --release -p lattice-embed --test embed_drift_baseline \
+            -- --nocapture > embed-drift-x86.log 2>&1
+          then
+            cat embed-drift-x86.log
+          else
+            status=$?
+            cat embed-drift-x86.log
+            exit "$status"
+          fi
+          grep -Fq 'Loaded drift baseline:' embed-drift-x86.log
+          grep -Fq '[bge-small drift gate] max(1-cosine)=' embed-drift-x86.log
 
   # wasm embedding parity gate (PR #681). Proves the wasm32-compiled
   # `LatticeEmbedder` binding (crates/embed/src/wasm.rs) produces output that
