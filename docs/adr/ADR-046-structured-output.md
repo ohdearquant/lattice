@@ -68,6 +68,7 @@ immediately before `sampler.sample(logits)` on every step. The `mask_logits` cal
 ## Scope
 
 **v0 (this ADR)**:
+
 - `GrammarSpec`: `JsonSchema(serde_json::Value)` and `Gbnf(String)` variants
 - `GrammarEngine`: vocabulary analysis, bitmask precomputation, per-step state machine
 - `GrammarState`: runtime PDA stack + current grammar position, cloned per decode sequence
@@ -77,6 +78,7 @@ immediately before `sampler.sample(logits)` on every step. The `mask_logits` cal
   `integer`, `boolean`, `null`, `anyOf`/`oneOf`, nested `$ref` resolved within the same document
 
 **Deferred**:
+
 - External `$ref` resolution (URI references) — requires HTTP client, out of scope for inference
 - Regex pattern constraints on `string` fields (`"pattern": "..."`)
 - Streaming grammar state export for speculative decoding integration
@@ -166,6 +168,7 @@ vocabulary iterator will be accessed once; no ongoing coupling.
 ### Bitmask Precomputation Algorithm
 
 For each grammar state `s` and each token `t`:
+
 1. Obtain the token's byte string from `vocab_bytes[t]`.
 2. Simulate advancing the grammar PDA from state `s` by consuming the bytes of `t`.
 3. If the simulation succeeds (reaches a valid intermediate or terminal state), set bit `t` in
@@ -197,8 +200,8 @@ for word_idx in 0..self.mask_stride {
 ```
 
 On a vocab of 248,320 tokens (Qwen3), `mask_stride = ceil(248320/64) = 3880` u64 words.
-The outer loop is 3880 iterations; the inner bit-scan can be SIMD-vectorized (e.g., `_mm256_movemask_epi8`
-+ batch store) but the scalar version is already well under 40 µs.
+The outer loop is 3880 iterations; the inner bit-scan can be SIMD-vectorized (e.g., with
+`_mm256_movemask_epi8` and a batch store), but the scalar version is already well under 40 µs.
 
 ## Alternatives Considered
 

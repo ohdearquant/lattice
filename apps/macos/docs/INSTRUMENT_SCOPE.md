@@ -26,36 +26,36 @@ processes, parses their output, and renders live readouts.
 
 ### 2.1 Swift Source Files (28 files in 7 directories)
 
-| Dir | File | Role | State |
-|-----|------|------|-------|
-| App/ | LatticeStudioApp.swift | @main entry, @NSApplicationDelegateAdaptor, @State AppStore | EXISTS |
-| Bridge/ | LatticeBridge.swift | Process spawn, binary resolution, model/adapter discovery | EXISTS |
-| Bridge/ | LatticeEvents.swift | `@@lattice` protocol decoder, HumanLineParser, QuantAccumulator | EXISTS |
-| Bridge/ | Drivers.swift | TrainConfig, QuantConfig, GenConfig typed arg-builders; AppStore launch extensions | EXISTS |
-| Store/ | AppStore.swift | @Observable @MainActor singleton, run lifecycle, event routing, run archive | EXISTS |
-| Store/ | DomainModels.swift | Screen, ModelInfo, AdapterInfo, RunKind, LiveRun, TrainPoint, RunRecord | EXISTS |
-| Shell/ | ContentView.swift | NavigationSplitView two-pane shell, CommandBar overlay, global ⌘1-6 shortcuts | EXISTS |
-| Shell/ | LeftRail.swift | Wordmark, live RUN block (step+loss), nav rows, system memory bar | EXISTS |
-| Screens/ | TrainScreen.swift | LoRA fine-tune config + live oscilloscope + control strip | EXISTS |
-| Screens/ | QuantizeScreen.swift | Q4 / QuaRot config + layer progress + mass comparison | EXISTS |
-| Screens/ | ModelsScreen.swift | Model DataTable + inspector + action row (Train/Quantize/Chat→) | EXISTS |
-| Screens/ | ChatScreen.swift | Model/backend config + multi-turn transcript; persistent GPU chat, one-shot CPU chat | PARTIAL |
-| Screens/ | DataScreen.swift | Source dir scan, .jsonl inspector, builder-script copy buttons | EXISTS |
-| Screens/ | RunsScreen.swift | Run archive DataTable + live banner + inspector | EXISTS |
-| Screens/ | ScreenScaffold.swift | Shared header chrome (index / title / subtitle / trailing slot) | EXISTS |
-| Components/ | CommandBar.swift | ⌘K floating palette, fuzzy prefix match, 7 default commands | EXISTS |
-| Components/ | StripChart.swift | Swift Charts oscilloscope: LineMark + AreaMark + scrub-to-freeze | EXISTS |
-| Components/ | HeroNumber.swift | 56pt tabular-mono hero with .contentTransition(.numericText()) | EXISTS |
-| Components/ | GatePill.swift | PASS/WARN/FAIL/RUN verdict pill, 6px radius, animated pulse on RUN | EXISTS |
-| Components/ | FaderToggle.swift | Unwired BASE↔+ADAPTER console fader; instantiated only by its SwiftUI preview | PARTIAL |
-| Components/ | ReadoutWell.swift | 15pt tabular-mono well: label + value + unit + delta caret | EXISTS |
-| Components/ | OpaquePanel.swift | Instrument panel surface (opaque, 1px hairline, 0px radius) + well surface | EXISTS |
-| Components/ | ParamRow.swift | Config param row variants used in TrainScreen/QuantizeScreen | EXISTS |
-| Components/ | DataTable.swift | Generic sortable DataTable used across Models/Data/Runs screens | EXISTS |
-| Components/ | ContrastPair.swift | Before/after contrast pair (fold-wipe on completion) used in QuantizeScreen | EXISTS |
-| Components/ | MassBars.swift | Dual mass bars (before/after MB) used in QuantizeScreen | EXISTS |
-| Components/ | KeyCapChip.swift | ⌘K keyboard shortcut keycap chip used in CommandBar | EXISTS |
-| Theme/ | Theme.swift | Adaptive palette, SF Mono fonts, motion constants — no asset catalog | EXISTS |
+| Dir         | File                   | Role                                                                                 | State   |
+| ----------- | ---------------------- | ------------------------------------------------------------------------------------ | ------- |
+| App/        | LatticeStudioApp.swift | @main entry, @NSApplicationDelegateAdaptor, @State AppStore                          | EXISTS  |
+| Bridge/     | LatticeBridge.swift    | Process spawn, binary resolution, model/adapter discovery                            | EXISTS  |
+| Bridge/     | LatticeEvents.swift    | `@@lattice` protocol decoder, HumanLineParser, QuantAccumulator                      | EXISTS  |
+| Bridge/     | Drivers.swift          | TrainConfig, QuantConfig, GenConfig typed arg-builders; AppStore launch extensions   | EXISTS  |
+| Store/      | AppStore.swift         | @Observable @MainActor singleton, run lifecycle, event routing, run archive          | EXISTS  |
+| Store/      | DomainModels.swift     | Screen, ModelInfo, AdapterInfo, RunKind, LiveRun, TrainPoint, RunRecord              | EXISTS  |
+| Shell/      | ContentView.swift      | NavigationSplitView two-pane shell, CommandBar overlay, global ⌘1-6 shortcuts        | EXISTS  |
+| Shell/      | LeftRail.swift         | Wordmark, live RUN block (step+loss), nav rows, system memory bar                    | EXISTS  |
+| Screens/    | TrainScreen.swift      | LoRA fine-tune config + live oscilloscope + control strip                            | EXISTS  |
+| Screens/    | QuantizeScreen.swift   | Q4 / QuaRot config + layer progress + mass comparison                                | EXISTS  |
+| Screens/    | ModelsScreen.swift     | Model DataTable + inspector + action row (Train/Quantize/Chat→)                      | EXISTS  |
+| Screens/    | ChatScreen.swift       | Model/backend config + multi-turn transcript; persistent GPU chat, one-shot CPU chat | PARTIAL |
+| Screens/    | DataScreen.swift       | Source dir scan, .jsonl inspector, builder-script copy buttons                       | EXISTS  |
+| Screens/    | RunsScreen.swift       | Run archive DataTable + live banner + inspector                                      | EXISTS  |
+| Screens/    | ScreenScaffold.swift   | Shared header chrome (index / title / subtitle / trailing slot)                      | EXISTS  |
+| Components/ | CommandBar.swift       | ⌘K floating palette, fuzzy prefix match, 7 default commands                          | EXISTS  |
+| Components/ | StripChart.swift       | Swift Charts oscilloscope: LineMark + AreaMark + scrub-to-freeze                     | EXISTS  |
+| Components/ | HeroNumber.swift       | 56pt tabular-mono hero with .contentTransition(.numericText())                       | EXISTS  |
+| Components/ | GatePill.swift         | PASS/WARN/FAIL/RUN verdict pill, 6px radius, animated pulse on RUN                   | EXISTS  |
+| Components/ | FaderToggle.swift      | Unwired BASE↔+ADAPTER console fader; instantiated only by its SwiftUI preview        | PARTIAL |
+| Components/ | ReadoutWell.swift      | 15pt tabular-mono well: label + value + unit + delta caret                           | EXISTS  |
+| Components/ | OpaquePanel.swift      | Instrument panel surface (opaque, 1px hairline, 0px radius) + well surface           | EXISTS  |
+| Components/ | ParamRow.swift         | Config param row variants used in TrainScreen/QuantizeScreen                         | EXISTS  |
+| Components/ | DataTable.swift        | Generic sortable DataTable used across Models/Data/Runs screens                      | EXISTS  |
+| Components/ | ContrastPair.swift     | Before/after contrast pair (fold-wipe on completion) used in QuantizeScreen          | EXISTS  |
+| Components/ | MassBars.swift         | Dual mass bars (before/after MB) used in QuantizeScreen                              | EXISTS  |
+| Components/ | KeyCapChip.swift       | ⌘K keyboard shortcut keycap chip used in CommandBar                                  | EXISTS  |
+| Theme/      | Theme.swift            | Adaptive palette, SF Mono fonts, motion constants — no asset catalog                 | EXISTS  |
 
 ### 2.2 State Model
 
@@ -134,18 +134,18 @@ Resolution order (LatticeBridge.swift `launchSpec`):
 
 Defined in `apps/macos/scripts/package-app.sh`:
 
-| Binary | Crate | Features | Used For |
-|--------|-------|----------|----------|
-| `quantize_q4` | lattice-inference | (none) | Q4 quantize |
-| `quantize_quarot` | lattice-inference | (none) | QuaRot quantize |
-| `lattice` | lattice-inference | (none) | main inference binary |
-| `qwen35_generate` | lattice-inference | (none) | Qwen3.5 generation |
-| `train_grad_full` | lattice-tune | `train-backward` | LoRA fine-tune |
-| `generate_lora` | lattice-tune | `safetensors,inference-hook` | LoRA chat generation |
-| `eval_perplexity` | lattice-inference | `f16,metal-gpu` | CPU BF16 and Metal Q4/QuaRot perplexity evaluation |
-| `embed` | lattice-embed | default | embedding CLI |
-| `chat_metal` | lattice-inference | `f16,metal-gpu` | persistent Metal chat session |
-| `lattice_serve` | lattice-inference | `f16,metal-gpu` | OpenAI-format HTTP daemon |
+| Binary            | Crate             | Features                     | Used For                                           |
+| ----------------- | ----------------- | ---------------------------- | -------------------------------------------------- |
+| `quantize_q4`     | lattice-inference | (none)                       | Q4 quantize                                        |
+| `quantize_quarot` | lattice-inference | (none)                       | QuaRot quantize                                    |
+| `lattice`         | lattice-inference | (none)                       | main inference binary                              |
+| `qwen35_generate` | lattice-inference | (none)                       | Qwen3.5 generation                                 |
+| `train_grad_full` | lattice-tune      | `train-backward`             | LoRA fine-tune                                     |
+| `generate_lora`   | lattice-tune      | `safetensors,inference-hook` | LoRA chat generation                               |
+| `eval_perplexity` | lattice-inference | `f16,metal-gpu`              | CPU BF16 and Metal Q4/QuaRot perplexity evaluation |
+| `embed`           | lattice-embed     | default                      | embedding CLI                                      |
+| `chat_metal`      | lattice-inference | `f16,metal-gpu`              | persistent Metal chat session                      |
+| `lattice_serve`   | lattice-inference | `f16,metal-gpu`              | OpenAI-format HTTP daemon                          |
 
 ### 3.4 Event Protocol
 
@@ -274,70 +274,70 @@ the UI leaves the seed unset. Direct `quantize_quarot` callers must choose and p
 
 ### Surface 1: LoRA Fine-Tune (TrainScreen.swift)
 
-| Feature | State | Notes |
-|---------|-------|-------|
-| 12 config params (ParamRow) | EXISTS | model-dir, data-dir, first-layer, steps, lr, rank, alpha, seq-len, max-train, max-valid, log-every, save-path |
-| NSOpenPanel directory choosers | EXISTS | model-dir + data-dir |
-| TrainConfig → subprocess | EXISTS | Drivers.swift `startTrain(_:)` |
-| `@@lattice` train_step events | EXISTS | real-time loss, lr, grad_norm, val_loss, tok_s |
-| StripChart oscilloscope | EXISTS | 20Hz, scrub-to-freeze, val_loss overlay |
-| ReadoutWells (6: STEP, TRAIN NLL, HELD-OUT, Δ FROM BASE, TOK/S, BEST VAL) | EXISTS | |
-| HeroNumber (56pt best val) | EXISTS | .numericText() per-digit tick |
-| PAUSE / RESUME / STOP | EXISTS | SIGSTOP/SIGCONT via RunHandle |
-| Adapter path display on done | EXISTS | `@@lattice train_done.saved` field |
-| `--json` mode actually wired | EXISTS | `--json` in TrainConfig.args; binary supports it |
-| Grad-norm scheduling display | PARTIAL | TrainPoint has gradNorm field; no dedicated well yet |
-| ETA display | PARTIAL | eta_s in TrainStep struct (Drivers.swift); no ReadoutWell shows it |
-| Per-step LR schedule chart | PROPOSED | lr field present in TrainPoint; not charted separately |
-| Multi-run overlay | PROPOSED | RunRecord has no point series; chart can only show the live run |
+| Feature                                                                   | State    | Notes                                                                                                         |
+| ------------------------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------- |
+| 12 config params (ParamRow)                                               | EXISTS   | model-dir, data-dir, first-layer, steps, lr, rank, alpha, seq-len, max-train, max-valid, log-every, save-path |
+| NSOpenPanel directory choosers                                            | EXISTS   | model-dir + data-dir                                                                                          |
+| TrainConfig → subprocess                                                  | EXISTS   | Drivers.swift `startTrain(_:)`                                                                                |
+| `@@lattice` train_step events                                             | EXISTS   | real-time loss, lr, grad_norm, val_loss, tok_s                                                                |
+| StripChart oscilloscope                                                   | EXISTS   | 20Hz, scrub-to-freeze, val_loss overlay                                                                       |
+| ReadoutWells (6: STEP, TRAIN NLL, HELD-OUT, Δ FROM BASE, TOK/S, BEST VAL) | EXISTS   |                                                                                                               |
+| HeroNumber (56pt best val)                                                | EXISTS   | .numericText() per-digit tick                                                                                 |
+| PAUSE / RESUME / STOP                                                     | EXISTS   | SIGSTOP/SIGCONT via RunHandle                                                                                 |
+| Adapter path display on done                                              | EXISTS   | `@@lattice train_done.saved` field                                                                            |
+| `--json` mode actually wired                                              | EXISTS   | `--json` in TrainConfig.args; binary supports it                                                              |
+| Grad-norm scheduling display                                              | PARTIAL  | TrainPoint has gradNorm field; no dedicated well yet                                                          |
+| ETA display                                                               | PARTIAL  | eta_s in TrainStep struct (Drivers.swift); no ReadoutWell shows it                                            |
+| Per-step LR schedule chart                                                | PROPOSED | lr field present in TrainPoint; not charted separately                                                        |
+| Multi-run overlay                                                         | PROPOSED | RunRecord has no point series; chart can only show the live run                                               |
 
 ### Surface 2: Model Management (ModelsScreen.swift)
 
-| Feature | State | Notes |
-|---------|-------|-------|
-| Model discovery (config.json) | EXISTS | LatticeBridge.discoverModels() |
-| Layer summary (GDN/GQA counts) | EXISTS | parses `layer_types` array from config.json |
-| Adapter discovery | EXISTS | LatticeBridge.discoverAdapters() |
-| DataTable (8 columns) | EXISTS | NAME, FORMAT, PARAMS, LAYERS, SIZE, FILES, TOK, #ADAPTERS |
-| Inspector panel | EXISTS | model wells + adapter list + Reveal buttons |
-| Train→ / Quantize→ / Chat→ nav | EXISTS | AppStore.use(_:on:) |
-| Finder reveal (NSWorkspace) | EXISTS | |
-| Adapter rank/alpha metadata | MISSING | AdapterInfo.rank/alpha/targetModules always nil; discoverAdapters() does not parse adapter config |
-| Model delete | PROPOSED | no delete action in ModelsScreen |
-| Model download | PROPOSED | out of scope for v1; no CLI surface exists |
+| Feature                        | State    | Notes                                                                                             |
+| ------------------------------ | -------- | ------------------------------------------------------------------------------------------------- |
+| Model discovery (config.json)  | EXISTS   | LatticeBridge.discoverModels()                                                                    |
+| Layer summary (GDN/GQA counts) | EXISTS   | parses `layer_types` array from config.json                                                       |
+| Adapter discovery              | EXISTS   | LatticeBridge.discoverAdapters()                                                                  |
+| DataTable (8 columns)          | EXISTS   | NAME, FORMAT, PARAMS, LAYERS, SIZE, FILES, TOK, #ADAPTERS                                         |
+| Inspector panel                | EXISTS   | model wells + adapter list + Reveal buttons                                                       |
+| Train→ / Quantize→ / Chat→ nav | EXISTS   | AppStore.use(_:on:)                                                                               |
+| Finder reveal (NSWorkspace)    | EXISTS   |                                                                                                   |
+| Adapter rank/alpha metadata    | MISSING  | AdapterInfo.rank/alpha/targetModules always nil; discoverAdapters() does not parse adapter config |
+| Model delete                   | PROPOSED | no delete action in ModelsScreen                                                                  |
+| Model download                 | PROPOSED | out of scope for v1; no CLI surface exists                                                        |
 
 ### Surface 3: Training Data Curation (DataScreen.swift)
 
-| Feature | State | Notes |
-|---------|-------|-------|
-| Source dir field + Scan | EXISTS | immediate + 1 level deep |
-| .jsonl file enumeration | EXISTS | |
-| Summary strip (FILES, ≈TOKENS, AVG LEN, TRAIN, VALID) | EXISTS | |
-| HeroNumber (total examples) | EXISTS | |
-| Files DataTable | EXISTS | |
-| 5-example preview panel | EXISTS | parses prompt/completion or raw line |
-| Builder script copy buttons | EXISTS | `uv run scripts/build_claude_lora_dataset.py` + `uv run scripts/budget_lora_dataset.py` |
-| Token count accuracy | PARTIAL | approximate chars/4; NOT lattice tokenizer |
-| Train/valid split detection | PARTIAL | detected by filename (train.jsonl vs valid.jsonl); no visual split editor |
-| In-app example editing | PROPOSED | read-only; editing out of scope for v1 |
-| Builder script execution | PROPOSED | explicitly not runnable from UI (DataScreen.swift comment) |
-| Lattice tokenizer integration | PROPOSED | would need FFI or subprocess to get exact counts |
+| Feature                                               | State    | Notes                                                                                   |
+| ----------------------------------------------------- | -------- | --------------------------------------------------------------------------------------- |
+| Source dir field + Scan                               | EXISTS   | immediate + 1 level deep                                                                |
+| .jsonl file enumeration                               | EXISTS   |                                                                                         |
+| Summary strip (FILES, ≈TOKENS, AVG LEN, TRAIN, VALID) | EXISTS   |                                                                                         |
+| HeroNumber (total examples)                           | EXISTS   |                                                                                         |
+| Files DataTable                                       | EXISTS   |                                                                                         |
+| 5-example preview panel                               | EXISTS   | parses prompt/completion or raw line                                                    |
+| Builder script copy buttons                           | EXISTS   | `uv run scripts/build_claude_lora_dataset.py` + `uv run scripts/budget_lora_dataset.py` |
+| Token count accuracy                                  | PARTIAL  | approximate chars/4; NOT lattice tokenizer                                              |
+| Train/valid split detection                           | PARTIAL  | detected by filename (train.jsonl vs valid.jsonl); no visual split editor               |
+| In-app example editing                                | PROPOSED | read-only; editing out of scope for v1                                                  |
+| Builder script execution                              | PROPOSED | explicitly not runnable from UI (DataScreen.swift comment)                              |
+| Lattice tokenizer integration                         | PROPOSED | would need FFI or subprocess to get exact counts                                        |
 
 ### Surface 4: Sample-Testing Chat (ChatScreen.swift)
 
-| Feature | State | Notes |
-|---------|-------|-------|
-| Config strip (model + CPU/GPU picker) | EXISTS | |
-| Adapter picker / FaderToggle | MISSING | `FaderToggle` is preview-only; live `GenConfig.adapterPath` is nil |
-| Sampling params (temperature, max-tokens, seed) | EXISTS | |
-| Single-variant multi-turn transcript | EXISTS | `renderChatML` replays completed `ChatTurn` pairs into each prompt |
-| GPU `chat_metal --json --serve` session | EXISTS | one persistent process keeps the selected model resident |
-| CPU `generate_lora --json` subprocess | EXISTS | one fresh process per turn via `AppStore.runGenerate()` |
-| Streaming gen_token events | EXISTS | onChange on store.liveRun?.genText accumulates deltas |
-| Non-streaming fallback | EXISTS | filters log lines for non-"$ " prefix |
-| True A/B lockstep streaming | MISSING | each send dispatches one backend run; no production adapter control is wired |
-| Conversation history (multi-turn) | EXISTS | completed turns are prompt-replayed; there is no cross-turn KV prefix cache |
-| Adapter hot-swap mid-conversation | MISSING | DESIGN.md arc_swap/LiveModel references are aspirational; no engine API exists |
+| Feature                                         | State   | Notes                                                                          |
+| ----------------------------------------------- | ------- | ------------------------------------------------------------------------------ |
+| Config strip (model + CPU/GPU picker)           | EXISTS  |                                                                                |
+| Adapter picker / FaderToggle                    | MISSING | `FaderToggle` is preview-only; live `GenConfig.adapterPath` is nil             |
+| Sampling params (temperature, max-tokens, seed) | EXISTS  |                                                                                |
+| Single-variant multi-turn transcript            | EXISTS  | `renderChatML` replays completed `ChatTurn` pairs into each prompt             |
+| GPU `chat_metal --json --serve` session         | EXISTS  | one persistent process keeps the selected model resident                       |
+| CPU `generate_lora --json` subprocess           | EXISTS  | one fresh process per turn via `AppStore.runGenerate()`                        |
+| Streaming gen_token events                      | EXISTS  | onChange on store.liveRun?.genText accumulates deltas                          |
+| Non-streaming fallback                          | EXISTS  | filters log lines for non-"$ " prefix                                          |
+| True A/B lockstep streaming                     | MISSING | each send dispatches one backend run; no production adapter control is wired   |
+| Conversation history (multi-turn)               | EXISTS  | completed turns are prompt-replayed; there is no cross-turn KV prefix cache    |
+| Adapter hot-swap mid-conversation               | MISSING | DESIGN.md arc_swap/LiveModel references are aspirational; no engine API exists |
 
 ---
 
@@ -438,6 +438,6 @@ Files: `AppStore.swift`, `ChatScreen.swift`, `FaderToggle.swift`, `DomainModels.
 
 ---
 
-*Document generated from source reads. All file paths are absolute within the lattice repo at
+_Document generated from source reads. All file paths are absolute within the lattice repo at
 `/Users/lion/projects/khive/lattice/`. No build was run. All claims cite specific file and
-line numbers verified in the research phase.*
+line numbers verified in the research phase._

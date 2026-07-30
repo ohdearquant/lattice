@@ -31,23 +31,23 @@ The feature is opt-in and adds no code to a default build: every call site is a 
 
 The `signpost` feature's `os_log` category is chosen at runtime from the `LATTICE_SIGNPOST_MODE` environment variable, read once at first use:
 
-| `LATTICE_SIGNPOST_MODE` | Category | `os_signpost_enabled` default | Use with |
-|---|---|---|---|
+| `LATTICE_SIGNPOST_MODE`   | Category         | `os_signpost_enabled` default                                         | Use with              |
+| ------------------------- | ---------------- | --------------------------------------------------------------------- | --------------------- |
 | unset or `auto` (default) | `DynamicTracing` | `false` until an Instruments-style tool session attaches (idle-inert) | Instruments.app (GUI) |
-| `always` | `decode` | `true` unconditionally, whether or not any tool is attached | `xcrun xctrace` (CLI) |
+| `always`                  | `decode`         | `true` unconditionally, whether or not any tool is attached           | `xcrun xctrace` (CLI) |
 
 Both paths exist because the two tools drive `os_signpost_enabled` differently on macOS. `DynamicTracing` (`OS_LOG_CATEGORY_DYNAMIC_TRACING` in `<os/signpost.h>`) is disabled by default and only becomes enabled while a performance tool like Instruments.app is actively recording — that's what keeps the feature idle-inert (no signpost overhead) in a `--features signpost` build with nothing attached. Instruments.app's GUI recording session satisfies that contract. The `xcrun xctrace` CLI's `os_signpost` instrument, however, was observed on this project's macOS 26 development machine to **not** enable `DynamicTracing`-category signposts under `xctrace record --template 'Metal System Trace' --instrument os_signpost`: a direct `os_signpost_enabled` probe reported `DynamicTracing=0` while an ordinary category reported `decode=1` in the same process, under the same invocation. So the CLI path needs the ordinary `decode` category (`LATTICE_SIGNPOST_MODE=always`) to observe anything at all — trading idle-inertness for CLI-capture compatibility, which is fine for the duration of a deliberate trace-capture run.
 
 ## Label glossary
 
-| Label | Scope | Meaning |
-|---|---|---|
-| `decode.step` | one call to the per-token forward pass | Wall-clock span of a single decode step: embedding lookup through logits/top-k readback. |
-| `decode.cb_commit` | one `MTLCommandBuffer::commit()` call | Time to submit the step's command buffer to the GPU queue. |
-| `decode.cb_wait` | one `waitUntilCompleted()` call | Interior wait for the GPU to finish the step's command buffer — the launch+sync cost the W1 speculation-lane promotion rule measures against. |
-| `decode.host_scalar_read` | one host-side buffer read | CPU read of a `StorageModeShared` GPU buffer after the step's wait (logits, top-k candidates, or the pre-final hidden state used by MTP). |
-| `decode.grammar_mask` | one grammar-engine logit mask | CPU-side grammar constraint applied to a step's logits before sampling. |
-| `decode.sample` | one token-sampling call | CPU-side sampling (greedy, top-k/top-p, or compact-candidate) that picks the step's next token. |
+| Label                     | Scope                                  | Meaning                                                                                                                                       |
+| ------------------------- | -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `decode.step`             | one call to the per-token forward pass | Wall-clock span of a single decode step: embedding lookup through logits/top-k readback.                                                      |
+| `decode.cb_commit`        | one `MTLCommandBuffer::commit()` call  | Time to submit the step's command buffer to the GPU queue.                                                                                    |
+| `decode.cb_wait`          | one `waitUntilCompleted()` call        | Interior wait for the GPU to finish the step's command buffer — the launch+sync cost the W1 speculation-lane promotion rule measures against. |
+| `decode.host_scalar_read` | one host-side buffer read              | CPU read of a `StorageModeShared` GPU buffer after the step's wait (logits, top-k candidates, or the pre-final hidden state used by MTP).     |
+| `decode.grammar_mask`     | one grammar-engine logit mask          | CPU-side grammar constraint applied to a step's logits before sampling.                                                                       |
+| `decode.sample`           | one token-sampling call                | CPU-side sampling (greedy, top-k/top-p, or compact-candidate) that picks the step's next token.                                               |
 
 ## Scope
 

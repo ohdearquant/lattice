@@ -179,6 +179,12 @@ impl GrammarState {
     }
 }
 
+pub(crate) fn initial_grammar_state(grammar: &CompiledGrammar) -> GrammarState {
+    let mut state = GrammarState::initial();
+    state.complete = is_accepting(&state, grammar);
+    state
+}
+
 // ---------------------------------------------------------------------------
 // PDA execution engine
 // ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ and normalization reuse the cached configuration when they choose a kernel.
 | Float dot, cosine, squared L2, normalize | AVX-512F, then AVX2 + FMA                                       | NEON                        | SIMD128 when compiled in | scalar   |
 | Batch-four float dot                     | AVX2 + FMA                                                      | NEON                        | none                     | scalar   |
 | INT8 dot                                 | AVX-512 VNNI + BW when the `avx512` feature is built, then AVX2 | NEON only with FEAT_DotProd | none                     | scalar   |
+| INT8, INT4, and binary quantization      | AVX2                                                            | NEON                        | none                     | scalar   |
 | Binary Hamming                           | none                                                            | NEON `vcnt`                 | none                     | scalar   |
 | INT4 dot                                 | none                                                            | NEON                        | none                     | scalar   |
 
@@ -229,6 +230,11 @@ Mapping `[-max_abs, max_abs]` to `[-127, 127]` gives a step size of
 be acceptable for the tier selected by the caller; use `Full` or `Int8` instead
 of lower-precision tiers when recall needs more fidelity.
 
+The finite min/max scan and integer conversion use explicit AVX2 or NEON
+kernels, with a scalar fallback. Conversion keeps round-half-away-from-zero
+semantics and finishes lengths shorter than a full vector in the scalar tail.
+The source L2 norm remains a scalar-ordered reduction.
+
 ### Dot product and dispatch
 
 The raw integer reduction is dequantized by dividing by the product of the two
@@ -276,6 +282,10 @@ bytes. For an odd-dimensional vector, only the final byte's high nibble is a
 real dimension; the low nibble is padding and is ignored by dequantization and
 dot-product accumulation. Non-finite source values are treated as zero, and
 the L2 norm records the finite source values.
+
+Finite max-absolute reduction and nibble conversion use explicit AVX2 or NEON
+kernels. Both leave incomplete chunks to the scalar implementation, including
+an odd final high nibble. The source L2 norm remains scalar-ordered.
 
 The 16 quantization levels have step size `2 * max_abs / 15`, so the maximum
 per-element round-trip error is `max_abs / 15`. This is a storage-oriented
@@ -325,6 +335,10 @@ dimension one is bit 6, and so on. The storage size is
 `ceil(dimensions / 8)` bytes. Dequantization maps one to `+1.0` and zero to
 `-1.0`; it is intentionally lossy and returns an empty vector if public fields
 describe a buffer shorter than the required packed length.
+
+Threshold conversion uses explicit AVX2 or NEON kernels for full eight-value
+groups and a scalar tail for the final partial byte. The kernels preserve the
+same finite-value substitution and most-significant-bit-first layout.
 
 Hamming distance is the population count of the XOR of two packed buffers. The
 scalar implementation counts full 64-bit groups and remaining bytes; the NEON

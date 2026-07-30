@@ -10,6 +10,7 @@ cd lattice/
 ```
 
 This will:
+
 1. Run `swift build -c release` to produce the Swift instrument panel.
 2. Build all 10 Rust engine binaries with `cargo build --release`: `quantize_q4`,
    `quantize_quarot`, `lattice`, `qwen35_generate`, `train_grad_full`, `generate_lora`,
@@ -46,11 +47,13 @@ The app is ad-hoc signed, which means macOS Gatekeeper will quarantine it on
 first launch because it lacks a Developer ID certificate. Recipients must:
 
 **Option 1 — right-click → Open:**
+
 1. Right-click (or Ctrl-click) `Lattice.app` in Finder.
 2. Choose "Open" from the context menu.
 3. Click "Open" in the dialog. macOS remembers the exception.
 
 **Option 2 — remove the quarantine xattr:**
+
 ```bash
 xattr -dr com.apple.quarantine /Applications/Lattice.app
 ```
@@ -90,6 +93,7 @@ right-click-Open workaround. Distribution via direct download or any store
 works without restrictions.
 
 An entitlements file (`LatticeStudio.entitlements`) must grant at minimum:
+
 ```xml
 <key>com.apple.security.cs.allow-jit</key><false/>
 <key>com.apple.security.cs.allow-unsigned-executable-memory</key><false/>
@@ -109,6 +113,7 @@ it up automatically, or re-runs the generator if the file is missing.
 ## Binary resolution order (inside the .app)
 
 The Swift bridge resolves engine binaries in this order:
+
 1. `Contents/Resources/bin/<name>` — bundled binary (used from /Applications).
 2. `LATTICE_BIN_DIR` env var — dev override.
 3. `<repo root>/target/release/<name>` — running from source checkout.
