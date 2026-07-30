@@ -71,15 +71,15 @@ fn bench_context_rechecks(c: &mut Criterion) {
     let mut group = c.benchmark_group("grammar_mask");
     group.throughput(Throughput::Elements(vocab_size as u64));
     group.bench_function("state_sparse_context_rechecks", |b| {
-        b.iter_batched(
+        b.iter_batched_ref(
             || (state.clone(), vec![0.0; vocab_size]),
-            |(mut state, mut logits)| {
+            |(state, logits)| {
                 engine
-                    .mask_logits(black_box(&mut state), black_box(&mut logits))
+                    .mask_logits(black_box(state), black_box(logits.as_mut_slice()))
                     .expect("fixture logits match the vocabulary");
-                black_box(logits);
+                black_box(logits.as_slice());
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
     group.finish();
