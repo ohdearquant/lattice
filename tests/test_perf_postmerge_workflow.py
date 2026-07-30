@@ -9,6 +9,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[1]
 _WORKFLOW = _ROOT / ".github" / "workflows" / "perf-postmerge-gate.yml"
+_BENCH_IMPL = _ROOT / "scripts" / "lib" / "bench-compare-impl.sh"
 _BENCH_BINARY_INPUTS = {
     "crates/inference/src/forward/cpu/**",
     "crates/inference/src/attention/**",
@@ -49,6 +50,29 @@ def _push_paths() -> set[str]:
 class PerfPostmergeWorkflowTests(unittest.TestCase):
     def test_push_filter_contains_only_bench_binary_inputs(self) -> None:
         self.assertEqual(_push_paths(), _BENCH_BINARY_INPUTS)
+
+    def test_automated_lane_wires_ambient_status_contract(self) -> None:
+        workflow = _WORKFLOW.read_text()
+        bench_impl = _BENCH_IMPL.read_text()
+        self.assertIn(
+            "PERF_POSTMERGE_STATUS_DIR: ${{ runner.temp }}/perf-postmerge-status",
+            workflow,
+        )
+        self.assertIn("perf-postmerge-status-${{ matrix.arch }}", workflow)
+        self.assertIn('if [ "$AB_RC" = "3" ]; then', workflow)
+        self.assertIn("::warning title=Performance run not measurable::", workflow)
+        self.assertIn('--ambient-samples "$AMBIENT_SAMPLES_FILE"', bench_impl)
+        self.assertIn("--status-out", bench_impl)
+        self.assertIn('if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]', bench_impl)
+
+    def test_not_measurable_does_not_advance_progression_base(self) -> None:
+        workflow = _WORKFLOW.read_text()
+        record_step = workflow.split(
+            "- name: Record the successfully measured head", 1
+        )[1].split("- name: Classify the gate outcome", 1)[0]
+        self.assertIn("steps.ab.outputs.rc == '0'", record_step)
+        self.assertNotIn("success()", record_step)
+        self.assertIn("git push origin", record_step)
 
 
 if __name__ == "__main__":
