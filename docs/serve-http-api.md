@@ -182,6 +182,7 @@ pub struct ChatCompletionRequest {
     pub max_completion_tokens: Option<usize>,        // alias; must agree with max_tokens if both set
     pub temperature: Option<f32>,                    // default 0.7, range [0.0, 2.0]
     pub top_p: Option<f32>,                          // default 0.9, range (0.0, 1.0]
+    pub reasoning_budget: Option<usize>,             // positive static budget; 0 is absent
     pub stream: Option<bool>,
     pub stop: Option<Value>,                         // string, or array of 1-4 non-empty strings
     pub seed: Option<u64>,
@@ -201,8 +202,8 @@ that position in the rendered multimodal prompt. The decoded payload is capped a
 and each serving image is capped at 256 pre-merge patches and 16 MiB of preprocessed patch data.
 Image requests must use `stream: false` (or omit `stream`) until the multimodal decoder supports
 incremental deltas. Remote URLs are never fetched, multi-image requests are rejected, and a
-text-only/CPU model returns 400 `vision_unsupported`. Audio/file parts remain unsupported rather
-than being silently dropped.
+text-only/CPU model returns 400 `vision_unsupported`. Image requests also reject
+`reasoning_budget`; audio/file parts remain unsupported rather than being silently dropped.
 
 `messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and `"developer"` are
 explicitly named and rejected (`"role 'tool' is not supported by this server"`); anything else
@@ -220,16 +221,20 @@ Requests are validated in a fixed sequence; the first failure wins. Useful to kn
 predict which error you'll get when more than one thing is wrong with a request:
 
 1. JSON body parses and is under the 1 MiB limit.
-2. `reject_unsupported`: `tools`/`tool_choice` present, `logprobs: true`, `n > 1`,
-   `response_format.type != "text"`.
+2. `reject_unsupported`: `tools`/`tool_choice` present, `stream: true` together with
+   `logprobs: true`, `n > 1`, or `response_format.type != "text"`.
 3. `model` matches the server's loaded model ID.
 4. `messages` is non-empty.
 5. The **last** message has role `"user"` (a Qwen ChatML constraint — the conversation must end on
    a user turn for the model to have something to respond to).
-6. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` are all in range.
+6. `max_tokens`/`max_completion_tokens`, `temperature`, and `top_p` are all in range.
 7. Every message renders into ChatML (role + content-part checks).
-8. The rendered prompt's token count plus `max_tokens` fits the model's context window.
-9. `stop` parses into valid stop strings.
+8. Image-specific combinations (`logprobs`, streaming, or JSON schema with an image) are rejected.
+9. `reasoning_budget` is a valid integer (positive values are applied; zero is treated as absent);
+   image requests reject an active reasoning budget.
+10. The complete saturating budget fits the model's context window:
+    `prompt_tokens + max_tokens + reasoning_budget + 1 <= max_context`.
+11. `stop` parses into valid stop strings.
 
 ### Rejected requests — exact error shapes
 
@@ -366,11 +371,12 @@ literal in `main()`'s `Command::Serve` handling. A request asking for more is re
 Separately, for the Metal/Q4 backend specifically, the usable context window is capped at
 `MetalChatBackend::MAX_CACHE_LEN` (4096 tokens) regardless of the loaded model's actual
 `max_position_embeddings` (Qwen3.5-0.8B's config reports 262144) — `lattice doctor` will show you
-this cap directly (see [`docs/q4-quantization.md`](q4-quantization.md)). If your rendered prompt's
-token count plus `max_tokens` exceeds the effective context window, you get:
+this cap directly (see [`docs/q4-quantization.md`](q4-quantization.md)). The server reserves the
+rendered prompt, answer budget, optional reasoning budget, and one delimiter slot. If that complete
+saturating sum exceeds the effective context window, you get:
 
 ```
-{"error":{"message":"prompt (X tokens) plus max_tokens (Y) exceeds model context window (Z)","type":"invalid_request_error","code":"context_length_exceeded","param":null}}
+{"error":{"message":"prompt (X tokens) plus max_tokens (Y) plus reasoning_budget (R) plus one delimiter token exceeds model context window (Z)","type":"invalid_request_error","code":"context_length_exceeded","param":null}}
 ```
 
 The CPU (safetensors) backend doesn't have this particular cap — its `max_context()` comes from

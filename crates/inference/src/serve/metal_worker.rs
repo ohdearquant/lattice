@@ -56,6 +56,7 @@ use crate::model::qwen35_config::{
     GenerateConfig, GenerateOutput, Qwen35Config, VisionModelConfig,
 };
 use crate::serve::ApiError;
+use crate::serve::contract::full_context_tokens_required;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::vision::checkpoint::{
@@ -95,14 +96,16 @@ enum WorkerShutdown {
     Panicked,
 }
 
-/// Selects the context-window formula enforced before Metal generation.
-/// Each serve adapter supplies the policy matching its pre-worker contract.
+/// Records which serve adapter selected the shared context-window preflight.
+///
+/// Both variants enforce the same full-window arithmetic. The variants
+/// remain distinct for metadata compatibility and the unified adapter's
+/// historical empty-prompt guard.
 #[derive(Debug, Clone, Copy)]
 pub enum ContextWindowPolicy {
-    /// Enforce `prompt_tokens + max_new_tokens <= model_max_context`.
+    /// Unified `lattice serve` adapter provenance.
     PromptAndMaxTokens,
-    /// Enforce `prompt_tokens + max_new_tokens + reasoning_budget + 1
-    /// <= model_max_context`.
+    /// Standalone `lattice_serve` adapter provenance.
     PromptAndDecodeWithDelimiter,
 }
 
@@ -468,16 +471,11 @@ impl MetalWorkerClient {
     }
 }
 
-/// Adapter-selected KV-window invariant for Metal jobs (#656).
-/// `lattice_serve` only knows the rendered prompt length on this worker, so
-/// its full-window check runs here. `lattice` already checks the rendered
-/// prompt in its HTTP preflight; repeating that adapter's exact formula here
-/// prevents the shared worker from tightening its accepted boundary.
+/// Shared KV-window invariant for Metal jobs (#656, #831).
 ///
-/// `lattice_serve.rs` keeps its pre-existing full-decode formula, including
-/// reasoning tokens and one delimiter slot. `lattice.rs` keeps its
-/// pre-existing HTTP formula, which accepts
-/// `prompt_tokens + max_tokens == max_context`.
+/// `lattice_serve` only knows the rendered prompt length on this worker, so
+/// its full-window check runs here. `lattice` also checks the rendered prompt
+/// in its HTTP preflight; the shared arithmetic prevents adapter drift.
 fn check_prompt_fits_window(
     policy: ContextWindowPolicy,
     model_max_context: usize,
@@ -498,28 +496,19 @@ fn check_prompt_fits_window(
             code: "context_length_exceeded",
         });
     }
-    let (decode_cap, delimiter_tokens) = match policy {
-        ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
-        ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
-            cfg.max_new_tokens
-                .saturating_add(cfg.reasoning_budget.unwrap_or(0)),
-            1,
-        ),
-    };
-    let required = prompt_len
-        .saturating_add(decode_cap)
-        .saturating_add(delimiter_tokens);
+    let decode_cap = cfg
+        .max_new_tokens
+        .saturating_add(cfg.reasoning_budget.unwrap_or(0));
+    let required =
+        full_context_tokens_required(prompt_len, cfg.max_new_tokens, cfg.reasoning_budget);
     if required > model_max_context {
         let available = model_max_context.saturating_sub(prompt_len);
-        let delimiter_clause = match delimiter_tokens {
-            0 => String::new(),
-            n => format!(" plus {n}"),
-        };
         return Err(ApiError::BadRequest {
             message: format!(
                 "prompt has {prompt_len} tokens, leaving {available} of the \
                  {model_max_context}-token context window for generation, but this \
-                 request needs {decode_cap} generated tokens{delimiter_clause} (total {required}); \
+                 request needs {decode_cap} generated tokens plus 1 delimiter token \
+                 (total {required}); \
                  reduce max_tokens/reasoning_budget or shorten the prompt"
             ),
             code: "context_length_exceeded",
@@ -2471,14 +2460,24 @@ mod tests {
     }
 
     #[test]
-    fn lattice_context_boundary_accepts_exact_window_and_rejects_one_past() {
-        let cfg = cfg_with(7, None);
-        assert!(
-            check_prompt_fits_window(ContextWindowPolicy::PromptAndMaxTokens, 8, 1, &cfg).is_ok()
-        );
-        assert!(
-            check_prompt_fits_window(ContextWindowPolicy::PromptAndMaxTokens, 8, 2, &cfg).is_err()
-        );
+    fn check_prompt_fits_window_both_policies_share_full_window_boundary() {
+        for policy in [
+            ContextWindowPolicy::PromptAndMaxTokens,
+            ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+        ] {
+            assert!(
+                check_prompt_fits_window(policy, 8, 1, &cfg_with(5, Some(1))).is_ok(),
+                "{policy:?} must accept 1 prompt + 5 answer + 1 reasoning + 1 delimiter"
+            );
+            assert!(
+                check_prompt_fits_window(policy, 8, 1, &cfg_with(6, Some(1))).is_err(),
+                "{policy:?} must count the reasoning budget"
+            );
+            assert!(
+                check_prompt_fits_window(policy, 8, 1, &cfg_with(7, None)).is_err(),
+                "{policy:?} must reserve the delimiter slot without reasoning"
+            );
+        }
     }
 
     /// `lattice.rs`'s original `check_context_window` rejects a zero-token
@@ -2510,31 +2509,6 @@ mod tests {
                 &cfg_with(7, None),
             )
             .is_ok()
-        );
-    }
-
-    #[test]
-    fn lattice_serve_context_boundary_accepts_exact_window_and_rejects_one_past() {
-        let at_boundary = cfg_with(5, Some(1));
-        assert!(
-            check_prompt_fits_window(
-                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-                8,
-                1,
-                &at_boundary,
-            )
-            .is_ok()
-        );
-
-        let one_past = cfg_with(6, Some(1));
-        assert!(
-            check_prompt_fits_window(
-                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-                8,
-                1,
-                &one_past,
-            )
-            .is_err()
         );
     }
 

@@ -2544,8 +2544,8 @@ mod serve {
     use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
-        ValidatedChatRequest as ContractValidatedChatRequest, normalize_request_with_context,
-        validate_context_window,
+        ValidatedChatRequest as ContractValidatedChatRequest,
+        normalize_request_with_generation_context, validate_full_context_window,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
@@ -3313,6 +3313,24 @@ mod serve {
         lattice_inference::serve::finish_reason(output.stopped)
     }
 
+    fn generated_tokens_within_decode_budget(
+        generated_tokens: usize,
+        max_tokens: usize,
+        reasoning_budget: Option<usize>,
+    ) -> bool {
+        let decode_budget = match reasoning_budget {
+            Some(reasoning_tokens) if reasoning_tokens > 0 => {
+                lattice_inference::serve::contract::full_context_tokens_required(
+                    0,
+                    max_tokens,
+                    Some(reasoning_tokens),
+                )
+            }
+            _ => max_tokens,
+        };
+        generated_tokens <= decode_budget
+    }
+
     /// Resolve a token id back to its OpenAI `logprobs` text/bytes representation (#585).
     ///
     /// `token` uses the lossy UTF-8 rendering (matches OpenAI, which also shows
@@ -3430,6 +3448,7 @@ mod serve {
         logprobs: Option<usize>,
         prompt: String,
         stop_strings: Vec<String>,
+        reasoning_budget: Option<usize>,
         seed: Option<u64>,
         stream: bool,
     }
@@ -3437,7 +3456,7 @@ mod serve {
     /// Production entry point for the shared context-aware normalization
     /// cascade: supplies the prompt-aware context-window check (rendering the
     /// chat template, tokenizing it, then calling the shared
-    /// `validate_context_window`) as the context check, in the
+    /// `validate_full_context_window`) as the context check, in the
     /// exact order the original inline `chat_completions` cascade used:
     /// `stop` is validated *last*, after both the served-model hard
     /// requirements and the context-window check that guards against a
@@ -3462,14 +3481,19 @@ mod serve {
         tokenize_len: impl FnOnce(&str) -> usize,
         max_context: impl FnOnce() -> usize,
     ) -> Result<PreparedChatRequest, ApiError> {
-        let (validated, prompt) = normalize_request_with_context(
+        let (validated, prompt) = normalize_request_with_generation_context(
             req,
             GenerationDefaults::standard(default_max_tokens),
             ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
-            |messages, max_tokens| {
+            |messages, max_tokens, reasoning_budget| {
                 let prompt = format_normalized_chat_template(messages);
                 let prompt_token_count = tokenize_len(&prompt);
-                validate_context_window(prompt_token_count, max_tokens, max_context())?;
+                validate_full_context_window(
+                    prompt_token_count,
+                    max_tokens,
+                    reasoning_budget,
+                    max_context(),
+                )?;
                 Ok(prompt)
             },
         )?;
@@ -3480,6 +3504,7 @@ mod serve {
             top_p,
             logprobs,
             stop_strings,
+            reasoning_budget,
             seed,
             stream,
             ..
@@ -3494,6 +3519,7 @@ mod serve {
             logprobs,
             prompt,
             stop_strings,
+            reasoning_budget,
             seed,
             stream,
         })
@@ -3640,6 +3666,7 @@ mod serve {
             logprobs,
             prompt,
             stop_strings,
+            reasoning_budget,
             seed,
             stream,
         } = prepare_chat_request(
@@ -3658,6 +3685,7 @@ mod serve {
             top_p,
             seed,
             stop_strings,
+            reasoning_budget,
             logprobs,
             ..Default::default()
         };
@@ -3691,10 +3719,10 @@ mod serve {
             // unbounded MPSC channel.  The async SSE handler drains the channel
             // and converts each message to an OpenAI `chat.completion.chunk` event.
             // An unbounded channel is acceptable here because the channel depth is
-            // bounded by `max_tokens` (capped at `max_tokens_cap`): the producer
-            // sends at most one `Delta` per generated token and generation halts at
-            // the cap, so the worst-case buffer is a few thousand short strings —
-            // the same order the non-streaming path already holds as one buffered
+            // bounded by the validated full decode window: the producer sends at
+            // most one `Delta` per generated token and generation halts at that
+            // cap, so the worst-case buffer is a few thousand short strings — the
+            // same order the non-streaming path already holds as one buffered
             // string.
             //
             // Disconnect cancellation (ADR-080 C2, #744): `cancel_guard` is
@@ -3712,15 +3740,21 @@ mod serve {
             let stream_model = state.model_id.clone();
 
             // Both backends funnel their result through this closure so the
-            // "generated_tokens > max_tokens invariant, then finish_reason_for"
+            // "generated_tokens exceeds the complete decode budget invariant,
+            // then finish_reason_for"
             // logic is written exactly once and shared by CPU and Metal.
             let finish_streaming = {
                 let tx = tx.clone();
                 move |output: GenerateOutput| {
-                    if output.generated_tokens > max_tokens {
+                    if !generated_tokens_within_decode_budget(
+                        output.generated_tokens,
+                        max_tokens,
+                        reasoning_budget,
+                    ) {
                         eprintln!(
-                            "generation invariant violation: generated_tokens={} max_tokens={}",
-                            output.generated_tokens, max_tokens
+                            "generation invariant violation: generated_tokens={} \
+                             max_tokens={} reasoning_budget={:?}",
+                            output.generated_tokens, max_tokens, reasoning_budget
                         );
                         let _ = tx.unbounded_send(StreamMsg::Failed);
                     } else {
@@ -3975,10 +4009,15 @@ mod serve {
             // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
             // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
             // Log and return 500 if the invariant is violated.
-            if output.generated_tokens > max_tokens {
+            if !generated_tokens_within_decode_budget(
+                output.generated_tokens,
+                max_tokens,
+                reasoning_budget,
+            ) {
                 eprintln!(
-                    "generation invariant violation: generated_tokens={} max_tokens={}",
-                    output.generated_tokens, max_tokens
+                    "generation invariant violation: generated_tokens={} \
+                     max_tokens={} reasoning_budget={:?}",
+                    output.generated_tokens, max_tokens, reasoning_budget
                 );
                 return Err(ApiError::Internal {
                     message: "inference failed".to_string(),
@@ -5539,6 +5578,32 @@ mod serve {
         }
 
         #[test]
+        fn cm_serve_reasoning_budget_and_full_window_resolved_end_to_end() {
+            let req = ChatCompletionRequest {
+                model: Some("served-model".to_string()),
+                messages: vec![user_msg("hi")],
+                max_tokens: Some(5),
+                reasoning_budget: Some(
+                    serde_json::value::RawValue::from_string("2".to_string()).unwrap(),
+                ),
+                ..bare_req()
+            };
+            let prepared =
+                prepare_chat_request(&req, "served-model", 256, 4096, false, |_| 8, || 16).unwrap();
+            assert_eq!(prepared.reasoning_budget, Some(2));
+
+            let mut overflowing = req;
+            overflowing.max_tokens = Some(6);
+            assert!(matches!(
+                prepare_chat_request(&overflowing, "served-model", 256, 4096, false, |_| 8, || 16,),
+                Err(ApiError::BadRequest {
+                    code: "context_length_exceeded",
+                    ..
+                })
+            ));
+        }
+
+        #[test]
         fn cm_serve_context_window_checked_before_stop_parsing() {
             // Regression fixture for a refactor bug: extracting stop-sequence
             // parsing into the pre-model validation cascade moved it ahead of
@@ -5605,6 +5670,127 @@ mod serve {
                 max_tokens_cap,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        #[cfg(feature = "test-utils")]
+        mod reasoning_output_budget {
+            use super::*;
+            use axum::body::Body;
+            use tower::ServiceExt as _;
+
+            const MAX_TOKENS: usize = 2;
+            const REASONING_BUDGET: usize = 3;
+            const DECODE_CAP: usize = MAX_TOKENS + REASONING_BUDGET + 1;
+
+            fn state_with_generated_tokens(generated_tokens: usize) -> AppState {
+                let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
+                #[allow(clippy::type_complexity)]
+                let generate: Arc<
+                    dyn Fn(
+                            &str,
+                            &lattice_inference::model::qwen35_config::GenerateConfig,
+                            &mut dyn FnMut(&str) -> bool,
+                            &mut dyn FnMut() -> bool,
+                        )
+                            -> Result<GenerateOutput, lattice_inference::error::InferenceError>
+                        + Send
+                        + Sync,
+                > = Arc::new(move |_prompt, _cfg, on_token, _should_cancel| {
+                    let _ = on_token("ok");
+                    Ok(GenerateOutput {
+                        text: "ok".to_string(),
+                        token_ids: vec![],
+                        prompt_tokens: 7,
+                        generated_tokens,
+                        stopped: true,
+                        stop_reason: Some(lattice_inference::StopReason::Eos),
+                        token_logprobs: vec![],
+                    })
+                });
+                AppState {
+                    model: ModelBackend::CpuFakeGenerate {
+                        model: Arc::new(model),
+                        generate,
+                    },
+                    default_max_tokens: 64,
+                    max_tokens_cap: 64,
+                    model_id: "test-model".to_string(),
+                    request_counter: Arc::new(AtomicU64::new(0)),
+                }
+            }
+
+            fn request(stream: bool) -> axum::http::Request<Body> {
+                let body = serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": MAX_TOKENS,
+                    "reasoning_budget": REASONING_BUDGET,
+                    "stream": stream,
+                });
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("fixture request must build")
+            }
+
+            async fn response_body(response: axum::http::Response<Body>) -> String {
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body must be readable");
+                String::from_utf8(bytes.to_vec()).expect("response body must be UTF-8")
+            }
+
+            #[tokio::test]
+            async fn non_streaming_accepts_exact_reasoning_decode_cap() {
+                let response = router(state_with_generated_tokens(DECODE_CAP))
+                    .oneshot(request(false))
+                    .await
+                    .expect("router must produce a response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: serde_json::Value =
+                    serde_json::from_str(&response_body(response).await).unwrap();
+                assert_eq!(body["usage"]["completion_tokens"], DECODE_CAP);
+            }
+
+            #[tokio::test]
+            async fn non_streaming_rejects_one_past_reasoning_decode_cap() {
+                let response = router(state_with_generated_tokens(DECODE_CAP + 1))
+                    .oneshot(request(false))
+                    .await
+                    .expect("router must produce a response");
+                assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                let body: serde_json::Value =
+                    serde_json::from_str(&response_body(response).await).unwrap();
+                assert_eq!(body["error"]["code"], "internal_error");
+            }
+
+            #[tokio::test]
+            async fn streaming_accepts_exact_reasoning_decode_cap() {
+                let response = router(state_with_generated_tokens(DECODE_CAP))
+                    .oneshot(request(true))
+                    .await
+                    .expect("router must produce a response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response_body(response).await;
+                assert!(body.contains(r#""finish_reason":"stop""#), "{body}");
+                assert!(!body.contains(r#""code":"internal_error""#), "{body}");
+                assert!(body.contains("data: [DONE]"), "{body}");
+            }
+
+            #[tokio::test]
+            async fn streaming_rejects_one_past_reasoning_decode_cap() {
+                let response = router(state_with_generated_tokens(DECODE_CAP + 1))
+                    .oneshot(request(true))
+                    .await
+                    .expect("router must produce a response");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response_body(response).await;
+                assert!(body.contains(r#""code":"internal_error""#), "{body}");
+                assert!(!body.contains(r#""finish_reason":"stop""#), "{body}");
+                assert!(body.contains("data: [DONE]"), "{body}");
             }
         }
 
@@ -6584,26 +6770,34 @@ mod serve {
             use super::*;
             use lattice_inference::serve::{
                 ExpectedObservation, GenerateConfigSnapshot,
-                OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, ProductionAdapterObservation,
+                OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, PRODUCTION_ADAPTER_PARITY_CASES,
+                PRODUCTION_ADAPTER_PARITY_CONTEXT_WINDOW, ProductionAdapterObservation,
+                ProductionAdapterParityCase, ProductionAdapterParityOutcome,
                 assert_observation_matches,
             };
             use std::sync::Mutex;
             use tower::ServiceExt as _;
 
-            /// Builds the fixture state + fires the fixed `{"messages":[{"role":
-            /// "user","content":"hi there"}],"temperature":1.3,"top_p":0.55,
-            /// "seed":7,"max_tokens":9}` request against a real router, with the
+            struct CaseRun {
+                status: StatusCode,
+                body: serde_json::Value,
+                observation: Option<ProductionAdapterObservation>,
+                prompt_tokens: usize,
+            }
+
+            /// Builds the fixture state and fires one shared production-
+            /// adapter parity row against a real router, with the
             /// injected `CpuFakeGenerate` closure recording a
             /// `ProductionAdapterObservation` -- strictly below the real
             /// request-parse/`format_chat_template`/`GenerateConfig`-construction path
-            /// (issue #828). `stopped` is threaded through a single local
-            /// variable into both the recorded observation and the returned
-            /// `GenerateOutput`, so a caller of this helper can vary it and prove
-            /// the observation genuinely mirrors what the seam returned rather
-            /// than an independent hardcoded literal.
-            async fn run_observed(stopped: bool) -> ProductionAdapterObservation {
+            /// (issues #828/#831). The request body and effective context
+            /// limit come from the same shared row the daemon consumes.
+            async fn run_observed(case: &ProductionAdapterParityCase, stopped: bool) -> CaseRun {
                 let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
                 let tokenizer = model.tokenizer().clone();
+                let prompt_tokens = tokenizer
+                    .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+                    .real_length;
                 let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> =
                     Arc::new(Mutex::new(None));
                 let observed_for_closure = Arc::clone(&observed);
@@ -6650,73 +6844,71 @@ mod serve {
                         generate,
                     },
                     default_max_tokens: 64,
-                    max_tokens_cap: 64,
+                    max_tokens_cap: PRODUCTION_ADAPTER_PARITY_CONTEXT_WINDOW,
                     model_id: "test-model".to_string(),
                     request_counter: Arc::new(AtomicU64::new(0)),
                 };
-                let body = r#"{"model":"test-model","messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#;
                 let request = axum::http::Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
                     .header("content-type", "application/json")
-                    .body(axum::body::Body::from(body.to_string()))
+                    .body(axum::body::Body::from(case.request_body(prompt_tokens)))
                     .expect("fixture request must build");
                 let response = router(state)
                     .oneshot(request)
                     .await
                     .expect("router must produce a response, not a transport error");
-                assert_eq!(response.status(), StatusCode::OK);
-
-                observed
-                    .lock()
-                    .expect("observation mutex poisoned")
-                    .clone()
-                    .expect("the injected generate closure must have recorded an observation")
-            }
-
-            /// The `GenerateConfig` `lattice.rs`'s real `chat_completions` ->
-            /// `prepare_chat_request`/`build_cfg`-equivalent construction (see
-            /// its `let gen_cfg = ...` literal in this file) must produce for the
-            /// fixed request body `run_observed` sends: every explicitly-set
-            /// field mirrors the request, every other field is
-            /// `GenerateConfig::default()` -- exactly like production's own
-            /// `..Default::default()` tail.
-            fn expected_gen_cfg() -> GenerateConfigSnapshot {
-                GenerateConfigSnapshot::from(
-                    &lattice_inference::model::qwen35_config::GenerateConfig {
-                        max_new_tokens: 9,
-                        temperature: 1.3,
-                        top_p: 0.55,
-                        seed: Some(7),
-                        stop_strings: vec![],
-                        logprobs: None,
-                        ..Default::default()
-                    },
-                )
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body must be readable");
+                let body =
+                    serde_json::from_slice(&bytes).expect("response body must be valid JSON");
+                let observation = observed.lock().expect("observation mutex poisoned").clone();
+                CaseRun {
+                    status,
+                    body,
+                    observation,
+                    prompt_tokens,
+                }
             }
 
             #[tokio::test]
             async fn chat_completions_non_streaming_observation_captures_real_config_and_prompt() {
-                let obs = run_observed(true).await;
-                let expected_prompt_tokens = {
-                    let tokenizer =
-                        lattice_inference::model::qwen35::test_support::tiny_zero_model()
-                            .tokenizer()
-                            .clone();
-                    tokenizer
-                        .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
-                        .real_length
-                };
-                assert_observation_matches(
-                    &obs,
-                    &ExpectedObservation {
-                        gen_cfg: expected_gen_cfg(),
-                        rendered_prompt: Some(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML),
-                        messages: None,
-                        prompt_tokens: expected_prompt_tokens,
-                        stopped: true,
-                    },
-                );
+                for case in PRODUCTION_ADAPTER_PARITY_CASES {
+                    let run = run_observed(case, true).await;
+                    match case.outcome {
+                        ProductionAdapterParityOutcome::Accepted => {
+                            assert_eq!(run.status, StatusCode::OK, "case {}", case.name);
+                            let observation = run.observation.as_ref().unwrap_or_else(|| {
+                                panic!("case {} did not reach the production adapter", case.name)
+                            });
+                            assert_observation_matches(
+                                observation,
+                                &ExpectedObservation {
+                                    gen_cfg: case.expected_gen_cfg(run.prompt_tokens),
+                                    rendered_prompt: Some(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML),
+                                    messages: None,
+                                    prompt_tokens: run.prompt_tokens,
+                                    stopped: true,
+                                },
+                            );
+                        }
+                        ProductionAdapterParityOutcome::ContextLengthExceeded => {
+                            assert_eq!(run.status, StatusCode::BAD_REQUEST, "case {}", case.name);
+                            assert_eq!(
+                                run.body["error"]["code"], "context_length_exceeded",
+                                "case {}",
+                                case.name
+                            );
+                            assert!(
+                                run.observation.is_none(),
+                                "case {} must be rejected before generation",
+                                case.name
+                            );
+                        }
+                    }
+                }
             }
 
             /// Proves `ProductionAdapterObservation::stopped` is genuinely
@@ -6727,7 +6919,11 @@ mod serve {
             /// `run_observed(false)` must observe `stopped == false`.
             #[tokio::test]
             async fn chat_completions_non_streaming_observation_captures_real_stopped_false() {
-                let obs = run_observed(false).await;
+                let case = &PRODUCTION_ADAPTER_PARITY_CASES[0];
+                let run = run_observed(case, false).await;
+                let obs = run
+                    .observation
+                    .expect("accepted row must reach the production adapter");
                 assert!(
                     !obs.stopped,
                     "observation must report the seam's actual stopped=false, not a hardcoded true"

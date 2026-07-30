@@ -185,6 +185,16 @@ across both binaries — plus filed #744 (disconnect cancellation), #745 (max_to
 scope narrowed during audit triage), #746 (`finish_reason` hardcoding) — all three are instances of
 the same "two independently-maintained request/response paths" root cause this cluster targets.
 
+**Post-acceptance contract amendment (#831, 2026-07-29).** The shared module now also owns
+reasoning-aware context admission. The additive public helpers
+`normalize_request_with_generation_context`, `full_context_tokens_required`, and
+`validate_full_context_window` let the unified binary render/tokenize once while both binaries use
+the same saturating `prompt + max_tokens + reasoning_budget + 1` calculation. The old
+`validate_context_window` signature remains as a compatibility wrapper with no reasoning budget.
+Both serve profiles accept the same bounded stop-string shape; positive reasoning budgets are
+applied to `GenerateConfig`, while malformed values and backend-incompatible image requests remain
+fail-closed. The C3 engine guards are unchanged.
+
 ### C3: Backend-neutral decode policy (sampling-decode)
 
 **Evidence.** The Qwen autoregressive decode-policy loop recurs across 9 sites:

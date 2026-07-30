@@ -1128,6 +1128,141 @@ pub fn assert_observation_matches(
     );
 }
 
+/// Effective model context shared by both production-adapter parity
+/// consumers. The unified binary's tiny model has this exact context, and
+/// the daemon fixture configures its real worker to the same value.
+pub const PRODUCTION_ADAPTER_PARITY_CONTEXT_WINDOW: usize = 1024;
+
+/// Expected HTTP outcome for one [`ProductionAdapterParityCase`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProductionAdapterParityOutcome {
+    /// The request exactly fits the full context window and reaches the
+    /// generation adapter, where its config is captured.
+    Accepted,
+    /// The request is one token beyond the full context window and must be
+    /// rejected before generation.
+    ContextLengthExceeded,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProductionAdapterStopShape {
+    Scalar(&'static str),
+    Array(&'static [&'static str]),
+}
+
+impl ProductionAdapterStopShape {
+    fn value(self) -> Value {
+        match self {
+            Self::Scalar(value) => Value::String(value.to_string()),
+            Self::Array(values) => Value::Array(
+                values
+                    .iter()
+                    .map(|value| Value::String((*value).to_string()))
+                    .collect(),
+            ),
+        }
+    }
+
+    fn strings(self) -> Vec<String> {
+        match self {
+            Self::Scalar(value) => vec![value.to_string()],
+            Self::Array(values) => values.iter().map(|value| (*value).to_string()).collect(),
+        }
+    }
+}
+
+/// One shared request/config/window row driven through both binaries'
+/// production adapters.
+///
+/// `request_body` derives `max_tokens` from the real tiny tokenizer's
+/// measured prompt length. Both consumers therefore send byte-identical JSON
+/// against the same effective context limit while still exercising their
+/// own real render/tokenize/config construction paths.
+pub struct ProductionAdapterParityCase {
+    /// Stable fixture name used in assertion messages.
+    pub name: &'static str,
+    stop: ProductionAdapterStopShape,
+    /// Expected admission result at the shared context boundary.
+    pub outcome: ProductionAdapterParityOutcome,
+}
+
+impl ProductionAdapterParityCase {
+    const REASONING_BUDGET: usize = 3;
+
+    /// Request `max_tokens` that exactly fills the shared full window, or is
+    /// one token beyond it for the rejection row.
+    pub fn max_tokens(&self, prompt_tokens: usize) -> usize {
+        let exact = PRODUCTION_ADAPTER_PARITY_CONTEXT_WINDOW
+            .saturating_sub(prompt_tokens)
+            .saturating_sub(Self::REASONING_BUDGET)
+            .saturating_sub(1);
+        match self.outcome {
+            ProductionAdapterParityOutcome::Accepted => exact,
+            ProductionAdapterParityOutcome::ContextLengthExceeded => exact.saturating_add(1),
+        }
+    }
+
+    /// Build the exact OpenAI-shaped request body consumed by both binary
+    /// harnesses.
+    pub fn request_body(&self, prompt_tokens: usize) -> String {
+        serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hi there"}],
+            "temperature": 1.3,
+            "top_p": 0.55,
+            "seed": 7,
+            "max_tokens": self.max_tokens(prompt_tokens),
+            "reasoning_budget": Self::REASONING_BUDGET,
+            "stop": self.stop.value(),
+        })
+        .to_string()
+    }
+
+    /// Full config snapshot an accepted row must hand to either production
+    /// generation adapter.
+    pub fn expected_gen_cfg(&self, prompt_tokens: usize) -> GenerateConfigSnapshot {
+        GenerateConfigSnapshot::from(&GenerateConfig {
+            max_new_tokens: self.max_tokens(prompt_tokens),
+            temperature: 1.3,
+            top_p: 0.55,
+            seed: Some(7),
+            stop_strings: self.stop.strings(),
+            reasoning_budget: Some(Self::REASONING_BUDGET),
+            ..Default::default()
+        })
+    }
+}
+
+const PRODUCTION_ADAPTER_MULTI_STOP: &[&str] = &["FIRST", "SECOND", "THIRD"];
+const PRODUCTION_ADAPTER_REJECT_STOP: &[&str] = &["LEFT", "RIGHT"];
+
+/// Shared production-adapter/config parity rows for issue #831.
+///
+/// The accepted scalar and multi-stop rows capture the complete real
+/// `GenerateConfig`, so dropping/zeroing `reasoning_budget` or truncating a
+/// stop array fails both binary consumers. The one-past row differs from the
+/// exact boundary by one `max_tokens` token, so omitting reasoning from
+/// either adapter's check, restoring the unified adapter's old accounting,
+/// or removing the shared `+1` reserve admits it and fails the corresponding
+/// consumer.
+pub const PRODUCTION_ADAPTER_PARITY_CASES: &[ProductionAdapterParityCase] = &[
+    ProductionAdapterParityCase {
+        name: "reasoning_stop_scalar_exact_boundary",
+        stop: ProductionAdapterStopShape::Scalar("SCALAR"),
+        outcome: ProductionAdapterParityOutcome::Accepted,
+    },
+    ProductionAdapterParityCase {
+        name: "reasoning_stop_multi_exact_boundary",
+        stop: ProductionAdapterStopShape::Array(PRODUCTION_ADAPTER_MULTI_STOP),
+        outcome: ProductionAdapterParityOutcome::Accepted,
+    },
+    ProductionAdapterParityCase {
+        name: "reasoning_full_window_one_past_rejected",
+        stop: ProductionAdapterStopShape::Array(PRODUCTION_ADAPTER_REJECT_STOP),
+        outcome: ProductionAdapterParityOutcome::ContextLengthExceeded,
+    },
+];
+
 /// Shared fixture table for both binaries' `/v1/chat/completions` HTTP
 /// contract, driven through each binary's real `Router` via
 /// `tower::ServiceExt::oneshot` in `lattice.rs`'s and `lattice_serve.rs`'s
@@ -1571,6 +1706,57 @@ pub const CHAT_COMPLETIONS_PARITY_CASES: &[ParityCase] = &[
         lattice_serve: ExpectedResponse::Error {
             status: 400,
             code: "invalid_top_p",
+        },
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "stop_scalar_accepted",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stop":"DONE"}"#,
+        ),
+        lattice: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "stop_array_at_four_element_cap_accepted",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stop":["A","B","C","D"]}"#,
+        ),
+        lattice: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        lattice_serve: ExpectedResponse::Json {
+            status: 200,
+            fields: ACCEPTED_MINIMAL_FIELDS,
+        },
+        divergence_reason: None,
+    },
+    ParityCase {
+        name: "stop_array_one_past_four_element_cap_rejected",
+        method: "POST",
+        path: "/v1/chat/completions",
+        body: CaseBody::Fixed(
+            r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"stop":["A","B","C","D","E"]}"#,
+        ),
+        lattice: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_stop",
+        },
+        lattice_serve: ExpectedResponse::Error {
+            status: 400,
+            code: "invalid_stop",
         },
         divergence_reason: None,
     },

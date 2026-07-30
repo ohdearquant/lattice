@@ -9,8 +9,8 @@
 > (ADR-073), this is a **split verdict** at two genuinely different maturity levels. The **static**
 > s1-style reasoning-budget (force-inject `</think>` after N reasoning tokens) is fully shipped,
 > wired on both backends, and grammar-fail-closed with a mutation-verified test — its only open
-> sub-lever is **surface coverage** (missing from the public `lattice` CLI), a standard wiring task
-> rankable today with zero new data. The **adaptive** lever (input-conditioned, entropy/confidence-
+> surface gap is the interactive `lattice chat` command; the public `lattice serve` HTTP route now
+> accepts a per-request budget. The **adaptive** lever (input-conditioned, entropy/confidence-
 > gated budget) has **zero lattice code, zero committed eval data, and no instrumentation** — it is a
 > well-specified, already-filed, unstarted 6-issue research family whose own first prerequisite (a
 > margin/entropy-vs-correctness measurement) is the defined minimal experiment gating the rest. This
@@ -32,17 +32,21 @@ What ships today (all confirmed against source, table below): a **static** s1 re
 `GenerateConfig.reasoning_budget: Option<usize>` force-injects `</think>` once the reasoning-token
 count crosses the budget, on both the CPU decode loop and the Metal candidate-sampling path, with a
 grammar-fail-closed interaction that is regression- and mutation-tested. It costs nothing when
-disabled. It is exposed on the Studio-internal `chat_metal` binary and the standalone `lattice_serve`
-daemon, but **not** on the public `lattice` CLI. The thinking on/off decision is not driven by the
-engine's `enable_thinking` field (hardcoded `true` in every serving binary) but by ChatML prompt
-priming; the Studio budget control is a **manual per-conversation stepper**, never derived from the
-query. There is no dynamic, per-query, or confidence-based budget anywhere.
+disabled. It is exposed on the Studio-internal `chat_metal` binary, the standalone `lattice_serve`
+daemon, and the public `lattice serve` HTTP route, but not the interactive `lattice chat` command.
+The thinking on/off decision is not driven by the engine's `enable_thinking` field (hardcoded `true`
+in every serving binary) but by ChatML prompt priming; the Studio budget control is a **manual
+per-conversation stepper**, never derived from the query. There is no dynamic, per-query, or
+confidence-based budget anywhere.
 
 ## Measured / source-verified reality (this engine)
 
 Tags: **runtime-measured** (a number from running this hardware), **unit-test/gate-pinned** (a
 committed test or lint script enforces it), **source-read** (a structural fact from merged code).
-All pointers are on `origin/main @ 4cb006d32`.
+Unless a row says otherwise, pre-existing pointers retain their original
+`origin/main @ 4cb006d32` evidence snapshot. R7 and P3 record the #831 amendment implemented
+against `codex/serve-next @ 1e8ba317241d7b7dc674516a67d0ef10c5dcfe03` in the same change as this
+document.
 
 | #   | Finding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                | How known                                          | Pointer                                                                                                                                                                                          |
 | --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -52,7 +56,7 @@ All pointers are on `origin/main @ 4cb006d32`.
 | R4  | **Wired into the Metal candidate-sampling path** identically — `force_close_think` overrides `sampled_id` before grammar `advance()`, with an in-code note that grammar+budget is fail-closed.                                                                                                                                                                                                                                                                                         | source-read                                        | `crates/inference/src/forward/metal_qwen35.rs:13131-13148` (call + interaction note), `:15671` (2nd site)                                                                                        |
 | R5  | **Grammar × budget fail-closed is mutation-verified.** A test builds a model where `</think>` is out-of-grammar-vocab, sets `reasoning_budget=Some(1)`, and asserts generation stops via `StopReason::Grammar` **without** emitting the forbidden token; PR body documents the mutation flip that breaks it.                                                                                                                                                                           | unit-test/gate-pinned                              | PR **#511** (MERGED 2026-07-01), test `grammar_budget_forced_close_fails_closed`; comment `metal_qwen35.rs:13141-13146`                                                                          |
 | R6  | **`enable_thinking` never reaches `false` in a live request path.** It is a real field that _does_ gate `force_close_think`, but every serving binary hardcodes it `true`; no CLI flag, no request field sets it otherwise. Thinking on/off is done by prompt priming, not this field.                                                                                                                                                                                                 | source-read (exhaustive grep)                      | `bin/chat_metal.rs:818,907`; `bin/lattice_serve.rs:869`; test `force_close_think_disabled_when_enable_thinking_false` (`qwen35_config.rs:1687`)                                                  |
-| R7  | **The public `lattice` CLI exposes neither the budget nor any thinking control.** `lattice chat`/`lattice serve` construct `GenerateConfig { .. , ..Default::default() }`, so `reasoning_budget` is permanently `None`. This is gate-pinned prose, not free-floating.                                                                                                                                                                                                                  | source-read + doc-gate-pinned                      | `docs/capability-matrix.md` row 85 + `:36-40`; enforced by `scripts/check-capability-matrix.sh` in `make lint-docs` (`scripts/lint-docs.sh:9-10`)                                                |
+| R7  | **The public `lattice serve` HTTP surface exposes the static budget; `lattice chat` still does not.** A positive request `reasoning_budget` is mapped into `GenerateConfig`; zero is treated as absent, and unsupported generation paths reject rather than silently omit it. No thinking on/off flag was added.                                                                                                                                                                       | source-read + route/adapter tests                  | `crates/inference/src/bin/lattice.rs` (`prepare_chat_request`, production adapter observation); `docs/capability-matrix.md`                                                                      |
 | R8  | **`lattice_serve` (OpenAI-compatible daemon) supports the budget** as a server-wide default **and** a per-request override, clamped to the real context window.                                                                                                                                                                                                                                                                                                                        | source-read                                        | `bin/lattice_serve.rs:153,227` (fields), `:855-858` (`.or(d.reasoning_budget)` resolution), `:838-849` (clamp doc); `docs/capability-matrix.md` row 85 (right column)                            |
 | R9  | **`chat_metal` supports `--reasoning-budget` + a per-request JSON field**, with `reasoning_budget: 0` normalized to "absent", unit-tested.                                                                                                                                                                                                                                                                                                                                             | unit-test/gate-pinned                              | `bin/chat_metal.rs:529-538,603-608`; test `cm_chat_metal_serve_zero_reasoning_budget_falls_back_to_default` (`:1108`)                                                                            |
 | R10 | **Studio exposes only a manual, static, per-conversation control** — a numeric stepper (`String` default `"1024"`) plus a thinking toggle (`Bool` default `false`); the budget is `nil` unless thinking is on, and is set once before sending, never from the query.                                                                                                                                                                                                                   | source-read                                        | `apps/macos/Sources/LatticeStudio/Store/AppStore.swift:76,79`; `Screens/ChatScreen.swift:450-451,1345-1349`; `:1308-1329` (`renderChatML`, ChatML priming = the real on/off)                     |
@@ -106,12 +110,10 @@ one, not as independent confirmation beyond what the issues already record.
 - **P2 — run the scratchpad-vs-calibration measurement (#487).** Parallel G1 experiment gating the
   safety-triage framing (#482) specifically, distinct from #493's general-domain framing. Also
   unstarted, also cheap, also a measurement rather than a build.
-- **P3 — expose the shipped static budget on the public `lattice` surface.** Certain-value, low-risk
-  plumbing: wire the already-shipped `reasoning_budget` (and, if desired, the thinking toggle) into the
-  public `lattice chat`/`lattice serve` path, copying `lattice_serve.rs`'s implementation (R8). No
-  research, no new machinery. Ranked below P1/P2 because its magnitude is small and whether the public
-  CLI should reach `lattice_serve` parity is a product-surface call; **no tracking issue is filed for
-  it yet** (file one if pursued).
+- **P3 — expose the shipped static budget on the public `lattice` surface: completed for
+  `lattice serve` by #831.** The HTTP request field now reaches the already-shipped
+  `GenerateConfig.reasoning_budget` policy with full-window accounting. `lattice chat` and a
+  thinking on/off flag remain outside that issue; neither is implied by the HTTP parity change.
 
 **Gated, not ranked:**
 

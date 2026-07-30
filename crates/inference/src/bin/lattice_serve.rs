@@ -4664,15 +4664,26 @@ mod imp {
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
-        async fn chat_completions_stop_400() {
+        async fn chat_completions_stop_accepted() {
+            let (state, mut jobs_rx) = test_app_state_with_jobs();
+            tokio::spawn(async move {
+                if let Some(job) = jobs_rx.recv().await {
+                    let _ = job.reply(WorkerEvent::Complete(GenerateOutput {
+                        text: "ok".to_string(),
+                        token_ids: vec![0],
+                        prompt_tokens: 1,
+                        generated_tokens: 1,
+                        stopped: true,
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    }));
+                }
+            });
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stop":"\n"}"#.to_string(),
             );
-            let response =
-                chat_completions(State(test_app_state()), test_json_headers(), body).await;
-            let (status, message) = error_message_of(response).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(message, "stop is not supported by this server");
+            let response = chat_completions(State(state), test_json_headers(), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -5586,15 +5597,23 @@ mod imp {
             use super::*;
             use lattice_inference::serve::{
                 ExpectedObservation, GenerateConfigSnapshot,
-                OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, ProductionAdapterObservation,
+                OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, PRODUCTION_ADAPTER_PARITY_CASES,
+                PRODUCTION_ADAPTER_PARITY_CONTEXT_WINDOW, ProductionAdapterObservation,
+                ProductionAdapterParityCase, ProductionAdapterParityOutcome,
                 assert_observation_matches,
             };
             use std::sync::Mutex;
 
+            struct CaseRun {
+                status: StatusCode,
+                body: serde_json::Value,
+                observation: Option<ProductionAdapterObservation>,
+                prompt_tokens: usize,
+            }
+
             /// Mirrors `lattice.rs`'s equivalent helper (issue #828):
-            /// fires the fixed `{"messages":[{"role":"user","content":"hi
-            /// there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}`
-            /// request through a REAL background thread running the actual
+            /// fires one shared production-adapter parity row through a REAL
+            /// background thread running the actual
             /// `run_worker_loop` + `check_prompt_fits_window` production code
             /// (via `metal_worker::spawn_fake`, issue #832's cross-binary test
             /// seam; real tiny tokenizer, no Metal engine) -- only the terminal
@@ -5604,19 +5623,19 @@ mod imp {
             /// real `check_prompt_fits_window` measured length -- surfaced by
             /// `spawn_fake` as the closure's `prompt_tokens` argument -- is the
             /// ONLY source for `prompt_tokens` here.
-            async fn run_observed(
-                model_max_context: usize,
-                stopped: bool,
-            ) -> ProductionAdapterObservation {
+            async fn run_observed(case: &ProductionAdapterParityCase, stopped: bool) -> CaseRun {
                 let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
                     .tokenizer()
                     .clone();
+                let prompt_tokens = tokenizer
+                    .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
+                    .real_length;
                 let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> =
                     Arc::new(Mutex::new(None));
                 let observed_for_worker = Arc::clone(&observed);
                 let jobs = spawn_fake(
                     ContextWindowPolicy::PromptAndDecodeWithDelimiter,
-                    model_max_context,
+                    PRODUCTION_ADAPTER_PARITY_CONTEXT_WINDOW,
                     tokenizer,
                     move |messages, cfg, prompt_tokens, on_token, _should_cancel| {
                         let normalized: Vec<(String, String)> = messages
@@ -5668,65 +5687,66 @@ mod imp {
                     jobs,
                     model_id: Arc::from("test-model"),
                     defaults: GenerationDefaults::standard(100),
-                    model_max_context,
+                    model_max_context: PRODUCTION_ADAPTER_PARITY_CONTEXT_WINDOW,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
                     grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
                 };
-                let body = Body::from(
-                    r#"{"messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#
-                        .to_string(),
-                );
+                let body = Body::from(case.request_body(prompt_tokens));
                 let response = chat_completions(State(state), test_json_headers(), body).await;
-                assert_eq!(response.status(), StatusCode::OK);
-
-                observed
-                    .lock()
-                    .expect("observation mutex poisoned")
-                    .clone()
-                    .expect("the injected worker-loop generate closure must have recorded an observation")
-            }
-
-            /// The `GenerateConfig` `lattice_serve.rs`'s real `build_cfg` must
-            /// produce for the fixed request `run_observed` sends, given
-            /// `run_observed`'s `GenerationDefaults` above: every explicitly-set field
-            /// mirrors the request; `build_cfg` always sets the remaining
-            /// fields (`stop_token_ids`, `enable_thinking`, `enable_mtp`,
-            /// `grammar`, `reasoning_budget`, `logprobs`, `stop_strings`) to
-            /// the exact same values `GenerateConfig::default()` carries.
-            fn expected_gen_cfg() -> GenerateConfigSnapshot {
-                GenerateConfigSnapshot::from(
-                    &lattice_inference::model::qwen35_config::GenerateConfig {
-                        max_new_tokens: 9,
-                        temperature: 1.3,
-                        top_p: 0.55,
-                        seed: Some(7),
-                        ..Default::default()
-                    },
-                )
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("response body must be readable");
+                let body =
+                    serde_json::from_slice(&bytes).expect("response body must be valid JSON");
+                let observation = observed.lock().expect("observation mutex poisoned").clone();
+                CaseRun {
+                    status,
+                    body,
+                    observation,
+                    prompt_tokens,
+                }
             }
 
             #[tokio::test]
             async fn chat_completions_non_streaming_observation_captures_real_config_and_messages()
             {
-                let obs = run_observed(4096, true).await;
-                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
-                    .tokenizer()
-                    .clone();
-                let expected_prompt_tokens = tokenizer
-                    .tokenize(OBSERVATION_GOLDEN_USER_HI_THERE_CHATML)
-                    .real_length;
-                assert_observation_matches(
-                    &obs,
-                    &ExpectedObservation {
-                        gen_cfg: expected_gen_cfg(),
-                        rendered_prompt: None,
-                        messages: Some(&[("user", "hi there")]),
-                        prompt_tokens: expected_prompt_tokens,
-                        stopped: true,
-                    },
-                );
+                for case in PRODUCTION_ADAPTER_PARITY_CASES {
+                    let run = run_observed(case, true).await;
+                    match case.outcome {
+                        ProductionAdapterParityOutcome::Accepted => {
+                            assert_eq!(run.status, StatusCode::OK, "case {}", case.name);
+                            let observation = run.observation.as_ref().unwrap_or_else(|| {
+                                panic!("case {} did not reach the production adapter", case.name)
+                            });
+                            assert_observation_matches(
+                                observation,
+                                &ExpectedObservation {
+                                    gen_cfg: case.expected_gen_cfg(run.prompt_tokens),
+                                    rendered_prompt: None,
+                                    messages: Some(&[("user", "hi there")]),
+                                    prompt_tokens: run.prompt_tokens,
+                                    stopped: true,
+                                },
+                            );
+                        }
+                        ProductionAdapterParityOutcome::ContextLengthExceeded => {
+                            assert_eq!(run.status, StatusCode::BAD_REQUEST, "case {}", case.name);
+                            assert_eq!(
+                                run.body["error"]["code"], "context_length_exceeded",
+                                "case {}",
+                                case.name
+                            );
+                            assert!(
+                                run.observation.is_none(),
+                                "case {} must be rejected before generation",
+                                case.name
+                            );
+                        }
+                    }
+                }
             }
 
             /// Proves `stopped` is genuinely derived from what the worker's
@@ -5735,7 +5755,11 @@ mod imp {
             /// `stopped: true` regardless of the closure's actual return).
             #[tokio::test]
             async fn chat_completions_non_streaming_observation_captures_real_stopped_false() {
-                let obs = run_observed(4096, false).await;
+                let case = &PRODUCTION_ADAPTER_PARITY_CASES[0];
+                let run = run_observed(case, false).await;
+                let obs = run
+                    .observation
+                    .expect("accepted row must reach the production adapter");
                 assert!(
                     !obs.stopped,
                     "observation must report the worker's actual stopped=false, not a hardcoded true"
