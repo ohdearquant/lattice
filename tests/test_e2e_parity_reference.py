@@ -1,6 +1,8 @@
 import importlib.util
 import json
 import math
+import os
+import sys
 import tempfile
 import unittest
 import unittest.mock
@@ -229,6 +231,28 @@ class FrozenReferenceLoaderRefusalTest(unittest.TestCase):
             p.write_text(json.dumps(self._schema_valid_fixture(partial)))
             with self.assertRaisesRegex(RuntimeError, "must name exactly"):
                 self._load_with(p)
+
+    def test_frozen_loader_failure_never_falls_back_to_live_hf(self):
+        with tempfile.TemporaryDirectory() as d:
+            model_dir = Path(d) / "model"
+            model_dir.mkdir()
+            lattice_bin = Path(d) / "lattice"
+            lattice_bin.touch()
+            with (
+                unittest.mock.patch.object(PARITY, "MODEL_DIR", str(model_dir)),
+                unittest.mock.patch.object(PARITY, "LATTICE_BIN", str(lattice_bin)),
+                unittest.mock.patch.object(PARITY, "_LATTICE_BIN_EXPLICIT", True),
+                unittest.mock.patch.object(
+                    PARITY, "REFERENCE_PATH", Path(d) / "missing.json"
+                ),
+                unittest.mock.patch.object(PARITY, "run_hf_reference") as run_hf,
+                unittest.mock.patch.object(sys, "argv", [str(SCRIPT_PATH)]),
+                unittest.mock.patch.dict(
+                    os.environ, {"GITHUB_EVENT_NAME": "pull_request"}
+                ),
+            ):
+                self.assertEqual(PARITY.main(), 2)
+                run_hf.assert_not_called()
 
 
 if __name__ == "__main__":
