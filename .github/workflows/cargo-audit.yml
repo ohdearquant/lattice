@@ -39,6 +39,8 @@ name: cargo audit
 on:
   pull_request:
     branches: [main]
+    # A required check must also report after a draft-to-ready transition.
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     branches: [main]
     types: [checks_requested]

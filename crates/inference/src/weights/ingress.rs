@@ -9,14 +9,14 @@
 //! route through immediately before a tensor view escapes to a caller, so
 //! the same class of gap cannot silently reopen at the next loader.
 //!
-//! Safetensors F32/F16/BF16 normalize to `f32` by the time they reach this
+//! Safetensors F32/F16/BF16 and native KHF1 normalize to `f32` before this
 //! seam (`SafetensorsFile::get_f32_tensor` widens F16/BF16 before
-//! returning). In-memory Q8 construction validates its decoded f32 source
-//! before quantization and its derived Q8 data/scales before returning, so
-//! the seam covers the conversion boundary as a whole. Other payload forms
-//! named in lattice#800 — raw safetensors F32/F16/BF16 bytes, decoded F64,
-//! and native Q4 blocks/bytes — are added as those loaders start calling
-//! into this seam.
+//! returning); native Q4 files stream their block metadata through it
+//! without materializing an additional payload copy. In-memory Q8
+//! construction validates its decoded f32 source before quantization and
+//! its derived Q8 data/scales before returning, so the seam covers the
+//! conversion boundary as a whole. Other payload forms named in
+//! lattice#800 are added as their loaders start calling into this seam.
 
 use crate::error::InferenceError;
 
@@ -30,10 +30,11 @@ pub(crate) struct IngestedTensor<'a> {
     source: &'a str,
     tensor_name: &'a str,
     shape: &'a [usize],
+    expected_shape: Option<&'a [usize]>,
     payload: IngestPayload<'a>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum IngestPayload<'a> {
     /// Already widened to `f32`. `dtype_label` names the *source* dtype
     /// ("F32", "F16", "BF16") for error messages — the slice itself is
@@ -44,7 +45,22 @@ enum IngestPayload<'a> {
         error_kind: IngressErrorKind,
     },
     /// Derived Q8 data and per-row scales.
-    Q8 { data: &'a [i8], scales: &'a [f32] },
+    Q8 {
+        data: &'a [i8],
+        scales: &'a [f32],
+    },
+    NativeQ4 {
+        original_len: usize,
+        block_count: usize,
+    },
+    NativeQ4Block(Q4BlockMetadata),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Q4BlockMetadata {
+    index: usize,
+    scale_bits: u16,
+    bias_bits: u16,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -62,12 +78,159 @@ impl IngressErrorKind {
     }
 }
 
-impl IngestPayload<'_> {
-    fn geometry_error(&self, message: String) -> InferenceError {
-        match self {
-            Self::DecodedF32 { error_kind, .. } => error_kind.error(message),
-            Self::Q8 { .. } => InferenceError::InvalidInput(message),
+/// Shared provenance, shape, and finite-value validator for one-pass
+/// decoders.
+///
+/// Byte-stream readers reduce raw non-finite markers while materializing
+/// each decode group, then use [`Self::finish_f64_materialization`].
+/// Narrowing writers use the shared finite-f16 encoder, then call
+/// [`Self::observe_finite`] before publishing a completed payload.
+pub(crate) struct DecodedTensorValidator<'a> {
+    source: &'a str,
+    tensor_name: &'a str,
+    shape: &'a [usize],
+    dtype_label: &'static str,
+    error_kind: IngressErrorKind,
+    numel: usize,
+    seen: usize,
+}
+
+impl<'a> DecodedTensorValidator<'a> {
+    fn new(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        dtype_label: &'static str,
+        error_kind: IngressErrorKind,
+        numel: usize,
+        decoded_len: usize,
+    ) -> Result<Self, InferenceError> {
+        if decoded_len != numel {
+            return Err(error_kind.error(format!(
+                "{source}: tensor {tensor_name} ({dtype_label}) decoded element count \
+                 {decoded_len} does not match shape {shape:?} (shape product {numel})",
+            )));
         }
+        Ok(Self {
+            source,
+            tensor_name,
+            shape,
+            dtype_label,
+            error_kind,
+            numel,
+            seen: 0,
+        })
+    }
+
+    /// Construct a validator for one SafeTensors decode.
+    pub(crate) fn safetensors(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        dtype_label: &'static str,
+        decoded_len: usize,
+    ) -> Result<Self, InferenceError> {
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                InferenceError::InvalidSafetensors(format!(
+                    "{source}: tensor {tensor_name} shape {shape:?} overflows usize element count",
+                ))
+            })?;
+        Self::new(
+            source,
+            tensor_name,
+            shape,
+            dtype_label,
+            IngressErrorKind::InvalidSafetensors,
+            numel,
+            decoded_len,
+        )
+    }
+
+    /// Construct a validator for derived values before they are serialized.
+    pub(crate) fn decoded_input(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        dtype_label: &'static str,
+        decoded_len: usize,
+    ) -> Result<Self, InferenceError> {
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "{source}: tensor {tensor_name} shape {shape:?} overflows usize element count",
+                ))
+            })?;
+        Self::new(
+            source,
+            tensor_name,
+            shape,
+            dtype_label,
+            IngressErrorKind::InvalidInput,
+            numel,
+            decoded_len,
+        )
+    }
+
+    #[cold]
+    fn reject_non_finite_at(&self, index: usize, value: f64) -> InferenceError {
+        self.error_kind.error(format!(
+            "{}: tensor {} ({}) has non-finite value {value} at element index \
+             {} of {} (shape {:?})",
+            self.source, self.tensor_name, self.dtype_label, index, self.numel, self.shape,
+        ))
+    }
+
+    #[cold]
+    fn reject_non_finite(&self, value: f64) -> InferenceError {
+        self.reject_non_finite_at(self.seen, value)
+    }
+
+    pub(crate) fn reject_f16_bits(&self, bits: u16) -> InferenceError {
+        let value = crate::weights::half_bits::f16_bits_to_f32(bits);
+        self.reject_non_finite(value as f64)
+    }
+
+    #[inline(always)]
+    pub(crate) fn observe_finite(&mut self) {
+        self.seen += 1;
+    }
+
+    /// Complete a one-pass f64 materialization whose decode loop reduced
+    /// raw non-finite markers without branching. The valid path never
+    /// traverses the materialized tensor again; only an already-invalid
+    /// input is scanned to recover its first offending index for diagnostics.
+    #[inline]
+    pub(crate) fn finish_f64_materialization(
+        self,
+        values: &[f64],
+        has_non_finite: bool,
+    ) -> Result<(), InferenceError> {
+        if has_non_finite
+            && let Some((index, &value)) = values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+        {
+            return Err(self.reject_non_finite_at(index, value));
+        }
+        Ok(())
+    }
+
+    /// Confirm the decoder observed exactly the declared element count.
+    #[inline]
+    pub(crate) fn finish(self) -> Result<(), InferenceError> {
+        if self.seen != self.numel {
+            return Err(self.error_kind.error(format!(
+                "{}: tensor {} ({}) decoder observed {} elements, expected {} for shape {:?}",
+                self.source, self.tensor_name, self.dtype_label, self.seen, self.numel, self.shape,
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -84,6 +247,7 @@ impl<'a> IngestedTensor<'a> {
             source,
             tensor_name,
             shape,
+            expected_shape: None,
             payload: IngestPayload::DecodedF32 {
                 values,
                 dtype_label,
@@ -103,6 +267,7 @@ impl<'a> IngestedTensor<'a> {
             source,
             tensor_name,
             shape,
+            expected_shape: None,
             payload: IngestPayload::DecodedF32 {
                 values,
                 dtype_label: "F32",
@@ -123,9 +288,70 @@ impl<'a> IngestedTensor<'a> {
             source,
             tensor_name,
             shape,
+            expected_shape: None,
             payload: IngestPayload::Q8 { data, scales },
         }
     }
+
+    /// Wrap native Q4 layout and optional per-block metadata for validation.
+    pub(crate) fn native_q4(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        original_len: usize,
+        block_count: usize,
+    ) -> Self {
+        Self {
+            source,
+            tensor_name,
+            shape,
+            expected_shape: None,
+            payload: IngestPayload::NativeQ4 {
+                original_len,
+                block_count,
+            },
+        }
+    }
+
+    /// Wrap one native Q4 block's serialized metadata for validation.
+    pub(crate) fn native_q4_block(
+        source: &'a str,
+        tensor_name: &'a str,
+        index: usize,
+        scale_bits: u16,
+        bias_bits: u16,
+    ) -> Self {
+        Self {
+            source,
+            tensor_name,
+            shape: &[],
+            expected_shape: None,
+            payload: IngestPayload::NativeQ4Block(Q4BlockMetadata {
+                index,
+                scale_bits,
+                bias_bits,
+            }),
+        }
+    }
+
+    /// Require the declared tensor shape to match model-config geometry.
+    pub(crate) fn with_expected_shape(mut self, expected_shape: &'a [usize]) -> Self {
+        self.expected_shape = Some(expected_shape);
+        self
+    }
+}
+
+fn checked_shape_numel(tensor: &IngestedTensor<'_>) -> Result<usize, InferenceError> {
+    tensor
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| {
+            InferenceError::InvalidSafetensors(format!(
+                "{}: tensor {} shape {:?} overflows usize element count",
+                tensor.source, tensor.tensor_name, tensor.shape,
+            ))
+        })
 }
 
 /// Validate one ingested tensor at the exact point its bytes become trusted
@@ -139,17 +365,14 @@ impl<'a> IngestedTensor<'a> {
 /// label, tensor name, dtype, shape, and (for a finite-value failure) the
 /// first offending element index.
 pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(), InferenceError> {
-    let numel = tensor
-        .shape
-        .iter()
-        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-        .ok_or_else(|| {
-            let message = format!(
-                "{}: tensor {} shape {:?} overflows usize element count",
-                tensor.source, tensor.tensor_name, tensor.shape,
-            );
-            tensor.payload.geometry_error(message)
-        })?;
+    if let Some(expected_shape) = tensor.expected_shape
+        && tensor.shape != expected_shape
+    {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "{}: tensor {} has shape {:?}, expected {:?}",
+            tensor.source, tensor.tensor_name, tensor.shape, expected_shape,
+        )));
+    }
 
     match tensor.payload {
         IngestPayload::DecodedF32 {
@@ -157,10 +380,11 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
             dtype_label,
             error_kind,
         } => {
+            let numel = checked_shape_numel(&tensor)?;
             if values.len() != numel {
                 return Err(error_kind.error(format!(
                     "{}: tensor {} ({dtype_label}) decoded element count {} does not match \
-                     shape {:?} (expected {numel})",
+                     shape {:?} (shape product {numel})",
                     tensor.source,
                     tensor.tensor_name,
                     values.len(),
@@ -183,6 +407,7 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                     tensor.source, tensor.tensor_name, tensor.shape,
                 )));
             }
+            let numel = checked_shape_numel(&tensor)?;
             if data.len() != numel {
                 return Err(InferenceError::InvalidInput(format!(
                     "{}: tensor {} (Q8) data element count {} does not match shape {:?} \
@@ -232,6 +457,46 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                     "{}: tensor {} (Q8) has non-positive scale {scale} at row {row} of \
                      {expected_scales} (shape {:?})",
                     tensor.source, tensor.tensor_name, tensor.shape,
+                )));
+            }
+            Ok(())
+        }
+        IngestPayload::NativeQ4 {
+            original_len,
+            block_count,
+        } => {
+            let numel = checked_shape_numel(&tensor)?;
+            if original_len != numel {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: tensor {} (Q4) original_len {original_len} does not match shape {:?} \
+                     (expected {numel})",
+                    tensor.source, tensor.tensor_name, tensor.shape,
+                )));
+            }
+            let expected_blocks = original_len.div_ceil(super::q4_weights::Q4_BLOCK_WEIGHTS);
+            if block_count != expected_blocks {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: tensor {} (Q4) block count {block_count} does not match original_len \
+                     {original_len} (expected {expected_blocks})",
+                    tensor.source, tensor.tensor_name,
+                )));
+            }
+            Ok(())
+        }
+        IngestPayload::NativeQ4Block(metadata) => {
+            let scale = super::half_bits::f16_bits_to_f32(metadata.scale_bits);
+            let bias = super::half_bits::f16_bits_to_f32(metadata.bias_bits);
+            if !scale.is_finite() || scale <= 0.0 {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: tensor {} (Q4) block {} has invalid scale {scale}; scale must be \
+                     finite and strictly positive",
+                    tensor.source, tensor.tensor_name, metadata.index,
+                )));
+            }
+            if !bias.is_finite() {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "{}: tensor {} (Q4) block {} has non-finite bias {bias}",
+                    tensor.source, tensor.tensor_name, metadata.index,
                 )));
             }
             Ok(())

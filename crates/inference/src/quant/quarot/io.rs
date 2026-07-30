@@ -50,6 +50,10 @@ use crate::error::InferenceError;
 use crate::model::qwen35::qwen_layer_tensor_prefix;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::plan::{OnlineRotationSpec, OnlineTransformSite};
+use crate::weights::ingress::DecodedTensorValidator;
+use crate::weights::safetensors_layout::{
+    SafetensorsLayoutEntry, safetensors_dtype, validate_safetensors_layout,
+};
 use crate::weights::{contained_shard_path, parse_index};
 
 /// On-disk storage dtype of a tensor.
@@ -97,6 +101,7 @@ struct TensorHeader {
 #[derive(Debug)]
 struct Shard {
     mmap: Mmap,
+    source: String,
     /// Absolute file offset where the data section begins
     /// (`8 + header_len`).
     data_offset: usize,
@@ -113,56 +118,14 @@ struct Shard {
 /// per-tensor validation alone would miss.
 struct ParsedEntry {
     name: String,
+    dtype: &'static str,
+    shape: Vec<usize>,
     start: usize,
     end: usize,
     /// `Some` for F32/F16/BF16; `None` for any other SafeTensors dtype.
     /// `None` entries are still kept in the contiguity check but never
     /// appear in `Shard::headers`.
     header: Option<TensorHeader>,
-}
-
-/// Bits per element for every standard SafeTensors dtype name. The
-/// bit-size variant (rather than bytes) is required because the format
-/// admits sub-byte dtypes: `F4` stores 4 bits per element, and
-/// `F6_E2M3` / `F6_E3M2` store 6 bits.
-///
-/// Returns `None` for any unrecognized dtype string. The caller MUST
-/// reject unknown dtypes rather than treat them as opaque, since they
-/// indicate either a newer SafeTensors revision the reader has not yet
-/// been updated for or a corrupted header.
-///
-/// Strictness note: the official `safetensors` Rust crate rejects
-/// unknown/invalid dtype metadata outright, and this reader follows
-/// that strict contract. Lattice's runtime weights parser
-/// ([`crate::weights::f32_weights::SafetensorsFile`]'s `parse_tensor_meta`)
-/// was more permissive prior to lattice#800 — it mapped unknown dtypes to
-/// `Ok(None)` and silently skipped the entry. As of lattice#800 it also
-/// rejects a genuinely unrecognized dtype string at parse time and tracks
-/// known-but-unsupported whole-byte dtypes (I64, BOOL, ...) structurally
-/// instead of dropping them, matching this reader's strictness for those
-/// cases. The two parsers still diverge on sub-byte dtypes (`F4`,
-/// `F6_E2M3`, `F6_E3M2`): this reader's bit-size table represents them
-/// exactly, while the runtime parser's whole-byte extent model treats them
-/// as unrecognized. Unifying the two parsers (not just their strictness) is
-/// a separate concern, tracked by the native Q4/KHF1 validation-unification
-/// and QuaRot/offline-quantizer routing issues in the lattice#800 cluster.
-///
-/// Table mirrors `Dtype::bitsize()` in the official `safetensors` Rust
-/// crate. Kept inline rather than depending on `safetensors` to match
-/// the hand-roll pattern of [`crate::weights::f32_weights`] (which also
-/// parses safetensors headers directly). When upstream adds a dtype,
-/// add it here and to the dtype-coverage regression tests.
-fn safetensors_bits_per_elem(dtype_str: &str) -> Option<usize> {
-    match dtype_str {
-        "F4" => Some(4),
-        "F6_E2M3" | "F6_E3M2" => Some(6),
-        "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" | "F8_E4M3FNUZ"
-        | "F8_E5M2FNUZ" => Some(8),
-        "I16" | "U16" | "F16" | "BF16" => Some(16),
-        "I32" | "U32" | "F32" => Some(32),
-        "I64" | "U64" | "F64" | "C64" => Some(64),
-        _ => None,
-    }
 }
 
 impl Shard {
@@ -222,12 +185,8 @@ impl Shard {
         let data_len = mmap.len() - data_offset;
 
         // Phase 1: parse every entry — including dtypes the converter
-        // doesn't decode — so we can validate offset contiguity across
-        // the whole data section. Per-tensor byte length is validated
-        // against the bit-size table of every standard SafeTensors
-        // dtype (sub-byte dtypes like F4 require the shape product to
-        // be byte-aligned), and any unrecognized dtype string is
-        // rejected outright — the runtime / official parser would.
+        // doesn't decode — so the shared validator can account for the
+        // complete data section.
         let mut parsed: Vec<ParsedEntry> = Vec::with_capacity(obj.len());
         for (name, entry) in obj {
             if name == "__metadata__" {
@@ -285,94 +244,42 @@ impl Shard {
                 ))
             })? as usize;
 
-            if start > end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: invalid data_offsets [{start}, {end})"
-                )));
-            }
-            if end > data_len {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: data_offsets end={end} past data_len={data_len}"
-                )));
-            }
-
-            let numel = shape.iter().try_fold(1usize, |acc, &dim| {
-                acc.checked_mul(dim).ok_or_else(|| {
-                    InferenceError::InvalidSafetensors(format!(
-                        "tensor {name}: shape {shape:?} overflows usize"
-                    ))
-                })
-            })?;
-            let bits = safetensors_bits_per_elem(dtype_str).ok_or_else(|| {
+            let dtype = safetensors_dtype(dtype_str).ok_or_else(|| {
                 InferenceError::InvalidSafetensors(format!(
                     "tensor {name}: unrecognized SafeTensors dtype {dtype_str:?}"
                 ))
             })?;
-            let total_bits = numel.checked_mul(bits).ok_or_else(|| {
-                InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: bit length overflows usize"
-                ))
-            })?;
-            if total_bits % 8 != 0 {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: sub-byte dtype {dtype_str} with shape {shape:?} \
-                     produces {total_bits} bits, which is not byte-aligned"
-                )));
-            }
-            let expected = total_bits / 8;
-            let actual = end - start;
-            if actual != expected {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "tensor {name}: byte length mismatch for {dtype_str} {shape:?}: \
-                     expected {expected}, got {actual}"
-                )));
-            }
 
             let header = SourceDType::from_header_str(dtype_str).map(|dtype| TensorHeader {
                 dtype,
-                shape,
+                shape: shape.clone(),
                 start,
                 end,
             });
 
             parsed.push(ParsedEntry {
                 name: name.clone(),
+                dtype: dtype.name,
+                shape,
                 start,
                 end,
                 header,
             });
         }
 
-        // Phase 2: validate that all tensor byte ranges are sorted,
-        // disjoint, contiguous from offset 0, and exhaust the data
-        // section. This mirrors the official `safetensors` crate
-        // validation rules — without it, a corrupted checkpoint could
-        // silently alias two tensor names to the same byte range (e.g.
-        // both `a` and `b` pointing at `[0, 4)`), or hide leading /
-        // trailing padding, and the converter would rotate or quantize
-        // bytes that the runtime would never load.
-        parsed.sort_by_key(|p| (p.start, p.end));
-        let mut prev_end = 0usize;
-        for p in &parsed {
-            if p.start != prev_end {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "{}: data_offsets non-contiguous at tensor {}: \
-                     expected start={prev_end}, got [{}, {})",
-                    path.display(),
-                    p.name,
-                    p.start,
-                    p.end,
-                )));
-            }
-            prev_end = p.end;
-        }
-        if prev_end != data_len {
-            return Err(InferenceError::InvalidSafetensors(format!(
-                "{}: data section is {data_len} bytes but tensors cover {prev_end} bytes \
-                 (trailing or missing payload)",
-                path.display(),
-            )));
-        }
+        // Phase 2: apply the same dtype extent, byte-alignment, and complete
+        // data-section contract as the runtime SafeTensors loader.
+        let layout: Vec<_> = parsed
+            .iter()
+            .map(|entry| SafetensorsLayoutEntry {
+                name: &entry.name,
+                dtype: entry.dtype,
+                shape: &entry.shape,
+                start: entry.start,
+                end: entry.end,
+            })
+            .collect();
+        validate_safetensors_layout(&path.display().to_string(), data_len, &layout)?;
 
         // Phase 3: expose only supported-dtype tensors via the read API.
         // Unsupported entries already had their offsets validated above
@@ -386,6 +293,7 @@ impl Shard {
 
         Ok(Shard {
             mmap,
+            source: path.display().to_string(),
             data_offset,
             headers,
         })
@@ -956,7 +864,7 @@ impl QuarotTensorReader {
             .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?
             .clone();
         let bytes = shard.tensor_bytes(name)?;
-        let data = decode_bytes_to_f64(bytes, header.dtype)?;
+        let data = decode_bytes_to_f64(bytes, header.dtype, &shard.source, name, &header.shape)?;
         Ok((data, header.shape))
     }
 
@@ -986,51 +894,153 @@ impl QuarotTensorReader {
     }
 }
 
-fn decode_bytes_to_f64(bytes: &[u8], dtype: SourceDType) -> Result<Vec<f64>, InferenceError> {
+const VALIDATED_DECODE_LANES: usize = 16;
+
+fn decode_bytes_to_f64(
+    bytes: &[u8],
+    dtype: SourceDType,
+    source: &str,
+    tensor_name: &str,
+    shape: &[usize],
+) -> Result<Vec<f64>, InferenceError> {
+    let element_width = match dtype {
+        SourceDType::F32 => 4,
+        SourceDType::F16 | SourceDType::BF16 => 2,
+    };
+    if !bytes.len().is_multiple_of(element_width) {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "{source}: tensor {tensor_name} ({}) byte length {} not divisible by \
+             element width {element_width}",
+            dtype.name(),
+            bytes.len(),
+        )));
+    }
+
+    let decoded_len = bytes.len() / element_width;
+    let validator =
+        DecodedTensorValidator::safetensors(source, tensor_name, shape, dtype.name(), decoded_len)?;
+    let mut data = Vec::with_capacity(decoded_len);
+    let mut non_finite_lanes = [false; VALIDATED_DECODE_LANES];
+
     match dtype {
         SourceDType::F32 => {
-            if !bytes.len().is_multiple_of(4) {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "F32 tensor byte length {} not divisible by 4",
-                    bytes.len()
-                )));
+            let mut groups = bytes.chunks_exact(VALIDATED_DECODE_LANES * 4);
+            for group in &mut groups {
+                let mut decoded = [0.0_f64; VALIDATED_DECODE_LANES];
+                macro_rules! decode_lane {
+                    ($lane:literal) => {{
+                        let offset = $lane * 4;
+                        let bits = u32::from_le_bytes([
+                            group[offset],
+                            group[offset + 1],
+                            group[offset + 2],
+                            group[offset + 3],
+                        ]);
+                        non_finite_lanes[$lane] |= bits & 0x7f80_0000 == 0x7f80_0000;
+                        decoded[$lane] = f32::from_bits(bits) as f64;
+                    }};
+                }
+                decode_lane!(0);
+                decode_lane!(1);
+                decode_lane!(2);
+                decode_lane!(3);
+                decode_lane!(4);
+                decode_lane!(5);
+                decode_lane!(6);
+                decode_lane!(7);
+                decode_lane!(8);
+                decode_lane!(9);
+                decode_lane!(10);
+                decode_lane!(11);
+                decode_lane!(12);
+                decode_lane!(13);
+                decode_lane!(14);
+                decode_lane!(15);
+                data.extend_from_slice(&decoded);
             }
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
-                .collect())
+            for bytes in groups.remainder().chunks_exact(4) {
+                let bits = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                non_finite_lanes[0] |= bits & 0x7f80_0000 == 0x7f80_0000;
+                data.push(f32::from_bits(bits) as f64);
+            }
         }
         SourceDType::BF16 => {
-            if !bytes.len().is_multiple_of(2) {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "BF16 tensor byte length {} not divisible by 2",
-                    bytes.len()
-                )));
+            let mut groups = bytes.chunks_exact(VALIDATED_DECODE_LANES * 2);
+            for group in &mut groups {
+                let mut decoded = [0.0_f64; VALIDATED_DECODE_LANES];
+                macro_rules! decode_lane {
+                    ($lane:literal) => {{
+                        let offset = $lane * 2;
+                        let bits = u16::from_le_bytes([group[offset], group[offset + 1]]);
+                        non_finite_lanes[$lane] |= bits & 0x7f80 == 0x7f80;
+                        decoded[$lane] = crate::weights::half_bits::bf16_bits_to_f32(bits) as f64;
+                    }};
+                }
+                decode_lane!(0);
+                decode_lane!(1);
+                decode_lane!(2);
+                decode_lane!(3);
+                decode_lane!(4);
+                decode_lane!(5);
+                decode_lane!(6);
+                decode_lane!(7);
+                decode_lane!(8);
+                decode_lane!(9);
+                decode_lane!(10);
+                decode_lane!(11);
+                decode_lane!(12);
+                decode_lane!(13);
+                decode_lane!(14);
+                decode_lane!(15);
+                data.extend_from_slice(&decoded);
             }
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|b| {
-                    crate::weights::half_bits::bf16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]))
-                        as f64
-                })
-                .collect())
+            for bytes in groups.remainder().chunks_exact(2) {
+                let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                non_finite_lanes[0] |= bits & 0x7f80 == 0x7f80;
+                data.push(crate::weights::half_bits::bf16_bits_to_f32(bits) as f64);
+            }
         }
         SourceDType::F16 => {
-            if !bytes.len().is_multiple_of(2) {
-                return Err(InferenceError::InvalidSafetensors(format!(
-                    "F16 tensor byte length {} not divisible by 2",
-                    bytes.len()
-                )));
+            let mut groups = bytes.chunks_exact(VALIDATED_DECODE_LANES * 2);
+            for group in &mut groups {
+                let mut decoded = [0.0_f64; VALIDATED_DECODE_LANES];
+                macro_rules! decode_lane {
+                    ($lane:literal) => {{
+                        let offset = $lane * 2;
+                        let bits = u16::from_le_bytes([group[offset], group[offset + 1]]);
+                        non_finite_lanes[$lane] |= bits & 0x7c00 == 0x7c00;
+                        decoded[$lane] = crate::weights::half_bits::f16_bits_to_f32(bits) as f64;
+                    }};
+                }
+                decode_lane!(0);
+                decode_lane!(1);
+                decode_lane!(2);
+                decode_lane!(3);
+                decode_lane!(4);
+                decode_lane!(5);
+                decode_lane!(6);
+                decode_lane!(7);
+                decode_lane!(8);
+                decode_lane!(9);
+                decode_lane!(10);
+                decode_lane!(11);
+                decode_lane!(12);
+                decode_lane!(13);
+                decode_lane!(14);
+                decode_lane!(15);
+                data.extend_from_slice(&decoded);
             }
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|b| {
-                    crate::weights::half_bits::f16_bits_to_f32(u16::from_le_bytes([b[0], b[1]]))
-                        as f64
-                })
-                .collect())
+            for bytes in groups.remainder().chunks_exact(2) {
+                let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+                non_finite_lanes[0] |= bits & 0x7c00 == 0x7c00;
+                data.push(crate::weights::half_bits::f16_bits_to_f32(bits) as f64);
+            }
         }
     }
+
+    let has_non_finite = non_finite_lanes.into_iter().any(|found| found);
+    validator.finish_f64_materialization(&data, has_non_finite)?;
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -1148,6 +1158,32 @@ mod tests {
         file.write_all(&payload).unwrap();
     }
 
+    fn write_raw_safetensor(
+        path: &Path,
+        tensor_name: &str,
+        dtype: FixtureDType,
+        shape: &[usize],
+        payload: &[u8],
+    ) {
+        assert_eq!(
+            payload.len(),
+            shape.iter().product::<usize>() * bytes_per_elem(dtype)
+        );
+        let header = serde_json::json!({
+            (tensor_name): {
+                "dtype": dtype_name(dtype),
+                "shape": shape,
+                "data_offsets": [0, payload.len()],
+            }
+        });
+        let header = serde_json::to_vec(&header).unwrap();
+        let mut file = File::create(path).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(&header).unwrap();
+        file.write_all(payload).unwrap();
+    }
+
     fn approx_eq(a: f64, b: f64, eps: f64) -> bool {
         (a - b).abs() <= eps
     }
@@ -1210,6 +1246,99 @@ mod tests {
         for (g, &v) in got.iter().zip(values.iter()) {
             let tol = (v.abs() as f64) * (1.0 / 1024.0) + 1e-6;
             assert!(approx_eq(*g, v as f64, tol), "got {g} expected ~{v}");
+        }
+    }
+
+    /// Mutation-sensitive lattice#801 gate: removing a raw exponent-marker
+    /// reduction makes that dtype's NaN/Inf cases return `Ok`.
+    #[test]
+    fn read_tensor_f64_rejects_non_finite_values_for_every_supported_dtype() {
+        for dtype in [FixtureDType::F32, FixtureDType::F16, FixtureDType::BF16] {
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                for bad_index in [5, 17] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("model.safetensors");
+                    let mut values = vec![1.0; 18];
+                    values[bad_index] = bad;
+                    write_safetensors(&path, &[("bad.weight", dtype, vec![18], &values)]);
+
+                    let reader = QuarotTensorReader::open(dir.path()).unwrap();
+                    let err = reader.read_tensor_f64("bad.weight").unwrap_err();
+                    match err {
+                        InferenceError::InvalidSafetensors(message) => {
+                            assert!(message.contains(&path.display().to_string()), "{message}");
+                            assert!(message.contains("bad.weight"), "{message}");
+                            assert!(message.contains(dtype_name(dtype)), "{message}");
+                            assert!(message.contains("non-finite value"), "{message}");
+                            assert!(
+                                message.contains(&format!("element index {bad_index}")),
+                                "{message}"
+                            );
+                        }
+                        other => panic!("expected InvalidSafetensors, got {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_tensor_f64_accepts_signed_zero_and_smallest_subnormal_for_every_dtype() {
+        let mut f32_bits = vec![1.0_f32.to_bits(); 18];
+        f32_bits[0] = 0;
+        f32_bits[1] = 0x8000_0000;
+        f32_bits[2] = 1;
+        f32_bits[16] = 0x8000_0000;
+        f32_bits[17] = 1;
+        let f32_payload = f32_bits
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let mut f16_bits = vec![0x3c00_u16; 18];
+        f16_bits[0] = 0;
+        f16_bits[1] = 0x8000;
+        f16_bits[2] = 1;
+        f16_bits[16] = 0x8000;
+        f16_bits[17] = 1;
+        let f16_payload = f16_bits
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        let mut bf16_bits = vec![0x3f80_u16; 18];
+        bf16_bits[0] = 0;
+        bf16_bits[1] = 0x8000;
+        bf16_bits[2] = 1;
+        bf16_bits[16] = 0x8000;
+        bf16_bits[17] = 1;
+        let bf16_payload = bf16_bits
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        for (dtype, payload, smallest_subnormal) in [
+            (FixtureDType::F32, f32_payload, 2.0_f64.powi(-149)),
+            (FixtureDType::F16, f16_payload, 2.0_f64.powi(-24)),
+            (FixtureDType::BF16, bf16_payload, 2.0_f64.powi(-133)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_raw_safetensor(
+                &dir.path().join("model.safetensors"),
+                "finite.weight",
+                dtype,
+                &[18],
+                &payload,
+            );
+
+            let reader = QuarotTensorReader::open(dir.path()).unwrap();
+            let (decoded, shape) = reader.read_tensor_f64("finite.weight").unwrap();
+            assert_eq!(shape, vec![18]);
+            assert_eq!(decoded[0].to_bits(), 0.0_f64.to_bits());
+            assert_eq!(decoded[1].to_bits(), (-0.0_f64).to_bits());
+            assert_eq!(decoded[2], smallest_subnormal, "{}", dtype_name(dtype));
+            assert_eq!(decoded[16].to_bits(), (-0.0_f64).to_bits());
+            assert_eq!(decoded[17], smallest_subnormal, "{}", dtype_name(dtype));
         }
     }
 
