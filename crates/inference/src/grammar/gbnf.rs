@@ -347,9 +347,31 @@ impl<'a> Parser<'a> {
     }
 
     fn anon_rule_name(&mut self) -> String {
-        let n = format!("__anon_{}", self.anon_counter);
+        // Angle brackets cannot be tokenized as a source identifier, so a
+        // user rule can never overwrite parser-generated state.
+        let n = format!("<gbnf-anon:{}>", self.anon_counter);
         self.anon_counter += 1;
         n
+    }
+
+    fn set_expression_alts(&mut self, id: usize, mut alts: Vec<Alt>) {
+        let has_explicit_epsilon = alts.iter().any(Vec::is_empty);
+        let has_non_empty = alts.iter().any(|alt| !alt.is_empty());
+        if !has_explicit_epsilon || !has_non_empty {
+            self.builder.set_alts(id, alts);
+            return;
+        }
+
+        // A single wrapper alternative lets nullability inspect every helper
+        // alternative while byte matching still starts from the first
+        // non-empty branch instead of committing to an epsilon-first branch.
+        alts.retain(|alt| !alt.is_empty());
+        alts.push(Vec::new());
+        let helper_name = self.anon_rule_name();
+        let helper_id = self.builder.reserve(&helper_name);
+        self.builder.set_alts(helper_id, alts);
+        self.builder
+            .set_alts(id, vec![vec![Symbol::NonTerminal(helper_id)]]);
     }
 
     // grammar = rule+
@@ -372,7 +394,7 @@ impl<'a> Parser<'a> {
         self.expect(&Token::Assign)?;
         let alts = self.parse_expr()?;
         let id = self.builder.reserve(&name);
-        self.builder.set_alts(id, alts);
+        self.set_expression_alts(id, alts);
         // Consume optional trailing newline(s)
         self.skip_newlines()?;
         Ok(())
@@ -507,7 +529,7 @@ impl<'a> Parser<'a> {
                 }
                 let rule_name = self.anon_rule_name();
                 let id = self.builder.reserve(&rule_name);
-                self.builder.set_alts(id, alts);
+                self.set_expression_alts(id, alts);
                 Ok(vec![Symbol::NonTerminal(id)])
             }
             tok => Err(GbnfError(format!("unexpected token in item: {tok:?}"))),
@@ -601,10 +623,11 @@ pub fn parse_gbnf(gbnf: &str) -> Result<CompiledGrammar, GbnfError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::pda::{GrammarState, SimResult, simulate_token};
+    use crate::grammar::pda::{GrammarState, SimResult, initial_grammar_state, simulate_token};
+    use crate::grammar::{GrammarEngine, GrammarSpec};
 
     fn accepts(grammar: &CompiledGrammar, input: &[u8]) -> bool {
-        let state = GrammarState::initial();
+        let state = initial_grammar_state(grammar);
         let (result, final_state) = simulate_token(&state, grammar, input);
         result == SimResult::Accept && final_state.is_complete()
     }
@@ -629,6 +652,79 @@ mod tests {
         assert!(accepts(&g, b"yes"));
         assert!(accepts(&g, b"no"));
         assert!(rejects(&g, b"maybe"));
+    }
+
+    #[test]
+    fn gbnf_explicit_epsilon_position_does_not_change_language() {
+        for source in ["root ::= | \"a\"\n", "root ::= \"a\" |\n"] {
+            let grammar = parse_gbnf(source).unwrap();
+            assert!(accepts(&grammar, b""), "epsilon must accept: {source:?}");
+            assert!(
+                accepts(&grammar, b"a"),
+                "non-empty sibling must remain reachable: {source:?}"
+            );
+            assert!(rejects(&grammar, b"b"), "unlisted byte: {source:?}");
+        }
+    }
+
+    #[test]
+    fn gbnf_nested_explicit_epsilon_preserves_both_continuations() {
+        let grammar = parse_gbnf("root ::= opt \"b\"\nopt ::= | \"a\"\n").unwrap();
+        assert!(accepts(&grammar, b"b"));
+        assert!(accepts(&grammar, b"ab"));
+        assert!(rejects(&grammar, b"a"));
+        assert!(rejects(&grammar, b"bb"));
+    }
+
+    #[test]
+    fn gbnf_grouped_explicit_epsilon_preserves_both_continuations() {
+        let grammar = parse_gbnf("root ::= (| \"a\") \"b\"\n").unwrap();
+        assert!(accepts(&grammar, b"b"));
+        assert!(accepts(&grammar, b"ab"));
+        assert!(rejects(&grammar, b"a"));
+    }
+
+    #[test]
+    fn gbnf_epsilon_normalization_preserves_non_empty_priority() {
+        let grammar = parse_gbnf("root ::= | \"b\" | \"a\"\n").unwrap();
+        let Symbol::NonTerminal(helper_id) = grammar.root().alts[0][0] else {
+            panic!("normalized root must delegate to one helper");
+        };
+        assert_eq!(
+            grammar.rules[helper_id].alts,
+            vec![
+                vec![Symbol::Terminal(b'b')],
+                vec![Symbol::Terminal(b'a')],
+                vec![]
+            ]
+        );
+    }
+
+    #[test]
+    fn gbnf_user_rule_cannot_overwrite_generated_epsilon_helper() {
+        let grammar = parse_gbnf("root ::= | \"a\"\n__anon_0 ::= \"z\"\n").unwrap();
+        assert!(accepts(&grammar, b""));
+        assert!(accepts(&grammar, b"a"));
+        assert!(rejects(&grammar, b"z"));
+    }
+
+    #[test]
+    fn gbnf_epsilon_first_is_reachable_through_engine_mask_and_advance() {
+        let spec = GrammarSpec::Gbnf("root ::= | \"a\"\n".to_string());
+        let engine = GrammarEngine::new(&spec, vec![b"a".to_vec(), b"b".to_vec()]).unwrap();
+        assert!(!engine.exceeds_state_budget());
+
+        let mut state = engine.initial_state();
+        assert!(state.is_complete());
+        let mut logits = vec![0.0; 2];
+        engine.mask_logits(&mut state, &mut logits).unwrap();
+        assert!(
+            logits[0].is_finite(),
+            "the non-empty sibling must be selectable"
+        );
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+        assert!(engine.advance(&mut state, 0));
+        assert!(state.is_complete());
     }
 
     #[test]
