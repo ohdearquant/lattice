@@ -29,6 +29,9 @@ LIB = REPO / "scripts" / "lib"
 
 # Exits 0 for every subcommand and prints nothing a measurement filter matches.
 STUB_CARGO = """#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+fi
 if [ "${STUB_EMIT_CRITERION_HOME:-0}" = "1" ]; then
   case " $* " in
     *" --save-baseline "*|*" --baseline "*)
@@ -39,17 +42,57 @@ fi
 exit 0
 """
 
+STUB_GOVERNOR = """#!/usr/bin/env python3
+import json
+import sys
+from datetime import UTC, datetime
+
+label = sys.argv[sys.argv.index("--label") + 1]
+print(json.dumps({
+    "schema": "lattice-machine-state-v1",
+    "label": label,
+    "captured_at_utc": datetime.now(UTC).replace(
+        microsecond=0
+    ).isoformat().replace("+00:00", "Z"),
+    "power": {"status": "measured", "source": "fixture", "state": "ac"},
+    "thermal": {
+        "status": "measured",
+        "source": "fixture",
+        "state": "nominal",
+    },
+    "idle": {
+        "status": "measured",
+        "source": "fixture",
+        "seconds": 30.0,
+    },
+    "gate": {
+        "status": "passed",
+        "cooldown_seconds": 30.0,
+        "afk_threshold_seconds": 30.0,
+        "kill_switch": "clear",
+    },
+}, separators=(",", ":"), sort_keys=True))
+"""
+
 # Test helpers invoking real Git must disable repository hooks.
 GIT = ("git", "-c", "core.hooksPath=/dev/null")
 
 STALE_CHANGE_CARGO = r"""#!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+  exit 0
+fi
+
 write_baseline() {
   local bench="$1"
   mkdir -p "$CRITERION_HOME/$bench/compare-base"
   printf '%s\n' '{"mean":{"point_estimate":90.0}}' \
     > "$CRITERION_HOME/$bench/compare-base/estimates.json"
+  printf '%s\n' \
+    '{"sampling_mode":"Linear","iters":[1.0,2.0],"times":[1.0,2.0]}' \
+    > "$CRITERION_HOME/$bench/compare-base/sample.json"
 }
 
 write_head() {
@@ -58,6 +101,9 @@ write_head() {
   mkdir -p "$CRITERION_HOME/$bench/change"
   printf '%s\n' '{"mean":{"point_estimate":100.0}}' \
     > "$CRITERION_HOME/$bench/new/estimates.json"
+  printf '%s\n' \
+    '{"sampling_mode":"Flat","iters":[1.0,2.0],"times":[1.0,2.0]}' \
+    > "$CRITERION_HOME/$bench/new/sample.json"
   printf '%s\n' \
     '{"mean":{"point_estimate":0.01,"confidence_interval":{"lower_bound":0.0,"upper_bound":0.02}}}' \
     > "$CRITERION_HOME/$bench/change/estimates.json"
@@ -129,17 +175,41 @@ def _run(
         shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
         shutil.copy2(GATE, root / "scripts" / GATE.name)
         shutil.copytree(LIB, root / "scripts" / "lib")
+        shutil.copy2(REPO / ".gitignore", root / ".gitignore")
+        governor = root / "scripts" / "perf_governor.py"
+        governor.write_text(STUB_GOVERNOR)
+        governor.chmod(0o755)
         quiet_probe = root / "scripts" / "lib" / "quiet-probe.py"
         quiet_probe.write_text(
             "#!/usr/bin/env python3\n"
             "import sys\n"
             "label = sys.argv[sys.argv.index('--label') + 1]\n"
-            "print(f'[quiet] {label}: idle 100.0% (fixture) ok')\n"
+            "print(f'[quiet] {label}: idle 100.0% (floor 0.0%) ok | top: fixture 0.0%')\n"
+        )
+        machine_probe = root / "scripts" / "lib" / "machine-state-probe.py"
+        machine_probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import datetime, json, sys\n"
+            "label = sys.argv[sys.argv.index('--label') + 1]\n"
+            "print(json.dumps({'schema':'lattice-machine-state-v1','label':label,"
+            "'captured_at_utc':datetime.datetime.now(datetime.UTC)"
+            ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
+            "'power':{'status':'unavailable','reason':'fixture'},"
+            "'thermal':{'status':'unavailable','reason':'fixture'},"
+            "'idle':{'status':'unavailable','reason':'fixture'}},"
+            "separators=(',', ':'), sort_keys=True))\n"
         )
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
         subprocess.run([*GIT, "init", "-q", "-b", "main", str(root)], check=True)
+        (root / "Cargo.lock").write_text(
+            'version = 4\n\n'
+            '[[package]]\n'
+            'name = "criterion"\n'
+            'version = "0.5.1"\n'
+        )
+        subprocess.run([*GIT, "-C", str(root), "add", "-f", "Cargo.lock"], check=True)
         for i in range(2):
             (root / f"f{i}.txt").write_text(str(i))
             subprocess.run([*GIT, "-C", str(root), "add", "-A"], check=True)
@@ -169,6 +239,15 @@ def _run(
             )
             assert src != before, f"{const} constant not found to redirect"
         locks.write_text(src)
+        subprocess.run(
+            [*GIT, "-C", str(root), "add", "scripts/lib/bench-locks.py"],
+            check=True,
+        )
+        subprocess.run(
+            [*GIT, "-C", str(root), "commit", "-qm", "fixture lock paths"],
+            check=True,
+            env=env_git,
+        )
 
         bindir = Path(tmp) / "bin"
         bindir.mkdir()
@@ -189,6 +268,7 @@ def _run(
             **os.environ,
             "PATH": f"{bindir}:{os.environ['PATH']}",
             "BENCH_IDLE_FLOOR": "0",
+            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
             **(extra_env or {}),
             "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
