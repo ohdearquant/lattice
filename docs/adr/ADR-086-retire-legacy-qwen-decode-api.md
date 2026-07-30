@@ -35,11 +35,11 @@ Their surviving callers and tests remain independent of the removed decode loop.
 
 ### Alternatives Considered
 
-| Alternative | Pros | Cons | Why Not |
-| ----------- | ---- | ---- | ------- |
-| Keep the deprecated stack indefinitely | No downstream source break | Maintains a second uncalled decode loop and invites fixes to drift between paths | The announced compatibility window has elapsed |
-| Move the old attention helper to a benchmark-only module | Preserves historical Criterion names | Measures no production dispatch path and can create misleading performance evidence | Benchmarks must represent live behavior |
-| Adapt the old function to delegate to Qwen3.5 | Keeps the symbol | The model, configuration, cache, and output types are not drop-in compatible | A wrapper would either change semantics silently or retain the duplicate types |
+| Alternative                                              | Pros                                 | Cons                                                                                | Why Not                                                                        |
+| -------------------------------------------------------- | ------------------------------------ | ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| Keep the deprecated stack indefinitely                   | No downstream source break           | Maintains a second uncalled decode loop and invites fixes to drift between paths    | The announced compatibility window has elapsed                                 |
+| Move the old attention helper to a benchmark-only module | Preserves historical Criterion names | Measures no production dispatch path and can create misleading performance evidence | Benchmarks must represent live behavior                                        |
+| Adapt the old function to delegate to Qwen3.5            | Keeps the symbol                     | The model, configuration, cache, and output types are not drop-in compatible        | A wrapper would either change semantics silently or retain the duplicate types |
 
 ## Consequences
 

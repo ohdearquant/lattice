@@ -18,38 +18,38 @@ inference engine itself.
 
 These modules contain submodules (directories with their own `mod.rs`).
 
-| Module | Responsibility |
-|--------|---------------|
-| `attention` | Attention kernel variants: standard MHA, GQA, flash (CPU tiled), flash-causal (decoder prefill), GDN (gated decay network), GDN-fused, native sparse, and differential. Exposes `AttentionTag` for typed dispatch. |
-| `forward` | Compute backends: scalar CPU, NEON (AArch64), Metal (macOS MSL), WGPU, Q8/f16 CPU kernels, tiled GEMM (`metal_gemm`, `gpu_gemm`), batched prefill, and BitNet kernel. Exports `matmul_bt`, `rms_norm`, `silu_inplace`, `elementwise_mul` from the CPU submodule. |
-| `model` | Model configs and loaders: `BertModel`/`BertConfig`, `QwenModel`/`QwenConfig`, `Qwen35Model`, `CrossEncoderModel`, `BitNet` config. Each submodule owns its safetensors load path and forward-pass dispatch. |
-| `tokenizer` | Tokenizer implementations: `WordPieceTokenizer` (BERT), `BpeTokenizer` (Qwen3/GPT-2 byte-level), `SentencePieceTokenizer`. Shared `Tokenizer` trait and `load_tokenizer` auto-detect helper live in `tokenizer/common.rs`. |
-| `vision` | Qwen3-VL vision encoder (ADR-049): ViT forward pass, patch preprocessing, MLP merger, `MultimodalInput` type. CPU-only; Metal GPU path is deferred. |
-| `weights` | Weight storage formats (`Tensor2D`), safetensors memory-mapped loading, f32/f16/Q8/Q4 weight structs, sharded-checkpoint support. |
+| Module      | Responsibility                                                                                                                                                                                                                                                   |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `attention` | Attention kernel variants: standard MHA, GQA, flash (CPU tiled), flash-causal (decoder prefill), GDN (gated decay network), GDN-fused, native sparse, and differential. Exposes `AttentionTag` for typed dispatch.                                               |
+| `forward`   | Compute backends: scalar CPU, NEON (AArch64), Metal (macOS MSL), WGPU, Q8/f16 CPU kernels, tiled GEMM (`metal_gemm`, `gpu_gemm`), batched prefill, and BitNet kernel. Exports `matmul_bt`, `rms_norm`, `silu_inplace`, `elementwise_mul` from the CPU submodule. |
+| `model`     | Model configs and loaders: `BertModel`/`BertConfig`, `QwenModel`/`QwenConfig`, `Qwen35Model`, `CrossEncoderModel`, `BitNet` config. Each submodule owns its safetensors load path and forward-pass dispatch.                                                     |
+| `tokenizer` | Tokenizer implementations: `WordPieceTokenizer` (BERT), `BpeTokenizer` (Qwen3/GPT-2 byte-level), `SentencePieceTokenizer`. Shared `Tokenizer` trait and `load_tokenizer` auto-detect helper live in `tokenizer/common.rs`.                                       |
+| `vision`    | Qwen3-VL vision encoder (ADR-049): ViT forward pass, patch preprocessing, MLP merger, `MultimodalInput` type. CPU-only; Metal GPU path is deferred.                                                                                                              |
+| `weights`   | Weight storage formats (`Tensor2D`), safetensors memory-mapped loading, f32/f16/Q8/Q4 weight structs, sharded-checkpoint support.                                                                                                                                |
 
 ### Standalone modules
 
-| Module | Responsibility |
-|--------|---------------|
-| `batch` | Continuous batching engine (ADR-048): `BatchWorker`, `FifoScheduler`, `Sequence`, `SequenceManager`, chunked prefill interleaved with decode steps. |
-| `download` | Model file cache and conditional download (`ensure_model_files`). Disabled unless the `download` feature is enabled. |
-| `error` | `InferenceError` — the crate's single error type, re-exported at the crate root. Stable; adding variants is backward-compatible. |
-| `grammar` | Grammar-constrained decoding (ADR-046): `GrammarEngine` compiles a JSON Schema or GBNF spec to a byte-level PDA, then masks logits via `mask_logits` and advances state via `advance` each decode step. |
-| `kv_cache` | Two KV cache implementations: `FlatKVCache` (contiguous pre-allocated, single request) and `PagedKVCache` (256-token pages, LRU eviction, multi-model serving). Includes `PrefixPageCache` for prefix reuse. |
-| `lora_hook` | `LoraHook` trait: defines the `apply(layer_idx, module, x, output)` contract that the forward pass calls after each linear projection. `NoopLoraHook` is the zero-overhead default. |
-| `metrics` | Inference metrics (ADR-061): `MetricsMode` enum and `LayerMetrics` schema. Zero overhead when `MetricsMode::Off`. |
-| `pool` | Pooling strategies for producing a single embedding vector: `BertPooling` (Mean or CLS), `mean_pool`, `cls_pool`, `last_token_pool` (Qwen3), `l2_normalize`. |
-| `pruning` | ShortGPT block-influence scorer (ADR-060 D2 seed): `BlockInfluenceAccumulator` and `BlockInfluence`. Standalone math; the calibration pipeline hooks are future work. |
-| `quant` | Quantization pre-transforms: `quarot` (Walsh-Hadamard rotation primitives, ADR-044). Not yet wired into the Q4 weight path. |
-| `rope` | Rotary position embeddings: `RopeTable` precomputes sin/cos tables and applies them in-place to Q and K slices before attention. |
-| `sampling` | Token sampling for generation: `Sampler`, `SamplingConfig` (temperature, top-k, top-p, repetition penalty). |
-| `speculative` | N-gram prompt-lookup speculative decoding: `NgramSpeculator::speculate` + `verify_draft` (low-level) and `generate_with_speculation` (high-level wrapper). |
+| Module        | Responsibility                                                                                                                                                                                               |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `batch`       | Continuous batching engine (ADR-048): `BatchWorker`, `FifoScheduler`, `Sequence`, `SequenceManager`, chunked prefill interleaved with decode steps.                                                          |
+| `download`    | Model file cache and conditional download (`ensure_model_files`). Disabled unless the `download` feature is enabled.                                                                                         |
+| `error`       | `InferenceError` — the crate's single error type, re-exported at the crate root. Stable; adding variants is backward-compatible.                                                                             |
+| `grammar`     | Grammar-constrained decoding (ADR-046): `GrammarEngine` compiles a JSON Schema or GBNF spec to a byte-level PDA, then masks logits via `mask_logits` and advances state via `advance` each decode step.      |
+| `kv_cache`    | Two KV cache implementations: `FlatKVCache` (contiguous pre-allocated, single request) and `PagedKVCache` (256-token pages, LRU eviction, multi-model serving). Includes `PrefixPageCache` for prefix reuse. |
+| `lora_hook`   | `LoraHook` trait: defines the `apply(layer_idx, module, x, output)` contract that the forward pass calls after each linear projection. `NoopLoraHook` is the zero-overhead default.                          |
+| `metrics`     | Inference metrics (ADR-061): `MetricsMode` enum and `LayerMetrics` schema. Zero overhead when `MetricsMode::Off`.                                                                                            |
+| `pool`        | Pooling strategies for producing a single embedding vector: `BertPooling` (Mean or CLS), `mean_pool`, `cls_pool`, `last_token_pool` (Qwen3), `l2_normalize`.                                                 |
+| `pruning`     | ShortGPT block-influence scorer (ADR-060 D2 seed): `BlockInfluenceAccumulator` and `BlockInfluence`. Standalone math; the calibration pipeline hooks are future work.                                        |
+| `quant`       | Quantization pre-transforms: `quarot` (Walsh-Hadamard rotation primitives, ADR-044). Not yet wired into the Q4 weight path.                                                                                  |
+| `rope`        | Rotary position embeddings: `RopeTable` precomputes sin/cos tables and applies them in-place to Q and K slices before attention.                                                                             |
+| `sampling`    | Token sampling for generation: `Sampler`, `SamplingConfig` (temperature, top-k, top-p, repetition penalty).                                                                                                  |
+| `speculative` | N-gram prompt-lookup speculative decoding: `NgramSpeculator::speculate` + `verify_draft` (low-level) and `generate_with_speculation` (high-level wrapper).                                                   |
 
 ### Feature-gated modules
 
-| Module | Feature flag | Responsibility |
-|--------|-------------|----------------|
-| `mixture` | `mixture` | Adapter routing and mixture-of-LoRA support layered on top of `lora_hook`. |
+| Module     | Feature flag     | Responsibility                                                                                                                     |
+| ---------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `mixture`  | `mixture`        | Adapter routing and mixture-of-LoRA support layered on top of `lora_hook`.                                                         |
 | `backward` | `train-backward` | Reverse-mode autodiff for LoRA training: `tape`, `ops`, `attention_gqa`, `gradcheck`. Submodule of `lattice-tune`'s training loop. |
 
 ---
@@ -79,13 +79,13 @@ A deeper Qwen3.5-specific walkthrough lives in `docs/forward-pass.md`.
 
 ## Supported Architectures
 
-| Architecture | Submodule | Notes |
-|---|---|---|
-| BERT / BGE (encoder-only) | `model/bert.rs` | Bidirectional attention, WordPiece tokenizer, mean or CLS pooling. Covers BGE-small/base/large, E5-small/base, all-MiniLM, paraphrase-multilingual-MiniLM. |
-| Qwen3 / Qwen3.5 (decoder-only) | `model/qwen.rs`, `model/qwen35/` | Causal GQA, RoPE, RMSNorm, SwiGLU FFN, BPE tokenizer, last-token pooling. Covers Qwen3-Embedding-0.6B and 4B. |
-| BitNet | `model/bitnet_config.rs` | 1.58-bit quantized weight architecture. |
-| Qwen3-VL (vision) | `vision/` | ViT patch encoder + MLP merger for multimodal input; CPU-only (ADR-049 v0 scope). |
-| Cross-encoder | `model/cross_encoder.rs` | BERT-style reranker with a classification head on top of the CLS token. |
+| Architecture                   | Submodule                        | Notes                                                                                                                                                      |
+| ------------------------------ | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| BERT / BGE (encoder-only)      | `model/bert.rs`                  | Bidirectional attention, WordPiece tokenizer, mean or CLS pooling. Covers BGE-small/base/large, E5-small/base, all-MiniLM, paraphrase-multilingual-MiniLM. |
+| Qwen3 / Qwen3.5 (decoder-only) | `model/qwen.rs`, `model/qwen35/` | Causal GQA, RoPE, RMSNorm, SwiGLU FFN, BPE tokenizer, last-token pooling. Covers Qwen3-Embedding-0.6B and 4B.                                              |
+| BitNet                         | `model/bitnet_config.rs`         | 1.58-bit quantized weight architecture.                                                                                                                    |
+| Qwen3-VL (vision)              | `vision/`                        | ViT patch encoder + MLP merger for multimodal input; CPU-only (ADR-049 v0 scope).                                                                          |
+| Cross-encoder                  | `model/cross_encoder.rs`         | BERT-style reranker with a classification head on top of the CLS token.                                                                                    |
 
 ---
 

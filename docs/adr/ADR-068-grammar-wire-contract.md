@@ -42,11 +42,11 @@ responsibility.
 
 The ecosystem offers **three incompatible conventions**, not one:
 
-| Pattern | Representative servers | Shape |
-| ------- | ---------------------- | ----- |
-| A — sibling field outside `response_format` | vLLM, SGLang, llama.cpp | grammar is a parallel request field; `response_format` stays JSON-only |
-| B — folded into the `response_format.type` enum | Fireworks | `{ "type": "grammar", "grammar": "<BNF>" }` as a peer of `json_object`/`text` |
-| C — separate tool-scoped primitive | OpenAI Custom Tools | constrains one tool-call argument (Lark/regex), not the message |
+| Pattern                                         | Representative servers  | Shape                                                                         |
+| ----------------------------------------------- | ----------------------- | ----------------------------------------------------------------------------- |
+| A — sibling field outside `response_format`     | vLLM, SGLang, llama.cpp | grammar is a parallel request field; `response_format` stays JSON-only        |
+| B — folded into the `response_format.type` enum | Fireworks               | `{ "type": "grammar", "grammar": "<BNF>" }` as a peer of `json_object`/`text` |
+| C — separate tool-scoped primitive              | OpenAI Custom Tools     | constrains one tool-call argument (Lark/regex), not the message               |
 
 One thing does converge across the field: the grammar **text format**. llama.cpp's GBNF is the
 de-facto lineage; the widely-used masking libraries follow that EBNF spelling. **Lattice's engine
@@ -151,11 +151,11 @@ older/standard clients are unaffected):
 ```jsonc
 {
   "model": "qwen3.5-0.8b-q4",
-  "messages": [ { "role": "user", "content": "..." } ],
+  "messages": [{ "role": "user", "content": "..." }],
 
   // Channel 1 — OpenAI-standard, unchanged passthrough (Phase 1 / issue #588).
   "response_format": {
-    "type": "json_schema",                 // "text" | "json_object" | "json_schema"
+    "type": "json_schema", // "text" | "json_object" | "json_schema"
     "json_schema": {
       "name": "person",
       "strict": true,
@@ -171,8 +171,8 @@ older/standard clients are unaffected):
   // Channel 2 — lattice extension (Phase 2). MUTUALLY EXCLUSIVE with a constraining
   // response_format above. A standard OpenAI client never sends this field.
   "grammar": {
-    "syntax": "gbnf",                      // accepted today: "gbnf" | "json_schema".
-                                           // any other value -> 400 unsupported_grammar_syntax.
+    "syntax": "gbnf", // accepted today: "gbnf" | "json_schema".
+    // any other value -> 400 unsupported_grammar_syntax.
     "definition": "root ::= \"<lvar \" name \">\" body \"</lvar>\"\nname ::= [a-zA-Z_][a-zA-Z0-9_]*\nbody ::= [^<]*"
   }
 }
@@ -199,14 +199,14 @@ header may signal that a constraint was active, without touching the JSON a clie
 
 Error taxonomy (all fail-closed; `type: "invalid_request_error"` unless noted):
 
-| Code | HTTP | When |
-| ---- | ---- | ---- |
-| `unsupported_response_format` | 400 | `response_format.type` not in the accepted set |
-| `unsupported_grammar_syntax` | 400 | `grammar.syntax` not currently compilable |
-| `conflicting_constraints` | 400 | both `grammar` and a constraining `response_format` present |
-| `grammar_parse_error` | 400 | malformed GBNF / invalid JSON-Schema |
-| `grammar_too_complex` | 400 | exceeds a parse-time complexity cap |
-| `grammar_compile_rate_exceeded` | 429 | too many distinct-grammar compiles in the window |
+| Code                            | HTTP | When                                                        |
+| ------------------------------- | ---- | ----------------------------------------------------------- |
+| `unsupported_response_format`   | 400  | `response_format.type` not in the accepted set              |
+| `unsupported_grammar_syntax`    | 400  | `grammar.syntax` not currently compilable                   |
+| `conflicting_constraints`       | 400  | both `grammar` and a constraining `response_format` present |
+| `grammar_parse_error`           | 400  | malformed GBNF / invalid JSON-Schema                        |
+| `grammar_too_complex`           | 400  | exceeds a parse-time complexity cap                         |
+| `grammar_compile_rate_exceeded` | 429  | too many distinct-grammar compiles in the window            |
 
 ## Refutation (the assumptions, attacked)
 
@@ -229,7 +229,7 @@ rejected.
 breaks "just compile to GBNF." Found one genuine theoretical breaker and showed why it does not
 change the decision:
 
-- *Context-sensitive constraints* — e.g. a closing tag that must echo the opening tag's name over an
+- _Context-sensitive constraints_ — e.g. a closing tag that must echo the opening tag's name over an
   unbounded identifier alphabet (`<lvar foo>...</lvar foo>` where the closer must equal `foo`). This
   is the classic copy-language / matched-name case. A PDA can balance brackets but cannot copy an
   arbitrary-length name pulled from an open alphabet — that is context-sensitive, and **no
@@ -240,12 +240,12 @@ change the decision:
   while cross-reference and semantic constraints (name-matching, type-checking, define-before-use) are
   enforced by the **host after generation**. So this breaker is real but out of scope for any masking
   engine, and is correctly handled host-side, not by widening lattice's wire.
-- *Ambiguity requiring Earley/GLR* — irrelevant to masking. Constrained decoding never needs to fully
+- _Ambiguity requiring Earley/GLR_ — irrelevant to masking. Constrained decoding never needs to fully
   parse; it only asks "does any legal continuation exist?", which the PDA-with-stack answers. There is
   a real engine limitation here (the backtracker does not rewind consumed bytes, causing some
   shared-prefix `anyOf` over-accept/over-reject), but that is an **engine correctness** matter tracked
   under #310/#322 and explicitly out of scope for this wire ADR.
-- *Unbounded/lazy repetition terminals* — a documented failure class for grammar maskers generally
+- _Unbounded/lazy repetition terminals_ — a documented failure class for grammar maskers generally
   (OpenAI's own CFG feature documents it). Lattice should document the same caveat; it is not a reason
   to change the wire.
 
@@ -286,15 +286,15 @@ thin, stable seam.
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why Not |
-| ----------- | ---- | ---- | ------- |
-| (a) `response_format.type = "grammar"` (Fireworks) | Minimal surface; one field | Pollutes an enum OpenAI clients validate; conflates clean-passthrough with lattice extension | Rejected — risks breaking strict OpenAI clients; muddies the two audiences |
-| (c) OpenAI Custom-Tool-CFG (Lark, tool-scoped) | Forward-compat with OpenAI SDK tool call sites | Wrong semantic scope (one argument, not the message); Chat-Completions support unverified; needs a Lark front-end lattice lacks | Rejected — semantic mismatch + engine work explicitly out of scope |
-| Put custom grammars inside `response_format.grammar` sub-object | Keeps one top-level field | Still couples the lattice extension to the OpenAI object; a client that echoes `response_format` back or validates it can choke | Rejected — sibling field keeps the passthrough truly pure |
-| One ADR owning LNDL-to-GBNF too | Single narrative | Puts an unstable, externally-owned grammar inside a semver crate ADR | Rejected — see R4; split to a host-side doc |
-| Hard-code LNDL syntax in the Rust engine | No host compiler needed | Couples lattice releases to a parked DSL; guaranteed rework | Rejected — see Fork 3 |
-| Caching only (no rate limit), per #588 as written | Simple | Defeated by distinct-grammar flood (R3) | Rejected — pair cache with rate-limit + parse-time caps |
-| Add response-body grammar metadata | Observability | Forks the response shape; breaks OpenAI response parsers | Rejected — use an optional response header instead |
+| Alternative                                                     | Pros                                           | Cons                                                                                                                            | Why Not                                                                    |
+| --------------------------------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| (a) `response_format.type = "grammar"` (Fireworks)              | Minimal surface; one field                     | Pollutes an enum OpenAI clients validate; conflates clean-passthrough with lattice extension                                    | Rejected — risks breaking strict OpenAI clients; muddies the two audiences |
+| (c) OpenAI Custom-Tool-CFG (Lark, tool-scoped)                  | Forward-compat with OpenAI SDK tool call sites | Wrong semantic scope (one argument, not the message); Chat-Completions support unverified; needs a Lark front-end lattice lacks | Rejected — semantic mismatch + engine work explicitly out of scope         |
+| Put custom grammars inside `response_format.grammar` sub-object | Keeps one top-level field                      | Still couples the lattice extension to the OpenAI object; a client that echoes `response_format` back or validates it can choke | Rejected — sibling field keeps the passthrough truly pure                  |
+| One ADR owning LNDL-to-GBNF too                                 | Single narrative                               | Puts an unstable, externally-owned grammar inside a semver crate ADR                                                            | Rejected — see R4; split to a host-side doc                                |
+| Hard-code LNDL syntax in the Rust engine                        | No host compiler needed                        | Couples lattice releases to a parked DSL; guaranteed rework                                                                     | Rejected — see Fork 3                                                      |
+| Caching only (no rate limit), per #588 as written               | Simple                                         | Defeated by distinct-grammar flood (R3)                                                                                         | Rejected — pair cache with rate-limit + parse-time caps                    |
+| Add response-body grammar metadata                              | Observability                                  | Forks the response shape; breaks OpenAI response parsers                                                                        | Rejected — use an optional response header instead                         |
 
 ## Relationship to issue #588
 

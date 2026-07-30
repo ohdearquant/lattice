@@ -47,12 +47,12 @@ The Qwen3.5 forward pass calls `deinterleave_q_gate` and `apply_sigmoid_gate` (e
 
 ## Alternatives Considered
 
-| Alternative | Pros | Cons | Why Not |
-|---|---|---|---|
-| Keep gate inlined in Qwen3.5 forward pass | Zero abstraction overhead | Not reusable; duplicated when adding Qwen3-Next support | Reuse across model architectures justifies extraction |
-| Trait-based `GatedAttention` wrapping full SDPA | Clean interface | Duplicates GQA/MHA compute; gate is a modifier, not a replacement | Free functions compose better with existing attention modules |
-| Separate `gate_proj` weight tensor | Cleaner weight loading | Released Qwen3.5/Qwen3-Next checkpoints pack gate into `q_proj`; a separate tensor requires repacking on load | Match the checkpoint format; repacking is a loader concern |
-| Standard `exp()` instead of fast-exp | Higher accuracy | 2–3× slower; softmax.rs already establishes the fast-exp precedent | Consistency with existing SIMD strategy; accuracy is sufficient for gating |
+| Alternative                                     | Pros                      | Cons                                                                                                          | Why Not                                                                    |
+| ----------------------------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| Keep gate inlined in Qwen3.5 forward pass       | Zero abstraction overhead | Not reusable; duplicated when adding Qwen3-Next support                                                       | Reuse across model architectures justifies extraction                      |
+| Trait-based `GatedAttention` wrapping full SDPA | Clean interface           | Duplicates GQA/MHA compute; gate is a modifier, not a replacement                                             | Free functions compose better with existing attention modules              |
+| Separate `gate_proj` weight tensor              | Cleaner weight loading    | Released Qwen3.5/Qwen3-Next checkpoints pack gate into `q_proj`; a separate tensor requires repacking on load | Match the checkpoint format; repacking is a loader concern                 |
+| Standard `exp()` instead of fast-exp            | Higher accuracy           | 2–3× slower; softmax.rs already establishes the fast-exp precedent                                            | Consistency with existing SIMD strategy; accuracy is sufficient for gating |
 
 ---
 

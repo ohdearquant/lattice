@@ -33,12 +33,12 @@ Three facts shape everything below:
 2. **f16 KV already shipped and measured decode-neutral on the production model.** PR #238 (merged)
    found f16 KV correct (PPL Δ≈4e-6) and decode-neutral (71.6 vs 72.8 tok/s @1k ctx) on Qwen3.5-0.8B,
    because the model is GDN-dominated: only 6 of 24 layers carry a KV cache, so KV reads are <1% of
-   per-token weight-read bandwidth. Its own conclusion: *"The real decode lever is weight
-   quantization, not KV dtype."* This reframes KV-quant as a **memory-capacity** lever, not a
+   per-token weight-read bandwidth. Its own conclusion: _"The real decode lever is weight
+   quantization, not KV dtype."_ This reframes KV-quant as a **memory-capacity** lever, not a
    decode-throughput one, on this GDN-hybrid family.
 3. **Apple GPUs have no low-precision matrix unit.** As with weight quant (ADR-072), int8/int4 KV is
    a storage/bandwidth play only — values dequantize to f16/f32 before the QK^T and P·V matmuls.
-   There is no compute-cost reduction. And PR #238 already shows that even *halving* KV bandwidth
+   There is no compute-cost reduction. And PR #238 already shows that even _halving_ KV bandwidth
    (f32→f16, free of dequant complexity) bought ~0% decode at 1k context. So a fused int8/int4 kernel
    adds real complexity for a payoff capped below KV's actual bandwidth share — the one number nobody
    has measured (#491, open, unrun).
@@ -50,20 +50,20 @@ Each row is tagged **runtime-measured** (a bench/eval on this hardware), **unit-
 merged code on `origin/main @ 454245434`), with its most durable public pointer. Internal profiling
 with no merged artifact says so.
 
-| # | Finding | How known | Pointer |
-|---|---------|-----------|---------|
-| KV1 | **Production serving uses `MetalKvCache`**: GPU-resident, separate `k_bufs`/`v_bufs: Vec<Buffer>` per full-attention layer, flat `[max_cache_len * kv_dim]`. Both serving binaries build `MetalQwen35State` directly — neither touches `FlatKVCache` or `PagedKVCache`. | source-read | `forward/metal_qwen35.rs:1166-1180`; `bin/chat_metal.rs:783`, `bin/lattice_serve.rs:989,1134` |
-| KV2 | **`MetalKvCache` dtype defaults to f32; f16 is opt-in** via `LATTICE_KV_F16=1` at construction (read at 4 sites, must agree). Doc: *"store KV cache in f16 (default OFF, opt-in)"*; f32 is byte-identical to the pre-#154 path. | source-read | field `metal_qwen35.rs:1828-1835`; env reads `:3218-3223,:3481-3486,:14243-14251,:17358-17363` |
-| KV3 | **f16 KV measured correct + decode-NEUTRAL (Qwen3.5-0.8B, real Metal)**: greedy-parity exact; PPL f32 4.3365 vs f16 4.3365 (Δ≈4e-6 NLL, under the 0.05 gate); decode 71.6 (f32) vs 72.8 tok/s (f16) @1k ctx, neutral within noise. PR conclusion verbatim: *"The real decode lever is weight quantization (Q4 vs Q8), not KV dtype."* **Artifact is the PR body, not a committed bench file.** | runtime-measured (PR-body artifact) | `gh pr view 238` (MERGED 2026-06-24), title "opt-in f16 KV cache for Metal GQA path (#154)" |
-| KV4 | **CI exercises the f16 Metal KV path for execution-capability** (not perf): a test with `LATTICE_KV_F16=1`+path-proof enforce fails-closed unless all four f16 KV kernels actually dispatch. | gate-pinned | `gh pr view 558` (MERGED 2026-07-02, "cover f16 KV-cache Metal path (#252)") |
-| KV5 | **#252's original bar (greedy first-N parity f16-vs-f32) is broader than KV4's dispatch-proof; #252 stays OPEN despite #558.** Whether the remaining gap is parity-test specificity or a self-hosted perf leg is **not independently verified here** — do not assume #558 fully closed it. | source-read (state) + flagged | `gh issue view 252` (OPEN); PR #558 body's own "does not cover" disclaimer |
-| KV6 | **The remaining CPU `FlatKVCache` is always f16**, used by MTP CPU verification scratch and test/benchmark fixtures — not production serving. No f32/f16 toggle. | source-read | `kv_cache/flat.rs`; `speculative.rs:495,654-664` |
-| KV7 | **Continuous-batching engine KV cache is f32-only** (`PagedKVCache` `Vec<f32>`, `PrefixPageCache` `Arc<[f32]>`), consumed only by `batch/*`, **not wired into either serving binary** (zero `PagedKVCache`/`BatchWorker` hits in both). Third, currently-unserved path. | source-read | `kv_cache/paged.rs:14,146,148`; `kv_cache/prefix.rs:3,59-60`; `batch/worker.rs:28,600-630` |
-| KV8 | **Cross-turn KV prefix reuse (#462/#619) is a logical handle over the live `MetalKvCache`** — owns no storage, is dtype-aware (`kv_f16: bool`), composes with whichever KV2 dtype is active. | source-read | `kv_cache/cross_turn.rs:59-76` |
-| KV9 | **Per-token KV bytes = `num_full_attention_layers * 2 * full_kv_dim * dtype_bytes`**, `full_kv_dim = num_key_value_heads * head_dim`; tested formula backing the `doctor` memory-fit preflight. Worked example: 0.8B f16 = 6·2·512·2 = 12,288 B/tok ≈ 48 MiB @4096 ctx. | gate-pinned + source-read | `model/qwen35_config.rs:517-539,552-571` |
-| KV10 | **Actual model shapes** (correct any prior-art assuming a generic GQA shape): 0.8B — 24 layers, `full_attention_interval=4` → 6 full-attn, `kv_heads=2`, `head_dim=256` → `full_kv_dim=512`. 27B — 64 layers → 16 full-attn, `kv_heads=4`, `head_dim=256` → `full_kv_dim=1024`. Interval=4 constant across every preset. | source-read | `model/qwen35_config.rs:212-260` (0.8b), `:302-338` (27b) |
-| KV11 | **No int8/int4/fp8 KV path exists anywhere** — exhaustive grep of `crates/inference/src/` returns zero (`enum KvFormat` = 0 hits; the `KvFormat{F32,F16,I8,I4}` sketch in ADR-062 §Phase-4/5 was never implemented). Nearby "quant" hits are unrelated *weight* quantization. | source-read (absence, verified vs origin/main) | design sketch only: `docs/adr/ADR-062-metal-fa2-prefill.md:313-331` |
-| KV12 | **No long-context retrieval harness exists** (needle/passkey/RULER/LongBench — zero hits). Any int8/int4 quality gate beyond a single-corpus PPL number must be built from scratch. | source-read (absence) | grep of `crates/inference/` |
+| #    | Finding                                                                                                                                                                                                                                                                                                                                                                                        | How known                                      | Pointer                                                                                        |
+| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| KV1  | **Production serving uses `MetalKvCache`**: GPU-resident, separate `k_bufs`/`v_bufs: Vec<Buffer>` per full-attention layer, flat `[max_cache_len * kv_dim]`. Both serving binaries build `MetalQwen35State` directly — neither touches `FlatKVCache` or `PagedKVCache`.                                                                                                                        | source-read                                    | `forward/metal_qwen35.rs:1166-1180`; `bin/chat_metal.rs:783`, `bin/lattice_serve.rs:989,1134`  |
+| KV2  | **`MetalKvCache` dtype defaults to f32; f16 is opt-in** via `LATTICE_KV_F16=1` at construction (read at 4 sites, must agree). Doc: _"store KV cache in f16 (default OFF, opt-in)"_; f32 is byte-identical to the pre-#154 path.                                                                                                                                                                | source-read                                    | field `metal_qwen35.rs:1828-1835`; env reads `:3218-3223,:3481-3486,:14243-14251,:17358-17363` |
+| KV3  | **f16 KV measured correct + decode-NEUTRAL (Qwen3.5-0.8B, real Metal)**: greedy-parity exact; PPL f32 4.3365 vs f16 4.3365 (Δ≈4e-6 NLL, under the 0.05 gate); decode 71.6 (f32) vs 72.8 tok/s (f16) @1k ctx, neutral within noise. PR conclusion verbatim: _"The real decode lever is weight quantization (Q4 vs Q8), not KV dtype."_ **Artifact is the PR body, not a committed bench file.** | runtime-measured (PR-body artifact)            | `gh pr view 238` (MERGED 2026-06-24), title "opt-in f16 KV cache for Metal GQA path (#154)"    |
+| KV4  | **CI exercises the f16 Metal KV path for execution-capability** (not perf): a test with `LATTICE_KV_F16=1`+path-proof enforce fails-closed unless all four f16 KV kernels actually dispatch.                                                                                                                                                                                                   | gate-pinned                                    | `gh pr view 558` (MERGED 2026-07-02, "cover f16 KV-cache Metal path (#252)")                   |
+| KV5  | **#252's original bar (greedy first-N parity f16-vs-f32) is broader than KV4's dispatch-proof; #252 stays OPEN despite #558.** Whether the remaining gap is parity-test specificity or a self-hosted perf leg is **not independently verified here** — do not assume #558 fully closed it.                                                                                                     | source-read (state) + flagged                  | `gh issue view 252` (OPEN); PR #558 body's own "does not cover" disclaimer                     |
+| KV6  | **The remaining CPU `FlatKVCache` is always f16**, used by MTP CPU verification scratch and test/benchmark fixtures — not production serving. No f32/f16 toggle.                                                                                                                                                                                                                               | source-read                                    | `kv_cache/flat.rs`; `speculative.rs:495,654-664`                                               |
+| KV7  | **Continuous-batching engine KV cache is f32-only** (`PagedKVCache` `Vec<f32>`, `PrefixPageCache` `Arc<[f32]>`), consumed only by `batch/*`, **not wired into either serving binary** (zero `PagedKVCache`/`BatchWorker` hits in both). Third, currently-unserved path.                                                                                                                        | source-read                                    | `kv_cache/paged.rs:14,146,148`; `kv_cache/prefix.rs:3,59-60`; `batch/worker.rs:28,600-630`     |
+| KV8  | **Cross-turn KV prefix reuse (#462/#619) is a logical handle over the live `MetalKvCache`** — owns no storage, is dtype-aware (`kv_f16: bool`), composes with whichever KV2 dtype is active.                                                                                                                                                                                                   | source-read                                    | `kv_cache/cross_turn.rs:59-76`                                                                 |
+| KV9  | **Per-token KV bytes = `num_full_attention_layers * 2 * full_kv_dim * dtype_bytes`**, `full_kv_dim = num_key_value_heads * head_dim`; tested formula backing the `doctor` memory-fit preflight. Worked example: 0.8B f16 = 6·2·512·2 = 12,288 B/tok ≈ 48 MiB @4096 ctx.                                                                                                                        | gate-pinned + source-read                      | `model/qwen35_config.rs:517-539,552-571`                                                       |
+| KV10 | **Actual model shapes** (correct any prior-art assuming a generic GQA shape): 0.8B — 24 layers, `full_attention_interval=4` → 6 full-attn, `kv_heads=2`, `head_dim=256` → `full_kv_dim=512`. 27B — 64 layers → 16 full-attn, `kv_heads=4`, `head_dim=256` → `full_kv_dim=1024`. Interval=4 constant across every preset.                                                                       | source-read                                    | `model/qwen35_config.rs:212-260` (0.8b), `:302-338` (27b)                                      |
+| KV11 | **No int8/int4/fp8 KV path exists anywhere** — exhaustive grep of `crates/inference/src/` returns zero (`enum KvFormat` = 0 hits; the `KvFormat{F32,F16,I8,I4}` sketch in ADR-062 §Phase-4/5 was never implemented). Nearby "quant" hits are unrelated _weight_ quantization.                                                                                                                  | source-read (absence, verified vs origin/main) | design sketch only: `docs/adr/ADR-062-metal-fa2-prefill.md:313-331`                            |
+| KV12 | **No long-context retrieval harness exists** (needle/passkey/RULER/LongBench — zero hits). Any int8/int4 quality gate beyond a single-corpus PPL number must be built from scratch.                                                                                                                                                                                                            | source-read (absence)                          | grep of `crates/inference/`                                                                    |
 
 **Derived (not measured) — memory-capacity arithmetic** from KV9/KV10: at 4096 ctx, 0.8B KV is 96 MiB
 (f32) / 48 MiB (f16); 27B is 512 MiB / 256 MiB; int8 halves the f16 column again (27B: 128 MiB @4096,
@@ -89,7 +89,7 @@ its arithmetic assumes shapes this engine does not have.
   this engine's own long-context measurement, not the generic literature share**, before any
   int8/int4 "expected speedup" is trusted.)
 - **f16 KV before any int8/int4 work** — the survey rates this CONFIRMED-BY-ANALYSIS/High, and it is
-  *independently* corroborated by KV2/KV3 (f16 already proven correct and cheap, just not defaulted).
+  _independently_ corroborated by KV2/KV3 (f16 already proven correct and cheap, just not defaulted).
 - **int8 before int4; int4 non-default** — survey CONFIRMED-BY-ANALYSIS; but the underlying quality
   numbers are rated **Low/Medium-low Qwen-transfer confidence by the survey itself** — no method in
   its 14-method table is High-confidence for Qwen3.5/3.6-hybrid transfer.
@@ -102,7 +102,7 @@ its arithmetic assumes shapes this engine does not have.
 
 ## Decision
 
-Rank by *measured leverage × quality risk*. Two levers are rankable now; the int8/int4 family is
+Rank by _measured leverage × quality risk_. Two levers are rankable now; the int8/int4 family is
 gated behind an experiment because no lattice quality/throughput data exists for it.
 
 1. **P1 — f16 KV default-flip (#154).** Rankable on measured evidence exactly as ADR-072 ranked
@@ -113,12 +113,12 @@ gated behind an experiment because no lattice quality/throughput data exists for
    into the first-N greedy-parity test #252 originally specified, then flip `use_kv_f16` default to
    ON. Validate: the existing f32-vs-f16 A/B (`ppl_metal` / `bench_decode_ab`) already produces the
    evidence; `make bench-compare` on the default path is byte-identical to main (the win is memory,
-   not the A/B table). *Build — small, mostly a default-flip + parity-test.*
+   not the A/B table). _Build — small, mostly a default-flip + parity-test._
 2. **P-low — f16 for `PagedKVCache` (#148).** A mechanical port of the KV2/KV3 pattern to the
    f32-only paged cache (KV7); the f32→f16 correctness argument transfers unchanged (same math,
    different buffer owner). Not a research question. **Priority tracks whether the continuous-batching
    engine is on a near-term roadmap at all** — it serves zero production traffic today (KV7). Do not
-   rank above P1; do not do speculatively ahead of that engine being wired. *Build, roadmap-gated.*
+   rank above P1; do not do speculatively ahead of that engine being wired. _Build, roadmap-gated._
 3. **P2 — the int8/int4 KV family (#118 umbrella, #120 fused kernel, #122 pre-RoPE K, #123 int4
    rotation) is GATED behind a minimal experiment, not ranked on evidence it does not have.** There is
    zero lattice PPL or throughput data below f16 at any KV bit-width, and the central open question is
@@ -133,7 +133,7 @@ gated behind an experiment because no lattice quality/throughput data exists for
    harness — it already reads `LATTICE_KV_F16` at construction) or `eval_perplexity` with a CPU-side
    int8-K quantize/dequantize shim; the `ppl_gate_v1/golden.json` RECORD-bootstrap pattern (ADR-072
    W5) is the template for turning a chosen delta into a committed gate. **This KV harness does not
-   exist yet** — building it *is* the experiment, which is exactly why P2 needs one and P1/P-low don't.
+   exist yet** — building it _is_ the experiment, which is exactly why P2 needs one and P1/P-low don't.
 
    The experiment settles: (a) whether int8-K PPL delta stays under a defensible budget (survey/#118
    suggest ≤0.02) on the **actual** 0.8B/27B presets, not the literature number; and (b) whether a
@@ -144,9 +144,9 @@ gated behind an experiment because no lattice quality/throughput data exists for
    fused-kernel branch (#120), not just adjacent.
 
 **Ordering rationale.** #491 (measure KV bandwidth share vs context) is the pivot: until it runs,
-the *throughput* case for any int8/int4 kernel is unfounded on this architecture. The **memory-capacity**
+the _throughput_ case for any int8/int4 kernel is unfounded on this architecture. The **memory-capacity**
 case is real and derivable now (KV9/KV10 — multi-GB swings on the 27B at long context), so the P2
-experiment should be framed as answering *memory-tier viability at acceptable quality*, with the
+experiment should be framed as answering _memory-tier viability at acceptable quality_, with the
 throughput case explicitly contingent on #491.
 
 **Deferred — int4 KV + WHT rotation (#123), V-side and fused-kernel work (#120), pre-RoPE K

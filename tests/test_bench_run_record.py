@@ -8,7 +8,7 @@ convention: scripts/ is not a package).
 
 Covers the PR's acceptance row: fixtures prove missing cell / missing
 path proof / missing lock receipt / non-finite metric / low valid-n /
-post-run threshold change / wrong SHA all fail closed, a v1 observation
+post-run policy change / wrong SHA all fail closed, a v1 observation
 still imports/validates unchanged, and the north-star ranking query works
 over the shipped `CellRecord` shape without further schema change.
 
@@ -18,6 +18,8 @@ Run with: python3 -m pytest tests/test_bench_run_record.py -v
 from __future__ import annotations
 
 import importlib.util
+import json
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -33,6 +35,10 @@ _SPEC.loader.exec_module(harness)
 # --------------------------------------------------------------------------
 # Fixtures
 # --------------------------------------------------------------------------
+
+
+def _canonical_policy_sha(digit: str = "d") -> str:
+    return f"{harness.bench_gate_math.POLICY_SHA_PREFIX}{digit * 64}"
 
 
 def _provenance(**overrides) -> harness.ProvenanceRecord:
@@ -206,9 +212,62 @@ class ProvenanceParseTest(unittest.TestCase):
         p = _provenance()
         self.assertEqual(p.policy_version, 1)
 
+    def test_canonical_policy_identity_accepted(self):
+        p = _provenance(policy_sha=_canonical_policy_sha(), policy_file_sha="f" * 64)
+        self.assertEqual(
+            harness.bench_gate_math.policy_sha_scheme(p.policy_sha),
+            harness.bench_gate_math.POLICY_SHA_SCHEME,
+        )
+        self.assertEqual(p.policy_file_sha, "f" * 64)
+
+    def test_canonical_policy_identity_requires_raw_file_digest(self):
+        with self.assertRaisesRegex(
+            harness.RunRecordValidationError,
+            "canonical policy_sha requires policy_file_sha",
+        ):
+            _provenance(policy_sha=_canonical_policy_sha())
+
+    def test_policy_file_sha_rejects_malformed_and_inconsistent_legacy_values(self):
+        for policy_sha, policy_file_sha in (
+            (_canonical_policy_sha(), "F" * 64),
+            (_canonical_policy_sha(), "f" * 63),
+            ("d" * 64, "e" * 64),
+        ):
+            with self.subTest(policy_sha=policy_sha, policy_file_sha=policy_file_sha):
+                with self.assertRaisesRegex(
+                    harness.RunRecordValidationError,
+                    "policy_file_sha|must match",
+                ):
+                    _provenance(
+                        policy_sha=policy_sha,
+                        policy_file_sha=policy_file_sha,
+                    )
+
+    def test_malformed_policy_identity_rejected(self):
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "policy_sha"):
+            _provenance(policy_sha="not-a-policy-identity")
+
     def test_missing_field_rejected(self):
         with self.assertRaisesRegex(harness.RunRecordValidationError, "missing required field"):
             harness.parse_provenance({"repo_sha": "a"})
+
+
+class LegacyEvidencePolicyIdentityTest(unittest.TestCase):
+    def test_pr882_reports_remain_explicit_legacy_byte_sha_records(self):
+        evidence_dir = Path(__file__).resolve().parents[1] / "scripts" / "bench_evidence" / "pr882"
+        for name in ("report_ctx512.json", "report_ctx1024.json"):
+            with self.subTest(name=name):
+                report = json.loads((evidence_dir / name).read_text())
+                policy_sha = report["provenance"]["policy_sha"]
+                self.assertEqual(
+                    policy_sha,
+                    "17c4f9ef52c647aeb32642c065af135607d03ccc329d6245482ff899abf1de3c",
+                )
+                self.assertEqual(
+                    harness.bench_gate_math.policy_sha_scheme(policy_sha),
+                    harness.bench_gate_math.LEGACY_POLICY_SHA_SCHEME,
+                )
+                self.assertNotIn("policy_file_sha", report["provenance"])
 
 
 # --------------------------------------------------------------------------
@@ -392,6 +451,39 @@ class NonFiniteMetricTest(unittest.TestCase):
             harness.validate_run_record(record)
 
 
+class MeasuredCvValidationTest(unittest.TestCase):
+    def test_parse_rejects_non_positive_and_non_finite_cv(self):
+        for measured_cv in (-0.01, -0.0, 0.0, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(measured_cv=measured_cv):
+                with self.assertRaisesRegex(harness.RunRecordValidationError, "positive finite"):
+                    _aggregate(measured_cv=measured_cv)
+
+    def test_parse_accepts_tiny_positive_cv(self):
+        measured_cv = math.nextafter(0.0, math.inf)
+        self.assertEqual(_aggregate(measured_cv=measured_cv).measured_cv, measured_cv)
+
+    def test_hand_built_invalid_cv_fails_before_class_c_exemption(self):
+        for measured_cv in (False, True, 0.0, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(measured_cv=measured_cv):
+                aggregate = harness.CellAggregate(
+                    point_estimate=0.02,
+                    ci_low=-0.01,
+                    ci_high=0.05,
+                    corrected_lower_bound=0.01,
+                    n_valid=7,
+                    n_invalid=0,
+                    measured_cv=measured_cv,
+                    required_n=None,
+                )
+                record = _cell_record(
+                    metric_family="memory",
+                    metric_name="model_load_time",
+                    aggregate=aggregate,
+                )
+                with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*positive finite"):
+                    harness.validate_run_record(record)
+
+
 class LowValidNTest(unittest.TestCase):
     def test_below_required_n_fails_closed(self):
         agg = _aggregate(n_valid=5, required_n=7, measured_cv=0.01)
@@ -473,15 +565,52 @@ class SubmitterControlledRequiredNTest(unittest.TestCase):
             harness.validate_run_record(record)
 
 
-class PostRunThresholdChangeTest(unittest.TestCase):
-    def test_policy_sha_mismatch_fails_closed(self):
-        record = _cell_record(provenance=_provenance(policy_sha="d" * 64))
-        with self.assertRaisesRegex(harness.RunRecordValidationError, "INFRA-FAIL.*policy_sha"):
-            harness.validate_run_record(record, current_policy_sha="different" + "0" * 56)
+class PostRunPolicyChangeTest(unittest.TestCase):
+    def test_canonical_policy_sha_mismatch_fails_closed(self):
+        record = _cell_record(
+            provenance=_provenance(
+                policy_sha=_canonical_policy_sha("d"),
+                policy_file_sha="f" * 64,
+            )
+        )
+        with self.assertRaisesRegex(
+            harness.RunRecordValidationError,
+            "INFRA-FAIL.*canonical gating-policy identity changed",
+        ):
+            harness.validate_run_record(record, current_policy_sha=_canonical_policy_sha("e"))
 
-    def test_matching_policy_sha_passes(self):
+    def test_matching_canonical_policy_sha_passes(self):
+        record = _cell_record(
+            provenance=_provenance(
+                policy_sha=_canonical_policy_sha(),
+                policy_file_sha="f" * 64,
+            )
+        )
+        harness.validate_run_record(record, current_policy_sha=_canonical_policy_sha())
+
+    def test_matching_legacy_byte_sha_passes(self):
         record = _cell_record(provenance=_provenance(policy_sha="d" * 64))
-        harness.validate_run_record(record, current_policy_sha="d" * 64)  # must not raise
+        harness.validate_run_record(record, current_policy_sha="d" * 64)
+
+    def test_legacy_record_is_not_aliased_to_canonical_current_policy(self):
+        record = _cell_record(provenance=_provenance(policy_sha="d" * 64))
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "legacy byte-SHA.*not comparable"):
+            harness.validate_run_record(record, current_policy_sha=_canonical_policy_sha())
+
+    def test_mismatched_legacy_byte_sha_fails_closed_explicitly(self):
+        record = _cell_record(provenance=_provenance(policy_sha="d" * 64))
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "legacy byte-SHA mismatch"):
+            harness.validate_run_record(record, current_policy_sha="e" * 64)
+
+    def test_malformed_current_policy_identity_fails_closed(self):
+        record = _cell_record(
+            provenance=_provenance(
+                policy_sha=_canonical_policy_sha(),
+                policy_file_sha="f" * 64,
+            )
+        )
+        with self.assertRaisesRegex(harness.RunRecordValidationError, "invalid policy identity"):
+            harness.validate_run_record(record, current_policy_sha="malformed")
 
     def test_no_current_policy_sha_given_skips_check(self):
         record = _cell_record(provenance=_provenance(policy_sha="d" * 64))
