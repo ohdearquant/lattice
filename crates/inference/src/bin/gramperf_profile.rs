@@ -385,7 +385,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             for l in dummy_logits.iter_mut() {
                 *l = 0.0;
             }
-            engine.mask_logits(&mut state, &mut dummy_logits);
+            engine.mask_logits(&mut state, &mut dummy_logits)?;
             let masked = dummy_logits
                 .iter()
                 .filter(|&&l| l == f32::NEG_INFINITY)

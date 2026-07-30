@@ -124,6 +124,11 @@ pub(crate) fn q4_f32_to_f16(x: f32) -> u16 {
     crate::weights::half_bits::f32_to_f16_bits(x)
 }
 
+#[inline]
+pub(crate) fn q4_f32_to_finite_f16(x: f32) -> Result<u16, u16> {
+    crate::weights::half_bits::f32_to_finite_f16_bits(x)
+}
+
 /// Convert an IEEE-754 f16 bit pattern (`u16`) back to `f32`.
 #[inline]
 pub(crate) fn q4_f16_to_f32(bits: u16) -> f32 {

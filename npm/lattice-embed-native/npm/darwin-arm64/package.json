@@ -2,7 +2,7 @@
   "name": "@khive-ai/lattice-embed-darwin-arm64",
   "version": "0.1.0",
   "description": "Native binary for @khive-ai/lattice-embed on darwin-arm64.",
-  "license": "Apache-2.0",
+  "license": "MIT OR Apache-2.0",
   "main": "lattice-embed-native.darwin-arm64.node",
   "files": [
     "lattice-embed-native.darwin-arm64.node"

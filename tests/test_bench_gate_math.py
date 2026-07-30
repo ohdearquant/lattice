@@ -13,6 +13,7 @@ import importlib.util
 import math
 import random
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -297,10 +298,23 @@ class CvBandsTest(unittest.TestCase):
         n, _ = gm.required_n(0.01, bands, "B")
         self.assertEqual(n, 9)
 
-    def test_negative_cv_rejected(self):
+    def test_non_positive_cv_rejected(self):
         bands = self._bands()
-        with self.assertRaises(gm.GateMathError):
-            gm.required_n(-0.01, bands, "A")
+        for measured_cv in (-0.01, -0.0, 0.0):
+            with self.subTest(measured_cv=measured_cv):
+                with self.assertRaisesRegex(gm.GateMathError, "positive finite"):
+                    gm.required_n(measured_cv, bands, "A")
+
+    def test_tiny_positive_cv_uses_first_band(self):
+        bands = self._bands()
+        self.assertEqual(gm.required_n(math.nextafter(0.0, math.inf), bands, "A"), (7, 1.0))
+
+    def test_non_finite_cv_rejected(self):
+        bands = self._bands()
+        for measured_cv in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(measured_cv=measured_cv):
+                with self.assertRaisesRegex(gm.GateMathError, "positive finite"):
+                    gm.required_n(measured_cv, bands, "A")
 
     def test_invalid_class_rejected(self):
         bands = self._bands()
@@ -330,29 +344,9 @@ class CvBandsTest(unittest.TestCase):
         with self.assertRaises(gm.PolicyConfigError):
             gm.parse_cv_bands([{"max_cv": 1.0, "required_n_class_a": 7, "required_n_class_b": 9}])
 
-    def test_module_does_not_itself_refuse_an_absent_cv(self):
-        """Pin where the missing-CV guard actually lives, because the module
-        header used to claim it lived here.
-
-        `required_n` is typed to take a float. An absent CV therefore reaches
-        it either as a bare `TypeError` or, if a caller substitutes 0.0, as a
-        silent lookup that returns the CHEAPEST band -- the most permissive
-        answer available, from the function a reader would expect to refuse.
-        The refusal is the caller's:
-        `bench_decode_harness.validate_run_record` raises
-        `RunRecordValidationError` for a non-`unsupported` cell with no
-        `measured_cv` (covered by
-        `test_bench_run_record.test_missing_measured_cv_fails_closed`).
-
-        This test asserts the absence of a guard, which is unusual, and it is
-        deliberate: a safety property documented at a module but enforced by
-        its callers reads as fail-closed in isolation, so a new call site
-        inherits the belief without inheriting the guard. Pinning the real
-        locus keeps the header from drifting back.
-        """
+    def test_missing_cv_cannot_be_substituted_at_band_lookup(self):
         bands = self._bands()
-        self.assertEqual(gm.required_n(0.0, bands, "A"), (7, 1.0))
-        with self.assertRaises(TypeError):
+        with self.assertRaisesRegex(gm.GateMathError, "positive finite"):
             gm.required_n(None, bands, "A")  # type: ignore[arg-type]
 
     def test_band_boundaries_not_the_calibration_points(self):
@@ -362,6 +356,10 @@ class CvBandsTest(unittest.TestCase):
         bands = self._bands()
         self.assertEqual(gm.required_n(0.02, bands, "A"), (25, 1.0))
         self.assertEqual(gm.required_n(0.06, bands, "A"), (25, 2.0))
+        self.assertEqual(gm.required_n(0.015, bands, "A"), (7, 1.0))
+        self.assertEqual(gm.required_n(math.nextafter(0.015, math.inf), bands, "A"), (25, 1.0))
+        self.assertEqual(gm.required_n(0.05, bands, "A"), (25, 1.0))
+        self.assertEqual(gm.required_n(math.nextafter(0.05, math.inf), bands, "A"), (25, 2.0))
 
 
 # --------------------------------------------------------------------------
@@ -370,22 +368,101 @@ class CvBandsTest(unittest.TestCase):
 
 
 class LoadPolicyTest(unittest.TestCase):
+    def _path_for_text(self, directory: str, text: str) -> Path:
+        path = Path(directory) / "perf-policy.toml"
+        path.write_text(text)
+        return path
+
+    def _sha_for_text(self, text: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            return gm.policy_sha(self._path_for_text(tmp, text))
+
+    def _file_sha_for_text(self, text: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            return gm.policy_file_sha(self._path_for_text(tmp, text))
+
     def test_shipped_policy_file_loads(self):
         doc = gm.load_policy()
         self.assertEqual(doc["policy_version"], 1)
         self.assertIn("families", doc)
         self.assertIn("decode", doc["families"])
 
-    def test_policy_sha_is_stable_hex_digest(self):
+    def test_policy_sha_is_stable_tagged_digest(self):
         sha1 = gm.policy_sha()
         sha2 = gm.policy_sha()
         self.assertEqual(sha1, sha2)
-        self.assertEqual(len(sha1), 64)
-        int(sha1, 16)  # must be valid hex
+        self.assertEqual(
+            sha1,
+            "canonical-v1:84095f1f4e7aac7d331b87260ccb9460429527bb88b54dc4e1a6e057e30a98be",
+        )
+        self.assertTrue(sha1.startswith(gm.POLICY_SHA_PREFIX))
+        digest = sha1.removeprefix(gm.POLICY_SHA_PREFIX)
+        self.assertEqual(len(digest), 64)
+        int(digest, 16)
+        self.assertEqual(gm.policy_sha_scheme(sha1), gm.POLICY_SHA_SCHEME)
+
+    def test_policy_sha_ignores_comments_and_cv_band_notes(self):
+        original = gm.DEFAULT_POLICY_FILE.read_text()
+        changed = "# editorial comment with no gate effect\n" + original.replace(
+            'note = "applies to measured_cv <= 0.015. Calibration point cv~=1%: n=7/9 as originally registered, ~99% power vs a true 10% regression."',
+            'note = "Editorial wording only; every numeric band value is unchanged."',
+            1,
+        )
+        self.assertNotEqual(changed, original)
+        self.assertEqual(self._sha_for_text(changed), gm.policy_sha())
+        self.assertNotEqual(self._file_sha_for_text(changed), gm.policy_file_sha())
+
+    def test_policy_file_sha_is_exact_lowercase_digest(self):
+        digest = gm.policy_file_sha()
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, digest.lower())
+        int(digest, 16)
+
+    def test_policy_sha_detects_band_and_threshold_tampering(self):
+        original = gm.DEFAULT_POLICY_FILE.read_text()
+        mutations = [
+            ("max_cv", "max_cv = 0.015", "max_cv = 0.016"),
+            ("required_n", "required_n_class_a = 7", "required_n_class_a = 8"),
+            ("fail_margin", "fail_margin_multiplier = 2.0", "fail_margin_multiplier = 2.1"),
+            ("fail_pct", "fail_pct = 0.07", "fail_pct = 0.071"),
+            (
+                "noise_class",
+                'noise_class = "A"\nwarn_pct = 0.03\nfail_pct = 0.07',
+                'noise_class = "B"\nwarn_pct = 0.03\nfail_pct = 0.07',
+            ),
+            ("policy_version", "policy_version = 1", "policy_version = 2"),
+        ]
+        expected = gm.policy_sha()
+        for label, old, new in mutations:
+            with self.subTest(label=label):
+                self.assertEqual(original.count(old), 1, f"mutation anchor {old!r} must be unique")
+                self.assertNotEqual(self._sha_for_text(original.replace(old, new, 1)), expected)
+
+    def test_other_rule_remains_identity_bearing(self):
+        original = gm.DEFAULT_POLICY_FILE.read_text()
+        old = 'other_rule = "Any required context cell can fail; do not average contexts."'
+        new = 'other_rule = "Changed advisory rule that might gain gate semantics later."'
+        self.assertEqual(original.count(old), 1)
+        self.assertNotEqual(self._sha_for_text(original.replace(old, new, 1)), gm.policy_sha())
+
+    def test_policy_sha_scheme_classifies_legacy_and_rejects_malformed(self):
+        self.assertEqual(gm.policy_sha_scheme("d" * 64), gm.LEGACY_POLICY_SHA_SCHEME)
+        for malformed in (
+            "",
+            None,
+            "D" * 64,
+            "canonical-v1:" + "z" * 64,
+            "sha256:" + "d" * 64,
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises(gm.PolicyConfigError):
+                    gm.policy_sha_scheme(malformed)
 
     def test_missing_file_rejected(self):
         with self.assertRaises(gm.PolicyConfigError):
             gm.load_policy(Path("/nonexistent/perf-policy.toml"))
+        with self.assertRaises(gm.PolicyConfigError):
+            gm.policy_file_sha(Path("/nonexistent/perf-policy.toml"))
 
 
 # --------------------------------------------------------------------------

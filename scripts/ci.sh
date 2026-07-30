@@ -11,11 +11,7 @@ echo "=== Clippy ==="
 cargo clippy --workspace -- -D warnings
 
 echo "=== Doc Lint ==="
-if command -v deno >/dev/null 2>&1; then
-    deno fmt --check **/*.md
-else
-    echo "deno not found, skipping doc lint"
-fi
+./scripts/lint-docs.sh
 
 echo "=== Tests ==="
 # gemma4_e2e_forward_test.rs fails closed by default on a missing checkpoint
