@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 /// model list are subject to change.
 ///
 /// Ensure that the model files exist locally, downloading them if needed.
+/// Cached artifacts are checksum-verified even when automatic download is unavailable.
 pub fn ensure_model_files(model_name: &str, cache_dir: &Path) -> Result<PathBuf, InferenceError> {
     // Offline gate: when LATTICE_OFFLINE is set, never touch the network — a cache miss
     // fails fast instead of implicitly fetching from Hugging Face. Downstream consumers
@@ -21,6 +22,20 @@ fn ensure_model_files_inner(
     offline: bool,
 ) -> Result<PathBuf, InferenceError> {
     let model_name = canonical_model_name(model_name)?;
+    ensure_model_files_inner_with_checksums(
+        model_name,
+        cache_dir,
+        offline,
+        expected_checksums(model_name),
+    )
+}
+
+fn ensure_model_files_inner_with_checksums(
+    model_name: &str,
+    cache_dir: &Path,
+    offline: bool,
+    expected: ExpectedChecksums,
+) -> Result<PathBuf, InferenceError> {
     let model_dir = cache_dir.join(model_name);
     let safetensors_path = model_dir.join("model.safetensors");
     let vocab_path = model_dir.join("vocab.txt");
@@ -29,6 +44,14 @@ fn ensure_model_files_inner(
     // Check if model files are cached — accept either vocab.txt or tokenizer.json
     let has_tokenizer = vocab_path.exists() || tokenizer_json_path.exists();
     if safetensors_path.exists() && has_tokenizer {
+        // Prefetched caches may be offline or read-only, so reject corrupt bytes
+        // without deleting the caller-managed artifact.
+        verify_checksums(
+            model_name,
+            &model_dir,
+            ChecksumFailureAction::Preserve,
+            expected,
+        )?;
         tracing::debug!(path = %model_dir.display(), "model files already cached");
         return Ok(model_dir);
     }
@@ -99,7 +122,12 @@ fn ensure_model_files_inner(
             download_file(&url, &vocab_path)?;
         }
 
-        verify_checksums(model_name, &model_dir)?;
+        verify_checksums(
+            model_name,
+            &model_dir,
+            ChecksumFailureAction::Remove,
+            expected,
+        )?;
         Ok(model_dir)
     }
 }
@@ -120,12 +148,39 @@ fn canonical_model_name(model_name: &str) -> Result<&str, InferenceError> {
     }
 }
 
-#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
-fn verify_checksums(model_name: &str, model_dir: &Path) -> Result<(), InferenceError> {
-    let expected = expected_checksums(model_name);
+#[derive(Clone, Copy)]
+enum ChecksumFailureAction {
+    Preserve,
+    #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+    Remove,
+}
 
+impl ChecksumFailureAction {
+    fn removes_file(self) -> bool {
+        #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+        {
+            matches!(self, Self::Remove)
+        }
+        #[cfg(not(all(feature = "download", not(target_arch = "wasm32"))))]
+        {
+            let _ = self;
+            false
+        }
+    }
+}
+
+fn verify_checksums(
+    model_name: &str,
+    model_dir: &Path,
+    failure_action: ChecksumFailureAction,
+    expected: ExpectedChecksums,
+) -> Result<(), InferenceError> {
     if let Some(expected_model_sha) = expected.model_safetensors {
-        verify_file_checksum(&model_dir.join("model.safetensors"), expected_model_sha)?;
+        verify_file_checksum(
+            &model_dir.join("model.safetensors"),
+            expected_model_sha,
+            failure_action,
+        )?;
     } else {
         // Refuse to proceed without a checksum -- silent acceptance of unverified
         // downloads is a supply-chain risk. When the real SHA-256 is obtained from
@@ -137,7 +192,11 @@ fn verify_checksums(model_name: &str, model_dir: &Path) -> Result<(), InferenceE
     }
 
     if let Some((tokenizer_file, expected_sha)) = expected.tokenizer {
-        verify_file_checksum(&model_dir.join(tokenizer_file), expected_sha)?;
+        verify_file_checksum(
+            &model_dir.join(tokenizer_file),
+            expected_sha,
+            failure_action,
+        )?;
     } else {
         return Err(InferenceError::Download(format!(
             "No checksum available for model '{model_name}' tokenizer. \
@@ -148,11 +207,16 @@ fn verify_checksums(model_name: &str, model_dir: &Path) -> Result<(), InferenceE
     Ok(())
 }
 
-#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
-fn verify_file_checksum(path: &Path, expected: &str) -> Result<(), InferenceError> {
+fn verify_file_checksum(
+    path: &Path,
+    expected: &str,
+    failure_action: ChecksumFailureAction,
+) -> Result<(), InferenceError> {
     let actual = sha256_hex(path)?;
     if actual != expected {
-        let _ = std::fs::remove_file(path);
+        if failure_action.removes_file() {
+            let _ = std::fs::remove_file(path);
+        }
         return Err(InferenceError::ChecksumMismatch {
             file: path.display().to_string(),
             expected: expected.to_string(),
@@ -162,14 +226,13 @@ fn verify_file_checksum(path: &Path, expected: &str) -> Result<(), InferenceErro
     Ok(())
 }
 
-#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+#[derive(Clone, Copy)]
 struct ExpectedChecksums {
     model_safetensors: Option<&'static str>,
     /// vocab.txt for WordPiece models (BGE), tokenizer.json for SentencePiece models (E5).
     tokenizer: Option<(&'static str, &'static str)>, // (filename, sha256)
 }
 
-#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn expected_checksums(model_name: &str) -> ExpectedChecksums {
     match model_name {
         // model.safetensors SHA-256 from the Hugging Face LFS pointer.
@@ -263,7 +326,6 @@ fn download_file(url: &str, path: &Path) -> Result<(), InferenceError> {
     Ok(())
 }
 
-#[cfg(all(feature = "download", not(target_arch = "wasm32")))]
 fn sha256_hex(path: &Path) -> Result<String, InferenceError> {
     use sha2::{Digest, Sha256};
     use std::io::Read;
@@ -292,6 +354,31 @@ fn sha256_hex(path: &Path) -> Result<String, InferenceError> {
 mod tests {
     use super::*;
 
+    const MODEL_FIXTURE: &[u8] = b"model fixture";
+    const MODEL_FIXTURE_SHA256: &str =
+        "21249a290a4255a0f3ee6685ff7933bffa241c3e35bb13a52dc0c7a679bed3b2";
+    const TOKENIZER_FIXTURE: &[u8] = b"tokenizer fixture";
+    const TOKENIZER_FIXTURE_SHA256: &str =
+        "c882d95b612f23378308ac1207596a83cf97ed59d57e1b18e12a7085a10bf8e2";
+
+    fn fixture_checksums() -> ExpectedChecksums {
+        ExpectedChecksums {
+            model_safetensors: Some(MODEL_FIXTURE_SHA256),
+            tokenizer: Some(("vocab.txt", TOKENIZER_FIXTURE_SHA256)),
+        }
+    }
+
+    fn write_fixture_cache(test_name: &str, model: &[u8], tokenizer: &[u8]) -> (PathBuf, PathBuf) {
+        let tmp = std::env::temp_dir().join(format!("lattice_{test_name}_{}", std::process::id()));
+        let model_dir = tmp.join("all-minilm-l6-v2");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&model_dir).expect("create temp model dir");
+        std::fs::write(model_dir.join("model.safetensors"), model)
+            .expect("write safetensors fixture");
+        std::fs::write(model_dir.join("vocab.txt"), tokenizer).expect("write vocab fixture");
+        (tmp, model_dir)
+    }
+
     /// Offline mode + cache miss must error immediately, never attempting a download.
     #[test]
     fn offline_cache_miss_errors_without_download() {
@@ -307,16 +394,94 @@ mod tests {
 
     /// Offline mode still serves a populated cache — it blocks the network, not cache reads.
     #[test]
-    fn offline_cache_hit_succeeds() {
-        let tmp = std::env::temp_dir().join(format!("lattice_offline_hit_{}", std::process::id()));
-        let model_dir = tmp.join("all-minilm-l6-v2");
+    fn verified_offline_cache_hit_succeeds() {
+        let (tmp, model_dir) =
+            write_fixture_cache("offline_verified_hit", MODEL_FIXTURE, TOKENIZER_FIXTURE);
+        let res = ensure_model_files_inner_with_checksums(
+            "all-minilm-l6-v2",
+            &tmp,
+            true,
+            fixture_checksums(),
+        );
+        assert_eq!(
+            res.expect("verified offline cache hit must succeed"),
+            model_dir
+        );
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&model_dir).expect("create temp model dir");
-        std::fs::write(model_dir.join("model.safetensors"), b"stub")
-            .expect("write safetensors stub");
-        std::fs::write(model_dir.join("vocab.txt"), b"stub").expect("write vocab stub");
-        let res = ensure_model_files_inner("all-minilm-l6-v2", &tmp, true);
-        assert!(res.is_ok(), "offline + cache hit must succeed, got {res:?}");
+    }
+
+    #[test]
+    fn corrupt_cached_model_fails_before_online_download() {
+        let (tmp, model_dir) = write_fixture_cache(
+            "corrupt_cached_model",
+            b"corrupt model fixture",
+            TOKENIZER_FIXTURE,
+        );
+        let model_path = model_dir.join("model.safetensors");
+        let res = ensure_model_files_inner_with_checksums(
+            "all-minilm-l6-v2",
+            &tmp,
+            false,
+            fixture_checksums(),
+        );
+        assert!(
+            matches!(res, Err(InferenceError::ChecksumMismatch { .. })),
+            "corrupt cache hit must fail before download, got {res:?}"
+        );
+        assert!(
+            model_path.exists(),
+            "cache-hit verification must preserve caller-managed artifacts"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn corrupt_cached_tokenizer_fails_offline_without_deleting_it() {
+        let (tmp, model_dir) = write_fixture_cache(
+            "corrupt_cached_tokenizer",
+            MODEL_FIXTURE,
+            b"corrupt tokenizer fixture",
+        );
+        let tokenizer_path = model_dir.join("vocab.txt");
+        let res = ensure_model_files_inner_with_checksums(
+            "all-minilm-l6-v2",
+            &tmp,
+            true,
+            fixture_checksums(),
+        );
+        assert!(
+            matches!(res, Err(InferenceError::ChecksumMismatch { .. })),
+            "corrupt offline cache hit must fail closed, got {res:?}"
+        );
+        assert!(
+            tokenizer_path.exists(),
+            "offline verification must preserve the prefetched artifact"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(all(feature = "download", not(target_arch = "wasm32")))]
+    #[test]
+    fn downloaded_checksum_mismatch_removes_artifact() {
+        let (tmp, model_dir) = write_fixture_cache(
+            "corrupt_downloaded_model",
+            b"corrupt model fixture",
+            TOKENIZER_FIXTURE,
+        );
+        let model_path = model_dir.join("model.safetensors");
+        let res = verify_file_checksum(
+            &model_path,
+            MODEL_FIXTURE_SHA256,
+            ChecksumFailureAction::Remove,
+        );
+        assert!(
+            matches!(res, Err(InferenceError::ChecksumMismatch { .. })),
+            "corrupt downloaded artifact must fail verification, got {res:?}"
+        );
+        assert!(
+            !model_path.exists(),
+            "failed download verification must retain its self-healing cleanup"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

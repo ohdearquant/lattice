@@ -23,14 +23,14 @@ use crate::forward::cpu::{elementwise_mul, silu_inplace};
 use crate::forward::neon::{matmul_q8_neon_into, pack_weights_q8};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, FeedForwardWeights, ForwardScratch,
-    FullAttentionLayerWeights, KvCache, ModelWeights, decode_tokens, qwen35_rms_norm, resize,
+    FullAttentionLayerWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
+    KvCache, ModelWeights, decode_tokens, prepare_generation, qwen35_rms_norm, resize,
     sample_token, should_stop_token,
 };
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
 use crate::rope::RopeTable;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
-use crate::tokenizer::common::Tokenizer;
 use crate::weights::ingress::{IngestedTensor, validate_ingested_tensor};
 use crate::weights::q8_weights::{validate_cfg_len, validate_gdn_shapes};
 
@@ -955,74 +955,23 @@ pub fn generate_q8_neon(
     prompt: &str,
     gen_cfg: &GenerateConfig,
 ) -> Result<GenerateOutput, crate::error::InferenceError> {
-    // Initialize RNG
-    let mut rng_state = match gen_cfg.seed {
-        Some(s) => {
-            if s == 0 {
-                1
-            } else {
-                s
-            }
-        }
-        None => {
-            use std::time::SystemTime;
-            let t = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0x12345678_9abcdef0);
-            if t == 0 { 1 } else { t }
-        }
+    let plan = match prepare_generation(
+        tokenizer,
+        prompt,
+        gen_cfg,
+        cfg.vocab_size,
+        rope.max_positions(),
+        GenerationEntryContract::StandaloneCpu,
+    )? {
+        GenerationPreparation::Ready(plan) => plan,
+        GenerationPreparation::Complete(output) => return Ok(output),
     };
-
-    // Tokenize prompt
-    let input = tokenizer.tokenize(prompt);
-    let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-    let prompt_len = prompt_ids.len();
-
-    // #856: single shared preflight, unified with the Metal paths (which
-    // used to accept an empty prompt and return an empty Ok) — see
-    // `check_prompt_not_empty` (model::qwen35::generation).
-    crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
-
-    // max_new_tokens == 0 means "generate nothing": return before sampling so
-    // we never emit a token the caller did not ask for. Mirrors the guard in
-    // Qwen35Model::generate (crates/inference/src/model/qwen35/generation.rs).
-    if gen_cfg.max_new_tokens == 0 {
-        return Ok(GenerateOutput {
-            text: String::new(),
-            token_ids: vec![],
-            prompt_tokens: prompt_len,
-            generated_tokens: 0,
-            stopped: false,
-            stop_reason: Some(StopReason::Length),
-            token_logprobs: vec![],
-        });
-    }
-
-    // Reject grammar configs before allocating any state. Grammar masking
-    // (`mask_logits` + `advance`) is not wired into this generate loop; without
-    // the guard the grammar field would be silently ignored, producing
-    // unconstrained output despite a grammar being set (#397/#398).
-    crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
-    // Same rationale for logprobs capture, which is also not wired into this
-    // generate loop (#585).
-    crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-    // Same rationale for stop_strings matching and reasoning-budget forcing,
-    // neither of which is wired into this generate loop (ADR-080 C3, #783).
-    crate::model::qwen35::check_stop_strings_not_set(gen_cfg)?;
-    crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
-
-    // Reject requests whose total token budget exceeds the RoPE table's
-    // position capacity before allocating caches or dereferencing weights.
-    // Mirrors Qwen35Model::generate and forward::cpu_q8::generate_q8.
-    let max_context = rope.max_positions();
-    if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
-        return Err(crate::error::InferenceError::Inference(format!(
-            "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
-             model context window ({max_context})",
-            gen_cfg.max_new_tokens
-        )));
-    }
+    let GenerationPlan {
+        mut rng_state,
+        prompt_ids,
+        prompt_len,
+        required_capacity: max_seq_len,
+    } = plan;
 
     // Initialize states
     let num_linear = cfg.num_linear_attention_layers();
@@ -1032,10 +981,6 @@ pub fn generate_q8_neon(
         .collect();
     let mut kv_cache = KvCache::new(num_full);
     let mut scratch = ForwardScratch::new();
-    let max_seq_len = prompt_len
-        .saturating_add(gen_cfg.max_new_tokens)
-        .saturating_add(1);
-
     kv_cache.reserve(max_seq_len, cfg.full_kv_dim());
     scratch.ensure_capacity(cfg, max_seq_len);
 
@@ -3103,8 +3048,8 @@ mod tests {
     /// Metal paths, which used to silently accept an empty prompt and
     /// return an empty `Ok`. See docs/generation-entrypoint-matrix.md row 2.
     ///
-    /// Mutation sensitivity: reverting the `check_prompt_not_empty` call at
-    /// this call site makes the function proceed past the guard with a
+    /// Mutation sensitivity: bypassing the shared preparation at this entry
+    /// point makes the function proceed past the guard with a
     /// zero-length prompt, either panicking in the prefill/decode loop or
     /// producing a non-`Inference` error — this assert fails either way.
     #[test]
@@ -3139,6 +3084,87 @@ mod tests {
             matches!(result, Err(InferenceError::Inference(ref msg)) if msg.contains("empty prompt")),
             "generate_q8_neon must reject an empty prompt with Err(Inference(\"empty \
              prompt\")) (#856); got {result:?}"
+        );
+    }
+
+    /// A standalone NEON driver can receive a tokenizer whose vocabulary is
+    /// larger than the supplied model config. The boundary ID `vocab_size`
+    /// must be rejected before `forward_step_q8_neon` slices the embedding
+    /// table.
+    ///
+    /// Mutation sensitivity: removing the shared setup's
+    /// `check_prompt_ids_in_vocab` call lets this request reach the unchecked
+    /// embedding slice and panic instead of returning `InvalidInput`.
+    #[test]
+    fn generate_q8_neon_rejects_out_of_vocab_prompt_id() {
+        use std::collections::HashMap;
+
+        let hidden = 32usize;
+        let vocab = 8usize;
+        let cfg = Qwen35Config {
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            vocab_size: vocab,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 32,
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 0.5,
+            rope_parameters: None,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: Some(1),
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 32,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            output_router_logits: false,
+            router_aux_loss_coef: None,
+            tie_word_embeddings: true,
+            full_attention_interval: 2,
+            layer_types: vec![],
+            layer_mask: vec![],
+            eos_token_id: 5,
+            max_position_embeddings: 512,
+            mtp_num_hidden_layers: 0,
+            mtp_use_dedicated_embeddings: false,
+            quarot_rotation_seed: None,
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+            vision_end_token_id: None,
+        };
+        let model = Q8NeonModel {
+            embed_tokens: vec![0.0f32; vocab * hidden],
+            final_norm: vec![0.0f32; hidden],
+            lm_head_packed: zero_packed(vocab, hidden),
+            lm_head_rows: vocab,
+            lm_head_cols: hidden,
+            layers: vec![],
+        };
+        let rope = RopeTable::new(16, 64, 10_000.0);
+        let mut vocab_map: HashMap<String, u32> = HashMap::new();
+        for (i, c) in ["h", "e", "l", "o", "w", "r", "d", "!"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        vocab_map.insert("z".to_string(), cfg.vocab_size as u32);
+        let mismatched_tokenizer = BpeTokenizer::from_vocab_and_merges(vocab_map, vec![])
+            .expect("tokenizer with an OOV vocab entry still constructs");
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+
+        let err = generate_q8_neon(&model, &cfg, &mismatched_tokenizer, &rope, "z", &gen_cfg)
+            .expect_err("an out-of-vocabulary prompt token id must be rejected, not panic");
+        assert!(
+            matches!(err, crate::error::InferenceError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
         );
     }
 

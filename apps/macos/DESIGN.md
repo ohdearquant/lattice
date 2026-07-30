@@ -3,7 +3,7 @@
 > **Status:** Decision doc. Two refined finalists, head-to-head, with a recommendation and a build sequence.
 > **Target:** macOS 26, SwiftUI, `swift build`. Toolchain verified: Apple Swift 6.3.2 / `arm64-apple-macosx26.0`.
 > **Backend:** the `lattice` pure-Rust engine, driven via CLI subprocesses (line-delimited JSON event stream).
-> **Brand law (governs both directions):** *measure first, the number is the truth.* Bold is spent on the **numbers**, not on chrome. Adaptive light + dark from day one.
+> **Brand law (governs both directions):** _measure first, the number is the truth._ Bold is spent on the **numbers**, not on chrome. Adaptive light + dark from day one.
 > **Current implementation status:** The shipped app forces `.preferredColorScheme(.dark)`; light mode remains deferred relative to this decision.
 
 ---
@@ -12,18 +12,19 @@
 
 Two monochrome, numeral-first directions survived refinement. They share one thesis (the app is the **instrument panel** of the engine, not a consumer wrapper) and diverge on **density vs. speed**.
 
-| | **PRIMARY — Lattice Instrument** | **ALTERNATIVE — Lattice / Console** |
-|---|---|---|
-| Angle | Trading-desk × oscilloscope, data-forward pro tool | Linear/Raycast/Zed minimal, keyboard-first |
-| Hero of the screen | A 56pt tabular-mono number on opaque matte | A 40pt tabular-mono number, Cmd-K runs everything |
-| Density | High (readout wells, dense tables, 3 panes) | Lean (flat config lists, command-palette spine) |
-| Accent | Signal Teal `#00E5C7` / `#00A892` | Voltage Blue `#3D7BFF` / `#2C5FE0` |
-| Feasibility | High | Highest |
-| Distinctiveness | Strong (full instrument metaphor) | Good (risks "another dark dev tool" if type is weak) |
+|                    | **PRIMARY — Lattice Instrument**                   | **ALTERNATIVE — Lattice / Console**                  |
+| ------------------ | -------------------------------------------------- | ---------------------------------------------------- |
+| Angle              | Trading-desk × oscilloscope, data-forward pro tool | Linear/Raycast/Zed minimal, keyboard-first           |
+| Hero of the screen | A 56pt tabular-mono number on opaque matte         | A 40pt tabular-mono number, Cmd-K runs everything    |
+| Density            | High (readout wells, dense tables, 3 panes)        | Lean (flat config lists, command-palette spine)      |
+| Accent             | Signal Teal `#00E5C7` / `#00A892`                  | Voltage Blue `#3D7BFF` / `#2C5FE0`                   |
+| Feasibility        | High                                               | Highest                                              |
+| Distinctiveness    | Strong (full instrument metaphor)                  | Good (risks "another dark dev tool" if type is weak) |
 
 **Recommendation: build Lattice Instrument**, grafting Console's Cmd-K command spine. Rationale in the [comparison](#head-to-head) and [recommendation](#recommendation) sections.
 
 Both directions adopt three shared laws, grafted from the design exploration:
+
 1. **Numbers never touch glass.** Glass (`.glassEffect` / `.regularMaterial`) is permitted on the navigation/overlay layer only — toolbar + Cmd-K palette. Every content surface holding a numeral is **opaque**. The truth does not shimmer.
 2. **Before↔after ContrastPair** for the QuaRot quantization story — a decisive two-column reveal, never a buried claim.
 3. **Verdict as text, not vibe** — every measurable action ends in a GATE PILL stating the result (`PASS` / `WARN` / `FAIL`).
@@ -32,7 +33,7 @@ Both directions adopt three shared laws, grafted from the design exploration:
 
 # PRIMARY — Lattice Instrument
 
-**Tagline:** *Measure first. The readout is the truth.*
+**Tagline:** _Measure first. The readout is the truth._
 
 ## Philosophy
 
@@ -50,18 +51,18 @@ This design specifies dark and light semantic color tokens. The shipped app curr
 `preferredColorScheme(.dark)`, so dark is the only active appearance and light implementation is
 deferred. The table below retains the intended paired values.
 
-| Token | Dark hex | Light hex | Usage |
-|---|---|---|---|
-| Canvas / Panel face | `#0A0B0D` Vantablack | `#F7F8FA` Quartz | Primary background, the instrument face. **Opaque.** |
-| Panel Raise | `#121419` | `#FFFFFF` | Elevated center panel + readout-well body (one step up). |
-| Well Sink | `#070809` | `#ECEEF2` | Recessed fill **inside** a readout well (below the face). |
-| Hairline | `#23262E` | `#DCDFE5` | 1px rules: dividers, grid, table separators, well borders. Depth via line. |
-| Ink (text + numerals) | `#E8EAED` | `#14161A` | Primary text/numerals. ~14.5:1 dark / ~15:1 light. |
-| Ink Dim | `#7C828D` | `#5C636E` | Labels, units, axis ticks, metadata. ~4.8:1 / ~5.2:1. |
-| **Signal Teal** (accent) | `#00E5C7` | `#00A892` Teal Deep | Live trace, token stream, now-cursor, the **one** primary CTA/screen, focus ring. The only color that shifts value between modes (to hold ~4.5:1). |
-| Teal Glow | `#00E5C7 @12%` | `#00A892 @12%` | Area-fill gradient under the live trace; under-glow behind newest segment. |
-| Amber Caution | `#FFB020` | `#FFB020` (value-shifted) | Regression/warning: loss rising, grad-norm spike, PPL over budget, mem pressure. Replaces red for colorblind safety. |
-| Crimson Halt | `#FF4D5E` | `#FF4D5E` (value-shifted) | Hard failure only: NaN loss, OOM, run crashed, parity FAIL. Rare by design. |
+| Token                    | Dark hex             | Light hex                 | Usage                                                                                                                                              |
+| ------------------------ | -------------------- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Canvas / Panel face      | `#0A0B0D` Vantablack | `#F7F8FA` Quartz          | Primary background, the instrument face. **Opaque.**                                                                                               |
+| Panel Raise              | `#121419`            | `#FFFFFF`                 | Elevated center panel + readout-well body (one step up).                                                                                           |
+| Well Sink                | `#070809`            | `#ECEEF2`                 | Recessed fill **inside** a readout well (below the face).                                                                                          |
+| Hairline                 | `#23262E`            | `#DCDFE5`                 | 1px rules: dividers, grid, table separators, well borders. Depth via line.                                                                         |
+| Ink (text + numerals)    | `#E8EAED`            | `#14161A`                 | Primary text/numerals. ~14.5:1 dark / ~15:1 light.                                                                                                 |
+| Ink Dim                  | `#7C828D`            | `#5C636E`                 | Labels, units, axis ticks, metadata. ~4.8:1 / ~5.2:1.                                                                                              |
+| **Signal Teal** (accent) | `#00E5C7`            | `#00A892` Teal Deep       | Live trace, token stream, now-cursor, the **one** primary CTA/screen, focus ring. The only color that shifts value between modes (to hold ~4.5:1). |
+| Teal Glow                | `#00E5C7 @12%`       | `#00A892 @12%`            | Area-fill gradient under the live trace; under-glow behind newest segment.                                                                         |
+| Amber Caution            | `#FFB020`            | `#FFB020` (value-shifted) | Regression/warning: loss rising, grad-norm spike, PPL over budget, mem pressure. Replaces red for colorblind safety.                               |
+| Crimson Halt             | `#FF4D5E`            | `#FF4D5E` (value-shifted) | Hard failure only: NaN loss, OOM, run crashed, parity FAIL. Rare by design.                                                                        |
 
 **WCAG AA is a hard floor:** hero Ink-on-panel ≥14:1, dim labels ≥4.5:1, teal-on-its-ground ≥4.5:1. Amber/Crimson keep hue and shift lightness for AA on each ground.
 
@@ -87,6 +88,7 @@ Readout wells: inset 1px Hairline border + Well-Sink fill + a 2px inner top-shad
 **Governing law: numbers never touch glass.** Glass is permitted on the navigation/overlay layer only (top toolbar + the floating ⌘K command bar use thin `.regularMaterial`). Every content surface — panels, wells, tables, the strip chart, transcripts — is opaque. This also dodges the Liquid-Glass perf caveats, because data is solid.
 
 Motion is mechanical, never bouncy:
+
 1. **Numerals tick per-digit** via `.contentTransition(.numericText())` at ~120ms — throttled to 8Hz on fast values (tok/s) so it never looks frantic.
 2. **Loss curve draws as an oscilloscope sweep** (left→right) with a 1px teal now-cursor and a 12% teal under-glow; chart commits throttled to ~20Hz with rolling-window downsample.
 3. **Panel focus** traces a 1px teal ring in 180ms ease-out.
@@ -108,7 +110,7 @@ Instruments, not widgets. Eleven primitives, opaque unless noted.
 8. **GATE PILL** — status capsule encoding the verdict: `PASS` (teal) / `WARN` (amber) / `FAIL` (crimson) / `RUN` (animated teal pulse). e.g. `Q4 ok 405MB −74% · est.ΔPPL +0.09 PASS`.
 9. **FADER TOGGLE** — the adapter A/B switch styled as a console fader (the one spring element).
 10. **KEY-CAP CHIP** — a tiny 1px-outlined ⌘-cap on actionable elements so the keyboard map self-documents.
-11. **COMMAND BAR** — a floating ⌘K mono palette (the one glass slab) where `train qwen3.5 r8` or `quantize quarot` parse into argument chips and fire a run without touching a form. *(Grafted from Console — see recommendation.)*
+11. **COMMAND BAR** — a floating ⌘K mono palette (the one glass slab) where `train qwen3.5 r8` or `quantize quarot` parse into argument chips and fire a run without touching a form. _(Grafted from Console — see recommendation.)_
 
 Buttons: rectangular, 6px radius, 1px-bordered hairline default; exactly **one** teal-filled primary per screen. No rounded cards, no drop shadows except the recessed-well inner shadow.
 
@@ -178,7 +180,7 @@ MAIN SHELL — 02 TRAIN (dark) ---------------------------------------
 
 # ALTERNATIVE — Lattice / Console
 
-**Tagline:** *Measure first. Every number, one keystroke away.*
+**Tagline:** _Measure first. Every number, one keystroke away._
 
 ## Philosophy
 
@@ -192,19 +194,19 @@ It follows the editorial/bold design direction by spending all of that boldness 
 
 Four elevation levels resolved per appearance: base(L0) → panel(L1) → raise(L2) → overlay. Dark is default + native habitat; light is a true warm-paper theme, not an inverted hack. Shadows appear **only** in light (single y2/blur8/6% step under cards); dark relies on borders alone.
 
-| Token | Dark hex | Light hex | Usage |
-|---|---|---|---|
-| Base canvas (L0) | `#0B0C0E` Ink | `#FBFBFA` Paper (warm) | Window canvas, deepest surface. |
-| Panel (L1) | `#131519` Slate-900 | `#FFFFFF` Surface | Sidebar, cards, metric rail, table body. |
-| Raise (L2) | `#1B1E24` Slate-800 | `#F2F1EE` | Hover, selected-row base, input wells. |
-| Hairline | `#262A31` | `#E6E4E0` | 1px inset borders + dividers + chart grid. |
-| Text hi (+ hero numerals) | `#ECEEF1` | `#16181C` | Primary text/numerals. |
-| Text mid | `#9AA1AC` | `#5E636B` | Secondary labels, units, ticks. |
-| Text dim | `#5B626D` | (derived) | Tertiary / placeholder / disabled / key-cap outline. |
-| **Voltage** (accent) | `#3D7BFF` | `#2C5FE0` Voltage-deep | Focus ring, the one primary CTA/screen, live-metric line, ⌘K selection, selected-row left-border. Rationed. ~4.6:1 on each base. |
-| Signal-pass | `#2FB079` | `#2FB079` | Correctness only: parity PASS, quant OK, converging caret. Paired with a glyph (✓ / ▼). |
-| Signal-warn | `#D9A227` | `#D9A227` | Drift / PPL regression / OOM-risk / loss-rising caret. Paired with ▲. |
-| Signal-fail | `#E5523C` | `#E5523C` | Parity FAIL, NaN loss, crash. Rare; paired with ✕. |
+| Token                     | Dark hex            | Light hex              | Usage                                                                                                                            |
+| ------------------------- | ------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Base canvas (L0)          | `#0B0C0E` Ink       | `#FBFBFA` Paper (warm) | Window canvas, deepest surface.                                                                                                  |
+| Panel (L1)                | `#131519` Slate-900 | `#FFFFFF` Surface      | Sidebar, cards, metric rail, table body.                                                                                         |
+| Raise (L2)                | `#1B1E24` Slate-800 | `#F2F1EE`              | Hover, selected-row base, input wells.                                                                                           |
+| Hairline                  | `#262A31`           | `#E6E4E0`              | 1px inset borders + dividers + chart grid.                                                                                       |
+| Text hi (+ hero numerals) | `#ECEEF1`           | `#16181C`              | Primary text/numerals.                                                                                                           |
+| Text mid                  | `#9AA1AC`           | `#5E636B`              | Secondary labels, units, ticks.                                                                                                  |
+| Text dim                  | `#5B626D`           | (derived)              | Tertiary / placeholder / disabled / key-cap outline.                                                                             |
+| **Voltage** (accent)      | `#3D7BFF`           | `#2C5FE0` Voltage-deep | Focus ring, the one primary CTA/screen, live-metric line, ⌘K selection, selected-row left-border. Rationed. ~4.6:1 on each base. |
+| Signal-pass               | `#2FB079`           | `#2FB079`              | Correctness only: parity PASS, quant OK, converging caret. Paired with a glyph (✓ / ▼).                                          |
+| Signal-warn               | `#D9A227`           | `#D9A227`              | Drift / PPL regression / OOM-risk / loss-rising caret. Paired with ▲.                                                            |
+| Signal-fail               | `#E5523C`           | `#E5523C`              | Parity FAIL, NaN loss, crash. Rare; paired with ✕.                                                                               |
 
 Every signal color pairs with a redundant glyph for colorblind safety; signal hues shift lightness (not hue) to clear ~4.5:1 on both grounds.
 
@@ -309,18 +311,18 @@ CHAT split-compare — hot-swap fader (base vs +adapter)
 
 # Head-to-Head
 
-| Criterion | Lattice Instrument | Lattice / Console | Edge |
-|---|---|---|---|
-| **Sleek / modern** | 9 — full instrument metaphor, recessed wells, oscilloscope | 9 — ruthless Linear-class restraint | tie |
-| **Brand fit** | 10 — most literal "measure first" translation | 9 — same thesis, leans on a known aesthetic | Instrument |
-| **Feature surfacing** | 9 — dedicated comparator/quant-table screens, denser readouts | 8 — slightly thinner; config lists + right-rail metrics | Instrument |
-| **Feasibility** | 9 — all native APIs; density redraw is the only watch-item | 10 — least surface area, glass on nav only | Console |
-| **Distinctiveness** | 8 — instrument/Bloomberg metaphor is on-brand but not category-novel | 7 — risks "another dark dev tool" without an exceptional type pass | Instrument |
-| **Density posture** | High by default (with a comfortable toggle) | Lean by default (Cmd-K hides forms) | open design choice |
+| Criterion             | Lattice Instrument                                                   | Lattice / Console                                                  | Edge               |
+| --------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------ | ------------------ |
+| **Sleek / modern**    | 9 — full instrument metaphor, recessed wells, oscilloscope           | 9 — ruthless Linear-class restraint                                | tie                |
+| **Brand fit**         | 10 — most literal "measure first" translation                        | 9 — same thesis, leans on a known aesthetic                        | Instrument         |
+| **Feature surfacing** | 9 — dedicated comparator/quant-table screens, denser readouts        | 8 — slightly thinner; config lists + right-rail metrics            | Instrument         |
+| **Feasibility**       | 9 — all native APIs; density redraw is the only watch-item           | 10 — least surface area, glass on nav only                         | Console            |
+| **Distinctiveness**   | 8 — instrument/Bloomberg metaphor is on-brand but not category-novel | 7 — risks "another dark dev tool" without an exceptional type pass | Instrument         |
+| **Density posture**   | High by default (with a comfortable toggle)                          | Lean by default (Cmd-K hides forms)                                | open design choice |
 
-**When each wins.** Instrument wins when the user lives *inside* a run — watching loss, scrubbing the curve, reading six wells at once — and wants the screen to be a panel of live truth. It is the richer demo and the more defensible brand statement. Console wins on pure speed and minimal build risk: a power user who configures by keystroke and never wants to see a form, on the cheapest path to ship. Console's distinctiveness is its only soft spot — near-monochrome reads generic unless the hero numerals are genuinely authored.
+**When each wins.** Instrument wins when the user lives _inside_ a run — watching loss, scrubbing the curve, reading six wells at once — and wants the screen to be a panel of live truth. It is the richer demo and the more defensible brand statement. Console wins on pure speed and minimal build risk: a power user who configures by keystroke and never wants to see a form, on the cheapest path to ship. Console's distinctiveness is its only soft spot — near-monochrome reads generic unless the hero numerals are genuinely authored.
 
-The crucial point: **they are not opposites.** Console's Cmd-K command spine is the single best IA primitive in the whole exploration, and it slots cleanly into Instrument as primitive #11. The real fork is *density default*, not *which thesis*.
+The crucial point: **they are not opposites.** Console's Cmd-K command spine is the single best IA primitive in the whole exploration, and it slots cleanly into Instrument as primitive #11. The real fork is _density default_, not _which thesis_.
 
 ---
 
@@ -329,12 +331,13 @@ The crucial point: **they are not opposites.** Console's Cmd-K command spine is 
 **Build Lattice Instrument, with Console's ⌘K command spine grafted in from day one.**
 
 Why:
-1. **Brand fit is the tiebreaker and Instrument wins it 10 vs 9.** lattice's identity is literally "the number is the truth," and Instrument is the most complete translation of that into UI — readout wells, the oscilloscope strip chart with scrub-to-freeze, GATE PILL verdicts. It sells the *moat* (QuaRot ContrastPair, hot-swap fader) rather than raw speed, exactly as the README demands.
+
+1. **Brand fit is the tiebreaker and Instrument wins it 10 vs 9.** lattice's identity is literally "the number is the truth," and Instrument is the most complete translation of that into UI — readout wells, the oscilloscope strip chart with scrub-to-freeze, GATE PILL verdicts. It sells the _moat_ (QuaRot ContrastPair, hot-swap fader) rather than raw speed, exactly as the README demands.
 2. **The feasibility gap is small and closeable.** Instrument is a 9 to Console's 10. Its only real risk is 60fps redraw of the live curve under a fast step/token stream — mitigated by buffering points and throttling chart commits to ~20Hz, the same technique both directions already specify. Everything else maps to native APIs (`.monospacedDigit`, `.contentTransition(.numericText())`, Swift Charts `LineMark`+`RuleMark`+`chartOverlay`, `NavigationSplitView`). Verified buildable on the installed Swift 6.3.2 / macOS 26 toolchain.
-3. **Grafting closes the only thing Console wins on.** Adding the ⌘K spine to Instrument gives power users the keyboard-first launch path without sacrificing the dense readout panels. The comfortable-row toggle (32px) handles the density-too-cold risk Instrument self-flags. We get Console's speed *and* Instrument's brand depth.
+3. **Grafting closes the only thing Console wins on.** Adding the ⌘K spine to Instrument gives power users the keyboard-first launch path without sacrificing the dense readout panels. The comfortable-row toggle (32px) handles the density-too-cold risk Instrument self-flags. We get Console's speed _and_ Instrument's brand depth.
 4. **Honors the editorial/bold design lean correctly.** Both reject the literal display-serif reading (a streaming loss in a 96pt serif visibly jitters — it contradicts "the truth does not shimmer"). Instrument spends all its boldness on a 56pt tabular-mono hero numeral: editorial confidence without the jitter risk.
 
-The override on the "editorial/bold" lean is deliberate and stated: editorial is a *typographic posture*, not a literal magazine. We deliver it as **monospace-numeral boldness**, which is both more on-brand for an instrument and lower-risk to build. If the magazine-cover feel is specifically wanted, that is the genuine fork below.
+The override on the "editorial/bold" lean is deliberate and stated: editorial is a _typographic posture_, not a literal magazine. We deliver it as **monospace-numeral boldness**, which is both more on-brand for an instrument and lower-risk to build. If the magazine-cover feel is specifically wanted, that is the genuine fork below.
 
 ---
 
@@ -344,7 +347,7 @@ The override on the "editorial/bold" lean is deliberate and stated: editorial is
 
 1. **SwiftPM target + shell.** Create `apps/macos/` SwiftPM executable target that `swift build` compiles. Stand up the `NavigationSplitView` three-pane shell, the left rail with static nav, and the asset-catalog semantic colors (both appearances, all elevation tokens). Goal: an empty but adaptive shell that launches.
 2. **The opaque-panel + numeral kit.** Build the shared primitives that everything depends on: `OpaquePanel` container (enforces "numbers never touch glass"), `ReadoutWell`, `HeroNumber` (`.contentTransition(.numericText())`), `DataTable`, `GatePill`, `KeyCapChip`. Bundle JetBrains Mono. This is the visual identity made real.
-3. **CLI bridge + event store.** A subprocess runner that spawns the lattice `tune` / `quantize` / `chat` bins and parses their line-delimited JSON `stdout` into an `@Observable` run store. Map JSON 1:1 onto the real serde structs (`EpochMetrics`, `AdaptStepResult`, `TrainingMetrics`). **Critical:** own the run `@State` *above* the view and key by run-id so a re-render never resets a live run.
+3. **CLI bridge + event store.** A subprocess runner that spawns the lattice `tune` / `quantize` / `chat` bins and parses their line-delimited JSON `stdout` into an `@Observable` run store. Map JSON 1:1 onto the real serde structs (`EpochMetrics`, `AdaptStepResult`, `TrainingMetrics`). **Critical:** own the run `@State` _above_ the view and key by run-id so a re-render never resets a live run.
 4. **01 MODELS (read-only first).** The simplest real-data screen: list `~/.lattice/models`, parse `config.json` into readout wells. Proves the bridge and the table primitive against real on-disk artifacts before any long-running job.
 5. **02 TRAIN (the flagship loop).** Wire PARAM ROWS → CLI launch → live HERO NUMBER + STRIP CHART + READOUT WELLS off the event store. Add scrub-to-freeze. This is the demo centerpiece; get the ~20Hz throttle right here.
 6. **⌘K command spine.** The grafted Console primitive: a glass palette that parses `train qwen3.5 r8` into argument chips and fires step 5's launch path. Add the ⌘1–6 key-cap legend.
