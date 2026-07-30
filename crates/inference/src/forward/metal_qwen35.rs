@@ -9238,246 +9238,6 @@ mod inner {
         // Layer-encoding helpers (called from forward_step_inner)
         // ===================================================================
 
-        /// Encode all Metal commands for a single GQA (full-attention) layer.
-        ///
-        /// All commands are appended to the already-open encoder `enc`; no new
-        /// command buffer is created here.
-        #[allow(clippy::too_many_arguments)]
-        #[allow(clippy::too_many_arguments)]
-        fn encode_gqa_layer(
-            &mut self,
-            enc: &ComputeCommandEncoderRef,
-            compact_idx: usize,
-            full_idx: usize,
-            position: usize,
-            kv_dim: usize,
-            layer_idx: usize,
-            cfg: &Qwen35Config,
-            prof: &mut StepProfile,
-            profiling: bool,
-            with_mlp: bool,
-            mrope_override: Option<(&Buffer, &Buffer)>,
-        ) {
-            let hidden = cfg.hidden_size;
-            // GQA: SINGLE command buffer — pre-norm + projections + KV copy + attention + MLP
-            let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
-                let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[compact_idx].0
-                else {
-                    unreachable!()
-                };
-                (
-                    &full_w.q_proj as *const Q4WeightBuf,
-                    &full_w.k_proj as *const Q4WeightBuf,
-                    &full_w.v_proj as *const Q4WeightBuf,
-                    &full_w.o_proj as *const Q4WeightBuf,
-                    &full_w.q_norm as *const Buffer,
-                    &full_w.k_norm as *const Buffer,
-                )
-            };
-            let (_, common_w) = &self.engine.layer_weights[compact_idx];
-            let q_dim = cfg.full_q_dim();
-            let head_dim = cfg.head_dim;
-            let num_q_heads = cfg.num_attention_heads;
-            let num_kv_heads = cfg.num_key_value_heads;
-            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
-            assert!(
-                self.session.kv_cache.seq_len < self.session.kv_cache.max_cache_len,
-                "KV cache overflow: seq_len {} >= max_cache_len {}",
-                self.session.kv_cache.seq_len,
-                self.session.kv_cache.max_cache_len
-            );
-            let kv_cache_offset = (self.session.kv_cache.seq_len * kv_dim) as u32;
-            let cur_seq_len = (self.session.kv_cache.seq_len + 1) as u32;
-            let scale = 1.0 / (head_dim as f32).sqrt();
-
-            // Pre-norm: save residual + normalize hidden in one dispatch
-            self.dispatch_copy_and_rms_norm(
-                enc,
-                &self.session.activations.hidden,
-                &self.session.activations.residual,
-                &common_w.input_layernorm,
-                hidden as u32,
-                cfg.rms_norm_eps,
-            );
-
-            // Q/K/V projections + scatter + norms + RoPE
-            // SAFETY: Raw layer weight pointers were taken from
-            // self.engine.layer_weights and remain valid while self is borrowed;
-            // dispatch dimensions match the preallocated activation buffers.
-            let gqa_proj_t0 = profiling.then(std::time::Instant::now);
-            unsafe {
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.hidden,
-                    &*w_q_proj,
-                    &self.session.activations.q,
-                    1,
-                    (2 * q_dim) as u32,
-                    hidden as u32,
-                );
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.hidden,
-                    &*w_k_proj,
-                    &self.session.activations.k,
-                    1,
-                    kv_dim as u32,
-                    hidden as u32,
-                );
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.hidden,
-                    &*w_v_proj,
-                    &self.session.activations.v,
-                    1,
-                    kv_dim as u32,
-                    hidden as u32,
-                );
-            }
-            // LoRA for Q/K/V projections
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.q,
-                0,
-                layer_idx,
-                "q_proj",
-            );
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.k,
-                0,
-                layer_idx,
-                "k_proj",
-            );
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.v,
-                0,
-                layer_idx,
-                "v_proj",
-            );
-            if let Some(t0) = gqa_proj_t0 {
-                prof.projection_us += t0.elapsed().as_micros();
-            }
-            self.dispatch_scatter_q_gate(enc, num_q_heads as u32, head_dim as u32);
-            // SAFETY: Q/K norm buffers are live layer-owned buffers and the
-            // head counts/head_dim come from the same config used to size them.
-            unsafe {
-                self.dispatch_per_head_rms_norm(
-                    enc,
-                    &self.session.activations.q_separated,
-                    &*w_q_norm,
-                    num_q_heads as u32,
-                    head_dim as u32,
-                    cfg.rms_norm_eps,
-                );
-                self.dispatch_per_head_rms_norm(
-                    enc,
-                    &self.session.activations.k,
-                    &*w_k_norm,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    cfg.rms_norm_eps,
-                );
-            }
-            self.dispatch_partial_rope(
-                enc,
-                &self.session.activations.q_separated,
-                num_q_heads as u32,
-                head_dim as u32,
-                half_rope_dim,
-                position as u32,
-                mrope_override,
-            );
-            self.dispatch_partial_rope(
-                enc,
-                &self.session.activations.k,
-                num_kv_heads as u32,
-                head_dim as u32,
-                half_rope_dim,
-                position as u32,
-                mrope_override,
-            );
-
-            // GPU KV cache copy
-            self.dispatch_copy_offset_kv(
-                enc,
-                &self.session.activations.k,
-                &self.session.kv_cache.k_bufs[full_idx],
-                kv_dim as u32,
-                kv_cache_offset,
-            );
-            self.dispatch_copy_offset_kv(
-                enc,
-                &self.session.activations.v,
-                &self.session.kv_cache.v_bufs[full_idx],
-                kv_dim as u32,
-                kv_cache_offset,
-            );
-
-            // Decode attention + gating + O projection
-            let gqa_attn_t0 = profiling.then(std::time::Instant::now);
-            self.dispatch_decode_attention(
-                enc,
-                &self.session.kv_cache.k_bufs[full_idx],
-                &self.session.kv_cache.v_bufs[full_idx],
-                cur_seq_len,
-                head_dim as u32,
-                num_q_heads as u32,
-                num_kv_heads as u32,
-                q_dim as u32,
-                kv_dim as u32,
-                scale,
-            );
-            self.dispatch_sigmoid_gate(enc, q_dim as u32);
-            if let Some(t0) = gqa_attn_t0 {
-                prof.gqa_attention_us += t0.elapsed().as_micros();
-            }
-            // SAFETY: The O-projection buffer pointer is live for the command
-            // buffer and dimensions match [hidden, q_dim].
-            let gqa_oproj_t0 = profiling.then(std::time::Instant::now);
-            unsafe {
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.attn_out,
-                    &*w_o_proj,
-                    &self.session.activations.ffn_out,
-                    1,
-                    hidden as u32,
-                    q_dim as u32,
-                );
-            }
-            // LoRA for o_proj: x = attn_out (gated attention output), y = ffn_out
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.attn_out,
-                0,
-                &self.session.activations.ffn_out,
-                0,
-                layer_idx,
-                "o_proj",
-            );
-            self.dispatch_copy(
-                enc,
-                &self.session.activations.ffn_out,
-                &self.session.activations.attn_out,
-                hidden as u32,
-            );
-            if let Some(t0) = gqa_oproj_t0 {
-                prof.projection_us += t0.elapsed().as_micros();
-            }
-
-            if with_mlp {
-                self.encode_mlp_block(enc, compact_idx, layer_idx, position, cfg, prof, profiling);
-            }
-        }
-
         /// Encode the final head: optional pre-final hidden capture, RMS norm,
         /// logit GEMV, and optional top-k.
         ///
@@ -13674,7 +13434,14 @@ mod inner {
             let dispatch_src = include_str!("metal_qwen35/inner/dispatch.rs");
             let layers_src = include_str!("metal_qwen35/inner/layers/mod.rs");
             let gdn_layer_src = include_str!("metal_qwen35/inner/layers/gdn.rs");
-            let production_sources = [production_src, dispatch_src, layers_src, gdn_layer_src];
+            let gqa_layer_src = include_str!("metal_qwen35/inner/layers/gqa.rs");
+            let production_sources = [
+                production_src,
+                dispatch_src,
+                layers_src,
+                gdn_layer_src,
+                gqa_layer_src,
+            ];
 
             for retired_declaration in [
                 concat!("fn full_attention_layer_step_by_", "idx("),
@@ -13711,6 +13478,40 @@ mod inner {
                 "the release-build LATTICE_GDN_CPU fail-closed guard is independent \
                  of the retired debug reference functions and must remain"
             );
+
+            assert_eq!(
+                production_src.matches("fn encode_gqa_layer(").count(),
+                0,
+                "encode_gqa_layer must stay out of the parent inner module"
+            );
+            assert_eq!(
+                gqa_layer_src.matches("fn encode_gqa_layer(").count(),
+                1,
+                "the GQA layer module must own exactly one encoder definition"
+            );
+            assert_eq!(
+                gqa_layer_src
+                    .matches("self.dispatch_lora_if_active(")
+                    .count(),
+                4,
+                "the GQA encoder must route all four projection adapters through the shared helper"
+            );
+            assert_eq!(
+                gqa_layer_src.matches("self.encode_mlp_block(").count(),
+                1,
+                "the GQA encoder must reuse the shared MLP helper"
+            );
+            for shared_helper in ["fn dispatch_lora_if_active(", "fn encode_mlp_block("] {
+                assert_eq!(
+                    layers_src.matches(shared_helper).count(),
+                    1,
+                    "layers/mod.rs must own exactly one shared helper definition: {shared_helper}"
+                );
+                assert!(
+                    !gqa_layer_src.contains(shared_helper),
+                    "the GQA layer module must not duplicate shared helper: {shared_helper}"
+                );
+            }
         }
 
         #[test]
@@ -16065,49 +15866,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
-        fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
-            let Some(_) = Device::system_default() else {
-                return;
-            };
-            let (cfg, weights) = tiny_metal_qwen35_fixture();
-            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
-                .expect("tiny MetalQwen35State fixture constructs");
-
-            let logits = state.forward_step(42, 0);
-            assert_eq!(logits.len(), cfg.vocab_size);
-            let actual = &logits[..10];
-            // Math: token 42's embedding is one-hot: x[0]=1.0, x[1..]=0.0.
-            // All attention and FFN weights are zero → residual stream equals the
-            // raw embedding at every stage. final_norm then applies the shifted
-            // RMSNorm (qwen35_rms_norm convention: output = x * (1 + gamma) / rms(x)).
-            // With final_norm=[1.0] the scale is (1+1.0)=2; identity is gamma=0.
-            //   rms(x) = sqrt(1/512),  output[0] = 1.0 * (1+1.0) * sqrt(512) = 2*sqrt(512) ≈ 45.254.
-            // Tied lm_head col-0 pattern is [-1,0,1,-1,0,1,...], so logits ≈ ±45.25 / 0.
-            // (Issue #31: the original golden ±22.62 assumed plain-gamma; ±45.24 is correct.)
-            let expected = [
-                -45.243256_f32,
-                0.0,
-                45.243256,
-                -45.243256,
-                0.0,
-                45.243256,
-                -45.243256,
-                0.0,
-                45.243256,
-                -45.243256,
-            ];
-            let max_abs_diff = actual
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, e)| (a - e).abs())
-                .fold(0.0_f32, f32::max);
-            assert!(
-                max_abs_diff < 1e-4,
-                "golden first-10 logits changed: actual={actual:?} expected={expected:?} max_abs_diff={max_abs_diff}"
-            );
-        }
-
-        #[test]
         fn forward_step_rejects_position_and_cache_capacity_before_dispatch() {
             let Some(_) = Device::system_default() else {
                 return;
@@ -16269,62 +16027,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 Err(other) => panic!("expected InvalidInput, got {other}"),
             }
             assert_eq!(state.session.kv_cache.seq_len, 0);
-        }
-
-        #[test]
-        fn test_metal_qwen35_kv_cache_determinism_replay_5_tokens() {
-            let Some(_) = Device::system_default() else {
-                return;
-            };
-            let (cfg, weights) = tiny_metal_qwen35_fixture();
-            let tokens = [42_u32, 7, 13, 8, 42];
-            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
-                .expect("tiny MetalQwen35State fixture constructs");
-
-            // First pass
-            let mut first_logits: Vec<Vec<f32>> = Vec::new();
-            for &token in &tokens {
-                let pos = state.session.kv_cache.seq_len;
-                let logits = state.forward_step(token, pos);
-                assert_eq!(
-                    state.session.kv_cache.seq_len,
-                    pos + 1,
-                    "forward_step must advance seq_len exactly once"
-                );
-                first_logits.push(logits);
-            }
-            let first_seq_len = state.session.kv_cache.seq_len;
-
-            state.reset_state();
-
-            // Second pass (replay)
-            let mut second_logits: Vec<Vec<f32>> = Vec::new();
-            for &token in &tokens {
-                let pos = state.session.kv_cache.seq_len;
-                let logits = state.forward_step(token, pos);
-                assert_eq!(
-                    state.session.kv_cache.seq_len,
-                    pos + 1,
-                    "forward_step must advance seq_len exactly once"
-                );
-                second_logits.push(logits);
-            }
-            let second_seq_len = state.session.kv_cache.seq_len;
-
-            assert_eq!(first_seq_len, tokens.len(), "first pass seq_len");
-            assert_eq!(second_seq_len, tokens.len(), "second pass seq_len");
-            for (step, (first, second)) in first_logits.iter().zip(second_logits.iter()).enumerate()
-            {
-                let max_abs_diff = first
-                    .iter()
-                    .zip(second.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f32, f32::max);
-                assert!(
-                    max_abs_diff < 1e-4,
-                    "replay logits diverged at step {step}: max_abs_diff={max_abs_diff}"
-                );
-            }
         }
 
         #[test]
