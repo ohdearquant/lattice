@@ -72,6 +72,7 @@ fn bench_gen_cfg(max_new_tokens: usize) -> GenerateConfig {
         temperature: 0.0,
         top_k: 1,
         top_p: 1.0,
+        min_p: 0.0,
         repetition_penalty: 1.0,
         seed: Some(7),
         stop_token_ids: vec![],

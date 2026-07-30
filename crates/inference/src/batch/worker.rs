@@ -819,6 +819,7 @@ mod tests {
                 temperature: 0.0, // greedy fast path
                 top_k: 1,
                 top_p: 1.0,
+                min_p: 0.0,
                 repetition_penalty: 2.0,
             },
             lora_adapter: None,

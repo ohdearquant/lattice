@@ -1,7 +1,8 @@
-//! Qwen3.5 token sampling, repetition penalty, greedy fallback, softmax probability build, top-p filtering, distribution draw, and RNG helper.
+//! Qwen3.5 token sampling, repetition penalty, greedy fallback, softmax probability
+//! build, min-p/top-p filtering, distribution draw, and RNG helper.
 use crate::model::qwen35_config::GenerateConfig;
 
-/// Sample a token from logits using temperature, top-k, top-p, and repetition penalty.
+/// Sample a token from logits using temperature, top-k, min-p, top-p, and repetition penalty.
 ///
 /// Delegates to `crate::sampling::sample_full_logits`, the shared engine also
 /// used by the Metal CPU fallback (`forward/metal_qwen35.rs`'s private
@@ -70,7 +71,7 @@ pub(crate) fn sample_token_reference(
 
     // Sort indices by descending adjusted logit + ascending token-id so that
     // build_softmax_probs iterates in the same order as
-    // CandidateSet::sample_top_p_with_scratch (which sorts candidates first).
+    // CandidateSet::sample_min_p_top_p_with_scratch (which sorts candidates first).
     // Identical iteration order guarantees bit-identical softmax sums and
     // therefore bit-identical probabilities — required for the cross-path
     // parity test and for exact numerical alignment at the draw boundary.
@@ -92,6 +93,8 @@ pub(crate) fn sample_token_reference(
     let Some(mut probs) = build_softmax_probs(&adjusted, &indices) else {
         return greedy_token(&adjusted);
     };
+
+    apply_min_p(&mut probs, cfg.min_p);
 
     if cfg.top_p < 1.0 {
         apply_top_p(&mut probs, cfg.top_p);
@@ -175,6 +178,30 @@ fn build_softmax_probs(adjusted: &[f32], indices: &[usize]) -> Option<Vec<(usize
 }
 
 #[cfg(test)]
+fn apply_min_p(probs: &mut Vec<(usize, f32)>, min_p: f32) {
+    let min_p = if min_p.is_nan() {
+        0.0
+    } else {
+        min_p.clamp(0.0, 1.0)
+    };
+    if min_p == 0.0 || probs.is_empty() {
+        return;
+    }
+
+    let threshold = probs[0].1 * min_p;
+    let cutoff = probs
+        .iter()
+        .position(|&(_, probability)| probability < threshold)
+        .unwrap_or(probs.len())
+        .max(1);
+    probs.truncate(cutoff);
+    let sum: f32 = probs.iter().map(|(_, probability)| probability).sum();
+    for (_, probability) in probs {
+        *probability /= sum;
+    }
+}
+
+#[cfg(test)]
 fn apply_top_p(probs: &mut Vec<(usize, f32)>, top_p: f32) {
     let mut cumsum = 0.0f32;
     let mut cutoff = probs.len();
@@ -208,7 +235,7 @@ fn draw_from_distribution(probs: &[(usize, f32)], rng_state: &mut u64) -> u32 {
 /// sum≈1.0, so cumulative thresholds are c_0<c_1<...<c_{n-1}≈1.0. The last
 /// bucket owns the half-open interval `[c_{n-2}, 1.0)`. A draw `r` that floats
 /// past c_{n-1} lies in that final interval, so the correct token is the LAST
-/// iterated one. This matches `CandidateSet::sample_top_p_with_scratch` (Path A),
+/// iterated one. This matches `CandidateSet::sample_min_p_top_p_with_scratch` (Path A),
 /// which also returns `candidates.last()` for the same reason.
 #[cfg(test)]
 fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
@@ -231,7 +258,7 @@ fn draw_index(probs: &[(usize, f32)], r: f32) -> u32 {
 /// conversion, provably strictly < 1.0). Both CPU sampling paths share this
 /// primitive so a fixed seed yields the same uniform draw stream. After the
 /// fallback unification (`draw_index` now returns the LAST element, matching
-/// `CandidateSet::sample_top_p_with_scratch`) and the tie-break alignment (the
+/// `CandidateSet::sample_min_p_top_p_with_scratch`) and the tie-break alignment (the
 /// top-k selection and the single pre-softmax index sort fix both the tie order
 /// and the softmax summation order to match Path A), a fixed seed produces
 /// token-identical streams for the same (logits, config, seed) — including inputs
@@ -252,6 +279,7 @@ mod tests {
             temperature,
             top_k,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         }
@@ -347,7 +375,7 @@ mod tests {
     /// scalar/NEON seed phases rewrite a NaN *scaled* logit to
     /// `f32::NEG_INFINITY` so the min-heap root is never NaN. That
     /// sanitization erases the NaN before
-    /// `CandidateSet::sample_top_p_with_scratch`'s own poisoned-sum guard
+    /// `CandidateSet::sample_min_p_top_p_with_scratch`'s own poisoned-sum guard
     /// ever sees it, silently turning a fail-closed case into a normal
     /// weighted draw. Proven counterexample: `top_k=0`, logits
     /// `[0.0, NaN, 0.0]`, seed `0x5eed_f00d_1234_5678` returned token 2
@@ -545,6 +573,7 @@ mod tests {
             temperature,
             top_k,
             top_p,
+            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
@@ -556,6 +585,7 @@ mod tests {
             temperature,
             top_k,
             top_p,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -569,6 +599,48 @@ mod tests {
             "Sampler::sample and sample_token must produce identical token streams \
              for the same logits, config, and seed (consolidation parity proof)"
         );
+    }
+
+    #[test]
+    fn min_p_is_active_and_identical_across_cpu_sampling_paths() {
+        use crate::sampling::{Sampler, SamplingConfig};
+
+        let logits = [0.0, 0.49_f32.ln(), 0.1_f32.ln()];
+        let seed = 0x5870_5870_5870_5870;
+        let draws = 128;
+        let cfg = GenerateConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.5,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        let mut sampler = Sampler::new(SamplingConfig {
+            temperature: cfg.temperature,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
+            min_p: cfg.min_p,
+            repetition_penalty: cfg.repetition_penalty,
+        })
+        .with_seed(seed);
+        let sampler_tokens: Vec<u32> = (0..draws).map(|_| sampler.sample(&logits)).collect();
+
+        let mut optimized_rng = seed;
+        let optimized_tokens: Vec<u32> = (0..draws)
+            .map(|_| sample_token(&logits, &cfg, &[], &mut optimized_rng))
+            .collect();
+        let mut reference_rng = seed;
+        let reference_tokens: Vec<u32> = (0..draws)
+            .map(|_| sample_token_reference(&logits, &cfg, &[], &mut reference_rng))
+            .collect();
+
+        assert!(
+            sampler_tokens.iter().all(|&token| token == 0),
+            "min_p=0.5 must remove the 0.49- and 0.1-relative-probability tails"
+        );
+        assert_eq!(sampler_tokens, optimized_tokens);
+        assert_eq!(optimized_tokens, reference_tokens);
     }
 
     #[test]
@@ -639,7 +711,8 @@ mod tests {
         // correct fallback is the LAST bucket — on a descending-prob, sum≈1.0 CDF
         // the final bucket owns [c_{n-2}, 1.0), so an r that floats past the last
         // threshold belongs to the LAST token. This matches Path A's
-        // `CandidateSet::sample_top_p_with_scratch`, which returns `candidates.last()`.
+        // `CandidateSet::sample_min_p_top_p_with_scratch`, which returns
+        // `candidates.last()`.
         //
         // This test is the mutation-sensitive proof of the fallback alignment:
         // reverting `draw_index` to the old `probs[probs.len()-1]` → `probs[0]`
@@ -695,12 +768,13 @@ mod tests {
         let seed = 0xdead_beef_cafe_babe_u64;
         let n = 200usize;
 
-        // Path A: Sampler (CandidateSet::sample_top_p_with_scratch). Keeps {0,1,2}
+        // Path A: Sampler (CandidateSet::sample_min_p_top_p_with_scratch). Keeps {0,1,2}
         // (idx 2 wins the rank-3 tie by lower id), ordered [0,1,2] (lower id first).
         let config_a = SamplingConfig {
             temperature,
             top_k,
             top_p,
+            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
@@ -713,6 +787,7 @@ mod tests {
             temperature,
             top_k,
             top_p,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };

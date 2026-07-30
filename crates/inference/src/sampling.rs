@@ -1,7 +1,7 @@
 //! Token sampling strategies for text generation.
 //!
-//! Supports temperature scaling, top-k filtering, top-p (nucleus) sampling,
-//! and repetition penalty.
+//! Supports temperature scaling, top-k filtering, min-p filtering, top-p
+//! (nucleus) sampling, and repetition penalty.
 
 use crate::model::qwen35_config::{GenerateConfig, TopLogprob};
 
@@ -111,6 +111,9 @@ pub struct SamplingConfig {
     pub top_k: usize,
     /// Top-p (nucleus): keep tokens whose cumulative probability <= p. 1.0 = disabled.
     pub top_p: f32,
+    /// Min-p: keep tokens with probability at least `min_p * max_probability`.
+    /// 0.0 or NaN = disabled; all other values clamp to `[0.0, 1.0]`.
+    pub min_p: f32,
     /// Repetition penalty multiplier. 1.0 = no penalty.
     pub repetition_penalty: f32,
 }
@@ -121,6 +124,7 @@ impl Default for SamplingConfig {
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
+            min_p: 0.0,
             repetition_penalty: 1.1,
         }
     }
@@ -133,6 +137,7 @@ impl SamplingConfig {
             temperature: 0.0,
             top_k: 1,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
         }
     }
@@ -151,7 +156,7 @@ pub struct Candidate {
 /// **Unstable**: a set of (token_id, logit) candidates for categorical sampling.
 ///
 /// Provides the sampling pipeline: apply repetition penalty → temperature →
-/// top-k → top-p → sample.  Both the Metal compact path and the CPU Qwen
+/// top-k → min-p → top-p → sample. Both the Metal compact path and the CPU Qwen
 /// path use this type so sampling semantics are shared.
 pub struct CandidateSet {
     candidates: Vec<Candidate>,
@@ -256,14 +261,46 @@ impl CandidateSet {
     /// `r` must be a uniform f32 in [0, 1).
     pub fn sample_top_p(&mut self, top_p: f32, r: f32) -> u32 {
         let mut probs = Vec::new();
-        self.sample_top_p_with_scratch(top_p, r, &mut probs)
+        self.sample_min_p_top_p_with_scratch(0.0, top_p, r, &mut probs)
     }
 
-    /// Same as `sample_top_p` but reuses the caller's probability buffer to avoid allocation.
+    /// Apply min-p and top-p filtering, then sample from the surviving candidates.
+    ///
+    /// Min-p runs after repetition penalty, temperature scaling, and top-k,
+    /// but before top-p. `min_p == 0.0` disables the relative-probability
+    /// filter; `min_p == 1.0` retains only candidates tied for maximum
+    /// probability. `NaN` is treated as `0.0` so invalid programmatic input
+    /// preserves the pre-min-p distribution; all other values clamp to
+    /// `[0.0, 1.0]`.
+    pub fn sample_min_p_top_p(&mut self, min_p: f32, top_p: f32, r: f32) -> u32 {
+        let mut probs = Vec::new();
+        self.sample_min_p_top_p_with_scratch(min_p, top_p, r, &mut probs)
+    }
+
+    /// Allocation-free top-p path retained for internal regression tests.
+    #[cfg(test)]
     fn sample_top_p_with_scratch(&mut self, top_p: f32, r: f32, probs: &mut Vec<f32>) -> u32 {
+        self.sample_min_p_top_p_with_scratch(0.0, top_p, r, probs)
+    }
+
+    /// Same as [`CandidateSet::sample_min_p_top_p`] but reuses the caller's
+    /// probability buffer to avoid allocation.
+    fn sample_min_p_top_p_with_scratch(
+        &mut self,
+        min_p: f32,
+        top_p: f32,
+        r: f32,
+        probs: &mut Vec<f32>,
+    ) -> u32 {
         if self.candidates.is_empty() {
             return 0;
         }
+
+        let min_p = if min_p.is_nan() {
+            0.0
+        } else {
+            min_p.clamp(0.0, 1.0)
+        };
 
         // #328: normalise top_p into a defined regime before the `top_p < 1.0`
         // gate below. The raw argument is otherwise interpreted by undefined
@@ -294,6 +331,28 @@ impl CandidateSet {
         }
         probs.clear();
         probs.extend(self.candidates.iter().map(|c| (c.logit - max_logit).exp()));
+
+        // Since every softmax weight shares the same normalizing denominator,
+        // `probability >= min_p * max_probability` is exactly equivalent to
+        // `exp(logit - max_logit) >= min_p`. Filtering the unnormalized
+        // weights avoids an extra normalization pass. Candidates are already
+        // sorted by descending logit, so the survivors form one prefix.
+        if min_p > 0.0 {
+            // Preserve the fail-closed contract for direct CandidateSet callers:
+            // a NaN after the first below-threshold finite weight must not be hidden
+            // by truncation and turn a poisoned distribution into a normal draw.
+            if probs.iter().any(|weight| !weight.is_finite()) {
+                return self.candidates[0].token_id;
+            }
+            let cutoff = probs
+                .iter()
+                .position(|&weight| weight < min_p)
+                .unwrap_or(probs.len())
+                .max(1);
+            probs.truncate(cutoff);
+            self.candidates.truncate(cutoff);
+        }
+
         let sum: f32 = probs.iter().sum();
         // A finite max does not guarantee a finite sum: a NaN logit in a
         // non-max position (NaN sorts last, so it does not become `max_logit`)
@@ -393,7 +452,7 @@ pub struct Sampler {
     penalty_seen: std::collections::HashSet<u32>,
     /// Reused candidate buffer; avoids 1.9 MB alloc per call at vocab=248,320.
     candidate_scratch: Vec<Candidate>,
-    /// Reused probability buffer for top-p softmax.
+    /// Reused probability buffer for min-p/top-p softmax.
     prob_scratch: Vec<f32>,
     /// Reused f32 scratch for adjusted logits; avoids 993 KB alloc per call.
     logit_scratch: Vec<f32>,
@@ -517,7 +576,12 @@ impl Sampler {
             candidates: std::mem::take(&mut self.candidate_scratch),
         };
         let r = self.rng.next_f32();
-        let token = cs.sample_top_p_with_scratch(self.config.top_p, r, &mut self.prob_scratch);
+        let token = cs.sample_min_p_top_p_with_scratch(
+            self.config.min_p,
+            self.config.top_p,
+            r,
+            &mut self.prob_scratch,
+        );
         self.candidate_scratch = cs.candidates; // restore scratch capacity
         self.push_token(token);
         token
@@ -582,7 +646,7 @@ impl FullLogitScratch {
 /// [`Sampler`]). Implements the same pipeline as `Sampler::sample`'s non-greedy
 /// path: apply repetition penalty once per unique previously-seen id, check
 /// the degenerate-temperature greedy short-circuit, then a single fused
-/// temperature-scale + partial top-k select feeding a top-p softmax draw.
+/// temperature-scale + partial top-k select feeding a min-p/top-p softmax draw.
 ///
 /// This replaces, at each of its two call sites, a per-call
 /// `CandidateSet::from_full_logits` (materializes every vocabulary entry as a
@@ -645,7 +709,7 @@ pub(crate) fn sample_full_logits(
         // (a NaN root would reject every finite candidate in the NEON prefilter).
         // That sanitization is correct for the heap's internal ordering, but it
         // erases the NaN *before* the softmax degeneracy guard in
-        // `CandidateSet::sample_top_p_with_scratch` ever sees it, silently
+        // `CandidateSet::sample_min_p_top_p_with_scratch` ever sees it, silently
         // turning a "poisoned distribution" case into "normal sampling over a
         // masked candidate" — exactly the regression this scan closes.
         //
@@ -655,7 +719,7 @@ pub(crate) fn sample_full_logits(
         // NaN anywhere forces degeneracy (a NaN can never become the max, so it
         // would otherwise poison the softmax sum from a non-max position,
         // #322-class); a non-finite max (every logit `-inf`, or a `+inf` logit)
-        // also forces degeneracy, matching `sample_top_p_with_scratch`'s
+        // also forces degeneracy, matching `sample_min_p_top_p_with_scratch`'s
         // non-finite-max short-circuit. Scaling by a positive finite `inv_temp`
         // (guaranteed by the `temperature_degenerate` check above) preserves
         // both NaN-ness and finiteness, so scanning before the fused top-k scale
@@ -673,7 +737,7 @@ pub(crate) fn sample_full_logits(
             candidates: std::mem::take(candidate_scratch),
         };
         let r = uniform_f32_from_u64(xorshift64_next(rng_state));
-        let token = cs.sample_top_p_with_scratch(cfg.top_p, r, prob_scratch);
+        let token = cs.sample_min_p_top_p_with_scratch(cfg.min_p, cfg.top_p, r, prob_scratch);
         *candidate_scratch = cs.candidates; // restore scratch capacity
         token
     })
@@ -1251,6 +1315,7 @@ mod tests {
                 temperature: bad,
                 top_k: 2,
                 top_p: 1.0,
+                min_p: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1268,6 +1333,7 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(0x5eed_f00d_1234_5678);
@@ -1293,6 +1359,7 @@ mod tests {
                 temperature: tiny,
                 top_k: 2,
                 top_p: 1.0,
+                min_p: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1352,6 +1419,7 @@ mod tests {
                 temperature: band,
                 top_k: 2,
                 top_p: 1.0,
+                min_p: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1425,6 +1493,7 @@ mod tests {
             temperature: 1.0,
             top_k: 2,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(123);
@@ -1449,6 +1518,7 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 100.0, // very strong penalty
         };
         let mut sampler = Sampler::new(config);
@@ -1473,6 +1543,7 @@ mod tests {
             temperature: 0.0, // greedy fast path
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 0.5, // < 1.0 boosts recent tokens
         };
         let mut sampler = Sampler::new(config);
@@ -1496,6 +1567,7 @@ mod tests {
             temperature: 0.0, // greedy fast path
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 0.5, // < 1.0 boosts recent tokens
         };
         let mut sampler = Sampler::new(config);
@@ -1514,6 +1586,7 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 0.5,
+            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(456);
@@ -1525,6 +1598,167 @@ mod tests {
         }
         // Token 0 should get almost all samples (its probability >> 0.5)
         assert!(counts[0] > 90);
+    }
+
+    #[test]
+    fn min_p_filters_by_probability_relative_to_maximum() {
+        let candidates = || {
+            CandidateSet::from_candidates(vec![
+                Candidate {
+                    token_id: 7,
+                    logit: 0.0,
+                },
+                Candidate {
+                    token_id: 8,
+                    logit: 0.49_f32.ln(),
+                },
+                Candidate {
+                    token_id: 9,
+                    logit: 0.1_f32.ln(),
+                },
+            ])
+        };
+
+        assert_eq!(
+            candidates().sample_min_p_top_p(0.0, 1.0, 0.8),
+            8,
+            "control draw must reach the 0.49-relative-probability candidate"
+        );
+        assert_eq!(
+            candidates().sample_min_p_top_p(0.5, 1.0, 0.8),
+            7,
+            "min_p=0.5 must remove every candidate below half of max probability"
+        );
+    }
+
+    #[test]
+    fn min_p_nan_is_a_documented_disabled_noop() {
+        let candidates = || {
+            CandidateSet::from_candidates(vec![
+                Candidate {
+                    token_id: 7,
+                    logit: 0.0,
+                },
+                Candidate {
+                    token_id: 8,
+                    logit: 0.49_f32.ln(),
+                },
+            ])
+        };
+
+        assert_eq!(
+            candidates().sample_min_p_top_p(f32::NAN, 1.0, 0.8),
+            candidates().sample_min_p_top_p(0.0, 1.0, 0.8),
+            "NaN min-p must preserve the explicitly disabled distribution"
+        );
+    }
+
+    #[test]
+    fn min_p_interacts_with_penalty_temperature_top_k_and_top_p() {
+        let logits = [4.0, 3.0, 2.5];
+        let mut seen = [false; 3];
+
+        for seed in [0xdead_beef_cafe_babe, 0x1234_5678_9abc_def0] {
+            let mut sampler = Sampler::new(SamplingConfig {
+                temperature: 2.0,
+                top_k: 2,
+                top_p: 0.9,
+                min_p: 0.7,
+                repetition_penalty: 2.0,
+            })
+            .with_seed(seed);
+            sampler.seed_history(&[0]);
+            let token = sampler.sample(&logits);
+            assert!(
+                token == 1 || token == 2,
+                "penalty → temperature → top-k → min-p → top-p must exclude token {token}"
+            );
+            seen[token as usize] = true;
+        }
+
+        assert!(
+            seen[1] && seen[2],
+            "temperature must keep both top-k survivors above the min-p floor, \
+             and top-p must leave both reachable"
+        );
+    }
+
+    #[test]
+    fn min_p_runs_before_top_p_and_renormalizes_survivors() {
+        let mut candidates = CandidateSet::from_candidates(vec![
+            Candidate {
+                token_id: 0,
+                logit: 0.0,
+            },
+            Candidate {
+                token_id: 1,
+                logit: 0.6_f32.ln(),
+            },
+            Candidate {
+                token_id: 2,
+                logit: 0.5_f32.ln(),
+            },
+        ]);
+
+        assert_eq!(
+            candidates.sample_min_p_top_p(0.55, 0.6, 0.8),
+            0,
+            "min-p must first remove token 2; after renormalization top-p=0.6 \
+             retains only token 0"
+        );
+    }
+
+    #[test]
+    fn min_p_one_keeps_all_max_probability_ties() {
+        let mut candidates = CandidateSet::from_candidates(vec![
+            Candidate {
+                token_id: 3,
+                logit: 4.0,
+            },
+            Candidate {
+                token_id: 4,
+                logit: 4.0,
+            },
+            Candidate {
+                token_id: 5,
+                logit: 3.0,
+            },
+        ]);
+
+        assert_eq!(
+            candidates.sample_min_p_top_p(1.0, 1.0, 0.75),
+            4,
+            "min_p=1 must retain every token tied at the maximum, not collapse \
+             equal maxima to one arbitrary id"
+        );
+    }
+
+    #[test]
+    fn min_p_does_not_hide_nan_beyond_a_finite_cutoff() {
+        let mut candidates = CandidateSet::from_candidates(vec![
+            Candidate {
+                token_id: 0,
+                logit: 4.0,
+            },
+            Candidate {
+                token_id: 1,
+                logit: 4.0,
+            },
+            Candidate {
+                token_id: 2,
+                logit: 1.0,
+            },
+            Candidate {
+                token_id: 3,
+                logit: f32::NAN,
+            },
+        ]);
+
+        assert_eq!(
+            candidates.sample_min_p_top_p(0.5, 1.0, 0.75),
+            0,
+            "a NaN after the min-p cutoff must preserve the argmax fail-closed fallback"
+        );
     }
 
     #[test]
@@ -2026,6 +2260,7 @@ mod tests {
             temperature: 1.0,
             top_k: 0,   // disabled
             top_p: 1.0, // disabled
+            min_p: 0.0, // disabled
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(42);
@@ -2156,6 +2391,7 @@ mod tests {
             temperature: 0.0,
             top_k: 1,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 2.0,
         })
         .with_seed(1);
@@ -2210,6 +2446,7 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2236,6 +2473,7 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2270,6 +2508,7 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2544,6 +2783,7 @@ mod tests {
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,
+            min_p: 0.0,
             repetition_penalty: 1.1,
         };
         let gen_cfg = GenerateConfig {
