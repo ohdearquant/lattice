@@ -564,7 +564,7 @@ pub fn generate(
 
     // Apply grammar masking on the logit buffer in-place before sampling.
     if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
-        engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+        engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
         // If the grammar blocked every token the sampler's non-finite-max
         // short-circuit would silently return token 0 (the lowest id after
         // sorting an all-NEG_INFINITY candidate set). Fail closed instead (#398).
@@ -636,7 +636,7 @@ pub fn generate(
 
             // Apply grammar masking before sampling.
             if let (Some(engine), Some(gs)) = (&config.grammar, &mut grammar_state) {
-                engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size]);
+                engine.mask_logits(gs, &mut scratch.logits[..cfg.vocab_size])?;
                 // Same empty-mask guard as the first-token path: an all-NEG_INFINITY
                 // logit buffer would cause the sampler to silently emit token 0 (#398).
                 if !has_finite_logit(&scratch.logits[..cfg.vocab_size]) {

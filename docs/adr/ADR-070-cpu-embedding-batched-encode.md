@@ -19,13 +19,13 @@ A same-model comparison (all-MiniLM-L6-v2, 384-dim, CPU, identical input corpus,
 cosine agreement 0.99993 so both sides compute equivalent work) measured on 2026-07-05
 shows lattice losing across the board:
 
-| Metric | lattice-embed | ONNX Runtime | Gap |
-|---|---|---|---|
-| Single-text latency p50 / p90 | 3.02 / 3.70 ms | 2.05 / 2.37 ms | ORT 1.4-1.6x faster |
-| Batch throughput, bs=1 (texts/s) | 560 | 1074 | ORT 1.9x |
-| Batch throughput, bs=8 | 525 | 1112 | ORT 2.1x |
-| Batch throughput, bs=32 | 486 | 733 | ORT 1.5x |
-| Batch throughput, bs=64 | 481 | 691 | ORT 1.4x |
+| Metric                           | lattice-embed  | ONNX Runtime   | Gap                 |
+| -------------------------------- | -------------- | -------------- | ------------------- |
+| Single-text latency p50 / p90    | 3.02 / 3.70 ms | 2.05 / 2.37 ms | ORT 1.4-1.6x faster |
+| Batch throughput, bs=1 (texts/s) | 560            | 1074           | ORT 1.9x            |
+| Batch throughput, bs=8           | 525            | 1112           | ORT 2.1x            |
+| Batch throughput, bs=32          | 486            | 733            | ORT 1.5x            |
+| Batch throughput, bs=64          | 481            | 691            | ORT 1.4x            |
 
 The numbers are indicative (measured under background load, loadavg ~11 on 12 logical
 cores); the ordering is robust. Two structural causes, both verified by reading the
@@ -84,6 +84,7 @@ attention score/context step is inherently per-sequence.
 ## Consequences
 
 **Positive**
+
 - Closes the measured 1.4-2.1x deficit with work that is structurally understood, not
   speculative: batching recovers the flat-throughput loss, threading recovers the
   single-text loss.
@@ -93,6 +94,7 @@ attention score/context step is inherently per-sequence.
   prevents shipping performance claims that a competitor benchmark would contradict.
 
 **Negative / risks**
+
 - `attention/standard.rs` is correctness-critical; introducing a batch dimension and
   masking there is the riskiest edit in this change. Mitigation: a mutation-sensitive
   parity test encodes a mixed-length batch through the new fused path and through a
