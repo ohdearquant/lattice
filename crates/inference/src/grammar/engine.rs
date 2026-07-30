@@ -36,7 +36,8 @@
 use crate::grammar::gbnf::parse_gbnf;
 use crate::grammar::json_schema::compile;
 use crate::grammar::pda::{
-    CompiledGrammar, GrammarState, SimResult, StepResult, advance_byte, simulate_token,
+    CompiledGrammar, GrammarState, SimResult, StepResult, advance_byte, initial_grammar_state,
+    simulate_token,
 };
 use crate::grammar::spec::GrammarSpec;
 use crate::grammar::trie::ByteTrie;
@@ -214,7 +215,7 @@ fn enumerate_grammar_states(
     vocab_bytes: &[Vec<u8>],
     max_states: usize,
 ) -> Vec<GrammarState> {
-    let initial = GrammarState::initial();
+    let initial = initial_grammar_state(grammar);
     let mut queue: Vec<GrammarState> = vec![initial.clone()];
     let mut visited: Vec<GrammarState> = vec![initial];
     let mut head = 0;
@@ -371,7 +372,7 @@ impl GrammarEngine {
 
     /// Create the initial `GrammarState` for a new decode sequence.
     pub fn initial_state(&self) -> GrammarState {
-        GrammarState::initial()
+        initial_grammar_state(&self.grammar)
     }
 
     /// Apply grammar constraints to `logits` in-place.
@@ -860,6 +861,48 @@ mod tests {
         let engine = GrammarEngine::new(&spec, vocab).unwrap();
         let state = engine.initial_state();
         assert!(!state.is_complete(), "initial state should not be complete");
+    }
+
+    #[test]
+    fn nullable_initial_state_is_complete_without_continuation() {
+        let vocab = vec![b"a".to_vec()];
+        let spec = GrammarSpec::Gbnf("root ::= \"\"\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab).unwrap();
+        let mut state = engine.initial_state();
+
+        assert!(state.is_complete());
+        assert!(engine.is_complete_without_continuation(&state));
+
+        let mut logits = vec![0.0];
+        enable_mask_profiling();
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("locally constructed engine and matching logits length must mask");
+        let profile = take_mask_profile();
+        assert_eq!(logits, vec![f32::NEG_INFINITY]);
+        assert_eq!(profile.precomputed_calls, 1);
+        assert_eq!(profile.fallback_calls, 0);
+    }
+
+    #[test]
+    fn nullable_initial_state_with_continuation_is_not_terminal() {
+        let vocab = vec![b"a".to_vec()];
+        let spec = GrammarSpec::Gbnf("root ::= \"a\"?\n".to_string());
+        let engine = GrammarEngine::new(&spec, vocab).unwrap();
+        let mut state = engine.initial_state();
+
+        assert!(state.is_complete());
+        assert!(!engine.is_complete_without_continuation(&state));
+
+        let mut logits = vec![0.0];
+        enable_mask_profiling();
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("locally constructed engine and matching logits length must mask");
+        let profile = take_mask_profile();
+        assert_eq!(logits, vec![0.0]);
+        assert_eq!(profile.precomputed_calls, 1);
+        assert_eq!(profile.fallback_calls, 0);
     }
 
     #[test]

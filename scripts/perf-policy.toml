@@ -2,15 +2,17 @@
 # "canonical contract and policy, in days" — DESIGN.md section 4
 # "Regression-gating semantics" and its "Initial registered policy" table).
 #
-# Kill-points, not aspirational targets. Changing a threshold, a cv_bands
-# entry, or a family's noise class requires rationale and a new
+# Kill-points, not aspirational targets. Changing a threshold, a gating field
+# in `cv_bands`, or a family's noise class requires rationale and a new
 # `policy_version` (DESIGN.md: "versioned in perf-policy.toml before shadow
-# runs; changing one requires rationale and a new policy version"). A run
-# record pins the SHA-256 of this file's bytes at gate time
-# (`bench_gate_math.policy_sha`) so `bench_decode_harness.validate_run_record`
-# can fail closed on a post-run threshold change — the recorded gate must
-# have been evaluated against the policy content it claims, not a policy
-# that drifted underneath the same version number.
+# runs; changing one requires rationale and a new policy version"). TOML
+# comments and `cv_bands[*].note` are documentation only, so prose-only edits
+# do not require a version bump. `other_rule` remains identity-bearing because
+# its rule text could gain validator semantics later. A run record pins both
+# the tagged canonical identity from `bench_gate_math.policy_sha` and the exact
+# byte digest from `bench_gate_math.policy_file_sha`. Revalidation gates on the
+# canonical identity, while the byte digest preserves the source artifact for
+# audit without invalidating records for note/comment edits.
 #
 # Loaded by `scripts/bench_gate_math.load_policy` (structural validation)
 # and consumed by `scripts/bench_decode_harness.py`'s schema-v2 run-record

@@ -119,6 +119,29 @@ const REF_IGNORED_SIBLING_KEYS: &[&str] = &[
     "writeOnly",
 ];
 
+/// Supported assertion keywords whose conjunction with a `$ref` target cannot
+/// be represented by the current grammar compiler.
+///
+/// Silently compiling the target alone widens the schema, so these siblings
+/// must fail closed until their intersections are implemented.
+const REF_NARROWING_SIBLING_KEYS: &[&str] = &["const", "enum", "type"];
+
+/// Annotation keys that cannot narrow the resolved target's instance language.
+///
+/// Structural keys from `REF_IGNORED_SIBLING_KEYS` are deliberately excluded:
+/// `$ref` would mean resolution stopped early, while `$defs`, `definitions`,
+/// `$id`, and `$schema` describe schema structure rather than emitted values.
+const REF_TARGET_ANNOTATION_KEYS: &[&str] = &[
+    "$comment",
+    "title",
+    "description",
+    "default",
+    "examples",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+];
+
 /// Error returned by the JSON Schema compiler.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SchemaError(pub String);
@@ -319,8 +342,8 @@ impl<'a> CompileCtx<'a> {
     ///     `const`, or an all-string `enum`, see `ref_sub_forces_string`) but
     ///     its `$ref` resolves to a NON-string target, the conjunction is the
     ///     empty language, so the branch is DROPPED entirely rather than routed
-    ///     to `other_subs` — otherwise `compile_ref` would materialize the
-    ///     sibling-dropped non-string target and over-accept it;
+    ///     to `other_subs`, where the general `$ref` path would reject an
+    ///     intersection this specialized fold can represent exactly;
     ///   * an untyped `enum` mixing string and non-string members has its
     ///     string members folded into the literal set (`fold_string_members`)
     ///     while the branch itself is ALSO kept in `other_subs`, so its
@@ -368,22 +391,19 @@ impl<'a> CompileCtx<'a> {
                 }
                 None => {
                     if sub.get("$ref").is_some() {
-                        // Shape 1 (issue #473): a `$ref` branch. `compile_schema_inner`
-                        // resolves `$ref` first and drops sibling `const`/`enum`, so the
-                        // compiler's own language for the branch is the target's — an
-                        // over-accept vs the true `$ref` ∧ sibling conjunction.
-                        // `ref_string_contribution` recovers that conjunction (terminal
-                        // string class ∩ chain narrowing); its result is never broader
-                        // than compiling the terminal, so it can only narrow, never
-                        // over-accept.
+                        // Shape 1 (issue #473): a `$ref` branch. The general
+                        // `$ref` path rejects unrepresentable `const`/`enum`/`type`
+                        // intersections rather than widening them.
+                        // `ref_string_contribution` handles the string subset here
+                        // before that path: terminal string class ∩ chain narrowing.
                         match self.ref_string_contribution(sub)? {
                             RefStr::Broad => broad_string = true,
                             RefStr::Literals(values) => {
                                 // A string terminal has no non-string language, so the
                                 // hoisted set fully represents the branch — it must NOT
-                                // also go to `other_subs`, where `compile_ref` would
-                                // re-add the broad, sibling-dropped target and reopen the
-                                // over-accept. An empty set is a dead branch (empty
+                                // also go to `other_subs`, where the generic `$ref`
+                                // compiler would reject the already-represented
+                                // intersection. An empty set is a dead branch (empty
                                 // intersection) that hoists nothing.
                                 if !values.is_empty() {
                                     fold_literals_into(&mut literals, &mut byte_total, values)?;
@@ -394,15 +414,12 @@ impl<'a> CompileCtx<'a> {
                                 // (`type:"string"`, a string `const`, or an all-string
                                 // `enum`) conjoined with a non-string terminal is the
                                 // EMPTY language: no value is both a string and (e.g.) an
-                                // integer. Routing it to `other_subs` would let
-                                // `compile_ref` materialize the sibling-dropped non-string
-                                // terminal and accept, e.g., an integer the branch forbids
-                                // — a genuine over-accept that `origin/main` did NOT commit
-                                // (it rejected the number there). The forcing node may be
-                                // an intermediate `$defs` link (`{$ref: N, type:"string"}`),
-                                // not just the outer sub, so this decision is made across
-                                // the whole chain in `ref_string_contribution`. Dropping
-                                // the branch is exactly faithful.
+                                // integer. The forcing node may be an intermediate
+                                // `$defs` link (`{$ref: N, type:"string"}`), not just
+                                // the outer sub, so this decision is made across the
+                                // whole chain in `ref_string_contribution`. Dropping
+                                // the branch is exactly faithful and avoids rejecting a
+                                // conjunction this specialized path can prove empty.
                             }
                             RefStr::NotString => {
                                 // No chain node forced a string and the terminal is
@@ -483,7 +500,9 @@ impl<'a> CompileCtx<'a> {
         schema: &'a Value,
         _path: &[&str],
     ) -> Result<Vec<Alt>, SchemaError> {
-        // Handle `$ref` (and any `required`/`properties` siblings — issue #1078).
+        // Handle `$ref` siblings before keyword dispatch: object-field
+        // conjunctions are merged, while unrepresentable supported narrowing
+        // keywords fail closed instead of widening the schema.
         if let Some(ref_str) = schema.get("$ref").and_then(Value::as_str) {
             return self.compile_ref_with_siblings(ref_str, schema);
         }
@@ -580,16 +599,13 @@ impl<'a> CompileCtx<'a> {
     /// reference, not instead of it (draft-07's replace-the-object semantics do
     /// not apply here).
     ///
-    /// Scope: only `required`/`properties` siblings on a `$ref` to an
-    /// object-typed target are merged — the common "extend a base object"
-    /// pattern, and exactly what issue #1078's regression test exercises.
-    /// Anything else (a non-object target, or any other sibling keyword such
-    /// as `enum`/`const`/`type`/`pattern`) falls through to the plain `$ref`
-    /// compile unchanged: those already have a separate, narrower, DELIBERATE
-    /// partial-narrowing treatment when reached through an `anyOf`/`oneOf`
-    /// branch (see `ref_string_contribution`, issue #473), which this fix must
-    /// not disturb, and a general `allOf`-style intersection of arbitrary
-    /// schemas is out of scope here.
+    /// Scope: `required`/`properties` siblings on a `$ref` to an object-typed
+    /// target are merged — the common "extend a base object" pattern.
+    /// Supported value/type assertions (`const`, `enum`, and `type`) are
+    /// compiled away only when the resolved target's language is provably a
+    /// subset of each sibling assertion. Otherwise their conjunction is
+    /// rejected: compiling the target alone would silently widen the schema.
+    /// Other deferred keywords retain the plain `$ref` fallback.
     ///
     /// Kept deliberately tiny (only the sibling-key scan, no merge locals) and
     /// out of the merge body (`merge_ref_with_siblings`, `#[inline(never)]`):
@@ -609,6 +625,13 @@ impl<'a> CompileCtx<'a> {
         ref_str: &str,
         schema: &'a Value,
     ) -> Result<Vec<Alt>, SchemaError> {
+        if schema.as_object().is_some_and(|m| {
+            m.keys()
+                .any(|key| REF_NARROWING_SIBLING_KEYS.contains(&key.as_str()))
+        }) {
+            return self.compile_ref_with_redundant_narrowing(ref_str, schema);
+        }
+
         let mergeable = schema.as_object().is_some_and(|m| {
             let mut saw_sibling = false;
             for k in m.keys() {
@@ -632,6 +655,128 @@ impl<'a> CompileCtx<'a> {
             return self.compile_ref(ref_str);
         }
         self.merge_ref_with_siblings(ref_str, schema)
+    }
+
+    /// Prove every narrowing sibling redundant against the resolved target,
+    /// then compile that target alone.
+    ///
+    /// A target `const`/`enum` value set and its declared scalar `type` are
+    /// upper bounds on its emitted language. The proof is available only for
+    /// the small target shapes modeled below.
+    ///
+    /// Kept out of [`Self::compile_ref_with_siblings`] because that function is
+    /// re-entered once per `$ref` chain link and must retain a small stack
+    /// frame.
+    #[inline(never)]
+    fn compile_ref_with_redundant_narrowing(
+        &mut self,
+        ref_str: &str,
+        schema: &'a Value,
+    ) -> Result<Vec<Alt>, SchemaError> {
+        let siblings = schema
+            .as_object()
+            .ok_or_else(|| SchemaError("schema containing `$ref` must be an object".to_string()))?;
+        let narrowing_key = siblings
+            .keys()
+            .find(|key| REF_NARROWING_SIBLING_KEYS.contains(&key.as_str()))
+            .map(String::as_str)
+            .ok_or_else(|| SchemaError("missing narrowing `$ref` sibling".to_string()))?;
+
+        // Compiling the target alone drops every sibling, not just the one
+        // proven redundant. Mixing this exemption with another assertion such
+        // as `required` would therefore silently widen through that assertion.
+        if siblings.keys().any(|key| {
+            !REF_IGNORED_SIBLING_KEYS.contains(&key.as_str())
+                && !REF_NARROWING_SIBLING_KEYS.contains(&key.as_str())
+        }) {
+            return Err(unrepresentable_ref_narrowing(narrowing_key));
+        }
+
+        let target = self.resolve_ref_chain_target(ref_str)?;
+        let target_shape_is_modeled = target.as_object().is_some_and(|object| {
+            !object.is_empty()
+                && object.keys().all(|key| {
+                    matches!(key.as_str(), "const" | "enum" | "type")
+                        || REF_TARGET_ANNOTATION_KEYS.contains(&key.as_str())
+                })
+                && !(object.contains_key("const") && object.contains_key("enum"))
+                && object.get("enum").is_none_or(Value::is_array)
+                && object.get("type").is_none_or(Value::is_string)
+        });
+        // This is intentionally an allow-list rather than a list of known
+        // compiler dispatch keywords. A newly supported keyword must make the
+        // proof unavailable by default: rejecting a redundant schema is safer
+        // than silently widening constrained decoding through an unmodeled
+        // early return.
+        if !target_shape_is_modeled {
+            return Err(unrepresentable_ref_narrowing(narrowing_key));
+        }
+
+        let target_const = target.get("const");
+        let target_enum = target.get("enum").and_then(Value::as_array);
+
+        if let Some(Value::String(name)) = target.get("type") {
+            if target_const.is_some_and(|value| !value_matches_type(value, name)) {
+                return Err(unrepresentable_ref_narrowing(narrowing_key));
+            }
+            if target_enum
+                .is_some_and(|values| values.iter().any(|value| !value_matches_type(value, name)))
+            {
+                return Err(unrepresentable_ref_narrowing(narrowing_key));
+            }
+        }
+
+        let target_values: Option<Vec<&Value>> = if let Some(value) = target.get("const") {
+            // `Value` equality distinguishes 1 from 1.0 more strictly than
+            // JSON Schema. That can refuse a proof, but cannot create one.
+            Some(vec![value])
+        } else {
+            target
+                .get("enum")
+                .and_then(Value::as_array)
+                .filter(|values| !values.is_empty())
+                .map(|values| values.iter().collect())
+        };
+
+        for key in REF_NARROWING_SIBLING_KEYS {
+            let Some(sibling) = siblings.get(*key) else {
+                continue;
+            };
+            let redundant = match *key {
+                "const" => target_values
+                    .as_ref()
+                    .is_some_and(|values| values.iter().all(|value| *value == sibling)),
+                "enum" => sibling.as_array().is_some_and(|allowed| {
+                    target_values
+                        .as_ref()
+                        .is_some_and(|values| values.iter().all(|value| allowed.contains(value)))
+                }),
+                "type" => {
+                    let sibling_types = schema_type_names(sibling)?;
+                    match target.get("type") {
+                        Some(Value::String(name)) => sibling_types.contains(&name.as_str()),
+                        // The normal compiler does not currently materialize
+                        // target-side type arrays, so compiling that target
+                        // alone would widen even without considering the
+                        // sibling. Do not use such an unrepresented bound.
+                        Some(_) => false,
+                        None => target_values.as_ref().is_some_and(|values| {
+                            values.iter().all(|value| {
+                                sibling_types
+                                    .iter()
+                                    .any(|name| value_matches_type(value, name))
+                            })
+                        }),
+                    }
+                }
+                _ => unreachable!("narrowing keys are a closed constant"),
+            };
+            if !redundant {
+                return Err(unrepresentable_ref_narrowing(key));
+            }
+        }
+
+        self.compile_ref(ref_str)
     }
 
     /// The actual `required`/`properties` conjunction merge for
@@ -893,19 +1038,14 @@ impl<'a> CompileCtx<'a> {
 
     /// Compute the string-language contribution of a `$ref`-bearing `anyOf`
     /// branch as the resolved terminal's string class INTERSECTED with every
-    /// `const`/`enum` narrowing dropped along the `$ref` chain (issue #473).
+    /// `const`/`enum` narrowing along the `$ref` chain (issue #473).
     ///
-    /// `compile_schema_inner` resolves `$ref` FIRST and drops sibling keywords,
-    /// so the compiler's own language for `{"$ref":<string def>,"enum":["a"]}`
-    /// is the target's (any string) — an over-accept relative to the true
-    /// draft-2020-12 conjunction `string ∩ {"a"} = {"a"}`. Hoisting that broad
-    /// target into the shared string entry would let the union accept any
-    /// string. Instead this walks the chain (`sub` and each intermediate
-    /// `$defs` node), collects the string set any `const`/`enum` permits,
-    /// classifies the terminal, and returns the intersection. The result is
-    /// never BROADER than what the terminal alone would compile to, so it can
-    /// never over-accept relative to origin; where a narrowing applies it is
-    /// strictly more faithful.
+    /// The general `$ref` path cannot represent
+    /// `{"$ref":<string def>,"enum":["a"]}` and fails closed rather than
+    /// compiling the broad target. This specialized `anyOf` path can represent
+    /// that conjunction: it walks `sub` and each intermediate `$defs` node,
+    /// collects the string set any `const`/`enum` permits, classifies the
+    /// terminal, and returns the intersection.
     ///
     /// Returns `NotString` when the terminal may accept a non-string value AND
     /// no node in the chain forces a string (so a genuine non-string target is
@@ -917,14 +1057,13 @@ impl<'a> CompileCtx<'a> {
     /// chain forces a string (`type:"string"`, a string `const`, or an
     /// all-string `enum`, see `ref_sub_forces_string`) but the terminal is
     /// non-string: that conjunction is the empty language, so the caller drops
-    /// the branch instead of routing it to `other_subs` where `compile_ref`
-    /// would re-materialize the (sibling-dropped) non-string target and
-    /// over-accept it. The string-forcing check spans the WHOLE chain, not just
-    /// the outer `sub`, so an intermediate `$defs` node such as
+    /// the branch instead of rejecting a case it can resolve exactly. The
+    /// string-forcing check spans the WHOLE chain, not just the outer `sub`, so
+    /// an intermediate `$defs` node such as
     /// `{"$ref":<integer def>,"type":"string"}` is caught (issue #473). This
-    /// lookup never touches `self.depth` and never registers a
-    /// rule; `compile_ref` / `compile_schema` remain the authoritative recursion
-    /// guard (issue #343) for the `other_subs` path.
+    /// lookup never touches `self.depth` and never registers a rule;
+    /// `compile_ref` / `compile_schema` remain the authoritative recursion guard
+    /// (issue #343) for the `other_subs` path.
     fn ref_string_contribution(&self, sub: &'a Value) -> Result<RefStr, SchemaError> {
         let mut narrowing: Option<Vec<String>> = None;
         let mut chain_forces_string = ref_sub_forces_string(sub);
@@ -2420,19 +2559,12 @@ fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
     let Some(obj) = sub.as_object() else {
         return Ok(None);
     };
-    // A `$ref` alongside `type`/`const`/`enum` is NOT the conjunctive
-    // intersection this classifier otherwise models: `compile_schema_inner`
-    // resolves `$ref` FIRST and returns before reading any sibling keyword (see
-    // `compile_ref`), so the branch's real compiled language is the resolved
-    // target's and the sibling is dropped. Folding a sibling `const`/`enum`
-    // STRING here would hoist a literal the resolved target never accepts — e.g.
-    // `{"$ref":<integer def>,"const":"y"}` compiles to `json_integer` yet the
-    // fold would make the grammar accept `"y"` (an over-accept). Return `None` so
-    // `compile_any_of` reclassifies via `ref_string_contribution`, which
-    // intersects the resolved target's string class with the `const`/`enum`
-    // narrowing dropped along the chain: a non-string target leaves the branch in
-    // `other_subs` to compile for real, and a string target hoists only the
-    // narrowed set — never widening the string entry (issue #473).
+    // A `$ref` alongside `type`/`const`/`enum` needs the referenced target in
+    // order to compute the conjunction, so this single-node classifier cannot
+    // handle it. Return `None` so `compile_any_of` reclassifies via
+    // `ref_string_contribution`, which resolves the target and hoists only a
+    // faithfully intersected string set. Non-string cases fall through to the
+    // general `$ref` path, which fails closed rather than widening (issue #473).
     if obj.contains_key("$ref") {
         return Ok(None);
     }
@@ -2528,15 +2660,14 @@ fn string_class_of(sub: &Value) -> Result<Option<StrClass>, SchemaError> {
 enum RefStr {
     /// The terminal may accept a non-string value and no chain node forced a
     /// string: contribute no string hoist and leave the branch in `other_subs`
-    /// for `compile_schema` to handle (the pre-#473 behavior). Also returned for
-    /// an unresolvable/cyclic chain, so the pre-existing `$ref`-not-found error
-    /// still surfaces on that path.
+    /// for `compile_schema` to handle. Also returned for an
+    /// unresolvable/cyclic chain, so the `$ref` error still surfaces on that
+    /// path.
     NotString,
     /// A chain node forces a string (`type:"string"`, a string `const`, or an
     /// all-string `enum`) but the terminal is non-string: the conjunction is the
     /// EMPTY language, so the caller drops the branch entirely (it contributes
-    /// nothing, and must NOT go to `other_subs` where the sibling-dropped
-    /// non-string target would be re-materialized and over-accepted).
+    /// nothing and need not reach the generic fail-closed `$ref` path).
     Dead,
     /// The terminal is a broad string and no `const`/`enum` narrowed it: hoist a
     /// broad string entry, exactly as compiling the terminal would.
@@ -2643,14 +2774,12 @@ fn intersect_string_sets(a: &[String], b: &[String]) -> Vec<String> {
 /// non-empty `enum` whose members are all strings. When such a node sits
 /// ANYWHERE on a `$ref` chain (the outer sub or an intermediate `$defs` link)
 /// whose terminal is a NON-string target, the conjunction is the empty
-/// language, so `compile_any_of` drops the branch rather than materializing the
-/// sibling-dropped non-string target (which would over-accept). A pure `$ref`,
-/// or one whose keyword admits a non-string — a numeric `const`, an all-numeric
+/// language, so `compile_any_of` drops the branch exactly. A pure `$ref`, or
+/// one whose keyword admits a non-string — a numeric `const`, an all-numeric
 /// or mixed `enum`, or a `type` array that permits any non-string type
-/// (`["string","null"]`, `["integer"]`, …) — returns `false` and keeps its
-/// non-string target reachable. Those non-string-forcing cases stay in the
-/// pre-existing `$ref`-drops-siblings over-approximation (identical to
-/// `origin/main`), the same tolerated class as a dropped numeric `enum`.
+/// (`["string","null"]`, `["integer"]`, …) — returns `false`; the generic
+/// compiler then either compiles the pure reference or rejects the narrowing
+/// sibling it cannot represent.
 fn ref_sub_forces_string(sub: &Value) -> bool {
     let Some(obj) = sub.as_object() else {
         return false;
@@ -2804,6 +2933,33 @@ fn value_matches_type(v: &Value, t: &str) -> bool {
         "array" => v.is_array(),
         _ => false,
     }
+}
+
+/// Parse a non-empty JSON Schema `type` assertion without applying a subtype
+/// lattice. Literal name membership is the only proof used for `$ref` sibling
+/// redundancy.
+fn schema_type_names(value: &Value) -> Result<Vec<&str>, SchemaError> {
+    match value {
+        Value::String(name) => Ok(vec![name]),
+        Value::Array(names) if !names.is_empty() => names
+            .iter()
+            .map(|name| {
+                name.as_str().ok_or_else(|| {
+                    SchemaError(
+                        "unsupported schema: `type` alongside `$ref` must contain only type names"
+                            .to_string(),
+                    )
+                })
+            })
+            .collect(),
+        _ => Err(unrepresentable_ref_narrowing("type")),
+    }
+}
+
+fn unrepresentable_ref_narrowing(key: &str) -> SchemaError {
+    SchemaError(format!(
+        "unsupported schema: `{key}` sibling alongside `$ref` requires an intersection with the referenced schema that this grammar cannot represent safely"
+    ))
 }
 
 /// Reject a `oneOf` whose branches provably overlap on a literal value (issue
@@ -3115,6 +3271,19 @@ pub fn compile(schema: &Value) -> Result<CompiledGrammar, SchemaError> {
 mod tests {
     use super::*;
     use crate::grammar::pda::{GrammarState, SimResult, simulate_token};
+
+    #[test]
+    fn ref_target_annotations_exclude_structural_keys() {
+        // `resolve_ref_chain_target` follows `$ref` to a terminal target, and
+        // the other keys below do not emit instance values today. This guards
+        // a latent proof-widening risk if either behavior changes.
+        for key in ["$ref", "$defs", "definitions", "$id", "$schema"] {
+            assert!(
+                !REF_TARGET_ANNOTATION_KEYS.contains(&key),
+                "structural key `{key}` must not be admitted as a target annotation"
+            );
+        }
+    }
 
     fn compile_ok(schema_json: &str) -> CompiledGrammar {
         let v: Value = serde_json::from_str(schema_json).unwrap();
@@ -3860,8 +4029,8 @@ mod tests {
     /// mis-hoisted the sibling into the shared string entry, accepting "y" /
     /// "zzz"), while rejecting the number. `ref_string_contribution` resolves
     /// the string part to `RefStr::NotString`, and `ref_sub_forces_string`
-    /// makes `compile_any_of` DROP the branch rather than materialize the
-    /// sibling-dropped integer target.
+    /// makes `compile_any_of` DROP the branch as an exact empty intersection
+    /// instead of routing it to the generic fail-closed path.
     ///
     /// Mutation guard: reverting the drop (routing `RefStr::NotString` straight
     /// to `other_subs` again) reopens a number over-accept — `7` would be
@@ -3979,11 +4148,10 @@ mod tests {
     /// non-empty all-`"string"` array) is string-forcing, exactly like the scalar
     /// `type:"string"`. On a `$ref`->integer terminal — DIRECT sibling or an
     /// intermediate `$defs` node — the conjunction is empty, so the branch must be
-    /// dropped (`RefStr::Dead`), rejecting both the string AND `7`. A `type` array
-    /// that admits any non-string type (`["string","null"]`, `["integer"]`) is
-    /// NOT string-forcing and stays in the pre-existing `$ref`-drops-siblings
-    /// approximation (verified identical to `origin/main`), so it is intentionally
-    /// not covered here.
+    /// dropped (`RefStr::Dead`), rejecting both the string AND `7`. A `type`
+    /// array that admits any non-string type (`["string","null"]`,
+    /// `["integer"]`) is not representable by this specialized fold and fails
+    /// closed in the generic path, as covered below.
     ///
     /// Mutation guard: reverting `ref_sub_forces_string` to recognize only the
     /// scalar `type:"string"` (dropping the array arm) reopens the number
@@ -4021,66 +4189,78 @@ mod tests {
         );
     }
 
-    /// A `type` array that admits a NON-string type is not string-forcing, so a
-    /// `$ref`->integer branch keeps its integer target reachable (`7` accepted),
-    /// exactly as with a numeric `enum` sibling and matching `origin/main`. This
-    /// pins `ref_sub_forces_string` to NOT over-fire on a mixed/other-type `type`
-    /// array (which would silence a legitimate integer branch).
-    ///
-    /// Mutation guard: if `ref_sub_forces_string` returned true for
-    /// `["string","integer"]` (treating any array containing `"string"` as
-    /// string-forcing), `7` would be wrongly REJECTED here.
+    /// A mixed sibling `type` array that covers the target's declared type is
+    /// redundant. The generic `$ref` path may therefore compile the integer
+    /// target alone, while the peer branch remains intact.
     #[test]
-    fn anyof_ref_type_array_with_nonstring_member_stays_reachable() {
-        let g = compile_ok(
-            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"ok"},{"$ref":"#/$defs/N","type":["string","integer"]}]}"##,
-        );
+    fn anyof_ref_type_array_covering_target_preserves_target() {
+        let schema = serde_json::json!({
+            "$defs": { "N": { "type": "integer" } },
+            "anyOf": [
+                { "const": "ok" },
+                { "$ref": "#/$defs/N", "type": ["string", "integer"] }
+            ]
+        });
+        let g = compile(&schema).expect("the sibling type array covers the target type");
+        assert!(accepts(&g, b"7"), "the referenced integer must be accepted");
         assert!(
             accepts(&g, b"\"ok\""),
-            "the peer const \"ok\" still accepted"
+            "the peer const branch must remain accepted"
         );
         assert!(
-            accepts(&g, b"7"),
-            "a type array admitting integer is not string-forcing — the integer branch stays reachable"
+            rejects(&g, b"\"other\""),
+            "dropping the redundant sibling must not drop the integer target"
         );
     }
 
-    /// A NON-string-forcing sibling (an all-numeric `enum`) on a `$ref`->integer
-    /// branch does NOT empty the conjunction — the number is admissible — so the
-    /// integer target stays reachable, matching `origin/main` and the
-    /// pre-existing `$ref`-drops-sibling approximation (the enum values
-    /// themselves are not enforced; the whole integer type is accepted, an
-    /// over-reject-free continuation of prior behavior). The point is that
-    /// `ref_sub_forces_string` must NOT over-fire on a numeric enum.
-    ///
-    /// Mutation guard: if `ref_sub_forces_string` returned true for an
-    /// all-numeric `enum` (dropping the branch), `7` would be wrongly REJECTED
-    /// here — a regression that silences a legitimate integer branch.
+    /// A sibling type array that omits the target's declared type is not
+    /// redundant and must continue to fail closed.
     #[test]
-    fn anyof_ref_to_integer_with_numeric_enum_sibling_stays_reachable() {
-        let g = compile_ok(
-            r##"{"$defs":{"N":{"type":"integer"}},"anyOf":[{"const":"abc"},{"$ref":"#/$defs/N","enum":[1,2]}]}"##,
-        );
+    fn anyof_ref_type_array_not_covering_target_fails_closed() {
+        let schema = serde_json::json!({
+            "$defs": { "N": { "type": "integer" } },
+            "anyOf": [
+                { "const": "ok" },
+                { "$ref": "#/$defs/N", "type": ["string", "null"] }
+            ]
+        });
+        let err = compile(&schema)
+            .expect_err("a sibling type array that omits the target type must fail closed");
         assert!(
-            accepts(&g, b"\"abc\""),
-            "the peer const \"abc\" still accepted"
+            err.0.contains("`type` sibling"),
+            "error should name the unrepresentable type sibling, got: {}",
+            err.0
         );
+    }
+
+    /// A numeric `enum` cannot use the specialized string intersection either.
+    /// Routing it through the generic `$ref` path must reject the unsupported
+    /// conjunction instead of compiling the whole integer target and admitting
+    /// enum non-members such as `7`.
+    #[test]
+    fn anyof_ref_to_integer_with_numeric_enum_sibling_fails_closed() {
+        let schema = serde_json::json!({
+            "$defs": { "N": { "type": "integer" } },
+            "anyOf": [
+                { "const": "abc" },
+                { "$ref": "#/$defs/N", "enum": [1, 2] }
+            ]
+        });
+        let err = compile(&schema)
+            .expect_err("an unrepresentable enum sibling inside anyOf must fail closed");
         assert!(
-            accepts(&g, b"7"),
-            "a numeric-enum sibling is not string-forcing — the integer branch stays reachable"
-        );
-        assert!(
-            rejects(&g, b"\"z\""),
-            "a non-member string is still rejected"
+            err.0.contains("`enum` sibling"),
+            "error should name the unrepresentable enum sibling, got: {}",
+            err.0
         );
     }
 
     /// FIXED (issue #473, chain-collect intersection): a DIRECT string `enum`
     /// sibling on a branch whose `$ref` resolves to a BROAD string narrows the
-    /// branch to that enum. `compile_ref` drops the sibling `enum` (ref-first),
-    /// so `origin/main`'s branch was the broad target; the fix intersects the
+    /// branch to that enum. The specialized `anyOf` path intersects the
     /// terminal's broad string class with the sibling narrowing, folding exactly
-    /// `{"abc"}` into the shared trie.
+    /// `{"abc"}` into the shared trie rather than reaching the generic
+    /// fail-closed intersection path.
     ///
     /// Mutation guard: dropping the sibling narrowing (returning the terminal's
     /// broad class unintersected) would accept "zzz" — a re-widening over-accept.
@@ -4720,6 +4900,50 @@ mod tests {
         assert!(compile(&v).is_err());
     }
 
+    /// Draft 2020-12 applies supported assertion siblings alongside `$ref`.
+    /// Until the grammar can represent these intersections, compiling the
+    /// referenced target alone would widen each schema and must fail closed.
+    ///
+    /// Mutation guard: removing the narrowing-key check makes every case
+    /// compile successfully by dropping the sibling.
+    #[test]
+    fn ref_narrowing_siblings_fail_closed() {
+        for (keyword, schema) in [
+            (
+                "const",
+                serde_json::json!({
+                    "$defs": { "S": { "type": "string" } },
+                    "$ref": "#/$defs/S",
+                    "const": "a"
+                }),
+            ),
+            (
+                "enum",
+                serde_json::json!({
+                    "$defs": { "S": { "type": "string" } },
+                    "$ref": "#/$defs/S",
+                    "enum": ["a"]
+                }),
+            ),
+            (
+                "type",
+                serde_json::json!({
+                    "$defs": { "N": { "type": "number" } },
+                    "$ref": "#/$defs/N",
+                    "type": "integer"
+                }),
+            ),
+        ] {
+            let err = compile(&schema)
+                .expect_err("an unrepresentable narrowing sibling must not be dropped");
+            assert!(
+                err.0.contains(&format!("`{keyword}` sibling")) && err.0.contains("`$ref`"),
+                "error should name `{keyword}` and `$ref`, got: {}",
+                err.0
+            );
+        }
+    }
+
     #[test]
     fn defs_resolved() {
         let schema = serde_json::json!({
@@ -4924,15 +5148,10 @@ mod tests {
         assert!(rejects(&g, b"{}"), "sibling's required must be enforced");
     }
 
-    /// Sibling keywords this compiler cannot merge (anything beyond
-    /// `required`/`properties`) must not be silently widened into an
-    /// incorrect conjunction — they fall through to the pre-existing plain
-    /// `$ref` compile (which drops them, same as before this fix; see
-    /// `anyof_ref_to_integer_with_numeric_enum_sibling_stays_reachable` for
-    /// the deliberately-scoped `enum` case reached via `anyOf`). This test
-    /// only pins that a non-object `$ref` target with `properties`/`required`
-    /// siblings does not panic or wrongly merge — it still compiles via the
-    /// unmerged target.
+    /// `required`/`properties` only constrain object instances, so they are
+    /// vacuous beside a target explicitly pinned to a non-object type. This
+    /// test pins that case to the unmerged target; unlike a value/type
+    /// narrowing sibling, dropping these assertions cannot widen the target.
     #[test]
     fn ref_sibling_on_non_object_target_falls_through() {
         let schema = serde_json::json!({
