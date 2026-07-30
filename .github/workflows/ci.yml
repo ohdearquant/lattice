@@ -310,7 +310,7 @@ jobs:
       # at all). A fixture nobody runs cannot catch drift. Run them here.
       # The `lattice` binary's own metal-gpu `#[cfg(test)]` suite has the same
       # gap: `render_prompt_matches_shared_chat_template` and the
-      # `to_chat_messages_*` fixtures (#661, crates/inference/src/bin/lattice.rs)
+      # `to_chat_messages_*` fixtures (#661, crates/inference/src/bin/lattice/serve.rs)
       # pin the CPU (`render_prompt`) and Metal (`format_chat_template`) chat
       # renderers to identical ChatML output for the same conversation, but
       # nothing invoked `cargo test --bin lattice --features f16,metal-gpu`
@@ -326,7 +326,7 @@ jobs:
           # for real behind the shared field-level parity rows -- without
           # it here those modules would silently not compile/run under
           # this job, the same gap the test-utils comment below already
-          # documents for `lattice.rs`.
+          # documents for `lattice/serve.rs`.
           #
           # issue #828 round 2 medium finding: piping through `tee` would
           # report the PIPESTATUS-losing `tee` exit code to the shell, and

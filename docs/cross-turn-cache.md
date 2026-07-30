@@ -30,7 +30,7 @@ or a second client's unrelated prompt interleaved onto the same slot) still fall
 document. Cache stats (`slot`, `prompt_tokens`, `reused_tokens`, `mode`) are logged to stderr per
 request; there is no response-surface (HTTP header/JSON field/SSE event) telemetry yet.
 
-**`lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) now calls the cache-aware
+**`lattice serve` (the OpenAI-compatible HTTP server in `lattice/serve.rs`) now calls the cache-aware
 methods too**, on the same single sticky `CrossTurnSlotId::DEFAULT` slot as `lattice_serve`: its
 Metal worker thread calls `generate_streaming_with_prefix_cache` instead of the plain,
 non-cache-aware `generate_streaming` on every request. `POST /v1/chat/completions` no longer
@@ -315,7 +315,7 @@ the fallback path alone, and a dedicated Criterion bench,
 ## Summary
 
 - The cache is reachable today through direct `MetalQwen35State` calls, `chat_metal`,
-  `lattice_serve`, and `lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) — all on
+  `lattice_serve`, and `lattice serve` (the OpenAI-compatible HTTP server in `lattice/serve.rs`) — all on
   a sticky `CrossTurnSlotId::DEFAULT` slot, with honest full-refill fallback on any mismatch.
 - Use `CrossTurnSlotId::DEFAULT` for a single local conversation; only one entry is ever retained
   process-wide, so multiplexing several conversations through distinct slot IDs on one

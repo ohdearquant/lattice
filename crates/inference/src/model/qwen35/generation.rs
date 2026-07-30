@@ -89,7 +89,7 @@ impl Qwen35Model {
         // unbudgeted), reaching at most position prompt_len + cap - 2. We adopt
         // the stricter OpenAI-style "prompt plus requested completion fits the
         // window" bound prompt_len + cap <= max_context: it matches the HTTP
-        // server (bin/lattice.rs) verbatim, so direct and HTTP generation agree
+        // server (bin/lattice/serve.rs) verbatim, so direct and HTTP generation agree
         // on when a request is too long. Strictly safe (it can only reject one
         // extra edge request, never admit a panic). Same guard in
         // generate_streaming — using decode_cap is what makes a budgeted request
@@ -2964,7 +2964,7 @@ mod tests {
     //
     // The zero-weight fixture itself lives in `qwen35::test_support`
     // (reachable here via its `cfg(any(test, feature = "test-utils"))`
-    // gate), so this crate's own library tests and `bin/lattice.rs`'s
+    // gate), so this crate's own library tests and `bin/lattice/serve.rs`'s
     // separate `--features test-utils` compilation unit build the identical
     // fixture from one definition instead of two copies (#816).
     use super::super::test_support::{

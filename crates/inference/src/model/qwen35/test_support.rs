@@ -4,7 +4,7 @@
 //! `crates/inference/src/model/qwen35/generation.rs`'s `#[cfg(test)] mod
 //! tests` builds an all-zero-weight tiny model for its own
 //! mutation-sensitive `StopReason` tests, reaching this module through the
-//! plain `cfg(test)` arm of the gate below. `crates/inference/src/bin/lattice.rs`'s
+//! plain `cfg(test)` arm of the gate below. `crates/inference/src/bin/lattice/serve.rs`'s
 //! test module is a *separate* compilation unit that links against this
 //! crate as an ordinary (non-test) dependency, so it cannot see anything
 //! gated on `cfg(test)` alone; it reaches this same module through the

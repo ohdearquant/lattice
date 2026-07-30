@@ -54,7 +54,7 @@ gdn-state-counters = []
 signpost = []
 # Exposes test-only fixture constructors (currently: a tiny all-zero-weight
 # Qwen35Model, ADR-080 C2) as `pub` library API, gated so they never
-# ship in a normal build. Needed because bin targets (lattice.rs,
+# ship in a normal build. Needed because bin targets (lattice/serve.rs,
 # lattice_serve.rs) link against this crate as an ordinary dependency and
 # cannot see its `#[cfg(test)]`-only internals -- only a real Cargo feature
 # crosses that boundary.
@@ -108,7 +108,7 @@ libc = "0.2"
 
 [[bin]]
 name = "lattice"
-path = "src/bin/lattice.rs"
+path = "src/bin/lattice/main.rs"
 required-features = ["serve"]
 
 [[bin]]

@@ -524,7 +524,7 @@ lowest-risk/highest-already-confirmed cluster first.
 
 - Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; verified and re-verified at `0699e60cc`) — the four cluster evidence tables above
 - `crates/inference/src/attention/gqa.rs`, `crates/inference/src/attention/decode.rs`
-- `crates/inference/src/bin/lattice.rs`, `crates/inference/src/bin/lattice_serve.rs`
+- `crates/inference/src/bin/lattice/serve.rs`, `crates/inference/src/bin/lattice_serve.rs`
 - `crates/inference/src/model/qwen35/generation.rs`
 - `crates/inference/src/forward/cpu/matmul.rs`, `crates/inference/src/forward/cpu/blas.rs`
 - `docs/adr/ADR-058-cpu-perf-regression-ci.md` (Superseded — bench-compare provenance only)

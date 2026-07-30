@@ -1,5 +1,5 @@
 //! Shared HTTP serving contract for the `lattice` unified server
-//! (`crates/inference/src/bin/lattice.rs`) and the `lattice_serve` daemon
+//! (`crates/inference/src/bin/lattice/serve.rs`) and the `lattice_serve` daemon
 //! (`crates/inference/src/bin/lattice_serve.rs`) -- ADR-080 cluster C2 (#782).
 //!
 //! Both binaries speak a subset of the OpenAI chat-completions wire format,
@@ -1943,7 +1943,7 @@ mod tests {
 
     #[test]
     fn both_server_binaries_use_shared_graceful_runner() {
-        let lattice = include_str!("../bin/lattice.rs");
+        let lattice = include_str!("../bin/lattice/serve.rs");
         let lattice_serve = include_str!("../bin/lattice_serve.rs");
         for (name, source) in [("lattice", lattice), ("lattice_serve", lattice_serve)] {
             assert!(

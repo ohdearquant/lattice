@@ -1,7 +1,8 @@
 #!/bin/sh
 # Cross-checks docs/capability-matrix.md's Fixture manifest section against
-# the actual #[test]/#[tokio::test] fns in the three serve-surface binaries
-# plus the shared Metal worker module they both route through (#654, #832).
+# the actual #[test]/#[tokio::test] fns in the lattice module tree, the two
+# auxiliary serve-surface binaries, and the shared Metal worker module they
+# route through (#654, #832, #834).
 # A row that cites a fixture ID whose test function has been renamed,
 # removed, or never existed fails this check closed instead of silently
 # going stale.
@@ -16,13 +17,26 @@ set -eu
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
-lattice_rs="$repo_root/crates/inference/src/bin/lattice.rs"
+lattice_main_rs="$repo_root/crates/inference/src/bin/lattice/main.rs"
+lattice_chat_rs="$repo_root/crates/inference/src/bin/lattice/chat.rs"
+lattice_doctor_rs="$repo_root/crates/inference/src/bin/lattice/doctor.rs"
+lattice_serve_module_rs="$repo_root/crates/inference/src/bin/lattice/serve.rs"
 lattice_serve_rs="$repo_root/crates/inference/src/bin/lattice_serve.rs"
 chat_metal_rs="$repo_root/crates/inference/src/bin/chat_metal.rs"
 # Shared Metal worker owner (#832): the cancellation/window-check fixtures
 # that used to live in lattice_serve.rs's own #[cfg(test)] mod now live here
 # instead, ported verbatim and shared by both `lattice` and `lattice_serve`.
 metal_worker_rs="$repo_root/crates/inference/src/serve/metal_worker.rs"
+
+fixture_sources="$lattice_main_rs $lattice_chat_rs $lattice_doctor_rs $lattice_serve_module_rs $lattice_serve_rs $chat_metal_rs $metal_worker_rs"
+fixture_source_names="lattice/{main,chat,doctor,serve}.rs, lattice_serve.rs, chat_metal.rs, or serve/metal_worker.rs"
+
+for source in $fixture_sources; do
+    if [ ! -f "$source" ]; then
+        echo "check-capability-matrix: required fixture source '$source' not found" >&2
+        exit 1
+    fi
+done
 
 # Fixture IDs always start with one of these prefixes (the naming convention
 # every `#[test] fn` added for #654, plus the pre-existing per-surface test
@@ -47,14 +61,13 @@ extract_test_fn_names() {
         | sed -E 's/^[[:space:]]*(async )?fn ([a-zA-Z0-9_]*)\(.*/\2/'
 }
 
-all_test_fns="$(
-    {
-        extract_test_fn_names "$lattice_rs"
-        extract_test_fn_names "$lattice_serve_rs"
-        extract_test_fn_names "$chat_metal_rs"
-        extract_test_fn_names "$metal_worker_rs"
-    } | sort -u
-)"
+collect_test_fn_names() {
+    for source in "$@"; do
+        extract_test_fn_names "$source"
+    done | sort -u
+}
+
+all_test_fns="$(collect_test_fn_names $fixture_sources)"
 
 is_real_test_fn() {
     printf '%s\n' "$all_test_fns" | grep -qx "$1"
@@ -88,7 +101,7 @@ check_doc() {
     # Every backtick-quoted token in that section's table rows (lines
     # starting with `|`), one per line. Fixture IDs are only ever cited in
     # table cells; the section's own prose paragraphs (e.g. "see
-    # `validate_chat_request` in `lattice.rs`") reference real, non-test
+    # `validate_chat_request` in `lattice/serve.rs`") reference real, non-test
     # implementation functions by the same backtick style and would
     # otherwise false-positive against the `validate_`/`chat_completions_`/
     # etc. prefixes below.
@@ -109,7 +122,7 @@ check_doc() {
         cited="$cited $tok"
 
         if ! is_real_test_fn "$tok"; then
-            [ "$quiet" = "1" ] || echo "check-capability-matrix: fixture '$tok' is cited in $doc but no #[test]/#[tokio::test] fn named '$tok' exists in lattice.rs, lattice_serve.rs, chat_metal.rs, or serve/metal_worker.rs" >&2
+            [ "$quiet" = "1" ] || echo "check-capability-matrix: fixture '$tok' is cited in $doc but no #[test]/#[tokio::test] fn named '$tok' exists in $fixture_source_names" >&2
             fail=1
         fi
     done
@@ -140,6 +153,11 @@ if [ "${1:-}" = "--selftest" ]; then
     scratch="$(mktemp)"
     trap 'rm -f "$scratch"' EXIT
 
+    if ! check_doc "$doc" 1; then
+        echo "check-capability-matrix: SELFTEST SETUP FAILED -- the real fixture manifest does not resolve with the complete source inventory" >&2
+        exit 1
+    fi
+
     # The injected line must itself look like a table row (start with `|`):
     # tokens are only scanned from table rows within the section (see
     # check_doc), so a bogus citation dropped into surrounding prose would
@@ -154,7 +172,31 @@ if [ "${1:-}" = "--selftest" ]; then
         exit 1
     fi
 
-    echo "check-capability-matrix: selftest OK -- a bogus fixture ID correctly fails the check"
+    # Prove fixture discovery fails closed if the newly-moved serve module
+    # is omitted. The real manifest cites multiple tests that exist only in
+    # lattice/serve.rs; with that source absent, the forward check must fail.
+    complete_test_fns="$all_test_fns"
+    all_test_fns="$(
+        collect_test_fn_names \
+            "$lattice_main_rs" \
+            "$lattice_chat_rs" \
+            "$lattice_doctor_rs" \
+            "$lattice_serve_rs" \
+            "$chat_metal_rs" \
+            "$metal_worker_rs"
+    )"
+    omitted_fixture="cm_serve_model_match_passes_model_check"
+    if is_real_test_fn "$omitted_fixture"; then
+        echo "check-capability-matrix: SELFTEST FAILED -- omitting lattice/serve.rs still discovered '$omitted_fixture'" >&2
+        exit 1
+    fi
+    if check_doc "$doc" 1; then
+        echo "check-capability-matrix: SELFTEST FAILED -- omitting lattice/serve.rs did not make fixture discovery fail" >&2
+        exit 1
+    fi
+    all_test_fns="$complete_test_fns"
+
+    echo "check-capability-matrix: selftest OK -- bogus fixture and omitted lattice/serve.rs fixture '$omitted_fixture' correctly fail the check"
     exit 0
 fi
 
@@ -165,13 +207,13 @@ if ! check_doc "$doc" 0; then
 fi
 
 # Reverse direction: every capability-matrix #[test] fn that exists in the
-# three binaries and matches one of the known fixture-naming prefixes should
+# complete source inventory and matches one of the known fixture-naming prefixes should
 # be cited somewhere in the doc, or a fixture can silently stop being tracked
 # after a rename. Report-only (not yet a hard fail) so pre-existing fixture
 # families added before #654's Fixture manifest section don't need every
 # single test enumerated by name on day one. Reuses $tokens, set by the
 # check_doc call above.
-for f in "$lattice_rs" "$lattice_serve_rs" "$chat_metal_rs" "$metal_worker_rs"; do
+for f in $fixture_sources; do
     extract_test_fn_names "$f" | while read -r name; do
         matched_prefix=0
         for p in $prefixes; do

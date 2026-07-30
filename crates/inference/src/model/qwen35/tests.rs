@@ -876,7 +876,7 @@ mod lora_serving {
         // A direct generate() call whose prompt + max_new_tokens exceeds the
         // RoPE table capacity must return a clean error, NOT panic in the
         // decode loop by indexing the cos/sin table past its end. The HTTP
-        // server preflights this (bin/lattice.rs); the public library method
+        // server preflights this (bin/lattice/serve.rs); the public library method
         // must agree. Mutation-sensitive: the preflight is the only path to
         // Err for a non-empty prompt with a large max_new_tokens — without it
         // this input either panics (index OOB) or returns Ok, both of which

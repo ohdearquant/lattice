@@ -35,7 +35,7 @@ pub(crate) use eval::{log_softmax_nll, run_strided_perplexity};
 mod tests;
 
 /// Test-only tiny zero-weight model construction (ADR-080 C2), gated behind
-/// the `test-utils` Cargo feature (for `crates/inference/src/bin/lattice.rs`'s
+/// the `test-utils` Cargo feature (for `crates/inference/src/bin/lattice/serve.rs`'s
 /// separate compilation unit) OR `cfg(test)` (for this crate's own library
 /// tests, e.g. `generation.rs`'s `StopReason` tests) so it never ships in a
 /// normal build.

@@ -1417,7 +1417,7 @@ mod tests {
     #[test]
     fn serving_adapters_do_not_restate_standard_defaults() {
         for (name, source) in [
-            ("lattice", include_str!("../bin/lattice.rs")),
+            ("lattice", include_str!("../bin/lattice/serve.rs")),
             ("lattice_serve", include_str!("../bin/lattice_serve.rs")),
         ] {
             for literal in [

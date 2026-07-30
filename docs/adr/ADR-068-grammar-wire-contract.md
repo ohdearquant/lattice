@@ -16,21 +16,24 @@ internal byte-level PDA. The engine is opt-in through a single `GenerateConfig` 
 `grammar: Option<Arc<GrammarEngine>>`, and applies `mask_logits` before sampling. Constraining
 decoding to an arbitrary context-free grammar is therefore a **solved, shipped capability**.
 
-What does not exist is any way for a network or CLI caller to reach it. Every caller-facing
-generation-config construction hardcodes `grammar: None`:
+Network reachability is partial. The standalone `lattice_serve` daemon now admits strict
+`response_format.json_schema`, compiles it through a bounded cache, and attaches the resulting
+engine to the request config (`bin/lattice_serve.rs:939-1059,1946-1983`). Its ordinary base config
+still begins with `grammar: None` (`:1640-1655`). The other caller-facing surfaces remain
+unconstrained:
 
-- `bin/lattice_serve.rs:202` (the shipped Metal/f16 HTTP daemon; `build_cfg`)
-- `bin/chat_metal.rs:676` and `:779` (interactive chat, including its `--serve` warm mode)
-- `bin/lattice.rs` (the unified-CLI binary from ADR-063) parses `response_format` only as a bare
-  `{ "type": String }` discriminator (`ResponseFormat` at `:276`); a real `json_schema` payload's
-  nested schema is silently dropped by serde, and `reject_unsupported` (`:525`) returns HTTP 400
-  for any `response_format.type` other than `"text"`.
+- `bin/chat_metal.rs:826-840,915-929` hardcodes `grammar: None` for interactive chat and its
+  `--serve` warm mode.
+- The unified `lattice` CLI shares the nested `ResponseFormat` DTO
+  (`serve/contract.rs:263-289`), but `ServeProfile::lattice` rejects `json_schema` through the
+  shared `reject_unsupported` path (`serve/contract.rs:612-643`; binary test adapter
+  `bin/lattice/serve.rs:827-858`).
 
-So the engine is reachable today only from Rust test code. Issue **#588** (OPEN) tracks one slice
-of the gap: wiring `response_format.json_schema` into `lattice_serve`, with per-schema caching
-(a `GrammarEngine` compile over Qwen3's 248,320-token vocabulary costs 50–200 ms per
-`grammar/engine.rs:148-152`) and fail-closed 400s. #588 does not cover interactive chat, non-JSON
-grammars, or any general "pass me a raw grammar" field.
+What still does not exist on any surface is a wire field for arbitrary GBNF. Issue **#588**
+originally tracked the daemon's JSON-Schema slice; that implemented slice does not cover
+interactive chat, non-JSON grammars, or any general "pass me a raw grammar" field. Compiling a
+`GrammarEngine` over Qwen3's 248,320-token vocabulary remains expensive
+(`grammar/engine.rs:148-152`), which is why the daemon caches admitted schemas.
 
 The concrete driver for going beyond JSON is **LNDL** (a Lion-ecosystem symbolic DSL). Its
 Layer-1 syntax is tag-structured prose with typed declaration/execution blocks and a terminal
@@ -389,9 +392,11 @@ depend on it.
 - Issue #588 — `feat(serve): wire response_format.json_schema (grammar) into lattice_serve`
 - Issues #310, #322 — open JSON-Schema-compiler/PDA correctness trackers (BETA caveats)
 - Issue #343 (closed) — DoS hardening of `GrammarEngine::new`; re-verify against the GBNF wire path
-- Source: `bin/lattice_serve.rs:181-206` (`build_cfg`, `grammar: None`); `bin/lattice.rs:244-278,
-  525-556` (`ChatCompletionRequest`, `ResponseFormat`, `reject_unsupported`); `bin/chat_metal.rs:676,
-  779`; `grammar/spec.rs:15-32`; `grammar/engine.rs:142-169`; `grammar/mod.rs:38-69`
+- Source: `bin/lattice_serve.rs:1640-1651` (`build_cfg`, `grammar: None`);
+  `serve/contract.rs:71-130,265-271` (`ChatRequest`, `ResponseFormat`);
+  `bin/lattice/serve.rs:827-858` (`reject_unsupported`);
+  `bin/chat_metal.rs:826-836,915-925` (`grammar: None`); `grammar/spec.rs:15-32`;
+  `grammar/engine.rs:142-169`; `grammar/mod.rs:38-69`
 - Ecosystem: vLLM structured outputs, SGLang EBNF, llama.cpp GBNF `grammar` field
   (`ggml-org/llama.cpp#11847`, "either json_schema or grammar, not both"), Fireworks grammar mode,
   OpenAI Custom Tools CFG (`openai-python#2667`)

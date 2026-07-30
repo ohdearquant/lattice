@@ -20,7 +20,7 @@
 //! precedence rule -- a `model.safetensors`/`model.safetensors.index.json`
 //! file always wins over a `.q4` tensor file, and an unreadable or
 //! non-matching directory fails closed to [`ModelFormat::Unknown`]) was
-//! implemented independently in `bin/lattice.rs` (`backend::detect_format`,
+//! implemented independently in the unified `lattice` binary (`backend::detect_format`,
 //! enum-valued, with its own unit tests), `bin/lattice_serve.rs`
 //! (`detect_q4`, bool-valued), and `bin/chat_metal.rs` (`is_q4_dir`,
 //! bool-valued, plus a fourth, partial decision site that only re-checked

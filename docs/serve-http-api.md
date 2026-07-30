@@ -3,7 +3,7 @@
 The README shows one bare `curl` example against `/v1/chat/completions`. This document covers
 the rest of the surface: exact request/response shapes, streaming, error responses, validation
 order, and behavior that is easy to get wrong if you only read the happy path. Everything below
-was verified against `crates/inference/src/bin/lattice.rs`'s `mod serve` (the `lattice serve`
+was verified against `crates/inference/src/bin/lattice/serve.rs` (the `lattice serve`
 subcommand's implementation) and confirmed live against a running server built from this
 repository.
 
@@ -12,7 +12,7 @@ repository.
 This codebase has **two** separately built HTTP servers with confusingly similar names:
 
 - **`lattice serve`** — a subcommand of the unified `lattice` CLI binary
-  (`crates/inference/src/bin/lattice.rs`). This is the general-purpose, OpenAI-compatible server
+  (`crates/inference/src/bin/lattice/serve.rs`). This is the general-purpose, OpenAI-compatible server
   the README documents (Quick Start and "### HTTP API" sections), with an active development
   history (unified-CLI ADR-063, SSE streaming, stop sequences, native Q4 checkpoint support,
   `lattice doctor` preflight). **This document is about `lattice serve`.**
@@ -102,12 +102,12 @@ None of this is implemented today — worth stating explicitly, since issue #601
   before it reaches model code is the 1 MiB body-size cap already shown above.
 - **CPU backend: not serialized by the server, but not free either.** Each CPU request's
   `generate` call runs as blocking work on a Tokio blocking-pool task
-  (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice.rs`), so multiple CPU requests
+  (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice/serve.rs`), so multiple CPU requests
   can execute concurrently up to Tokio's blocking-pool size — this is not a hard concurrency-1
   limit, but concurrent CPU requests still contend for the same CPU cores and memory.
 - **Metal/Q4 backend: effectively concurrency-1.** All Metal generation is funneled through one
   dedicated worker thread (an `mpsc` channel into a single OS thread holding the `!Send` Metal
-  state, `crates/inference/src/bin/lattice.rs`) — a deliberate design choice matching how one local
+  state, `crates/inference/src/bin/lattice/serve.rs`) — a deliberate design choice matching how one local
   GPU device actually works, not an oversight. Two concurrent requests against a Q4-backed
   `lattice serve` run back-to-back, not in parallel; the later request's connection simply stays
   open until its turn in the channel comes up.
@@ -308,7 +308,7 @@ non-streaming path, with `top_logprobs` range-checked to `0..=20` and required t
   from this HTTP server anyway — not a regression from that change, just a documented gap.
 
 If you're reading this after #620 has merged, verify the current behavior against
-`reject_unsupported` in `lattice.rs` directly rather than trusting this paragraph — it will be
+`reject_unsupported` in `lattice/serve.rs` directly rather than trusting this paragraph — it will be
 stale at that point.
 
 ## `POST /v1/chat/completions` — streaming (SSE)

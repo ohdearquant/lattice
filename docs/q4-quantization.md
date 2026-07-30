@@ -87,26 +87,20 @@ would save almost no memory and would hurt accuracy disproportionately.
 This is the single most important thing in this document. **`quantize_q4` never writes a
 `config.json`** — its output directory holds only `.q4`/`.f16` tensor files and
 `quantize_index.json`. This differs from `quantize_quarot` (below), whose output directory
-_does_ include one. Every consumer of a Q4 directory that isn't `quantize_q4` itself assumes
-`config.json` might be present, but they disagree on what happens when it's not:
+_does_ include one. Every current consumer of a Q4 directory requires `config.json` and fails
+closed before loading weights when it is absent:
 
-- `lattice serve --model <q4-dir>` and `lattice chat --model <q4-dir>` (in `lattice.rs`)
-  call a helper (`load_q4_config`) that **falls back to a hardcoded Qwen3.6-27B default config**
-  when `config.json` is missing, printing only a one-line warning to stderr:
-  `Warning: <dir> has no config.json; falling back to the Qwen3.6-27B default config.` For any
-  checkpoint that isn't actually the 27B model — including the 0.8B checkpoint used throughout
-  this document — this silently loads the wrong architecture (wrong layer count, hidden size,
-  attention/GDN layer pattern). It does not fail; it fails _wrong_, and only a warning line
-  distinguishes that from a normal load.
-- `eval_perplexity --q4-dir <dir>` (see Step 3) hard-errors instead:
-  `ERROR: Q4 dir <dir> is missing config.json` and exits 1. No silent fallback.
-- `lattice doctor --model <q4-dir>` (see "Verify before you load", below) also ends up using the
-  same Qwen3.6-27B fallback internally, which causes it to expect ~500 additional tensors that a
-  smaller checkpoint doesn't have. It **does** fail closed (exit 1, `Result: NOT READY`), but the
-  reported reason — "531 required tensor(s) missing" — points at the symptom, not the cause.
+- `lattice serve --model <q4-dir>` and `lattice chat --model <q4-dir>` call
+  `Qwen35Config::from_model_dir` through the shared Q4-config bridge
+  (`lattice/chat.rs:3-20`, used by `lattice/serve.rs:72-142`) and return a descriptive
+  `config.json load failed` error.
+- `lattice doctor --model <q4-dir>` uses the same resolver before tensor inventory
+  (`lattice/doctor.rs:819-843`), so it cannot substitute a different architecture or report
+  downstream missing-tensor noise for a missing config.
+- `eval_perplexity --q4-dir <dir>` also prints an error naming the missing `config.json` and exits 1.
 
-**The fix is the same in all three cases: copy `config.json` from the source model directory into
-the `quantize_q4` output directory before loading it with anything else.**
+There is no silent architecture fallback. Copy `config.json` from the source model directory into
+the `quantize_q4` output directory before loading it with anything else.
 
 ```bash
 cp ~/.lattice/models/qwen3.5-0.8b/config.json ~/.lattice/models/qwen3.5-0.8b-q4/config.json
@@ -334,14 +328,10 @@ your system's memory are actually sufficient to load it, without spending the ti
 the model. Run it before `chat`/`serve` on any new Q4 output, including QuaRot outputs.
 
 `doctor` exits 0 with `Result: OK` when the checkpoint is loadable and fits comfortably; exits 1 with
-`Result: NOT READY` and a specific reason otherwise. **If `doctor` reports dozens or hundreds of
-"missing required tensors" with layer indices well beyond what you'd expect for your model size**
-(for example, layers in the 20s-40s for what you know is a small checkpoint), the near-certain
-real cause is a missing `config.json` in that directory (see the gotcha in Step 1) rather than a
-corrupted or incomplete conversion — `doctor` inherits the same Qwen3.6-27B config fallback as
-`lattice serve`/`lattice chat`, so a missing config makes it expect a 27B-shaped tensor set against
-your smaller checkpoint's actual tensors. Copy `config.json` in and re-run `doctor` before assuming
-the conversion itself is broken.
+`Result: NOT READY` and a specific reason otherwise. A missing `config.json` now stops preflight
+immediately with a config-load error, before tensor inventory. If `doctor` instead reports missing
+required tensors, it resolved the checkpoint's real config and the inventory mismatch should be
+treated as a conversion/artifact problem rather than architecture-fallback noise.
 
 The bounded, fail-closed read of `quantize_index.json` is centralized in one place: the
 `lattice_inference::quant::q4_manifest` module (`crates/inference/src/quant/q4_manifest.rs`).
