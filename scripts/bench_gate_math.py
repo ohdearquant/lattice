@@ -41,19 +41,12 @@ documenting them:
      the widened FAIL margin.
 
      Bands are DATA in `perf-policy.toml`; this module only looks them up.
-     It does NOT refuse a cell with no measured CV, and cannot: `required_n`
-     takes a float, so a missing CV arrives here either as a bare `TypeError`
-     or, if a caller substitutes 0.0, as a silent lookup into the CHEAPEST
-     band. The fail-closed behaviour lives in the CALLERS —
-     `bench_decode_harness.validate_run_record` raises
-     `RunRecordValidationError` ("INFRA-FAIL: ... has no measured_cv on
-     record") for any cell whose verdict is not `unsupported`, and
-     `bench_cpu_flagship_supervisor` demotes an un-CV'd cell to shadow
-     rather than defaulting it. A NEW CALL SITE INHERITS THE OBLIGATION,
-     NOT THE GUARD: if you call `required_n` from somewhere else, you must
-     refuse the missing-CV case yourself before calling, because nothing in
-     this module will do it for you and nothing here will fail if you skip
-     it.
+     `required_n` rejects any measured CV that is not a positive finite
+     number. In particular, 0.0 is not accepted as a stand-in for a missing
+     or unresolved measurement: doing so would silently select the CHEAPEST
+     band. Callers still own record-level handling of an absent CV so they
+     can distinguish an unsupported observation from malformed gating
+     evidence, but every call into the band lookup itself fails closed.
 
   2. `order_stratified_bootstrap_means` bootstraps the MEAN of paired
      log-slowdowns, never the median. At n=7 the bootstrap distribution of
@@ -469,13 +462,16 @@ def required_n(measured_cv: float, cv_bands: Sequence[CvBand], cell_class: str) 
     """Look up `(required_n, fail_margin_multiplier)` for a measured CV and
     cell class ("A" or "B"). The FIRST band whose `max_cv >= measured_cv`
     wins (bands are pre-sorted ascending by `parse_cv_bands`). Raises
-    `GateMathError` for a negative CV or an unrecognized class — this
-    function is never asked to guess in the absence of a measured CV; the
-    CALLER (the run-record validator) is responsible for refusing
-    promotion of any cell lacking a `measured_cv` record in the first
-    place (correction 1's fail-closed requirement)."""
-    if measured_cv < 0:
-        raise GateMathError(f"measured_cv must be >= 0, got {measured_cv!r}")
+    `GateMathError` unless the CV is a positive finite number and the class
+    is recognized. An absent or zero CV cannot be mapped to the cheapest
+    band (correction 1's fail-closed requirement)."""
+    if (
+        isinstance(measured_cv, bool)
+        or not isinstance(measured_cv, (int, float))
+        or not math.isfinite(measured_cv)
+        or measured_cv <= 0
+    ):
+        raise GateMathError(f"measured_cv must be a positive finite number, got {measured_cv!r}")
     if cell_class not in ("A", "B"):
         raise GateMathError(f"cell_class must be 'A' or 'B', got {cell_class!r}")
     for band in cv_bands:
@@ -938,3 +934,11 @@ def policy_sha(path: Path = DEFAULT_POLICY_FILE) -> str:
         raise PolicyConfigError(f"{path}: policy values cannot be canonicalized: {exc}") from exc
     digest = hashlib.sha256(payload).hexdigest()
     return f"{POLICY_SHA_PREFIX}{digest}"
+
+
+def policy_file_sha(path: Path = DEFAULT_POLICY_FILE) -> str:
+    """SHA-256 of the exact policy file bytes retained for provenance."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise PolicyConfigError(f"{path}: cannot read policy bytes: {exc}") from exc
