@@ -65,6 +65,10 @@ pub(crate) use generation_setup::{
 // (forward::metal_qwen35) calls this instead of its own inline
 // `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
 pub(crate) use generation::check_prompt_not_empty;
+// Raw-token Metal generation entry points cannot rely on a tokenizer/model
+// pairing to keep prompt ids inside the embedding table.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use generation::check_prompt_ids_in_vocab;
 // Shared total-context admission bound (#922): every Metal generation entry
 // point (forward::metal_qwen35) calls this after check_prompt_not_empty to
 // mirror the CPU `generate`/`generate_streaming` total bound

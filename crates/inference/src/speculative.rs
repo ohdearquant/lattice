@@ -71,7 +71,9 @@ impl NgramSpeculator {
 
             if let Some(pos) = self.find_ngram(suffix) {
                 let start = pos + n;
-                let end = (start + self.max_draft).min(self.prompt_tokens.len());
+                let end = start
+                    .saturating_add(self.max_draft)
+                    .min(self.prompt_tokens.len());
                 if start < end {
                     return self.prompt_tokens[start..end].to_vec();
                 }
@@ -2273,6 +2275,16 @@ where
 /// single-token forward step returning logits, and this function handles
 /// the speculation/verification loop.
 ///
+/// # Metal state warning
+///
+/// Do not pass a live
+/// [`MetalQwen35State::forward_step`](crate::forward::metal_qwen35::MetalQwen35State::forward_step)
+/// callback after Metal prefill. This compatibility wrapper feeds the final
+/// prompt token at `position = prompt_tokens.len()` on its first callback,
+/// which would duplicate that token in the Metal KV/GDN state. Use
+/// [`MetalQwen35State::generate_with_speculation`](crate::forward::metal_qwen35::MetalQwen35State::generate_with_speculation)
+/// instead; it owns admission, prefill, and state advancement.
+///
 /// # Arguments
 ///
 /// - `prompt_tokens`: tokenised prompt (caller must have already run prefill).
@@ -2352,6 +2364,84 @@ where
     Ok(generated)
 }
 
+/// Drive n-gram speculative generation from logits produced by a completed
+/// prompt prefill.
+///
+/// Unlike [`generate_with_speculation`], the callback receives each newly
+/// emitted token exactly once at its true absolute position. The final token
+/// admitted by `max_new_tokens` is also forwarded so the caller's live state
+/// represents the full returned sequence.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn generate_with_speculation_from_prefill<F>(
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos_token: u32,
+    mut logits: Vec<f32>,
+    mut forward_fn: F,
+    max_ngram: usize,
+    max_draft: usize,
+) -> Result<Vec<u32>, crate::error::InferenceError>
+where
+    F: FnMut(u32, usize) -> Result<Vec<f32>, crate::error::InferenceError>,
+{
+    if prompt_tokens.is_empty() {
+        return Err(crate::error::InferenceError::Inference(
+            "empty prompt".into(),
+        ));
+    }
+
+    let speculator = NgramSpeculator::new(prompt_tokens.to_vec(), max_ngram, max_draft);
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    let mut all_tokens = prompt_tokens.to_vec();
+    let mut position = prompt_tokens.len();
+
+    while generated.len() < max_new_tokens {
+        let draft = speculator.speculate(&all_tokens);
+        let mut rejected = false;
+
+        for &candidate in &draft {
+            if generated.len() == max_new_tokens {
+                break;
+            }
+
+            let model_choice = argmax(&logits) as u32;
+            if model_choice == eos_token {
+                return Ok(generated);
+            }
+
+            let emitted = if model_choice == candidate {
+                candidate
+            } else {
+                rejected = true;
+                model_choice
+            };
+            generated.push(emitted);
+            all_tokens.push(emitted);
+            logits = forward_fn(emitted, position)?;
+            position += 1;
+
+            if rejected {
+                break;
+            }
+        }
+
+        if generated.len() == max_new_tokens || rejected {
+            continue;
+        }
+
+        let bonus = argmax(&logits) as u32;
+        if bonus == eos_token {
+            break;
+        }
+        generated.push(bonus);
+        all_tokens.push(bonus);
+        logits = forward_fn(bonus, position)?;
+        position += 1;
+    }
+
+    Ok(generated)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2411,6 +2501,12 @@ mod tests {
         // Match [1, 2] at pos 0, max_draft=2 so drafts [3, 4] only
         let draft = spec.speculate(&[1, 2]);
         assert_eq!(draft, vec![3, 4]);
+    }
+
+    #[test]
+    fn speculate_saturates_adversarial_max_draft() {
+        let spec = NgramSpeculator::new(vec![1, 2, 3, 4], 5, usize::MAX);
+        assert_eq!(spec.speculate(&[1, 2]), vec![3, 4]);
     }
 
     #[test]
@@ -3260,6 +3356,145 @@ mod tests {
             spec_out, greedy_out,
             "speculative output diverged from greedy under tie-break: spec={spec_out:?} greedy={greedy_out:?}"
         );
+    }
+
+    #[test]
+    fn stateful_speculation_starts_from_prefill_and_forwards_final_budget_token() {
+        let prompt = vec![4u32, 5];
+        let initial_logits = logits_with_argmax(16, 7);
+        let mut calls = Vec::new();
+
+        let output = generate_with_speculation_from_prefill(
+            &prompt,
+            2,
+            15,
+            initial_logits,
+            |token, position| {
+                calls.push((token, position));
+                Ok(logits_with_argmax(16, 8))
+            },
+            5,
+            4,
+        )
+        .expect("prefill-seeded generation must succeed");
+
+        assert_eq!(output, vec![7, 8]);
+        assert_eq!(
+            calls,
+            vec![(7, prompt.len()), (8, prompt.len() + 1)],
+            "the callback must receive generated tokens at their true positions, \
+             including the final budget token"
+        );
+    }
+
+    #[test]
+    fn stateful_speculation_verifies_draft_against_prefill_logits() {
+        let prompt = vec![7u32, 8, 9, 0, 7, 8, 9];
+        let mut next = [7u32, 8, 9, 1].into_iter();
+        let mut calls = Vec::new();
+
+        let output = generate_with_speculation_from_prefill(
+            &prompt,
+            4,
+            31,
+            logits_with_argmax(32, 0),
+            |token, position| {
+                calls.push((token, position));
+                Ok(logits_with_argmax(
+                    32,
+                    next.next().expect("each emitted token must be forwarded"),
+                ))
+            },
+            5,
+            4,
+        )
+        .expect("matching draft must succeed");
+
+        assert_eq!(output, vec![0, 7, 8, 9]);
+        assert_eq!(
+            calls,
+            vec![(0, 7), (7, 8), (8, 9), (9, 10)],
+            "each accepted draft token must advance live state exactly once"
+        );
+    }
+
+    #[test]
+    fn stateful_speculation_handles_draft_mismatch_and_eos_during_verification() {
+        let prompt = vec![7u32, 8, 9, 0, 7, 8, 9];
+
+        let mut mismatch_calls = Vec::new();
+        let mismatch = generate_with_speculation_from_prefill(
+            &prompt,
+            1,
+            31,
+            logits_with_argmax(32, 6),
+            |token, position| {
+                mismatch_calls.push((token, position));
+                Ok(logits_with_argmax(32, 5))
+            },
+            5,
+            4,
+        )
+        .expect("a rejected draft must emit and forward the model choice");
+        assert_eq!(mismatch, vec![6]);
+        assert_eq!(mismatch_calls, vec![(6, prompt.len())]);
+
+        let eos = 3u32;
+        let mut eos_calls = Vec::new();
+        let stopped = generate_with_speculation_from_prefill(
+            &prompt,
+            4,
+            eos,
+            logits_with_argmax(32, 0),
+            |token, position| {
+                eos_calls.push((token, position));
+                Ok(logits_with_argmax(32, eos))
+            },
+            5,
+            4,
+        )
+        .expect("EOS during draft verification is a successful stop");
+        assert_eq!(stopped, vec![0]);
+        assert_eq!(
+            eos_calls,
+            vec![(0, prompt.len())],
+            "EOS must not be returned or forwarded"
+        );
+    }
+
+    #[test]
+    fn stateful_speculation_stops_before_forwarding_eos_and_propagates_step_errors() {
+        let eos = 3u32;
+        let no_forward = generate_with_speculation_from_prefill(
+            &[1, 2],
+            4,
+            eos,
+            logits_with_argmax(8, eos),
+            |_token, _position| panic!("EOS selected from prefill logits must not be forwarded"),
+            5,
+            4,
+        )
+        .expect("EOS is a successful stop");
+        assert!(no_forward.is_empty());
+
+        let error = generate_with_speculation_from_prefill(
+            &[1, 2],
+            1,
+            eos,
+            logits_with_argmax(8, 4),
+            |_token, _position| {
+                Err(crate::error::InferenceError::Inference(
+                    "synthetic step failure".into(),
+                ))
+            },
+            5,
+            4,
+        );
+        assert!(matches!(
+            error,
+            Err(crate::error::InferenceError::Inference(ref message))
+                if message == "synthetic step failure"
+        ));
     }
 
     // ── rejection_sample_draft tests ─────────────────────────────────────────
