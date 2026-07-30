@@ -13,8 +13,8 @@ under thresholds that moved after the run.
 It cannot, however, tell a threshold change apart from a prose correction, and
 this file records the one transition where the difference matters.
 
-| From | To | Semantic delta |
-|---|---|---|
+| From                | To                  | Semantic delta                        |
+| ------------------- | ------------------- | ------------------------------------- |
 | `17c4f9ef52c647ae…` | `9d5a3a3776e50610…` | none — three `note` strings rewritten |
 
 ## Why that row is a claim you can check rather than one you have to trust
@@ -52,7 +52,7 @@ kill-point costs: every recorded run record pinning the old sha stops
 revalidating. That prices honesty at the same rate as a threshold move, which is
 part of why the wrong notes survived as long as they did.
 
-A sha computed over the canonicalized *parsed* values, with prose keys excluded,
+A sha computed over the canonicalized _parsed_ values, with prose keys excluded,
 would still fail closed on any band, threshold, or noise-class change while
 staying quiet for a comment fix. That is a change to what a gate identity means,
 so it belongs in its own change with its own review rather than riding along
