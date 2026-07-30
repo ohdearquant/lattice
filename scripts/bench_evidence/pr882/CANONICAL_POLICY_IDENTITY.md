@@ -13,6 +13,12 @@ TOML values, excluding only comments (already absent after parsing) and
 `cv_bands[*].note`. Every other parsed value remains identity-bearing, including
 `other_rule`.
 
+New canonical records also carry `provenance.policy_file_sha`, the SHA-256 of
+the exact TOML bytes. Revalidation compares `policy_sha`, while
+`policy_file_sha` preserves byte-level provenance and changes on a prose-only
+edit. Historical legacy records remain unchanged: their untagged `policy_sha`
+already is the byte digest, and they predate the separate field.
+
 The scheme tag is part of the identity. `validate_run_record` recognizes legacy
 byte SHAs but never aliases one to `canonical-v1`, even when the historical
 transition evidence records that a particular transition had no gating delta.

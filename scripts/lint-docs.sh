@@ -1,11 +1,14 @@
 #!/bin/sh
 set -e
 
+unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
+
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 script_path="$script_dir/lint-docs.sh"
 mode=${1:-}
 
 run_discovery_selftest() {
+    index_count_before=$(git ls-files | wc -l | tr -d '[:space:]')
     sandbox=$(mktemp -d "${TMPDIR:-/tmp}/lattice-lint-docs.XXXXXX")
     case "$sandbox" in
         "${TMPDIR:-/tmp}"/lattice-lint-docs.*) ;;
@@ -77,6 +80,11 @@ EOF
         echo "lint-docs selftest: linter did not receive the exact tracked Markdown set" >&2
         exit 1
     fi
+    index_count_after=$(git ls-files | wc -l | tr -d '[:space:]')
+    if [ "$index_count_after" -ne "$index_count_before" ]; then
+        echo "lint-docs selftest: real index entry count changed: $index_count_before -> $index_count_after" >&2
+        exit 1
+    fi
     echo "lint-docs: recursive tracked-Markdown selftest OK"
 }
 
@@ -94,34 +102,57 @@ esac
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
-markdown_list=$(mktemp "${TMPDIR:-/tmp}/lattice-markdown-files.XXXXXX")
-trap 'rm -f "$markdown_list"' 0 1 2 3 15
-git ls-files -z -- '*.md' >"$markdown_list"
-markdown_count=$(tr -cd '\000' <"$markdown_list" | wc -c | tr -d '[:space:]')
-if [ "$markdown_count" -eq 0 ]; then
-    echo "lint-docs: tracked Markdown discovery returned zero files" >&2
-    exit 1
-fi
 
 if [ "$mode" = "--format" ]; then
+    if ! command -v deno >/dev/null 2>&1; then
+        echo "lint-docs: deno not found; cannot format Markdown" >&2
+        exit 127
+    fi
+    markdown_list=$(mktemp "${TMPDIR:-/tmp}/lattice-markdown-files.XXXXXX")
+    trap 'rm -f "$markdown_list"' 0 1 2 3 15
+    git ls-files -z -- '*.md' >"$markdown_list"
+    markdown_count=$(tr -cd '\000' <"$markdown_list" | wc -c | tr -d '[:space:]')
+    if [ "$markdown_count" -eq 0 ]; then
+        echo "lint-docs: tracked Markdown discovery returned zero files" >&2
+        exit 1
+    fi
     echo "=== Formatting $markdown_count tracked Markdown files (deno) ==="
     xargs -0 deno fmt <"$markdown_list"
     exit 0
 fi
 
-echo "=== Doc Linting $markdown_count tracked Markdown files (deno) ==="
-xargs -0 deno fmt --check <"$markdown_list"
-xargs -0 deno lint <"$markdown_list" 2>/dev/null || true
+if command -v deno >/dev/null 2>&1; then
+    markdown_list=$(mktemp "${TMPDIR:-/tmp}/lattice-markdown-files.XXXXXX")
+    trap 'rm -f "$markdown_list"' 0 1 2 3 15
+    git ls-files -z -- '*.md' >"$markdown_list"
+    markdown_count=$(tr -cd '\000' <"$markdown_list" | wc -c | tr -d '[:space:]')
+    if [ "$markdown_count" -eq 0 ]; then
+        echo "lint-docs: tracked Markdown discovery returned zero files" >&2
+        exit 1
+    fi
+    echo "=== Doc Linting $markdown_count tracked Markdown files (deno) ==="
+    xargs -0 deno fmt --check <"$markdown_list"
+    xargs -0 deno lint <"$markdown_list" 2>/dev/null || true
 
-if [ "$mode" = "--markdown-only" ]; then
-    exit 0
+    if [ "$mode" = "--markdown-only" ]; then
+        exit 0
+    fi
+
+    echo "=== Recursive Markdown Discovery Self-Test (#1148) ==="
+    "$script_path" --selftest
+elif [ "$mode" = "--markdown-only" ]; then
+    echo "lint-docs: deno not found; cannot lint Markdown" >&2
+    exit 127
+else
+    echo "lint-docs: deno not found; skipping Markdown format, lint, and discovery self-test"
 fi
-
-echo "=== Recursive Markdown Discovery Self-Test (#1148) ==="
-"$script_path" --selftest
 
 echo "=== Capability Matrix Fixture Check (#654) ==="
 "$script_dir/check-capability-matrix.sh" --selftest
 "$script_dir/check-capability-matrix.sh"
+
+echo "=== Absolute Developer Path Check (#1102) ==="
+"$script_dir/lint-absolute-paths.sh" --selftest
+"$script_dir/lint-absolute-paths.sh"
 
 echo "=== Doc Lint Passed ==="
