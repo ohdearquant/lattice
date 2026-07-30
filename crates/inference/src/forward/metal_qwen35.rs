@@ -459,7 +459,6 @@ mod mtp_resolve_tests {
     /// `[hidden]`.
     // Only reachable via `write_full_mtp_fixture` (see its own
     // `#[allow(dead_code)]` note above).
-    #[allow(dead_code)]
     fn mtp_norm_names_and_shapes(cfg: &Qwen35Config) -> [(&'static str, Vec<usize>); 7] {
         let hidden = cfg.hidden_size;
         let head_dim = cfg.head_dim;
@@ -1027,12 +1026,22 @@ impl ChatMessage {
 /// Template: <|im_start|>{role}\n{content}<|im_end|>\n
 /// Final assistant turn left open for generation.
 pub fn format_chat_template(messages: &[ChatMessage]) -> String {
+    format_chat_template_parts(
+        messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str())),
+    )
+}
+
+pub(crate) fn format_chat_template_parts<'a>(
+    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
     let mut prompt = String::new();
-    for msg in messages {
+    for (role, content) in messages {
         prompt.push_str("<|im_start|>");
-        prompt.push_str(msg.role.as_str());
+        prompt.push_str(role);
         prompt.push('\n');
-        prompt.push_str(&msg.content);
+        prompt.push_str(content);
         prompt.push_str("<|im_end|>\n");
     }
     // Open assistant turn for generation
@@ -1058,11 +1067,6 @@ mod inner {
     use super::{MtpLoadErr, MtpTensorSource, resolve_mtp_norm, resolve_mtp_projection};
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
-    #[cfg(debug_assertions)]
-    use crate::attention::gdn_fused::{
-        conv1d_silu_fused, simd_decay_and_rank1_update, simd_gated_rms_norm, simd_l2_normalize,
-        simd_matvec_transpose,
-    };
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{AttentionWeights, ModelWeights};
@@ -1266,7 +1270,6 @@ mod inner {
         ///
         /// Exercised today only by [`mmap_q3_weight`] and its tests; live
         /// checkpoint loading does not yet route MLP tensors through it.
-        #[allow(dead_code)]
         fn from_mmap(buffer: Buffer, payload_offset: u64, mmap: memmap2::Mmap) -> Self {
             Q3WeightBuf {
                 buffer,
@@ -1727,13 +1730,8 @@ mod inner {
         v_bufs: Vec<Buffer>,
         /// Current number of tokens cached.
         seq_len: usize,
-        #[allow(dead_code)]
-        // stride dimension stored for CPU-side append_kv; not needed on GPU path
         kv_dim: usize,
         max_cache_len: usize,
-        /// When true the k/v buffers hold half-precision elements (2 bytes each).
-        /// GPU kernels use the `_f16` pipeline variants; CPU append_kv writes u16 bits.
-        kv_f16: bool,
     }
 
     /// Compiled MSL pipeline state objects.
@@ -1751,7 +1749,6 @@ mod inner {
         silu_mul_fused: ComputePipelineState,
         copy: ComputePipelineState,
         copy_offset: ComputePipelineState,
-        add: ComputePipelineState,
         gemv_q4: ComputePipelineState,
         gemm_q4: ComputePipelineState,
         gemm_q4_tiled: Option<ComputePipelineState>,
@@ -1985,10 +1982,8 @@ mod inner {
     /// infrastructure. For now, use `MetalQwen35State` as the backward-compatible
     /// single-session entry point.
     pub struct MetalQwen35Engine {
-        #[allow(dead_code)]
         // Device handle kept alive for GPU lifetime management (the MTLDevice must
-        // outlive the command queue/pipelines it created). Not yet tracked by a
-        // filed issue.
+        // outlive the command queue/pipelines it created).
         pub(crate) device: Device,
         pub(crate) queue: CommandQueue,
         pub(crate) pipelines: MetalQwen35Pipelines,
@@ -2050,7 +2045,6 @@ mod inner {
 
     impl InferenceSession {
         /// Set both the logical position and the KV cache sequence length atomically.
-        #[allow(dead_code)] // reserved for the concurrent Engine::forward_step API (ADR roadmap)
         pub(crate) fn set_position(&mut self, position: usize) {
             self.position = position;
             self.kv_cache.seq_len = position;
@@ -2076,7 +2070,6 @@ mod inner {
         projections: Vec<std::collections::HashMap<String, MetalLoraProjection>>,
         scale: f32,
         intermediate: Buffer,
-        #[allow(dead_code)]
         // max rank used to size `intermediate` buffer at load time; stored for adapter introspection
         max_rank: u32,
     }
@@ -2938,7 +2931,6 @@ mod inner {
                 seq_len: 0,
                 kv_dim,
                 max_cache_len,
-                kv_f16: use_kv_f16,
             };
             // ADR-064: runtime KV layout assertion (debug builds only).
             // Layout is f16 (2 bytes/elem) when use_kv_f16, f32 (4 bytes/elem) otherwise.
@@ -2961,53 +2953,6 @@ mod inner {
                 }
             }
             cache
-        }
-
-        /// Append a K/V pair into the cache for a given full-attention layer.
-        /// Writes directly into the shared Metal buffer via CPU pointer.
-        ///
-        /// Returns `Err` if the cache is full; callers must handle this before calling
-        /// to avoid a buffer overflow in release builds.
-        #[allow(dead_code)] // CPU-side KV append; superseded by GPU copy_offset dispatch but retained for the debug path
-        fn append_kv(
-            &mut self,
-            full_layer_idx: usize,
-            k_vec: &[f32],
-            v_vec: &[f32],
-        ) -> Result<(), String> {
-            if self.seq_len >= self.max_cache_len {
-                return Err(format!(
-                    "KV cache full: seq_len {} >= max_cache_len {}",
-                    self.seq_len, self.max_cache_len
-                ));
-            }
-            let offset = self.seq_len * self.kv_dim;
-            // SAFETY: seq_len < max_cache_len (checked above); buffers are
-            // StorageModeShared and we have exclusive access (no GPU command
-            // buffer is in flight during this call); offset + k_vec.len() ==
-            // (seq_len + 1) * kv_dim which is ≤ max_cache_len * kv_dim (the
-            // allocated buffer size).
-            if self.kv_f16 {
-                // Write as f16 bits into the half-precision buffer.
-                unsafe {
-                    let k_ptr = self.k_bufs[full_layer_idx].contents() as *mut u16;
-                    for (i, &val) in k_vec.iter().enumerate() {
-                        k_ptr.add(offset + i).write(f32_to_f16(val));
-                    }
-                    let v_ptr = self.v_bufs[full_layer_idx].contents() as *mut u16;
-                    for (i, &val) in v_vec.iter().enumerate() {
-                        v_ptr.add(offset + i).write(f32_to_f16(val));
-                    }
-                }
-            } else {
-                unsafe {
-                    let k_ptr = self.k_bufs[full_layer_idx].contents() as *mut f32;
-                    std::ptr::copy_nonoverlapping(k_vec.as_ptr(), k_ptr.add(offset), k_vec.len());
-                    let v_ptr = self.v_bufs[full_layer_idx].contents() as *mut f32;
-                    std::ptr::copy_nonoverlapping(v_vec.as_ptr(), v_ptr.add(offset), v_vec.len());
-                }
-            }
-            Ok(())
         }
 
         fn reset(&mut self) {
@@ -3246,7 +3191,6 @@ mod inner {
                 silu_mul_fused: make_pipeline("silu_mul_fused")?,
                 copy: make_pipeline("copy_buf")?,
                 copy_offset: make_pipeline("copy_buf_offset")?,
-                add: make_pipeline("add_buf")?,
                 conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
                 gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
                 gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
@@ -9898,595 +9842,6 @@ mod inner {
         }
 
         // ===================================================================
-        // GatedDeltaNet layer: GPU projections + CPU recurrence
-        // ===================================================================
-
-        /// Process a single token through a GatedDeltaNet layer (CPU path, debug-only).
-        ///
-        /// Strategy: GPU handles the 2 large projections (QKV, Z) and
-        /// the output projection. CPU handles conv1d + recurrence via unified memory.
-        /// Beta/alpha projections are small (16 rows) so done on CPU.
-        ///
-        /// QKV, Z, and out_proj use f16 weights via `dispatch_matmul_half`.
-        /// Beta/alpha projections (in_proj_b, in_proj_a) also use f16 weights
-        /// but are read via CPU and converted to f32 for the CPU-side matmul.
-        ///
-        /// Requires `LATTICE_GDN_CPU=1`. Not available in release builds.
-        #[cfg(debug_assertions)]
-        #[allow(dead_code)] // debug-assertions-only path; called when LATTICE_GDN_CPU=1
-        fn gdn_layer_step_by_idx(
-            &mut self,
-            layer_idx: usize,
-            state_idx: usize,
-            cfg: &Qwen35Config,
-        ) {
-            let hidden = cfg.hidden_size;
-            let num_heads = cfg.linear_num_key_heads;
-            let value_heads = cfg.linear_num_value_heads();
-            let ratio = value_heads / num_heads;
-            let key_dim = cfg.linear_key_head_dim;
-            let value_dim = cfg.linear_value_head_dim;
-            let qkv_dim = cfg.linear_qkv_dim();
-            let output_dim = cfg.linear_output_dim();
-            let kernel_size = cfg.linear_conv_kernel_dim;
-
-            // Extract raw pointers to weight buffers, releasing the borrow on
-            // self.engine.layer_weights before we need &mut self for dispatch/state.
-            // SAFETY: layer_weights is never mutated during forward pass, so the
-            // pointers remain valid. We dereference them inside unsafe blocks below.
-            let (
-                w_in_proj_qkv,
-                w_in_proj_z,
-                w_in_proj_b,
-                w_in_proj_a,
-                w_a_log,
-                w_dt_bias,
-                w_conv1d,
-                w_norm,
-                w_out_proj,
-            ) = {
-                let MetalLayerAttnWeights::Linear(gdn_w) = &self.engine.layer_weights[layer_idx].0
-                else {
-                    unreachable!("gdn_layer_step called on non-linear layer")
-                };
-                (
-                    &gdn_w.in_proj_qkv as *const Q4WeightBuf,
-                    &gdn_w.in_proj_z as *const Q4WeightBuf,
-                    &gdn_w.in_proj_b as *const Buffer,
-                    &gdn_w.in_proj_a as *const Buffer,
-                    &gdn_w.a_log as *const Buffer,
-                    &gdn_w.dt_bias as *const Buffer,
-                    &gdn_w.conv1d_weight as *const Buffer,
-                    &gdn_w.norm_weight as *const Buffer,
-                    &gdn_w.out_proj as *const Q4WeightBuf,
-                )
-            };
-
-            // --- GPU: 2 large projections (f16 weights) ---
-            // SAFETY: Weight buffer pointers are valid for the lifetime of self.
-            // self.engine.layer_weights is not mutated during forward pass.
-            let cmd = self.engine.queue.new_command_buffer();
-            {
-                let enc = cmd.new_compute_command_encoder();
-                // SAFETY: Raw projection pointers are live layer-owned buffers;
-                // dispatch dimensions match [qkv_dim/output_dim, hidden].
-                unsafe {
-                    self.dispatch_matmul(
-                        enc,
-                        &self.session.activations.hidden,
-                        &*w_in_proj_qkv,
-                        &self.session.activations.gdn_qkv,
-                        1,
-                        qkv_dim as u32,
-                        hidden as u32,
-                    );
-                    self.dispatch_matmul(
-                        enc,
-                        &self.session.activations.hidden,
-                        &*w_in_proj_z,
-                        &self.session.activations.gdn_z,
-                        1,
-                        output_dim as u32,
-                        hidden as u32,
-                    );
-                }
-                enc.end_encoding();
-            }
-            cmd.commit();
-            cmd.wait_until_completed();
-
-            // --- CPU: read projections from shared memory ---
-            // SAFETY: The projection command buffer completed and the buffer is
-            // StorageModeShared with qkv_dim f32 values.
-            let qkv_proj = unsafe { read_buffer(&self.session.activations.gdn_qkv, qkv_dim) };
-            // SAFETY: The projection command buffer completed and the buffer is
-            // StorageModeShared with output_dim f32 values.
-            let z_proj = unsafe { read_buffer(&self.session.activations.gdn_z, output_dim) };
-            // SAFETY: No GPU writes are in flight and hidden is the activation length.
-            let hidden_vec = unsafe { read_buffer(&self.session.activations.hidden, hidden) };
-
-            // Read small weight vectors for CPU-side projections
-            // a_log, dt_bias: f32 buffers (read directly)
-            // in_proj_b, in_proj_a: f16 buffers (read and convert)
-            // conv1d_weight, norm_weight: f32 buffers (read directly)
-            // SAFETY: Layer parameter buffers are StorageModeShared and sized
-            // during initialization from the same model config.
-            let a_log = unsafe { read_buffer(&*w_a_log, value_heads) };
-            // SAFETY: Layer parameter buffers are StorageModeShared and sized
-            // during initialization from the same model config.
-            let dt_bias = unsafe { read_buffer(&*w_dt_bias, value_heads) };
-            // SAFETY: The f16 projection buffer has value_heads * hidden elements.
-            let in_proj_b = unsafe { read_buffer_f16(&*w_in_proj_b, value_heads * hidden) };
-            // SAFETY: The f16 projection buffer has value_heads * hidden elements.
-            let in_proj_a = unsafe { read_buffer_f16(&*w_in_proj_a, value_heads * hidden) };
-            // SAFETY: Conv1d weights are StorageModeShared and sized qkv_dim * kernel_size.
-            let conv1d_weight = unsafe { read_buffer(&*w_conv1d, qkv_dim * kernel_size) };
-            // SAFETY: Norm weights are StorageModeShared and sized value_dim.
-            let norm_weight = unsafe { read_buffer(&*w_norm, value_dim) };
-
-            // Beta projection (small): [value_heads, hidden] @ hidden -> [value_heads]
-            let mut beta_proj = vec![0.0f32; value_heads];
-            crate::forward::cpu::matmul_bt(
-                &hidden_vec,
-                &in_proj_b,
-                &mut beta_proj,
-                1,
-                hidden,
-                value_heads,
-            );
-            for b in &mut beta_proj {
-                *b = 1.0 / (1.0 + (-*b).exp());
-            }
-
-            // Alpha projection (small): [value_heads, hidden] @ hidden -> [value_heads]
-            let mut alpha_proj = vec![0.0f32; value_heads];
-            crate::forward::cpu::matmul_bt(
-                &hidden_vec,
-                &in_proj_a,
-                &mut alpha_proj,
-                1,
-                hidden,
-                value_heads,
-            );
-
-            // --- CPU: conv1d + SiLU ---
-            let mut conv_output = vec![0.0f32; qkv_dim];
-            conv1d_silu_fused(
-                &qkv_proj,
-                &mut self.session.gdn_states[state_idx].conv_buffer,
-                &conv1d_weight,
-                &mut conv_output,
-                qkv_dim,
-                kernel_size,
-            );
-
-            // --- CPU: per-head recurrence ---
-            let q_total = num_heads * key_dim;
-            let k_total = num_heads * key_dim;
-            let v_offset = q_total + k_total;
-            let scale = 1.0 / (key_dim as f32).sqrt();
-            let mut output_heads = vec![0.0f32; output_dim];
-
-            let state = &mut self.session.gdn_states[state_idx];
-
-            for h in 0..value_heads {
-                let kh = h / ratio;
-                let q_start = kh * key_dim;
-                let k_start = q_total + kh * key_dim;
-                let v_start = v_offset + h * value_dim;
-
-                let mut q_head = conv_output[q_start..q_start + key_dim].to_vec();
-                let mut k_head = conv_output[k_start..k_start + key_dim].to_vec();
-                let v = &conv_output[v_start..v_start + value_dim];
-
-                simd_l2_normalize(&mut q_head);
-                simd_l2_normalize(&mut k_head);
-
-                let a = a_log[h].exp().min(f32::MAX); // finite clamp (see gdn.rs compute_decay_gate): inf*0 = NaN poisons state
-                let sp = softplus(alpha_proj[h] + dt_bias[h]);
-                let g = (-a * sp).exp();
-
-                let s_off = h * key_dim * value_dim;
-                let s = &mut state.s_matrices[s_off..s_off + key_dim * value_dim];
-
-                let mut kv_mem = vec![0.0f32; value_dim];
-                simd_matvec_transpose(s, &k_head, &mut kv_mem, key_dim, value_dim);
-
-                let beta_h = beta_proj[h];
-                let mut delta = vec![0.0f32; value_dim];
-                for j in 0..value_dim {
-                    delta[j] = (v[j] - kv_mem[j] * g) * beta_h;
-                }
-
-                simd_decay_and_rank1_update(s, &k_head, &delta, g, key_dim, value_dim);
-
-                let out_start = h * value_dim;
-                let out_head = &mut output_heads[out_start..out_start + value_dim];
-                simd_matvec_transpose(s, &q_head, out_head, key_dim, value_dim);
-                for val in out_head.iter_mut() {
-                    *val *= scale;
-                }
-            }
-
-            // --- CPU: gated RMS norm ---
-            let gamma = &norm_weight[..value_dim];
-            let mut gated_norm_buf = vec![0.0f32; output_dim];
-            for h in 0..value_heads {
-                let start = h * value_dim;
-                let end = start + value_dim;
-                simd_gated_rms_norm(
-                    &output_heads[start..end],
-                    &z_proj[start..end],
-                    gamma,
-                    &mut gated_norm_buf[start..end],
-                    cfg.rms_norm_eps,
-                );
-            }
-
-            // --- GPU: output projection (f16 weights) ---
-            // SAFETY: gdn_z is StorageModeShared, no command buffer is in flight,
-            // and gated_norm_buf length matches output_dim.
-            unsafe { write_buffer(&self.session.activations.gdn_z, &gated_norm_buf) };
-
-            let cmd = self.engine.queue.new_command_buffer();
-            {
-                let enc = cmd.new_compute_command_encoder();
-                // SAFETY: Raw output projection pointer is live and dimensions
-                // match [1, output_dim] by [hidden, output_dim].
-                unsafe {
-                    self.dispatch_matmul(
-                        enc,
-                        &self.session.activations.gdn_z,
-                        &*w_out_proj,
-                        &self.session.activations.attn_out,
-                        1,
-                        hidden as u32,
-                        output_dim as u32,
-                    );
-                }
-                enc.end_encoding();
-            }
-            cmd.commit();
-            cmd.wait_until_completed();
-        }
-
-        /// CPU-only portion of GDN layer: conv1d + recurrence + gated norm (debug-only).
-        /// Reads QKV/Z projections from GPU shared buffers (written by CMD A),
-        /// writes gated norm output to gdn_z buffer (read by CMD B for out_proj).
-        /// Requires `LATTICE_GDN_CPU=1`. Not available in release builds.
-        #[cfg(debug_assertions)]
-        #[allow(dead_code)] // debug-assertions-only path; called when LATTICE_GDN_CPU=1
-        fn gdn_cpu_recurrence(&mut self, layer_idx: usize, state_idx: usize, cfg: &Qwen35Config) {
-            let hidden = cfg.hidden_size;
-            let num_heads = cfg.linear_num_key_heads;
-            let value_heads = cfg.linear_num_value_heads();
-            let ratio = value_heads / num_heads;
-            let key_dim = cfg.linear_key_head_dim;
-            let value_dim = cfg.linear_value_head_dim;
-            let qkv_dim = cfg.linear_qkv_dim();
-            let output_dim = cfg.linear_output_dim();
-            let kernel_size = cfg.linear_conv_kernel_dim;
-
-            let (w_in_proj_b, w_in_proj_a, w_a_log, w_dt_bias, w_conv1d, w_norm) = {
-                let MetalLayerAttnWeights::Linear(gdn_w) = &self.engine.layer_weights[layer_idx].0
-                else {
-                    unreachable!()
-                };
-                (
-                    &gdn_w.in_proj_b as *const Buffer,
-                    &gdn_w.in_proj_a as *const Buffer,
-                    &gdn_w.a_log as *const Buffer,
-                    &gdn_w.dt_bias as *const Buffer,
-                    &gdn_w.conv1d_weight as *const Buffer,
-                    &gdn_w.norm_weight as *const Buffer,
-                )
-            };
-
-            // Read GPU outputs from shared memory
-            // SAFETY: The producer command buffer completed and the buffer is
-            // StorageModeShared with qkv_dim f32 values.
-            let qkv_proj = unsafe { read_buffer(&self.session.activations.gdn_qkv, qkv_dim) };
-            // SAFETY: The producer command buffer completed and the buffer is
-            // StorageModeShared with output_dim f32 values.
-            let z_proj = unsafe { read_buffer(&self.session.activations.gdn_z, output_dim) };
-            // SAFETY: No GPU writes are in flight and hidden is the activation length.
-            let hidden_vec = unsafe { read_buffer(&self.session.activations.hidden, hidden) };
-
-            // SAFETY: Layer parameter buffers are StorageModeShared and sized
-            // during initialization from the same model config.
-            let a_log_v = unsafe { read_buffer(&*w_a_log, value_heads) };
-            // SAFETY: Layer parameter buffers are StorageModeShared and sized
-            // during initialization from the same model config.
-            let dt_bias_v = unsafe { read_buffer(&*w_dt_bias, value_heads) };
-            // SAFETY: The f16 projection buffer has value_heads * hidden elements.
-            let in_proj_b = unsafe { read_buffer_f16(&*w_in_proj_b, value_heads * hidden) };
-            // SAFETY: The f16 projection buffer has value_heads * hidden elements.
-            let in_proj_a = unsafe { read_buffer_f16(&*w_in_proj_a, value_heads * hidden) };
-            // SAFETY: Conv1d weights are StorageModeShared and sized qkv_dim * kernel_size.
-            let conv1d_weight = unsafe { read_buffer(&*w_conv1d, qkv_dim * kernel_size) };
-            // SAFETY: Norm weights are StorageModeShared and sized value_dim.
-            let norm_weight = unsafe { read_buffer(&*w_norm, value_dim) };
-
-            // Beta/alpha projections
-            let mut beta_proj = vec![0.0f32; value_heads];
-            crate::forward::cpu::matmul_bt(
-                &hidden_vec,
-                &in_proj_b,
-                &mut beta_proj,
-                1,
-                hidden,
-                value_heads,
-            );
-            for b in &mut beta_proj {
-                *b = 1.0 / (1.0 + (-*b).exp());
-            }
-
-            let mut alpha_proj = vec![0.0f32; value_heads];
-            crate::forward::cpu::matmul_bt(
-                &hidden_vec,
-                &in_proj_a,
-                &mut alpha_proj,
-                1,
-                hidden,
-                value_heads,
-            );
-
-            // Conv1d + SiLU
-            let mut conv_output = vec![0.0f32; qkv_dim];
-            conv1d_silu_fused(
-                &qkv_proj,
-                &mut self.session.gdn_states[state_idx].conv_buffer,
-                &conv1d_weight,
-                &mut conv_output,
-                qkv_dim,
-                kernel_size,
-            );
-
-            // Per-head recurrence
-            let q_total = num_heads * key_dim;
-            let k_total = num_heads * key_dim;
-            let v_offset = q_total + k_total;
-            let scale = 1.0 / (key_dim as f32).sqrt();
-            let mut output_heads = vec![0.0f32; output_dim];
-            let state = &mut self.session.gdn_states[state_idx];
-
-            for h in 0..value_heads {
-                let kh = h / ratio;
-                let q_start = kh * key_dim;
-                let k_start = q_total + kh * key_dim;
-                let v_start = v_offset + h * value_dim;
-
-                let mut q_head = conv_output[q_start..q_start + key_dim].to_vec();
-                let mut k_head = conv_output[k_start..k_start + key_dim].to_vec();
-                let v = &conv_output[v_start..v_start + value_dim];
-
-                simd_l2_normalize(&mut q_head);
-                simd_l2_normalize(&mut k_head);
-
-                let a = a_log_v[h].exp().min(f32::MAX); // finite clamp (see gdn.rs compute_decay_gate): inf*0 = NaN poisons state
-                let sp = softplus(alpha_proj[h] + dt_bias_v[h]);
-                let g = (-a * sp).exp();
-
-                let s_off = h * key_dim * value_dim;
-                let s = &mut state.s_matrices[s_off..s_off + key_dim * value_dim];
-
-                let mut kv_mem = vec![0.0f32; value_dim];
-                simd_matvec_transpose(s, &k_head, &mut kv_mem, key_dim, value_dim);
-
-                let beta_h = beta_proj[h];
-                let mut delta = vec![0.0f32; value_dim];
-                for j in 0..value_dim {
-                    delta[j] = (v[j] - kv_mem[j] * g) * beta_h;
-                }
-
-                simd_decay_and_rank1_update(s, &k_head, &delta, g, key_dim, value_dim);
-
-                let out_start = h * value_dim;
-                let out_head = &mut output_heads[out_start..out_start + value_dim];
-                simd_matvec_transpose(s, &q_head, out_head, key_dim, value_dim);
-                for val in out_head.iter_mut() {
-                    *val *= scale;
-                }
-            }
-
-            // Gated RMS norm
-            let gamma = &norm_weight[..value_dim];
-            let mut gated_norm_buf = vec![0.0f32; output_dim];
-            for h in 0..value_heads {
-                let start = h * value_dim;
-                let end = start + value_dim;
-                simd_gated_rms_norm(
-                    &output_heads[start..end],
-                    &z_proj[start..end],
-                    gamma,
-                    &mut gated_norm_buf[start..end],
-                    cfg.rms_norm_eps,
-                );
-            }
-
-            // Write result to gdn_z buffer for CMD B's output projection
-            // SAFETY: gdn_z is StorageModeShared, no command buffer is in flight,
-            // and gated_norm_buf length matches output_dim.
-            unsafe { write_buffer(&self.session.activations.gdn_z, &gated_norm_buf) };
-        }
-
-        // ===================================================================
-        // Full attention layer: fully on GPU
-        // ===================================================================
-
-        #[allow(dead_code)] // single-token full-attention step; superseded by batch prefill path but retained as reference
-        fn full_attention_layer_step_by_idx(
-            &mut self,
-            layer_idx: usize,
-            cache_idx: usize,
-            position: usize,
-            cfg: &Qwen35Config,
-        ) -> Result<(), String> {
-            let hidden = cfg.hidden_size;
-            let q_dim = cfg.full_q_dim();
-            let kv_dim = cfg.full_kv_dim();
-            let head_dim = cfg.head_dim;
-            let num_q_heads = cfg.num_attention_heads;
-            let num_kv_heads = cfg.num_key_value_heads;
-            let rope_dim = cfg.rope_dim();
-            let half_rope_dim = (rope_dim / 2) as u32;
-
-            // Extract weight buffer pointers to avoid holding borrow on layer_weights.
-            // SAFETY: layer_weights is never mutated during forward pass.
-            let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
-                let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[layer_idx].0
-                else {
-                    unreachable!("full_attention_layer_step called on non-full layer")
-                };
-                (
-                    &full_w.q_proj as *const Q4WeightBuf,
-                    &full_w.k_proj as *const Q4WeightBuf,
-                    &full_w.v_proj as *const Q4WeightBuf,
-                    &full_w.o_proj as *const Q4WeightBuf,
-                    &full_w.q_norm as *const Buffer,
-                    &full_w.k_norm as *const Buffer,
-                )
-            };
-
-            // --- GPU: Q (+ gate), K, V projections (f16) + norm + RoPE ---
-            let cmd = self.engine.queue.new_command_buffer();
-            {
-                let enc = cmd.new_compute_command_encoder();
-                // SAFETY: Raw Q/K/V projection pointers are live layer-owned
-                // buffers and dispatch dimensions match hidden/q/kv layouts.
-                unsafe {
-                    self.dispatch_matmul(
-                        enc,
-                        &self.session.activations.hidden,
-                        &*w_q_proj,
-                        &self.session.activations.q,
-                        1,
-                        (2 * q_dim) as u32,
-                        hidden as u32,
-                    );
-                    self.dispatch_matmul(
-                        enc,
-                        &self.session.activations.hidden,
-                        &*w_k_proj,
-                        &self.session.activations.k,
-                        1,
-                        kv_dim as u32,
-                        hidden as u32,
-                    );
-                    self.dispatch_matmul(
-                        enc,
-                        &self.session.activations.hidden,
-                        &*w_v_proj,
-                        &self.session.activations.v,
-                        1,
-                        kv_dim as u32,
-                        hidden as u32,
-                    );
-                }
-
-                self.dispatch_scatter_q_gate(enc, num_q_heads as u32, head_dim as u32);
-
-                // SAFETY: Q/K norm buffer pointers are live and head counts/head_dim
-                // match the activation buffers allocated from the same config.
-                unsafe {
-                    self.dispatch_per_head_rms_norm(
-                        enc,
-                        &self.session.activations.q_separated,
-                        &*w_q_norm,
-                        num_q_heads as u32,
-                        head_dim as u32,
-                        cfg.rms_norm_eps,
-                    );
-                    self.dispatch_per_head_rms_norm(
-                        enc,
-                        &self.session.activations.k,
-                        &*w_k_norm,
-                        num_kv_heads as u32,
-                        head_dim as u32,
-                        cfg.rms_norm_eps,
-                    );
-                }
-
-                self.dispatch_partial_rope(
-                    enc,
-                    &self.session.activations.q_separated,
-                    num_q_heads as u32,
-                    head_dim as u32,
-                    half_rope_dim,
-                    position as u32,
-                    None,
-                );
-                self.dispatch_partial_rope(
-                    enc,
-                    &self.session.activations.k,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    half_rope_dim,
-                    position as u32,
-                    None,
-                );
-
-                enc.end_encoding();
-            }
-            cmd.commit();
-            cmd.wait_until_completed();
-
-            // --- CPU: append K/V to cache (read from shared memory) ---
-            // SAFETY: The Q/K/V command buffer completed and k buffer has kv_dim f32 values.
-            let k_vec = unsafe { read_buffer(&self.session.activations.k, kv_dim) };
-            // SAFETY: The Q/K/V command buffer completed and v buffer has kv_dim f32 values.
-            let v_vec = unsafe { read_buffer(&self.session.activations.v, kv_dim) };
-            self.session.kv_cache.append_kv(cache_idx, &k_vec, &v_vec)?;
-            let cur_seq_len = self.session.kv_cache.seq_len + 1;
-
-            // --- GPU: decode attention + gating + O projection (f16 weights) ---
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            let cmd = self.engine.queue.new_command_buffer();
-            {
-                let enc = cmd.new_compute_command_encoder();
-                self.dispatch_decode_attention(
-                    enc,
-                    &self.session.kv_cache.k_bufs[cache_idx],
-                    &self.session.kv_cache.v_bufs[cache_idx],
-                    cur_seq_len as u32,
-                    head_dim as u32,
-                    num_q_heads as u32,
-                    num_kv_heads as u32,
-                    q_dim as u32,
-                    kv_dim as u32,
-                    scale,
-                );
-
-                self.dispatch_sigmoid_gate(enc, q_dim as u32);
-
-                // SAFETY: The O-projection pointer is live and dimensions match
-                // [1, q_dim] by [hidden, q_dim].
-                unsafe {
-                    self.dispatch_matmul(
-                        enc,
-                        &self.session.activations.attn_out,
-                        &*w_o_proj,
-                        &self.session.activations.ffn_out,
-                        1,
-                        hidden as u32,
-                        q_dim as u32,
-                    );
-                }
-                self.dispatch_copy(
-                    enc,
-                    &self.session.activations.ffn_out,
-                    &self.session.activations.attn_out,
-                    hidden as u32,
-                );
-
-                enc.end_encoding();
-            }
-            cmd.commit();
-            cmd.wait_until_completed();
-            Ok(())
-        }
-
-        // ===================================================================
         // Layer-encoding helpers (called from forward_step_inner)
         // ===================================================================
 
@@ -12932,25 +12287,6 @@ mod inner {
             }
         }
 
-        #[allow(dead_code)] // element-wise add dispatch helper; used by full_attention_layer_step_by_idx
-        fn dispatch_add(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            src: &Buffer,
-            dst: &Buffer,
-            count: u32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.add);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(dst), 0);
-            enc.set_bytes(2, 4, &count as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
         /// Fused residual add + RMS norm.
         /// residual_out = base + delta; normed_out = rms_norm(residual_out) * (1+gamma)
         /// Replaces 4 dispatches (copy+add+copy+rms_norm) with 1.
@@ -13474,11 +12810,6 @@ mod inner {
         // (provably < 1.0), matching the CPU sampling path.
         let r = crate::sampling::uniform_f32_from_u64(raw);
         cs.sample_top_p(cfg.top_p, r)
-    }
-
-    #[allow(dead_code)] // numerically stable softplus; staged for GDN a_log activation path
-    fn softplus(x: f32) -> f32 {
-        if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
     }
 
     fn xorshift64(state: &mut u64) -> u64 {
@@ -14924,7 +14255,6 @@ mod inner {
                 silu_mul_fused: make_pipeline("silu_mul_fused")?,
                 copy: make_pipeline("copy_buf")?,
                 copy_offset: make_pipeline("copy_buf_offset")?,
-                add: make_pipeline("add_buf")?,
                 conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
                 gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
                 gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
@@ -17398,6 +16728,48 @@ mod inner {
                  call sites; got {count} instead -- a decode loop likely reverted to \
                  calling sample_token/sample_from_candidates directly, the exact drift \
                  round 3's review caught in the two multimodal decode loops"
+            );
+        }
+
+        #[test]
+        fn retired_closed_call_chains_stay_deleted() {
+            let src = include_str!("metal_qwen35.rs");
+            let production_end = src
+                .find("    mod tests {")
+                .expect("mod tests must exist in this file");
+            let production_src = &src[..production_end];
+
+            for retired_declaration in [
+                concat!("fn full_attention_layer_step_by_", "idx("),
+                concat!("fn gdn_layer_step_by_", "idx("),
+                concat!("fn gdn_cpu_", "recurrence("),
+                concat!("fn append_", "kv("),
+                concat!("fn dispatch_", "add("),
+                concat!("fn soft", "plus("),
+            ] {
+                assert!(
+                    !production_src.contains(retired_declaration),
+                    "retired closed call-chain member was restored: {retired_declaration}"
+                );
+            }
+            assert!(
+                !production_src.contains("\n        add: ComputePipelineState,")
+                    && !production_src
+                        .contains("\n                add: make_pipeline(\"add_buf\")?,"),
+                "the retired standalone add pipeline must not be registered"
+            );
+            assert!(
+                !MSL_SOURCE.contains(concat!("kernel void add_", "buf(")),
+                "the retired standalone add kernel must not be present in qwen35.metal"
+            );
+
+            assert!(
+                production_src.contains("std::env::var_os(\"LATTICE_GDN_CPU\")")
+                    && production_src.contains(
+                        "LATTICE_GDN_CPU=1 is debug-only and cannot be used in release decode"
+                    ),
+                "the release-build LATTICE_GDN_CPU fail-closed guard is independent \
+                 of the retired debug reference functions and must remain"
             );
         }
 
@@ -19908,7 +19280,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
 
             assert!(state.use_kv_f16, "state did not enable f16 KV cache");
-            assert!(state.session.kv_cache.kv_f16, "KV cache layout is not f16");
+            assert!(state.use_kv_f16, "KV cache layout is not f16");
             assert!(state.path_proof_enabled, "path-proof counters are disabled");
 
             let expected_kv_bytes = 16 * cfg.full_kv_dim() * 2;
