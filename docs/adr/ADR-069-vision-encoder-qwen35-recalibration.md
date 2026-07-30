@@ -42,14 +42,14 @@ is recorded here so the corrected contract is signed off before dependent implem
 
 ## What ADR-049 assumed vs. the actual 0.8B checkpoint
 
-| ADR-049 assumption (7B Qwen3-VL) | Actual Qwen3.5-0.8B checkpoint |
-|---|---|
-| ViT depth 27, d_model 1152, 16 heads | ViT depth 12, hidden 768, 12 heads, out_hidden 1024 |
-| Weight keys `vision_model.*` | Weight keys `model.visual.*`; text decoder `model.language_model.*` |
-| ~15 GB total, targets 32 GB tier | ~1.6 GB fp16 / ~0.5 GB q4 whole model; runs on the 16 GB base tier and below |
-| Image tokens **bypass** decoder RoPE (R3) | Decoder applies genuine 3-axis interleaved M-RoPE to image-token positions (R3 overturned — see Decision §2) |
-| ViT Metal path is a deferred "v1" item; v0 is Metal-for-ViT-only, decoder unchanged | Every stage (ViT, merger, visual-embedding injection, decode) executes on Metal GPU |
-| DeepStack visual indexes possible | `deepstack_visual_indexes: []` — not used by this checkpoint |
+| ADR-049 assumption (7B Qwen3-VL)                                                    | Actual Qwen3.5-0.8B checkpoint                                                                               |
+| ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| ViT depth 27, d_model 1152, 16 heads                                                | ViT depth 12, hidden 768, 12 heads, out_hidden 1024                                                          |
+| Weight keys `vision_model.*`                                                        | Weight keys `model.visual.*`; text decoder `model.language_model.*`                                          |
+| ~15 GB total, targets 32 GB tier                                                    | ~1.6 GB fp16 / ~0.5 GB q4 whole model; runs on the 16 GB base tier and below                                 |
+| Image tokens **bypass** decoder RoPE (R3)                                           | Decoder applies genuine 3-axis interleaved M-RoPE to image-token positions (R3 overturned — see Decision §2) |
+| ViT Metal path is a deferred "v1" item; v0 is Metal-for-ViT-only, decoder unchanged | Every stage (ViT, merger, visual-embedding injection, decode) executes on Metal GPU                          |
+| DeepStack visual indexes possible                                                   | `deepstack_visual_indexes: []` — not used by this checkpoint                                                 |
 
 ## Decision
 

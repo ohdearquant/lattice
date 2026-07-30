@@ -509,7 +509,7 @@ mod tests {
             out_hidden_size: 8,
             temporal_patch_size: 1,
             num_position_embeddings: 16, // side = 4
-            in_channels: 1,
+            in_channels: 3,
             deepstack_visual_indexes: vec![],
             intermediate_size: None,
         }

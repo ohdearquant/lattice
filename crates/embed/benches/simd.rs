@@ -6,6 +6,8 @@
 //! scalar fallbacks to measure the speedup.
 
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use lattice_embed::EmbeddingModel;
+use lattice_embed::service::{CachedEmbeddingService, EmbeddingService, NativeEmbeddingService};
 use lattice_embed::simd::{
     self, BinaryVector, Int4Vector, NormalizationHint, PreparedQuery, PreparedQueryWithMeta,
     QuantizationTier, QuantizedData, QuantizedVector, SimdConfig, approximate_cosine_distance,
@@ -15,6 +17,7 @@ use lattice_embed::simd::{
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 /// Embedding dimensions to test.
 const DIMENSIONS: [usize; 4] = [384, 768, 1024, 1536];
@@ -35,6 +38,32 @@ fn generate_normalized_vector(dim: usize, seed: u64) -> Vec<f32> {
     let mut v = generate_vector(dim, seed);
     simd::normalize(&mut v);
     v
+}
+
+fn bench_cached_embedding_delegation(c: &mut Criterion) {
+    const BATCH_SIZE: usize = 64;
+    const TEXT_BYTES: usize = 4096;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("benchmark runtime");
+    let service = CachedEmbeddingService::new(Arc::new(NativeEmbeddingService::default()), 0);
+    let texts = vec!["x".repeat(TEXT_BYTES); BATCH_SIZE];
+    let wrong_model = EmbeddingModel::BgeBaseEnV15;
+
+    let mut group = c.benchmark_group("cached_embedding_delegate");
+    group.throughput(Throughput::Bytes((BATCH_SIZE * TEXT_BYTES) as u64));
+    group.bench_function("native_wrong_model_disabled_64x4096", |bench| {
+        bench.to_async(&runtime).iter(|| async {
+            black_box(
+                service
+                    .embed(black_box(&texts), wrong_model)
+                    .await
+                    .expect_err("wrong model must fail before model loading"),
+            )
+        });
+    });
+    group.finish();
 }
 
 // ============================================================================
@@ -1222,6 +1251,7 @@ criterion_group!(
     bench_batch_cosine_normalized_query,
     bench_batch_cosine_non_normalized_query,
     bench_prepared_batch_sizes,
+    bench_cached_embedding_delegation,
 );
 
 criterion_main!(simd_benches);
