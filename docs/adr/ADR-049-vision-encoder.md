@@ -65,6 +65,7 @@ backbones is deferred until the integration pattern is validated.
 ## Scope
 
 **v0 (this ADR)**:
+
 - `vision/preprocess.rs`: CPU-side image resize (bilinear), per-channel normalize, patch grid
   extraction. Output: `Vec<f32>` shaped `[n_patches, patch_h, patch_w, 3]`.
 - `vision/vit.rs`: ViT encoder forward pass on Metal. Implements the Qwen3-VL ViT configuration
@@ -82,6 +83,7 @@ backbones is deferred until the integration pattern is validated.
   the VLM safetensors file. No new loader required.
 
 **Deferred**:
+
 - Dynamic resolution tiling (Qwen2.5-VL style — arbitrary input size tiled to NxM crops)
 - Multi-image inputs (more than one image per prompt)
 - Video frame input
@@ -249,13 +251,13 @@ file. The existing `load_qwen35_weights` function (ADR-003) is extended with a
 
 ### Memory Budget (7 B model)
 
-| Component | Parameters | fp16 size |
-|---|---|---|
-| ViT encoder | ~300 M | ~600 MB |
-| MLP merger | ~10 M | ~20 MB |
-| Decoder (Qwen3.5-7B) | ~7 B | ~14 GB |
-| Patch KV activations (784 raw → 196 merged) | — | ~50 MB |
-| **Total** | | **~15 GB** |
+| Component                                   | Parameters | fp16 size  |
+| ------------------------------------------- | ---------- | ---------- |
+| ViT encoder                                 | ~300 M     | ~600 MB    |
+| MLP merger                                  | ~10 M      | ~20 MB     |
+| Decoder (Qwen3.5-7B)                        | ~7 B       | ~14 GB     |
+| Patch KV activations (784 raw → 196 merged) | —          | ~50 MB     |
+| **Total**                                   |            | **~15 GB** |
 
 Apple M2/M3/M4 Max with 48 GB unified memory accommodates this. The 16 GB base tier cannot;
 v0 targets 32 GB+ configurations. A future 3 B VLM variant would target 16 GB.

@@ -12,7 +12,6 @@ on:
       - 'crates/inference/src/forward/cpu/**'
       - 'crates/inference/src/attention/**'
       - 'crates/inference/benches/elementwise_cpu_bench.rs'
-      - 'crates/inference/benches/attention_bench.rs'
       - 'crates/inference/Cargo.toml'
       - 'crates/embed/src/simd/**'
       - 'crates/embed/benches/simd.rs'

@@ -11,7 +11,7 @@
 
 Lattice ships a research-composable inference kernel. The cost of this composability is an ever-growing backlog of ideas that are technically plausible but not yet measured: learnable test-time state updates, latent GDN reasoning, state interpolation, adaptive compute routing, and more. Without a shared gate taxonomy, the bar for "ready to merge" is implicit and inconsistent — some PRs land at the research-note stage, others stall indefinitely because the bar is unclear.
 
-ADR-064 classifies *existing* CI gates. This ADR defines the *decision rule* for any new feature or research idea from inception to default-on: a five-level gate ladder where each level has an explicit measurable threshold and a standard issue template that every research question must answer before merge.
+ADR-064 classifies _existing_ CI gates. This ADR defines the _decision rule_ for any new feature or research idea from inception to default-on: a five-level gate ladder where each level has an explicit measurable threshold and a standard issue template that every research question must answer before merge.
 
 The core tension is: features are cheap to add and expensive to maintain. Every default-on feature is a permanent regression surface, a forever-tested configuration, and a mental model that every future developer must carry. The gate ladder is designed to make that cost explicit before it is paid.
 
@@ -37,9 +37,10 @@ G0 artifacts: GitHub issue, `experiments/<topic>/`, literature reference.
 
 #### G1 — Measurement Primitive
 
-A measurement primitive adds visibility *without changing model output*. It is telemetry, a bench harness, a state dump, or a JSONL trace, always behind a Cargo feature flag or a runtime `LATTICE_*` env var.
+A measurement primitive adds visibility _without changing model output_. It is telemetry, a bench harness, a state dump, or a JSONL trace, always behind a Cargo feature flag or a runtime `LATTICE_*` env var.
 
 Merge bar for G1:
+
 - Adds no observable change to generated token sequences when the flag is off.
 - `< 2%` decode-throughput overhead when the flag is on; `0%` when off (confirmed by `bench_decode_ab` on the primary target workload).
 - Stable JSONL schema that captures at minimum: `model`, `tokenizer`, `quant`, `commit`, `hardware`, `prompt_hash`, and the metric being observed.
@@ -52,6 +53,7 @@ G1 artifacts: Cargo feature or env-gated telemetry path, bench JSONL trace, sche
 An experiment branch implements the feature idea behind a named feature gate. It does not change any default behavior.
 
 Merge bar for G2:
+
 - Exactly one target benchmark (the primary metric this feature is supposed to improve).
 - Exactly one baseline measurement on the same hardware and model checkpoint (committed as `experiments/<name>/baseline.jsonl`).
 - Exactly one kill threshold: a value of the primary metric at or below which the branch is abandoned (committed as `experiments/<name>/kill_threshold.md`).
@@ -66,16 +68,16 @@ A default-off feature has beaten its baseline on the primary metric, survived it
 
 Merge bar for G3 (all thresholds must be met simultaneously):
 
-| Metric class | Threshold |
-|---|---|
-| Speed | ≥ 15% wall-clock improvement on the primary decode or prefill benchmark |
-| Memory | ≥ 20% peak memory reduction (if memory is the primary claim) |
-| Quality | Statistically significant improvement at matched token counts (p < 0.05, Welch t-test or bootstrap CI) |
-| Safety | Lower false-negative rate at matched false-positive rate on the safety eval suite |
-| Telemetry overhead | < 2% decode throughput impact when on; exactly 0% when off |
-| Training overhead | No hot-path cost increase unless < 5% additional decode overhead |
+| Metric class       | Threshold                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------ |
+| Speed              | ≥ 15% wall-clock improvement on the primary decode or prefill benchmark                                |
+| Memory             | ≥ 20% peak memory reduction (if memory is the primary claim)                                           |
+| Quality            | Statistically significant improvement at matched token counts (p < 0.05, Welch t-test or bootstrap CI) |
+| Safety             | Lower false-negative rate at matched false-positive rate on the safety eval suite                      |
+| Telemetry overhead | < 2% decode throughput impact when on; exactly 0% when off                                             |
+| Training overhead  | No hot-path cost increase unless < 5% additional decode overhead                                       |
 
-A G3 feature may relax any threshold that is not its primary claim (e.g., a speed feature need not show memory improvement), but it must not *worsen* any metric beyond measurement noise (< 1 σ of the baseline distribution).
+A G3 feature may relax any threshold that is not its primary claim (e.g., a speed feature need not show memory improvement), but it must not _worsen_ any metric beyond measurement noise (< 1 σ of the baseline distribution).
 
 G3 artifacts: feature-gated implementation, full benchmark results against G2 baseline, CI integration with feature enabled, updated `docs/adr/` entry or new ADR.
 
@@ -136,19 +138,19 @@ Any feature whose job is to "decide how hard to think" or "how much to trust thi
 
 #### Cheap per-token signals (inputs)
 
-| Signal | Source | Cost |
-|---|---|---|
-| Token entropy | softmax of top-k logits | one pass over logits |
-| Top-k logit mass | sum of top-k softmax | same pass |
-| Logit margin (top1 − top2) | already computed for sampling | free |
-| Sequence average log-prob | running sum, O(1) update | O(1) per token |
-| MTP accept rate | `MtpVerifier` output | G1 telemetry flag |
-| MTP head disagreement | KL between draft and target distributions | G1 telemetry flag |
-| GDN state-delta cosine | cosine similarity of consecutive `GatedDeltaNetState` snapshots | G1 telemetry flag |
-| State-norm growth | L2 norm of delta between snapshots | G1 telemetry flag |
-| Gate entropy | entropy of GDN gating vector | G1 telemetry flag |
-| Context length | token position / KV fill fraction | free |
-| Domain flags | per-request metadata (e.g., code, math, safety-sensitive) | O(1) |
+| Signal                     | Source                                                          | Cost                 |
+| -------------------------- | --------------------------------------------------------------- | -------------------- |
+| Token entropy              | softmax of top-k logits                                         | one pass over logits |
+| Top-k logit mass           | sum of top-k softmax                                            | same pass            |
+| Logit margin (top1 − top2) | already computed for sampling                                   | free                 |
+| Sequence average log-prob  | running sum, O(1) update                                        | O(1) per token       |
+| MTP accept rate            | `MtpVerifier` output                                            | G1 telemetry flag    |
+| MTP head disagreement      | KL between draft and target distributions                       | G1 telemetry flag    |
+| GDN state-delta cosine     | cosine similarity of consecutive `GatedDeltaNetState` snapshots | G1 telemetry flag    |
+| State-norm growth          | L2 norm of delta between snapshots                              | G1 telemetry flag    |
+| Gate entropy               | entropy of GDN gating vector                                    | G1 telemetry flag    |
+| Context length             | token position / KV fill fraction                               | free                 |
+| Domain flags               | per-request metadata (e.g., code, math, safety-sensitive)       | O(1)                 |
 
 #### Calibrated error probability (intermediate)
 
@@ -158,14 +160,14 @@ The signals above are mapped to a single scalar `p_err ∈ [0, 1]` representing 
 
 #### Action set (outputs)
 
-| Action | Trigger condition | Cost |
-|---|---|---|
-| `allow-direct` | `p_err < θ_low` | baseline decode |
-| `short-think` | `θ_low ≤ p_err < θ_mid` | reasoning budget × short multiplier |
-| `long-think` | `θ_mid ≤ p_err < θ_high` | reasoning budget × long multiplier |
-| `multi-sample` | `p_err ≥ θ_high` and budget allows | N independent samples, majority vote |
-| `escalate-larger-local-model` | `p_err ≥ θ_high` and larger model available | switch to resident larger model |
-| `quarantine-or-defer` | safety flag set or `p_err = 1.0` | return structured error |
+| Action                        | Trigger condition                           | Cost                                 |
+| ----------------------------- | ------------------------------------------- | ------------------------------------ |
+| `allow-direct`                | `p_err < θ_low`                             | baseline decode                      |
+| `short-think`                 | `θ_low ≤ p_err < θ_mid`                     | reasoning budget × short multiplier  |
+| `long-think`                  | `θ_mid ≤ p_err < θ_high`                    | reasoning budget × long multiplier   |
+| `multi-sample`                | `p_err ≥ θ_high` and budget allows          | N independent samples, majority vote |
+| `escalate-larger-local-model` | `p_err ≥ θ_high` and larger model available | switch to resident larger model      |
+| `quarantine-or-defer`         | safety flag set or `p_err = 1.0`            | return structured error              |
 
 Thresholds `θ_low`, `θ_mid`, `θ_high` are calibrated per domain and per model checkpoint. They are not compile-time constants; they are loaded from a config file at model startup and are themselves G1-gated until calibrated on production data.
 
@@ -188,11 +190,13 @@ All three **stay at G0 or G1** until the G1 state-telemetry primitive (GDN state
 ## Consequences
 
 **Positive**:
+
 - Any contributor opening a new research issue knows exactly what questions to answer and what gate to target.
 - The kill threshold is committed before the feature is built, removing retrospective ambiguity about when to abandon a direction.
 - G1 measurement primitives accumulate calibration data that makes all future gating-vector features cheaper to evaluate.
 
 **Negative**:
+
 - The gate ladder adds friction for genuinely obvious improvements that would have passed G3 trivially. Mitigation: G3 merge bar can be satisfied in a single PR if the experiment results are included.
 - Calibration curves require a held-out corpus, which must be maintained as the model checkpoint evolves.
 

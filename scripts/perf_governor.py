@@ -2,11 +2,11 @@
 """
 perf_governor.py — Resource guardrail for perf benchmarking on macOS.
 
-Pure stdlib, no pip deps. macOS-only. Uses pmset and ioreg (no sudo).
+Pure stdlib, no pip deps. macOS-only. Uses the shared machine-state probe (no sudo).
 
 Six guards:
   1. AC-GATE     : refuse unless on AC power
-  2. THERMAL     : refuse/pause+cooldown on CPU_Speed_Limit < 100
+  2. THERMAL     : refuse/pause+cooldown on non-nominal macOS thermal state
   3. BOUNDED     : hard wall-clock cap per measurement (default 90 s)
   4. COOLDOWN    : mandatory idle gap between runs (default 30 s)
   5. KILL-SWITCH : sentinel file .khive/loop/PERF_STOP aborts immediately
@@ -23,6 +23,7 @@ Override these in tests / --selftest to trip guards without real hardware stress
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import signal
@@ -40,6 +41,7 @@ from typing import Callable, List, Optional
 _THIS_FILE = Path(__file__).resolve()
 _SCRIPTS_DIR = _THIS_FILE.parent       # scripts/ (tracked)
 _REPO_ROOT = _SCRIPTS_DIR.parent       # one level up: repo root
+_MACHINE_STATE_PROBE_PATH = _SCRIPTS_DIR / "lib" / "machine-state-probe.py"
 
 # Kill-switch sentinel. DECOUPLED from this module's own location (see commit f5aa3305):
 # the emergency-stop path must stay at a stable, repo-rooted location even if
@@ -47,6 +49,23 @@ _REPO_ROOT = _SCRIPTS_DIR.parent       # one level up: repo root
 #   --sentinel arg  >  $PERF_GOVERNOR_SENTINEL env  >  this default.
 DEFAULT_SENTINEL_FILE = _REPO_ROOT / ".khive" / "loop" / "PERF_STOP"
 ENV_SENTINEL_VAR = "PERF_GOVERNOR_SENTINEL"
+
+
+def _load_machine_state_probe():
+    spec = importlib.util.spec_from_file_location(
+        "lattice_machine_state_probe",
+        _MACHINE_STATE_PROBE_PATH,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(
+            f"cannot load machine-state probe at {_MACHINE_STATE_PROBE_PATH}"
+        )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_MACHINE_STATE_PROBE = _load_machine_state_probe()
 
 
 def _log(msg: str) -> None:
@@ -71,84 +90,30 @@ class GovernorAbort(Exception):
 # ---------------------------------------------------------------------------
 
 def _read_thermal() -> dict:
-    """
-    Parse `pmset -g therm`.
-
-    Nominal (no pressure): all three 'No ... has been recorded' notes, no
-    CPU_Speed_Limit line.  speed_limit=100, nominal=True.
-
-    Under pressure: CPU_Speed_Limit = N line present.  speed_limit=N,
-    nominal=(N >= 100).  Also catches non-'No ...' recorded-warning lines.
-    """
-    try:
-        r = subprocess.run(
-            ["pmset", "-g", "therm"],
-            capture_output=True, text=True, timeout=5,
-        )
-        output = r.stdout
-    except Exception as exc:
-        # DELIBERATE fail-OPEN: a pmset read error assumes nominal so a flaky
-        # thermal probe never blocks a run. Safe because BOUNDED + AFK-ONLY +
-        # KILL-SWITCH still bound every run (AC and AFK readers fail CLOSED).
-        # Verified in commit f5aa3305.
-        _log(f"WARNING: pmset -g therm failed ({exc}); assuming nominal")
-        return {"speed_limit": 100, "nominal": True}
-
-    speed_limit: Optional[int] = None
-    has_recorded_warning = False
-
-    for raw in output.splitlines():
-        line = raw.strip()
-        if line.startswith("CPU_Speed_Limit"):
-            # e.g. "CPU_Speed_Limit = 80"
-            try:
-                speed_limit = int(line.split("=", 1)[1].strip())
-            except (IndexError, ValueError):
-                pass
-        elif any(kw in line for kw in ("warning level", "performance warning", "CPU power")):
-            # Nominal markers look like "Note: No thermal warning level has been recorded"
-            if not (line.startswith("Note:") and "has been recorded" in line):
-                has_recorded_warning = True
-
-    if speed_limit is not None:
-        return {"speed_limit": speed_limit, "nominal": speed_limit >= 100}
-    # No CPU_Speed_Limit line: nominal unless a non-nominal warning line was seen
-    return {"speed_limit": 100, "nominal": not has_recorded_warning}
+    """Adapt the shared probe's thermal record to the governor interface."""
+    thermal = _MACHINE_STATE_PROBE.read_macos_thermal()
+    measured = thermal.get("status") == "measured"
+    state = thermal.get("state", "unavailable")
+    return {
+        "speed_limit": thermal.get("cpu_speed_limit_percent"),
+        "nominal": measured and state == "nominal",
+        "state": state,
+        "source": thermal.get("source", thermal.get("reason", "unavailable")),
+    }
 
 
 def _read_ac() -> bool:
-    """Return True iff on AC power. Parses `pmset -g batt`. Fail-closed (False)."""
-    try:
-        r = subprocess.run(
-            ["pmset", "-g", "batt"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in r.stdout.splitlines():
-            if "Now drawing from" in line:
-                return "AC Power" in line
-    except Exception as exc:
-        _log(f"WARNING: pmset -g batt failed ({exc}); assuming battery (fail-closed)")
-    return False
+    """Return true only for a measured AC-power record."""
+    power = _MACHINE_STATE_PROBE.read_macos_power()
+    return power.get("status") == "measured" and power.get("state") == "ac"
 
 
 def _read_idle_s() -> float:
-    """
-    Return idle seconds via HIDIdleTime from ioreg.
-    Fail-closed: returns 0.0 on error (assume machine is active).
-    """
-    try:
-        r = subprocess.run(
-            ["ioreg", "-c", "IOHIDSystem"],
-            capture_output=True, text=True, timeout=10,
-        )
-        for line in r.stdout.splitlines():
-            if "HIDIdleTime" in line:
-                # '    | | |   "HIDIdleTime" = 499077973041'
-                _, _, rhs = line.partition("=")
-                return int(rhs.strip()) / 1e9
-    except Exception as exc:
-        _log(f"WARNING: ioreg HIDIdleTime failed ({exc}); assuming active (0 s)")
-    return 0.0
+    """Return measured HID idle seconds, or zero when unavailable."""
+    idle = _MACHINE_STATE_PROBE.read_macos_idle()
+    if idle.get("status") != "measured":
+        return 0.0
+    return float(idle["seconds"])
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +171,10 @@ class PerfGovernor:
             "on_ac": on_ac,
             "thermal_speed_limit": thermal["speed_limit"],
             "thermal_nominal": thermal["nominal"],
+            "thermal_state": thermal.get(
+                "state", "nominal" if thermal["nominal"] else "pressured"
+            ),
+            "thermal_source": thermal.get("source", "injected reader"),
             "idle_s": round(idle_s, 1),
             "kill_switch": kill_sw,
             "afk_idle_ok": afk_ok,
@@ -213,7 +182,7 @@ class PerfGovernor:
         }
 
     # ------------------------------------------------------------------
-    def preflight(self) -> None:
+    def preflight(self, snapshot: Optional[dict] = None) -> None:
         """
         Run all guards as a pre-run gate.
         Raises GovernorAbort if any check fails. Logs each verdict to stderr.
@@ -221,31 +190,41 @@ class PerfGovernor:
         """
         _log("=== PREFLIGHT START ===")
 
+        state = self.status() if snapshot is None else snapshot
+
         # Guard 5 first — highest-priority abort signal
-        if self._check_kill_switch():
-            reason = f"KILL-SWITCH: sentinel exists at {self.sentinel_path}"
+        if state["kill_switch"]:
+            reason = f"KILL-SWITCH: sentinel exists at {state['sentinel_path']}"
             _log(f"BLOCK: {reason}")
             raise GovernorAbort(reason)
         _log("PASS: kill-switch clear")
 
         # Guard 1: AC-GATE
-        if not self._ac_reader():
+        if not state["on_ac"]:
             reason = "AC-GATE: not on AC power (running on battery)"
             _log(f"BLOCK: {reason}")
             raise GovernorAbort(reason)
         _log("PASS: AC power confirmed")
 
         # Guard 2: THERMAL
-        thermal = self._thermal_reader()
-        if not thermal["nominal"]:
-            reason = f"THERMAL: pressure present (speed_limit={thermal['speed_limit']})"
+        if not state["thermal_nominal"]:
+            reason = (
+                "THERMAL: state is "
+                f"{state['thermal_state']} "
+                f"(speed_limit={state['thermal_speed_limit']}, "
+                f"source={state['thermal_source']})"
+            )
             _log(f"BLOCK: {reason}")
             raise GovernorAbort(reason)
-        _log(f"PASS: thermal nominal (speed_limit={thermal['speed_limit']})")
+        _log(
+            "PASS: thermal nominal "
+            f"(speed_limit={state['thermal_speed_limit']}, "
+            f"source={state['thermal_source']})"
+        )
 
         # Guard 6: AFK-ONLY
         if self.afk_only:
-            idle_s = self._idle_reader()
+            idle_s = state["idle_s"]
             if idle_s < self.afk_threshold_s:
                 reason = (
                     f"AFK-ONLY: machine active "
@@ -560,6 +539,8 @@ def _cmd_status(gov: PerfGovernor) -> int:
     print("=== perf_governor status ===")
     print(f"  on_ac             : {s['on_ac']}")
     print(f"  thermal_nominal   : {s['thermal_nominal']}")
+    print(f"  thermal_state     : {s['thermal_state']}")
+    print(f"  thermal_source    : {s['thermal_source']}")
     print(f"  thermal_speed_lim : {s['thermal_speed_limit']}")
     print(f"  idle_s            : {s['idle_s']}")
     print(f"  afk_idle_ok       : {s['afk_idle_ok']}")
@@ -568,6 +549,74 @@ def _cmd_status(gov: PerfGovernor) -> int:
     print()
     print(json.dumps(s, indent=2))
     return 0
+
+
+def _checkpoint_snapshot(gov: PerfGovernor, record: dict) -> dict:
+    """Map one shared-probe record into the governor's fail-closed policy."""
+    power = record.get("power", {})
+    thermal = record.get("thermal", {})
+    idle = record.get("idle", {})
+
+    power_measured = power.get("status") == "measured"
+    thermal_measured = thermal.get("status") == "measured"
+    idle_measured = idle.get("status") == "measured"
+    idle_seconds = float(idle.get("seconds", 0.0)) if idle_measured else 0.0
+    return {
+        "on_ac": power_measured and power.get("state") == "ac",
+        "thermal_speed_limit": thermal.get("cpu_speed_limit_percent"),
+        "thermal_nominal": (
+            thermal_measured and thermal.get("state") == "nominal"
+        ),
+        "thermal_state": thermal.get("state", "unavailable"),
+        "thermal_source": thermal.get(
+            "source", thermal.get("reason", "unavailable")
+        ),
+        "idle_s": idle_seconds,
+        "kill_switch": gov._check_kill_switch(),
+        "afk_idle_ok": (
+            idle_seconds >= gov.afk_threshold_s if gov.afk_only else True
+        ),
+        "sentinel_path": str(gov.sentinel_path),
+    }
+
+
+def _print_checkpoint_record(record: dict) -> None:
+    print(json.dumps(record, separators=(",", ":"), sort_keys=True))
+
+
+def _cmd_checkpoint(gov: PerfGovernor, label: str) -> int:
+    try:
+        gov.cooldown()
+    except GovernorAbort as exc:
+        print(f"CHECKPOINT BLOCKED: {exc.reason}", file=sys.stderr)
+        return 2
+
+    record = _MACHINE_STATE_PROBE.collect_record(label, sys.platform)
+    state = _checkpoint_snapshot(gov, record)
+    try:
+        gov.preflight(state)
+        record["gate"] = {
+            "status": "passed",
+            "cooldown_seconds": gov.cooldown_s,
+            "afk_threshold_seconds": (
+                gov.afk_threshold_s if gov.afk_only else None
+            ),
+            "kill_switch": "clear",
+        }
+        _print_checkpoint_record(record)
+        return 0
+    except GovernorAbort as exc:
+        record["gate"] = {
+            "status": "blocked",
+            "cooldown_seconds": gov.cooldown_s,
+            "afk_threshold_seconds": (
+                gov.afk_threshold_s if gov.afk_only else None
+            ),
+            "reason": exc.reason,
+        }
+        _print_checkpoint_record(record)
+        print(f"CHECKPOINT BLOCKED: {exc.reason}", file=sys.stderr)
+        return 2
 
 
 def _cmd_preflight(gov: PerfGovernor) -> int:
@@ -837,13 +886,21 @@ def main() -> int:
                       help="Print current system status and exit 0")
     mode.add_argument("--preflight", action="store_true",
                       help="Run preflight gates; exit 0 if clear, 2 if blocked")
+    mode.add_argument(
+        "--checkpoint",
+        action="store_true",
+        help="cooldown, emit one auditable state record, and fail if a guard blocks",
+    )
     mode.add_argument("--selftest", action="store_true",
                       help="Demonstrate all guards without running a real bench")
     mode.add_argument("--run", action="store_true",
                       help="preflight + run_guarded(cmd) + cooldown; needs -- <cmd>")
 
-    parser.add_argument("--label", default="run",
-                        help="Label for --run (default: 'run')")
+    parser.add_argument(
+        "--label",
+        default="run",
+        help="Label for --run or --checkpoint (default: 'run')",
+    )
     parser.add_argument("--max-window", type=float, default=90.0, metavar="S",
                         help="Wall-clock cap in seconds (default: 90)")
     parser.add_argument("--cooldown", type=float, default=30.0, metavar="S",
@@ -877,6 +934,8 @@ def main() -> int:
         return _cmd_status(gov)
     if args.preflight:
         return _cmd_preflight(gov)
+    if args.checkpoint:
+        return _cmd_checkpoint(gov, args.label)
     if args.selftest:
         return _cmd_selftest(gov)
     if args.run:
