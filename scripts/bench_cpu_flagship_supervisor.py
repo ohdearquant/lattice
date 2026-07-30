@@ -872,6 +872,10 @@ def build_decode_cell_aggregate(session: dict, policy: dict, rng_seed: int) -> t
         measured_cv = statistics.stdev(a_values) / statistics.fmean(a_values)
     else:
         measured_cv = None
+    if measured_cv is not None and (not math.isfinite(measured_cv) or measured_cv <= 0):
+        raise gate_math.GateMathError(
+            f"measured_cv must be a positive finite number, got {measured_cv!r}"
+        )
 
     metric_policy = gate_math.resolve_metric_policy(policy, "decode", "decode_tok_s")
     cell_class = metric_policy["noise_class"]
