@@ -2533,27 +2533,25 @@ mod serve {
     };
     use futures::StreamExt as _;
     use lattice_inference::Tokenizer;
-    // `ChatMessage` and `format_chat_template` are CPU-available (#668): this
-    // binary's own CPU (safetensors) serve path renders every request's
-    // ChatML prompt through them (`prepare_chat_request`, via the shared
-    // `serve::contract::normalize_messages`), the same shared renderer the
-    // Metal worker loop uses -- there is no second bespoke ChatML renderer
-    // in this file anymore. `to_chat_messages` below is a `#[cfg(test)]`-only
-    // helper local to this binary's own tests, not part of that production
-    // path.
-    use lattice_inference::forward::metal_qwen35::{ChatMessage, format_chat_template};
+    // The canonical ChatML renderer is CPU-available (#668): this binary's
+    // CPU serve path renders normalized contract messages through the same
+    // formatter core the Metal worker uses, with no bespoke template copy.
+    use lattice_inference::forward::metal_qwen35::ChatMessage;
+    #[cfg(test)]
+    use lattice_inference::forward::metal_qwen35::format_chat_template;
     #[cfg(feature = "metal-gpu")]
     use lattice_inference::model::qwen35_config::GenerateConfig;
     use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
-        ValidatedChatRequest as ContractValidatedChatRequest, normalize_request,
+        ValidatedChatRequest as ContractValidatedChatRequest, normalize_request_with_context,
         validate_context_window,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
-        ContentPart, Message, MessageContent, ResponseFormat,
+        ContentPart, Message, MessageContent, ResponseFormat, normalize_request,
     };
+    use lattice_inference::serve::{format_normalized_chat_template, into_engine_chat_messages};
     use serde::Serialize;
     use serde_json::Value;
     use std::sync::Arc;
@@ -3161,13 +3159,17 @@ mod serve {
     /// Validate `temperature` is in `[0.0, 2.0]`.
     #[cfg(test)]
     fn validate_temperature(value: Option<f32>) -> Result<f32, ApiError> {
-        lattice_inference::serve::contract::validate_temperature(value.unwrap_or(0.7))
+        lattice_inference::serve::contract::validate_temperature(
+            value.unwrap_or(GenerationDefaults::standard(1).temperature),
+        )
     }
 
     /// Validate `top_p` is in `(0.0, 1.0]`.
     #[cfg(test)]
     fn validate_top_p(value: Option<f32>) -> Result<f32, ApiError> {
-        lattice_inference::serve::contract::validate_top_p(value.unwrap_or(0.9))
+        lattice_inference::serve::contract::validate_top_p(
+            value.unwrap_or(GenerationDefaults::standard(1).top_p),
+        )
     }
 
     /// Validate the `logprobs` / `top_logprobs` pair (#585) and resolve the
@@ -3264,16 +3266,13 @@ mod serve {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// `#[cfg(test)]`-only alias for this binary's own role/content-part
-    /// test fixtures below. Production requests go through
-    /// `serve::contract::normalize_messages` directly (`prepare_chat_request`,
-    /// then rendered via the shared `format_chat_template`, #661/#668); this
-    /// exercises that same shared validator rather than a local copy of its
-    /// role/content-part logic, so those tests cannot drift from production
-    /// behavior.
+    /// `#[cfg(test)]`-only adapter for fixtures that exercise the engine
+    /// renderer. Validation and contract-to-engine conversion both delegate
+    /// to the same shared paths production uses.
     #[cfg(test)]
     fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> {
         lattice_inference::serve::contract::normalize_messages(messages)
+            .map(into_engine_chat_messages)
     }
 
     // -----------------------------------------------------------------------
@@ -3391,21 +3390,11 @@ mod serve {
         default_max_tokens: usize,
         max_tokens_cap: usize,
     ) -> Result<ContractValidatedChatRequest, ApiError> {
-        let defaults = GenerationDefaults {
-            max_tokens: default_max_tokens,
-            temperature: 0.7,
-            top_k: 50,
-            top_p: 0.9,
-            repetition_penalty: 1.1,
-            reasoning_budget: None,
-        };
-        let (validated, ()) = normalize_request(
+        normalize_request(
             req,
-            defaults,
+            GenerationDefaults::standard(default_max_tokens),
             ServeProfile::lattice(model_id, max_tokens_cap),
-            |_, _| Ok(()),
-        )?;
-        Ok(validated)
+        )
     }
 
     /// Output of the full pre-generation validation cascade, ready for
@@ -3423,10 +3412,10 @@ mod serve {
         stream: bool,
     }
 
-    /// Production entry point for the shared `normalize_request` cascade:
-    /// supplies the prompt-aware context-window check (rendering the chat
-    /// template, tokenizing it, then calling the shared
-    /// `validate_context_window`) as the `check_context` closure, in the
+    /// Production entry point for the shared context-aware normalization
+    /// cascade: supplies the prompt-aware context-window check (rendering the
+    /// chat template, tokenizing it, then calling the shared
+    /// `validate_context_window`) as the context check, in the
     /// exact order the original inline `chat_completions` cascade used:
     /// `stop` is validated *last*, after both the served-model hard
     /// requirements and the context-window check that guards against a
@@ -3450,20 +3439,12 @@ mod serve {
         tokenize_len: impl FnOnce(&str) -> usize,
         max_context: impl FnOnce() -> usize,
     ) -> Result<PreparedChatRequest, ApiError> {
-        let defaults = GenerationDefaults {
-            max_tokens: default_max_tokens,
-            temperature: 0.7,
-            top_k: 50,
-            top_p: 0.9,
-            repetition_penalty: 1.1,
-            reasoning_budget: None,
-        };
-        let (validated, prompt) = normalize_request(
+        let (validated, prompt) = normalize_request_with_context(
             req,
-            defaults,
+            GenerationDefaults::standard(default_max_tokens),
             ServeProfile::lattice(model_id, max_tokens_cap),
             |messages, max_tokens| {
-                let prompt = format_chat_template(messages);
+                let prompt = format_normalized_chat_template(messages);
                 let prompt_token_count = tokenize_len(&prompt);
                 validate_context_window(prompt_token_count, max_tokens, max_context())?;
                 Ok(prompt)
@@ -3480,6 +3461,7 @@ mod serve {
             stream,
             ..
         } = validated;
+        let messages = into_engine_chat_messages(messages);
 
         Ok(PreparedChatRequest {
             messages,
@@ -4911,7 +4893,10 @@ mod serve {
 
         #[test]
         fn validate_temperature_none_uses_default() {
-            assert_eq!(validate_temperature(None).unwrap(), 0.7);
+            assert_eq!(
+                validate_temperature(None).unwrap(),
+                GenerationDefaults::standard(1).temperature
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -4920,7 +4905,10 @@ mod serve {
 
         #[test]
         fn validate_top_p_none_uses_default() {
-            assert_eq!(validate_top_p(None).unwrap(), 0.9);
+            assert_eq!(
+                validate_top_p(None).unwrap(),
+                GenerationDefaults::standard(1).top_p
+            );
         }
 
         // -----------------------------------------------------------------------
