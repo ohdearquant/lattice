@@ -925,6 +925,38 @@ class AmbientLoadGate(unittest.TestCase):
         )
         self.assertIn("top: fixture 0.0%", stdout.getvalue())
 
+    def test_probe_appends_versioned_ambient_sample(self):
+        spec = importlib.util.spec_from_file_location(
+            "quiet_probe_jsonl", str(LIB / "quiet-probe.py")
+        )
+        qp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(qp)
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "ambient.jsonl"
+            argv = [
+                "quiet-probe.py",
+                "--label",
+                "between phases",
+                "--phase",
+                "between",
+                "--jsonl-out",
+                str(output),
+                "--floor",
+                "0",
+            ]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(qp, "idle_percent", return_value=87.25), \
+                    mock.patch.object(qp, "top_consumers", return_value="fixture"):
+                self.assertEqual(qp.main(), 0)
+            self.assertEqual(
+                json.loads(output.read_text()),
+                {
+                    "schema": "perf-ambient-sample/v1",
+                    "phase": "between",
+                    "idle_pct": 87.25,
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -169,7 +169,10 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("contents: write", workflow)
         self.assertIn("perf-postmerge-measured-${{ matrix.arch }}", workflow)
         self.assertIn("python3 scripts/perf-postmerge-base.py", workflow)
-        self.assertIn("if: ${{ success() && github.event_name == 'push' }}", workflow)
+        self.assertIn(
+            "if: ${{ steps.ab.outputs.rc == '0' && github.event_name == 'push' }}",
+            workflow,
+        )
         self.assertIn('git push origin "$HEAD:refs/heads/$STATE_BRANCH"', workflow)
         self.assertNotIn("'scripts/perf-postmerge-base.py'", workflow)
 
