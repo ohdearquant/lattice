@@ -932,6 +932,38 @@ mod tests {
             .expect("iterative fallback must not overflow the bounded stack");
     }
 
+    fn nested_terminal_grammar(depth: usize, terminal: u8) -> CompiledGrammar {
+        let mut rules = Vec::with_capacity(depth);
+        for rule_id in 0..depth - 1 {
+            rules.push(Rule {
+                name: String::new(),
+                alts: vec![vec![Symbol::NonTerminal(rule_id + 1)]],
+            });
+        }
+        rules.push(Rule {
+            name: String::new(),
+            alts: vec![vec![Symbol::Terminal(terminal)]],
+        });
+        CompiledGrammar { rules }
+    }
+
+    #[test]
+    fn nesting_depth_limit_matches_recursive_boundary() {
+        let at_limit = nested_terminal_grammar(MAX_PDA_DEPTH, b'x');
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &at_limit, b'x'),
+            StepResult::Accepted
+        );
+
+        let past_limit = nested_terminal_grammar(MAX_PDA_DEPTH + 1, b'x');
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &past_limit, b'x'),
+            StepResult::Rejected
+        );
+    }
+
     /// Grammar: root = "a" nonterm | "x" ; nonterm = "cd"
     /// Root reserved first so it lands at index 0.
     fn leading_terminal_then_nt_grammar() -> CompiledGrammar {
