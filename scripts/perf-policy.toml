@@ -8,10 +8,11 @@
 # runs; changing one requires rationale and a new policy version"). TOML
 # comments and `cv_bands[*].note` are documentation only, so prose-only edits
 # do not require a version bump. `other_rule` remains identity-bearing because
-# its rule text could gain validator semantics later. A run record pins the
-# tagged canonical identity from `bench_gate_math.policy_sha` at gate time so
-# `bench_decode_harness.validate_run_record` can fail closed on a post-run
-# gating-policy change without invalidating records for note/comment edits.
+# its rule text could gain validator semantics later. A run record pins both
+# the tagged canonical identity from `bench_gate_math.policy_sha` and the exact
+# byte digest from `bench_gate_math.policy_file_sha`. Revalidation gates on the
+# canonical identity, while the byte digest preserves the source artifact for
+# audit without invalidating records for note/comment edits.
 #
 # Loaded by `scripts/bench_gate_math.load_policy` (structural validation)
 # and consumed by `scripts/bench_decode_harness.py`'s schema-v2 run-record
