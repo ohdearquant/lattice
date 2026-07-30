@@ -647,6 +647,10 @@ jobs:
           version: '1.7.12'
       - name: merge-queue config tests
         run: python3 tests/test_ci_changed_files.py -v
+      - name: post-merge benchmark progression tests
+        run: python3 tests/test_perf_postmerge_base.py -v
+      - name: post-merge perf workflow contract tests
+        run: python3 tests/test_perf_postmerge_workflow.py -v
 
   # Deterministic fake-adapter unit tests + raw-observation schema validation
   # for the decode-benchmark harness core (issue #813 step 1) and every
@@ -713,6 +717,8 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      - name: python3 tests/test_bench_targets.py
+        run: python3 tests/test_bench_targets.py -v
 
       # bench-compare.sh's isolation guards: the lock proof (the measurement
       # body refuses unless the supervisor that recorded the lock status is one
@@ -724,6 +730,8 @@ jobs:
       # the lock the guard replaced.
       - name: python3 tests/test_bench_locks.py
         run: python3 tests/test_bench_locks.py -v
+      - name: python3 tests/test_perf_governor.py
+        run: python3 tests/test_perf_governor.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is

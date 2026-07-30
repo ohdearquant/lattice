@@ -2,7 +2,7 @@
 
 Pure Rust inference engine for transformer models on Apple Silicon, with a native macOS app.
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Crates.io](https://img.shields.io/crates/v/lattice-embed.svg)](https://crates.io/crates/lattice-embed)
 [![CI](https://github.com/ohdearquant/lattice/actions/workflows/ci.yml/badge.svg)](https://github.com/ohdearquant/lattice/actions)
 
@@ -612,7 +612,10 @@ make publish
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+this work shall be dual-licensed as above, without any additional terms or conditions.
 
 Built by [Ocean (HaiyangLi)](https://github.com/ohdearquant). Powers
 [khive](https://khive.ai), a cognitive infrastructure for AI agents.

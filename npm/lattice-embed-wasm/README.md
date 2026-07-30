@@ -186,4 +186,4 @@ with `-C target-feature=+simd128` (see "Performance" above); see
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0
