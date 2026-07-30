@@ -13,12 +13,14 @@ from pathlib import Path
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "ci-changed-files.sh"
 _ROOT = _SCRIPT.parent.parent
 _ZERO_SHA = "0" * 40
+_GIT = ("git", "-c", "core.hooksPath=/dev/null")
 _REQUIRED_WORKFLOWS = (
     ".github/workflows/app-binaries.yml",
     ".github/workflows/cargo-audit.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/e2e-parity.yml",
 )
+_E2E_PARITY_WORKFLOW = _ROOT / ".github/workflows/e2e-parity.yml"
 
 
 def _workflow_job(contents: str, job_id: str) -> str:
@@ -53,6 +55,19 @@ def _workflow_step(job: str, step_name: str) -> str:
     return job[start:end]
 
 
+def _engine_change_pattern(contents: str) -> re.Pattern[str]:
+    changes = _workflow_job(contents, "changes")
+    match = re.search(
+        r"""if\ grep\ -E\ '([^']+)'\ <<<"\$CHANGED"\ >/dev/null;\ then
+            \s+echo\ "engine=true" """,
+        changes,
+        re.VERBOSE,
+    )
+    if match is None:
+        raise AssertionError("changes job engine classifier is missing")
+    return re.compile(match.group(1))
+
+
 class ChangedFilesTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tempdir = tempfile.TemporaryDirectory()
@@ -65,8 +80,9 @@ class ChangedFilesTests(unittest.TestCase):
         self._tempdir.cleanup()
 
     def _git(self, *args: str) -> str:
+        # Test helpers invoking real Git must disable repository hooks.
         result = subprocess.run(
-            ["git", *args],
+            [*_GIT, *args],
             cwd=self.repo,
             check=True,
             capture_output=True,
@@ -237,6 +253,68 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             with self.subTest(workflow=relative_path):
                 contents = (_ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertIn(trigger, contents)
+
+
+class E2eParityChangeClassificationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        contents = _E2E_PARITY_WORKFLOW.read_text(encoding="utf-8")
+        cls.engine_pattern = _engine_change_pattern(contents)
+
+    def test_frozen_reference_fixture_change_is_an_engine_change(self) -> None:
+        path = (
+            "crates/inference/tests/fixtures/"
+            "e2e_parity_reference_v1/reference.json"
+        )
+
+        self.assertIsNotNone(self.engine_pattern.search(path))
+
+    def test_frozen_reference_contract_test_change_is_an_engine_change(self) -> None:
+        self.assertIsNotNone(
+            self.engine_pattern.search("tests/test_e2e_parity_reference.py")
+        )
+
+
+class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.contents = _E2E_PARITY_WORKFLOW.read_text(encoding="utf-8")
+        cls.job = _workflow_job(cls.contents, "embed-drift-x86")
+
+    def test_job_selects_x86_64_for_engine_changes(self) -> None:
+        self.assertIn("name: embed drift gate (x86_64 observation)", self.job)
+        self.assertIn("needs: changes", self.job)
+        self.assertIn("if: needs.changes.outputs.engine == 'true'", self.job)
+        self.assertIn("runs-on: ubuntu-latest", self.job)
+        self.assertIn("""run: test "$(uname -m)" = 'x86_64'""", self.job)
+
+    def test_job_reports_failures_without_gating_the_workflow(self) -> None:
+        self.assertIn("continue-on-error: true", self.job)
+        self.assertIn("-- --model bge-small-en-v1.5 --download-only", self.job)
+        self.assertIn("LATTICE_DRIFT_GATE_ENFORCE: '1'", self.job)
+        self.assertIn(
+            "-- --nocapture > embed-drift-x86.log 2>&1",
+            self.job,
+        )
+        self.assertIn('exit "$status"', self.job)
+        self.assertIn(
+            "grep -Fq 'Loaded drift baseline:' embed-drift-x86.log",
+            self.job,
+        )
+        self.assertIn(
+            "grep -Fq '[bge-small drift gate] max(1-cosine)=' "
+            "embed-drift-x86.log",
+            self.job,
+        )
+
+    def test_observation_does_not_replace_the_required_arm_gate(self) -> None:
+        arm_job = _workflow_job(self.contents, "embed-drift")
+        self.assertIn("runs-on: ubuntu-24.04-arm", arm_job)
+        self.assertIn("LATTICE_DRIFT_GATE_ENFORCE: '1'", arm_job)
+
+        parity_gate = _workflow_job(self.contents, "parity-gate")
+        self.assertIn("embed-drift,", parity_gate)
+        self.assertNotIn("embed-drift-x86", parity_gate)
 
 
 class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
@@ -511,7 +589,5 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
         for name, mutated in mutations.items():
             with self.subTest(mutation=name), self.assertRaises(AssertionError):
                 self._assert_split_is_fail_closed(mutated)
-
-
 if __name__ == "__main__":
     unittest.main()

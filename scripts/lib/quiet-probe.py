@@ -26,6 +26,7 @@ quiet.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -130,6 +131,9 @@ def top_consumers(n: int = 4) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
+    ap.add_argument("--phase", choices=("before", "between", "after"))
+    ap.add_argument("--jsonl-out",
+                    help="Append a perf-ambient-sample/v1 record for this phase")
     ap.add_argument(
         "--floor",
         type=float,
@@ -148,6 +152,15 @@ def main() -> int:
         return 1
 
     consumers = top_consumers()
+    if args.jsonl_out is not None:
+        if args.phase is None:
+            ap.error("--jsonl-out requires --phase")
+        with open(args.jsonl_out, "a", encoding="utf-8") as output:
+            output.write(json.dumps({
+                "schema": "perf-ambient-sample/v1",
+                "phase": args.phase,
+                "idle_pct": idle,
+            }, separators=(",", ":")) + "\n")
     verdict = "ok" if idle >= args.floor else "BELOW FLOOR"
     print(
         f"[quiet] {args.label}: idle {idle:.1f}% (floor {args.floor:.1f}%) "
