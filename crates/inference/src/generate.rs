@@ -2,7 +2,7 @@
 //!
 //! Provides the missing decode loop: prompt → tokenize → prefill → decode → detokenize.
 //! Uses the flat KV cache for O(1) per-step attention and the sampling module for
-//! temperature/top-k/top-p token selection.
+//! top-n-sigma/temperature/top-k/min-p/top-p token selection.
 //!
 //! # Architecture
 //!
@@ -36,7 +36,7 @@
 //! | This module (`crate::generate::GenerateConfig`) | Canonical (`crate::model::GenerateConfig`) | Notes |
 //! |---|---|---|
 //! | `max_new_tokens: usize` | `max_new_tokens: usize` | same name and meaning |
-//! | `sampling: SamplingConfig` | `temperature`, `top_k`, `min_p`, `top_p`, `repetition_penalty` | canonical flattens the nested `SamplingConfig` into top-level fields |
+//! | `sampling: SamplingConfig` | `temperature`, `top_k`, `min_p`, `top_n_sigma`, `top_p`, `repetition_penalty` | canonical flattens the nested `SamplingConfig` into top-level fields |
 //! | `eos_token_id: Option<u32>` | *(none — read from `Qwen35Config::eos_token_id`)* | canonical EOS is fixed per loaded model, not per-request; use `stop_token_ids: Vec<u32>` for additional per-request stop tokens |
 //! | `include_prompt: bool` | *(no equivalent)* | canonical `generate`/`generate_streaming` **always** exclude the prompt from `GenerateOutput::text`/`token_ids` — there is no option to include it. A caller relying on `include_prompt = true` must prepend the prompt string to `GenerateOutput::text` itself after calling the canonical path. |
 //! | `grammar: Option<Arc<GrammarEngine>>` | `grammar: Option<Arc<GrammarEngine>>` | same name and type |

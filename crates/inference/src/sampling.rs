@@ -1,7 +1,7 @@
 //! Token sampling strategies for text generation.
 //!
-//! Supports temperature scaling, top-k filtering, min-p filtering, top-p
-//! (nucleus) sampling, and repetition penalty.
+//! Supports top-n-sigma filtering, temperature scaling, top-k filtering,
+//! min-p filtering, top-p (nucleus) sampling, and repetition penalty.
 
 use crate::model::qwen35_config::{GenerateConfig, TopLogprob};
 
@@ -114,6 +114,9 @@ pub struct SamplingConfig {
     /// Min-p: keep tokens with probability at least `min_p * max_probability`.
     /// 0.0 or NaN = disabled; all other values clamp to `[0.0, 1.0]`.
     pub min_p: f32,
+    /// Top-n-sigma: keep logits at least `max_logit - top_n_sigma * stddev`.
+    /// Non-finite or non-positive values disable filtering.
+    pub top_n_sigma: f32,
     /// Repetition penalty multiplier. 1.0 = no penalty.
     pub repetition_penalty: f32,
 }
@@ -125,6 +128,7 @@ impl Default for SamplingConfig {
             top_k: 50,
             top_p: 0.9,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.1,
         }
     }
@@ -138,6 +142,7 @@ impl SamplingConfig {
             top_k: 1,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         }
     }
@@ -155,9 +160,10 @@ pub struct Candidate {
 
 /// **Unstable**: a set of (token_id, logit) candidates for categorical sampling.
 ///
-/// Provides the sampling pipeline: apply repetition penalty → temperature →
-/// top-k → min-p → top-p → sample. Both the Metal compact path and the CPU Qwen
-/// path use this type so sampling semantics are shared.
+/// Provides the candidate-stage sampling pipeline after any full-logit
+/// top-n-sigma filter: temperature → top-k → min-p → top-p → sample. Both the
+/// Metal and CPU Qwen paths use this type so candidate sampling semantics are
+/// shared.
 pub struct CandidateSet {
     candidates: Vec<Candidate>,
 }
@@ -551,6 +557,11 @@ impl Sampler {
             self.apply_penalty_to_logit_scratch(penalty);
         }
 
+        let top_n_sigma_enabled = top_n_sigma_active(self.config.top_n_sigma);
+        if top_n_sigma_enabled {
+            apply_top_n_sigma(&mut self.logit_scratch, self.config.top_n_sigma);
+        }
+
         let (has_nan, max_logit) = scan_nan_or_nonfinite_max(&self.logit_scratch);
         if has_nan || !max_logit.is_finite() {
             let token = argmax_f32(&self.logit_scratch);
@@ -572,6 +583,10 @@ impl Sampler {
             inv_temp,
             &mut self.candidate_scratch,
         );
+        if top_n_sigma_enabled {
+            self.candidate_scratch
+                .retain(|candidate| candidate.logit != f32::NEG_INFINITY);
+        }
         let mut cs = CandidateSet {
             candidates: std::mem::take(&mut self.candidate_scratch),
         };
@@ -644,8 +659,9 @@ impl FullLogitScratch {
 /// Shared full-logit sampling engine for callers that receive the full token
 /// history and RNG state as plain arguments each step (rather than owning a
 /// [`Sampler`]). Implements the same pipeline as `Sampler::sample`'s non-greedy
-/// path: apply repetition penalty once per unique previously-seen id, check
-/// the degenerate-temperature greedy short-circuit, then a single fused
+/// path: apply repetition penalty once per unique previously-seen id, apply
+/// top-n-sigma over the full adjusted logit vector, check the
+/// degenerate-temperature greedy short-circuit, then a single fused
 /// temperature-scale + partial top-k select feeding a min-p/top-p softmax draw.
 ///
 /// This replaces, at each of its two call sites, a per-call
@@ -691,6 +707,11 @@ pub(crate) fn sample_full_logits(
             }
         }
 
+        let top_n_sigma_enabled = top_n_sigma_active(cfg.top_n_sigma);
+        if top_n_sigma_enabled {
+            apply_top_n_sigma(logit_scratch, cfg.top_n_sigma);
+        }
+
         // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so its
         // reciprocal overflows) carries no valid scaling; the t -> 0+ limit is
         // greedy argmax over the already-penalized logits.
@@ -732,6 +753,9 @@ pub(crate) fn sample_full_logits(
         // Streaming min-heap top-k with fused temperature scaling — the softmax
         // draw below runs only over these k survivors, never the full vocabulary.
         select_top_k(logit_scratch, cfg.top_k, inv_temp, candidate_scratch);
+        if top_n_sigma_enabled {
+            candidate_scratch.retain(|candidate| candidate.logit != f32::NEG_INFINITY);
+        }
 
         let mut cs = CandidateSet {
             candidates: std::mem::take(candidate_scratch),
@@ -790,6 +814,56 @@ pub(crate) fn penalized_logit(logit: f32, penalty: f32) -> f32 {
         logit / penalty
     } else {
         logit * penalty
+    }
+}
+
+/// Whether a top-n-sigma value enables filtering.
+#[inline]
+pub(crate) fn top_n_sigma_active(top_n_sigma: f32) -> bool {
+    top_n_sigma.is_finite() && top_n_sigma > 0.0
+}
+
+/// Mask logits below `max_logit - top_n_sigma * population_stddev`.
+///
+/// The statistics exclude `NEG_INFINITY`, which represents an upstream mask.
+/// Any other non-finite value leaves the slice untouched so the sampler's
+/// existing poisoned-distribution guard can fail closed to argmax.
+fn apply_top_n_sigma(logits: &mut [f32], top_n_sigma: f32) {
+    if !top_n_sigma_active(top_n_sigma) || logits.len() <= 1 {
+        return;
+    }
+
+    let mut count = 0_u64;
+    let mut mean = 0.0_f64;
+    let mut squared_deviation_sum = 0.0_f64;
+    let mut max_logit = f32::NEG_INFINITY;
+
+    for &logit in logits.iter() {
+        if logit == f32::NEG_INFINITY {
+            continue;
+        }
+        if !logit.is_finite() {
+            return;
+        }
+
+        count += 1;
+        let value = f64::from(logit);
+        let delta = value - mean;
+        mean += delta / count as f64;
+        squared_deviation_sum += delta * (value - mean);
+        max_logit = max_logit.max(logit);
+    }
+
+    if count == 0 {
+        return;
+    }
+
+    let stddev = (squared_deviation_sum / count as f64).sqrt();
+    let threshold = f64::from(max_logit) - f64::from(top_n_sigma) * stddev;
+    for logit in logits {
+        if f64::from(*logit) < threshold {
+            *logit = f32::NEG_INFINITY;
+        }
     }
 }
 
@@ -1316,6 +1390,7 @@ mod tests {
                 top_k: 2,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1334,6 +1409,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(0x5eed_f00d_1234_5678);
@@ -1360,6 +1436,7 @@ mod tests {
                 top_k: 2,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1420,6 +1497,7 @@ mod tests {
                 top_k: 2,
                 top_p: 1.0,
                 min_p: 0.0,
+                top_n_sigma: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1494,6 +1572,7 @@ mod tests {
             top_k: 2,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(123);
@@ -1519,6 +1598,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 100.0, // very strong penalty
         };
         let mut sampler = Sampler::new(config);
@@ -1544,6 +1624,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 0.5, // < 1.0 boosts recent tokens
         };
         let mut sampler = Sampler::new(config);
@@ -1568,6 +1649,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 0.5, // < 1.0 boosts recent tokens
         };
         let mut sampler = Sampler::new(config);
@@ -1587,6 +1669,7 @@ mod tests {
             top_k: 0,
             top_p: 0.5,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(456);
@@ -1598,6 +1681,138 @@ mod tests {
         }
         // Token 0 should get almost all samples (its probability >> 0.5)
         assert!(counts[0] > 90);
+    }
+
+    #[test]
+    fn top_n_sigma_masks_below_max_minus_population_stddev() {
+        let mut logits = [4.0_f32, 3.0, 2.0, 1.0, f32::NEG_INFINITY];
+        apply_top_n_sigma(&mut logits, 1.7);
+
+        assert_eq!(logits[0], 4.0);
+        assert_eq!(logits[1], 3.0);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        assert_eq!(logits[4], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn top_n_sigma_keeps_logits_equal_to_the_threshold() {
+        let mut logits = [4.0_f32, 2.0];
+        apply_top_n_sigma(&mut logits, 2.0);
+
+        assert_eq!(logits, [4.0, 2.0]);
+    }
+
+    #[test]
+    fn top_n_sigma_defaults_disabled() {
+        assert_eq!(SamplingConfig::default().top_n_sigma, 0.0);
+        assert_eq!(SamplingConfig::greedy().top_n_sigma, 0.0);
+    }
+
+    #[test]
+    fn top_n_sigma_selection_is_temperature_invariant() {
+        let mut raw = [4.0_f32, 3.0, 2.0, 1.0];
+        let mut scaled = raw.map(|logit| logit / 2.5);
+        apply_top_n_sigma(&mut raw, 1.0);
+        apply_top_n_sigma(&mut scaled, 1.0);
+
+        let raw_mask = raw.map(f32::is_finite);
+        let scaled_mask = scaled.map(f32::is_finite);
+        assert_eq!(raw_mask, scaled_mask);
+    }
+
+    #[test]
+    fn top_n_sigma_invalid_values_are_disabled_noops() {
+        let original = [4.0_f32, 3.0, 2.0, 1.0];
+        for disabled in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut logits = original;
+            apply_top_n_sigma(&mut logits, disabled);
+            assert_eq!(
+                logits.map(f32::to_bits),
+                original.map(f32::to_bits),
+                "top_n_sigma={disabled:?} must preserve every logit bit"
+            );
+        }
+    }
+
+    #[test]
+    fn top_n_sigma_preserves_poisoned_distribution_fallbacks() {
+        let config = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            top_n_sigma: 1.0,
+            repetition_penalty: 1.0,
+        };
+
+        let mut nan_sampler = Sampler::new(config.clone()).with_seed(7);
+        assert_eq!(nan_sampler.sample(&[4.0, f32::NAN, 1.0]), 0);
+
+        let mut infinity_sampler = Sampler::new(config.clone()).with_seed(7);
+        assert_eq!(infinity_sampler.sample(&[4.0, f32::INFINITY, 1.0]), 1);
+
+        let mut masked_sampler = Sampler::new(config).with_seed(7);
+        assert_eq!(masked_sampler.sample(&[f32::NEG_INFINITY; 3]), 0);
+    }
+
+    #[test]
+    fn top_n_sigma_interacts_with_the_existing_sampling_pipeline() {
+        let logits = [10.0_f32, 9.5, 9.0, 8.0, 7.0, 2.0, 1.0, 0.0];
+        let active = SamplingConfig {
+            temperature: 2.0,
+            top_k: 6,
+            top_p: 0.67,
+            min_p: 0.02,
+            top_n_sigma: 1.5,
+            repetition_penalty: 2.0,
+        };
+        let mut disabled = active.clone();
+        disabled.top_n_sigma = 0.0;
+        let mut active_seen = [false; 8];
+        let mut disabled_seen = [false; 8];
+
+        for index in 0..512_u64 {
+            let seed = index
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut active_sampler = Sampler::new(active.clone()).with_seed(seed);
+            active_sampler.seed_history(&[0]);
+            active_seen[active_sampler.sample(&logits) as usize] = true;
+
+            let mut disabled_sampler = Sampler::new(disabled.clone()).with_seed(seed);
+            disabled_sampler.seed_history(&[0]);
+            disabled_seen[disabled_sampler.sample(&logits) as usize] = true;
+        }
+
+        assert_eq!(
+            active_seen,
+            [false, true, true, false, false, false, false, false],
+            "penalty → top-n-sigma → temperature → top-k → min-p → top-p \
+             must leave exactly tokens 1 and 2 reachable"
+        );
+        assert!(
+            disabled_seen[3],
+            "the disabled control must reach token 3 or the top-n-sigma route assertion is vacuous"
+        );
+    }
+
+    #[test]
+    fn top_n_sigma_runs_after_repetition_penalty() {
+        let mut sampler = Sampler::new(SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            top_n_sigma: 1.0,
+            repetition_penalty: 2.0,
+        })
+        .with_seed(7);
+        sampler.seed_history(&[0]);
+
+        assert_eq!(sampler.sample(&[10.0, 9.0, 0.0, 0.0]), 1);
+        assert_eq!(sampler.logit_scratch[0], f32::NEG_INFINITY);
+        assert_eq!(sampler.logit_scratch[1], 9.0);
     }
 
     #[test]
@@ -1664,6 +1879,7 @@ mod tests {
                 top_k: 2,
                 top_p: 0.9,
                 min_p: 0.7,
+                top_n_sigma: 0.0,
                 repetition_penalty: 2.0,
             })
             .with_seed(seed);
@@ -2261,6 +2477,7 @@ mod tests {
             top_k: 0,   // disabled
             top_p: 1.0, // disabled
             min_p: 0.0, // disabled
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(42);
@@ -2392,6 +2609,7 @@ mod tests {
             top_k: 1,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 2.0,
         })
         .with_seed(1);
@@ -2447,6 +2665,7 @@ mod tests {
             top_k: 1,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2474,6 +2693,7 @@ mod tests {
             top_k: 1,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2509,6 +2729,7 @@ mod tests {
             top_k: 1,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2784,6 +3005,7 @@ mod tests {
             top_k: 40,
             top_p: 0.9,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.1,
         };
         let gen_cfg = GenerateConfig {

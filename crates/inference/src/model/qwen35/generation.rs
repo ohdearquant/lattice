@@ -48,7 +48,7 @@ fn force_serial_prefill() -> bool {
 }
 
 impl Qwen35Model {
-    /// **Unstable**: autoregressive text generation with temperature/top-k/top-p sampling.
+    /// **Unstable**: autoregressive text generation with top-n-sigma/temperature/top-k/min-p/top-p sampling.
     pub fn generate(
         &self,
         prompt: &str,

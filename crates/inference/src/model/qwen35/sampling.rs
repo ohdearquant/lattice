@@ -1,8 +1,10 @@
-//! Qwen3.5 token sampling, repetition penalty, greedy fallback, softmax probability
-//! build, min-p/top-p filtering, distribution draw, and RNG helper.
+//! Qwen3.5 token sampling, repetition penalty, greedy fallback, top-n-sigma
+//! filtering, softmax probability build, min-p/top-p filtering, distribution
+//! draw, and RNG helper.
 use crate::model::qwen35_config::GenerateConfig;
 
-/// Sample a token from logits using temperature, top-k, min-p, top-p, and repetition penalty.
+/// Sample a token from logits using repetition penalty, top-n-sigma,
+/// temperature, top-k, min-p, and top-p.
 ///
 /// Delegates to `crate::sampling::sample_full_logits`, the shared engine also
 /// used by the Metal CPU fallback (`forward/metal_qwen35.rs`'s private
@@ -41,6 +43,19 @@ pub(crate) fn sample_token_reference(
         apply_repetition_penalty(&mut adjusted, previous_ids, cfg.repetition_penalty);
     }
 
+    let top_n_sigma_enabled = apply_top_n_sigma_reference(&mut adjusted, cfg.top_n_sigma);
+    if top_n_sigma_enabled {
+        let mut has_nan = false;
+        let mut max_logit = f32::NEG_INFINITY;
+        for &logit in &adjusted {
+            has_nan |= logit.is_nan();
+            max_logit = max_logit.max(logit);
+        }
+        if has_nan || !max_logit.is_finite() {
+            return greedy_token(&adjusted);
+        }
+    }
+
     // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so its
     // reciprocal overflows or scales a logit past f32::MAX) carries no valid
     // scaling and is routed to deterministic greedy argmax before any scaling,
@@ -67,6 +82,9 @@ pub(crate) fn sample_token_reference(
                 .then_with(|| a.cmp(&b))
         });
         indices.truncate(k);
+    }
+    if top_n_sigma_enabled {
+        indices.retain(|&idx| adjusted[idx] != f32::NEG_INFINITY);
     }
 
     // Sort indices by descending adjusted logit + ascending token-id so that
@@ -118,6 +136,50 @@ fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty:
             adjusted[idx] = crate::sampling::penalized_logit(adjusted[idx], penalty);
         }
     }
+}
+
+#[cfg(test)]
+fn apply_top_n_sigma_reference(adjusted: &mut [f32], top_n_sigma: f32) -> bool {
+    if !top_n_sigma.is_finite() || top_n_sigma <= 0.0 || adjusted.len() <= 1 {
+        return false;
+    }
+
+    let mut finite_count = 0_u64;
+    let mut sum = 0.0_f64;
+    let mut max_logit = f32::NEG_INFINITY;
+    for &logit in adjusted.iter() {
+        if logit == f32::NEG_INFINITY {
+            continue;
+        }
+        if !logit.is_finite() {
+            return true;
+        }
+        finite_count += 1;
+        sum += f64::from(logit);
+        max_logit = max_logit.max(logit);
+    }
+    if finite_count == 0 {
+        return true;
+    }
+
+    let mean = sum / finite_count as f64;
+    let variance = adjusted
+        .iter()
+        .copied()
+        .filter(|&logit| logit != f32::NEG_INFINITY)
+        .map(|logit| {
+            let delta = f64::from(logit) - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / finite_count as f64;
+    let threshold = f64::from(max_logit) - f64::from(top_n_sigma) * variance.sqrt();
+    for logit in adjusted {
+        if f64::from(*logit) < threshold {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+    true
 }
 
 /// Greedy argmax with **first-wins** tie-break.
@@ -280,6 +342,7 @@ mod tests {
             top_k,
             top_p: 1.0,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         }
@@ -574,6 +637,7 @@ mod tests {
             top_k,
             top_p,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
@@ -586,6 +650,7 @@ mod tests {
             top_k,
             top_p,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -613,6 +678,7 @@ mod tests {
             top_k: 0,
             top_p: 1.0,
             min_p: 0.5,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -621,6 +687,7 @@ mod tests {
             top_k: cfg.top_k,
             top_p: cfg.top_p,
             min_p: cfg.min_p,
+            top_n_sigma: cfg.top_n_sigma,
             repetition_penalty: cfg.repetition_penalty,
         })
         .with_seed(seed);
@@ -641,6 +708,57 @@ mod tests {
         );
         assert_eq!(sampler_tokens, optimized_tokens);
         assert_eq!(optimized_tokens, reference_tokens);
+    }
+
+    #[test]
+    fn top_n_sigma_is_active_and_identical_across_cpu_sampling_paths() {
+        use crate::sampling::{Sampler, SamplingConfig};
+
+        let logits = [10.0_f32, 9.5, 9.0, 8.0, 7.0, 2.0, 1.0, 0.0];
+        let cfg = GenerateConfig {
+            temperature: 2.0,
+            top_k: 6,
+            top_p: 0.67,
+            min_p: 0.02,
+            top_n_sigma: 1.5,
+            repetition_penalty: 2.0,
+            ..Default::default()
+        };
+        let sampler_cfg = SamplingConfig {
+            temperature: cfg.temperature,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
+            min_p: cfg.min_p,
+            top_n_sigma: cfg.top_n_sigma,
+            repetition_penalty: cfg.repetition_penalty,
+        };
+        let mut seen = [false; 8];
+
+        for index in 0..512_u64 {
+            let seed = index
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+
+            let mut sampler = Sampler::new(sampler_cfg.clone()).with_seed(seed);
+            sampler.seed_history(&[0]);
+            let sampler_token = sampler.sample(&logits);
+
+            let mut optimized_rng = seed;
+            let optimized_token = sample_token(&logits, &cfg, &[0], &mut optimized_rng);
+            let mut reference_rng = seed;
+            let reference_token = sample_token_reference(&logits, &cfg, &[0], &mut reference_rng);
+
+            assert_eq!(sampler_token, optimized_token);
+            assert_eq!(optimized_token, reference_token);
+            seen[sampler_token as usize] = true;
+        }
+
+        assert_eq!(
+            seen,
+            [false, true, true, false, false, false, false, false],
+            "the canonical and independent pipelines must retain exactly the \
+             expected two-token nucleus"
+        );
     }
 
     #[test]
@@ -775,6 +893,7 @@ mod tests {
             top_k,
             top_p,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
@@ -788,6 +907,7 @@ mod tests {
             top_k,
             top_p,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };

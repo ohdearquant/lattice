@@ -4,7 +4,7 @@
 //! Pattern: [linear, linear, linear, full] x 6 = 24 layers.
 //!
 //! Key features:
-//! - Autoregressive text generation with temperature/top-k/top-p sampling
+//! - Autoregressive text generation with top-n-sigma/temperature/top-k/min-p/top-p sampling
 //! - Tied embeddings (lm_head = embed_tokens^T)
 //! - Partial RoPE (25% of head_dim) on full-attention layers
 //! - GatedDeltaNet recurrent state for linear layers, KV cache for full layers
