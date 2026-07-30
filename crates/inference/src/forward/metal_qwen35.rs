@@ -1113,6 +1113,12 @@ mod inner {
     ///   Total              = 10048 bytes < 32 KB → 2× occupancy on M1
     const MSL_Q8_TILED_SOURCE: &str = include_str!("shaders/gemm_q8_tiled.metal");
 
+    #[cfg(test)]
+    std::thread_local! {
+        static Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST: std::cell::Cell<u64> =
+            const { std::cell::Cell::new(0) };
+    }
+
     // ---------------------------------------------------------------------------
     // GPU Buffer Structures
     // ---------------------------------------------------------------------------
@@ -11807,6 +11813,21 @@ mod inner {
         // Dispatch helpers
         // ===================================================================
 
+        #[cfg(test)]
+        fn force_q4_gemm_fallback_for_test(&mut self) -> bool {
+            self.engine.pipelines.gemm_q4_tiled.take().is_some()
+        }
+
+        #[cfg(test)]
+        fn reset_q4_gemm_fallback_dispatches_for_test() {
+            Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST.with(|dispatches| dispatches.set(0));
+        }
+
+        #[cfg(test)]
+        fn q4_gemm_fallback_dispatches_for_test() -> u64 {
+            Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST.with(std::cell::Cell::get)
+        }
+
         /// Dispatch f16-weight matmul: C[M,N] = A[M,K] @ B_half[N,K]^T.
         ///
         /// A is f32 (activations), B is f16 (weights), C is f32 (output).
@@ -11998,6 +12019,9 @@ mod inner {
                     MTLSize::new(32, 4, 1),
                 );
             } else {
+                #[cfg(test)]
+                Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST
+                    .with(|dispatches| dispatches.set(dispatches.get() + 1));
                 enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q4);
                 enc.set_buffer(0, Some(&qw.buffer), qw.payload_offset);
                 enc.set_buffer(1, Some(x), x_offset);
@@ -12903,6 +12927,9 @@ mod inner {
                     MTLSize::new(32, 4, 1),
                 );
             } else {
+                #[cfg(test)]
+                Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST
+                    .with(|dispatches| dispatches.set(dispatches.get() + 1));
                 enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q4);
                 enc.set_buffer(0, Some(&qw.buffer), wq_offset);
                 enc.set_buffer(1, Some(x), x_offset);
@@ -21680,11 +21707,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let Some(device) = Device::system_default() else {
                 return;
             };
-            // #899: on non-Apple7 devices (the paravirtual CI GPU is the only one
-            // this repo ever meets) the Q4 GEMM runtime gates route to fallback
-            // kernels, where this parity check diverges deterministically by a
-            // uniform ~0.074 logit shift. All production Apple Silicon is Apple7+;
-            // the fallback-path investigation is tracked in #899.
+            // #899: the paravirtual CI GPU diverges deterministically here, but
+            // this fixture cannot exercise the Apple7-gated Q4 GEMM selection:
+            // MoE batch prefill is rejected and every projection below runs at
+            // M=1, which dispatches GEMV before either GEMM branch. Keep the
+            // device exception explicit while the zero-dispatch assertion below
+            // prevents the paravirtual discrepancy from being misattributed to
+            // the fallback GEMM again.
             if !device.supports_family(MTLGPUFamily::Apple7) {
                 return;
             }
@@ -21711,6 +21740,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
             let mut baseline = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
                 .expect("baseline (N=num_experts) load must succeed");
+            assert!(
+                baseline.force_q4_gemm_fallback_for_test(),
+                "Apple7+ discrimination requires the tiled Q4 pipeline to exist before \
+                 forcing the non-Apple7 fallback selection"
+            );
+            MetalQwen35State::reset_q4_gemm_fallback_dispatches_for_test();
             let mut baseline_logits = Vec::new();
             for (position, &token) in tokens.iter().enumerate() {
                 baseline_logits = baseline.forward_step(token, position);
@@ -21725,6 +21760,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
                     .expect("forced-eviction (N=2) load must succeed")
             };
+            assert!(
+                forced.force_q4_gemm_fallback_for_test(),
+                "Apple7+ discrimination requires the tiled Q4 pipeline to exist before \
+                 forcing the non-Apple7 fallback selection"
+            );
 
             let mut forced_logits = Vec::new();
             for (position, &token) in tokens.iter().enumerate() {
@@ -21751,9 +21791,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                      forced-eviction N=2 run ({f}) after repeated evict/reload cycles — a \
                      correct dequant-on-demand cache must be numerically transparent to \
                      decode output regardless of eviction pressure (baseline={baseline_logits:?}, \
-                     forced={forced_logits:?})"
+                    forced={forced_logits:?})"
                 );
             }
+            let fallback_dispatches = MetalQwen35State::q4_gemm_fallback_dispatches_for_test();
+            eprintln!(
+                "[moe-eviction-route-proof] q4_gemm_fallback_dispatches={fallback_dispatches} \
+                 route=m1-gemv"
+            );
+            assert_eq!(
+                fallback_dispatches, 0,
+                "MoE eviction parity must remain an M=1 GEMV test; a Q4 fallback GEMM dispatch \
+                 would invalidate #899's route discrimination"
+            );
         }
 
         /// Restores `FORCED_MOE_EXPERTS_FOR_TEST` to `None` on scope exit
@@ -24166,6 +24216,67 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     "[shape B] tiled_vs_naive={tiled_vs_naive:.4e} exceeds 0.012"
                 );
             }
+        }
+
+        #[test]
+        fn forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference() {
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return;
+            }
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            assert!(
+                state.force_q4_gemm_fallback_for_test(),
+                "Apple7+ fixture must start with gemm_q4_tiled so the test-only override \
+                 discriminates the non-Apple7 selection"
+            );
+            MetalQwen35State::reset_q4_gemm_fallback_dispatches_for_test();
+
+            let (m, n, k) = (8usize, 8usize, 64usize);
+            let (qw_buf, w_deq) = make_q4_weight_ref(&device, 0x899_u64, n, k);
+            let qw = Q4WeightBuf::from_buffer(qw_buf);
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 37 % 251) as f32 - 125.0) / 127.0)
+                .collect();
+            let x_buf = device.new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (x.len() * std::mem::size_of::<f32>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let y_buf =
+                device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+            let cmd = state.engine.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            state.dispatch_gemm_q4(enc, &x_buf, 0, &qw, &y_buf, 0, m as u32, n as u32, k as u32);
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            let fallback_dispatches = MetalQwen35State::q4_gemm_fallback_dispatches_for_test();
+            assert_eq!(
+                fallback_dispatches, 1,
+                "forced non-Apple7 selection must execute exactly one naive Q4 GEMM fallback"
+            );
+            let y_ref = cpu_matmul_ref(&x, &w_deq, m, n, k);
+            // SAFETY: the command buffer completed and y_buf contains m*n f32 values.
+            let y: &[f32] =
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, m * n) };
+            let diff = max_abs_diff(y, &y_ref);
+            eprintln!(
+                "[q4-fallback-proof] forced=true fallback_dispatches={fallback_dispatches} \
+                 max_abs_diff={diff:.4e}"
+            );
+            assert!(
+                diff < 1e-3,
+                "forced non-Apple7 Q4 GEMM fallback diverged from the f32 dequant reference: \
+                 max_abs_diff={diff:.4e}"
+            );
         }
 
         /// Regression for the Q4 decode dispatch-geometry bug (2026-06-26).
