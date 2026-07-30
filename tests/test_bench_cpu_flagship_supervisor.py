@@ -668,6 +668,12 @@ class BuildDecodeCellAggregateTest(unittest.TestCase):
         self.assertIsNotNone(aggregate.required_n)
         self.assertLess(aggregate.n_valid, aggregate.required_n)
 
+    def test_identical_measurements_reject_zero_cv(self):
+        values = [200.0, 200.0]
+        session = _fake_session(values, values)
+        with self.assertRaisesRegex(supervisor.gate_math.GateMathError, "positive finite"):
+            supervisor.build_decode_cell_aggregate(session, self.policy, rng_seed=1)
+
     def test_missing_decode_rate_raises(self):
         session = _fake_session([200.0], [200.0])
         session["arm_a"][0]["decode_tok_s"] = None
