@@ -69,6 +69,43 @@ def _run(root: Path, samples: Path, status: Path, target: str) -> subprocess.Com
 
 
 class PerfBenchGateStatusTests(unittest.TestCase):
+    def test_completeness_error_outranks_not_measurable_for_informational_target(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = root / "empty" / "criterion"
+            criterion.mkdir(parents=True)
+            samples = root / "ambient.jsonl"
+            _samples(samples, {"before": 95.0, "between": 12.0, "after": 94.0})
+            status = root / "status.json"
+            target = "lattice-embed:simd"
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(GATE),
+                    str(criterion),
+                    "fixture/informational",
+                    "--target",
+                    target,
+                    "--informational-target",
+                    target,
+                    "--require-measurements",
+                    "--ambient-samples",
+                    str(samples),
+                    "--status-out",
+                    str(status),
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "error")
+            self.assertEqual(payload["exit_code"], 2)
+            self.assertEqual(payload["ambient"]["samples"]["between"], 12.0)
+
     def test_below_floor_refuses_both_target_verdicts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
