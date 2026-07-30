@@ -31,25 +31,25 @@ npm install @khive-ai/lattice-embed
 ## Usage
 
 ```js
-const { loadModelSync } = require('@khive-ai/lattice-embed')
+const { loadModelSync } = require("@khive-ai/lattice-embed");
 
-const model = loadModelSync({ modelPath: '/path/to/all-minilm-l6-v2' })
-console.log(model.dimension) // 384
+const model = loadModelSync({ modelPath: "/path/to/all-minilm-l6-v2" });
+console.log(model.dimension); // 384
 
-const vec = model.embedSync('a dog runs in the park')
-console.log(vec instanceof Float32Array, vec.length) // true 384
+const vec = model.embedSync("a dog runs in the park");
+console.log(vec instanceof Float32Array, vec.length); // true 384
 
 const batch = model.embedBatchSync([
-  'a dog runs in the park',
-  'a puppy runs in the park',
-])
-console.log(batch.rows, batch.dimensions) // 2 384
-console.log(batch.vector(0)) // Float32Array view into batch.data
+  "a dog runs in the park",
+  "a puppy runs in the park",
+]);
+console.log(batch.rows, batch.dimensions); // 2 384
+console.log(batch.vector(0)); // Float32Array view into batch.data
 
 // Async variants (napi AsyncTask, run off the JS event loop thread):
-const { loadModel } = require('@khive-ai/lattice-embed')
-const asyncModel = await loadModel({ modelPath: '/path/to/bge-small-en-v1.5' })
-const asyncVec = await asyncModel.embed('quarterly financial report')
+const { loadModel } = require("@khive-ai/lattice-embed");
+const asyncModel = await loadModel({ modelPath: "/path/to/bge-small-en-v1.5" });
+const asyncVec = await asyncModel.embed("quarterly financial report");
 ```
 
 `modelPath`'s directory name is used to infer the model family (pooling
@@ -61,15 +61,15 @@ works automatically for a directory named after its canonical slug, e.g.
 
 Errors thrown by this package carry a stable `.code`:
 
-| Code | Meaning |
-|---|---|
-| `FL_EMBED_BAD_OPTIONS` | Malformed `loadModel`/`loadModelSync` options: missing/empty `modelPath`, a non-string `modelId`, a non-boolean `normalize`, or the unsupported value `normalize: false`. |
-| `FL_EMBED_BAD_MODEL` | `modelPath` does not exist, the model family could not be determined, the family is not BERT-family (e.g. Qwen), or the engine failed to load/encode. |
-| `FL_EMBED_EMPTY_INPUT` | `embed`/`embedSync` called with an empty string, or an empty string anywhere in an `embedBatch`/`embedBatchSync` array. |
-| `FL_EMBED_BAD_BATCH` | `embedBatch`/`embedBatchSync` called with a non-array, an empty array, or a batch of more than 1,000 items. |
-| `FL_EMBED_INPUT_TOO_LARGE` | A single text (or a batch item) is longer than 32,768 bytes. |
-| `FL_EMBED_UNSUPPORTED_PLATFORM` | No native binary exists for the current `process.platform`/`process.arch`. |
-| `FL_EMBED_NATIVE_LOAD_FAILED` | A native binary should exist for this platform but failed to load (missing optional dependency, ABI mismatch, etc). |
+| Code                            | Meaning                                                                                                                                                                   |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `FL_EMBED_BAD_OPTIONS`          | Malformed `loadModel`/`loadModelSync` options: missing/empty `modelPath`, a non-string `modelId`, a non-boolean `normalize`, or the unsupported value `normalize: false`. |
+| `FL_EMBED_BAD_MODEL`            | `modelPath` does not exist, the model family could not be determined, the family is not BERT-family (e.g. Qwen), or the engine failed to load/encode.                     |
+| `FL_EMBED_EMPTY_INPUT`          | `embed`/`embedSync` called with an empty string, or an empty string anywhere in an `embedBatch`/`embedBatchSync` array.                                                   |
+| `FL_EMBED_BAD_BATCH`            | `embedBatch`/`embedBatchSync` called with a non-array, an empty array, or a batch of more than 1,000 items.                                                               |
+| `FL_EMBED_INPUT_TOO_LARGE`      | A single text (or a batch item) is longer than 32,768 bytes.                                                                                                              |
+| `FL_EMBED_UNSUPPORTED_PLATFORM` | No native binary exists for the current `process.platform`/`process.arch`.                                                                                                |
+| `FL_EMBED_NATIVE_LOAD_FAILED`   | A native binary should exist for this platform but failed to load (missing optional dependency, ABI mismatch, etc).                                                       |
 
 ## Known v0 limitation: `normalize: false`
 
@@ -104,4 +104,4 @@ npm run test:prebuild # assert CI targets, napi targets, and optional packages s
 
 ## License
 
-Apache-2.0
+MIT OR Apache-2.0

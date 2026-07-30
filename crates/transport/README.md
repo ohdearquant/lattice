@@ -37,19 +37,19 @@ iteration loop. Callers create a workspace once and reuse it across calls.
 
 ## Module Map
 
-| Module | Responsibility |
-|--------|---------------|
-| `sinkhorn` | Core balanced Sinkhorn solver. `SinkhornSolver`, `SinkhornConfig`, `SinkhornWorkspace`, `SinkhornResult`. Also `uniform_weights`, `normalize_weights`. |
-| `sinkhorn_log` | Log-domain solver with epsilon-scaling schedule. `LogDomainSinkhornSolver`, `LogDomainSinkhornConfig`, `EpsilonScalingSchedule`. More numerically stable for small epsilon. |
-| `unbalanced` | KL-relaxed marginal variant. `UnbalancedSinkhornSolver`, `UnbalancedConfig`, `UnbalancedResult`. Useful when source/target marginals are imprecise. |
-| `cost` | Cost matrix abstraction. `CostMatrix` trait, `DenseCostMatrix`, `PairwiseCostMatrix`, `SquaredEuclidean`, `CosineDistance`. |
-| `divergence` | Debiased Sinkhorn divergence. `SinkhornDivergence`, `sinkhorn_divergence`, `point_set_sinkhorn_divergence`. Removes the self-transport bias from raw OT cost. |
-| `transport_plan` | Sparse transport plan extraction. `SparseTransportPlan`, `extract_sparse_plan`, `log_gamma`. |
-| `barycenter` | Wasserstein barycenter computation. `FixedSupportBarycenter`, `FreeSupportBarycenter`, `BarycenterConfig`. |
-| `drift` | High-level embedding drift API. `detect_drift_records`, `detect_drift_memories`, `DriftReport`, `DriftSummary`, `DriftMetricKind`, `PerEntryDisplacement`. |
-| `online_drift` | Streaming (sliding-window) drift detection. `OnlineDriftDetector`, `OnlineDriftConfig`, `OnlineDriftSignal`. Calls `point_set_sinkhorn_divergence` every `check_interval` observations. |
-| `logsumexp` | Stable log-sum-exp arithmetic used throughout the solvers. Internal numeric foundation. |
-| `math` | Internal numeric helpers (private). |
+| Module           | Responsibility                                                                                                                                                                          |
+| ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sinkhorn`       | Core balanced Sinkhorn solver. `SinkhornSolver`, `SinkhornConfig`, `SinkhornWorkspace`, `SinkhornResult`. Also `uniform_weights`, `normalize_weights`.                                  |
+| `sinkhorn_log`   | Log-domain solver with epsilon-scaling schedule. `LogDomainSinkhornSolver`, `LogDomainSinkhornConfig`, `EpsilonScalingSchedule`. More numerically stable for small epsilon.             |
+| `unbalanced`     | KL-relaxed marginal variant. `UnbalancedSinkhornSolver`, `UnbalancedConfig`, `UnbalancedResult`. Useful when source/target marginals are imprecise.                                     |
+| `cost`           | Cost matrix abstraction. `CostMatrix` trait, `DenseCostMatrix`, `PairwiseCostMatrix`, `SquaredEuclidean`, `CosineDistance`.                                                             |
+| `divergence`     | Debiased Sinkhorn divergence. `SinkhornDivergence`, `sinkhorn_divergence`, `point_set_sinkhorn_divergence`. Removes the self-transport bias from raw OT cost.                           |
+| `transport_plan` | Sparse transport plan extraction. `SparseTransportPlan`, `extract_sparse_plan`, `log_gamma`.                                                                                            |
+| `barycenter`     | Wasserstein barycenter computation. `FixedSupportBarycenter`, `FreeSupportBarycenter`, `BarycenterConfig`.                                                                              |
+| `drift`          | High-level embedding drift API. `detect_drift_records`, `detect_drift_memories`, `DriftReport`, `DriftSummary`, `DriftMetricKind`, `PerEntryDisplacement`.                              |
+| `online_drift`   | Streaming (sliding-window) drift detection. `OnlineDriftDetector`, `OnlineDriftConfig`, `OnlineDriftSignal`. Calls `point_set_sinkhorn_divergence` every `check_interval` observations. |
+| `logsumexp`      | Stable log-sum-exp arithmetic used throughout the solvers. Internal numeric foundation.                                                                                                 |
+| `math`           | Internal numeric helpers (private).                                                                                                                                                     |
 
 ---
 

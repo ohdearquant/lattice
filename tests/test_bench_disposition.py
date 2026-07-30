@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Regression tests for scripts/bench_disposition_check.sh (the CLAUDE.md bench-compare gate parser).
+"""Regression tests for the bench-evidence workflow and its disposition parser.
 
 Each case pins a behaviour the gate must keep. The one that matters most is
 ``test_summary_prose_mention_does_not_satisfy``: a bench-compare mention in
 Summary prose must not open the disposition section, only a real heading may.
 That case fixes a parser that accepted Summary prose as the disposition.
 """
+import re
 import subprocess
 import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "bench_disposition_check.sh"
+WORKFLOW = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "bench-evidence.yml"
 
 
 def has_disposition(body: str) -> bool:
@@ -21,6 +23,52 @@ def has_disposition(body: str) -> bool:
         text=True,
     )
     return result.returncode == 0
+
+
+def requires_disposition(path: str) -> bool:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    classifiers = re.findall(
+        r"""^\s*if ! grep -E '([^']+)' <<<"\$CHANGED" >/dev/null; then$""",
+        workflow,
+        flags=re.MULTILINE,
+    )
+    if len(classifiers) != 1:
+        raise AssertionError(
+            f"expected one CHANGED path classifier in {WORKFLOW}, found {len(classifiers)}"
+        )
+
+    result = subprocess.run(
+        ["grep", "-E", classifiers[0]],
+        input=f"{path}\n",
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode not in (0, 1):
+        raise AssertionError(f"workflow path classifier failed: {result.stderr}")
+    return result.returncode == 0
+
+
+class BenchEvidenceWorkflow(unittest.TestCase):
+    def test_perf_sensitive_crate_filter_matches_dependency_boundary(self):
+        # Mutation-sensitive: removing `fann` from the shipping ERE fails its
+        # required fixture; widening it to either downstream/fixture-only crate
+        # fails the corresponding exclusion fixture.
+        required = (
+            "crates/inference/src/lib.rs",
+            "crates/embed/Cargo.toml",
+            "crates/fann/src/network.rs",
+        )
+        excluded = (
+            "crates/transport/src/lib.rs",
+            "crates/tune/Cargo.toml",
+        )
+
+        for path in required:
+            with self.subTest(path=path):
+                self.assertTrue(requires_disposition(path))
+        for path in excluded:
+            with self.subTest(path=path):
+                self.assertFalse(requires_disposition(path))
 
 
 class BenchDispositionCheck(unittest.TestCase):

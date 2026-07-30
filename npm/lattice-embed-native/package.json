@@ -2,7 +2,7 @@
   "name": "@khive-ai/lattice-embed",
   "version": "0.1.0",
   "description": "Native (napi-rs) Node.js bindings for lattice-embed: local BERT-family text embeddings (MiniLM, BGE) loaded directly from disk, no WASM overhead.",
-  "license": "Apache-2.0",
+  "license": "MIT OR Apache-2.0",
   "main": "index.js",
   "types": "index.d.ts",
   "exports": {
@@ -15,7 +15,8 @@
   },
   "files": [
     "README.md",
-    "LICENSE",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
     "binding.js",
     "index.js",
     "index.d.ts",
