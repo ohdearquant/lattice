@@ -496,6 +496,58 @@ jobs:
           cargo test --release -p lattice-embed --test embed_drift_baseline \
             -- --nocapture
 
+  # x86_64 counterpart to embed-drift. This starts as an observation job rather
+  # than a required parity-gate dependency: the frozen threshold has live
+  # evidence on aarch64, but no measured x86_64 distribution yet. Keeping this
+  # job outside parity-gate and allowing it to fail makes that policy explicit:
+  # missing prerequisites and numerical regressions remain visible without
+  # turning an observation into a required gate.
+  embed-drift-x86:
+    name: embed drift gate (x86_64 observation)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assert x86_64 runner
+        run: test "$(uname -m)" = 'x86_64'
+
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: embed-drift-x86
+
+      - name: Cache BGE-small weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/bge-small-en-v1.5
+          key: bge-small-en-v1.5-v1
+
+      - name: Provision bge-small-en-v1.5 weights
+        run: |
+          cargo run --release -p lattice-embed --bin embed \
+            -- --model bge-small-en-v1.5 --download-only
+
+      - name: Run x86_64 embedding-drift observation (fail-closed)
+        env:
+          LATTICE_DRIFT_GATE_ENFORCE: '1'
+        run: |
+          if cargo test --release -p lattice-embed --test embed_drift_baseline \
+            -- --nocapture > embed-drift-x86.log 2>&1
+          then
+            cat embed-drift-x86.log
+          else
+            status=$?
+            cat embed-drift-x86.log
+            exit "$status"
+          fi
+          grep -Fq 'Loaded drift baseline:' embed-drift-x86.log
+          grep -Fq '[bge-small drift gate] max(1-cosine)=' embed-drift-x86.log
+
   # wasm embedding parity gate (PR #681). Proves the wasm32-compiled
   # `LatticeEmbedder` binding (crates/embed/src/wasm.rs) produces output that
   # matches both the committed HF-reference goldens and the native lattice
