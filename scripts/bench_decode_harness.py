@@ -1505,10 +1505,11 @@ class CellAggregate:
     corrected gate bound, n_valid, n_invalid, order balance, and raw-
     artifact digest" (order balance / raw-artifact digest live on
     `CellRecord`, not here). `measured_cv` and `required_n` are
-    correction 1's fields: a cell with `measured_cv is None` can never be
-    promoted (see `validate_run_record`'s low-valid-n / missing-CV
-    check) -- `required_n` is what `bench_gate_math.required_n` returned
-    for that measured CV at record time, so a later re-derivation can be
+    correction 1's fields: a recorded CV is either a positive finite
+    number or `None`, and a cell with `measured_cv is None` can never be
+    promoted (see `validate_run_record`'s low-valid-n / missing-CV check).
+    `required_n` is what `bench_gate_math.required_n` returned for that
+    measured CV at record time, so a later re-derivation can be
     cross-checked without re-running `bench_gate_math`."""
 
     point_estimate: float
@@ -1780,8 +1781,15 @@ def parse_cell_aggregate(d: dict) -> CellAggregate:
             raise RunRecordValidationError(f"cell_aggregate: {key} must be a non-negative int")
     measured_cv = d.get("measured_cv")
     if measured_cv is not None:
-        if isinstance(measured_cv, bool) or not isinstance(measured_cv, (int, float)) or measured_cv < 0:
-            raise RunRecordValidationError("cell_aggregate: measured_cv must be a non-negative number or null")
+        if (
+            isinstance(measured_cv, bool)
+            or not isinstance(measured_cv, (int, float))
+            or not math.isfinite(float(measured_cv))
+            or measured_cv <= 0
+        ):
+            raise RunRecordValidationError(
+                "cell_aggregate: measured_cv must be a positive finite number or null"
+            )
     required_n_val = d.get("required_n")
     if required_n_val is not None:
         if isinstance(required_n_val, bool) or not isinstance(required_n_val, int) or required_n_val < 1:
@@ -2193,9 +2201,9 @@ def validate_run_record(
         prefill_start -> prefill_end -> token_available(+)` sequence (see
         `_validate_phase_sequence`) -- the measurement boundary must be
         proven, not assumed.
-      - non-finite metric: enforced already at `parse_cell_aggregate`
-        (kept here as a defense-in-depth re-check for records built by
-        hand rather than parsed from JSON).
+      - non-finite metric or non-positive/non-finite measured CV: enforced
+        already at `parse_cell_aggregate` (kept here as a defense-in-depth
+        re-check for records built by hand rather than parsed from JSON).
       - low valid-n / missing measured-CV / submitter-controlled
         required_n (correction 1): a `PASS`/`WARN`/`FAIL` cell (not
         `unsupported`) must carry `measured_cv`; the cell's noise class is
@@ -2250,6 +2258,16 @@ def validate_run_record(
     for label, val in (("point_estimate", agg.point_estimate), ("ci_low", agg.ci_low), ("ci_high", agg.ci_high)):
         if not math.isfinite(val):
             raise RunRecordValidationError(f"INFRA-FAIL: cell {record.cell_id!r} {label}={val!r} is not finite")
+    if agg.measured_cv is not None and (
+        isinstance(agg.measured_cv, bool)
+        or not isinstance(agg.measured_cv, (int, float))
+        or not math.isfinite(float(agg.measured_cv))
+        or agg.measured_cv <= 0
+    ):
+        raise RunRecordValidationError(
+            f"INFRA-FAIL: cell {record.cell_id!r} measured_cv={agg.measured_cv!r} "
+            "must be a positive finite number"
+        )
 
     if record.verdict != "unsupported":
         if agg.measured_cv is None:
