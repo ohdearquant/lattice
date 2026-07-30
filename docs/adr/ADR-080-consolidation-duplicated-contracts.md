@@ -18,6 +18,10 @@
   `detect_format`, plus its two error-message helpers) consolidated into
   `crates/inference/src/model_format.rs`, shared by `lattice`, `lattice_serve`,
   and `chat_metal`; see "Amendment: model-format detector consolidation" below.
+- Amendment (#1052) — request normalization now owns backend-independent
+  normalized message/role types, both servers use one contract-to-engine adapter
+  and non-generic normalization entry points, and standard generation defaults
+  have one canonical constructor across production and test adapters.
 
 The cluster defect tickets (#739–#741, resolved by C1; #744–#746, resolved by C2) are
 closed against the merged PRs above. The non-cluster audit items from the same sweep

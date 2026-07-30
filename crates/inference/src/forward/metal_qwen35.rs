@@ -425,12 +425,22 @@ impl ChatMessage {
 /// Template: <|im_start|>{role}\n{content}<|im_end|>\n
 /// Final assistant turn left open for generation.
 pub fn format_chat_template(messages: &[ChatMessage]) -> String {
+    format_chat_template_parts(
+        messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str())),
+    )
+}
+
+pub(crate) fn format_chat_template_parts<'a>(
+    messages: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> String {
     let mut prompt = String::new();
-    for msg in messages {
+    for (role, content) in messages {
         prompt.push_str("<|im_start|>");
-        prompt.push_str(msg.role.as_str());
+        prompt.push_str(role);
         prompt.push('\n');
-        prompt.push_str(&msg.content);
+        prompt.push_str(content);
         prompt.push_str("<|im_end|>\n");
     }
     // Open assistant turn for generation
