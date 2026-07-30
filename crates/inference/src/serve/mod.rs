@@ -28,6 +28,38 @@ use crate::model::qwen35_config::GenerateConfig;
 /// Shared chat-completions wire DTO and normalization policies.
 pub mod contract;
 
+/// Convert normalized contract messages into the engine's chat representation.
+///
+/// Both HTTP binaries cross the contract/backend boundary through this one
+/// adapter so role mapping cannot drift between them.
+pub fn into_engine_chat_messages(
+    messages: Vec<contract::NormalizedChatMessage>,
+) -> Vec<crate::forward::metal_qwen35::ChatMessage> {
+    messages
+        .into_iter()
+        .map(|message| match message.role {
+            contract::NormalizedChatRole::System => {
+                crate::forward::metal_qwen35::ChatMessage::system(message.content)
+            }
+            contract::NormalizedChatRole::User => {
+                crate::forward::metal_qwen35::ChatMessage::user(message.content)
+            }
+            contract::NormalizedChatRole::Assistant => {
+                crate::forward::metal_qwen35::ChatMessage::assistant(message.content)
+            }
+        })
+        .collect()
+}
+
+/// Render normalized contract messages with the engine's canonical chat template.
+pub fn format_normalized_chat_template(messages: &[contract::NormalizedChatMessage]) -> String {
+    crate::forward::metal_qwen35::format_chat_template_parts(
+        messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str())),
+    )
+}
+
 /// Shared Metal GPU worker owner (issue #832, ADR-080 cluster C2/C3):
 /// the single dedicated thread that owns the `!Send` `MetalQwen35State` for
 /// the whole process lifetime, used by both the `lattice` unified server and
@@ -1419,6 +1451,46 @@ const ACCEPTED_MINIMAL_FIELDS: &[FieldExpectation] = &[FieldExpectation::Eq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contract_to_engine_message_adapter_preserves_roles_and_content() {
+        let normalized = vec![
+            contract::NormalizedChatMessage {
+                role: contract::NormalizedChatRole::System,
+                content: "system-content".to_string(),
+            },
+            contract::NormalizedChatMessage {
+                role: contract::NormalizedChatRole::User,
+                content: "user-content".to_string(),
+            },
+            contract::NormalizedChatMessage {
+                role: contract::NormalizedChatRole::Assistant,
+                content: "assistant-content".to_string(),
+            },
+        ];
+        let rendered = format_normalized_chat_template(&normalized);
+        let owned = into_engine_chat_messages(normalized);
+        assert_eq!(
+            rendered,
+            crate::forward::metal_qwen35::format_chat_template(&owned)
+        );
+
+        let expected = [
+            (
+                crate::forward::metal_qwen35::ChatRole::System,
+                "system-content",
+            ),
+            (crate::forward::metal_qwen35::ChatRole::User, "user-content"),
+            (
+                crate::forward::metal_qwen35::ChatRole::Assistant,
+                "assistant-content",
+            ),
+        ];
+        for (owned, (role, content)) in owned.iter().zip(expected) {
+            assert_eq!(owned.role, role);
+            assert_eq!(owned.content, content);
+        }
+    }
 
     #[test]
     fn finish_reason_stopped_true_is_stop() {
