@@ -178,5 +178,12 @@ class BenchTargetPolicyTests(unittest.TestCase):
             )
 
 
+class _FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        if self.test.countTestCases() == 0:
+            raise SystemExit("no tests collected")
+        super().runTests()
+
+
 if __name__ == "__main__":
-    unittest.main()
+    _FailOnEmptyTestProgram()

@@ -6,6 +6,7 @@ from __future__ import annotations
 import fcntl
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ SPECIAL_ENTRYPOINTS = {
     "scripts/e2e-parity-local.sh",
     "scripts/e2e_parity_check.py",
     "scripts/fake_quant_pilot.py",
+    "scripts/perf-bench-gate.py",
     "scripts/perf_governor.py",
 }
 INTERNAL_OR_TEST = {
@@ -488,6 +490,96 @@ class RuntimeContract(unittest.TestCase):
                 stdout, stderr = proc.communicate(timeout=30)
             self.assertEqual(proc.returncode, 0, f"{stdout}\n{stderr}")
             self.assertEqual(marker.read_text(), "ran")
+
+    def test_sigkill_of_supervisor_reaps_measurement_before_unlock(self):
+        """An orphaned measurement must not outlive the held lock window."""
+
+        with _SupervisorSandbox() as sb:
+            ready = Path(sb.tmp.name) / "measurement-ready"
+            release = Path(sb.tmp.name) / "release"
+            entrypoint = sb.root / "scripts" / "sigkill_entrypoint.py"
+            entrypoint.write_text(
+                "import os, sys, time\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(sb.helper.parent)!r})\n"
+                "from bench_supervision import sample_measurement_handoff\n"
+                "_, pipe_fd, _ = sample_measurement_handoff()\n"
+                "os.close(pipe_fd)\n"
+                f"Path({str(ready)!r}).write_text(f'{{os.getppid()}},{{os.getpid()}}')\n"
+                f"release = Path({str(release)!r})\n"
+                "while not release.exists():\n"
+                "    time.sleep(0.01)\n"
+            )
+
+            def lock_states() -> list[str]:
+                states = []
+                for path in (sb.bench_lock, sb.gpu_lock):
+                    fd = os.open(path, os.O_RDWR)
+                    try:
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except OSError:
+                            states.append("blocked")
+                        else:
+                            states.append("acquired")
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(fd)
+                return states
+
+            outer = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(sb.helper),
+                    "run",
+                    "--label",
+                    "fixture",
+                    "--entrypoint",
+                    "--",
+                    sys.executable,
+                    str(entrypoint),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            measurement_pid = None
+            try:
+                deadline = time.monotonic() + 10
+                while not ready.exists() and outer.poll() is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("measurement did not reach the handoff barrier")
+                    time.sleep(0.01)
+                self.assertIsNone(outer.poll())
+                supervisor_pid, measurement_pid = map(
+                    int, ready.read_text().split(",")
+                )
+                self.assertEqual(lock_states(), ["blocked", "blocked"])
+
+                os.kill(supervisor_pid, signal.SIGKILL)
+                outer.wait(timeout=30)
+
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(measurement_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail(
+                        "measurement remained alive after the lock owner returned"
+                    )
+                self.assertEqual(lock_states(), ["acquired", "acquired"])
+            finally:
+                release.touch()
+                if measurement_pid is not None:
+                    try:
+                        os.kill(measurement_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                if outer.poll() is None:
+                    outer.kill()
+                    outer.wait()
 
     def test_substitute_and_restore_is_outside_cooperative_contract(self):
         """A green result deliberately pins behavior outside the contract."""
@@ -1472,5 +1564,12 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
         self.assertNotIn("=== bench-compare:", result.stdout)
 
 
+class _FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        if self.test.countTestCases() == 0:
+            raise SystemExit("no tests collected")
+        super().runTests()
+
+
 if __name__ == "__main__":
-    unittest.main()
+    _FailOnEmptyTestProgram()

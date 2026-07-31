@@ -441,5 +441,12 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertTrue(any("/embed/criterion" in path for path in roots), roots)
 
 
+class _FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        if self.test.countTestCases() == 0:
+            raise SystemExit("no tests collected")
+        super().runTests()
+
+
 if __name__ == "__main__":
-    unittest.main()
+    _FailOnEmptyTestProgram()

@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -202,6 +203,20 @@ def acquire(path: str, name: str) -> tuple[int, str]:
             time.sleep(2)
 
 
+def _terminate_process_group(pgid: int) -> None:
+    """Keep the lock window closed until no in-group measurement can run."""
+
+    while True:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            # A zombie-only group can report EPERM until its new parent reaps it.
+            pass
+        time.sleep(0.01)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
@@ -244,11 +259,20 @@ def main() -> int:
         if args.pass_lock_fds:
             child_env = os.environ.copy()
             child_env["LATTICE_BENCH_LOCK_FDS"] = ",".join(str(fd) for fd in fds)
-            return subprocess.call(
+            proc = subprocess.Popen(
                 cmd,
                 env=child_env,
                 pass_fds=tuple(fds),
+                start_new_session=True,
             )
+            try:
+                returncode = proc.wait()
+            except BaseException:
+                _terminate_process_group(proc.pid)
+                raise
+            if returncode != 0:
+                _terminate_process_group(proc.pid)
+            return returncode
 
         # close_fds defaults True, so neither lock fd reaches cmd or anything
         # cmd spawns. Both stay held here for cmd's whole lifetime.

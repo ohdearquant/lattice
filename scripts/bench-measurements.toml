@@ -3,7 +3,7 @@ schema = 1
 [contract]
 scope = "local script and Make measurement entry points"
 caller_trust = "cooperative"
-lock_ownership = "ordinary wrapper retains both descriptors for the child lifetime"
+lock_ownership = "ordinary wrapper retains both descriptors through its dedicated supervisor; on abnormal exit, it drains descendants that remain in the cooperative process group before release, not deliberately detached children or loss of the lock-owning wrapper"
 pathname_check = "endpoint mismatch diagnostic; not rename-and-restore resistance"
 handoff_check = "instantaneous silent-pipe open-writer and lock-contention diagnostics; not authenticated ownership, continuous lock-lifetime proof, or deliberate same-user bypass resistance"
 rust_inventory_grammar = "crates/*/benches/*.rs; crates/inference/examples/bench*.rs; crates/inference/src/bin/bench_*.rs plus eval_perplexity.rs, gramperf_profile.rs, and ppl_metal.rs; README.md"
@@ -34,7 +34,6 @@ paths = [
     "crates/fann/benches/router_online.rs",
     "crates/inference/benches/attention_dispatch_bench.rs",
     "crates/inference/benches/attn_opt_bench.rs",
-    "crates/inference/benches/compute_attention_bench.rs",
     "crates/inference/benches/cross_turn_prefix_cache_bench.rs",
     "crates/inference/benches/decode_attn_bench.rs",
     "crates/inference/benches/differential_attention_bench.rs",
