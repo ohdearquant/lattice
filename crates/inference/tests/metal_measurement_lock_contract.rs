@@ -14,6 +14,30 @@ const EXPECTED_RAW_HARNESSES: &[&str] = &[
     "examples/profile_metal_decode.rs",
 ];
 
+// `MetalQwen35State::new`/`from_q4_dir` drive Metal indirectly through the
+// public forward API rather than raw `Device`/`command_buffer` calls, so
+// RAW_GPU_MARKERS misses them entirely. These six are the one-shot,
+// finite-lifetime measurement/profiling binaries that construct the state
+// and then time a decode/generate/perplexity call over it — the exact class
+// the shared flock exists to serialize.
+//
+// `src/bin/lattice_serve.rs`, `src/bin/chat_metal.rs`, `src/bin/lattice.rs`,
+// and `src/bin/lattice/prune_score.rs` also construct `MetalQwen35State` but
+// are deliberately excluded: they are long-running server/interactive/CLI
+// processes, not finite measurement runs, and binding the guard for their
+// whole lifetime would starve (or, past the 30-minute wait, panic) any
+// concurrent bench that needs the same lock. That is a distinct problem,
+// not covered by this contract.
+const CONSTRUCTION_MARKERS: &[&str] = &["MetalQwen35State::new(", "MetalQwen35State::from_q4_dir("];
+const EXPECTED_CONSTRUCTION_HARNESSES: &[&str] = &[
+    "src/bin/bench_decode_ab.rs",
+    "src/bin/bench_decode_slopefit.rs",
+    "src/bin/bench_lora_mixture.rs",
+    "src/bin/eval_perplexity.rs",
+    "src/bin/gramperf_profile.rs",
+    "src/bin/ppl_metal.rs",
+];
+
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     let mut pending = vec![root.to_path_buf()];
     let mut sources = Vec::new();
@@ -72,6 +96,36 @@ fn raw_metal_measurement_harnesses_acquire_the_shared_lock_first() {
         actual, expected,
         "raw Metal harness inventory changed; classify every added or removed path explicitly"
     );
+}
+
+#[test]
+fn metal_qwen35_state_construction_sites_acquire_the_shared_lock_first() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    for relative in EXPECTED_CONSTRUCTION_HARNESSES {
+        let path = manifest_dir.join(relative);
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read measurement harness {relative}: {e}"));
+
+        let first_construction = CONSTRUCTION_MARKERS
+            .iter()
+            .filter_map(|marker| source.find(marker))
+            .min()
+            .unwrap_or_else(|| {
+                panic!(
+                    "{relative} is listed as a MetalQwen35State construction site but no longer \
+                     constructs one; remove it from EXPECTED_CONSTRUCTION_HARNESSES"
+                )
+            });
+
+        let lock = source.find(SHARED_LOCK_CALL).unwrap_or_else(|| {
+            panic!("{relative} constructs MetalQwen35State without the shared GPU lock")
+        });
+        assert!(
+            lock < first_construction,
+            "{relative} acquires the shared GPU lock after its first MetalQwen35State construction"
+        );
+    }
 }
 
 #[test]
