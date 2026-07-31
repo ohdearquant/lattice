@@ -154,6 +154,7 @@
 //! and the probe has no expert-mixing path.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 
 use crate::error::InferenceError;
 use crate::model::qwen35::qwen_required_tensor_names;
@@ -171,6 +172,14 @@ use crate::quant::quarot::rmsnorm_fusion::{
 };
 use crate::quant::quarot::rotation::{absorb_input_rotation_f64, absorb_output_rotation_f64};
 
+/// Maximum retained bytes for chain-probe tokens, logit row descriptors, and
+/// complete f64 logit rows in a prepared forward-equivalence snapshot.
+///
+/// The default four probes for Qwen3.5-0.8B retain about 7.6 MiB. A 64 MiB
+/// ceiling permits 33 probes at its 248,320-token vocabulary while preventing
+/// caller-controlled probe counts from adding an unbounded resident working set.
+const MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Probe sample size + tolerance settings for
 /// [`assert_forward_equivalence_qwen35`].
 ///
@@ -179,7 +188,8 @@ use crate::quant::quarot::rotation::{absorb_input_rotation_f64, absorb_output_ro
 /// (`‖rotated_forward − original_forward‖ < 1e-5` on a small batch).
 #[derive(Debug, Clone)]
 pub struct ForwardEquivalenceConfig {
-    /// Number of token IDs to probe. Must be > 0.
+    /// Number of token IDs to probe. Must be > 0. The retained token and
+    /// complete-logit evidence must fit the 64 MiB preparation budget.
     pub num_probe_tokens: usize,
     /// Max-abs-error threshold (per-logit). Must be > 0.
     pub tolerance: f64,
@@ -234,18 +244,6 @@ pub(crate) struct ForwardEquivalenceSnapshot {
     original_logits: Vec<Vec<f64>>,
     fusion_gammas: HashMap<String, TensorEntry>,
     tolerance: f64,
-}
-
-impl ForwardEquivalenceSnapshot {
-    #[cfg(test)]
-    fn retained_f64_elements(&self) -> usize {
-        self.original_logits.iter().map(Vec::len).sum::<usize>()
-            + self
-                .fusion_gammas
-                .values()
-                .map(|entry| entry.data.len())
-                .sum::<usize>()
-    }
 }
 
 trait OriginalTensorSource {
@@ -318,6 +316,33 @@ fn validate_forward_equivalence_inputs(
             "assert_forward_equivalence_qwen35: cfg.vocab_size must be > 0".to_string(),
         ));
     }
+    let logit_elements = forward_cfg
+        .num_probe_tokens
+        .checked_mul(cfg.vocab_size)
+        .ok_or_else(forward_equivalence_logit_size_overflow)?;
+    let logit_bytes = logit_elements
+        .checked_mul(size_of::<f64>())
+        .ok_or_else(forward_equivalence_logit_size_overflow)?;
+    let row_descriptor_bytes = forward_cfg
+        .num_probe_tokens
+        .checked_mul(size_of::<Vec<f64>>())
+        .ok_or_else(forward_equivalence_logit_size_overflow)?;
+    let probe_token_bytes = forward_cfg
+        .num_probe_tokens
+        .checked_mul(size_of::<u32>())
+        .ok_or_else(forward_equivalence_logit_size_overflow)?;
+    let retained_bytes = logit_bytes
+        .checked_add(row_descriptor_bytes)
+        .and_then(|bytes| bytes.checked_add(probe_token_bytes))
+        .ok_or_else(forward_equivalence_logit_size_overflow)?;
+    if retained_bytes > MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES {
+        return Err(InferenceError::Inference(format!(
+            "assert_forward_equivalence_qwen35: retained chain-logit budget exceeded \
+             (num_probe_tokens={}, vocab_size={}, required_bytes={retained_bytes}, \
+             max_bytes={MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES})",
+            forward_cfg.num_probe_tokens, cfg.vocab_size
+        )));
+    }
     if rotation.dim() != cfg.hidden_size {
         return Err(InferenceError::Inference(format!(
             "assert_forward_equivalence_qwen35: rotation.dim()={} != cfg.hidden_size={}",
@@ -326,6 +351,12 @@ fn validate_forward_equivalence_inputs(
         )));
     }
     Ok(())
+}
+
+fn forward_equivalence_logit_size_overflow() -> InferenceError {
+    InferenceError::Inference(
+        "assert_forward_equivalence_qwen35: retained chain-logit size overflow".to_string(),
+    )
 }
 
 fn full_fusion_plan(cfg: &Qwen35Config) -> Result<Vec<RmsNormFusionTarget>, InferenceError> {
@@ -339,7 +370,9 @@ fn full_fusion_plan(cfg: &Qwen35Config) -> Result<Vec<RmsNormFusionTarget>, Infe
 ///
 /// This retains `num_probe_tokens * vocab_size` chain logits and one
 /// `hidden_size` RMSNorm scale for each input/post-attention norm plus
-/// the final norm. Planned matrices are not retained.
+/// the final norm. Retained chain-probe evidence is admitted against the
+/// 64 MiB budget before any probe tokens or logits are allocated. Planned
+/// matrices are not retained.
 pub(crate) fn prepare_forward_equivalence_qwen35(
     original: &HashMap<String, TensorEntry>,
     cfg: &Qwen35Config,
@@ -411,7 +444,9 @@ pub(crate) fn prepare_forward_equivalence_qwen35(
 /// # Errors
 ///
 /// - `cfg.is_moe()` — MoE conversion is deferred to v1.
-/// - `forward_cfg.num_probe_tokens == 0` or `tolerance` is not a positive finite.
+/// - `forward_cfg.num_probe_tokens == 0`, its retained chain-logit evidence
+///   exceeds the 64 MiB budget (or its size calculation overflows), or
+///   `tolerance` is not a positive finite value.
 /// - `rotation.dim() != cfg.hidden_size`.
 /// - Any planned tensor is missing from either working set, or has the
 ///   wrong shape or data length.
@@ -1196,37 +1231,73 @@ mod tests {
     }
 
     #[test]
-    fn prepared_snapshot_retains_only_probe_logits_and_norm_scales() {
-        let cfg = tied_tiny_test_cfg();
-        let mut original = build_working_set(&cfg, 0x1074);
-        materialize_lm_head_for_qwen35(&mut original, &cfg).unwrap();
+    fn prepared_snapshot_enforces_configured_logit_budget_before_tensor_access() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let original = HashMap::new();
         let rotation = RandomizedHadamard::new(0x51A5_EEED, cfg.hidden_size).unwrap();
-        let forward_cfg = ForwardEquivalenceConfig {
-            num_probe_tokens: 3,
+        let bytes_per_probe =
+            cfg.vocab_size * size_of::<f64>() + size_of::<Vec<f64>>() + size_of::<u32>();
+        let max_probe_tokens = MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES / bytes_per_probe;
+        assert_eq!(max_probe_tokens, 33);
+        assert!(max_probe_tokens * bytes_per_probe <= MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES);
+        assert!(
+            (max_probe_tokens + 1) * bytes_per_probe > MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES
+        );
+
+        let at_limit_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: max_probe_tokens,
             ..Default::default()
         };
-
-        let snapshot =
-            prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &forward_cfg).unwrap();
-
-        let expected_norm_count = 2 * cfg.num_hidden_layers + 1;
-        let expected_retained_elements =
-            forward_cfg.num_probe_tokens * cfg.vocab_size + expected_norm_count * cfg.hidden_size;
-        assert_eq!(snapshot.fusion_gammas.len(), expected_norm_count);
-        assert_eq!(
-            snapshot.retained_f64_elements(),
-            expected_retained_elements,
-            "the prepared gate must not retain planned matrices or the full working set"
-        );
-
-        let working_set_elements = original
-            .values()
-            .map(|entry| entry.data.len())
-            .sum::<usize>();
+        let at_limit =
+            prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &at_limit_cfg)
+                .err()
+                .expect("the empty fixture must fail at tensor access")
+                .to_string();
         assert!(
-            snapshot.retained_f64_elements() < working_set_elements,
-            "the tiny fixture must distinguish the sparse snapshot from a full clone"
+            at_limit.contains(QWEN35_EMBED_TOKENS_NAME),
+            "the largest in-budget probe count must reach tensor access: {at_limit}"
         );
+
+        let over_limit_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: max_probe_tokens + 1,
+            ..Default::default()
+        };
+        let over_limit =
+            prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &over_limit_cfg)
+                .err()
+                .expect("the over-budget request must fail admission")
+                .to_string();
+        assert!(
+            over_limit.contains("retained chain-logit budget"),
+            "one probe past the configured limit must be rejected before tensor access: \
+             {over_limit}"
+        );
+        assert!(
+            !over_limit.contains(QWEN35_EMBED_TOKENS_NAME),
+            "budget rejection must precede tensor access: {over_limit}"
+        );
+    }
+
+    #[test]
+    fn prepared_snapshot_rejects_logit_budget_arithmetic_overflow() {
+        let original = HashMap::new();
+        for (num_probe_tokens, vocab_size) in [(2, usize::MAX / 2 + 1), (1, usize::MAX / 8 + 1)] {
+            let mut cfg = tied_tiny_test_cfg();
+            cfg.vocab_size = vocab_size;
+            let rotation = RandomizedHadamard::new(0x51A5_EEED, cfg.hidden_size).unwrap();
+            let forward_cfg = ForwardEquivalenceConfig {
+                num_probe_tokens,
+                ..Default::default()
+            };
+            let err = prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &forward_cfg)
+                .err()
+                .expect("overflowing budget arithmetic must fail admission")
+                .to_string();
+            assert!(
+                err.contains("retained chain-logit size overflow"),
+                "overflowing budget arithmetic must return an error: {err}"
+            );
+        }
     }
 
     /// Happy path (untied): build → materialize is a no-op (already untied

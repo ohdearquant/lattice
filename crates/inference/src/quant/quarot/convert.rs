@@ -865,6 +865,7 @@ fn write_f16_file(
 mod tests {
     use super::*;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
+    use crate::quant::quarot::lm_head::{QWEN35_EMBED_TOKENS_NAME, QWEN35_LM_HEAD_NAME};
     use crate::weights::q4_weights::q4_f32_to_f16;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -1053,7 +1054,12 @@ mod tests {
     }
 
     /// Write every required tensor for `cfg` to a single safetensors file.
-    fn write_required_tensors_for(cfg: &Qwen35Config, path: &Path, seed: u64) {
+    fn write_required_tensors_for(
+        cfg: &Qwen35Config,
+        path: &Path,
+        seed: u64,
+        include_tied_lm_head: bool,
+    ) {
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let intermediate = cfg.intermediate_size;
@@ -1083,7 +1089,7 @@ mod tests {
             vec![hidden],
             next(hidden),
         ));
-        if !cfg.tie_word_embeddings {
+        if !cfg.tie_word_embeddings || include_tied_lm_head {
             entries.push((
                 "lm_head.weight".to_string(),
                 vec![vocab, hidden],
@@ -1210,7 +1216,7 @@ mod tests {
     fn write_input_dir(cfg: &Qwen35Config, dir: &Path, seed: u64) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("config.json"), tiny_config_json(cfg)).unwrap();
-        write_required_tensors_for(cfg, &dir.join("model.safetensors"), seed);
+        write_required_tensors_for(cfg, &dir.join("model.safetensors"), seed, false);
     }
 
     // ------------------------------------------------------------------
@@ -1311,9 +1317,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
         let cfg = tiny_cfg(true);
-        write_input_dir(&cfg, &input, 0x1074);
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 0x1074, true);
 
         let reader = QuarotTensorReader::open(&input).unwrap();
+        assert!(
+            reader.has_tensor(QWEN35_LM_HEAD_NAME),
+            "the tied fixture must contain a competing on-disk lm_head"
+        );
+        let (disk_embed, _) = reader.read_tensor_f64(QWEN35_EMBED_TOKENS_NAME).unwrap();
+        let (disk_lm_head, _) = reader.read_tensor_f64(QWEN35_LM_HEAD_NAME).unwrap();
+        assert_ne!(
+            disk_lm_head, disk_embed,
+            "the competing lm_head must differ from tied embeddings"
+        );
         let required_names = qwen_required_tensor_names(&cfg);
         let mut working_set = load_tensors_f64(&reader, &required_names).unwrap();
         materialize_lm_head_for_qwen35(&mut working_set, &cfg).unwrap();
@@ -2451,7 +2469,7 @@ mod tests {
         fs::create_dir_all(&input).unwrap();
         fs::write(input.join("config.json"), tiny_config_json_with_mtp(&cfg)).unwrap();
         // Write only the main model tensors — no MTP tensors in the file.
-        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 71);
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 71, false);
 
         let report = convert_quarot_qwen35(
             &input,
@@ -2501,7 +2519,7 @@ mod tests {
         // defaults to 0 on deserialize) alongside the main safetensors.
         fs::create_dir_all(&input).unwrap();
         fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
-        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 72);
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 72, false);
 
         let report = convert_quarot_qwen35(
             &input,
