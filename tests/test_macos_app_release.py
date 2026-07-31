@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -16,6 +17,7 @@ PACKAGE_SCRIPT = REPO_ROOT / "apps/macos/scripts/package-app.sh"
 UPLOAD_SCRIPT = REPO_ROOT / "apps/macos/scripts/upload-release-assets.sh"
 RELEASE_WORKFLOW = REPO_ROOT / ".github/workflows/release-binaries.yml"
 APP_BINARIES_WORKFLOW = REPO_ROOT / ".github/workflows/app-binaries.yml"
+E2E_PARITY_WORKFLOW = REPO_ROOT / ".github/workflows/e2e-parity.yml"
 MACOS_SOURCES = REPO_ROOT / "apps/macos/Sources"
 RELEASE_TARGETS = (
     "aarch64-apple-darwin",
@@ -73,6 +75,29 @@ def write_release_assets(directory: Path, tag: str, marker: str) -> None:
         (directory / f"{name}.sha256").write_text(
             f"{digest}  {name}\n", encoding="utf-8"
         )
+
+
+def workflow_change_pattern(workflow: Path, output: str) -> re.Pattern[str]:
+    contents = workflow.read_text(encoding="utf-8")
+    for match in re.finditer(
+        r"""if grep -E '([^']+)' <<<\"\$CHANGED\" >/dev/null; then(.*?)\n\s+fi""",
+        contents,
+        re.DOTALL,
+    ):
+        if f'echo "{output}=true"' in match.group(2):
+            return re.compile(match.group(1))
+    raise AssertionError(f"{workflow.name} has no classifier for {output}")
+
+
+def require_tests_collected(test_suite: unittest.TestSuite) -> None:
+    if test_suite.countTestCases() == 0:
+        raise SystemExit("ERROR: no tests collected")
+
+
+class FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        require_tests_collected(self.test)
+        super().runTests()
 
 
 class PackageScriptContractTest(unittest.TestCase):
@@ -146,6 +171,7 @@ class UploadContractTest(unittest.TestCase):
         remote_tag_sha: str | None = None,
         event_name: str = "workflow_dispatch",
         fail_uploads: int = 0,
+        interrupt_upload: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object], list[list[str]]]:
         root = artifact_dir.parent
         bin_dir = root / "bin"
@@ -157,6 +183,7 @@ class UploadContractTest(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json
                 import os
+                import signal
                 import shutil
                 import sys
                 from pathlib import Path
@@ -184,6 +211,10 @@ class UploadContractTest(unittest.TestCase):
                     for index, asset in enumerate(assets):
                         destination = remote / asset.name
                         destination.unlink(missing_ok=True)
+                        if state["interrupt_upload"] and index == 1:
+                            state["interrupted"] = True
+                            state_path.write_text(json.dumps(state), encoding="utf-8")
+                            os.killpg(os.getpgrp(), signal.SIGTERM)
                         if inject and index == 1:
                             state.setdefault("injected_exit_codes", []).append(42)
                             state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -216,6 +247,7 @@ class UploadContractTest(unittest.TestCase):
                 {
                     "draft": draft,
                     "fail_uploads": fail_uploads,
+                    "interrupt_upload": interrupt_upload,
                     "remote_dir": str(remote_dir),
                     "tag_sha": remote_tag_sha or tag_sha,
                 }
@@ -240,6 +272,7 @@ class UploadContractTest(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
+            start_new_session=True,
         )
         state = json.loads(state_path.read_text(encoding="utf-8"))
         log = []
@@ -316,7 +349,7 @@ class UploadContractTest(unittest.TestCase):
             self.assertIn("expected commit", result.stderr)
             self.assertEqual([args[0] for args in log], ["api"])
 
-    def test_published_repair_recovers_previous_set_after_upload_failure(self):
+    def test_published_release_is_refused_without_remote_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifacts = root / "dist"
@@ -333,22 +366,68 @@ class UploadContractTest(unittest.TestCase):
                 tag,
                 remote,
                 draft=False,
-                fail_uploads=1,
+                fail_uploads=2,
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(state["injected_exit_codes"], [42])
-            self.assertIn("previous release asset set restored", result.stderr)
+            self.assertIn("published release", result.stderr)
+            self.assertEqual(state["fail_uploads"], 2)
             self.assertEqual(
                 {path.name: path.read_bytes() for path in remote.iterdir()},
                 previous,
             )
-            uploads = [args for args in log if args[:2] == ["release", "upload"]]
-            downloads = [
-                args for args in log if args[:2] == ["release", "download"]
+            mutations = [
+                args
+                for args in log
+                if args[:2] in (["release", "upload"], ["release", "edit"])
             ]
-            self.assertEqual(len(uploads), 2)
-            self.assertGreaterEqual(len(downloads), 2)
+            self.assertEqual(mutations, [])
+
+    def test_interrupted_draft_upload_stays_unpublished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "dist"
+            remote = root / "remote"
+            tag = f"v{workspace_version()}"
+            write_release_assets(artifacts, tag, "new")
+
+            result, state, log = self.run_uploader(
+                artifacts,
+                tag,
+                remote,
+                draft=True,
+                interrupt_upload=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(state["draft"])
+            self.assertTrue(state["interrupted"])
+            self.assertNotIn(
+                ["release", "edit"], [args[:2] for args in log]
+            )
+
+    def test_failed_draft_upload_stays_unpublished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "dist"
+            remote = root / "remote"
+            tag = f"v{workspace_version()}"
+            write_release_assets(artifacts, tag, "new")
+
+            result, state, log = self.run_uploader(
+                artifacts,
+                tag,
+                remote,
+                draft=True,
+                fail_uploads=1,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(state["draft"])
+            self.assertEqual(state["injected_exit_codes"], [42])
+            self.assertNotIn(
+                ["release", "edit"], [args[:2] for args in log]
+            )
 
     def test_real_packaged_assets_when_requested(self):
         artifact_dir_value = os.environ.get(
@@ -382,25 +461,6 @@ class UploadContractTest(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_published_repair_accepts_older_semver_tag(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            artifacts = root / "dist"
-            remote = root / "remote"
-            tag = "v0.0.0"
-            write_release_assets(artifacts, tag, "new")
-            write_release_assets(remote, tag, "old")
-
-            result, _, _ = self.run_uploader(
-                artifacts, tag, remote, draft=False
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(
-                {path.name: path.read_bytes() for path in remote.iterdir()},
-                {path.name: path.read_bytes() for path in artifacts.iterdir()},
-            )
 
     def test_rejects_malformed_release_tag_before_upload(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -460,6 +520,9 @@ class WorkflowContractTest(unittest.TestCase):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("types: [published]", workflow)
         self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("Existing draft release tag", workflow)
+        self.assertIn("Require an existing draft release", workflow)
+        self.assertIn('if [ "$IS_DRAFT" != "true" ]; then', workflow)
         self.assertIn("group: release-binaries-${{ inputs.tag }}", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("\n  prepare:\n", workflow)
@@ -523,6 +586,47 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("SWIFT_RESULT", gate)
         self.assertIn("SWIFT", gate)
 
+    def test_swift_classifier_treats_detector_as_relevant(self):
+        pattern = workflow_change_pattern(APP_BINARIES_WORKFLOW, "swift")
+        cases = {
+            "scripts/ci-changed-files.sh": True,
+            "apps/macos/Sources/LatticeStudio/Components/Badges.swift": True,
+            "README.md": False,
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(pattern.search(path) is not None, expected)
+
+    def test_app_gate_runs_the_base_revision_detector(self):
+        workflow = APP_BINARIES_WORKFLOW.read_text(encoding="utf-8")
+        changes_job = workflow.split("\n  changes:\n", maxsplit=1)[1]
+        changes_job = changes_job.split("\n  build-app-bins:\n", maxsplit=1)[0]
+        self.assertIn(
+            'git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh"',
+            changes_job,
+        )
+        self.assertIn('CHANGED=$(sh "$TRUSTED_DETECTOR")', changes_job)
+        self.assertNotIn(
+            "CHANGED=$(./scripts/ci-changed-files.sh)", changes_job
+        )
+
+    def test_e2e_tune_classifier_treats_detector_as_relevant(self):
+        pattern = workflow_change_pattern(E2E_PARITY_WORKFLOW, "tune")
+        cases = {
+            "scripts/ci-changed-files.sh": True,
+            "crates/tune/src/train.rs": True,
+            "README.md": False,
+        }
+        for path, expected in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(pattern.search(path) is not None, expected)
+
+
+class RunnerContractTest(unittest.TestCase):
+    def test_empty_collection_fails_closed(self):
+        with self.assertRaisesRegex(SystemExit, "no tests collected"):
+            require_tests_collected(unittest.TestSuite())
+
 
 if __name__ == "__main__":
-    unittest.main()
+    FailOnEmptyTestProgram()
