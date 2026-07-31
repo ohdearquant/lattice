@@ -140,7 +140,7 @@ jobs:
             echo "engine=false" >> "$GITHUB_OUTPUT"
             echo "→ no engine change: parity not required"
           fi
-          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^scripts/ci-changed-files\.sh$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
             echo "tune=true" >> "$GITHUB_OUTPUT"
             echo "→ tune training surface changed: layer-23 golden REQUIRED"
           else

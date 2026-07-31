@@ -152,60 +152,29 @@ IS_DRAFT="$(
         --jq .isDraft
 )"
 
-WORK_DIR="$(mktemp -d)"
-trap 'rm -rf "$WORK_DIR"' EXIT
-
-if [[ "$IS_DRAFT" == "true" ]]; then
-    if upload_directory "$ARTIFACT_DIR"; then
-        :
-    else
-        UPLOAD_STATUS=$?
-        echo "ERROR: draft release upload failed; the release remains unpublished" >&2
-        exit "$UPLOAD_STATUS"
-    fi
-    if ! download_and_verify "$WORK_DIR/draft-verify"; then
-        echo "ERROR: draft release inventory verification failed; the release remains unpublished" >&2
-        exit 1
-    fi
-    gh release edit "$TAG" \
-        --repo "$REPOSITORY" \
-        --draft=false
-    exit 0
+if [[ "$IS_DRAFT" == "false" ]]; then
+    echo "ERROR: published release $TAG is immutable; create a new draft with a new tag and version" >&2
+    exit 1
 fi
-
-if [[ "$IS_DRAFT" != "false" ]]; then
+if [[ "$IS_DRAFT" != "true" ]]; then
     echo "ERROR: unexpected release draft state: $IS_DRAFT" >&2
     exit 1
 fi
 
-if ! download_and_verify "$WORK_DIR/previous"; then
-    echo "ERROR: published release is not a complete recoverable asset set; refusing repair" >&2
-    exit 1
-fi
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "$WORK_DIR"' EXIT
 
-REPAIR_STATUS=0
 if upload_directory "$ARTIFACT_DIR"; then
-    if download_and_verify "$WORK_DIR/repaired-verify"; then
-        exit 0
-    fi
-    REPAIR_STATUS=1
-    echo "ERROR: published release post-upload verification failed; restoring the previous asset set" >&2
+    :
 else
-    REPAIR_STATUS=$?
-    echo "ERROR: published release upload failed; restoring the previous asset set" >&2
+    UPLOAD_STATUS=$?
+    echo "ERROR: draft release upload failed; the release remains unpublished" >&2
+    exit "$UPLOAD_STATUS"
 fi
-
-if ! upload_directory "$WORK_DIR/previous"; then
-    echo "ERROR: recovery upload failed; published release may require manual repair" >&2
+if ! download_and_verify "$WORK_DIR/draft-verify"; then
+    echo "ERROR: draft release inventory verification failed; the release remains unpublished" >&2
     exit 1
 fi
-if ! download_and_verify "$WORK_DIR/recovery-verify"; then
-    echo "ERROR: recovery verification failed; published release requires manual repair" >&2
-    exit 1
-fi
-
-echo "ERROR: replacement failed; previous release asset set restored and verified" >&2
-if [[ "$REPAIR_STATUS" -eq 0 ]]; then
-    REPAIR_STATUS=1
-fi
-exit "$REPAIR_STATUS"
+gh release edit "$TAG" \
+    --repo "$REPOSITORY" \
+    --draft=false

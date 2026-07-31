@@ -1,14 +1,14 @@
 name: release-binaries
 # Build every public release asset without write credentials, transfer the
-# complete set through workflow artifacts, then let one environment-scoped
-# write job verify and publish it. Initial releases must already exist as
-# drafts; manual reruns use the uploader's verified repair path.
+# complete set through workflow artifacts, then let one write-scoped job verify
+# and publish it. Releases must already exist as drafts; published releases are
+# immutable to this workflow and corrections require a new tag and version.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing draft or published release tag (for example, v0.4.2)'
+        description: 'Existing draft release tag (for example, v0.4.2)'
         required: true
         type: string
 
@@ -57,11 +57,17 @@ jobs:
           fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Require an existing release
+      - name: Require an existing draft release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
-        run: gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft,tagName >/dev/null
+        run: |
+          set -euo pipefail
+          IS_DRAFT="$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)"
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Published releases are immutable; create a new draft with a new tag and version."
+            exit 1
+          fi
 
   build:
     name: build (${{ matrix.target }})
