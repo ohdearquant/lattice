@@ -37,6 +37,16 @@ case "${EVAL_MODE:-ok}" in
     result="$(awk -F '\t' 'NR == 1 { print $2 }' "${MKTEMP_LOG:?}")"
     [[ -f "$result" ]] && chmod 0444 "$result"
     ;;
+  sink-fail-late)
+    if [[ " $* " == *" --quarot-q4-dir "* ]]; then
+      result="$(awk -F '\t' 'NR == 1 { print $2 }' "${MKTEMP_LOG:?}")"
+      if ! grep -qF $'lattice\tq4\t16.589166\t2048' "$result"; then
+        echo "late sink-failure injection did not observe the q4 row" >&2
+        exit 98
+      fi
+      chmod 0444 "$result"
+    fi
+    ;;
 esac
 if [[ " $* " == *" --quarot-q4-dir "* ]]; then
   echo "PPL:                19.007144"
@@ -235,6 +245,12 @@ check_failure_preserves "staged output write failure preserves canonical" 1 "$RC
 chmod u+w "$CANONICAL" 2>/dev/null || true
 
 cp "$EXPECTED" "$CANONICAL"
+run_bench EVAL_MODE=sink-fail-late
+RC=$?
+check_failure_preserves "late staged output write failure preserves canonical" 1 "$RC" "failed to write lattice/q4-quarot result"
+chmod u+w "$CANONICAL" 2>/dev/null || true
+
+cp "$EXPECTED" "$CANONICAL"
 run_bench
 SUCCESS_RC=$?
 CONTENT_OK=0
@@ -301,4 +317,4 @@ fi
 
 echo ""
 echo "=== $pass passed, $fail failed ==="
-[[ "$pass" -eq 8 && "$fail" -eq 0 ]]
+[[ "$pass" -eq 9 && "$fail" -eq 0 ]]
