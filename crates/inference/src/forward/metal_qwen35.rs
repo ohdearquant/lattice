@@ -1962,11 +1962,16 @@ mod inner {
         } else {
             choose_gpu_topk_route(gen_cfg.top_k, environment.compact, environment.selection)
         };
-        // Every caller (direct, streaming, prefix-cache generation) reaches
-        // this function only after its own `check_logprobs_not_set` preflight
-        // has already rejected `logprobs: Some(_)`, so this is a defense-in-
-        // depth re-check, not a caller-distinguishing policy: compact
-        // sampling cannot provide full-logit logprob semantics.
+        // This uniform `is_none()` check is not one policy for all three
+        // callers: direct and prefix-cache generation already rejected
+        // `logprobs: Some(_)` in their own `check_logprobs_not_set` preflight
+        // before ever reaching this function, so for them the check below is
+        // defense-in-depth and always sees `None`. Streaming has no such
+        // preflight -- it intentionally supports `logprobs: Some(_)` to
+        // capture per-token log-probabilities -- so for streaming this is the
+        // real, load-bearing full-logit gate: compact sampling cannot
+        // provide full-logit logprob semantics, so a logprobs capture
+        // request must force the full-logit (non-compact) path here.
         let logprobs_eligible = gen_cfg.logprobs.is_none();
         let use_compact = route != GpuTopkRoute::CpuFallback
             && (gen_cfg.repetition_penalty == 1.0 || history_is_empty)
@@ -19025,61 +19030,113 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         /// Direct generation's `logprobs: Some(_)` admission is rejected by
         /// `preflight_generate`'s `check_logprobs_not_set` call, strictly
-        /// before `configure_sampling_route` (and therefore any sampling
-        /// route selection) ever runs -- `generate()` propagates that `Err`
-        /// via `?` immediately after the `preflight_generate` call, so
-        /// `configure_sampling_route` is unreachable on this path once the
-        /// guard rejects. This replaces a prior test that asserted a direct
-        /// caller's `logprobs: Some(_)` request could reach sampling-route
-        /// selection at all -- that state is impossible: this preflight
-        /// guard always runs first and always errors on it.
+        /// before `configure_sampling_route` (and therefore any sampling-route
+        /// selection, which is the only thing that mutates
+        /// `InferenceSession::compact_route` / `compact_topk` /
+        /// `compact_result`) ever runs. `generate()` propagates that `Err` via
+        /// `?` immediately after the `preflight_generate` call, so a rejected
+        /// request must leave route state untouched.
+        ///
+        /// This replaces a prior test that only proved the ordering held in
+        /// the *source text* (`preflight_generate` found lexically before
+        /// `configure_sampling_route`, with an unbounded "rest of the file"
+        /// slice as the search space). A source-text match cannot tell
+        /// whether the matched `configure_sampling_route` call even belongs
+        /// to `generate()`, and it cannot catch a caller that stores
+        /// `preflight_generate`'s `Result` in a local, calls
+        /// `configure_sampling_route` unconditionally, and only applies `?`
+        /// afterward: textual order is preserved, the guard's `Err` is still
+        /// returned, yet route state has already been mutated. This test
+        /// proves the real invariant behaviourally instead: seed route state
+        /// to values `plan_sampling_route` would never leave in place for a
+        /// rejected request, run the real `generate()`, and assert the
+        /// seeded state survives untouched.
+        ///
+        /// Note the boundary this test does *not* cover: a `max_new_tokens:
+        /// 0` request short-circuits to `GenerateAdmission::Zero` inside
+        /// `preflight_generate` *before* `check_logprobs_not_set` ever runs,
+        /// so a zero-budget request with `logprobs: Some(_)` is never
+        /// rejected at all -- it returns `Ok` and never touches sampling
+        /// routing either way. That path is untested here and must not be
+        /// read as if this test covered it.
+        ///
+        /// Mutation sensitivity: reordering `generate()` to call
+        /// `configure_sampling_route` before applying `preflight_generate`'s
+        /// `?` -- even while keeping the *textual* preflight-before-configure
+        /// ordering -- lets this rejected request mutate `compact_route` /
+        /// `compact_topk` / `compact_result` before the error is returned, so
+        /// the "state unchanged" assertions below fail.
         #[test]
         fn direct_generate_rejects_logprobs_before_configuring_sampling_route() {
-            let cfg = GenerateConfig {
-                logprobs: Some(5),
-                ..Default::default()
+            let Some(_) = metal::Device::system_default() else {
+                panic!(
+                    "this behavioural admission-order proof requires a real \
+                     Metal device and must fail closed rather than silently \
+                     skip -- a skipped run would report a pass over \
+                     assertions that never executed"
+                );
             };
-            let result = crate::model::qwen35::check_logprobs_not_set(&cfg);
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // Sentinel values `plan_sampling_route` would never produce for
+            // this (rejected) request: a real route/topk pair, and a
+            // non-empty result buffer. If `configure_sampling_route` runs at
+            // all, `apply_sampling_route_plan` unconditionally overwrites
+            // `compact_route`/`compact_topk` from its plan and clears
+            // `compact_result` whenever `use_compact` is false -- which it
+            // always is here, since `logprobs: Some(_)` forces
+            // `logprobs_eligible = false`.
+            let sentinel_route = GpuTopkRoute::BlockArgmax;
+            let sentinel_topk = 7usize;
+            let sentinel_result = vec![crate::sampling::Candidate {
+                token_id: 99,
+                logit: 1.23,
+            }];
+            state.session.compact_route = sentinel_route;
+            state.session.compact_topk = sentinel_topk;
+            state.session.compact_result = sentinel_result.clone();
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: Some(0),
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
             assert!(
                 matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
-                "logprobs: Some(_) must be rejected with InvalidInput; got {result:?}"
+                "logprobs: Some(_) with a nonzero budget must be rejected with \
+                 InvalidInput; got {result:?}"
             );
 
-            let source = include_str!("metal_qwen35.rs");
-            let preflight_start = source
-                .find("fn preflight_generate(")
-                .expect("preflight_generate must exist in this file");
-            let preflight_body_end = source[preflight_start..]
-                .find("\n        }\n")
-                .expect("preflight_generate's body must close with `\\n        }\\n`");
-            let preflight_body = &source[preflight_start..preflight_start + preflight_body_end];
-            assert!(
-                preflight_body.contains("check_logprobs_not_set(gen_cfg)?"),
-                "preflight_generate must run check_logprobs_not_set as a fallible \
-                 preflight (via `?`), not merely call it"
+            assert_eq!(
+                state.session.compact_route, sentinel_route,
+                "a rejected logprobs request must not mutate compact_route -- \
+                 configure_sampling_route must be unreachable once the \
+                 preflight guard errors"
             );
-            assert!(
-                !preflight_body.contains("configure_sampling_route"),
-                "preflight_generate must not itself select a sampling route -- the \
-                 logprobs guard must fully resolve (pass or `?`-return) before any \
-                 route selection is reachable"
+            assert_eq!(
+                state.session.compact_topk, sentinel_topk,
+                "a rejected logprobs request must not mutate compact_topk"
             );
-
-            let generate_start = source
-                .find("pub fn generate(\n")
-                .expect("generate must exist in this file");
-            let generate_body = &source[generate_start..];
-            let preflight_call = generate_body
-                .find("self.preflight_generate(")
-                .expect("generate must call preflight_generate");
-            let configure_call = generate_body
-                .find("self.configure_sampling_route(")
-                .expect("generate must call configure_sampling_route");
-            assert!(
-                preflight_call < configure_call,
-                "generate() must call preflight_generate (which runs the logprobs \
-                 guard via `?`) strictly before configure_sampling_route, so a \
-                 rejected logprobs request never reaches sampling-route selection"
+            assert_eq!(
+                state.session.compact_result, sentinel_result,
+                "a rejected logprobs request must not mutate compact_result"
             );
         }
 
