@@ -306,14 +306,16 @@ shift internally.
 The command performs a zero-adapter TBV check before it trains or checks
 gradients. Before constructing a logits tape, it rejects any sample selected
 by the current mode whose simultaneously live vocabulary-sized buffers would
-exceed 2 GiB. Training and gradient checking charge one retained row per
-completion position plus one backward `d_logits` workspace row; training
-checks every loaded training sample, while gradient checking checks only
-sample 0 because that mode forwards only that sample. Held-out evaluation
-charges only the retained rows because it does not run backward. Dataset-wide
-completion positions remain a reporting total because evaluation builds and
-drops one sample tape at a time. It uses `valid.jsonl` only for held-out
-evaluation when requested.
+exceed 2 GiB. Frozen-prefix cache admission remains dataset-wide for every
+loaded training or validation sample whose cache is built. Normal training
+charges every training sample for the `P` retained rows used by evaluation,
+then charges only `train_samples[..min(steps, train_samples.len())]` for the
+additional backward `d_logits` row. Gradient checking instead charges its
+single forwarded training sample, sample 0, for `P + 1` rows. Held-out samples
+are charged for `P` retained rows only when normal training will run held-out
+evaluation; gradient checking never charges held-out logits because it returns
+before that evaluation. Dataset-wide completion positions remain a reporting
+total because evaluation builds and drops one sample tape at a time.
 
 ### Gradient validation
 

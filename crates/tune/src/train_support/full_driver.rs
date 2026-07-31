@@ -392,19 +392,36 @@ fn check_live_logits_budget(
 fn check_training_logits_budget(
     samples: &[Sample],
     vocab: usize,
+    steps: usize,
     gradcheck: bool,
 ) -> Result<(), String> {
-    let (forwarded_samples, label) = if gradcheck {
-        (&samples[..samples.len().min(1)], "gradcheck")
-    } else {
-        (samples, "training")
-    };
+    if gradcheck {
+        return check_live_logits_budget(
+            &samples[..samples.len().min(1)],
+            vocab,
+            BACKWARD_LOGITS_WORKSPACE_ROWS,
+            "gradcheck",
+        );
+    }
+
+    check_live_logits_budget(samples, vocab, EVAL_LOGITS_WORKSPACE_ROWS, "training")?;
     check_live_logits_budget(
-        forwarded_samples,
+        &samples[..steps.min(samples.len())],
         vocab,
         BACKWARD_LOGITS_WORKSPACE_ROWS,
-        label,
+        "training",
     )
+}
+
+fn check_valid_logits_budget(
+    samples: &[Sample],
+    vocab: usize,
+    gradcheck: bool,
+) -> Result<(), String> {
+    if gradcheck {
+        return Ok(());
+    }
+    check_live_logits_budget(samples, vocab, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")
 }
 
 /// Validate the loaded model's depth against the driver's fixed `TOP_LAYER`
@@ -628,7 +645,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     println!("  {} samples loaded", train_samples.len());
 
     check_cache_budget(&train_samples, dims.hidden, dims.rope_dim, "train")?;
-    check_training_logits_budget(&train_samples, dims.vocab, gradcheck)?;
+    check_training_logits_budget(&train_samples, dims.vocab, steps, gradcheck)?;
 
     // Capture the frozen prefix output (h_in entering first_layer) per sample.
     println!("\nBuilding frozen-prefix cache (layers 0..{first_layer})...");
@@ -651,7 +668,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         ) {
             Ok(vs) if !vs.is_empty() => {
                 check_cache_budget(&vs, dims.hidden, dims.rope_dim, "valid")?;
-                check_live_logits_budget(&vs, dims.vocab, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")?;
+                check_valid_logits_budget(&vs, dims.vocab, gradcheck)?;
                 let (vc, vpos) = build_caches(&model, &vs, first_layer)?;
                 println!(
                     "  held-out: {vpos} completion positions across {} valid samples",
@@ -1406,12 +1423,82 @@ mod run_bounds_tests {
         assert!(retained_bytes <= MAX_LOGITS_BYTES);
         assert!(backward_bytes > MAX_LOGITS_BYTES);
 
-        check_training_logits_budget(&samples, vocab, true)
+        check_training_logits_budget(&samples, vocab, 1, true)
             .expect("gradcheck only forwards the first training sample");
-        let err = check_training_logits_budget(&samples, vocab, false).unwrap_err();
+        check_training_logits_budget(&samples, vocab, 1, false)
+            .expect("one step only runs backward on the safe first sample");
+    }
+
+    #[test]
+    fn check_training_logits_budget_rejects_sample_reached_by_update() {
+        let vocab = 248_320;
+        let samples = vec![
+            Sample {
+                tokens: vec![0u32; 2],
+                completion_start: 1,
+            },
+            Sample {
+                tokens: vec![0u32; 2_163],
+                completion_start: 1,
+            },
+        ];
+
+        let err = check_training_logits_budget(&samples, vocab, 2, false).unwrap_err();
         assert!(
             err.contains("training sample 2") && err.contains("2162 supervised positions"),
-            "expected training to reject its oversized second sample; got: {err}"
+            "expected two steps to reject the second backward sample; got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_training_logits_budget_with_zero_steps_charges_evaluation_only() {
+        let vocab = 248_320;
+        let completion_positions = 2_162;
+        let sample = Sample {
+            tokens: vec![0u32; completion_positions + 1],
+            completion_start: 1,
+        };
+        let retained_bytes = completion_positions * vocab * std::mem::size_of::<f32>();
+        let backward_bytes = (completion_positions + 1) * vocab * std::mem::size_of::<f32>();
+        assert!(retained_bytes <= MAX_LOGITS_BYTES);
+        assert!(backward_bytes > MAX_LOGITS_BYTES);
+
+        check_training_logits_budget(&[sample], vocab, 0, false)
+            .expect("zero steps evaluate the sample without running backward");
+    }
+
+    #[test]
+    fn check_valid_logits_budget_skips_held_out_in_gradcheck() {
+        let vocab = 248_320;
+        let train_sample = Sample {
+            tokens: vec![0u32; 2],
+            completion_start: 1,
+        };
+        let valid_sample = Sample {
+            tokens: vec![0u32; 2_164],
+            completion_start: 1,
+        };
+        let valid_bytes = 2_163 * vocab * std::mem::size_of::<f32>();
+        assert!(valid_bytes > MAX_LOGITS_BYTES);
+
+        check_training_logits_budget(&[train_sample], vocab, 1, true)
+            .expect("gradcheck's first training sample is within the live cap");
+        check_valid_logits_budget(std::slice::from_ref(&valid_sample), vocab, true)
+            .expect("gradcheck never forwards held-out samples");
+    }
+
+    #[test]
+    fn check_valid_logits_budget_charges_held_out_during_training() {
+        let vocab = 248_320;
+        let valid_sample = Sample {
+            tokens: vec![0u32; 2_164],
+            completion_start: 1,
+        };
+
+        let err = check_valid_logits_budget(&[valid_sample], vocab, false).unwrap_err();
+        assert!(
+            err.contains("held-out sample 1") && err.contains("2163 supervised positions"),
+            "expected normal held-out evaluation to reject the oversized sample; got: {err}"
         );
     }
 
