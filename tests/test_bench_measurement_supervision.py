@@ -183,15 +183,20 @@ class InventoryContract(unittest.TestCase):
         self.assertIn("stdio: supervisionStdio()", source)
         self.assertIn("closeSync(fd)", source)
         self.assertIn("delete process.env.LATTICE_BENCH_LOCK_FDS", source)
-        self.assertIn("'verify-retained'", source)
+        self.assertGreaterEqual(source.count("[SUPERVISION, 'verify'"), 2)
+        self.assertNotIn("verify-retained", source)
 
-    def test_retiring_entrypoints_probe_the_supervisor_copy(self):
+    def test_possessing_entrypoints_recheck_canonical_paths(self):
         for path in (
             "scripts/lib/bench-supervision.sh",
             "scripts/lib/bench-compare-impl.sh",
         ):
             with self.subTest(path=path):
-                self.assertIn("verify-retained", (REPO / path).read_text())
+                source = (REPO / path).read_text()
+                self.assertGreaterEqual(
+                    len(re.findall(r'python3 "[^"]+" verify', source)), 2
+                )
+                self.assertNotIn("verify-retained", source)
 
 
 class _SupervisorSandbox:
@@ -346,7 +351,7 @@ class RuntimeContract(unittest.TestCase):
             result = sb.run([sys.executable, "-c", code])
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_python_entrypoint_retires_capabilities_before_work(self):
+    def test_python_entrypoint_hides_capability_names_during_work(self):
         with _SupervisorSandbox() as sb:
             marker = Path(sb.tmp.name) / "python-entrypoint"
             entrypoint = sb.root / "scripts" / "entrypoint.py"
@@ -369,7 +374,7 @@ class RuntimeContract(unittest.TestCase):
                 "        os.close(fd)\n"
                 f"Path({str(marker)!r}).write_text("
                 "('present' if 'LATTICE_BENCH_LOCK_FDS' in os.environ "
-                "else 'retired') + ':' + ','.join(states))\n"
+                "else 'hidden') + ':' + ','.join(states))\n"
             )
             result = subprocess.run(
                 [sys.executable, str(entrypoint)],
@@ -378,7 +383,155 @@ class RuntimeContract(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(marker.read_text(), "retired:blocked,blocked")
+            self.assertEqual(marker.read_text(), "hidden:blocked,blocked")
+
+    def test_python_entrypoint_keeps_locks_after_parent_releases(self):
+        with _SupervisorSandbox() as sb:
+            for path in (sb.bench_lock, sb.gpu_lock):
+                path.touch()
+            status = Path(sb.tmp.name) / "parent-release.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.bench_lock}): acquired\n"
+                f"lock=Metal GPU ({sb.gpu_lock}): acquired\n"
+            )
+            ready = Path(sb.tmp.name) / "locks-acquired"
+            release = Path(sb.tmp.name) / "parent-released"
+            marker = Path(sb.tmp.name) / "measurement-ran"
+            entrypoint = sb.root / "scripts" / "parent_release.py"
+            entrypoint.write_text(
+                "import fcntl, os, sys, time\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(sb.helper.parent)!r})\n"
+                "from bench_supervision import ensure_python_entrypoint\n"
+                "ensure_python_entrypoint('fixture')\n"
+                f"Path({str(ready)!r}).write_text('ready')\n"
+                f"release = Path({str(release)!r})\n"
+                "while not release.exists():\n"
+                "    time.sleep(0.01)\n"
+                "states = []\n"
+                f"for path in ({str(sb.bench_lock)!r}, {str(sb.gpu_lock)!r}):\n"
+                "    fd = os.open(path, os.O_RDWR)\n"
+                "    try:\n"
+                "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "    except OSError:\n"
+                "        states.append('blocked')\n"
+                "    else:\n"
+                "        states.append('acquired')\n"
+                "    finally:\n"
+                "        os.close(fd)\n"
+                "if states != ['blocked', 'blocked']:\n"
+                "    raise SystemExit(3)\n"
+                f"Path({str(marker)!r}).write_text('ran')\n"
+            )
+            inherited = tuple(
+                os.open(path, os.O_RDWR) for path in (sb.bench_lock, sb.gpu_lock)
+            )
+            try:
+                for fd in inherited:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                proc = subprocess.Popen(
+                    [sys.executable, str(entrypoint)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "LATTICE_BENCH_LOCK_STATUS": str(status),
+                        "LATTICE_BENCH_LOCK_FDS": ",".join(map(str, inherited)),
+                    },
+                    pass_fds=inherited,
+                )
+                deadline = time.monotonic() + 10
+                while not ready.exists() and proc.poll() is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("entrypoint did not finish acquiring its locks")
+                    time.sleep(0.01)
+                for fd in inherited:
+                    os.close(fd)
+                inherited = ()
+                release.touch()
+                stdout, stderr = proc.communicate(timeout=30)
+            finally:
+                for fd in inherited:
+                    os.close(fd)
+            self.assertEqual(proc.returncode, 0, f"{stdout}\n{stderr}")
+            self.assertEqual(marker.read_text(), "ran")
+
+    def test_replaced_canonical_paths_are_refused_before_measurement(self):
+        with _SupervisorSandbox() as sb:
+            for path in (sb.bench_lock, sb.gpu_lock):
+                path.touch()
+            status = Path(sb.tmp.name) / "path-replacement.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.bench_lock}): acquired\n"
+                f"lock=Metal GPU ({sb.gpu_lock}): acquired\n"
+            )
+            marker = Path(sb.tmp.name) / "replacement-measurement-ran"
+            driver = sb.root / "scripts" / "replace_paths.py"
+            driver.write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(sb.helper.parent)!r})\n"
+                "import bench_supervision as supervision\n"
+                f"paths = ({str(sb.bench_lock)!r}, {str(sb.gpu_lock)!r})\n"
+                "original_flock = supervision.fcntl.flock\n"
+                "replaced = False\n"
+                "def replace_then_flock(fd, operation):\n"
+                "    global replaced\n"
+                "    if not replaced:\n"
+                "        replaced = True\n"
+                "        for raw in paths:\n"
+                "            path = Path(raw)\n"
+                "            path.rename(path.with_name(path.name + '.held'))\n"
+                "            path.touch()\n"
+                "    return original_flock(fd, operation)\n"
+                "supervision.fcntl.flock = replace_then_flock\n"
+                "raise SystemExit(supervision.main([\n"
+                "    'run', '--label', 'fixture', '--',\n"
+                f"    sys.executable, '-c', \"from pathlib import Path; Path({str(marker)!r}).write_text('ran')\",\n"
+                "]))\n"
+            )
+            inherited = tuple(
+                os.open(path, os.O_RDWR) for path in (sb.bench_lock, sb.gpu_lock)
+            )
+            try:
+                for fd in inherited:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = subprocess.run(
+                    [sys.executable, str(driver)],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "LATTICE_BENCH_LOCK_STATUS": str(status),
+                        "LATTICE_BENCH_LOCK_FDS": ",".join(map(str, inherited)),
+                    },
+                    pass_fds=inherited,
+                    timeout=30,
+                )
+            finally:
+                for fd in inherited:
+                    os.close(fd)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("changed while acquiring", result.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_replaced_canonical_paths_during_measurement_are_refused_afterward(self):
+        with _SupervisorSandbox() as sb:
+            marker = Path(sb.tmp.name) / "replacement-during-measurement"
+            code = (
+                "from pathlib import Path; "
+                f"paths=({str(sb.bench_lock)!r}, {str(sb.gpu_lock)!r}); "
+                "[(lambda path: (path.rename(path.with_name(path.name + '.held')), "
+                "path.touch()))(Path(raw)) for raw in paths]; "
+                f"Path({str(marker)!r}).write_text('ran')"
+            )
+            result = sb.run([sys.executable, "-c", code])
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("changed during measurement", result.stderr)
+            self.assertEqual(marker.read_text(), "ran")
 
     def test_durable_entrypoint_refuses_lock_only_outer_supervisor(self):
         with _SupervisorSandbox() as sb:
@@ -400,7 +553,7 @@ class RuntimeContract(unittest.TestCase):
             self.assertFalse(marker.exists())
             self.assertIn("lock-only", result.stderr)
 
-    def test_shell_entrypoint_retires_capabilities_before_work(self):
+    def test_shell_measurement_children_do_not_inherit_lock_capabilities(self):
         with _SupervisorSandbox() as sb:
             marker = Path(sb.tmp.name) / "shell-entrypoint"
             entrypoint = sb.root / "scripts" / "entrypoint.sh"
@@ -408,9 +561,21 @@ class RuntimeContract(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
                 f"source {str(sb.root / 'scripts/lib/bench-supervision.sh')!r}\n"
-                'bench_supervise_entry "fixture" ordinary "$@"\n'
-                '[[ -z "${LATTICE_BENCH_LOCK_FDS:-}" ]]\n'
-                f"printf retired > {str(marker)!r}\n"
+                'inherited_fds="${LATTICE_BENCH_LOCK_FDS:-}"\n'
+                "measurement() {\n"
+                '  [[ -z "${LATTICE_BENCH_LOCK_FDS:-}" ]]\n'
+                "  states=()\n"
+                "  IFS=',' read -r -a fds <<<\"$inherited_fds\"\n"
+                "  for fd in \"${fds[@]}\"; do\n"
+                "    if python3 -c \"import os; os.fstat($fd)\" 2>/dev/null; then\n"
+                "      states+=(inherited)\n"
+                "    else\n"
+                "      states+=(closed)\n"
+                "    fi\n"
+                "  done\n"
+                f"  printf '%s' \"${{states[*]}}\" > {str(marker)!r}\n"
+                "}\n"
+                'bench_supervise_entry "fixture" ordinary measurement "$@"\n'
             )
             entrypoint.chmod(0o755)
             result = subprocess.run(
@@ -420,7 +585,7 @@ class RuntimeContract(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(marker.read_text(), "retired")
+            self.assertEqual(marker.read_text(), "closed closed")
 
     def test_shell_handoff_keeps_capabilities_for_nested_python_guard(self):
         with _SupervisorSandbox() as sb:
@@ -434,17 +599,17 @@ class RuntimeContract(unittest.TestCase):
                 "from bench_supervision import ensure_python_entrypoint\n"
                 "ensure_python_entrypoint('fixture')\n"
                 f"Path({str(marker)!r}).write_text("
-                "'present' if 'LATTICE_BENCH_LOCK_FDS' in os.environ else 'retired')\n"
+                "'present' if 'LATTICE_BENCH_LOCK_FDS' in os.environ else 'hidden')\n"
             )
             shell_entrypoint = sb.root / "scripts" / "nested.sh"
             shell_entrypoint.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
                 f"source {str(sb.root / 'scripts/lib/bench-supervision.sh')!r}\n"
-                'bench_supervise_entry "fixture" handoff "$@"\n'
+                'bench_supervise_entry "fixture" handoff - "$@"\n'
                 "(\n"
-                "  bench_retire_lock_fds\n"
-                f"  printf '%s' \"${{LATTICE_BENCH_LOCK_FDS:-retired}}\" > {str(cargo_marker)!r}\n"
+                "  bench_close_lock_fds\n"
+                f"  printf '%s' \"${{LATTICE_BENCH_LOCK_FDS:-closed}}\" > {str(cargo_marker)!r}\n"
                 ")\n"
                 f"exec {sys.executable!r} {str(python_entrypoint)!r}\n"
             )
@@ -456,8 +621,8 @@ class RuntimeContract(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(cargo_marker.read_text(), "retired")
-            self.assertEqual(marker.read_text(), "retired")
+            self.assertEqual(cargo_marker.read_text(), "closed")
+            self.assertEqual(marker.read_text(), "hidden")
 
     def test_durable_shell_refuses_lock_only_outer_without_errexit(self):
         with _SupervisorSandbox() as sb:
@@ -467,8 +632,8 @@ class RuntimeContract(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 "set -uo pipefail\n"
                 f"source {str(sb.root / 'scripts/lib/bench-supervision.sh')!r}\n"
-                'bench_supervise_entry "fixture" durable "$@"\n'
-                f"printf ran > {str(marker)!r}\n"
+                f"measurement() {{ printf ran > {str(marker)!r}; }}\n"
+                'bench_supervise_entry "fixture" durable measurement "$@"\n'
             )
             entrypoint.chmod(0o755)
             result = sb.run(
@@ -507,7 +672,7 @@ process.exit(child.status ?? 2);
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_idle_unlocked_inherited_fds_are_refused(self):
+    def test_idle_inherited_fds_are_acquired_by_measuring_process(self):
         with _SupervisorSandbox() as sb:
             for path in (sb.bench_lock, sb.gpu_lock):
                 path.touch()
@@ -536,8 +701,7 @@ process.exit(child.status ?? 2);
             finally:
                 for fd in inherited:
                     os.close(fd)
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("was not already held", result.stderr)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_locked_noncanonical_paths_are_refused(self):
         with _SupervisorSandbox() as sb:
@@ -641,7 +805,7 @@ process.exit(child.status ?? 2);
             self.assertEqual(result.returncode, 2)
             self.assertIn("distinct inodes", result.stderr)
 
-    def test_self_held_fds_without_retained_supervisor_are_refused(self):
+    def test_self_held_fds_remain_held_through_measurement(self):
         with _SupervisorSandbox() as sb:
             for path in (sb.bench_lock, sb.gpu_lock):
                 path.touch()
@@ -673,9 +837,8 @@ process.exit(child.status ?? 2);
                 },
                 timeout=30,
             )
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("released after inherited descriptors closed", result.stderr)
-            self.assertFalse(marker.exists())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(), "ran")
 
     def test_forged_ancestor_receipt_without_fds_is_refused_before_command(self):
         with _SupervisorSandbox() as sb:
@@ -747,7 +910,7 @@ process.exit(child.status ?? 2);
                 for fd in (*inherited, *holders):
                     os.close(fd)
             self.assertEqual(result.returncode, 2)
-            self.assertIn("does not carry the lock", result.stderr)
+            self.assertIn("could not acquire canonical lock", result.stderr)
 
 
 class BenchCompareDirectInvocationRefusal(unittest.TestCase):

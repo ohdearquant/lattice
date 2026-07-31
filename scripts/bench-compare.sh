@@ -19,10 +19,10 @@
 # and there is no state to go stale. The body's own verify_locks does not stop
 # at a PID relation: --pass-lock-fds below hands the body the two acquired
 # lock descriptors, and the body proves identity against the ordered canonical
-# lock paths plus prior possession: fresh opens must already be blocked before
-# either inherited descriptor is re-flocked. After retiring its copies, the
-# body also proves the supervisor retained both locks. A caller who fabricates
-# a status file without the matching inherited descriptors is refused.
+# lock paths, acquires them itself, and retains them until the descriptor-free
+# measurement child completes. Fresh descriptor/path comparisons before and
+# after the measurement detect replacement of either canonical lock name. A
+# caller who fabricates a status file without both descriptors is refused.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$REPO/.cache"

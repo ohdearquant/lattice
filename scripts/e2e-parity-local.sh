@@ -7,10 +7,10 @@ if [[ $# -ne 0 ]]; then
     exit 2
 fi
 source "$REPO/scripts/lib/bench-supervision.sh"
-bench_supervise_entry "e2e-parity-local" handoff "$@"
+bench_supervise_entry "e2e-parity-local" handoff - "$@"
 
 (
-    bench_retire_lock_fds
+    bench_close_lock_fds
     cd "$REPO"
     cargo build --release --bin qwen35_generate -p lattice-inference --features f16
 )

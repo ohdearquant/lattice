@@ -126,6 +126,26 @@ class BenchTargetPolicyTests(unittest.TestCase):
                 ROOT / "scripts" / "perf-bench-gate.py",
                 root / "scripts" / "perf-bench-gate.py",
             )
+            gate_script = (ROOT / "scripts" / "bench-gate.sh").read_text()
+            gate_script = gate_script.replace(
+                'source "$REPO/scripts/lib/bench-supervision.sh"\n'
+                "\nbench_gate_measurement() {\n",
+                "",
+            )
+            gate_script = gate_script.replace(
+                "\n}\n\n"
+                'bench_supervise_entry "bench-gate" durable '
+                'bench_gate_measurement "$@"\n',
+                "\n",
+            )
+            gate_script = re.sub(
+                r'^bench_quiet_checkpoint "bench-gate: [^"]+"$',
+                ":",
+                gate_script,
+                flags=re.MULTILINE,
+            )
+            (root / "scripts" / "bench-gate.sh").write_text(gate_script)
+            (root / "scripts" / "bench-gate.sh").chmod(0o755)
             baseline = root / ".cache" / "perf-baselines" / "testarch-testos"
             baseline.mkdir(parents=True)
             bindir = root / "bin"

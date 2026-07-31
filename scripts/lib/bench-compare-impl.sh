@@ -148,8 +148,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# --- Refuse to measure unless the inherited lock descriptors prove both locks
-# --- are actually held ---
+# --- Hold both canonical lock descriptors for the complete measurement ---
 # scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py
 # --pass-lock-fds, which records its own PID and both lock dispositions in
 # LATTICE_BENCH_LOCK_STATUS and hands this process the two acquired lock file
@@ -157,22 +156,10 @@ done
 # they refer to the SAME open file descriptions bench-locks.py itself holds
 # open for this run's whole lifetime).
 #
-# A PID appearing in this process's ancestry is a RELATION, never a PROOF: the
-# status file supplies the PID and the OS supplies the chain, so a caller
-# willing to write an ancestor's own PID into a fabricated status file — their
-# own shell's included — gets through unchanged, with neither lock held. That
-# was this function's entire acceptance criterion until this fix, and it is
-# why this function no longer walks ancestry at all: an unprovable lock must
-# never read as a held one, so absent descriptors are refused outright rather
-# than falling back to the PID relation.
-#
-# The actual proof is descriptor identity plus possession: fstat both inherited
-# fds against the ordered canonical lock paths, reject duplicate inodes, and
-# probe both paths with FRESH opens before either inherited fd is re-flocked.
-# Both probes must fail while re-flocking both inherited fds must succeed. After
-# this process closes its copies, a second probe proves the supervisor retained
-# both locks. Those checks live in bench_supervision.py and are reused here via
-# its `verify` and `verify-retained` CLIs rather than reimplemented.
+# bench_supervision.py acquires both inherited descriptors, verifies their
+# identity against fresh stats of the canonical paths, and detects pathname
+# replacement with another fresh comparison after the measurement. This shell
+# retains the capabilities while the descriptor-free subshell does the work.
 LOCK_STATUS_FILE="$REPO/.cache/bench-locks-status.txt"
 LOCK_SUMMARY=""
 verify_locks() {
@@ -195,29 +182,22 @@ verify_locks() {
 
   export LATTICE_BENCH_LOCK_STATUS="$LOCK_STATUS_FILE"
   if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
-    echo "bench-compare: inherited lock descriptors did not prove the" \
-         "bench-window and Metal GPU locks are held — refusing to measure." >&2
-    exit 2
-  fi
-
-  # Verified. Close our copies now: bench-locks.py keeps its own descriptors
-  # on the same open file descriptions open for this run's whole lifetime, so
-  # this process no longer needs them, and leaving them open would leak into
-  # every cargo/rustc child this script spawns below.
-  local fd
-  local -a bench_lock_fds
-  IFS=',' read -r -a bench_lock_fds <<< "$LATTICE_BENCH_LOCK_FDS"
-  for fd in "${bench_lock_fds[@]}"; do
-    eval "exec ${fd}<&-" 2>/dev/null || true
-  done
-  unset LATTICE_BENCH_LOCK_FDS
-  if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify-retained; then
-    echo "bench-compare: lock supervisor did not retain both locks after" \
-         "descriptor retirement — refusing to measure." >&2
+    echo "bench-compare: this process could not acquire and hold the" \
+         "bench-window and Metal GPU locks — refusing to measure." >&2
     exit 2
   fi
 }
 verify_locks
+
+set +e
+(
+set -e
+bench_lock_fds=()
+IFS=',' read -r -a bench_lock_fds <<< "$LATTICE_BENCH_LOCK_FDS"
+for fd in "${bench_lock_fds[@]}"; do
+  eval "exec ${fd}<&-" 2>/dev/null || true
+done
+unset LATTICE_BENCH_LOCK_FDS
 
 # --- Machine-state and ambient-load gates ---
 # A lock excludes peers; it says nothing about ambient load, thermal pressure,
@@ -766,3 +746,13 @@ if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   fi
   exit "$GATE_RC"
 fi
+)
+MEASUREMENT_RC=$?
+set -e
+
+if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
+  echo "bench-compare: a canonical lock pathname changed during the" \
+       "measurement — refusing to certify it." >&2
+  exit 2
+fi
+exit "$MEASUREMENT_RC"

@@ -39,8 +39,10 @@ descriptor referring to that open file description is closed.
 entry-point convention. It passes both descriptors to the immediate command
 as an unforgeable-by-accident capability so that command can prove the locks
 are really held. ``scripts/lib/bench_supervision.py`` passes them only to a
-self-verifying measurement entry point, which closes its copies before doing
-work. Arbitrary commands and build descendants never receive them.
+self-verifying measurement process, which retains its copies through the work.
+Python marks them close-on-exec, Node closes extra descriptors in child spawns,
+and shell measurement children close them before running. Arbitrary commands
+and build descendants never receive them.
 
 WHY lsof IS ONLY A DIAGNOSTIC HERE. lsof lists processes that have the lock
 file OPEN, which is a superset of those holding a flock on it, and it does not

@@ -1,25 +1,21 @@
 #!/usr/bin/env bash
 
-bench_retire_lock_fds() {
-    local repo helper fd
+bench_close_lock_fds() {
+    local fd
     local -a bench_lock_fds
-    repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-    helper="$repo/scripts/lib/bench_supervision.py"
 
     IFS=',' read -r -a bench_lock_fds <<<"$LATTICE_BENCH_LOCK_FDS"
     for fd in "${bench_lock_fds[@]}"; do
         eval "exec ${fd}>&-"
     done
     unset LATTICE_BENCH_LOCK_FDS
-    if ! python3 "$helper" verify-retained; then
-        exit 2
-    fi
 }
 
 bench_supervise_entry() {
     local label="$1"
     local mode="$2"
-    shift 2
+    local measurement="$3"
+    shift 3
 
     local repo helper
     repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -43,7 +39,16 @@ bench_supervise_entry() {
     if [[ "$mode" == "handoff" ]]; then
         return 0
     fi
-    bench_retire_lock_fds
+
+    local measurement_rc=0
+    (
+        bench_close_lock_fds
+        "$measurement" "$@"
+    ) || measurement_rc=$?
+    if ! python3 "$helper" verify; then
+        return 2
+    fi
+    return "$measurement_rc"
 }
 
 bench_quiet_checkpoint() {

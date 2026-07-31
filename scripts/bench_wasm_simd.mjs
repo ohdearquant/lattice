@@ -87,19 +87,10 @@ const receipt = spawnSync('python3', [SUPERVISION, 'verify', '--require-quiet'],
   env: process.env,
 });
 if (receipt.error || receipt.status !== 0) {
-  console.error('bench_wasm_simd: invalid machine-wide lock receipt');
+  console.error('bench_wasm_simd: could not acquire both canonical locks');
   process.exit(2);
 }
-for (const fd of LOCK_FDS) closeSync(fd);
 delete process.env.LATTICE_BENCH_LOCK_FDS;
-const retained = spawnSync('python3', [SUPERVISION, 'verify-retained'], {
-  stdio: 'inherit',
-  env: process.env,
-});
-if (retained.error || retained.status !== 0) {
-  console.error('bench_wasm_simd: lock supervisor did not retain both locks');
-  process.exit(2);
-}
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -278,3 +269,16 @@ for (const dim of ARGS.dims) {
     );
   }
 }
+
+const completed = spawnSync('python3', [SUPERVISION, 'verify'], {
+  stdio: supervisionStdio(),
+  env: {
+    ...process.env,
+    LATTICE_BENCH_LOCK_FDS: LOCK_FDS.join(','),
+  },
+});
+if (completed.error || completed.status !== 0) {
+  console.error('bench_wasm_simd: a canonical lock pathname changed during measurement');
+  process.exit(2);
+}
+for (const fd of LOCK_FDS) closeSync(fd);
