@@ -97,7 +97,7 @@ by eliminating two norm-squared accumulations and two square roots.
 
 **Deterministic retrieval-fidelity regression**
 
-`test_tier_retrieval_quality_against_independent_f32_ranking` exercises the stored-vector
+`test_tier_retrieval_quality_against_independent_f64_ranking` exercises the stored-vector
 conversion, prepared-query conversion, and prepared cosine-distance dispatch for every tier.
 It compares each result with rankings produced independently by a scalar f64 cosine
 implementation over 16 fixed-seed queries and 256 fixed-seed 384-dimensional synthetic
@@ -110,11 +110,24 @@ vectors. The test reports mean Recall@10 and full-corpus pairwise ranking agreem
 | Int4   |            0.91875 |         0.85 |            0.96984 |           0.950 |
 | Binary |            0.44375 |         0.30 |            0.77285 |           0.700 |
 
-The floors leave margin below the deterministic aarch64 snapshot for backend reduction
-rounding while still detecting material ranking regressions. Representation, tier identity,
-lossy-conversion, and distance-divergence assertions ensure a storage-conversion bypass or tier
-misrouting cannot satisfy the quality checks accidentally. The ranking gate does not prove which
-internal distance kernel produced the scores.
+Except for exact Full Recall@10, the aggregate floors leave margin below the deterministic aarch64
+snapshot for backend reduction rounding. A worst-query gate also prevents a collapsed subset from
+being hidden by those means:
+
+| Tier   | Per-query Recall@10 range | Per-query recall floor | Per-query agreement range | Per-query agreement floor |
+| ------ | ------------------------: | ---------------------: | ------------------------: | ------------------------: |
+| Full   |                   1.0–1.0 |                    0.9 |         1.000000–1.000000 |                  1.000000 |
+| Int8   |                   1.0–1.0 |                    0.9 |         0.997763–0.998897 |                  0.996630 |
+| Int4   |                   0.8–1.0 |                    0.7 |         0.966023–0.973438 |                  0.958609 |
+| Binary |                   0.3–0.7 |                    0.2 |         0.748254–0.787531 |                  0.708977 |
+
+The recall bound allows one additional Recall@10 miss below the observed minimum. The agreement
+bound extends one observed min-to-max range below the minimum; Full has no observed agreement
+spread and therefore remains exact. These fixture-derived margins detect whole-query collapse
+without replacing the aggregate gates. Representation, tier identity, lossy-conversion, and
+distance-divergence assertions ensure a storage-conversion bypass or tier misrouting cannot
+satisfy the quality checks accidentally. The ranking gate does not prove which internal distance
+kernel produced the scores.
 
 This fixture is synthetic regression evidence, not a model benchmark. It neither establishes
 quality on production embedding distributions nor identifies acceptable end-user recall.
