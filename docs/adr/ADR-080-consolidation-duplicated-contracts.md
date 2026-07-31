@@ -345,11 +345,16 @@ protected entry point or entire test, and rejects any later use of that binding,
 including an immediate `drop`. This proves the repository's checked binding
 convention, not arbitrary Rust lifetime semantics or indirect GPU call graphs.
 The same contract rejects inventory drift, a second Rust definition, or a second
-fleet-path literal.
+fleet-path literal. A separate direct raw-dispatch inventory walks every Rust
+file below `src`, examines functions carrying `#[test]` or a `cfg_attr` capable
+of emitting a test attribute, and records every such function containing the
+literal `new_command_buffer()` marker by source path and function name. It does
+not claim helper-mediated dispatch whose test function lacks that literal.
 
-**Resolves**: #1115 — one shared Metal test/measurement guard, the four prior
-implementations migrated, and every verified raw Metal measurement harness
-serialized before GPU work.
+**Partial completion**: #1115 — one shared Metal test/measurement guard, the four
+prior implementations migrated, and the verified direct raw Metal measurement
+harnesses serialized before GPU work. The remaining target families,
+helper-mediated paths, and process-lifetime exemptions are tracked in #1274.
 
 ## What we are NOT doing
 

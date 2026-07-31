@@ -96,19 +96,20 @@ const REVIEWED_NON_METAL_TOP_LEVEL_TARGETS: &[&str] = &[
     "src/bin/qwen35_generate.rs",
 ];
 const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
-    "test_gemv_decode_numerical",
-    "test_gpu_argmax_parity_k1",
-    "decode_attention_reference_fails_closed_on_nan_q",
-    "gemv_q3_decode_matches_cpu_reference_across_shapes",
-    "gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
-    "gemm_q3_tiled_differential_fails_closed_on_nan_scale",
-    "gemv_q3_decode_mutation_sensitive_high_plane_bit",
-    "lora_gemv_kernel_matches_cpu_reference",
-    "load_adapter_and_dispatch_lora_if_active",
-    "dispatch_matmul_q4_writes_all_rows",
+    "src/forward/metal.rs::rms_norm_matches_pre_854_oracle_on_finite_input",
+    "src/forward/metal_qwen35.rs::test_gemv_decode_numerical",
+    "src/forward/metal_qwen35.rs::test_gpu_argmax_parity_k1",
+    "src/forward/metal_qwen35.rs::decode_attention_reference_fails_closed_on_nan_q",
+    "src/forward/metal_qwen35.rs::gemv_q3_decode_matches_cpu_reference_across_shapes",
+    "src/forward/metal_qwen35.rs::gemm_q3_tiled_matches_cpu_reference_at_tile_boundaries",
+    "src/forward/metal_qwen35.rs::gemm_q3_tiled_differential_fails_closed_on_nan_scale",
+    "src/forward/metal_qwen35.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
+    "src/forward/metal_qwen35.rs::lora_gemv_kernel_matches_cpu_reference",
+    "src/forward/metal_qwen35.rs::load_adapter_and_dispatch_lora_if_active",
+    "src/forward/metal_qwen35.rs::dispatch_matmul_q4_writes_all_rows",
 ];
 const IN_CRATE_COMMAND_BUFFER_EXEMPTIONS: &[(&str, &str)] = &[(
-    "test_gpu_argmax_parity_k1",
+    "src/forward/metal_qwen35.rs::test_gpu_argmax_parity_k1",
     "existing raw-dispatch test; migration is tracked with the remaining Metal lock work",
 )];
 
@@ -291,31 +292,75 @@ fn closing_scope(code: &[u8], start: usize, indentation: usize) -> Option<usize>
     None
 }
 
+fn matching_opening_bracket(code: &[u8], closing: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for offset in (0..=closing).rev() {
+        match code[offset] {
+            b']' => depth += 1,
+            b'[' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn outer_attribute_stack<'a>(
+    source: &'a str,
+    code: &[u8],
+    before: usize,
+    indentation: usize,
+) -> Result<Vec<&'a str>, ()> {
+    let mut attributes = Vec::new();
+    let mut cursor = before;
+    loop {
+        let Some(closing) = code[..cursor]
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())
+        else {
+            break;
+        };
+        if code[closing] != b']' {
+            break;
+        }
+        let Some(opening) = matching_opening_bracket(code, closing) else {
+            return Err(());
+        };
+        let Some(hash) = opening
+            .checked_sub(1)
+            .filter(|offset| code[*offset] == b'#')
+        else {
+            break;
+        };
+        let line_start = source[..hash].rfind('\n').map_or(0, |offset| offset + 1);
+        if code[line_start..hash]
+            .iter()
+            .any(|byte| !byte.is_ascii_whitespace())
+            || leading_spaces(&source[line_start..hash]) != indentation
+        {
+            return Err(());
+        }
+        attributes.push(&source[hash..=closing]);
+        cursor = hash;
+    }
+    Ok(attributes)
+}
+
 fn guard_statement_is_present_in_metal_build(
     source: &str,
     code: &[u8],
     line_start: usize,
     indentation: usize,
 ) -> bool {
-    let Some(previous_end) = code[..line_start]
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-    else {
-        return true;
+    let Ok(attributes) = outer_attribute_stack(source, code, line_start, indentation) else {
+        return false;
     };
-    let previous_start = code[..previous_end]
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |offset| offset + 1);
-    let previous_line = &source[previous_start..=previous_end];
-    if leading_spaces(previous_line) != indentation {
-        return true;
-    }
-    let attribute = previous_line.trim();
-    if attribute == "#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]" {
-        return true;
-    }
-    !attribute.starts_with("#[") && !attribute.ends_with(']')
+    attributes.is_empty()
+        || attributes.as_slice() == ["#[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]"]
 }
 
 fn guard_scopes(source: &str, lock_call: &str) -> Vec<GuardScope> {
@@ -419,35 +464,117 @@ struct TestFunction<'a> {
     source: &'a str,
 }
 
+fn top_level_meta_arguments(meta: &str) -> Vec<&str> {
+    let code = rust_code_mask(meta);
+    let mut arguments = Vec::new();
+    let mut start = 0;
+    let mut parens = 0usize;
+    let mut brackets = 0usize;
+    let mut braces = 0usize;
+    for (offset, byte) in code.iter().copied().enumerate() {
+        match byte {
+            b'(' => parens += 1,
+            b')' => parens = parens.saturating_sub(1),
+            b'[' => brackets += 1,
+            b']' => brackets = brackets.saturating_sub(1),
+            b'{' => braces += 1,
+            b'}' => braces = braces.saturating_sub(1),
+            b',' if parens == 0 && brackets == 0 && braces == 0 => {
+                arguments.push(&meta[start..offset]);
+                start = offset + 1;
+            }
+            _ => {}
+        }
+    }
+    arguments.push(&meta[start..]);
+    arguments
+}
+
+fn meta_registers_test(meta: &str) -> bool {
+    if meta == "test" || meta.ends_with("::test") {
+        return true;
+    }
+    let Some(arguments) = meta
+        .strip_prefix("cfg_attr(")
+        .and_then(|meta| meta.strip_suffix(')'))
+    else {
+        return false;
+    };
+    top_level_meta_arguments(arguments)
+        .into_iter()
+        .skip(1)
+        .any(meta_registers_test)
+}
+
+fn attribute_registers_test(attribute: &str) -> bool {
+    let compact = attribute
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    compact
+        .strip_prefix("#[")
+        .and_then(|attribute| attribute.strip_suffix(']'))
+        .is_some_and(meta_registers_test)
+}
+
+fn matching_closing_brace(code: &[u8], opening: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (relative, byte) in code[opening..].iter().copied().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(opening + relative);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn test_functions(source: &str) -> Vec<TestFunction<'_>> {
     let code = rust_code_mask(source);
     let mut functions = Vec::new();
     let mut cursor = 0;
-    while let Some(attribute) = source[cursor..].find("#[test]").map(|pos| cursor + pos) {
-        let Some(function) = source[attribute..].find("fn ").map(|pos| attribute + pos) else {
-            break;
-        };
-        let Some(open_brace) = source[function..].find('{').map(|pos| function + pos) else {
-            break;
-        };
+    while let Some(function) = code[cursor..]
+        .windows("fn ".len())
+        .position(|window| window == b"fn ")
+        .map(|position| cursor + position)
+    {
+        let before = code[..function].last().copied();
+        if before.is_some_and(|byte| byte == b'_' || byte.is_ascii_alphanumeric()) {
+            cursor = function + "fn ".len();
+            continue;
+        }
         let line_start = source[..function]
             .rfind('\n')
             .map_or(0, |offset| offset + 1);
         let indentation = leading_spaces(&source[line_start..function]);
-        let Some(close_line) = closing_scope(&code, open_brace + 1, indentation + 4) else {
+        let attributes = outer_attribute_stack(source, &code, line_start, indentation)
+            .unwrap_or_else(|()| panic!("could not parse the attribute stack before a function"));
+        if !attributes.iter().copied().any(attribute_registers_test) {
+            cursor = function + "fn ".len();
+            continue;
+        }
+        let Some(open_brace) = code[function..]
+            .iter()
+            .position(|byte| *byte == b'{')
+            .map(|position| function + position)
+        else {
             break;
         };
-        let close_brace = close_line
-            + source[close_line..]
-                .find('}')
-                .expect("closing scope line contains a brace");
+        let Some(close_brace) = matching_closing_brace(&code, open_brace) else {
+            break;
+        };
         let name_start = function + "fn ".len();
         let Some(name_end) = source[name_start..].find('(').map(|pos| name_start + pos) else {
             break;
         };
         functions.push(TestFunction {
-            name: &source[name_start..name_end],
-            source: &source[attribute..close_brace + 1],
+            name: source[name_start..name_end].trim(),
+            source: &source[function..close_brace + 1],
         });
         cursor = close_brace + 1;
     }
@@ -561,8 +688,6 @@ fn alternate_and_helper_mediated_entrypoints_hold_the_shared_lock() {
 #[test]
 fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = std::fs::read_to_string(manifest_dir.join("src/forward/metal_qwen35.rs"))
-        .expect("read in-crate Metal tests");
     let exemptions = IN_CRATE_COMMAND_BUFFER_EXEMPTIONS
         .iter()
         .map(|(name, reason)| {
@@ -575,31 +700,39 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut discovered = BTreeSet::new();
     let mut violations = Vec::new();
-    for function in test_functions(&source) {
-        let command_buffers = function
-            .source
-            .match_indices("new_command_buffer()")
-            .map(|(offset, _)| offset)
-            .collect::<Vec<_>>();
-        if command_buffers.is_empty() {
-            continue;
-        }
-        discovered.insert(function.name);
-        if exemptions.contains_key(function.name) {
-            continue;
-        }
-        for work in command_buffers {
-            if let Err(reason) =
-                lock_held_through_function(function.source, "gpu_test_lock()", work)
-            {
-                violations.push(format!("{}: {reason}", function.name));
+    for path in rust_sources_under(&manifest_dir.join("src")) {
+        let source = std::fs::read_to_string(&path).expect("read in-crate Rust source");
+        let relative = path
+            .strip_prefix(manifest_dir)
+            .expect("source under manifest directory")
+            .to_string_lossy();
+        for function in test_functions(&source) {
+            let command_buffers = function
+                .source
+                .match_indices("new_command_buffer()")
+                .map(|(offset, _)| offset)
+                .collect::<Vec<_>>();
+            if command_buffers.is_empty() {
+                continue;
+            }
+            let site = format!("{relative}::{}", function.name);
+            discovered.insert(site.clone());
+            if exemptions.contains_key(site.as_str()) {
+                continue;
+            }
+            for work in command_buffers {
+                if let Err(reason) =
+                    lock_held_through_function(function.source, "gpu_test_lock()", work)
+                {
+                    violations.push(format!("{site}: {reason}"));
+                }
             }
         }
     }
 
     let reviewed = IN_CRATE_COMMAND_BUFFER_TESTS
         .iter()
-        .copied()
+        .map(|site| (*site).to_string())
         .collect::<BTreeSet<_>>();
     assert_eq!(
         discovered, reviewed,
@@ -610,6 +743,23 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
         "in-crate raw command-buffer tests without a function-lifetime shared lock:\n{}",
         violations.join("\n")
     );
+}
+
+#[test]
+fn cfg_attr_test_function_is_included_in_raw_dispatch_inventory() {
+    let source = r#"
+#[cfg_attr(test, test)]
+fn cfg_attr_registered_test() {
+    let command_buffer = queue.new_command_buffer();
+}
+"#;
+    let discovered = test_functions(source)
+        .into_iter()
+        .filter(|function| function.source.contains("new_command_buffer()"))
+        .map(|function| function.name)
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(discovered, BTreeSet::from(["cfg_attr_registered_test"]));
 }
 
 #[test]
@@ -645,6 +795,32 @@ fn measurement() {
 }
 "#;
     assert_guard_fixture_rejected(source, "a cfg-elided guard acquisition");
+}
+
+#[test]
+fn guard_lifetime_rejects_a_stacked_cfg_elided_acquisition() {
+    let source = r#"
+fn measurement() {
+    #[cfg(any())]
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
+    let _device = Device::system_default();
+}
+"#;
+    assert_guard_fixture_rejected(source, "a stacked cfg-elided guard acquisition");
+}
+
+#[test]
+fn guard_lifetime_rejects_an_active_cfg_attr_elided_acquisition() {
+    let source = r#"
+fn measurement() {
+    #[cfg_attr(all(), cfg(any()))]
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
+    let _device = Device::system_default();
+}
+"#;
+    assert_guard_fixture_rejected(source, "an active cfg_attr-elided guard acquisition");
 }
 
 #[test]
