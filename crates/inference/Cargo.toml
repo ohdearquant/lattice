@@ -291,11 +291,6 @@ harness = false
 required-features = ["f16"]
 
 [[bench]]
-name = "compute_attention_bench"
-harness = false
-required-features = ["bench-internals"]
-
-[[bench]]
 name = "kv_cache_layout_bench"
 harness = false
 required-features = ["bench-internals"]

@@ -8177,7 +8177,7 @@ mod inner {
         ) -> GenerateOutput {
             let cfg = self.engine.config.clone();
 
-            // Mirror plain greedy `generate()` (generate.rs:235): max_new_tokens == 0
+            // Mirror canonical plain greedy generation: max_new_tokens == 0
             // means "generate nothing".  Return before sampling so we never emit a
             // token the caller did not ask for — including the case-A prefill-EOS path
             // below, which would otherwise emit one stop token for a zero budget.
@@ -8423,7 +8423,7 @@ mod inner {
         ) -> GenerateOutput {
             let cfg = self.engine.config.clone();
 
-            // Mirror plain greedy `generate()` (generate.rs:293) and the sibling
+            // Mirror canonical plain greedy generation and the sibling
             // `generate_greedy_mtp`: max_new_tokens == 0 means "generate nothing".
             // Return before sampling so we never emit a token the caller did not ask
             // for — including the case-A prefill-EOS path below, which would otherwise
@@ -36923,8 +36923,8 @@ mod multimodal_preflight_tests {
 // `generate`, `generate_streaming_with_cancel`, and
 // `generate_streaming_with_prefix_cache_inner` all apply grammar masking via
 // `GrammarEngine::mask_logits`, which sets every disallowed logit position to
-// `f32::NEG_INFINITY`. `crate::model::qwen35::generation` and `crate::generate`
-// (the CPU paths) each guard every `mask_logits` call with a `has_finite_logit`
+// `f32::NEG_INFINITY`. `crate::model::qwen35::generation` (the canonical CPU path)
+// guards every `mask_logits` call with a `has_finite_logit`
 // check and fail closed with `InferenceError::GrammarConstraintBlocked` when
 // the grammar blocks every token — otherwise the sampler's non-finite-max short-circuit
 // would silently return the first candidate's token id (numerically safe, but
@@ -37049,11 +37049,10 @@ pub enum MtpRoundOutcome {
 ///   choice for the draft position, replaces the rejected draft).
 /// * `is_stop` – Returns `true` for EOS / stop-token IDs.
 ///
-/// # Stop-token contract (#613, matches plain greedy `generate()`)
+/// # Stop-token contract (#613, matches canonical plain greedy generation)
 ///
 /// Plain greedy never appends the terminating stop token to the output
-/// (generate.rs checks `config.eos_token_id == Some(token)` *before*
-/// `generated_ids.push(token)` and skips the push on a match). This function
+/// (it checks the stop condition before appending the token). This function
 /// honours the same invariant for every terminal case: a token that is itself
 /// a stop token is never included in the emitted vector.
 ///
@@ -37771,7 +37770,7 @@ mod mtp_greedy_round_tests {
     // greedily pick argmax at each position, stop when argmax is a stop
     // token (excluding that stop token from the output), or at max_len.
     //
-    // Stop-token contract (#613): matches generate.rs's fixed logic — the
+    // Stop-token contract (#613): the
     // is_stop check happens BEFORE the push, so a stop token is never
     // present in `token_ids`/`text`. The stop still consumes the position
     // (an "attempt" within max_len), it's just not emitted.
@@ -38677,7 +38676,7 @@ mod mtp_greedy_round_tests {
 // post-fix decision logic for each termination path WITHOUT re-deriving it from
 // the buggy pre-fix code, so it acts as an independent reference.
 //
-// Stop-token contract (#613, matches generate.rs / GenerateOutput docs): the
+// Stop-token contract (#613, matches canonical GenerateOutput docs): the
 // terminating token is EXCLUDED from token_ids/text at every termination path:
 //   A:  prefill argmax is stop → emit [], generated_tokens = 0.
 //   R:  rejection: target replacement is stop → emit [pending] (replacement excluded).
