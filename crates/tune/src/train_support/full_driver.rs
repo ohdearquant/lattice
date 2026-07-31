@@ -181,12 +181,16 @@ const MAX_SAMPLES: usize = 100_000;
 /// ceiling used by the public micro-LoRA trainer.
 const MAX_SEQ_LEN_CAP: usize = 8_192;
 
-/// Upper bound on the live captured-logits memory for one sample.
+/// Upper bound on simultaneously live vocabulary-sized logit buffers for one
+/// sample.
 ///
 /// [`forward_full`] retains one vocabulary-sized `f32` row per supervised
-/// completion position, while training and [`eval_chain_nll`] build and drop
-/// one sample's [`crate::lora::train_core::FullFwd`] at a time.
+/// completion position. [`nll_and_grads`] also allocates one vocabulary-sized
+/// reverse workspace row while those retained rows remain live.
 const MAX_LOGITS_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+const BACKWARD_LOGITS_WORKSPACE_ROWS: usize = 1;
+const EVAL_LOGITS_WORKSPACE_ROWS: usize = 0;
 
 /// Upper bound on the frozen-prefix attention cache ([`build_caches`]'s
 /// `h_in` + RoPE `cos`/`sin` buffers) for one sample set, in bytes. Bounds
@@ -324,44 +328,58 @@ fn check_cache_budget(
     Ok(())
 }
 
-/// Reject any sample whose simultaneously live [`forward_full`] logits would
-/// exceed [`MAX_LOGITS_BYTES`].
+/// Reject any sample whose simultaneously live vocabulary-sized logit rows
+/// would exceed [`MAX_LOGITS_BYTES`].
 ///
 /// The tape retains logits only for supervised completion positions, not the
-/// prompt, and only one sample tape is live at a time. This check therefore
-/// applies per sample rather than summing positions across the dataset.
-fn check_live_logits_budget(samples: &[Sample], vocab: usize, label: &str) -> Result<(), String> {
+/// prompt. `workspace_rows` accounts for vocabulary-sized buffers that coexist
+/// with the tape, and only one sample tape is live at a time.
+fn check_live_logits_budget(
+    samples: &[Sample],
+    vocab: usize,
+    workspace_rows: usize,
+    label: &str,
+) -> Result<(), String> {
     let bytes_per_logit = std::mem::size_of::<f32>();
     for (sample_index, sample) in samples.iter().enumerate() {
-        let completion_positions = sample
-            .tokens
-            .len()
-            .checked_sub(sample.completion_start)
+        if sample.completion_start == 0 || sample.completion_start >= sample.tokens.len() {
+            return Err(format!(
+                "{label} sample {} has invalid completion_start {}; expected \
+                 1 <= completion_start < {} for its {} tokens",
+                sample_index + 1,
+                sample.completion_start,
+                sample.tokens.len(),
+                sample.tokens.len(),
+            ));
+        }
+        let completion_positions = sample.tokens.len() - sample.completion_start;
+        let live_rows = completion_positions
+            .checked_add(workspace_rows)
             .ok_or_else(|| {
                 format!(
-                    "{label} sample {} has completion_start {} beyond its {} tokens",
+                    "{label} sample {} live-logits row count overflows usize \
+                     ({completion_positions} supervised positions + {workspace_rows} \
+                     workspace rows)",
                     sample_index + 1,
-                    sample.completion_start,
-                    sample.tokens.len(),
                 )
             })?;
-        let logits_bytes = completion_positions
+        let logits_bytes = live_rows
             .checked_mul(vocab)
             .and_then(|elements| elements.checked_mul(bytes_per_logit))
             .ok_or_else(|| {
                 format!(
                     "{label} sample {} live-logits size overflows usize \
-                     ({completion_positions} supervised positions × {vocab} vocab × \
-                     {bytes_per_logit}B)",
+                     ({completion_positions} supervised positions + {workspace_rows} \
+                     workspace rows = {live_rows} live rows; {vocab} vocab × {bytes_per_logit}B)",
                     sample_index + 1,
                 )
             })?;
         if logits_bytes > MAX_LOGITS_BYTES {
             return Err(format!(
                 "{label} sample {} live logits would require {} MiB \
-                 ({completion_positions} supervised positions × {vocab} vocab × \
-                 {bytes_per_logit}B), exceeds {} MiB cap - reduce --seq-len or shorten \
-                 the completion",
+                 ({completion_positions} supervised positions + {workspace_rows} workspace rows \
+                 = {live_rows} live rows; {vocab} vocab × {bytes_per_logit}B), exceeds {} MiB \
+                 cap - reduce --seq-len or shorten the completion",
                 sample_index + 1,
                 logits_bytes / (1024 * 1024),
                 MAX_LOGITS_BYTES / (1024 * 1024),
@@ -592,7 +610,12 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     println!("  {} samples loaded", train_samples.len());
 
     check_cache_budget(&train_samples, dims.hidden, dims.rope_dim, "train")?;
-    check_live_logits_budget(&train_samples, dims.vocab, "training")?;
+    check_live_logits_budget(
+        &train_samples,
+        dims.vocab,
+        BACKWARD_LOGITS_WORKSPACE_ROWS,
+        "training",
+    )?;
 
     // Capture the frozen prefix output (h_in entering first_layer) per sample.
     println!("\nBuilding frozen-prefix cache (layers 0..{first_layer})...");
@@ -615,7 +638,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         ) {
             Ok(vs) if !vs.is_empty() => {
                 check_cache_budget(&vs, dims.hidden, dims.rope_dim, "valid")?;
-                check_live_logits_budget(&vs, dims.vocab, "held-out")?;
+                check_live_logits_budget(&vs, dims.vocab, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")?;
                 let (vc, vpos) = build_caches(&model, &vs, first_layer)?;
                 println!(
                     "  held-out: {vpos} completion positions across {} valid samples",
@@ -1347,7 +1370,7 @@ mod run_bounds_tests {
             * std::mem::size_of::<f32>() as u128;
         assert!(aggregate_bytes > MAX_LOGITS_BYTES as u128);
 
-        check_live_logits_budget(&samples, vocab, "training")
+        check_live_logits_budget(&samples, vocab, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
             .expect("only one sample's logits are live at a time");
     }
 
@@ -1369,7 +1392,9 @@ mod run_bounds_tests {
             },
         ];
 
-        let err = check_live_logits_budget(&samples, vocab, "training").unwrap_err();
+        let err =
+            check_live_logits_budget(&samples, vocab, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
+                .unwrap_err();
         assert!(
             err.contains("sample 2")
                 && err.contains("257 supervised positions")
@@ -1379,18 +1404,65 @@ mod run_bounds_tests {
     }
 
     #[test]
-    fn check_live_logits_budget_counts_only_supervised_positions() {
+    fn check_live_logits_budget_accepts_training_exact_live_cap() {
         let vocab = 2_097_152;
         let sample = Sample {
             tokens: vec![0u32; 1_024],
-            completion_start: 768,
+            completion_start: 769,
         };
         let raw_token_projection =
             sample.tokens.len() as u128 * vocab as u128 * std::mem::size_of::<f32>() as u128;
         assert!(raw_token_projection > MAX_LOGITS_BYTES as u128);
 
-        check_live_logits_budget(&[sample], vocab, "training")
-            .expect("256 supervised positions exactly at the cap must be accepted");
+        check_live_logits_budget(&[sample], vocab, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
+            .expect("255 retained rows plus one backward workspace row must reach the exact cap");
+    }
+
+    #[test]
+    fn check_live_logits_budget_rejects_training_one_row_over_live_cap() {
+        let sample = Sample {
+            tokens: vec![0u32; 257],
+            completion_start: 1,
+        };
+
+        let err = check_live_logits_budget(
+            &[sample],
+            2_097_152,
+            BACKWARD_LOGITS_WORKSPACE_ROWS,
+            "training",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("256 supervised positions") && err.contains("exceeds"),
+            "expected training workspace row to exceed the live cap; got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_live_logits_budget_accepts_held_out_exact_retained_cap() {
+        let sample = Sample {
+            tokens: vec![0u32; 257],
+            completion_start: 1,
+        };
+
+        check_live_logits_budget(&[sample], 2_097_152, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")
+            .expect("256 retained rows and no backward workspace must reach the exact cap");
+    }
+
+    #[test]
+    fn check_live_logits_budget_rejects_held_out_one_row_over_retained_cap() {
+        let sample = Sample {
+            tokens: vec![0u32; 258],
+            completion_start: 1,
+        };
+
+        let err =
+            check_live_logits_budget(&[sample], 2_097_152, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")
+                .unwrap_err();
+        assert!(
+            err.contains("257 supervised positions") && err.contains("exceeds"),
+            "expected retained logits to exceed the held-out cap; got: {err}"
+        );
     }
 
     #[test]
@@ -1399,7 +1471,13 @@ mod run_bounds_tests {
             tokens: vec![0u32; 3],
             completion_start: 1,
         };
-        let err = check_live_logits_budget(&[sample], usize::MAX, "held-out").unwrap_err();
+        let err = check_live_logits_budget(
+            &[sample],
+            usize::MAX,
+            EVAL_LOGITS_WORKSPACE_ROWS,
+            "held-out",
+        )
+        .unwrap_err();
         assert!(
             err.contains("held-out") && err.contains("overflows"),
             "expected checked-arithmetic rejection; got: {err}"
@@ -1407,15 +1485,59 @@ mod run_bounds_tests {
     }
 
     #[test]
-    fn check_live_logits_budget_rejects_invalid_completion_start() {
+    fn check_live_logits_budget_rejects_workspace_row_overflow() {
+        let sample = Sample {
+            tokens: vec![0u32; 2],
+            completion_start: 1,
+        };
+        let err = check_live_logits_budget(&[sample], 32, usize::MAX, "training").unwrap_err();
+        assert!(
+            err.contains("row count") && err.contains("overflows"),
+            "expected checked workspace-row rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_live_logits_budget_rejects_zero_completion_start() {
+        let sample = Sample {
+            tokens: vec![0u32; 2],
+            completion_start: 0,
+        };
+        let err =
+            check_live_logits_budget(&[sample], 32, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
+                .unwrap_err();
+        assert!(
+            err.contains("completion_start") && err.contains("1 <= completion_start < 2"),
+            "expected zero completion boundary rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_live_logits_budget_rejects_completion_start_at_token_count() {
+        let sample = Sample {
+            tokens: vec![0u32; 2],
+            completion_start: 2,
+        };
+        let err = check_live_logits_budget(&[sample], 32, EVAL_LOGITS_WORKSPACE_ROWS, "held-out")
+            .unwrap_err();
+        assert!(
+            err.contains("completion_start") && err.contains("1 <= completion_start < 2"),
+            "expected empty completion boundary rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_live_logits_budget_rejects_completion_start_past_token_count() {
         let sample = Sample {
             tokens: vec![0u32; 1],
             completion_start: 2,
         };
-        let err = check_live_logits_budget(&[sample], 32, "training").unwrap_err();
+        let err =
+            check_live_logits_budget(&[sample], 32, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
+                .unwrap_err();
         assert!(
-            err.contains("completion_start") && err.contains("beyond"),
-            "expected invalid completion boundary rejection; got: {err}"
+            err.contains("completion_start"),
+            "expected past-end completion boundary rejection; got: {err}"
         );
     }
 

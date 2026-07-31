@@ -304,11 +304,13 @@ q/k-normalization stays raw because the GQA forward path applies its own
 shift internally.
 
 The command performs a zero-adapter TBV check before it trains or checks
-gradients. It refuses any individual sample whose simultaneously retained
-completion-position logits would exceed 2 GiB; dataset-wide completion
-positions remain a reporting total because evaluation builds and drops one
-sample tape at a time. It uses `valid.jsonl` only for held-out evaluation when
-requested.
+gradients. It refuses any individual sample whose simultaneously live
+vocabulary-sized logit buffers would exceed 2 GiB. Training and gradient
+checking charge one retained row per completion position plus one backward
+`d_logits` workspace row; held-out evaluation charges only the retained rows
+because it does not run backward. Dataset-wide completion positions remain a
+reporting total because evaluation builds and drops one sample tape at a time.
+It uses `valid.jsonl` only for held-out evaluation when requested.
 
 ### Gradient validation
 
