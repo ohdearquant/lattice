@@ -57,13 +57,13 @@ fn run() {
     state.reset_state();
     let _ = state.forward_prefill(&prompt_ids);
 
-    // Warmup decode: 3 steps at positions prefill_len..prefill_len+3
-    // kv_cache.seq_len is private — it stays fixed at prefill_len after forward_prefill.
-    // We increment the `position` argument to give correct RoPE embeddings each step.
-    // KV writes overwrite the same slot (seq_len slot), which is acceptable for timing.
+    // Warmup decode: 3 steps at positions prefill_len..prefill_len+3.
     for i in 0..3usize {
         let _ = state.forward_step(200 + i as u32, prefill_len + i);
     }
+
+    state.reset_state();
+    let _ = state.forward_prefill(&prompt_ids);
 
     let n_steps = 10usize;
     eprintln!(
