@@ -124,10 +124,38 @@ being hidden by those means:
 The recall bound allows one additional Recall@10 miss below the observed minimum. The agreement
 bound extends one observed min-to-max range below the minimum; Full has no observed agreement
 spread and therefore remains exact. These fixture-derived margins detect whole-query collapse
-without replacing the aggregate gates. Representation, tier identity, lossy-conversion, and
-distance-divergence assertions ensure a storage-conversion bypass or tier misrouting cannot
-satisfy the quality checks accidentally. The ranking gate does not prove which internal distance
-kernel produced the scores.
+without replacing the aggregate gates. Every minimum floor is inclusive: a value at the floor is
+accepted. The comparison admits one `f64` epsilon so an exact boundary is not rejected solely
+because averaging rounded it down; non-finite values still fail.
+
+The gate also pins each tier's healthy 16-query vector as exact Recall@10 hit counts and agreeing
+pair counts. For each metric it sums the absolute per-query movement from that vector and permits
+at most one observed healthy min-to-max range across the entire fixture:
+
+```text
+movement(metric) = sum(abs(candidate[query] - healthy[query]))
+budget(metric) = max(healthy) - min(healthy)
+```
+
+| Tier   | Total recall budget | Uniform recall budget/query | Total agreement budget | Uniform agreement budget/query |
+| ------ | ------------------: | --------------------------: | ---------------------: | -----------------------------: |
+| Full   |              0.0000 |                      0.0000 |               0.000000 |                       0.000000 |
+| Int8   |              0.0000 |                      0.0000 |               0.001134 |                       0.000071 |
+| Int4   |              0.2000 |                      0.0125 |               0.007414 |                       0.000463 |
+| Binary |              0.4000 |                      0.0250 |               0.039277 |                       0.002455 |
+
+The agreement totals are exactly 0, 37, 242, and 1,282 pair movements out of 32,640 for Full,
+Int8, Int4, and Binary. Under a uniform shift, the nonzero allowances are therefore 2.3125,
+15.125, and 80.125 agreement-pair changes per query. This is the deliberately accepted broad movement;
+a larger uniform shift fails even if every query still clears its absolute floor. The healthy
+fixture has zero movement and retains the full stated margin. Zero-spread metrics retain zero
+movement allowance, so Full's exact handling is unchanged. Absolute movement prevents gains on
+some queries from cancelling losses on others and makes a material improvement require the same
+deliberate fixture recalibration as a material regression.
+
+Representation, tier identity, lossy-conversion, and distance-divergence assertions ensure a
+storage-conversion bypass or tier misrouting cannot satisfy the quality checks accidentally. The
+ranking gate does not prove which internal distance kernel produced the scores.
 
 This fixture is synthetic regression evidence, not a model benchmark. It neither establishes
 quality on production embedding distributions nor identifies acceptable end-user recall.

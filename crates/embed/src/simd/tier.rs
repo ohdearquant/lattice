@@ -655,6 +655,11 @@ mod tests {
         }
     }
 
+    /// A floor includes equality; one epsilon recovers equality lost while averaging.
+    fn meets_retrieval_quality_floor(value: f64, minimum: f64) -> bool {
+        value.is_finite() && value + f64::EPSILON >= minimum
+    }
+
     /// Bounds each query so a collapsed subset cannot hide behind healthy queries.
     ///
     /// The fixed 16-query fixture produces these per-query ranges at Recall@10:
@@ -680,6 +685,88 @@ mod tests {
         }
     }
 
+    /// Pins known-good metrics as Recall@10 hits and agreeing pairs out of 32,640.
+    ///
+    /// Each metric may move by one observed min-to-max span in total across all
+    /// 16 queries, or one sixteenth of that span under a uniform shift. Absolute
+    /// movement prevents cross-query cancellation and makes a broader path change
+    /// require deliberate recalibration. A zero-spread metric remains exact.
+    const HEALTHY_FULL_QUERY_QUALITY: [(u8, u16); 16] = [(10, 32_640); 16];
+    const HEALTHY_INT8_QUERY_QUALITY: [(u8, u16); 16] = [
+        (10, 32_588),
+        (10, 32_575),
+        (10, 32_597),
+        (10, 32_590),
+        (10, 32_595),
+        (10, 32_592),
+        (10, 32_580),
+        (10, 32_604),
+        (10, 32_587),
+        (10, 32_573),
+        (10, 32_580),
+        (10, 32_579),
+        (10, 32_567),
+        (10, 32_578),
+        (10, 32_576),
+        (10, 32_588),
+    ];
+    const HEALTHY_INT4_QUERY_QUALITY: [(u8, u16); 16] = [
+        (8, 31_582),
+        (9, 31_531),
+        (9, 31_642),
+        (8, 31_656),
+        (10, 31_773),
+        (8, 31_638),
+        (10, 31_744),
+        (9, 31_758),
+        (10, 31_661),
+        (10, 31_651),
+        (10, 31_662),
+        (8, 31_727),
+        (10, 31_531),
+        (10, 31_625),
+        (9, 31_655),
+        (9, 31_653),
+    ];
+    const HEALTHY_BINARY_QUERY_QUALITY: [(u8, u16); 16] = [
+        (7, 25_430),
+        (3, 25_031),
+        (6, 25_033),
+        (5, 25_339),
+        (4, 25_534),
+        (3, 25_166),
+        (3, 25_156),
+        (6, 25_705),
+        (5, 25_677),
+        (4, 25_419),
+        (4, 25_040),
+        (3, 25_150),
+        (4, 24_965),
+        (5, 25_190),
+        (5, 24_423),
+        (4, 25_355),
+    ];
+
+    fn healthy_query_quality(tier: QuantizationTier) -> &'static [(u8, u16); 16] {
+        match tier {
+            QuantizationTier::Full => &HEALTHY_FULL_QUERY_QUALITY,
+            QuantizationTier::Int8 => &HEALTHY_INT8_QUERY_QUALITY,
+            QuantizationTier::Int4 => &HEALTHY_INT4_QUERY_QUALITY,
+            QuantizationTier::Binary => &HEALTHY_BINARY_QUERY_QUALITY,
+        }
+    }
+
+    fn retrieval_quality_movement_budget(healthy: &[(u8, u16)]) -> (f64, f64) {
+        let minimum_recall_hits = healthy.iter().map(|quality| quality.0).min().unwrap();
+        let maximum_recall_hits = healthy.iter().map(|quality| quality.0).max().unwrap();
+        let minimum_agreements = healthy.iter().map(|quality| quality.1).min().unwrap();
+        let maximum_agreements = healthy.iter().map(|quality| quality.1).max().unwrap();
+        (
+            f64::from(maximum_recall_hits - minimum_recall_hits) / 10.0,
+            f64::from(maximum_agreements - minimum_agreements) / 32_640.0,
+        )
+    }
+
     fn validate_tier_retrieval_quality(
         tier: QuantizationTier,
         query_quality: &[(f64, f64)],
@@ -689,10 +776,21 @@ mod tests {
             return Err(format!("{tier:?} retrieval quality has zero queries"));
         }
 
+        let healthy = healthy_query_quality(tier);
+        if query_quality.len() != healthy.len() {
+            return Err(format!(
+                "{tier:?} retrieval quality has {} queries, expected {}",
+                query_quality.len(),
+                healthy.len()
+            ));
+        }
+
         let (minimum_query_recall, minimum_query_agreement) =
             retrieval_quality_per_query_floor(tier);
         for (query_index, &(recall, agreement)) in query_quality.iter().enumerate() {
-            if recall < minimum_query_recall || agreement < minimum_query_agreement {
+            if !meets_retrieval_quality_floor(recall, minimum_query_recall)
+                || !meets_retrieval_quality_floor(agreement, minimum_query_agreement)
+            {
                 return Err(format!(
                     "{tier:?} query {query_index} fails the per-query floor: Recall@{top_k}=\
                      {recall:.6} (minimum {minimum_query_recall:.6}), pairwise ranking agreement=\
@@ -709,16 +807,37 @@ mod tests {
         let recall = recall / query_quality.len() as f64;
         let agreement = agreement / query_quality.len() as f64;
         let (minimum_recall, minimum_agreement) = retrieval_quality_floor(tier);
-        if recall < minimum_recall {
+        if !meets_retrieval_quality_floor(recall, minimum_recall) {
             return Err(format!(
                 "{tier:?} Recall@{top_k} {recall:.6} is below the measured-data floor \
                  {minimum_recall:.3}"
             ));
         }
-        if agreement < minimum_agreement {
+        if !meets_retrieval_quality_floor(agreement, minimum_agreement) {
             return Err(format!(
                 "{tier:?} pairwise ranking agreement {agreement:.6} is below the measured-data \
                  floor {minimum_agreement:.3}"
+            ));
+        }
+
+        let (recall_movement, agreement_movement) = query_quality.iter().zip(healthy).fold(
+            (0.0, 0.0),
+            |(recall_movement, agreement_movement), (actual, expected)| {
+                (
+                    recall_movement + (actual.0 - f64::from(expected.0) / 10.0).abs(),
+                    agreement_movement + (actual.1 - f64::from(expected.1) / 32_640.0).abs(),
+                )
+            },
+        );
+        let (recall_budget, agreement_budget) = retrieval_quality_movement_budget(healthy);
+        if recall_movement > recall_budget + f64::EPSILON
+            || agreement_movement > agreement_budget + f64::EPSILON
+        {
+            return Err(format!(
+                "{tier:?} retrieval quality exceeds the fixture-relative movement budget: \
+                 total absolute Recall@{top_k} movement={recall_movement:.6} \
+                 (maximum {recall_budget:.6}), total absolute pairwise-agreement movement=\
+                 {agreement_movement:.6} (maximum {agreement_budget:.6})"
             ));
         }
         Ok((recall, agreement))
@@ -799,7 +918,9 @@ mod tests {
             QuantizationTier::Binary,
         ] {
             let (minimum_recall, minimum_agreement) = retrieval_quality_floor(tier);
-            if surrogate_recall >= minimum_recall && surrogate_agreement >= minimum_agreement {
+            if meets_retrieval_quality_floor(surrogate_recall, minimum_recall)
+                && meets_retrieval_quality_floor(surrogate_agreement, minimum_agreement)
+            {
                 return Err(format!(
                     "retrieval fixture is non-discriminating: an all-tied index-order surrogate \
                      passes the {tier:?} floor with Recall@{top_k}={surrogate_recall:.6} and \
@@ -943,6 +1064,115 @@ mod tests {
     }
 
     #[test]
+    fn test_tier_retrieval_quality_rejects_distributed_binary_query_collapse() {
+        const TOP_K: usize = 10;
+        let (corpus, queries) = fixed_retrieval_fixture();
+        let query_quality: Vec<_> = queries
+            .iter()
+            .map(|query| {
+                let reference = reference_ranking(query, &corpus);
+                let mut actual = Vec::with_capacity(reference.len());
+                actual.extend_from_slice(&reference[..3]);
+                actual.extend_from_slice(&reference[10..17]);
+                actual.extend_from_slice(&reference[3..10]);
+                actual.extend(reference[17..154].iter().rev().copied());
+                actual.extend_from_slice(&reference[154..]);
+                assert_eq!(actual.len(), reference.len());
+                (
+                    recall_at(&reference, &actual, TOP_K),
+                    pairwise_ranking_agreement(&reference, &actual),
+                )
+            })
+            .collect();
+
+        assert!(query_quality.iter().all(|&(recall, agreement)| {
+            recall == 3.0 / 10.0 && agreement == (32_640.0 - 9_365.0) / 32_640.0
+        }));
+
+        let error =
+            validate_tier_retrieval_quality(QuantizationTier::Binary, &query_quality, TOP_K)
+                .expect_err("a distributed 70% Recall@10 loss across every query must fail");
+        assert!(
+            error.contains("movement budget"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_tier_retrieval_quality_rejects_shallow_all_query_movement() {
+        const TOP_K: usize = 10;
+        let (corpus, queries) = fixed_retrieval_fixture();
+        let query_quality: Vec<_> = queries
+            .iter()
+            .map(|query| {
+                let reference = reference_ranking(query, &corpus);
+                let mut actual = reference.clone();
+                let last = actual.len() - 1;
+                actual.swap(TOP_K - 1, last);
+                (
+                    recall_at(&reference, &actual, TOP_K),
+                    pairwise_ranking_agreement(&reference, &actual),
+                )
+            })
+            .collect();
+
+        assert!(query_quality.iter().all(|&(recall, agreement)| {
+            recall == 9.0 / 10.0 && agreement == (32_640.0 - 491.0) / 32_640.0
+        }));
+
+        for (tier, result) in [
+            (
+                QuantizationTier::Int4,
+                validate_tier_retrieval_quality(QuantizationTier::Int4, &query_quality, TOP_K),
+            ),
+            (
+                QuantizationTier::Binary,
+                validate_tier_retrieval_quality(QuantizationTier::Binary, &query_quality, TOP_K),
+            ),
+        ] {
+            let error = result.unwrap_err();
+            assert!(
+                error.contains("movement budget"),
+                "unexpected {tier:?} error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tier_retrieval_quality_bounds_stated_binary_uniform_movement() {
+        const TOP_K: usize = 10;
+        let query_quality_with_pair_loss = |pair_loss: u16| {
+            healthy_query_quality(QuantizationTier::Binary)
+                .iter()
+                .map(|&(recall_hits, agreements)| {
+                    (
+                        f64::from(recall_hits) / 10.0,
+                        f64::from(agreements - pair_loss) / 32_640.0,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        validate_tier_retrieval_quality(
+            QuantizationTier::Binary,
+            &query_quality_with_pair_loss(80),
+            TOP_K,
+        )
+        .expect("1,280 total agreement-pair changes are within the 1,282-pair budget");
+
+        let error = validate_tier_retrieval_quality(
+            QuantizationTier::Binary,
+            &query_quality_with_pair_loss(81),
+            TOP_K,
+        )
+        .expect_err("1,296 total agreement-pair changes must exceed the 1,282-pair budget");
+        assert!(
+            error.contains("movement budget"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn test_validate_retrieval_fixture_rejects_non_discriminating_corpus() {
         const TOP_K: usize = 10;
         const DIMS: usize = 384;
@@ -998,7 +1228,8 @@ mod tests {
             ("Binary", 0.30, 0.70),
         ] {
             assert!(
-                recall < minimum_recall || agreement < minimum_agreement,
+                !meets_retrieval_quality_floor(recall, minimum_recall)
+                    || !meets_retrieval_quality_floor(agreement, minimum_agreement),
                 "index-order surrogate must fail the pinned {tier} floor"
             );
         }

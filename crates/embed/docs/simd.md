@@ -159,6 +159,23 @@ or older selects `Binary`. Age does not establish that a vector tolerates lower
 precision. Applications should select tiers directly from workload-specific
 retention and retrieval-quality measurements.
 
+The fixed retrieval-fidelity regression pins each tier's healthy per-query
+Recall@10 and pairwise-agreement vector. In addition to inclusive aggregate and
+per-query floors, it sums absolute movement from that vector independently for
+each metric. The total allowance is one healthy min-to-max range: recall budgets
+are 0, 0, 0.2, and 0.4 for Full through Binary, while agreement budgets are 0,
+37/32,640, 242/32,640, and 1,282/32,640. Equality at a floor or budget is
+accepted; one `f64` epsilon prevents an exact floor boundary from failing only
+because of averaging.
+
+For uniform movement across all 16 queries, the allowance is one sixteenth of
+the corresponding range. Binary therefore permits at most 80.125 aggregate
+agreement-pair changes per query, while a larger corpus-wide shift fails even when no
+query crosses an absolute floor. Absolute movement prevents one query's gain
+from cancelling another's loss and requires deliberate recalibration for a
+material improvement as well as a regression. Healthy fixture movement is zero;
+Full's zero-spread metrics retain zero movement allowance and remain exact.
+
 `QuantizedData` holds any tier behind one enum. Promoting or demoting it always
 dequantizes to `f32` and quantizes into the destination tier. Promotion does not
 recover information discarded by a previous lower-precision representation.
