@@ -64,11 +64,7 @@ impl QuantizationTier {
         }
     }
 
-    /// **Unstable**: placeholder recency-to-tier mapping with no retrieval-quality basis.
-    ///
-    /// The fixed boundaries are an example storage policy, not evidence that older
-    /// vectors tolerate lower precision. Applications should select tiers from
-    /// workload-specific quality measurements.
+    /// **Unstable**: maps recency to a storage tier; boundaries may be tuned.
     pub fn from_age_seconds(age_secs: u64) -> Self {
         const HOUR: u64 = 3600;
         const DAY: u64 = 86400;
