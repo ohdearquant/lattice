@@ -74,6 +74,15 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ] || [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
+            if [[ ! "$CI_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+              echo "::error::base revision must be a nonempty 40-character hexadecimal commit ID" >&2
+              exit 2
+            fi
+            if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+              echo "deps=true" >> "$GITHUB_OUTPUT"
+              echo "→ all-zero base revision: audit REQUIRED"
+              exit 0
+            fi
             TRUSTED_DETECTOR=$(mktemp)
             CHANGED_FILE=$(mktemp)
             trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT

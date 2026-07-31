@@ -369,11 +369,14 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
         workflow: Path,
         base_sha: str,
         head_sha: str,
+        *,
+        event: str = "pull_request",
     ) -> tuple[subprocess.CompletedProcess[str], str]:
         output = self.repo / "github-output"
+        output.unlink(missing_ok=True)
         env = os.environ.copy()
         env.update(
-            GITHUB_EVENT_NAME="pull_request",
+            GITHUB_EVENT_NAME=event,
             GITHUB_OUTPUT=str(output),
             CI_BASE_SHA=base_sha,
             CI_HEAD_SHA=head_sha,
@@ -465,6 +468,69 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
 
     def test_e2e_parity_observes_detector_failure_status(self) -> None:
         self._assert_detector_failure_is_observed(_E2E_PARITY_WORKFLOW)
+
+    def test_invalid_base_never_executes_checkout_detector(self) -> None:
+        head = self._commit(
+            "scripts/ci-changed-files.sh",
+            "#!/bin/sh\n"
+            "echo 'attacker-selected=true' >> \"$GITHUB_OUTPUT\"\n"
+            "echo README.md\n",
+        )
+
+        for workflow in (
+            _CI_WORKFLOW,
+            _CARGO_AUDIT_WORKFLOW,
+            _APP_BINARIES_WORKFLOW,
+            _E2E_PARITY_WORKFLOW,
+        ):
+            for base_sha in ("", "a" * 39, "g" * 40):
+                with self.subTest(workflow=workflow.name, base_sha=base_sha):
+                    result, output = self._run_filter(workflow, base_sha, head)
+
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(output, "")
+                    self.assertNotIn("attacker-selected=true", output)
+                    self.assertIn(
+                        "base revision must be a nonempty 40-character "
+                        "hexadecimal commit ID",
+                        result.stderr,
+                    )
+
+    def test_all_zero_base_selects_every_downstream_job(self) -> None:
+        head = self._commit(
+            "scripts/ci-changed-files.sh",
+            "#!/bin/sh\n"
+            "echo 'attacker-selected=true' >> \"$GITHUB_OUTPUT\"\n"
+            "exit 29\n",
+        )
+        cases = (
+            (_CI_WORKFLOW, "push", ("code=true",)),
+            (_CARGO_AUDIT_WORKFLOW, "pull_request", ("deps=true",)),
+            (
+                _APP_BINARIES_WORKFLOW,
+                "push",
+                ("bins=true", "swift=true"),
+            ),
+            (
+                _E2E_PARITY_WORKFLOW,
+                "push",
+                ("engine=true", "tune=true"),
+            ),
+        )
+
+        for workflow, event, expected_outputs in cases:
+            with self.subTest(workflow=workflow.name, event=event):
+                result, output = self._run_filter(
+                    workflow,
+                    _ZERO_SHA,
+                    head,
+                    event=event,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("attacker-selected=true", output)
+                for expected_output in expected_outputs:
+                    self.assertIn(expected_output, output)
 
 
 class TestRunnerContractTests(unittest.TestCase):
