@@ -42,18 +42,13 @@ import os from 'node:os';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
 const SUPERVISION = path.join(REPO, 'scripts', 'lib', 'bench_supervision.py');
-const LOCK_FDS = (process.env.LATTICE_BENCH_LOCK_FDS ?? '')
-  .split(',')
-  .filter(Boolean)
-  .map(Number);
+const SUPERVISOR_FD = Number(process.env.LATTICE_BENCH_SUPERVISOR_FD ?? '');
 
 function supervisionStdio() {
   const stdio = ['inherit', 'inherit', 'inherit'];
-  for (const fd of LOCK_FDS) {
-    if (!Number.isInteger(fd) || fd < 3) continue;
-    while (stdio.length <= fd) stdio.push('ignore');
-    stdio[fd] = fd;
-  }
+  if (!Number.isInteger(SUPERVISOR_FD) || SUPERVISOR_FD < 3) return stdio;
+  while (stdio.length <= SUPERVISOR_FD) stdio.push('ignore');
+  stdio[SUPERVISOR_FD] = SUPERVISOR_FD;
   return stdio;
 }
 
@@ -81,8 +76,8 @@ if (!process.env.LATTICE_BENCH_LOCK_STATUS) {
 }
 
 const receipt = spawnSync('python3', [SUPERVISION, 'verify', '--require-quiet'], {
-  // Node closes non-stdio descriptors by default. Preserve the two inherited
-  // lock capabilities for the verifier instead of degrading to an env claim.
+  // Node closes non-stdio descriptors by default. Preserve the non-lock
+  // liveness witness only for the verifier.
   stdio: supervisionStdio(),
   env: process.env,
 });
@@ -90,7 +85,7 @@ if (receipt.error || receipt.status !== 0) {
   console.error('bench_wasm_simd: could not acquire both canonical locks');
   process.exit(2);
 }
-delete process.env.LATTICE_BENCH_LOCK_FDS;
+delete process.env.LATTICE_BENCH_SUPERVISOR_FD;
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -274,11 +269,11 @@ const completed = spawnSync('python3', [SUPERVISION, 'verify'], {
   stdio: supervisionStdio(),
   env: {
     ...process.env,
-    LATTICE_BENCH_LOCK_FDS: LOCK_FDS.join(','),
+    LATTICE_BENCH_SUPERVISOR_FD: String(SUPERVISOR_FD),
   },
 });
 if (completed.error || completed.status !== 0) {
-  console.error('bench_wasm_simd: a canonical lock pathname changed during measurement');
+  console.error('bench_wasm_simd: a canonical lock pathname mismatched at the final sample');
   process.exit(2);
 }
-for (const fd of LOCK_FDS) closeSync(fd);
+closeSync(SUPERVISOR_FD);

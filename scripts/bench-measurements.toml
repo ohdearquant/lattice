@@ -1,10 +1,104 @@
 schema = 1
 
-# This inventory covers local script and Make entry points. Raw Rust Metal
-# benches/examples are owned by #1115 / PR #1195, where the harness itself
-# takes the GPU lock; wrapping those a second time here would deadlock on flock.
+[contract]
+scope = "local script and Make measurement entry points"
+caller_trust = "cooperative"
+lock_ownership = "trusted supervisor retains both descriptors for the child lifetime"
+pathname_check = "endpoint mismatch diagnostic; not rename-and-restore resistance"
+
+# The exclusions below are exact, explicit inventory rather than glob waivers.
+# A newly added Rust measurement path therefore fails the repository scan until
+# it is supervised or added to the tracked follow-up with an explicit reason.
+
+[[excluded_surface]]
+family = "cargo-benchmark-sources"
+tracking_issue = "#1273"
+reason = "Direct Cargo benchmark targets are outside this local script supervisor."
+paths = [
+    "crates/embed/benches/embeddings.rs",
+    "crates/embed/benches/simd.rs",
+    "crates/embed/benches/simd_bench.rs",
+    "crates/embed/benches/simd_opt_bench.rs",
+    "crates/embed/benches/simsimd_comparison.rs",
+    "crates/fann/benches/router_online.rs",
+    "crates/inference/benches/attention_dispatch_bench.rs",
+    "crates/inference/benches/attn_opt_bench.rs",
+    "crates/inference/benches/compute_attention_bench.rs",
+    "crates/inference/benches/cross_turn_prefix_cache_bench.rs",
+    "crates/inference/benches/decode_attn_bench.rs",
+    "crates/inference/benches/differential_attention_bench.rs",
+    "crates/inference/benches/e2e_bench.rs",
+    "crates/inference/benches/elementwise_bench.rs",
+    "crates/inference/benches/elementwise_cpu_bench.rs",
+    "crates/inference/benches/f16_convert_bench.rs",
+    "crates/inference/benches/gated_attention_bench.rs",
+    "crates/inference/benches/inference_bench.rs",
+    "crates/inference/benches/inference_perf.rs",
+    "crates/inference/benches/kv_cache_f16_bench.rs",
+    "crates/inference/benches/kv_cache_layout_bench.rs",
+    "crates/inference/benches/lm_head_bench.rs",
+    "crates/inference/benches/metal_decode_bench.rs",
+    "crates/inference/benches/metrics_bench.rs",
+    "crates/inference/benches/mtp_decode.rs",
+    "crates/inference/benches/native_sparse_attention_bench.rs",
+    "crates/inference/benches/pruning_bench.rs",
+    "crates/inference/benches/quarot_hadamard_bench.rs",
+    "crates/inference/benches/tokenizer_bench.rs",
+    "crates/inference/benches/topk_readback.rs",
+    "crates/transport/benches/round0_transport.rs",
+]
+
+[[excluded_surface]]
+family = "inference-benchmark-examples"
+tracking_issue = "#1273"
+reason = "Direct Rust benchmark examples are outside this local script supervisor."
+paths = [
+    "crates/inference/examples/bench_concurrent.rs",
+    "crates/inference/examples/bench_dispatch.rs",
+    "crates/inference/examples/bench_dispatch2.rs",
+    "crates/inference/examples/bench_embed_quality.rs",
+    "crates/inference/examples/bench_embedding.rs",
+    "crates/inference/examples/bench_gdn.rs",
+    "crates/inference/examples/bench_gdn_decode.rs",
+    "crates/inference/examples/bench_gdn_prefill_ab.rs",
+    "crates/inference/examples/bench_gdn_state.rs",
+    "crates/inference/examples/bench_gpu.rs",
+    "crates/inference/examples/bench_metal.rs",
+    "crates/inference/examples/bench_mps_gemm.rs",
+    "crates/inference/examples/bench_persistent_state.rs",
+    "crates/inference/examples/bench_profile.rs",
+    "crates/inference/examples/bench_pruning.rs",
+    "crates/inference/examples/bench_q4_prefill.rs",
+    "crates/inference/examples/bench_q8_prefill.rs",
+    "crates/inference/examples/bench_quality.rs",
+    "crates/inference/examples/bench_simdgroup.rs",
+    "crates/inference/examples/bench_stability.rs",
+    "crates/inference/examples/bench_suite.rs",
+]
+
+[[excluded_surface]]
+family = "inference-measurement-binaries"
+tracking_issue = "#1273"
+reason = "Benchmark-oriented binaries need a dedicated Rust-side supervision decision."
+paths = [
+    "crates/inference/src/bin/bench_decode_ab.rs",
+    "crates/inference/src/bin/bench_decode_slopefit.rs",
+    "crates/inference/src/bin/bench_gdn_prefill_ab.rs",
+    "crates/inference/src/bin/bench_logit_dump.rs",
+    "crates/inference/src/bin/bench_lora_mixture.rs",
+    "crates/inference/src/bin/eval_perplexity.rs",
+    "crates/inference/src/bin/gramperf_profile.rs",
+    "crates/inference/src/bin/ppl_metal.rs",
+]
+
+[[excluded_surface]]
+family = "documented-direct-cargo-commands"
+tracking_issue = "#1273"
+reason = "README commands remain direct until the Rust measurement interface is selected."
+paths = ["README.md"]
+
 # Hosted workflow measurements are intentionally outside this local-machine
-# convention. In particular, issue #1121 explicitly excludes bench-update.yml.
+# convention. Issue #1121 expressly excludes bench-update.yml.
 
 [[entry]]
 path = "scripts/adr064-gpu-decode-gate.py"

@@ -35,14 +35,14 @@ leaked lock fd in a long-lived build daemon holds the window open machine-wide
 long after the run that took it, because a flock is released only when every
 descriptor referring to that open file description is closed.
 
-``--pass-lock-fds`` is the narrow exception for the local measurement
-entry-point convention. It passes both descriptors to the immediate command
-as an unforgeable-by-accident capability so that command can prove the locks
-are really held. ``scripts/lib/bench_supervision.py`` passes them only to a
-self-verifying measurement process, which retains its copies through the work.
-Python marks them close-on-exec, Node closes extra descriptors in child spawns,
-and shell measurement children close them before running. Arbitrary commands
-and build descendants never receive them.
+``--pass-lock-fds`` is the narrow exception for trusted supervisor processes.
+The immediate command verifies the descriptors and keeps them private while
+running descriptor-free measurement children. ``bench_supervision.py`` gives
+self-verifying entry points a separate liveness pipe, never an open file
+description that can release either advisory lock. ``bench-compare-impl.sh``
+is itself a trusted supervisor and closes the lock descriptors in its
+measurement subshell. Arbitrary commands and build descendants never receive
+the lock descriptors.
 
 WHY lsof IS ONLY A DIAGNOSTIC HERE. lsof lists processes that have the lock
 file OPEN, which is a superset of those holding a flock on it, and it does not

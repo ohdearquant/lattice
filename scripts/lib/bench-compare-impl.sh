@@ -156,10 +156,11 @@ done
 # they refer to the SAME open file descriptions bench-locks.py itself holds
 # open for this run's whole lifetime).
 #
-# bench_supervision.py acquires both inherited descriptors, verifies their
-# identity against fresh stats of the canonical paths, and detects pathname
-# replacement with another fresh comparison after the measurement. This shell
-# retains the capabilities while the descriptor-free subshell does the work.
+# bench_supervision.py acquires both inherited descriptors and samples their
+# identity against fresh stats of the canonical paths. A final sample diagnoses
+# a mismatch that remains present; it does not establish pathname continuity
+# against a rename-and-restore caller. This shell retains the capabilities
+# while the descriptor-free, cooperative subshell does the work.
 LOCK_STATUS_FILE="$REPO/.cache/bench-locks-status.txt"
 LOCK_SUMMARY=""
 verify_locks() {
@@ -751,8 +752,8 @@ MEASUREMENT_RC=$?
 set -e
 
 if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
-  echo "bench-compare: a canonical lock pathname changed during the" \
-       "measurement — refusing to certify it." >&2
+  echo "bench-compare: a canonical lock pathname mismatched at the final" \
+       "sample — refusing to certify it." >&2
   exit 2
 fi
 exit "$MEASUREMENT_RC"

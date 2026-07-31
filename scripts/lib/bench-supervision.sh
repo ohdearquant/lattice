@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
 
-bench_close_lock_fds() {
-    local fd
-    local -a bench_lock_fds
+bench_close_supervisor_witness() {
+    local fd="${LATTICE_BENCH_SUPERVISOR_FD:-}"
 
-    IFS=',' read -r -a bench_lock_fds <<<"$LATTICE_BENCH_LOCK_FDS"
-    for fd in "${bench_lock_fds[@]}"; do
+    if [[ "$fd" =~ ^[0-9]+$ ]]; then
         eval "exec ${fd}>&-"
-    done
-    unset LATTICE_BENCH_LOCK_FDS
+    fi
+    unset LATTICE_BENCH_SUPERVISOR_FD
 }
 
 bench_supervise_entry() {
@@ -42,7 +40,7 @@ bench_supervise_entry() {
 
     local measurement_rc=0
     (
-        bench_close_lock_fds
+        bench_close_supervisor_witness
         "$measurement" "$@"
     ) || measurement_rc=$?
     if ! python3 "$helper" verify; then

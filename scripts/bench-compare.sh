@@ -20,9 +20,11 @@
 # at a PID relation: --pass-lock-fds below hands the body the two acquired
 # lock descriptors, and the body proves identity against the ordered canonical
 # lock paths, acquires them itself, and retains them until the descriptor-free
-# measurement child completes. Fresh descriptor/path comparisons before and
-# after the measurement detect replacement of either canonical lock name. A
-# caller who fabricates a status file without both descriptors is refused.
+# measurement child completes. Descriptor/path comparisons diagnose a mismatch
+# present at either sampled boundary; they do not prove pathname continuity
+# against rename-and-restore, so callers must cooperate by leaving lock names
+# intact. A caller who fabricates a status file without both descriptors is
+# refused.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$REPO/.cache"

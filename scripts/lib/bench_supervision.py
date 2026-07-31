@@ -3,18 +3,20 @@
 
 Measurement entry points call :func:`ensure_python_entrypoint` before doing
 work. Shell and Node entry points invoke the ``run``/``verify`` CLI below.
-The outer process is always ``bench-locks.py``; this module only supplies the
-common re-exec convention and, for durable evidence, ambient-idle checks.
+The outer process is always ``bench-locks.py``. This trusted process retains
+the lock descriptors while an entry point receives only a liveness witness;
+measurement code never receives a descriptor capable of releasing the locks.
 """
 
 from __future__ import annotations
 
 import argparse
-import atexit
 import fcntl
 import os
 import re
 import runpy
+import select
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -24,12 +26,13 @@ LOCKS = REPO / "scripts" / "lib" / "bench-locks.py"
 QUIET_PROBE = REPO / "scripts" / "lib" / "quiet-probe.py"
 STATUS_ENV = "LATTICE_BENCH_LOCK_STATUS"
 FDS_ENV = "LATTICE_BENCH_LOCK_FDS"
+SUPERVISOR_FD_ENV = "LATTICE_BENCH_SUPERVISOR_FD"
 QUIET_ENV = "LATTICE_BENCH_QUIET_SUPERVISION"
 REFUSAL_EXIT = 2
 
 
 class SupervisionError(RuntimeError):
-    """The measuring process cannot hold both canonical benchmark locks."""
+    """The trusted process cannot establish the benchmark supervision contract."""
 
 
 def _canonical_lock_paths() -> tuple[Path, Path]:
@@ -64,15 +67,17 @@ def _validated_receipt_paths(lock_lines: list[str]) -> tuple[Path, Path]:
     return canonical_paths
 
 
-def _verify_path_identities(
+def _sample_path_identities(
     fds: tuple[int, int], paths: tuple[Path, Path], *, phase: str
 ) -> None:
+    """Detect a pathname mismatch at one instant for cooperative callers."""
+
     inode_pairs: list[tuple[int, int]] = []
     for fd, path in zip(fds, paths, strict=True):
         try:
             fd_stat = os.fstat(fd)
             path_stat = path.stat()
-        except OSError as exc:
+        except (OSError, OverflowError) as exc:
             raise SupervisionError(
                 f"held lock descriptor {fd} cannot be matched to {path} {phase}: {exc}"
             ) from exc
@@ -94,7 +99,7 @@ def _verify_inherited_fds(paths: tuple[Path, Path]) -> tuple[int, int]:
     if len(fds) != 2 or len(set(fds)) != 2:
         raise SupervisionError(f"{FDS_ENV} must name exactly two descriptors")
 
-    _verify_path_identities(fds, paths, phase="before acquisition")
+    _sample_path_identities(fds, paths, phase="before acquisition")
     for fd, path in zip(fds, paths, strict=True):
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -103,9 +108,10 @@ def _verify_inherited_fds(paths: tuple[Path, Path]) -> tuple[int, int]:
             raise SupervisionError(
                 f"could not acquire canonical lock {path} on descriptor {fd}: {exc}"
             ) from exc
-    # This detects a pathname replacement during acquisition; advisory flock
-    # cannot prevent a rename or bind the directory entry to the held inode.
-    _verify_path_identities(fds, paths, phase="while acquiring locks")
+    # This sample detects a replacement that remains present at this instant.
+    # Advisory flock cannot prevent rename-and-restore by a hostile same-user
+    # caller, so this is a cooperative-caller diagnostic, not continuous proof.
+    _sample_path_identities(fds, paths, phase="while acquiring locks")
     return fds[0], fds[1]
 
 
@@ -140,7 +146,7 @@ def _read_receipt() -> tuple[Path, list[str]]:
 
 
 def verify_supervision() -> tuple[Path, tuple[int, int], tuple[Path, Path]]:
-    """Acquire and return both canonical lock capabilities or raise."""
+    """Acquire lock capabilities inside the trusted supervisor or raise."""
 
     status, lock_lines = _read_receipt()
     if FDS_ENV not in os.environ:
@@ -149,16 +155,59 @@ def verify_supervision() -> tuple[Path, tuple[int, int], tuple[Path, Path]]:
     return status, _verify_inherited_fds(paths), paths
 
 
-def _close_after_final_identity_check(
-    fds: tuple[int, int], paths: tuple[Path, Path]
-) -> None:
+def _verify_supervisor_witness() -> int:
+    raw = os.environ.get(SUPERVISOR_FD_ENV)
+    if raw is None:
+        raise SupervisionError(f"{SUPERVISOR_FD_ENV} is not set")
     try:
-        _verify_path_identities(fds, paths, phase="during measurement")
-    except SupervisionError as exc:
-        print(f"bench-supervision: {exc}; refusing to certify measurement", file=sys.stderr)
-        os._exit(REFUSAL_EXIT)
-    for fd in fds:
-        os.close(fd)
+        fd = int(raw)
+        fd_stat = os.fstat(fd)
+        if not stat.S_ISFIFO(fd_stat.st_mode):
+            raise SupervisionError(
+                f"{SUPERVISOR_FD_ENV} does not name a supervision pipe"
+            )
+        readable, _, _ = select.select([fd], [], [], 0)
+    except SupervisionError:
+        raise
+    except (OSError, OverflowError, ValueError) as exc:
+        raise SupervisionError(
+            f"{SUPERVISOR_FD_ENV} does not name a live supervision pipe: {exc}"
+        ) from exc
+    if readable:
+        raise SupervisionError("trusted lock supervisor exited before measurement")
+    return fd
+
+
+def _sample_locks_are_contended(paths: tuple[Path, Path]) -> None:
+    """Sample both names for contention, without attributing the holder."""
+
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except OSError as exc:
+            raise SupervisionError(f"cannot open canonical lock {path}: {exc}") from exc
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            raise SupervisionError(f"canonical lock {path} is not held by the supervisor")
+        finally:
+            os.close(fd)
+
+
+def verify_measurement_supervision() -> tuple[Path, int, tuple[Path, Path]]:
+    """Validate a live trusted parent without exposing its lock descriptors."""
+
+    status, lock_lines = _read_receipt()
+    paths = _validated_receipt_paths(lock_lines)
+    # Contention alone cannot identify an owner. The pipe binds this child to
+    # the trusted parent code path, which creates it only after verifying its
+    # private lock descriptors; both checks are intentionally required.
+    witness_fd = _verify_supervisor_witness()
+    _sample_locks_are_contended(paths)
+    return status, witness_fd, paths
 
 
 def _slug(label: str) -> str:
@@ -231,17 +280,34 @@ def run_supervised(
         return REFUSAL_EXIT
 
     child_env = os.environ.copy()
+    child_env.pop(FDS_ENV, None)
+    child_env.pop(SUPERVISOR_FD_ENV, None)
     if quiet:
         child_env[QUIET_ENV] = "1"
-    if not entrypoint:
-        child_env.pop(FDS_ENV, None)
-    result = subprocess.run(
-        command,
-        check=False,
-        env=child_env,
-        pass_fds=inherited_fds if entrypoint else (),
-    )
-    _verify_path_identities(inherited_fds, paths, phase="during measurement")
+
+    witness_fds: tuple[int, int] | None = None
+    try:
+        if entrypoint:
+            read_fd, write_fd = os.pipe()
+            witness_fds = (read_fd, write_fd)
+            child_env[SUPERVISOR_FD_ENV] = str(read_fd)
+            pass_fds = (read_fd,)
+        else:
+            pass_fds = ()
+        result = subprocess.run(
+            command,
+            check=False,
+            env=child_env,
+            pass_fds=pass_fds,
+        )
+    finally:
+        if witness_fds is not None:
+            for fd in witness_fds:
+                os.close(fd)
+
+    # This endpoint sample catches a persistent pathname mismatch. The flock
+    # contract is cooperative and does not claim rename-and-restore resistance.
+    _sample_path_identities(inherited_fds, paths, phase="after measurement")
     if result.returncode != 0:
         return result.returncode
 
@@ -263,9 +329,9 @@ def ensure_python_entrypoint(label: str, *, quiet: bool = False) -> None:
         rc = run_supervised(label, command, quiet=quiet, entrypoint=True)
         raise SystemExit(rc)
     try:
-        _, inherited_fds, paths = verify_supervision()
-        os.environ.pop(FDS_ENV, None)
-        atexit.register(_close_after_final_identity_check, inherited_fds, paths)
+        _, witness_fd, _ = verify_measurement_supervision()
+        os.environ.pop(SUPERVISOR_FD_ENV, None)
+        os.close(witness_fd)
     except SupervisionError as exc:
         print(f"bench-supervision: {exc}; refusing to measure", file=sys.stderr)
         raise SystemExit(REFUSAL_EXIT) from exc
@@ -292,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument(
         "--entrypoint",
         action="store_true",
-        help="pass lock capabilities to a self-verifying measurement entrypoint",
+        help="pass a non-lock liveness witness to a self-verifying entrypoint",
     )
     run.add_argument("measurement", nargs=argparse.REMAINDER)
     run.set_defaults(action="run")
@@ -300,7 +366,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.action == "verify":
         try:
-            verify_supervision()
+            if FDS_ENV in os.environ:
+                verify_supervision()
+            else:
+                verify_measurement_supervision()
         except SupervisionError as exc:
             print(f"bench-supervision: {exc}; refusing to measure", file=sys.stderr)
             return REFUSAL_EXIT
