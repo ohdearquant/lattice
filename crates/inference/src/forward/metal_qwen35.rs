@@ -17225,6 +17225,71 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny hybrid MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert!(state.gdn_state_is_initial());
+            let mut seeded_gdn = state.snapshot_gdn_states();
+            assert_eq!(seeded_gdn.len(), 3, "fixture must contain three GDN layers");
+            seeded_gdn[0].0[0] = 1.0;
+            state.restore_gdn_states(&seeded_gdn);
+            let _ = state.forward_step_gdn_only(1, 0);
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "GDN-only forward must leave the first fresh-session disjunct false"
+            );
+            assert!(
+                !state.gdn_state_is_initial(),
+                "GDN-only forward must leave live recurrent state non-initial"
+            );
+
+            state.reset_path_proof_counters();
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let error = state
+                .forward_prefill_with_hidden(&[2])
+                .expect_err("non-initial GDN state with empty KV cache must be rejected");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for non-initial GDN state, got {error}");
+            };
+            assert!(
+                message.contains("GDN recurrent state at its initial condition"),
+                "error must name the rejected GDN condition: {message}"
+            );
+            assert!(
+                message.contains("kv_cache.seq_len=0"),
+                "error must prove the KV half of the guard was false: {message}"
+            );
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(state.session.position, 0);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot().prefill,
+                0,
+                "rejection must not read hidden state"
+            );
+            assert_eq!(
+                snapshot_kv_bytes(&state),
+                kv_before,
+                "rejection must not write any KV row"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                gdn_before,
+                "rejection must not mutate GDN recurrent state"
+            );
+        }
+
+        #[test]
         fn forward_step_rejects_position_and_cache_capacity_before_dispatch() {
             let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
