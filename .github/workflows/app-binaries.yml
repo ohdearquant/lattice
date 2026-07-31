@@ -100,7 +100,24 @@ jobs:
             echo "→ manual dispatch: app-binary and Swift builds REQUIRED"
             exit 0
           fi
-          CHANGED=$(./scripts/ci-changed-files.sh)
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
           echo "Changed files:"
           echo "$CHANGED"
           # here-string, not `echo | grep -q`: -q exits at first match, echo gets
@@ -113,7 +130,7 @@ jobs:
             echo "bins=false" >> "$GITHUB_OUTPUT"
             echo "→ no app-binary change: build skipped, gate passes"
           fi
-          if grep -E '^apps/macos/|^\.github/workflows/(app-binaries|release-binaries)\.yml$|^tests/test_macos_app_release\.py$' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^apps/macos/|^scripts/ci-changed-files\.sh$|^\.github/workflows/(app-binaries|release-binaries)\.yml$|^tests/test_macos_app_release\.py$' <<<"$CHANGED" >/dev/null; then
             echo "swift=true" >> "$GITHUB_OUTPUT"
             echo "→ macOS app surface changed: Swift release build REQUIRED"
           else

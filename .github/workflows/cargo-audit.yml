@@ -74,7 +74,24 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ] || [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
-            CHANGED=$(./scripts/ci-changed-files.sh)
+            TRUSTED_DETECTOR=$(mktemp)
+            CHANGED_FILE=$(mktemp)
+            trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+            if git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+              :
+            else
+              DETECTOR_STATUS=$?
+              echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+              exit "$DETECTOR_STATUS"
+            fi
+            if sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+              :
+            else
+              DETECTOR_STATUS=$?
+              echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+              exit "$DETECTOR_STATUS"
+            fi
+            CHANGED=$(<"$CHANGED_FILE")
             echo "Changed files:"
             echo "$CHANGED"
             # Two single greps against a here-string, not a `grep | grep -q`

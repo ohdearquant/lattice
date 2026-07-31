@@ -85,7 +85,24 @@ jobs:
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: |
           set -euo pipefail
-          CHANGED=$(./scripts/ci-changed-files.sh)
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
           echo "Changed files:"
           echo "$CHANGED"
           # Non-Rust set: **/*.md, docs/**, LICENSE*, .gitignore, and the
@@ -102,13 +119,16 @@ jobs:
           # apps/macos and a Rust path still leaves the Rust file in NON_DOCS
           # below, so code=true and the full matrix runs.
           #
-          # Two single greps against here-strings, not a `grep | grep -q` pipe:
+          # Keep the detector's self-relevance explicit instead of relying on
+          # its membership in the generic non-docs bucket below.
+          DETECTOR_CHANGED=$(grep -E '^scripts/ci-changed-files\.sh$' <<<"$CHANGED" || true)
+          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/|^scripts/ci-changed-files\.sh$)' <<<"$CHANGED" || true)
+          # Single greps against here-strings, not a `grep | grep -q` pipe:
           # a downstream `-q` can close its end of a pipe early and SIGPIPE the
           # upstream producer, and under `pipefail` that reports as the
           # pipeline's exit code instead of the match result (fail-open on a
           # large diff).
-          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/)' <<<"$CHANGED" || true)
-          if grep -q . <<<"$NON_DOCS"; then
+          if [ -n "$DETECTOR_CHANGED" ] || grep -q . <<<"$NON_DOCS"; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "→ non-docs files changed: full matrix REQUIRED"
           else

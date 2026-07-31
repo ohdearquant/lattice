@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -21,6 +22,9 @@ _REQUIRED_WORKFLOWS = (
     ".github/workflows/e2e-parity.yml",
 )
 _E2E_PARITY_WORKFLOW = _ROOT / ".github/workflows/e2e-parity.yml"
+_CI_WORKFLOW = _ROOT / ".github/workflows/ci.yml"
+_CARGO_AUDIT_WORKFLOW = _ROOT / ".github/workflows/cargo-audit.yml"
+_APP_BINARIES_WORKFLOW = _ROOT / ".github/workflows/app-binaries.yml"
 
 
 def _workflow_job(contents: str, job_id: str) -> str:
@@ -53,6 +57,41 @@ def _workflow_step(job: str, step_name: str) -> str:
     )
     end = len(job) if next_match is None else body_start + next_match.start()
     return job[start:end]
+
+
+def _workflow_step_by_id(job: str, step_id: str) -> str:
+    marker = f"      - id: {step_id}\n"
+    start = job.find(marker)
+    if start < 0:
+        raise AssertionError(f"workflow step id {step_id!r} is missing")
+    body_start = start + len(marker)
+    next_match = re.search(
+        r"^      - (?:id:|name:|uses:)",
+        job[body_start:],
+        re.MULTILINE,
+    )
+    end = len(job) if next_match is None else body_start + next_match.start()
+    return job[start:end]
+
+
+def _workflow_run_script(workflow: Path, job_id: str, step_id: str) -> str:
+    contents = workflow.read_text(encoding="utf-8")
+    step = _workflow_step_by_id(_workflow_job(contents, job_id), step_id)
+    marker = "        run: |\n"
+    if marker not in step:
+        raise AssertionError(f"workflow step id {step_id!r} has no run script")
+    return textwrap.dedent(step.split(marker, maxsplit=1)[1])
+
+
+def _require_tests_collected(test_suite: unittest.TestSuite) -> None:
+    if test_suite.countTestCases() == 0:
+        raise SystemExit("ERROR: no tests collected")
+
+
+class _FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        _require_tests_collected(self.test)
+        super().runTests()
 
 
 def _engine_change_pattern(contents: str) -> re.Pattern[str]:
@@ -214,6 +253,27 @@ class ChangedFilesTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match event head", result.stderr)
 
+    def test_unavailable_base_is_a_named_range_resolution_failure(self) -> None:
+        head = self._commit("README.md", "base\n")
+
+        result = self._run("pull_request", _ZERO_SHA, head, check=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(
+            f"event base {_ZERO_SHA} is not available as a commit",
+            result.stderr,
+        )
+
+    def test_resolved_empty_range_succeeds_without_changed_paths(self) -> None:
+        head = self._commit("README.md", "base\n")
+
+        result = self._run("pull_request", head, head, check=False)
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.strip(), "")
+        self.assertEqual(result.stderr, "")
+
     def test_non_ancestor_base_fails_closed(self) -> None:
         base = self._commit("README.md", "base\n")
         self._git("checkout", "-q", "--orphan", "other")
@@ -253,6 +313,144 @@ class MergeQueueWorkflowTests(unittest.TestCase):
             with self.subTest(workflow=relative_path):
                 contents = (_ROOT / relative_path).read_text(encoding="utf-8")
                 self.assertIn(trigger, contents)
+
+
+class ChangeDetectorWorkflowTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tempdir = tempfile.TemporaryDirectory()
+        self.repo = Path(self._tempdir.name)
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.name", "CI Test")
+        self._git("config", "user.email", "ci-test@example.invalid")
+
+    def tearDown(self) -> None:
+        self._tempdir.cleanup()
+
+    def _git(self, *args: str) -> str:
+        result = subprocess.run(
+            [*_GIT, *args],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+
+    def _commit(self, path: str, contents: str) -> str:
+        target = self.repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(contents, encoding="utf-8")
+        self._git("add", path)
+        self._git("commit", "-q", "-m", f"write {path}")
+        return self._git("rev-parse", "HEAD")
+
+    def _run_filter(
+        self,
+        workflow: Path,
+        base_sha: str,
+        head_sha: str,
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
+        output = self.repo / "github-output"
+        env = os.environ.copy()
+        env.update(
+            GITHUB_EVENT_NAME="pull_request",
+            GITHUB_OUTPUT=str(output),
+            CI_BASE_SHA=base_sha,
+            CI_HEAD_SHA=head_sha,
+        )
+        result = subprocess.run(
+            [
+                "bash",
+                "--noprofile",
+                "--norc",
+                "-o",
+                "pipefail",
+                "-c",
+                _workflow_run_script(workflow, "changes", "filter"),
+            ],
+            cwd=self.repo,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        contents = output.read_text(encoding="utf-8") if output.exists() else ""
+        return result, contents
+
+    def _assert_base_detector_wins(
+        self,
+        workflow: Path,
+        expected_outputs: tuple[str, ...],
+    ) -> None:
+        base = self._commit(
+            "scripts/ci-changed-files.sh",
+            _SCRIPT.read_text(encoding="utf-8"),
+        )
+        head = self._commit(
+            "scripts/ci-changed-files.sh",
+            "#!/bin/sh\nexit 0\n",
+        )
+
+        result, output = self._run_filter(workflow, base, head)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for expected_output in expected_outputs:
+            self.assertIn(expected_output, output)
+
+    def _assert_detector_failure_is_observed(self, workflow: Path) -> None:
+        base = self._commit(
+            "scripts/ci-changed-files.sh",
+            "#!/bin/sh\nexit 23\n",
+        )
+        head = self._commit("README.md", "change\n")
+
+        result, output = self._run_filter(workflow, base, head)
+
+        self.assertEqual(result.returncode, 23)
+        self.assertEqual(output, "")
+        self.assertIn("change detector failed with status 23", result.stderr)
+
+    def test_ci_runs_the_base_detector_and_classifies_its_change(self) -> None:
+        self._assert_base_detector_wins(_CI_WORKFLOW, ("code=true",))
+
+    def test_ci_observes_detector_failure_status(self) -> None:
+        self._assert_detector_failure_is_observed(_CI_WORKFLOW)
+
+    def test_cargo_audit_runs_the_base_detector_and_classifies_its_change(
+        self,
+    ) -> None:
+        self._assert_base_detector_wins(_CARGO_AUDIT_WORKFLOW, ("deps=true",))
+
+    def test_cargo_audit_observes_detector_failure_status(self) -> None:
+        self._assert_detector_failure_is_observed(_CARGO_AUDIT_WORKFLOW)
+
+    def test_app_binaries_runs_the_base_detector_and_classifies_its_change(
+        self,
+    ) -> None:
+        self._assert_base_detector_wins(
+            _APP_BINARIES_WORKFLOW,
+            ("bins=true", "swift=true"),
+        )
+
+    def test_app_binaries_observes_detector_failure_status(self) -> None:
+        self._assert_detector_failure_is_observed(_APP_BINARIES_WORKFLOW)
+
+    def test_e2e_parity_runs_the_base_detector_and_classifies_its_change(
+        self,
+    ) -> None:
+        self._assert_base_detector_wins(
+            _E2E_PARITY_WORKFLOW,
+            ("engine=true", "tune=true"),
+        )
+
+    def test_e2e_parity_observes_detector_failure_status(self) -> None:
+        self._assert_detector_failure_is_observed(_E2E_PARITY_WORKFLOW)
+
+
+class TestRunnerContractTests(unittest.TestCase):
+    def test_empty_collection_fails_closed(self) -> None:
+        with self.assertRaisesRegex(SystemExit, "no tests collected"):
+            _require_tests_collected(unittest.TestSuite())
 
 
 class E2eParityChangeFilterTests(unittest.TestCase):
@@ -722,5 +920,7 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
         for name, mutated in mutations.items():
             with self.subTest(mutation=name), self.assertRaises(AssertionError):
                 self._assert_split_is_fail_closed(mutated)
+
+
 if __name__ == "__main__":
-    unittest.main()
+    _FailOnEmptyTestProgram()
