@@ -14,28 +14,38 @@ const EXPECTED_RAW_HARNESSES: &[&str] = &[
     "examples/profile_metal_decode.rs",
 ];
 
-// `MetalQwen35State::new`/`from_q4_dir` drive Metal indirectly through the
-// public forward API rather than raw `Device`/`command_buffer` calls, so
-// RAW_GPU_MARKERS misses them entirely. These six are the one-shot,
-// finite-lifetime measurement/profiling binaries that construct the state
-// and then time a decode/generate/perplexity call over it — the exact class
-// the shared flock exists to serialize.
-//
-// `src/bin/lattice_serve.rs`, `src/bin/chat_metal.rs`, `src/bin/lattice.rs`,
-// and `src/bin/lattice/prune_score.rs` also construct `MetalQwen35State` but
-// are deliberately excluded: they are long-running server/interactive/CLI
-// processes, not finite measurement runs, and binding the guard for their
-// whole lifetime would starve (or, past the 30-minute wait, panic) any
-// concurrent bench that needs the same lock. That is a distinct problem,
-// not covered by this contract.
-const CONSTRUCTION_MARKERS: &[&str] = &["MetalQwen35State::new(", "MetalQwen35State::from_q4_dir("];
-const EXPECTED_CONSTRUCTION_HARNESSES: &[&str] = &[
-    "src/bin/bench_decode_ab.rs",
-    "src/bin/bench_decode_slopefit.rs",
-    "src/bin/bench_lora_mixture.rs",
-    "src/bin/eval_perplexity.rs",
-    "src/bin/gramperf_profile.rs",
-    "src/bin/ppl_metal.rs",
+const CONSTRUCTION_METHODS: &[&str] = &["new", "from_q4_dir"];
+const LEGACY_CRITERION: &str =
+    "legacy Criterion target; source-level locking needs separate benchmark evidence";
+const LEGACY_EXAMPLE: &str =
+    "legacy manually launched measurement example; lock migration is tracked separately";
+const LONG_RUNNING: &str =
+    "long-running process; a lifetime lock would starve measurements or exceed its bounded wait";
+const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
+    ("benches/cross_turn_prefix_cache_bench.rs", LEGACY_CRITERION),
+    ("benches/lm_head_bench.rs", LEGACY_CRITERION),
+    ("benches/metal_decode_bench.rs", LEGACY_CRITERION),
+    ("benches/mtp_decode.rs", LEGACY_CRITERION),
+    ("examples/bench_gdn_decode.rs", LEGACY_EXAMPLE),
+    ("examples/bench_gdn_prefill_ab.rs", LEGACY_EXAMPLE),
+    ("examples/bench_gdn_state.rs", LEGACY_EXAMPLE),
+    ("examples/bench_persistent_state.rs", LEGACY_EXAMPLE),
+    ("examples/bench_pruning.rs", LEGACY_EXAMPLE),
+    ("examples/bench_q4_prefill.rs", LEGACY_EXAMPLE),
+    ("examples/bench_q8_prefill.rs", LEGACY_EXAMPLE),
+    ("examples/bench_quality.rs", LEGACY_EXAMPLE),
+    ("examples/bench_stability.rs", LEGACY_EXAMPLE),
+    ("examples/bench_suite.rs", LEGACY_EXAMPLE),
+    ("examples/decode_profile.rs", LEGACY_EXAMPLE),
+    ("examples/profile_metal.rs", LEGACY_EXAMPLE),
+    ("src/bin/chat_metal.rs", LONG_RUNNING),
+    ("src/bin/lattice.rs", LONG_RUNNING),
+    ("src/bin/lattice/prune_score.rs", LONG_RUNNING),
+    ("src/bin/lattice_serve.rs", LONG_RUNNING),
+    (
+        "tests/quarot_q4_composed_golden.rs",
+        "opt-in real-model gate runs as a serialized step on an isolated CI runner",
+    ),
 ];
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
@@ -53,6 +63,24 @@ fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
     }
     sources.sort();
     sources
+}
+
+fn first_construction(source: &str) -> Option<usize> {
+    CONSTRUCTION_METHODS
+        .iter()
+        .filter_map(|method| source.find(&format!("MetalQwen35State::{method}(")))
+        .min()
+}
+
+fn assert_construction_inventory_classified(
+    discovered: &BTreeSet<String>,
+    classified: &BTreeSet<String>,
+) {
+    assert_eq!(
+        discovered, classified,
+        "MetalQwen35State construction inventory changed; every site must acquire the shared \
+         lock before construction or have an explicit, justified exemption"
+    );
 }
 
 #[test]
@@ -101,31 +129,61 @@ fn raw_metal_measurement_harnesses_acquire_the_shared_lock_first() {
 #[test]
 fn metal_qwen35_state_construction_sites_acquire_the_shared_lock_first() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let exemptions = CONSTRUCTION_EXEMPTIONS
+        .iter()
+        .map(|(path, reason)| {
+            assert!(
+                !reason.trim().is_empty(),
+                "construction exemption {path} needs a justification"
+            );
+            ((*path).to_string(), *reason)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        exemptions.len(),
+        CONSTRUCTION_EXEMPTIONS.len(),
+        "construction exemptions must not contain duplicate paths"
+    );
 
-    for relative in EXPECTED_CONSTRUCTION_HARNESSES {
-        let path = manifest_dir.join(relative);
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read measurement harness {relative}: {e}"));
+    let mut discovered = BTreeSet::new();
+    let mut classified = exemptions.keys().cloned().collect::<BTreeSet<_>>();
+    for relative_dir in ["benches", "examples", "src/bin", "tests"] {
+        for path in rust_sources_under(&manifest_dir.join(relative_dir)) {
+            let source = std::fs::read_to_string(&path).expect("read construction source");
+            let Some(first_construction) = first_construction(&source) else {
+                continue;
+            };
+            let relative = path
+                .strip_prefix(manifest_dir)
+                .expect("source under manifest directory")
+                .to_string_lossy()
+                .into_owned();
+            discovered.insert(relative.clone());
 
-        let first_construction = CONSTRUCTION_MARKERS
-            .iter()
-            .filter_map(|marker| source.find(marker))
-            .min()
-            .unwrap_or_else(|| {
-                panic!(
-                    "{relative} is listed as a MetalQwen35State construction site but no longer \
-                     constructs one; remove it from EXPECTED_CONSTRUCTION_HARNESSES"
-                )
-            });
-
-        let lock = source.find(SHARED_LOCK_CALL).unwrap_or_else(|| {
-            panic!("{relative} constructs MetalQwen35State without the shared GPU lock")
-        });
-        assert!(
-            lock < first_construction,
-            "{relative} acquires the shared GPU lock after its first MetalQwen35State construction"
-        );
+            if source
+                .find(SHARED_LOCK_CALL)
+                .is_some_and(|lock| lock < first_construction)
+            {
+                classified.insert(relative);
+            }
+        }
     }
+
+    assert_construction_inventory_classified(&discovered, &classified);
+}
+
+#[test]
+fn construction_inventory_comparison_rejects_an_unclassified_site() {
+    let discovered = BTreeSet::from(["src/bin/known.rs".to_string(), "src/bin/new.rs".to_string()]);
+    let classified = BTreeSet::from(["src/bin/known.rs".to_string()]);
+
+    let result = std::panic::catch_unwind(|| {
+        assert_construction_inventory_classified(&discovered, &classified);
+    });
+    assert!(
+        result.is_err(),
+        "inventory comparison accepted an unclassified site"
+    );
 }
 
 #[test]
