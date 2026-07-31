@@ -346,10 +346,14 @@ including an immediate `drop`. This proves the repository's checked binding
 convention, not arbitrary Rust lifetime semantics or indirect GPU call graphs.
 The same contract rejects inventory drift, a second Rust definition, or a second
 fleet-path literal. A separate direct raw-dispatch inventory walks every Rust
-file below `src`, examines functions carrying `#[test]` or a `cfg_attr` capable
-of emitting a test attribute, and records every such function containing the
-literal `new_command_buffer()` marker by source path and function name. It does
-not claim helper-mediated dispatch whose test function lacks that literal.
+file below `src`, tokenizes executable source separately from comments and
+strings, examines functions carrying `#[test]` or a `cfg_attr` capable of
+emitting a test attribute, and records every direct `new_command_buffer` method
+call by source path and function name. Its brace-aware scope model carries
+recursive `cfg` and `cfg_attr` conditions from enclosing modules, functions,
+blocks, and guard bindings, and rejects protected syntax it cannot classify. It
+does not claim helper-mediated dispatch whose test function lacks that direct
+method call.
 
 **Partial completion**: #1115 — one shared Metal test/measurement guard, the four
 prior implementations migrated, and the verified direct raw Metal measurement
