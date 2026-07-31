@@ -18799,6 +18799,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_gpu_argmax_parity_k1() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -19141,6 +19142,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // unrotated reference path, within Metal f16/Q8 quantization tolerance.
         #[test]
         fn mtp_draft_logit_equivalence_with_quarot_counter_rotation() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19564,6 +19566,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_metal_qwen35_engine_session_isolation() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };

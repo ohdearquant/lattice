@@ -337,28 +337,36 @@ mutex first, then poll an exclusive advisory lock on
 `/tmp/lion-metal-gpu-test.lock` every 500 ms; panic after 30 minutes with an
 `lsof` hint; hold both resources until the opaque guard drops. The eight raw
 Metal measurement harnesses identified in #1115 keep that guard live across
-their protected entry point. The construction inventory also scans every direct
-`MetalQwen35State::{new,from_q4_dir}` call in repository targets and each test
-function in `src/forward/metal_qwen35.rs`. For non-exempt sites, the source
-contract requires a simple named binding whose lexical scope encloses the
-protected entry point or entire test, and rejects any later use of that binding,
-including an immediate `drop`. This proves the repository's checked binding
-convention, not arbitrary Rust lifetime semantics or indirect GPU call graphs.
-The same contract rejects inventory drift, a second Rust definition, or a second
-fleet-path literal. A separate direct raw-dispatch inventory walks every Rust
-file below `src`, tokenizes executable source separately from comments and
-strings, examines functions carrying `#[test]` or a `cfg_attr` capable of
-emitting a test attribute, and records every direct `new_command_buffer` method
-call by source path and function name. Its brace-aware scope model carries
-recursive `cfg` and `cfg_attr` conditions from enclosing modules, functions,
-blocks, and guard bindings, and rejects protected syntax it cannot classify. It
-does not claim helper-mediated dispatch whose test function lacks that direct
-method call.
+their protected entry point. Cargo metadata supplies the binary, example,
+benchmark, integration-test, and library roots, so nested and manifest-path
+targets enter the same inventory as conventional targets. The construction
+inventory scans direct `MetalQwen35State::{new,from_q4_dir}` calls in those
+compiler-selected source closures. Every deferred construction waiver names the
+Cargo target kind, target name, target root, and exact source line and column;
+adding a second construction to an exempt function therefore creates a new,
+unclassified site. For non-exempt sites, the source check requires a simple
+named binding whose lexical scope encloses the protected entry point or entire
+test, and rejects any later use of that binding, including an immediate `drop`.
+
+This is a checked pre-expansion binding convention, not a proof of arbitrary
+Rust lifetime semantics, name-resolved call graphs, or macro expansion. In
+particular, a macro invocation whose protected identifiers are supplied only as
+metavariables is outside the lexical inventory; a regression fixture records
+that limitation explicitly. A separate direct raw-dispatch inventory examines
+test functions in Cargo-selected library and integration-test module closures
+and records recognized direct command-buffer method calls by source path and
+function name. Its brace-aware scope model carries recursive `cfg` and
+`cfg_attr` conditions from enclosing modules, functions, blocks, and guard
+bindings. Recognized direct syntax, malformed selected source, unresolved
+modules, and unclassifiable test registration fail closed. Helper-mediated work
+without a recognized marker remains outside this source-level guarantee and
+must be guarded through an explicit checked entrypoint or tracked as an exact
+site.
 
 **Partial completion**: #1115 — one shared Metal test/measurement guard, the four
 prior implementations migrated, and the verified direct raw Metal measurement
-harnesses serialized before GPU work. The remaining target families,
-helper-mediated paths, and process-lifetime exemptions are tracked in #1274.
+harnesses serialized before GPU work. The remaining exact deferred measurement
+sites and process-lifetime exclusions are tracked in #1274.
 
 ## What we are NOT doing
 
