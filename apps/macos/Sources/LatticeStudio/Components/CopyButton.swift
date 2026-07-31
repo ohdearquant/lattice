@@ -84,6 +84,7 @@ struct CopyableCodeBlock: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("CopyButton") {
     HStack(spacing: Theme.Space.md) {
         CopyButton("lattice chat qwen3.5-0.8b --temperature 0.7")
@@ -112,3 +113,4 @@ struct CopyableCodeBlock: View {
     .background(Theme.Palette.canvas)
     .frame(width: 560)
 }
+#endif

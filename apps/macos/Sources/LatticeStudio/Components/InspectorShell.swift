@@ -60,6 +60,7 @@ struct InspectorShell<Content: View>: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("InspectorShell") {
     HStack(spacing: 0) {
         // Simulate a main content area
@@ -132,3 +133,4 @@ struct InspectorShell<Content: View>: View {
     .frame(width: 600, height: 300)
     .background(Theme.Palette.canvas)
 }
+#endif

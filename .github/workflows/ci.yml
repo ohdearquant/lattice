@@ -662,8 +662,8 @@ jobs:
   # are never imported by these test files -- adapters are exercised only
   # through pure parsing helpers and the harness's own deterministic fake
   # adapters), no engine binary or model weights required — cheap
-  # ubuntu-only, so it is ungated like typos/actionlint above rather than
-  # routed through ci-gate. (The four adapter test files were not wired into
+  # ubuntu-only and routed through ci-gate below so any failure blocks merge.
+  # (The four adapter test files were not wired into
   # any CI job before this issue's step-2 migrations landed; this closes
   # that gap for all of them at once rather than repeating the same
   # omission per migrated script.)
@@ -720,6 +720,12 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      # bench_quality.sh's canonical-artifact publication guard. Runs the
+      # shipping script in a disposable repo with stub lattice/MLX scorers,
+      # proving failures preserve the tracked TSV and a complete run publishes
+      # all rows; no benchmark, model, GPU, network, or cargo build is used.
+      - name: bash scripts/bench_quality_selftest.sh
+        run: bash scripts/bench_quality_selftest.sh
       - name: python3 tests/test_bench_targets.py
         run: python3 tests/test_bench_targets.py -v
 
@@ -770,12 +776,13 @@ jobs:
   # safe required context: a matrix job skipped at job level never creates
   # its per-combination check runs at all, and a plain gated job that skips
   # reports success even if `changes` itself blew up. This job passes when
-  # there is nothing to check (docs-only) and mirrors the five gated jobs'
+  # there is nothing to compile (docs-only), still requires the unconditional
+  # harness unit tests, and mirrors the other gated jobs'
   # results when there is, exactly like `parity-gate` in e2e-parity.yml and
   # `app-binaries-gate` in app-binaries.yml.
   ci-gate:
     name: ci-gate
-    needs: [changes, ci, feature-matrix, msrv, semver-checks]
+    needs: [changes, ci, feature-matrix, msrv, semver-checks, decode-harness-unit-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -787,9 +794,14 @@ jobs:
           FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
           MSRV_RESULT="${{ needs.msrv.result }}"
           SEMVER_RESULT="${{ needs.semver-checks.result }}"
-          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
+          DECODE_HARNESS_RESULT="${{ needs.decode-harness-unit-tests.result }}"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT decode-harness-unit-tests=$DECODE_HARNESS_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed, failing closed."
+            exit 1
+          fi
+          if [ "$DECODE_HARNESS_RESULT" != "success" ]; then
+            echo "::error::decode-harness-unit-tests did not succeed (result=$DECODE_HARNESS_RESULT)."
             exit 1
           fi
           if [ "$CODE" != "true" ]; then
@@ -822,5 +834,5 @@ jobs:
             echo "::error::semver-checks did not succeed (result=$SEMVER_RESULT)."
             exit 1
           fi
-          echo "Code changed; ci, feature-matrix, msrv, and semver-checks all PASSED."
+          echo "Code changed; ci, feature-matrix, msrv, semver-checks, and decode-harness-unit-tests all PASSED."
           exit 0
