@@ -83,6 +83,9 @@ proptest = "1.0"
 tempfile = "3.10"
 proc-macro2 = { version = "1.0", features = ["span-locations"] }
 syn = { version = "2.0", features = ["full", "visit"] }
+# Offline WGSL parsing and semantic validation for the WGPU shader artifacts.
+# This matches the Naga major used transitively by wgpu 24.
+naga = { version = "24.0", features = ["wgsl-in"] }
 # Partial-body polling (`BodyExt::frame`) and `tower::Service::oneshot` for
 # axum `Router`-level HTTP tests (ADR-080 C2 round 2). Both are already
 # transitive axum 0.8 dependencies; declared here so direct dev-dependents

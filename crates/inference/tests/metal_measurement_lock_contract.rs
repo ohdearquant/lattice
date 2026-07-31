@@ -104,7 +104,6 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
 const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "benches/attention_dispatch_bench.rs",
     "benches/attn_opt_bench.rs",
-    "benches/compute_attention_bench.rs",
     "benches/differential_attention_bench.rs",
     "benches/e2e_bench.rs",
     "benches/elementwise_bench.rs",

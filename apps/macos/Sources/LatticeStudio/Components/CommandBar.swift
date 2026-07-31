@@ -372,6 +372,7 @@ extension CommandSpec {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("CommandBar") {
     @Previewable @State var isPresented: Bool = true
 
@@ -396,3 +397,4 @@ extension CommandSpec {
     }
     .frame(width: 640, height: 400)
 }
+#endif
