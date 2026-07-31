@@ -172,6 +172,111 @@ use crate::quant::quarot::rmsnorm_fusion::{
 };
 use crate::quant::quarot::rotation::{absorb_input_rotation_f64, absorb_output_rotation_f64};
 
+#[cfg(test)]
+mod pre_admission_allocation_tracking {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy)]
+    struct State {
+        armed: bool,
+        allocation_calls: usize,
+        rejection_seen: bool,
+    }
+
+    const INACTIVE: State = State {
+        armed: false,
+        allocation_calls: 0,
+        rejection_seen: false,
+    };
+
+    std::thread_local! {
+        static STATE: Cell<State> = const { Cell::new(INACTIVE) };
+    }
+
+    struct TrackingAllocator;
+
+    #[global_allocator]
+    static GLOBAL: TrackingAllocator = TrackingAllocator;
+
+    fn record_allocation() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.armed {
+                state.allocation_calls = state.allocation_calls.saturating_add(1);
+                cell.set(state);
+            }
+        });
+    }
+
+    // SAFETY: allocation requests are observed without modification and then
+    // forwarded unchanged to the system allocator.
+    unsafe impl GlobalAlloc for TrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            System.alloc(layout)
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            System.alloc_zeroed(layout)
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout);
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation();
+            System.realloc(ptr, layout, new_size)
+        }
+    }
+
+    pub(super) struct Guard {
+        active: bool,
+    }
+
+    pub(super) fn start() -> Guard {
+        STATE.with(|cell| {
+            assert!(!cell.get().armed, "allocation tracking already armed");
+            cell.set(State {
+                armed: true,
+                ..INACTIVE
+            });
+        });
+        Guard { active: true }
+    }
+
+    pub(super) fn mark_rejection() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.armed {
+                state.armed = false;
+                state.rejection_seen = true;
+                cell.set(state);
+            }
+        });
+    }
+
+    impl Guard {
+        pub(super) fn finish(mut self) -> (usize, bool) {
+            self.active = false;
+            STATE.with(|cell| {
+                let state = cell.replace(INACTIVE);
+                (state.allocation_calls, state.rejection_seen)
+            })
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = STATE.try_with(|cell| cell.set(INACTIVE));
+            }
+        }
+    }
+}
+
 /// Maximum retained bytes for chain-probe tokens, logit row descriptors, and
 /// complete f64 logit rows in a prepared forward-equivalence snapshot.
 ///
@@ -336,6 +441,8 @@ fn validate_forward_equivalence_inputs(
         .and_then(|bytes| bytes.checked_add(probe_token_bytes))
         .ok_or_else(forward_equivalence_logit_size_overflow)?;
     if retained_bytes > MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES {
+        #[cfg(test)]
+        pre_admission_allocation_tracking::mark_rejection();
         return Err(InferenceError::Inference(format!(
             "assert_forward_equivalence_qwen35: retained chain-logit budget exceeded \
              (num_probe_tokens={}, vocab_size={}, required_bytes={retained_bytes}, \
@@ -1275,6 +1382,41 @@ mod tests {
         assert!(
             !over_limit.contains(QWEN35_EMBED_TOKENS_NAME),
             "budget rejection must precede tensor access: {over_limit}"
+        );
+    }
+
+    #[test]
+    fn prepared_snapshot_rejects_over_budget_before_any_owned_allocation() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let original = HashMap::new();
+        let rotation = RandomizedHadamard::new(0x51A5_EEED, cfg.hidden_size).unwrap();
+        let bytes_per_probe =
+            cfg.vocab_size * size_of::<f64>() + size_of::<Vec<f64>>() + size_of::<u32>();
+        let max_probe_tokens = MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES / bytes_per_probe;
+        let forward_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: max_probe_tokens + 1,
+            ..Default::default()
+        };
+
+        let tracking = pre_admission_allocation_tracking::start();
+        let result = prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &forward_cfg);
+        let (allocation_calls, rejection_seen) = tracking.finish();
+
+        assert!(
+            rejection_seen,
+            "the measured call must reach budget rejection"
+        );
+        assert_eq!(
+            allocation_calls, 0,
+            "over-budget preparation allocated before rejecting"
+        );
+        let error = result
+            .err()
+            .expect("the over-budget request must fail admission")
+            .to_string();
+        assert!(
+            error.contains("retained chain-logit budget"),
+            "unexpected error: {error}"
         );
     }
 

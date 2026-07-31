@@ -865,7 +865,9 @@ fn write_f16_file(
 mod tests {
     use super::*;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
-    use crate::quant::quarot::lm_head::{QWEN35_EMBED_TOKENS_NAME, QWEN35_LM_HEAD_NAME};
+    use crate::quant::quarot::lm_head::{
+        QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
+    };
     use crate::weights::q4_weights::q4_f32_to_f16;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -1053,6 +1055,9 @@ mod tests {
             .collect()
     }
 
+    const TIED_LM_HEAD_PERTURBED_INDEX: usize = 0;
+    const TIED_LM_HEAD_PERTURBATION: f64 = 1.0 / 32_768.0;
+
     /// Write every required tensor for `cfg` to a single safetensors file.
     fn write_required_tensors_for(
         cfg: &Qwen35Config,
@@ -1079,17 +1084,30 @@ mod tests {
             synth_data(n, s)
         };
 
+        let mut embed_tokens = next(vocab * hidden);
+        let mut final_norm = next(hidden);
+        let tied_lm_head = if cfg.tie_word_embeddings && include_tied_lm_head {
+            embed_tokens[TIED_LM_HEAD_PERTURBED_INDEX] = 0.25;
+            final_norm[TIED_LM_HEAD_PERTURBED_INDEX] = 0.0;
+            let mut lm_head = embed_tokens.clone();
+            lm_head[TIED_LM_HEAD_PERTURBED_INDEX] += TIED_LM_HEAD_PERTURBATION;
+            Some(lm_head)
+        } else {
+            None
+        };
         entries.push((
             "model.language_model.embed_tokens.weight".to_string(),
             vec![vocab, hidden],
-            next(vocab * hidden),
+            embed_tokens,
         ));
         entries.push((
             "model.language_model.norm.weight".to_string(),
             vec![hidden],
-            next(hidden),
+            final_norm,
         ));
-        if !cfg.tie_word_embeddings || include_tied_lm_head {
+        if let Some(lm_head) = tied_lm_head {
+            entries.push(("lm_head.weight".to_string(), vec![vocab, hidden], lm_head));
+        } else if !cfg.tie_word_embeddings {
             entries.push((
                 "lm_head.weight".to_string(),
                 vec![vocab, hidden],
@@ -1328,9 +1346,30 @@ mod tests {
         );
         let (disk_embed, _) = reader.read_tensor_f64(QWEN35_EMBED_TOKENS_NAME).unwrap();
         let (disk_lm_head, _) = reader.read_tensor_f64(QWEN35_LM_HEAD_NAME).unwrap();
-        assert_ne!(
-            disk_lm_head, disk_embed,
-            "the competing lm_head must differ from tied embeddings"
+        let (disk_final_norm, _) = reader.read_tensor_f64(QWEN35_FINAL_NORM_NAME).unwrap();
+        let differing_indices = disk_lm_head
+            .iter()
+            .zip(&disk_embed)
+            .enumerate()
+            .filter_map(|(index, (lm_head, embed))| (lm_head != embed).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            differing_indices,
+            vec![TIED_LM_HEAD_PERTURBED_INDEX],
+            "the competing lm_head must differ at exactly one element"
+        );
+        let source_delta = (disk_lm_head[TIED_LM_HEAD_PERTURBED_INDEX]
+            - disk_embed[TIED_LM_HEAD_PERTURBED_INDEX])
+            .abs();
+        assert_eq!(source_delta, TIED_LM_HEAD_PERTURBATION);
+        let tolerance = 1e-5;
+        let transformed_delta = source_delta
+            * (1.0 + disk_final_norm[TIED_LM_HEAD_PERTURBED_INDEX]).abs()
+            / (cfg.hidden_size as f64).sqrt();
+        assert!(
+            transformed_delta > tolerance && transformed_delta < 1.1 * tolerance,
+            "controlled post-fusion/rotation delta {transformed_delta} must sit just above \
+             tolerance {tolerance}"
         );
         let required_names = qwen_required_tensor_names(&cfg);
         let mut working_set = load_tensors_f64(&reader, &required_names).unwrap();
@@ -1339,6 +1378,7 @@ mod tests {
         let rotation = RandomizedHadamard::new(0xA11C_E5E5, cfg.hidden_size).unwrap();
         let forward_cfg = ForwardEquivalenceConfig {
             num_probe_tokens: 2,
+            tolerance,
             ..Default::default()
         };
         let passing_snapshot =
