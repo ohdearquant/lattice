@@ -28,17 +28,17 @@ Per-model runtime configuration, loaded from `inference_config.json` in the mode
 
 #### `eos_token_id` — default `151643`
 
-**What it does**: The end-of-sequence token ID appended during `tokenize_for_embedding()`. When this token is generated during text generation, decoding stops.
+**What it does**: The end-of-sequence token ID appended during `tokenize_for_embedding()`.
 
 **Why `151643`**: This is Qwen3-Embedding-0.6B's EOS token as defined in the model's `tokenizer_config.json`. Different Qwen variants may use different values (check the model's tokenizer config). BERT/BGE models don't use this field — they have their own EOS handling via `[SEP]` token (ID 102).
 
-**Where used**: Embedding tokenization (`qwen.rs` tokenize function), text generation EOS check (`generate.rs:49` `GenerateOutput.stopped_by_eos`).
+**Where used**: Embedding tokenization in `model/qwen.rs`.
 
 #### `rope_table_max_seq_len` — default `8192`
 
 **What it does**: Maximum sequence length for RoPE (Rotary Position Embedding) frequency table precomputation. Caps the cos/sin table allocation in both single-file and sharded weight loading paths.
 
-**Why `8192`**: Qwen3 models natively support up to 32K positions (`max_position_embeddings` in `config.json`), but embedding workloads rarely exceed 8K tokens. Setting this to the full 32K wastes ~4× memory on frequency tables that are never indexed. For generation workloads targeting longer contexts, increase to `max_position_embeddings`.
+**Why `8192`**: Qwen3 models natively support up to 32K positions (`max_position_embeddings` in `config.json`), but embedding workloads rarely exceed 8K tokens. Setting this to the full 32K wastes ~4× memory on frequency tables that are never indexed. Increase it only when embedding inputs need a longer supported context.
 
 **Where used**: RoPE table initialization (`rope.rs:8` `RopeTable`), model loading in `QwenModel::load_*()`.
 
@@ -46,9 +46,9 @@ Per-model runtime configuration, loaded from `inference_config.json` in the mode
 
 **What it does**: Maximum sequence length for Metal GPU buffer pre-allocation. Controls the size of `qkv_out`, `q_buf`, `k_buf`, `v_buf`, `attn_out`, and activation buffers allocated at model init time.
 
-**Why `2048`**: Embedding inputs are typically <512 tokens; 2048 provides 4× headroom without excessive GPU memory usage. For the 4B model with wider hidden dimensions (2560 vs 1024), the per-token buffer cost is 2.5× higher — reduce to 1024 if GPU memory is tight. For generation workloads, increase up to `rope_table_max_seq_len`.
+**Why `2048`**: Embedding inputs are typically <512 tokens; 2048 provides 4× headroom without excessive GPU memory usage. For the 4B model with wider hidden dimensions (2560 vs 1024), the per-token buffer cost is 2.5× higher — reduce to 1024 if GPU memory is tight. Increase it only for longer Metal embedding inputs, up to the effective RoPE context limit.
 
-**Where used**: Metal forward pass buffer allocation (`forward/metal.rs` `MetalForwardPass`), KV cache sizing (`kv_cache/flat.rs` `FlatKVCacheConfig`).
+**Where used**: Metal embedding forward-pass buffer allocation (`forward/metal.rs` `MetalForwardPass`).
 
 #### `base_model_rev` — default `"none"`, derived on load
 
@@ -75,25 +75,6 @@ Per-model runtime configuration, loaded from `inference_config.json` in the mode
 ```
 
 Omit any field to use the default. An empty `{}` is valid and equivalent to all defaults.
-
----
-
-## GenerateConfig
-
-**Source**: `src/generate.rs` (`GenerateConfig`)
-
-Legacy text generation configuration for decoder-only models. This `crate::generate::GenerateConfig` type is deprecated since 0.5.1 but remains functional during its compatibility window; the canonical Qwen3.5 configuration is `crate::model::GenerateConfig` in `src/model/qwen35_config.rs`.
-
-| Field               | Type                         | Default   | Source                              | Why                                                                                           |
-| ------------------- | ---------------------------- | --------- | ----------------------------------- | --------------------------------------------------------------------------------------------- |
-| `max_new_tokens`    | `usize`                      | `256`     | `Default` impl at `generate.rs:126` | Practical limit for chat-style responses. Increase for long-form generation                   |
-| `sampling`          | `SamplingConfig`             | see below | `SamplingConfig::default()`         | Balanced temperature+nucleus sampling                                                         |
-| `eos_token_id`      | `Option<u32>`                | `None`    | `Default` impl                      | When `None`, generation runs to `max_new_tokens`. Set to model's EOS to enable early stopping |
-| `include_prompt`    | `bool`                       | `false`   | `Default` impl                      | Whether output includes the original prompt text                                              |
-| `grammar`           | `Option<Arc<GrammarEngine>>` | `None`    | `Default` impl                      | Masks logits and advances grammar state at every generated token                              |
-| `kv_cache_capacity` | `Option<usize>`              | `None`    | `Default` impl                      | Optional per-request cap on KV allocation and effective generation length                     |
-
-When `grammar` masks every token, generation fails closed with `InferenceError::InvalidInput`; a token rejected while advancing the grammar stops with `StopReason::Grammar`. `kv_cache_capacity` is clamped to `[1, prompt_len + max_new_tokens]`; a cap smaller than the prompt is rejected, and generation stops with `StopReason::KvFull` when the cache reaches the effective cap.
 
 ---
 
