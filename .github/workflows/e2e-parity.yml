@@ -1037,15 +1037,18 @@ jobs:
       # job's `--lib q4` filter does not match their names). This step reuses
       # this job's already-downloaded checkpoint (no second ~2 min
       # checkout+download job) and its macos-latest runner, which exposes a
-      # PARAVIRTUAL Metal device — sufficient here because none of these four
+      # PARAVIRTUAL Metal device — sufficient here because none of these five
       # tests touch the Apple7-gated tiled-GEMM path (decode-only GEMV/element-wise
       # dispatch), the same reasoning the f16-KV-cache Metal gate in ci.yml
       # documents. LATTICE_METAL_TEST_ENFORCE=1 makes a missing device or
-      # checkpoint a hard failure instead of the default dev-run skip; the
-      # `--lib inject` filter also matches two unrelated pre-existing tests
-      # (a QuaRot seed round-trip test and the CPU f16 injection oracle), so
-      # the exact-count grep below is 7, not 5 -- update it in the same PR
-      # if the `inject`-matching test surface changes.
+      # checkpoint a hard failure instead of the default dev-run skip. The
+      # `--lib inject` filter also matches `inject_quarot_seed_roundtrips_in_config_json`
+      # (QuaRot seed round trip), `injection_replaces_lookup_and_is_mutation_sensitive`
+      # (CPU f16 injection oracle), and
+      # `shared_server_runner_drops_router_after_injected_shutdown` (serve-shutdown
+      # regression matching only incidentally on the `injected` substring), so
+      # the exact-count grep below is 8, not 5 -- update it in the same PR if the
+      # `inject`-matching test surface changes.
       - name: Run MP2 Metal injection gate (fail-closed)
         if: ${{ !cancelled() }}
         env:
@@ -1060,7 +1063,7 @@ jobs:
             cat vision-mp2-inject-gate.log
             exit "$status"
           fi
-          grep -Eq '^test result: ok\. 7 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
 
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
