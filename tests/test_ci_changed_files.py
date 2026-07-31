@@ -255,6 +255,102 @@ class MergeQueueWorkflowTests(unittest.TestCase):
                 self.assertIn(trigger, contents)
 
 
+class E2eReporterWorkflowTests(unittest.TestCase):
+    _REPORTING_CONTRACTS = (
+        (
+            "parity",
+            "Post parity report",
+            "e2e-parity",
+            "Run e2e parity check",
+            "python3 scripts/e2e_parity_check.py",
+        ),
+        (
+            "metal-parity",
+            "Post Metal parity report",
+            "e2e-metal-parity",
+            "Run Metal attention/KV parity check",
+            "python3 scripts/e2e_parity_check.py --backend metal",
+        ),
+        (
+            "q4-vision-gates",
+            "Post PPL gate report",
+            "q4-ppl-gate",
+            "Run Q4 PPL regression gate",
+            "python3 scripts/ppl_gate_check.py",
+        ),
+    )
+
+    def setUp(self) -> None:
+        self.workflow = (
+            _ROOT / ".github/workflows/e2e-parity.yml"
+        ).read_text(encoding="utf-8")
+
+    def _assert_reporting_contract(self, workflow: str) -> None:
+        for job_id, reporter_name, header, gate_name, command in (
+            self._REPORTING_CONTRACTS
+        ):
+            job = _workflow_job(workflow, job_id)
+            reporter = _workflow_step(job, reporter_name)
+            gate = _workflow_step(job, gate_name)
+
+            self.assertIn(
+                "if: github.event_name == 'pull_request' && always()",
+                reporter,
+            )
+            self.assertIn("continue-on-error: true", reporter)
+            self.assertIn("marocchino/sticky-pull-request-comment@", reporter)
+            self.assertIn(f"header: {header}", reporter)
+
+            self.assertNotIn("continue-on-error:", gate)
+            self.assertNotIn("|| true", gate)
+            self.assertRegex(
+                gate,
+                rf"(?m)^        run: {re.escape(command)}$",
+            )
+
+    def _mutate_step(
+        self,
+        workflow: str,
+        job_id: str,
+        step_name: str,
+        old: str,
+        new: str,
+    ) -> str:
+        job = _workflow_job(workflow, job_id)
+        step = _workflow_step(job, step_name)
+        self.assertIn(old, step)
+        mutated_step = step.replace(old, new, 1)
+        mutated_job = job.replace(step, mutated_step, 1)
+        return workflow.replace(job, mutated_job, 1)
+
+    def test_reporters_are_informational_and_verification_remains_gating(
+        self,
+    ) -> None:
+        self._assert_reporting_contract(self.workflow)
+
+    def test_contract_rejects_reporter_and_gate_mutations(self) -> None:
+        mutations = {}
+        for job_id, reporter_name, _, gate_name, command in (
+            self._REPORTING_CONTRACTS
+        ):
+            mutations[f"{reporter_name} made gating"] = self._mutate_step(
+                self.workflow,
+                job_id,
+                reporter_name,
+                "continue-on-error: true",
+                "continue-on-error: false",
+            )
+            mutations[f"{gate_name} made non-gating"] = self._mutate_step(
+                self.workflow,
+                job_id,
+                gate_name,
+                f"run: {command}",
+                f"continue-on-error: true\n        run: {command}",
+            )
+
+        for name, mutated in mutations.items():
+            with self.subTest(mutation=name), self.assertRaises(AssertionError):
+                self._assert_reporting_contract(mutated)
 class E2eParityChangeClassificationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
