@@ -4,20 +4,18 @@
 The locking and ambient-load properties are about refusing rather than about
 measuring.
 
-The body refuses to measure unless it holds inherited lock descriptors that
-prove -- by fstat identity against the recorded lock paths, plus a non-blocking
-flock re-acquire and a probe open that must fail to lock -- that both
-machine-wide locks are actually held. scripts/bench-compare.sh runs the
-measurement body under scripts/lib/bench-locks.py --pass-lock-fds, which
-records its own PID and both lock dispositions and hands the body the two
-acquired descriptors.
+The dedicated Python supervisor refuses to measure unless it holds inherited
+lock descriptors verified by fstat identity against the recorded lock paths
+and a non-blocking flock re-acquire. scripts/bench-compare.sh routes the body
+through that supervisor, which retains both descriptors and gives the shell
+only a non-lock handoff pipe.
 
 A PID recorded in the lock status and found in this process's ancestry is only
 a RELATION, never a proof: the file supplies the PID and the OS supplies the
 chain, so a caller willing to record an ancestor's own PID -- its own shell's
-included -- used to get through with neither lock held. That was fixed by
-requiring the descriptor proof unconditionally: a status file with no inherited
-LATTICE_BENCH_LOCK_FDS is refused outright, with no ancestry fallback.
+included -- used to get through with neither lock held. The dedicated supervisor
+requires both descriptor capabilities, and the body refuses a status receipt
+that arrives without its cooperative handoff pipe.
 
 A check that merely asserted the file exists would refuse none of the above.
 
@@ -245,19 +243,18 @@ class LockPrecondition(unittest.TestCase):
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
             self.assertIn("no lock status", r.stderr)
 
-    def test_status_file_without_inherited_lock_fds_is_refused(self):
-        """A status file without descriptor capabilities is only text.
+    def test_status_file_without_supervisor_handoff_is_refused(self):
+        """A status file without the supervisor handoff is only text.
 
-        Mutation-sensitive: removing the descriptor precondition lets this
-        caller-controlled receipt reach the measurement body without either
-        machine-wide lock.
+        Mutation-sensitive: removing the handoff precondition lets this
+        caller-controlled receipt reach the measurement body directly.
         """
         with _Sandbox() as sb:
             sb.status.parent.mkdir(parents=True, exist_ok=True)
             sb.status.write_text("supervisor_pid=1\nlock=fabricated\n")
             r = sb.run([sb.impl], BENCH_IDLE_FLOOR="0")
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
-            self.assertIn("LATTICE_BENCH_LOCK_FDS", r.stderr)
+            self.assertIn("LATTICE_BENCH_SUPERVISOR_FD", r.stderr)
             self.assertNotIn("Run conditions", r.stdout)
 
     def test_deliberately_recorded_ancestor_pid_alone_is_refused(self):
@@ -266,10 +263,9 @@ class LockPrecondition(unittest.TestCase):
         A caller who records a PID that really is one of its ancestors -- its
         own shell, here -- used to pass the check with no lock held, which is
         exactly the stale-environment bypass: an exported status made an ordinary
-        invocation failure read as a supervised run. The fix requires
-        the inherited LATTICE_BENCH_LOCK_FDS descriptor proof unconditionally,
-        so this receipt-only invocation must now be refused before the body
-        ever prints its run-conditions banner.
+        invocation failure read as a supervised run. The body now requires the
+        dedicated supervisor's descriptor-free handoff, so this receipt-only
+        invocation is refused before the run-conditions banner.
 
         Mutation-sensitive: reintroduce the ancestry-walk fallback and this run
         reaches "Run conditions" again with neither lock held.
@@ -287,7 +283,7 @@ class LockPrecondition(unittest.TestCase):
                 ["bash", "-c", script], capture_output=True, text=True,
                 env={**sb.env, "BENCH_IDLE_FLOOR": "0"}, timeout=300)
             self.assertEqual(r.returncode, 2, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
-            self.assertIn("LATTICE_BENCH_LOCK_FDS", r.stderr)
+            self.assertIn("LATTICE_BENCH_SUPERVISOR_FD", r.stderr)
             self.assertNotIn("Run conditions", r.stdout)
 
     def test_supervised_run_reaches_the_measurement(self):

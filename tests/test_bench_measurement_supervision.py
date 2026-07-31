@@ -185,7 +185,7 @@ class InventoryContract(unittest.TestCase):
             source = (REPO / path).read_text()
             with self.subTest(path=path):
                 if path == "scripts/bench-compare.sh":
-                    self.assertIn("bench-locks.py", source)
+                    self.assertIn("bench_supervision.py", source)
                 elif path.endswith(".py"):
                     self.assertIn("ensure_python_entrypoint(", source)
                 elif path.endswith(".mjs"):
@@ -265,7 +265,7 @@ class InventoryContract(unittest.TestCase):
         self.assertGreaterEqual(source.count("[SUPERVISION, 'verify'"), 2)
         self.assertNotIn("verify-retained", source)
 
-    def test_possessing_entrypoints_recheck_canonical_paths(self):
+    def test_cooperating_shell_entrypoints_recheck_handoff(self):
         for path in (
             "scripts/lib/bench-supervision.sh",
             "scripts/lib/bench-compare-impl.sh",
@@ -490,7 +490,7 @@ class RuntimeContract(unittest.TestCase):
             self.assertEqual(marker.read_text(), "ran")
 
     def test_substitute_and_restore_is_outside_cooperative_contract(self):
-        """Endpoint identity samples do not certify hostile pathname continuity."""
+        """A green result deliberately pins behavior outside the contract."""
 
         with _SupervisorSandbox() as sb:
             substituted = Path(sb.tmp.name) / "substituted"
@@ -544,8 +544,15 @@ class RuntimeContract(unittest.TestCase):
             finally:
                 restore.touch()
                 stdout, stderr = proc.communicate(timeout=30)
-            self.assertEqual(proc.returncode, 0, f"{stdout}\n{stderr}")
-            self.assertEqual(marker.read_text(), "restored")
+            outside_contract = (
+                "success deliberately records behavior outside the cooperative contract"
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"{outside_contract}:\n{stdout}\n{stderr}",
+            )
+            self.assertEqual(marker.read_text(), "restored", outside_contract)
 
     def test_forged_live_pipe_handoff_is_accepted_but_outside_cooperative_contract(
         self,
@@ -627,8 +634,19 @@ class RuntimeContract(unittest.TestCase):
                 if proc is not None and proc.poll() is None:
                     proc.kill()
                     proc.communicate()
-            self.assertEqual(proc.returncode, 0, f"{stdout}\n{stderr}")
-            self.assertEqual(marker.read_text(), "accepted:acquired,acquired")
+            outside_contract = (
+                "success deliberately records behavior outside the cooperative contract"
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"{outside_contract}:\n{stdout}\n{stderr}",
+            )
+            self.assertEqual(
+                marker.read_text(),
+                "accepted:acquired,acquired",
+                outside_contract,
+            )
 
     def test_oversized_descriptor_uses_normal_refusal_diagnostic(self):
         with _SupervisorSandbox() as sb:
@@ -962,7 +980,7 @@ class RuntimeContract(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("node"), "node is unavailable")
     def test_node_child_can_forward_pipe_to_handoff_sample(self):
-        """Mutation-sensitive: ordinary spawn closes the liveness witness."""
+        """Mutation-sensitive: ordinary spawn closes the handoff pipe."""
 
         with _SupervisorSandbox() as sb:
             code = """
@@ -1229,23 +1247,23 @@ process.exit(child.status ?? 2);
 
 
 class BenchCompareDirectInvocationRefusal(unittest.TestCase):
-    """scripts/lib/bench-compare-impl.sh verify_locks must require inherited
-    lock descriptors, not just an ancestor-PID relation in a caller-supplied
-    status file.
+    """The bench-compare body requires a descriptor-free supervisor handoff.
 
-    Mutation-sensitive: this reproduces the exact receipt-only exploit —
-    a caller invokes the body directly after writing a status file whose
-    supervisor_pid is its own PID (trivially "an ancestor" of the child bash
-    process it then spawns), with no LATTICE_BENCH_LOCK_FDS. Neither lock is
-    held. With the fix, verify_locks refuses (exit 2) before touching cargo.
-    Reverting the fix (restoring the ancestry-only check) must make the same
-    invocation exit 0, proving the bypass was real.
+    The entry point gives inherited lock capabilities only to the dedicated
+    Python supervisor. The shell receives its non-lock handoff pipe. A caller
+    that writes a status receipt and invokes the body directly has neither, so
+    verify_locks refuses before touching cargo.
     """
 
     def _build_repo(self, tmp: str) -> Path:
         root = Path(tmp) / "repo"
         lib = root / "scripts" / "lib"
         lib.mkdir(parents=True)
+        shutil.copy2(
+            REPO / "scripts" / "bench-compare.sh",
+            root / "scripts" / "bench-compare.sh",
+        )
+        (root / "scripts" / "bench-compare.sh").chmod(0o755)
         shutil.copy2(
             REPO / "scripts" / "lib" / "bench-compare-impl.sh",
             lib / "bench-compare-impl.sh",
@@ -1255,6 +1273,22 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
             REPO / "scripts" / "lib" / "bench_supervision.py",
             lib / "bench_supervision.py",
         )
+        self.bench_lock = Path(tmp) / "bench-window.lock"
+        self.gpu_lock = Path(tmp) / "metal-gpu.lock"
+        self.pending = Path(tmp) / "bench-window-pending"
+        lock_source = (REPO / "scripts" / "lib" / "bench-locks.py").read_text()
+        for name, value in (
+            ("BENCH_WINDOW", self.bench_lock),
+            ("GPU_LOCK", self.gpu_lock),
+            ("PENDING_DIR", self.pending),
+        ):
+            lock_source = re.sub(
+                rf'^{name} = "[^"]*"$',
+                f'{name} = "{value}"',
+                lock_source,
+                flags=re.M,
+            )
+        (lib / "bench-locks.py").write_text(lock_source)
         (lib / "quiet-probe.py").write_text(
             "#!/usr/bin/env python3\n"
             "import sys\n"
@@ -1327,8 +1361,81 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
         cache.mkdir(parents=True, exist_ok=True)
         (cache / "bench-locks-status.txt").write_text(
             f"supervisor_pid={own_pid}\n"
-            "lock=bench-window (/tmp/fake-bench-window.lock): fabricated\n"
-            "lock=Metal GPU (/tmp/fake-metal-gpu.lock): fabricated\n"
+            f"lock=bench-window ({self.bench_lock}): fabricated\n"
+            f"lock=Metal GPU ({self.gpu_lock}): fabricated\n"
+        )
+
+    def test_preflight_helper_cannot_observe_or_release_lock_capabilities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build_repo(tmp)
+            marker = Path(tmp) / "date-descriptor-probe"
+            date = self.bindir / "date"
+            date.write_text(
+                "#!/usr/bin/env python3\n"
+                "import fcntl, os\n"
+                "from pathlib import Path\n"
+                f"paths = ({str(self.bench_lock)!r}, {str(self.gpu_lock)!r})\n"
+                "lock_ids = {\n"
+                "    (os.stat(path).st_dev, os.stat(path).st_ino) for path in paths\n"
+                "}\n"
+                "observed = []\n"
+                "for fd in range(3, 256):\n"
+                "    try:\n"
+                "        fd_stat = os.fstat(fd)\n"
+                "    except OSError:\n"
+                "        continue\n"
+                "    if (fd_stat.st_dev, fd_stat.st_ino) in lock_ids:\n"
+                "        observed.append(fd)\n"
+                "        fcntl.flock(fd, fcntl.LOCK_UN)\n"
+                "states = []\n"
+                "for path in paths:\n"
+                "    fd = os.open(path, os.O_RDWR)\n"
+                "    try:\n"
+                "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "    except OSError:\n"
+                "        states.append('blocked')\n"
+                "    else:\n"
+                "        states.append('acquired')\n"
+                "    finally:\n"
+                "        os.close(fd)\n"
+                f"Path({str(marker)!r}).write_text(\n"
+                "    ('observed' if observed else 'hidden')\n"
+                "    + ':' + ','.join(states)\n"
+                ")\n"
+                "print('2026-07-31T00:00:00Z')\n"
+                "raise SystemExit(42)\n"
+            )
+            date.chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{self.bindir}:{os.environ['PATH']}",
+                "BENCH_HOST_ID": "fixture",
+            }
+            for name in (
+                "LATTICE_BENCH_LOCK_STATUS",
+                "LATTICE_BENCH_LOCK_FDS",
+                "LATTICE_BENCH_SUPERVISOR_FD",
+            ):
+                env.pop(name, None)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(root / "scripts" / "bench-compare.sh"),
+                    "HEAD~1",
+                    "HEAD",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+            observed = marker.read_text()
+
+        self.assertEqual(result.returncode, 42, result.stderr)
+        self.assertEqual(
+            observed,
+            "hidden:blocked,blocked",
+            f"preflight helper inherited usable lock capabilities:\n{result.stderr}",
         )
 
     def _invoke(self, root: Path) -> subprocess.CompletedProcess[str]:
@@ -1351,15 +1458,13 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
     def test_receipt_only_invocation_is_refused_before_any_benchmark(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = self._build_repo(tmp)
-            # own_pid is this test process's PID -- the forged supervisor_pid
-            # a caller would write for itself. It IS an ancestor of the bash
-            # child spawned below (its direct parent), which is exactly why
-            # the ancestry check alone used to accept it.
+            # The receipt contains a parseable caller-controlled PID, but no
+            # descriptor-free handoff from the dedicated supervisor.
             self._write_forged_status(root, os.getpid())
             result = self._invoke(root)
 
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn("LATTICE_BENCH_LOCK_FDS", result.stderr)
+        self.assertIn("LATTICE_BENCH_SUPERVISOR_FD", result.stderr)
         self.assertIn("refusing to measure", result.stderr)
         self.assertFalse(self.cargo_marker.exists())
         # Refused before the run-conditions banner, i.e. before base/head

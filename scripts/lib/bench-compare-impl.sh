@@ -2,12 +2,12 @@
 # bench-compare-impl.sh — A/B benchmark comparison across two git refs.
 #
 # INVOKE scripts/bench-compare.sh, NOT THIS FILE. This is the measurement body;
-# the entry point runs it under scripts/lib/bench-locks.py --pass-lock-fds,
-# which holds the machine-wide bench-window and Metal GPU locks for the whole
-# run and hands this body the two acquired lock descriptors. Running this file
-# by accident, or deliberately with a fabricated status file and no inherited
-# descriptors, is refused below — see the comment above verify_locks for
-# exactly what that check proves.
+# the entry point runs it through scripts/lib/bench_supervision.py, whose
+# dedicated process verifies and retains the machine-wide bench-window and
+# Metal GPU lock descriptors. This body receives only a cooperative handoff
+# pipe. Running this file by accident, or deliberately with only a fabricated
+# status file, is refused below — see the comment above verify_locks for the
+# exact boundary.
 #
 # Usage:
 #   scripts/bench-compare.sh                        # origin/main vs HEAD (quick)
@@ -148,20 +148,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# --- Hold both canonical lock descriptors for the complete measurement ---
-# scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py
-# --pass-lock-fds, which records its own PID and both lock dispositions in
-# LATTICE_BENCH_LOCK_STATUS and hands this process the two acquired lock file
-# descriptors via LATTICE_BENCH_LOCK_FDS (inherited across exec, not dup'ed —
-# they refer to the SAME open file descriptions bench-locks.py itself holds
-# open for this run's whole lifetime).
-#
-# bench_supervision.py acquires both inherited descriptors and samples their
-# identity against fresh stats of the canonical paths. A final sample diagnoses
-# a mismatch that remains present; it does not establish pathname continuity
-# against a rename-and-restore caller. This shell retains the capabilities
-# while the descriptor-free, cooperative subshell does the work.
-LOCK_STATUS_FILE="$REPO/.cache/bench-locks-status.txt"
+# --- Verify the descriptor-free handoff from the dedicated supervisor ---
+# scripts/bench-compare.sh routes this body through bench_supervision.py. That
+# parent verifies and retains both inherited lock capabilities, samples their
+# path identities before and after this process, and gives this shell only a
+# non-lock pipe. The shell's receipt, pipe-writer, and contention samples are
+# cooperative point-in-time diagnostics; they neither authenticate the holder
+# nor prove lock lifetime.
+LOCK_STATUS_FILE="${LATTICE_BENCH_LOCK_STATUS:-$REPO/.cache/bench-locks-status.txt}"
 LOCK_SUMMARY=""
 verify_locks() {
   if [ ! -f "$LOCK_STATUS_FILE" ]; then
@@ -171,20 +165,16 @@ verify_locks() {
   fi
   LOCK_SUMMARY="$(sed -n 's/^lock=/  /p' "$LOCK_STATUS_FILE")"
 
-  if [ -z "${LATTICE_BENCH_LOCK_FDS:-}" ]; then
-    echo "bench-compare: no inherited lock descriptors" \
-         "(LATTICE_BENCH_LOCK_FDS is unset) — refusing to measure." >&2
-    echo "  scripts/bench-compare.sh must invoke bench-locks.py with" \
-         "--pass-lock-fds; a caller-supplied ancestor PID is not proof a" \
-         "lock is held. Run scripts/bench-compare.sh, not this file" \
-         "directly." >&2
+  if [ -z "${LATTICE_BENCH_SUPERVISOR_FD:-}" ]; then
+    echo "bench-compare: no supervisor handoff pipe" \
+         "(LATTICE_BENCH_SUPERVISOR_FD is unset) — refusing to measure." >&2
+    echo "  Run scripts/bench-compare.sh, not this file directly." >&2
     exit 2
   fi
 
-  export LATTICE_BENCH_LOCK_STATUS="$LOCK_STATUS_FILE"
   if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
-    echo "bench-compare: this process could not acquire and hold the" \
-         "bench-window and Metal GPU locks — refusing to measure." >&2
+    echo "bench-compare: cooperative supervisor handoff failed —" \
+         "refusing to measure." >&2
     exit 2
   fi
 }
@@ -193,12 +183,11 @@ verify_locks
 set +e
 (
 set -e
-bench_lock_fds=()
-IFS=',' read -r -a bench_lock_fds <<< "$LATTICE_BENCH_LOCK_FDS"
-for fd in "${bench_lock_fds[@]}"; do
-  eval "exec ${fd}<&-" 2>/dev/null || true
-done
-unset LATTICE_BENCH_LOCK_FDS
+supervisor_fd="${LATTICE_BENCH_SUPERVISOR_FD:-}"
+if [[ "$supervisor_fd" =~ ^[0-9]+$ ]]; then
+  eval "exec ${supervisor_fd}<&-"
+fi
+unset LATTICE_BENCH_SUPERVISOR_FD
 
 # --- Machine-state and ambient-load gates ---
 # A lock excludes peers; it says nothing about ambient load, thermal pressure,
@@ -752,8 +741,8 @@ MEASUREMENT_RC=$?
 set -e
 
 if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
-  echo "bench-compare: a canonical lock pathname mismatched at the final" \
-       "sample — refusing to certify it." >&2
+  echo "bench-compare: final cooperative supervisor sample failed —" \
+       "refusing to certify it." >&2
   exit 2
 fi
 exit "$MEASUREMENT_RC"

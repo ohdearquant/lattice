@@ -35,13 +35,13 @@ leaked lock fd in a long-lived build daemon holds the window open machine-wide
 long after the run that took it, because a flock is released only when every
 descriptor referring to that open file description is closed.
 
-``--pass-lock-fds`` is the narrow exception for ordinary wrapper processes.
-The immediate command acquires the descriptors and keeps them private while
+``--pass-lock-fds`` is the narrow exception for dedicated wrapper processes.
+The immediate supervisor verifies the descriptors and keeps them private while
 running descriptor-free measurement children. ``bench_supervision.py`` gives
-cooperating entry points a separate liveness pipe, never an open file
-description that can release either advisory lock. ``bench-compare-impl.sh``
-retains the descriptors and closes them in its measurement subshell. Arbitrary
-commands and build descendants on these wrapper routes never receive them.
+cooperating entry points a separate handoff pipe, never an open file description
+that can release either advisory lock. The bench-compare route uses that same
+supervisor boundary, so arbitrary commands and build descendants on these
+wrapper routes never receive the capabilities.
 
 WHY lsof IS ONLY A DIAGNOSTIC HERE. lsof lists processes that have the lock
 file OPEN, which is a superset of those holding a flock on it, and it does not
