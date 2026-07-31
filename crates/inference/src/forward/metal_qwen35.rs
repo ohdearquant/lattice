@@ -4751,6 +4751,7 @@ mod inner {
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<MetalVerifyOutput, crate::error::InferenceError> {
+            self.check_live_cursor("verify_tokens_batched", start_pos)?;
             if self.session.gdn_checkpoints.is_none() {
                 return Err(crate::error::InferenceError::Inference(
                     "GDN checkpoint pool required for verify_tokens_batched".into(),
@@ -4805,6 +4806,7 @@ mod inner {
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<MetalVerifyOutput, crate::error::InferenceError> {
+            self.check_live_cursor("verify_tokens_batch_gemm", start_pos)?;
             let n = tokens.len();
             if n == 0 || n > MTP_VERIFY_MAX_TOKENS {
                 return Err(crate::error::InferenceError::Inference(format!(
@@ -6727,6 +6729,33 @@ mod inner {
             Ok(())
         }
 
+        fn validate_live_cursor(
+            entry_point: &str,
+            supplied_position: usize,
+            live_cursor: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            if supplied_position != live_cursor {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: supplied position {supplied_position} does not match the \
+                     live cache cursor {live_cursor}; KV placement and attention length derive \
+                     from kv_cache.seq_len while RoPE uses the supplied position"
+                )));
+            }
+            Ok(())
+        }
+
+        fn check_live_cursor(
+            &self,
+            entry_point: &str,
+            supplied_position: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            Self::validate_live_cursor(
+                entry_point,
+                supplied_position,
+                self.session.kv_cache.seq_len,
+            )
+        }
+
         /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
         /// starting at `start_pos` — every position `start_pos..start_pos + token_count` must
         /// land inside the RoPE table / KV cache, and (when `gdn_pool_capacity` is `Some`)
@@ -6857,17 +6886,20 @@ mod inner {
         /// **Unstable**: fallible single-token forward step; kernel dispatch strategy evolving.
         ///
         /// Run a single token through the full model. Returns logits [vocab_size].
+        /// `position` must equal the live cache cursor (`kv_cache.seq_len`).
         ///
         /// # Errors
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU dispatch
-        /// when `position` or the next KV-cache row is outside the session capacity.
+        /// when `position` or the next KV-cache row is outside the session capacity,
+        /// or when `position` does not equal the live cache cursor.
         pub fn try_forward_step(
             &mut self,
             token_id: u32,
             position: usize,
         ) -> Result<Vec<f32>, crate::error::InferenceError> {
             self.check_forward_step_capacity(position)?;
+            self.check_live_cursor("try_forward_step", position)?;
             self.cross_turn_prefix_cache.clear();
             Ok(self
                 .forward_step_inner(
@@ -6907,16 +6939,7 @@ mod inner {
         ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
             self.check_forward_token_id("forward_step_with_hidden", token_id)?;
             self.check_forward_step_capacity(position)?;
-            if position != self.session.kv_cache.seq_len {
-                return Err(crate::error::InferenceError::InvalidInput(format!(
-                    "forward_step_with_hidden: position {position} does not match the live \
-                     cache cursor {} — KV placement and attention length derive from \
-                     kv_cache.seq_len while RoPE rotates by the supplied position, so a \
-                     mismatched position would rotate the token for one position while \
-                     writing its KV row for another",
-                    self.session.kv_cache.seq_len
-                )));
-            }
+            self.check_live_cursor("forward_step_with_hidden", position)?;
             self.cross_turn_prefix_cache.clear();
             let output = self.forward_step_inner(
                 token_id,
@@ -6934,9 +6957,10 @@ mod inner {
         ///
         /// # Panics
         ///
-        /// Panics if `token_id >= vocab_size`, or if `position` or the next
-        /// KV-cache row exceeds the session capacity. Use [`Self::try_forward_step`]
-        /// to receive a typed capacity error. These checks run before GPU dispatch.
+        /// Panics if `token_id >= vocab_size`, if `position` or the next
+        /// KV-cache row exceeds the session capacity, or if `position` does not
+        /// equal the live cache cursor. Use [`Self::try_forward_step`] to receive
+        /// a typed error. These checks run before GPU dispatch.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -15630,6 +15654,7 @@ mod inner {
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+            self.check_live_cursor("MtpTargetVerifier::verify_tokens", start_pos)?;
             self.cross_turn_prefix_cache.clear();
             let out = self.verify_tokens_batched(tokens, start_pos)?;
             Ok(out.logits)
@@ -19781,6 +19806,90 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn raw_forward_and_verifier_boundaries_reject_mismatched_live_cursor() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=raw_forward_and_verifier_boundaries_reject_mismatched_live_cursor \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (raw_forward_and_verifier_boundaries_reject_mismatched_live_cursor)"
+                );
+                return;
+            };
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny hybrid MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+            state.reset_path_proof_counters();
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+
+            let error = state
+                .try_forward_step(1, 1)
+                .expect_err("raw forward must reject a position beyond the live cursor");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for mismatched raw-forward cursor, got {error}");
+            };
+            assert!(message.contains("try_forward_step"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+
+            let error = state
+                .verify_tokens(&[1], 1)
+                .expect_err("public verifier must reject start_pos beyond the live cursor");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for mismatched public verifier cursor, got {error}");
+            };
+            assert!(
+                message.contains("MtpTargetVerifier::verify_tokens"),
+                "{message}"
+            );
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+
+            let error = state
+                .verify_tokens_batched(&[1], 1)
+                .err()
+                .expect("sequential verifier must independently reject a cursor mismatch");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!(
+                    "expected InvalidInput for mismatched sequential verifier cursor, got {error}"
+                );
+            };
+            assert!(message.contains("verify_tokens_batched"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+
+            let error = state
+                .verify_tokens_batch_gemm(&[1], 1)
+                .err()
+                .expect("batch-GEMM verifier must independently reject a cursor mismatch");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!(
+                    "expected InvalidInput for mismatched batch-GEMM verifier cursor, got {error}"
+                );
+            };
+            assert!(message.contains("verify_tokens_batch_gemm"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                HiddenReadbackPathProofSnapshot::default(),
+                "cursor rejection must occur before any hidden readback"
+            );
+        }
+
+        #[test]
         fn forward_prefill_with_hidden_rejects_live_session_without_reset() {
             use crate::speculative::MtpTargetVerifier as _;
 
@@ -19852,7 +19961,17 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         fn forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv() {
             use crate::speculative::MtpTargetVerifier as _;
 
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv)"
+                );
                 return;
             };
             let _gpu = gpu_test_lock();
@@ -20008,6 +20127,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 MetalQwen35State::validate_dispatch_capacity(0, 6, 100, None).is_ok(),
                 "a caller that never checkpoints per-token must not be pool-bounded"
             );
+        }
+
+        #[test]
+        fn validate_live_cursor_rejects_mismatched_position() {
+            assert!(MetalQwen35State::validate_live_cursor("test", 3, 3).is_ok());
+            let error = MetalQwen35State::validate_live_cursor("test", 4, 3)
+                .expect_err("position beyond the live cursor must be rejected");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for mismatched cursor, got {error}");
+            };
+            assert!(message.contains("test"), "{message}");
+            assert!(message.contains("supplied position 4"), "{message}");
+            assert!(message.contains("live cache cursor 3"), "{message}");
         }
 
         /// Deferred-run regression: full round-trip through the public
