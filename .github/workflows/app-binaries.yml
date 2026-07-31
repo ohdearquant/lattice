@@ -86,8 +86,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Verify macOS app release contract
-        run: python3 tests/test_macos_app_release.py -v
       - id: filter
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
@@ -113,7 +111,7 @@ jobs:
           TRUSTED_DETECTOR=$(mktemp)
           CHANGED_FILE=$(mktemp)
           trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
-          if git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+          if git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
             :
           else
             DETECTOR_STATUS=$?
@@ -147,6 +145,8 @@ jobs:
             echo "swift=false" >> "$GITHUB_OUTPUT"
             echo "→ no macOS app change: Swift release build skipped"
           fi
+      - name: Verify macOS app release contract
+        run: python3 tests/test_macos_app_release.py -v
 
   # Deferred while a PR is a draft, matching the macOS legs of `ci` and
   # `feature-matrix` and every macOS job in `e2e-parity`. A draft

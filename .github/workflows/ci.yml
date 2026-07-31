@@ -97,7 +97,7 @@ jobs:
           TRUSTED_DETECTOR=$(mktemp)
           CHANGED_FILE=$(mktemp)
           trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
-          if git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+          if git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
             :
           else
             DETECTOR_STATUS=$?

@@ -433,6 +433,28 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
         self.assertEqual(output, "")
         self.assertIn("change detector failed with status 23", result.stderr)
 
+    def _assert_replacement_ref_is_ignored(
+        self,
+        workflow: Path,
+        expected_outputs: tuple[str, ...],
+    ) -> None:
+        base = self._commit(
+            "scripts/ci-changed-files.sh",
+            "#!/bin/sh\necho scripts/ci-changed-files.sh\n",
+        )
+        self._commit("README.md", "head\n")
+        replacement = self._commit(
+            "scripts/ci-changed-files.sh",
+            "#!/bin/sh\nexit 29\n",
+        )
+        self._git("replace", base, replacement)
+
+        result, output = self._run_filter(workflow, base, replacement)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for expected_output in expected_outputs:
+            self.assertIn(expected_output, output)
+
     def test_ci_runs_the_base_detector_and_classifies_its_change(self) -> None:
         self._assert_base_detector_wins(_CI_WORKFLOW, ("code=true",))
 
@@ -468,6 +490,67 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
 
     def test_e2e_parity_observes_detector_failure_status(self) -> None:
         self._assert_detector_failure_is_observed(_E2E_PARITY_WORKFLOW)
+
+    def test_ci_ignores_replacement_ref_when_loading_detector(self) -> None:
+        self._assert_replacement_ref_is_ignored(_CI_WORKFLOW, ("code=true",))
+
+    def test_cargo_audit_ignores_replacement_ref_when_loading_detector(
+        self,
+    ) -> None:
+        self._assert_replacement_ref_is_ignored(
+            _CARGO_AUDIT_WORKFLOW,
+            ("deps=true",),
+        )
+
+    def test_app_binaries_ignores_replacement_ref_when_loading_detector(
+        self,
+    ) -> None:
+        self._assert_replacement_ref_is_ignored(
+            _APP_BINARIES_WORKFLOW,
+            ("bins=true", "swift=true"),
+        )
+
+    def test_e2e_parity_ignores_replacement_ref_when_loading_detector(
+        self,
+    ) -> None:
+        self._assert_replacement_ref_is_ignored(
+            _E2E_PARITY_WORKFLOW,
+            ("engine=true", "tune=true"),
+        )
+
+    def test_change_jobs_extract_detector_immediately_after_checkout(self) -> None:
+        for relative_path in _REQUIRED_WORKFLOWS:
+            with self.subTest(workflow=relative_path):
+                contents = (_ROOT / relative_path).read_text(encoding="utf-8")
+                job = _workflow_job(contents, "changes")
+                step_headers = re.findall(
+                    r"^      - ((?:uses|id|name): .+)$",
+                    job,
+                    re.MULTILINE,
+                )
+
+                self.assertGreaterEqual(len(step_headers), 2)
+                self.assertRegex(step_headers[0], r"^uses: actions/checkout@")
+                self.assertEqual(step_headers[1], "id: filter")
+
+    def test_unavailable_base_fails_without_selector_outputs(self) -> None:
+        head = self._commit("README.md", "head\n")
+
+        for workflow in (
+            _CI_WORKFLOW,
+            _CARGO_AUDIT_WORKFLOW,
+            _APP_BINARIES_WORKFLOW,
+            _E2E_PARITY_WORKFLOW,
+        ):
+            with self.subTest(workflow=workflow.name):
+                result, output = self._run_filter(workflow, "f" * 40, head)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(output, "")
+                self.assertIn(
+                    "unable to load change detector from base revision",
+                    result.stderr,
+                )
 
     def test_invalid_base_never_executes_checkout_detector(self) -> None:
         head = self._commit(
