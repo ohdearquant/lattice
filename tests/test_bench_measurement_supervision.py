@@ -48,7 +48,7 @@ def excluded_measurement_surfaces() -> set[str]:
     }
 
 
-def discovered_rust_measurement_surfaces() -> set[str]:
+def discovered_declared_rust_inventory_paths() -> set[str]:
     paths = {
         str(path.relative_to(REPO))
         for path in (REPO / "crates").glob("*/benches/*.rs")
@@ -105,11 +105,43 @@ class InventoryContract(unittest.TestCase):
                 if entry["role"] == "measurement":
                     self.assertNotEqual(entry["supervision"], "none")
 
-    def test_unsupervised_rust_measurement_surface_is_explicit(self):
-        """A new direct Rust measurement must be explicitly classified."""
+    def test_declared_rust_inventory_grammar_is_exact_and_fail_closed(self):
+        """A Rust path matching the declared grammar must be classified."""
 
         data = tomllib.loads(MANIFEST.read_text())
-        self.assertEqual(data["contract"]["caller_trust"], "cooperative")
+        contract = data["contract"]
+        self.assertEqual(contract["caller_trust"], "cooperative")
+        self.assertEqual(
+            contract["handoff_check"],
+            "instantaneous silent-pipe open-writer and lock-contention "
+            "diagnostics; not authenticated ownership, continuous lock-lifetime "
+            "proof, or deliberate same-user bypass resistance",
+        )
+        self.assertEqual(
+            contract["rust_inventory_grammar"],
+            "crates/*/benches/*.rs; crates/inference/examples/bench*.rs; "
+            "crates/inference/src/bin/bench_*.rs plus eval_perplexity.rs, "
+            "gramperf_profile.rs, and ppl_metal.rs; README.md",
+        )
+        self.assertEqual(
+            contract["rust_inventory_limitation"],
+            "does not discover other Rust examples, binaries, or tests",
+        )
+        confirmed_outside = {
+            "crates/inference/examples/profile_metal_decode.rs",
+            "crates/inference/examples/profile_metal.rs",
+            "crates/inference/examples/decode_profile.rs",
+            "crates/inference/examples/layer_sweep.rs",
+            "crates/tune/tests/bench_backward_737.rs",
+        }
+        self.assertEqual(
+            set(contract["confirmed_outside_rust_inventory"]), confirmed_outside
+        )
+        self.assertTrue(
+            confirmed_outside.isdisjoint(discovered_declared_rust_inventory_paths())
+        )
+        for path in confirmed_outside:
+            self.assertTrue((REPO / path).is_file(), path)
         surfaces = data["excluded_surface"]
         self.assertTrue(surfaces)
         for surface in surfaces:
@@ -121,7 +153,7 @@ class InventoryContract(unittest.TestCase):
                     self.assertTrue((REPO / path).is_file(), path)
         excluded = excluded_measurement_surfaces()
         self.assertEqual(len(excluded), sum(len(s["paths"]) for s in surfaces))
-        self.assertEqual(excluded, discovered_rust_measurement_surfaces())
+        self.assertEqual(excluded, discovered_declared_rust_inventory_paths())
 
     def test_every_benchmark_named_script_is_classified(self):
         """A new bench script cannot appear without an explicit classification."""
@@ -220,8 +252,8 @@ class InventoryContract(unittest.TestCase):
         self.assertNotIn("fcntl.flock", source)
         self.assertNotIn("GPU_LOCK_PATH", source)
 
-    def test_node_measurement_forwards_supervisor_witness_to_verifier(self):
-        """Node closes extra fds unless its verifier stdio maps the witness."""
+    def test_node_measurement_forwards_pipe_to_handoff_sample(self):
+        """Node closes extra fds unless the handoff sample maps the pipe."""
 
         source = (REPO / "scripts" / "bench_wasm_simd.mjs").read_text()
         self.assertIn("LATTICE_BENCH_SUPERVISOR_FD", source)
@@ -515,6 +547,89 @@ class RuntimeContract(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, f"{stdout}\n{stderr}")
             self.assertEqual(marker.read_text(), "restored")
 
+    def test_forged_live_pipe_handoff_is_accepted_but_outside_cooperative_contract(
+        self,
+    ):
+        """Acceptance records the deliberate same-user bypass limitation."""
+
+        with _SupervisorSandbox() as sb:
+            for path in (sb.bench_lock, sb.gpu_lock):
+                path.touch()
+            status = Path(sb.tmp.name) / "forged-live-pipe.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.bench_lock}): fabricated\n"
+                f"lock=Metal GPU ({sb.gpu_lock}): fabricated\n"
+            )
+            handoff_accepted = Path(sb.tmp.name) / "handoff-accepted"
+            release = Path(sb.tmp.name) / "release-temporary-holders"
+            marker = Path(sb.tmp.name) / "forged-handoff-result"
+            entrypoint = sb.root / "scripts" / "forged_handoff.py"
+            entrypoint.write_text(
+                "import fcntl, os, sys, time\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(sb.helper.parent)!r})\n"
+                "from bench_supervision import ensure_python_entrypoint\n"
+                "ensure_python_entrypoint('fixture')\n"
+                f"Path({str(handoff_accepted)!r}).write_text('accepted')\n"
+                f"release = Path({str(release)!r})\n"
+                "while not release.exists():\n"
+                "    time.sleep(0.01)\n"
+                "states = []\n"
+                f"for path in ({str(sb.bench_lock)!r}, {str(sb.gpu_lock)!r}):\n"
+                "    fd = os.open(path, os.O_RDWR)\n"
+                "    try:\n"
+                "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "    except OSError:\n"
+                "        states.append('blocked')\n"
+                "    else:\n"
+                "        states.append('acquired')\n"
+                "    finally:\n"
+                "        os.close(fd)\n"
+                f"Path({str(marker)!r}).write_text('accepted:' + ','.join(states))\n"
+            )
+            holders = tuple(
+                os.open(path, os.O_RDWR) for path in (sb.bench_lock, sb.gpu_lock)
+            )
+            read_fd, write_fd = os.pipe()
+            env = {
+                **os.environ,
+                "LATTICE_BENCH_LOCK_STATUS": str(status),
+                "LATTICE_BENCH_SUPERVISOR_FD": str(read_fd),
+            }
+            env.pop("LATTICE_BENCH_LOCK_FDS", None)
+            proc = None
+            try:
+                for fd in holders:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                proc = subprocess.Popen(
+                    [sys.executable, str(entrypoint)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                    pass_fds=(read_fd,),
+                )
+                deadline = time.monotonic() + 10
+                while not handoff_accepted.exists() and proc.poll() is None:
+                    if time.monotonic() >= deadline:
+                        self.fail("forged handoff was not sampled")
+                    time.sleep(0.01)
+                self.assertIsNone(proc.poll())
+                for fd in holders:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                release.touch()
+                stdout, stderr = proc.communicate(timeout=30)
+            finally:
+                release.touch()
+                for fd in (*holders, read_fd, write_fd):
+                    os.close(fd)
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.communicate()
+            self.assertEqual(proc.returncode, 0, f"{stdout}\n{stderr}")
+            self.assertEqual(marker.read_text(), "accepted:acquired,acquired")
+
     def test_oversized_descriptor_uses_normal_refusal_diagnostic(self):
         with _SupervisorSandbox() as sb:
             for path in (sb.bench_lock, sb.gpu_lock):
@@ -575,18 +690,18 @@ class RuntimeContract(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(marker.read_text(), "hidden:blocked,blocked")
 
-    def test_python_entrypoint_refuses_dead_supervisor_witness(self):
+    def test_python_entrypoint_refuses_pipe_without_open_writer(self):
         with _SupervisorSandbox() as sb:
             for path in (sb.bench_lock, sb.gpu_lock):
                 path.touch()
-            status = Path(sb.tmp.name) / "dead-supervisor.status"
+            status = Path(sb.tmp.name) / "closed-pipe.status"
             status.write_text(
                 f"supervisor_pid={os.getpid()}\n"
                 f"lock=bench-window ({sb.bench_lock}): acquired\n"
                 f"lock=Metal GPU ({sb.gpu_lock}): acquired\n"
             )
             marker = Path(sb.tmp.name) / "must-not-run"
-            entrypoint = sb.root / "scripts" / "dead_supervisor.py"
+            entrypoint = sb.root / "scripts" / "closed_pipe.py"
             entrypoint.write_text(
                 "import sys\n"
                 "from pathlib import Path\n"
@@ -613,7 +728,7 @@ class RuntimeContract(unittest.TestCase):
             finally:
                 os.close(witness_fd)
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("supervisor exited", result.stderr)
+            self.assertIn("no open writer", result.stderr)
             self.assertFalse(marker.exists())
 
     def test_replaced_canonical_paths_are_refused_before_measurement(self):
@@ -778,6 +893,53 @@ class RuntimeContract(unittest.TestCase):
             self.assertEqual(cargo_marker.read_text(), "closed")
             self.assertEqual(marker.read_text(), "hidden")
 
+    def test_actual_e2e_entrypoint_hands_off_to_build_and_parity_check(self):
+        with _SupervisorSandbox() as sb:
+            entrypoint = sb.root / "scripts" / "e2e-parity-local.sh"
+            shutil.copy2(REPO / "scripts" / "e2e-parity-local.sh", entrypoint)
+            cargo_args = Path(sb.tmp.name) / "cargo-args"
+            parity_marker = Path(sb.tmp.name) / "parity-ran"
+            bindir = Path(sb.tmp.name) / "bin"
+            bindir.mkdir()
+            cargo = bindir / "cargo"
+            cargo.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                '[[ -z "${LATTICE_BENCH_SUPERVISOR_FD:-}" ]]\n'
+                f"printf '%s' \"$*\" > {str(cargo_args)!r}\n"
+            )
+            cargo.chmod(0o755)
+            parity = sb.root / "scripts" / "e2e_parity_check.py"
+            parity.write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(sb.helper.parent)!r})\n"
+                "from bench_supervision import ensure_python_entrypoint\n"
+                "ensure_python_entrypoint('e2e-parity-local')\n"
+                f"Path({str(parity_marker)!r}).write_text('ran')\n"
+            )
+            env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"}
+            for name in (
+                "LATTICE_BENCH_LOCK_STATUS",
+                "LATTICE_BENCH_LOCK_FDS",
+                "LATTICE_BENCH_SUPERVISOR_FD",
+            ):
+                env.pop(name, None)
+            result = subprocess.run(
+                ["bash", str(entrypoint)],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                cargo_args.read_text(),
+                "build --release --bin qwen35_generate -p lattice-inference "
+                "--features f16",
+            )
+            self.assertEqual(parity_marker.read_text(), "ran")
+
     def test_durable_shell_refuses_lock_only_outer_without_errexit(self):
         with _SupervisorSandbox() as sb:
             marker = Path(sb.tmp.name) / "shell-must-not-run"
@@ -799,7 +961,7 @@ class RuntimeContract(unittest.TestCase):
             self.assertIn("lock-only", result.stderr)
 
     @unittest.skipUnless(shutil.which("node"), "node is unavailable")
-    def test_node_child_can_forward_supervisor_witness_to_verifier(self):
+    def test_node_child_can_forward_pipe_to_handoff_sample(self):
         """Mutation-sensitive: ordinary spawn closes the liveness witness."""
 
         with _SupervisorSandbox() as sb:
@@ -1026,7 +1188,7 @@ process.exit(child.status ?? 2);
             self.assertIn("LATTICE_BENCH_LOCK_FDS is not set", result.stderr)
             self.assertFalse(marker.exists())
 
-    def test_unlocked_inherited_fds_do_not_borrow_another_holders_proof(self):
+    def test_unlocked_inherited_fds_do_not_borrow_another_holders_contention(self):
         """Mutation-sensitive: probing only by path accepts the wrong holder."""
 
         with _SupervisorSandbox() as sb:
@@ -1071,7 +1233,7 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
     lock descriptors, not just an ancestor-PID relation in a caller-supplied
     status file.
 
-    Mutation-sensitive: this reproduces the exact exploit from the review —
+    Mutation-sensitive: this reproduces the exact receipt-only exploit —
     a caller invokes the body directly after writing a status file whose
     supervisor_pid is its own PID (trivially "an ancestor" of the child bash
     process it then spawns), with no LATTICE_BENCH_LOCK_FDS. Neither lock is

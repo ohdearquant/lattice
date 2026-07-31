@@ -35,9 +35,9 @@ Invariants enforced by this script:
   reduction, matching the Rust quantizer's fail-closed behavior; `--self-
   check` proves the guard is wired.
 - `run-arm` is the complete write -> eval -> delete loop: it writes the
-  arm checkpoint, evaluates perplexity under both machine-wide measurement
-  locks, records the parsed result in the manifest, then deletes the arm's
-  weights (keeping only the manifest and console log).
+  arm checkpoint, enters the cooperative measurement wrapper, records the
+  parsed result in the manifest, then deletes the arm's weights (keeping only
+  the manifest and console log).
 
 Usage:
     uv run python3 scripts/fake_quant_pilot.py self-test --all
@@ -805,7 +805,7 @@ def cmd_quantize(args: argparse.Namespace) -> int:
 
 
 def run_eval_under_supervision(cmd: list[str], cwd: Path) -> dict:
-    """Run `cmd`; the entry-point supervisor already holds both fleet locks."""
+    """Run `cmd` after the cooperative entry-point handoff sample."""
     proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
 
     sys.stdout.write(proc.stdout)
@@ -858,7 +858,7 @@ def cmd_run_arm(args: argparse.Namespace) -> int:
         "--label",
         arm,
     ]
-    print(f"=== running evaluator under both measurement locks: {' '.join(eval_cmd)} ===")
+    print(f"=== running evaluator through measurement supervision: {' '.join(eval_cmd)} ===")
     ppl_event = run_eval_under_supervision(eval_cmd, cwd=REPO_ROOT)
 
     manifest["evaluator_invocation"] = " ".join(eval_cmd)

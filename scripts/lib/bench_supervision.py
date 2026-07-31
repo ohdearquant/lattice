@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run a local measurement under the repository's machine-wide supervisor.
+"""Run a local measurement through the repository's cooperative supervisor.
 
 Measurement entry points call :func:`ensure_python_entrypoint` before doing
 work. Shell and Node entry points invoke the ``run``/``verify`` CLI below.
-The outer process is always ``bench-locks.py``. This trusted process retains
-the lock descriptors while an entry point receives only a liveness witness;
-measurement code never receives a descriptor capable of releasing the locks.
+On the ordinary wrapper route, ``bench-locks.py`` retains the lock descriptors
+while an entry point receives only a liveness pipe; measurement code never
+receives a descriptor capable of releasing the locks. The handoff samples
+caller-supplied state and does not authenticate a deliberate same-user caller.
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ REFUSAL_EXIT = 2
 
 
 class SupervisionError(RuntimeError):
-    """The trusted process cannot establish the benchmark supervision contract."""
+    """The cooperative benchmark supervision contract was not observed."""
 
 
 def _canonical_lock_paths() -> tuple[Path, Path]:
@@ -146,7 +147,7 @@ def _read_receipt() -> tuple[Path, list[str]]:
 
 
 def verify_supervision() -> tuple[Path, tuple[int, int], tuple[Path, Path]]:
-    """Acquire lock capabilities inside the trusted supervisor or raise."""
+    """Acquire inherited lock descriptors inside the wrapper process or raise."""
 
     status, lock_lines = _read_receipt()
     if FDS_ENV not in os.environ:
@@ -155,7 +156,7 @@ def verify_supervision() -> tuple[Path, tuple[int, int], tuple[Path, Path]]:
     return status, _verify_inherited_fds(paths), paths
 
 
-def _verify_supervisor_witness() -> int:
+def _sample_open_pipe_writer() -> int:
     raw = os.environ.get(SUPERVISOR_FD_ENV)
     if raw is None:
         raise SupervisionError(f"{SUPERVISOR_FD_ENV} is not set")
@@ -174,7 +175,9 @@ def _verify_supervisor_witness() -> int:
             f"{SUPERVISOR_FD_ENV} does not name a live supervision pipe: {exc}"
         ) from exc
     if readable:
-        raise SupervisionError("trusted lock supervisor exited before measurement")
+        raise SupervisionError(
+            "supervision pipe had data or no open writer at the handoff sample"
+        )
     return fd
 
 
@@ -192,22 +195,25 @@ def _sample_locks_are_contended(paths: tuple[Path, Path]) -> None:
             except OSError:
                 continue
             fcntl.flock(fd, fcntl.LOCK_UN)
-            raise SupervisionError(f"canonical lock {path} is not held by the supervisor")
+            raise SupervisionError(
+                f"canonical lock {path} is not contended at the handoff sample"
+            )
         finally:
             os.close(fd)
 
 
-def verify_measurement_supervision() -> tuple[Path, int, tuple[Path, Path]]:
-    """Validate a live trusted parent without exposing its lock descriptors."""
+def sample_measurement_handoff() -> tuple[Path, int, tuple[Path, Path]]:
+    """Sample a cooperative handoff without receiving lock descriptors."""
 
     status, lock_lines = _read_receipt()
     paths = _validated_receipt_paths(lock_lines)
-    # Contention alone cannot identify an owner. The pipe binds this child to
-    # the trusted parent code path, which creates it only after verifying its
-    # private lock descriptors; both checks are intentionally required.
-    witness_fd = _verify_supervisor_witness()
+    # The ordinary wrapper creates this pipe after acquiring both descriptors.
+    # A same-user caller can forge the receipt, pipe, and momentary contention,
+    # so these samples catch accidental handoff misuse rather than authenticate
+    # the holder or prove that contention continues through the measurement.
+    pipe_fd = _sample_open_pipe_writer()
     _sample_locks_are_contended(paths)
-    return status, witness_fd, paths
+    return status, pipe_fd, paths
 
 
 def _slug(label: str) -> str:
@@ -285,11 +291,11 @@ def run_supervised(
     if quiet:
         child_env[QUIET_ENV] = "1"
 
-    witness_fds: tuple[int, int] | None = None
+    handoff_pipe_fds: tuple[int, int] | None = None
     try:
         if entrypoint:
             read_fd, write_fd = os.pipe()
-            witness_fds = (read_fd, write_fd)
+            handoff_pipe_fds = (read_fd, write_fd)
             child_env[SUPERVISOR_FD_ENV] = str(read_fd)
             pass_fds = (read_fd,)
         else:
@@ -301,8 +307,8 @@ def run_supervised(
             pass_fds=pass_fds,
         )
     finally:
-        if witness_fds is not None:
-            for fd in witness_fds:
+        if handoff_pipe_fds is not None:
+            for fd in handoff_pipe_fds:
                 os.close(fd)
 
     # This endpoint sample catches a persistent pathname mismatch. The flock
@@ -314,7 +320,7 @@ def run_supervised(
     if quiet and not _quiet(f"{label}: after"):
         print(
             f"bench-supervision: machine was not quiet after {label}; "
-            "refusing to certify the result",
+            "refusing to accept the result",
             file=sys.stderr,
         )
         return REFUSAL_EXIT
@@ -329,16 +335,16 @@ def ensure_python_entrypoint(label: str, *, quiet: bool = False) -> None:
         rc = run_supervised(label, command, quiet=quiet, entrypoint=True)
         raise SystemExit(rc)
     try:
-        _, witness_fd, _ = verify_measurement_supervision()
+        _, pipe_fd, _ = sample_measurement_handoff()
         os.environ.pop(SUPERVISOR_FD_ENV, None)
-        os.close(witness_fd)
+        os.close(pipe_fd)
     except SupervisionError as exc:
         print(f"bench-supervision: {exc}; refusing to measure", file=sys.stderr)
         raise SystemExit(REFUSAL_EXIT) from exc
     if quiet and os.environ.get(QUIET_ENV) != "1":
         print(
             f"bench-supervision: {label} requires ambient-idle gating, but its "
-            "existing supervisor is lock-only; refusing to measure",
+            "existing handoff is lock-only; refusing to measure",
             file=sys.stderr,
         )
         raise SystemExit(REFUSAL_EXIT)
@@ -358,7 +364,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument(
         "--entrypoint",
         action="store_true",
-        help="pass a non-lock liveness witness to a self-verifying entrypoint",
+        help="pass a non-lock liveness pipe to a cooperating entrypoint",
     )
     run.add_argument("measurement", nargs=argparse.REMAINDER)
     run.set_defaults(action="run")
@@ -369,14 +375,14 @@ def main(argv: list[str] | None = None) -> int:
             if FDS_ENV in os.environ:
                 verify_supervision()
             else:
-                verify_measurement_supervision()
+                sample_measurement_handoff()
         except SupervisionError as exc:
             print(f"bench-supervision: {exc}; refusing to measure", file=sys.stderr)
             return REFUSAL_EXIT
         if args.require_quiet and os.environ.get(QUIET_ENV) != "1":
             print(
                 "bench-supervision: this entrypoint requires ambient-idle "
-                "gating, but its existing supervisor is lock-only; refusing "
+                "gating, but its existing handoff is lock-only; refusing "
                 "to measure",
                 file=sys.stderr,
             )

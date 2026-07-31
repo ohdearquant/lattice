@@ -49,14 +49,17 @@ make bench-compare BENCH_GROUPS_EMBED="simd_dot_product|int8_raw"
 
 Leaving these variables unset keeps the default `elementwise_cpu_bench` and `simd` bench targets.
 
-Every local script that produces a measurement is classified in
-`scripts/bench-measurements.toml` and self-supervises through the machine-wide
-bench-window and Metal GPU locks. Add new local measurement entry points to
-that inventory; the CI contract rejects an unclassified `scripts/bench*`
-entry. Use `scripts/bench-command.sh --label <name> -- <command>` for an
-ad-hoc raw CPU Criterion command. `make bench-ci` and `make bench-gate` also
-refuse below the ambient-idle floor because their baseline/verdict outlives
-the process that produced it.
+The local script paths classified in `scripts/bench-measurements.toml` enter a
+cooperative wrapper on ordinary direct invocation. This prevents accidental
+unlocked runs but is not a same-user authentication boundary. Add new local
+measurement entry points to that inventory; the CI contract rejects an
+unclassified `scripts/bench*` entry. The Rust inventory in the same manifest
+covers only its declared path grammar; other Rust examples, binaries, and
+tests require manual classification. Use
+`scripts/bench-command.sh --label <name> -- <command>` for an ad-hoc raw CPU
+Criterion command. `make bench-ci` and `make bench-gate` also refuse below the
+ambient-idle floor because their baseline or result outlives the process that
+produced it.
 
 Quick mode (`--quick`) is sufficient for direction + magnitude. Full mode only when you need tight CIs for a PR description or ADR evidence.
 

@@ -265,8 +265,8 @@ class LockPrecondition(unittest.TestCase):
 
         A caller who records a PID that really is one of its ancestors -- its
         own shell, here -- used to pass the check with no lock held, which is
-        exactly the review-flagged bypass: an ordinary stale/exported-
-        environment failure would read as a supervised run. The fix requires
+        exactly the stale-environment bypass: an exported status made an ordinary
+        invocation failure read as a supervised run. The fix requires
         the inherited LATTICE_BENCH_LOCK_FDS descriptor proof unconditionally,
         so this receipt-only invocation must now be refused before the body
         ever prints its run-conditions banner.

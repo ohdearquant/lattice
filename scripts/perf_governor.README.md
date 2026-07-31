@@ -45,11 +45,12 @@ python3 scripts/perf_governor.py --run --no-afk --max-window 60 --cooldown 15 \
     --label simd-dot -- cargo bench -p lattice-embed -- simd_dot_product
 ```
 
-`--run` first re-execs through `scripts/lib/bench-locks.py`, taking both the
-machine-wide bench-window and Metal GPU locks for the complete governor run.
-Invoke it directly; wrapping it in `bench-command.sh` is redundant. An
-independent caller-side lock that does not forward the repository supervisor
-receipt would make the nested acquisition wait on its own ancestor.
+On an ordinary direct invocation, `--run` first re-execs through
+`scripts/lib/bench-locks.py`, which retains both machine-wide descriptors for
+the complete governor run. Invoke it directly; wrapping it in
+`bench-command.sh` is redundant. The handoff assumes a cooperative caller; an
+independent caller-side lock that does not forward the repository handoff
+state would make the nested acquisition wait on its own ancestor.
 
 ## Kill-switch sentinel
 

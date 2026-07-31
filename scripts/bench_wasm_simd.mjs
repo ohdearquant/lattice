@@ -77,12 +77,12 @@ if (!process.env.LATTICE_BENCH_LOCK_STATUS) {
 
 const receipt = spawnSync('python3', [SUPERVISION, 'verify', '--require-quiet'], {
   // Node closes non-stdio descriptors by default. Preserve the non-lock
-  // liveness witness only for the verifier.
+  // liveness pipe only for this cooperative handoff sample.
   stdio: supervisionStdio(),
   env: process.env,
 });
 if (receipt.error || receipt.status !== 0) {
-  console.error('bench_wasm_simd: could not acquire both canonical locks');
+  console.error('bench_wasm_simd: supervision handoff sample failed');
   process.exit(2);
 }
 delete process.env.LATTICE_BENCH_SUPERVISOR_FD;
@@ -273,7 +273,7 @@ const completed = spawnSync('python3', [SUPERVISION, 'verify'], {
   },
 });
 if (completed.error || completed.status !== 0) {
-  console.error('bench_wasm_simd: a canonical lock pathname mismatched at the final sample');
+  console.error('bench_wasm_simd: final supervision sample failed');
   process.exit(2);
 }
 closeSync(SUPERVISOR_FD);

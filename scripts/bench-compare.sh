@@ -18,8 +18,8 @@
 # report and in the exit status, from a locked one. Two files cannot recurse
 # and there is no state to go stale. The body's own verify_locks does not stop
 # at a PID relation: --pass-lock-fds below hands the body the two acquired
-# lock descriptors, and the body proves identity against the ordered canonical
-# lock paths, acquires them itself, and retains them until the descriptor-free
+# lock descriptors, and the body samples their identity against the ordered
+# canonical lock paths, acquires them itself, and retains them until the descriptor-free
 # measurement child completes. Descriptor/path comparisons diagnose a mismatch
 # present at either sampled boundary; they do not prove pathname continuity
 # against rename-and-restore, so callers must cooperate by leaving lock names

@@ -3,12 +3,23 @@ schema = 1
 [contract]
 scope = "local script and Make measurement entry points"
 caller_trust = "cooperative"
-lock_ownership = "trusted supervisor retains both descriptors for the child lifetime"
+lock_ownership = "ordinary wrapper retains both descriptors for the child lifetime"
 pathname_check = "endpoint mismatch diagnostic; not rename-and-restore resistance"
+handoff_check = "instantaneous silent-pipe open-writer and lock-contention diagnostics; not authenticated ownership, continuous lock-lifetime proof, or deliberate same-user bypass resistance"
+rust_inventory_grammar = "crates/*/benches/*.rs; crates/inference/examples/bench*.rs; crates/inference/src/bin/bench_*.rs plus eval_perplexity.rs, gramperf_profile.rs, and ppl_metal.rs; README.md"
+rust_inventory_limitation = "does not discover other Rust examples, binaries, or tests"
+# Confirmed examples outside the declared grammar; this list is not exhaustive.
+confirmed_outside_rust_inventory = [
+    "crates/inference/examples/profile_metal_decode.rs",
+    "crates/inference/examples/profile_metal.rs",
+    "crates/inference/examples/decode_profile.rs",
+    "crates/inference/examples/layer_sweep.rs",
+    "crates/tune/tests/bench_backward_737.rs",
+]
 
-# The exclusions below are exact, explicit inventory rather than glob waivers.
-# A newly added Rust measurement path therefore fails the repository scan until
-# it is supervised or added to the tracked follow-up with an explicit reason.
+# The exclusions below are exact for rust_inventory_grammar rather than glob
+# waivers. A new matching path fails the scan until it is classified. Paths
+# outside that grammar require manual tracking and do not fail this scan.
 
 [[excluded_surface]]
 family = "cargo-benchmark-sources"
@@ -49,9 +60,9 @@ paths = [
 ]
 
 [[excluded_surface]]
-family = "inference-benchmark-examples"
+family = "inference-bench-prefix-examples"
 tracking_issue = "#1273"
-reason = "Direct Rust benchmark examples are outside this local script supervisor."
+reason = "Rust examples whose basenames match bench*.rs are outside this local script supervisor."
 paths = [
     "crates/inference/examples/bench_concurrent.rs",
     "crates/inference/examples/bench_dispatch.rs",
@@ -77,9 +88,9 @@ paths = [
 ]
 
 [[excluded_surface]]
-family = "inference-measurement-binaries"
+family = "inference-declared-binary-grammar"
 tracking_issue = "#1273"
-reason = "Benchmark-oriented binaries need a dedicated Rust-side supervision decision."
+reason = "bench_*.rs and the three listed measurement binaries need a Rust-side supervision decision."
 paths = [
     "crates/inference/src/bin/bench_decode_ab.rs",
     "crates/inference/src/bin/bench_decode_slopefit.rs",

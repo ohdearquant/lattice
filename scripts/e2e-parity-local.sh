@@ -10,7 +10,7 @@ source "$REPO/scripts/lib/bench-supervision.sh"
 bench_supervise_entry "e2e-parity-local" handoff - "$@"
 
 (
-    bench_close_lock_fds
+    bench_close_supervisor_witness
     cd "$REPO"
     cargo build --release --bin qwen35_generate -p lattice-inference --features f16
 )
