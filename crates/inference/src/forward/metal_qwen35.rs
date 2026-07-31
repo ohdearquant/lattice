@@ -6313,6 +6313,48 @@ mod inner {
             )
         }
 
+        /// True when every GDN recurrent-state buffer (S matrices and conv1d
+        /// rolling buffers, for every linear-attention layer) holds its
+        /// post-`reset_state()` zero value. Reads the live GPU buffers directly
+        /// (same buffers and safety invariant as `snapshot_gdn_states`), so this
+        /// reflects the state Metal dispatch will actually see, not the CPU
+        /// `gdn_states` mirror.
+        fn gdn_state_is_initial(&self) -> bool {
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            for i in 0..num_layers {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                // SAFETY: GPU buffers are StorageModeShared (allocated with
+                // MTLResourceOptions::StorageModeShared in `new`/`from_q4_dir`), so
+                // `contents()` points to host-readable memory. `length()` is the
+                // exact allocated byte length and is divisible by 4 (we always
+                // allocate f32 buffers). Callers invoke this before their own GPU
+                // dispatch, with no command buffer in flight, so no GPU write can
+                // race with this read — same invariant as `snapshot_gdn_states`.
+                let conv_nonzero = unsafe {
+                    let ptr = conv_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, conv_floats)
+                        .iter()
+                        .any(|&v| v != 0.0)
+                };
+                if conv_nonzero {
+                    return false;
+                }
+                let s_nonzero = unsafe {
+                    let ptr = s_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, s_floats)
+                        .iter()
+                        .any(|&v| v != 0.0)
+                };
+                if s_nonzero {
+                    return false;
+                }
+            }
+            true
+        }
+
         /// **Unstable**: fallible single-token forward step; kernel dispatch strategy evolving.
         ///
         /// Run a single token through the full model. Returns logits [vocab_size].
@@ -6345,11 +6387,20 @@ mod inner {
         /// [`Self::try_forward_step`] and generation paths retain their current
         /// readback behavior.
         ///
+        /// `position` must equal the live cache cursor (`kv_cache.seq_len`): KV
+        /// placement and attention length derive from `kv_cache.seq_len` while
+        /// RoPE rotates by the supplied `position`, so a mismatched `position`
+        /// would rotate the token for a position other than the KV row it is
+        /// actually written to. Callers driving an out-of-order or sparse
+        /// position sequence are not supported by this entry point.
+        ///
         /// # Errors
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
         /// dispatch when `token_id`, `position`, or the next KV-cache row is
-        /// outside the session capacity.
+        /// outside the session capacity, or when `position` does not match
+        /// `kv_cache.seq_len`. On rejection, session state (KV cache, GDN
+        /// state, hidden-readback counters) is left unchanged.
         pub fn forward_step_with_hidden(
             &mut self,
             token_id: u32,
@@ -6357,6 +6408,16 @@ mod inner {
         ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
             self.check_forward_token_id("forward_step_with_hidden", token_id)?;
             self.check_forward_step_capacity(position)?;
+            if position != self.session.kv_cache.seq_len {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "forward_step_with_hidden: position {position} does not match the live \
+                     cache cursor {} — KV placement and attention length derive from \
+                     kv_cache.seq_len while RoPE rotates by the supplied position, so a \
+                     mismatched position would rotate the token for one position while \
+                     writing its KV row for another",
+                    self.session.kv_cache.seq_len
+                )));
+            }
             self.cross_turn_prefix_cache.clear();
             let output = self.forward_step_inner(
                 token_id,
@@ -6364,6 +6425,7 @@ mod inner {
                 true,
                 crate::forward::signpost::Scope::NotDecode,
             );
+            self.session.position = self.session.kv_cache.seq_len;
             Ok((output.logits, output.pre_final_hidden))
         }
 
@@ -6584,11 +6646,25 @@ mod inner {
         /// chunked, one-token, and LoRA fallback paths advance KV/GDN state by
         /// exactly the same token range as [`Self::forward_prefill`].
         ///
+        /// # Fresh-prompt semantics
+        ///
+        /// This call always dispatches from position 0. It requires a fresh
+        /// session (`kv_cache.seq_len == 0` and GDN recurrent state at its
+        /// initial condition) and rejects otherwise — it does not reset the
+        /// session on the caller's behalf, and it does not implement append
+        /// semantics against an existing prefix. Calling it against a session
+        /// with live state would overwrite the existing KV prefix rows while
+        /// leaving GDN recurrent state conditioned on the tokens it overwrote,
+        /// an unreconstructible mix. Call [`Self::reset_state`] first to start a
+        /// new prompt on a session that has already generated.
+        ///
         /// # Errors
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
-        /// dispatch for an empty prompt, an out-of-vocabulary token, or a prompt
-        /// whose token range exceeds the session capacity.
+        /// dispatch for an empty prompt, an out-of-vocabulary token, a prompt
+        /// whose token range exceeds the session capacity, or a session that is
+        /// not fresh (see above). On rejection, session state (KV cache, GDN
+        /// state, hidden-readback counters) is left unchanged.
         pub fn forward_prefill_with_hidden(
             &mut self,
             token_ids: &[u32],
@@ -6608,6 +6684,17 @@ mod inner {
                         self.engine.config.vocab_size
                     )));
                 }
+            }
+            if self.session.kv_cache.seq_len != 0 || !self.gdn_state_is_initial() {
+                return Err(InferenceError::InvalidInput(format!(
+                    "forward_prefill_with_hidden: requires a fresh session (kv_cache.seq_len \
+                     == 0 and GDN recurrent state at its initial condition), found \
+                     kv_cache.seq_len={}; this call always dispatches from position 0, so \
+                     calling it against a session with live state would overwrite the \
+                     existing KV prefix while leaving GDN state conditioned on the tokens it \
+                     overwrote. Call reset_state() first to start a new prompt.",
+                    self.session.kv_cache.seq_len
+                )));
             }
             self.check_forward_range_capacity(0, token_ids.len(), false)?;
             self.cross_turn_prefix_cache.clear();
@@ -16964,6 +17051,177 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
             assert_eq!(ordinary.session.kv_cache.seq_len, tokens.len() + 1);
             assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len() + 1);
+        }
+
+        /// Byte-for-byte snapshot of every KV buffer (K and V, every layer),
+        /// including unwritten rows beyond `seq_len`. Used to prove a rejected
+        /// call performed no GPU write anywhere in the cache, not just that
+        /// `seq_len` held still.
+        fn snapshot_kv_bytes(state: &MetalQwen35State) -> Vec<Vec<u8>> {
+            state
+                .session
+                .kv_cache
+                .k_bufs
+                .iter()
+                .chain(state.session.kv_cache.v_bufs.iter())
+                .map(|buf| {
+                    // SAFETY: StorageModeShared, no command buffer in flight
+                    // between test calls (each forward_*_with_hidden call
+                    // `wait_until_completed`s before returning).
+                    unsafe {
+                        let ptr = buf.contents() as *const u8;
+                        std::slice::from_raw_parts(ptr, buf.length() as usize).to_vec()
+                    }
+                })
+                .collect()
+        }
+
+        #[test]
+        fn forward_step_with_hidden_rejects_position_mismatched_with_cache_cursor() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+            state.reset_path_proof_counters();
+
+            // Defect-1 repro: on a fresh state (cursor at 0), a caller asks for
+            // position 5. The old guard only checked `position < max_cache_len`
+            // and would have RoPE-rotated token_a for position 5 while writing
+            // its KV row at row 0 (derived from kv_cache.seq_len). It must now
+            // be rejected before any dispatch.
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let err = state
+                .forward_step_with_hidden(42, 5)
+                .expect_err("position ahead of the live cache cursor must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "rejection must not advance the KV cache cursor"
+            );
+            assert_eq!(
+                state.session.position, 0,
+                "rejection must not advance the decode cursor"
+            );
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot().decode,
+                0,
+                "rejection must not read hidden state"
+            );
+            assert_eq!(
+                snapshot_kv_bytes(&state),
+                kv_before,
+                "rejection must not write any KV row"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                gdn_before,
+                "rejection must not mutate GDN recurrent state"
+            );
+
+            // The correctly-ordered sequence (position == cursor each call)
+            // still succeeds and advances both cursors together.
+            let (_, hidden_a) = state
+                .forward_step_with_hidden(42, 0)
+                .expect("position matching the live cache cursor succeeds");
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+            assert_eq!(state.session.position, 1);
+            assert!(hidden_a.iter().any(|&value| value != 0.0));
+
+            // Defect-1 repro, second call: token_b at position 1 is the correct
+            // next position now, but a stale/out-of-order position must still
+            // be rejected rather than silently accepted.
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let err = state
+                .forward_step_with_hidden(2, 0)
+                .expect_err("a stale position behind the live cache cursor must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+            assert_eq!(state.session.position, 1);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+
+            let (_, hidden_b) = state
+                .forward_step_with_hidden(2, 1)
+                .expect("position matching the live cache cursor succeeds");
+            assert_eq!(state.session.kv_cache.seq_len, 2);
+            assert_eq!(state.session.position, 2);
+            assert!(hidden_b.iter().any(|&value| value != 0.0));
+        }
+
+        #[test]
+        fn forward_prefill_with_hidden_rejects_live_session_without_reset() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+
+            // Establish live state: one token advances the KV cache cursor off
+            // zero. (`tiny_metal_qwen35_fixture` has no linear-attention layers,
+            // so `gdn_state_is_initial()` is vacuously true regardless of
+            // activity here; this test exercises the `kv_cache.seq_len` half of
+            // the fresh-session gate, which alone is already sufficient to
+            // reject this repro.)
+            state
+                .forward_step_with_hidden(42, 0)
+                .expect("first token at position 0 succeeds");
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+
+            state.reset_path_proof_counters();
+
+            // Defect-2 repro: forward_prefill_with_hidden always dispatches from
+            // position 0. Without a reset, the old code would overwrite KV row
+            // 0 (and row 1) while leaving GDN recurrent state still conditioned
+            // on the token it just overwrote — an unreconstructible mix. It
+            // must now be rejected before any dispatch.
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let err = state.forward_prefill_with_hidden(&[2, 5]).expect_err(
+                "prefill against a live session must be rejected without reset_state()",
+            );
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 1,
+                "rejection must not overwrite the live KV prefix"
+            );
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot().prefill,
+                0,
+                "rejection must not read hidden state"
+            );
+            assert_eq!(
+                snapshot_kv_bytes(&state),
+                kv_before,
+                "rejection must not write any KV row"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                gdn_before,
+                "rejection must not mutate GDN recurrent state"
+            );
+
+            // reset_state() clears both gates; the same call now succeeds.
+            state.reset_state();
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert!(state.gdn_state_is_initial());
+            let (_, hidden) = state
+                .forward_prefill_with_hidden(&[2, 5])
+                .expect("prefill against a freshly reset session succeeds");
+            assert_eq!(state.session.kv_cache.seq_len, 2);
+            assert!(hidden.iter().any(|&value| value != 0.0));
         }
 
         #[test]
