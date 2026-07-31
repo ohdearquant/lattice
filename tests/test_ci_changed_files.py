@@ -265,11 +265,31 @@ class ChangedFilesTests(unittest.TestCase):
             result.stderr,
         )
 
-    def test_resolved_empty_range_succeeds_without_changed_paths(self) -> None:
+    def test_degenerate_equal_commit_range_fails_with_named_error(self) -> None:
         head = self._commit("README.md", "base\n")
 
-        result = self._run("pull_request", head, head, check=False)
+        for base in (head, head[:12], head.upper()):
+            with self.subTest(base=base):
+                result = self._run("pull_request", base, head, check=False)
 
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(
+                    result.stderr,
+                    f"event base {base} and event head {head} resolve to the "
+                    "same commit; refusing degenerate range\n",
+                )
+
+    def test_distinct_commit_empty_range_succeeds_without_changed_paths(
+        self,
+    ) -> None:
+        base = self._commit("README.md", "base\n")
+        self._git("commit", "--allow-empty", "-q", "-m", "empty change")
+        head = self._git("rev-parse", "HEAD")
+
+        result = self._run("pull_request", base, head, check=False)
+
+        self.assertNotEqual(base, head)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout.strip(), "")
         self.assertEqual(result.stderr, "")
