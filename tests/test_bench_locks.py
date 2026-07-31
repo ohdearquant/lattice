@@ -4,18 +4,20 @@
 The locking and ambient-load properties are about refusing rather than about
 measuring.
 
-The body refuses to measure unless the PID recorded in the lock status is one of
-its own ancestors. scripts/bench-compare.sh runs the measurement body under
-scripts/lib/bench-locks.py, which records its own PID after taking both
-machine-wide locks.
+The body refuses to measure unless it holds inherited lock descriptors that
+prove -- by fstat identity against the recorded lock paths, plus a non-blocking
+flock re-acquire and a probe open that must fail to lock -- that both
+machine-wide locks are actually held. scripts/bench-compare.sh runs the
+measurement body under scripts/lib/bench-locks.py --pass-lock-fds, which
+records its own PID and both lock dispositions and hands the body the two
+acquired descriptors.
 
-Stated exactly, because the tempting claim is one word wider than the truth: the
-file supplies the PID and the OS supplies the chain, so the check establishes a
-RELATION. It refuses a status file left over from a finished run, one copied
-from a different run, and accidental direct invocation -- the ways this actually
-gets run without isolation. It does not stop a caller who deliberately records
-an ancestor's PID. Closing that needs the lock descriptor rather than a PID, and
-arrives with the nested-acquirer work.
+A PID recorded in the lock status and found in this process's ancestry is only
+a RELATION, never a proof: the file supplies the PID and the OS supplies the
+chain, so a caller willing to record an ancestor's own PID -- its own shell's
+included -- used to get through with neither lock held. That was fixed by
+requiring the descriptor proof unconditionally: a status file with no inherited
+LATTICE_BENCH_LOCK_FDS is refused outright, with no ancestry fallback.
 
 A check that merely asserted the file exists would refuse none of the above.
 
@@ -258,31 +260,25 @@ class LockPrecondition(unittest.TestCase):
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
             self.assertIn("ancestor", r.stderr)
 
-    def test_deliberately_recorded_ancestor_pid_is_accepted(self):
-        """The boundary of the guard, pinned as a fact rather than left in prose.
+    def test_deliberately_recorded_ancestor_pid_alone_is_refused(self):
+        """A caller-supplied ancestor PID is a relation, never a proof.
 
-        A caller who records a PID that really is one of its ancestors -- its own
-        shell, here -- passes the check with no lock held. That is the limit of
-        what a PID can establish: the file supplies the number, the OS confirms
-        only the relation.
+        A caller who records a PID that really is one of its ancestors -- its
+        own shell, here -- used to pass the check with no lock held, which is
+        exactly the review-flagged bypass: an ordinary stale/exported-
+        environment failure would read as a supervised run. The fix requires
+        the inherited LATTICE_BENCH_LOCK_FDS descriptor proof unconditionally,
+        so this receipt-only invocation must now be refused before the body
+        ever prints its run-conditions banner.
 
-        This is a characterization test, not a wish. It exists so the comment
-        describing that limit cannot drift away from the code: strengthen the
-        guard to close this and the test fails, which is the signal to update
-        every place the limit is described.
+        Mutation-sensitive: reintroduce the ancestry-walk fallback and this run
+        reaches "Run conditions" again with neither lock held.
         """
         with _Sandbox() as sb:
             sb.status.parent.mkdir(parents=True, exist_ok=True)
             script = (
                 f'echo "supervisor_pid=$$" > {sb.status}\n'
                 f'echo "lock=fabricated, nothing is held" >> {sb.status}\n'
-                # The recording shell must stay alive as the parent. Two ways to
-                # lose it, both of which make the body inherit that PID as its
-                # OWN and get refused (the walk starts at PPID, so self never
-                # matches): an explicit `exec`, and bash's implicit exec of the
-                # LAST simple command in a -c script. The trailing statement
-                # below defeats the second. An interactive operator typing the
-                # command hits neither, which is the case being characterized.
                 f'bash {sb.impl} HEAD~1 HEAD\n'
                 'rc=$?\n'
                 'exit "$rc"\n'
@@ -290,32 +286,9 @@ class LockPrecondition(unittest.TestCase):
             r = subprocess.run(
                 ["bash", "-c", script], capture_output=True, text=True,
                 env={**sb.env, "BENCH_IDLE_FLOOR": "0"}, timeout=300)
-            self.assertNotIn("not an ancestor", r.stderr)
-            self.assertIn("Run conditions", r.stdout, f"stderr:\n{r.stderr}")
-
-    def test_ancestry_walk_refuses_with_a_diagnostic_when_ps_fails(self):
-        """A walk that cannot complete refuses, and says which case it is.
-
-        Under `set -o pipefail` a failing ps propagates out of the assignment
-        and `set -e` exits with ps's own status before the refusal is reached,
-        so the caller gets a bare 1 or 126 and no message. Still fail-closed,
-        but silently and with the wrong status, and it fires on the ordinary
-        case of an ancestor exiting mid-walk, not only where process inspection
-        is denied.
-
-        Mutation-sensitive: restore the bare `pid="$(ps ... | tr -d ' ')"`
-        assignment and this exits 1 with no diagnostic instead of 2 with one.
-        """
-        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
-            sb.status.parent.mkdir(parents=True, exist_ok=True)
-            sb.status.write_text("supervisor_pid=1\nlock=fabricated\n")
-            ps = Path(shim) / "ps"
-            ps.write_text("#!/usr/bin/env bash\nexit 1\n")
-            ps.chmod(0o755)
-            r = sb.run([sb.impl], BENCH_IDLE_FLOOR="0",
-                       PATH=f"{shim}:{sb.env['PATH']}")
-            self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
-            self.assertIn("could not walk", r.stderr)
+            self.assertEqual(r.returncode, 2, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
+            self.assertIn("LATTICE_BENCH_LOCK_FDS", r.stderr)
+            self.assertNotIn("Run conditions", r.stdout)
 
     def test_supervised_run_reaches_the_measurement(self):
         """Through the entry point the check passes and the body runs.

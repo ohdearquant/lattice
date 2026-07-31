@@ -2,11 +2,12 @@
 # bench-compare-impl.sh — A/B benchmark comparison across two git refs.
 #
 # INVOKE scripts/bench-compare.sh, NOT THIS FILE. This is the measurement body;
-# the entry point runs it under scripts/lib/bench-locks.py, which holds the
-# machine-wide bench-window and Metal GPU locks for the whole run. Running this
-# file by accident is refused below. Running it deliberately, by a caller
-# willing to prepare the status file, is not prevented — see the comment above
-# verify_locks for exactly what that check establishes.
+# the entry point runs it under scripts/lib/bench-locks.py --pass-lock-fds,
+# which holds the machine-wide bench-window and Metal GPU locks for the whole
+# run and hands this body the two acquired lock descriptors. Running this file
+# by accident, or deliberately with a fabricated status file and no inherited
+# descriptors, is refused below — see the comment above verify_locks for
+# exactly what that check proves.
 #
 # Usage:
 #   scripts/bench-compare.sh                        # origin/main vs HEAD (quick)
@@ -147,26 +148,30 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# --- Refuse to measure unless the recorded supervisor is one of our ancestors ---
-# scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
-# which records its own PID here after taking both locks. This requires that PID
-# to be one of THIS process's ancestors before measuring.
+# --- Refuse to measure unless the inherited lock descriptors prove both locks
+# --- are actually held ---
+# scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py
+# --pass-lock-fds, which records its own PID and both lock dispositions in
+# LATTICE_BENCH_LOCK_STATUS and hands this process the two acquired lock file
+# descriptors via LATTICE_BENCH_LOCK_FDS (inherited across exec, not dup'ed —
+# they refer to the SAME open file descriptions bench-locks.py itself holds
+# open for this run's whole lifetime).
 #
-# WHAT THAT ACTUALLY PROVES, stated exactly, because the tempting overclaim is
-# one word wider than the truth. The file supplies the PID and the OS supplies
-# the chain, so the check establishes a RELATION: the named process is really an
-# ancestor of this one. It refuses a status file left over from a finished run,
-# a file copied from a different run or machine, and accidental direct
-# invocation of this body, which are the ways this actually gets run without
-# isolation. It does NOT stop a caller who deliberately records an ancestor's
-# PID, their own shell's included: the recorded PID is still caller-supplied,
-# and ancestry confirms the relation, not that the named process holds anything.
+# A PID appearing in this process's ancestry is a RELATION, never a PROOF: the
+# status file supplies the PID and the OS supplies the chain, so a caller
+# willing to write an ancestor's own PID into a fabricated status file — their
+# own shell's included — gets through unchanged, with neither lock held. That
+# was this function's entire acceptance criterion until this fix, and it is
+# why this function no longer walks ancestry at all: an unprovable lock must
+# never read as a held one, so absent descriptors are refused outright rather
+# than falling back to the PID relation.
 #
-# Closing that needs the lock DESCRIPTOR rather than a PID — an fstat identity
-# check on an inherited fd, followed by a non-blocking flock on it, which leaves
-# the lock held on that description whichever branch is taken. That arrives with
-# the nested-acquirer work, where a child that must hold a lock exists to
-# receive the descriptor. Until then this is the strong refusal, not a proof.
+# The actual proof is descriptor identity plus possession: fstat the inherited
+# fd against the lock path recorded in the receipt, non-blocking re-flock the
+# inherited fd (must succeed — same open file description), then flock a
+# FRESH open of the same path (must fail — someone else holds it). That check
+# is scripts/lib/bench_supervision.py's _verify_inherited_fds, reused here via
+# its own `verify` CLI rather than reimplemented.
 LOCK_STATUS_FILE="$REPO/.cache/bench-locks-status.txt"
 LOCK_SUMMARY=""
 verify_locks() {
@@ -175,48 +180,36 @@ verify_locks() {
     echo "  Run scripts/bench-compare.sh, not this file directly." >&2
     exit 2
   fi
-  local sup
-  sup="$(sed -n 's/^supervisor_pid=//p' "$LOCK_STATUS_FILE" | head -1)"
-  case "$sup" in
-    ''|*[!0-9]*)
-      echo "bench-compare: lock status names no supervisor PID — refusing." >&2
-      exit 2
-      ;;
-  esac
-  local pid="$PPID"
-  local hops=0
-  local parent
-  local walked=1
-  while [ "$pid" -gt 1 ] && [ "$hops" -lt 64 ]; do
-    if [ "$pid" = "$sup" ]; then
-      LOCK_SUMMARY="$(sed -n 's/^lock=/  /p' "$LOCK_STATUS_FILE")"
-      return 0
-    fi
-    # A failing ps must reach the refusal below rather than abort the script.
-    # Under `set -o pipefail` the failure propagates out of the assignment and
-    # `set -e` exits with ps's own status, skipping the diagnostic entirely: the
-    # caller sees a bare 1 or 126 and no message. That is still fail-closed, but
-    # silently, and it fires on the ordinary case of an ancestor exiting during
-    # the walk, not only where process inspection is denied.
-    if ! parent="$(ps -o ppid= -p "$pid" 2>/dev/null)"; then
-      walked=0
-      break
-    fi
-    pid="$(printf '%s' "$parent" | tr -d ' ')"
-    case "$pid" in ''|*[!0-9]*) walked=0; break ;; esac
-    hops=$((hops + 1))
-  done
-  if [ "$walked" -eq 0 ]; then
-    echo "bench-compare: could not walk this process's ancestry to the end" \
-         "(ps failed or returned nothing) — refusing to measure." >&2
-    echo "  Supervisor $sup was not seen before the walk stopped, so whether it" \
-         "is an ancestor is unknown, and unknown is refused." >&2
-  else
-    echo "bench-compare: lock supervisor $sup is not an ancestor of this run" \
-         "(stale or copied $LOCK_STATUS_FILE) — refusing to measure." >&2
+  LOCK_SUMMARY="$(sed -n 's/^lock=/  /p' "$LOCK_STATUS_FILE")"
+
+  if [ -z "${LATTICE_BENCH_LOCK_FDS:-}" ]; then
+    echo "bench-compare: no inherited lock descriptors" \
+         "(LATTICE_BENCH_LOCK_FDS is unset) — refusing to measure." >&2
+    echo "  scripts/bench-compare.sh must invoke bench-locks.py with" \
+         "--pass-lock-fds; a caller-supplied ancestor PID is not proof a" \
+         "lock is held. Run scripts/bench-compare.sh, not this file" \
+         "directly." >&2
+    exit 2
   fi
-  echo "  Run scripts/bench-compare.sh, not this file directly." >&2
-  exit 2
+
+  export LATTICE_BENCH_LOCK_STATUS="$LOCK_STATUS_FILE"
+  if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
+    echo "bench-compare: inherited lock descriptors did not prove the" \
+         "bench-window and Metal GPU locks are held — refusing to measure." >&2
+    exit 2
+  fi
+
+  # Verified. Close our copies now: bench-locks.py keeps its own descriptors
+  # on the same open file descriptions open for this run's whole lifetime, so
+  # this process no longer needs them, and leaving them open would leak into
+  # every cargo/rustc child this script spawns below.
+  local fd
+  local -a bench_lock_fds
+  IFS=',' read -r -a bench_lock_fds <<< "$LATTICE_BENCH_LOCK_FDS"
+  for fd in "${bench_lock_fds[@]}"; do
+    eval "exec ${fd}<&-" 2>/dev/null || true
+  done
+  unset LATTICE_BENCH_LOCK_FDS
 }
 verify_locks
 

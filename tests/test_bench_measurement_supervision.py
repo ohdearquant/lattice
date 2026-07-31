@@ -499,5 +499,144 @@ process.exit(child.status ?? 2);
             self.assertIn("does not carry the lock", result.stderr)
 
 
+class BenchCompareDirectInvocationRefusal(unittest.TestCase):
+    """scripts/lib/bench-compare-impl.sh verify_locks must require inherited
+    lock descriptors, not just an ancestor-PID relation in a caller-supplied
+    status file.
+
+    Mutation-sensitive: this reproduces the exact exploit from the review —
+    a caller invokes the body directly after writing a status file whose
+    supervisor_pid is its own PID (trivially "an ancestor" of the child bash
+    process it then spawns), with no LATTICE_BENCH_LOCK_FDS. Neither lock is
+    held. With the fix, verify_locks refuses (exit 2) before touching cargo.
+    Reverting the fix (restoring the ancestry-only check) must make the same
+    invocation exit 0, proving the bypass was real.
+    """
+
+    def _build_repo(self, tmp: str) -> Path:
+        root = Path(tmp) / "repo"
+        lib = root / "scripts" / "lib"
+        lib.mkdir(parents=True)
+        shutil.copy2(
+            REPO / "scripts" / "lib" / "bench-compare-impl.sh",
+            lib / "bench-compare-impl.sh",
+        )
+        (lib / "bench-compare-impl.sh").chmod(0o755)
+        shutil.copy2(
+            REPO / "scripts" / "lib" / "bench_supervision.py",
+            lib / "bench_supervision.py",
+        )
+        (lib / "quiet-probe.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "label = sys.argv[sys.argv.index('--label') + 1]\n"
+            "print(f'[quiet] {label}: idle 100.0% (floor 0.0%) ok | top: fixture 0.0%')\n"
+        )
+        (lib / "machine-state-probe.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import datetime, json, sys\n"
+            "label = sys.argv[sys.argv.index('--label') + 1]\n"
+            "print(json.dumps({'schema': 'lattice-machine-state-v1', 'label': label,"
+            "'captured_at_utc': datetime.datetime.now(datetime.UTC)"
+            ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
+            "'power': {'status': 'unavailable', 'reason': 'fixture'},"
+            "'thermal': {'status': 'unavailable', 'reason': 'fixture'},"
+            "'idle': {'status': 'unavailable', 'reason': 'fixture'}}))\n"
+        )
+        (root / "scripts" / "perf_governor.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "from datetime import UTC, datetime\n"
+            "label = sys.argv[sys.argv.index('--label') + 1]\n"
+            "print(json.dumps({'schema': 'lattice-machine-state-v1', 'label': label,"
+            "'captured_at_utc': datetime.now(UTC).replace(microsecond=0)"
+            ".isoformat().replace('+00:00', 'Z'),"
+            "'power': {'status': 'measured', 'source': 'fixture', 'state': 'ac'},"
+            "'thermal': {'status': 'measured', 'source': 'fixture', 'state': 'nominal'},"
+            "'idle': {'status': 'measured', 'source': 'fixture', 'seconds': 30.0},"
+            "'gate': {'status': 'passed', 'cooldown_seconds': 30.0,"
+            "'afk_threshold_seconds': 30.0, 'kill_switch': 'clear'}}))\n"
+        )
+        (root / "scripts" / "lib" / "ensure-noindex-marker.sh").write_text(
+            "#!/usr/bin/env bash\nexit 0\n"
+        )
+        (root / "scripts" / "lib" / "ensure-noindex-marker.sh").chmod(0o755)
+
+        shutil.copy2(REPO / ".gitignore", root / ".gitignore")
+        env_git = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        }
+        git = ("git", "-c", "core.hooksPath=/dev/null")
+        subprocess.run([*git, "init", "-q", "-b", "main", str(root)], check=True)
+        for i in range(2):
+            (root / f"f{i}.txt").write_text(str(i))
+            subprocess.run([*git, "-C", str(root), "add", "-A"], check=True)
+            subprocess.run(
+                [*git, "-C", str(root), "commit", "-qm", f"c{i}"],
+                check=True, env=env_git,
+            )
+
+        bindir = Path(tmp) / "bin"
+        bindir.mkdir()
+        cargo_marker = Path(tmp) / "cargo-was-invoked"
+        cargo = bindir / "cargo"
+        cargo.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf ran > {str(cargo_marker)!r}\n"
+            "if [[ \"$*\" == *--version* ]]; then printf '%s\\n' 'cargo 1.94.1 (fixture)'; fi\n"
+            "exit 0\n"
+        )
+        cargo.chmod(0o755)
+        self.cargo_marker = cargo_marker
+        self.bindir = bindir
+        return root
+
+    def _write_forged_status(self, root: Path, own_pid: int) -> None:
+        cache = root / ".cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        (cache / "bench-locks-status.txt").write_text(
+            f"supervisor_pid={own_pid}\n"
+            "lock=bench-window (/tmp/fake-bench-window.lock): fabricated\n"
+            "lock=Metal GPU (/tmp/fake-metal-gpu.lock): fabricated\n"
+        )
+
+    def _invoke(self, root: Path) -> subprocess.CompletedProcess[str]:
+        env = {
+            **os.environ,
+            "PATH": f"{self.bindir}:{os.environ['PATH']}",
+            "BENCH_HOST_ID": "fixture",
+            "BENCH_IDLE_FLOOR": "0",
+        }
+        env.pop("LATTICE_BENCH_LOCK_FDS", None)
+        return subprocess.run(
+            ["bash", str(root / "scripts" / "lib" / "bench-compare-impl.sh"),
+             "HEAD~1", "HEAD"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_receipt_only_invocation_is_refused_before_any_benchmark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build_repo(tmp)
+            # own_pid is this test process's PID -- the forged supervisor_pid
+            # a caller would write for itself. It IS an ancestor of the bash
+            # child spawned below (its direct parent), which is exactly why
+            # the ancestry check alone used to accept it.
+            self._write_forged_status(root, os.getpid())
+            result = self._invoke(root)
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("LATTICE_BENCH_LOCK_FDS", result.stderr)
+        self.assertIn("refusing to measure", result.stderr)
+        self.assertFalse(self.cargo_marker.exists())
+        # Refused before the run-conditions banner, i.e. before base/head
+        # resolution and worktree setup ever started.
+        self.assertNotIn("=== bench-compare:", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,17 +16,20 @@
 # the check depends on: a marker left exported in a shell makes the body skip
 # locking and produce an unlocked measurement that is indistinguishable, in the
 # report and in the exit status, from a locked one. Two files cannot recurse
-# and there is no state to go stale. The body additionally refuses to run
-# unless the PID recorded in the lock status is one of its own ancestors, which
-# catches a stale or copied status file and an accidental direct invocation. It
-# does not make direct invocation impossible: the file supplies the PID, so a
-# caller who deliberately records an ancestor's PID gets through. See the
-# comment above verify_locks in the body for what that check does and does not
-# establish.
+# and there is no state to go stale. The body's own verify_locks does not stop
+# at a PID relation: --pass-lock-fds below hands the body the two acquired
+# lock descriptors, and the body proves identity (fstat against the recorded
+# lock paths) plus possession (a non-blocking flock re-acquire on the
+# inherited descriptor, and a probe open on the same path that must fail to
+# lock) via bench_supervision.py's _verify_inherited_fds before anything is
+# measured. A caller who fabricates a status file without the matching
+# inherited descriptors is refused, not merely one who fails an ancestry walk.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$REPO/.cache"
+export LATTICE_BENCH_LOCK_STATUS="$REPO/.cache/bench-locks-status.txt"
 exec python3 "$REPO/scripts/lib/bench-locks.py" \
   --label "bench-compare" \
-  --status-file "$REPO/.cache/bench-locks-status.txt" \
+  --status-file "$LATTICE_BENCH_LOCK_STATUS" \
+  --pass-lock-fds \
   -- "$REPO/scripts/lib/bench-compare-impl.sh" "$@"
