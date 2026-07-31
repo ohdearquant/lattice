@@ -18091,6 +18091,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_gemv_decode_numerical() {
+            let _gpu_guard = gpu_test_lock();
             // Run a small GEMM through both f32 and f16 paths, compare results.
             let Some(device) = Device::system_default() else {
                 return;
@@ -22965,6 +22966,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn lora_gemv_kernel_matches_cpu_reference() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
