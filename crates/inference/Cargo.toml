@@ -252,6 +252,7 @@ approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = { workspace = true }
 tempfile = { workspace = true }
+naga.workspace = true
 [[bench]]
 name = "differential_attention_bench"
 harness = false
@@ -292,11 +293,6 @@ harness = false
 name = "decode_attn_bench"
 harness = false
 required-features = ["f16"]
-
-[[bench]]
-name = "compute_attention_bench"
-harness = false
-required-features = ["bench-internals"]
 
 [[bench]]
 name = "kv_cache_layout_bench"
