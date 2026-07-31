@@ -336,10 +336,16 @@ Behavior remains the established fail-loud contract: acquire the in-process
 mutex first, then poll an exclusive advisory lock on
 `/tmp/lion-metal-gpu-test.lock` every 500 ms; panic after 30 minutes with an
 `lsof` hint; hold both resources until the opaque guard drops. The eight raw
-Metal measurement harnesses identified in #1115 acquire that guard before device
-creation or command-buffer work. A source-contract integration test enumerates
-that complete raw-device harness set and rejects an unguarded call, a late call,
-inventory drift, a second Rust definition, or a second fleet-path literal.
+Metal measurement harnesses identified in #1115 keep that guard live across
+their protected entry point. The construction inventory also scans every direct
+`MetalQwen35State::{new,from_q4_dir}` call in repository targets and each test
+function in `src/forward/metal_qwen35.rs`. For non-exempt sites, the source
+contract requires a simple named binding whose lexical scope encloses the
+protected entry point or entire test, and rejects any later use of that binding,
+including an immediate `drop`. This proves the repository's checked binding
+convention, not arbitrary Rust lifetime semantics or indirect GPU call graphs.
+The same contract rejects inventory drift, a second Rust definition, or a second
+fleet-path literal.
 
 **Resolves**: #1115 — one shared Metal test/measurement guard, the four prior
 implementations migrated, and every verified raw Metal measurement harness
