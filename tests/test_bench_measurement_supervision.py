@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import os
 import re
@@ -34,6 +35,16 @@ MEASUREMENT_SIGNAL = re.compile(
     r"perf_counter(?:_ns)?\(|hrtime\.bigint\(|cargo bench|tok_per_sec|"
     r"elapsed_ns|elapsed_s|total_ms|tokens/s|tok/s|PPL:"
 )
+PYTHON_TIMING_CALLS = {
+    "time.monotonic",
+    "time.monotonic_ns",
+    "time.perf_counter",
+    "time.perf_counter_ns",
+    "time.process_time",
+    "time.process_time_ns",
+    "time.time",
+}
+SCRIPT_SUFFIXES = {".mjs", ".py", ".sh"}
 
 
 def manifest_entries() -> dict[str, dict[str, str]]:
@@ -67,6 +78,105 @@ def discovered_declared_rust_inventory_paths() -> set[str]:
     )
     paths.add("README.md")
     return paths
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _literal_strings(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, (ast.List, ast.Tuple)):
+        return [value for element in node.elts for value in _literal_strings(element)]
+    return []
+
+
+def _python_measurement_evidence(source: str, path: Path) -> set[str]:
+    tree = ast.parse(source, filename=str(path))
+    evidence: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        else:
+            modules = []
+        if any(module.split(".", 1)[0] in {"mlx", "mlx_lm"} for module in modules):
+            evidence.add("MLX runtime import")
+
+        if isinstance(node, ast.Attribute) and _dotted_name(node) in PYTHON_TIMING_CALLS:
+            evidence.add("wall or monotonic timer")
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and "/api/generate" in node.value
+        ):
+            evidence.add("generation timing API")
+        if isinstance(node, (ast.List, ast.Tuple)):
+            values = _literal_strings(node)
+            if any(
+                first == "cargo" and second == "bench"
+                for first, second in zip(values, values[1:])
+            ):
+                evidence.add("cargo bench command")
+    return evidence
+
+
+def _shell_or_node_measurement_evidence(source: str) -> set[str]:
+    evidence: set[str] = set()
+    if re.search(
+        r"(?m)^[ \t]*(?:if[ \t]+)?"
+        r"(?:[A-Z_][A-Z0-9_]*=[^ \t]+[ \t]+)*cargo[ \t]+bench\b",
+        source,
+    ):
+        evidence.add("cargo bench command")
+    if re.search(
+        r"(?m)^[ \t]*(?:bench_supervise_entry\b|"
+        r"exec[ \t]+python3[^\n]*bench_supervision\.py[^\n]*[ \t]run\b)",
+        source,
+    ):
+        evidence.add("measurement supervisor invocation")
+    if re.search(r"process\.hrtime\.bigint\(|performance\.now\(|Date\.now\(", source):
+        evidence.add("JavaScript timer")
+    if re.search(r"(?m)^[ \t]*(?:from[ \t]+mlx|import[ \t]+mlx)", source):
+        evidence.add("MLX runtime import")
+    return evidence
+
+
+def discovered_measurement_evidence() -> dict[str, set[str]]:
+    """Collect direct driver evidence without trusting manifest roles.
+
+    Literal source analysis cannot follow dynamically assembled commands,
+    imported helper call graphs, or renamed timing APIs. Unsupported shebang
+    languages and Python syntax errors fail the scan instead of being skipped.
+    """
+
+    evidence_by_path: dict[str, set[str]] = {}
+    for path in sorted((REPO / "scripts").rglob("*")):
+        if not path.is_file() or path.parent == REPO / "scripts" / "lib":
+            continue
+        if path.suffix not in SCRIPT_SUFFIXES:
+            if path.read_bytes()[:2] == b"#!":
+                raise AssertionError(
+                    f"unsupported script language for {path.relative_to(REPO)}"
+                )
+            continue
+        source = path.read_text()
+        if path.suffix == ".py":
+            evidence = _python_measurement_evidence(source, path)
+        else:
+            evidence = _shell_or_node_measurement_evidence(source)
+        if evidence:
+            evidence_by_path[str(path.relative_to(REPO))] = evidence
+    return evidence_by_path
 
 
 class InventoryContract(unittest.TestCase):
@@ -178,6 +288,27 @@ class InventoryContract(unittest.TestCase):
         discovered.difference_update(INTERNAL_OR_TEST)
         self.assertEqual(set(manifest_entries()), discovered)
 
+    def test_direct_measurement_evidence_requires_supervision(self):
+        """Source evidence, not manifest claims, determines this requirement."""
+
+        entries = manifest_entries()
+        evidence_by_path = discovered_measurement_evidence()
+        self.assertTrue(evidence_by_path, "measurement evidence scan collected zero paths")
+        for path, evidence in evidence_by_path.items():
+            detail = ", ".join(sorted(evidence))
+            with self.subTest(path=path, evidence=detail):
+                self.assertIn(path, entries, f"{path}: unclassified {detail}")
+                self.assertEqual(
+                    entries[path]["role"],
+                    "measurement",
+                    f"{path}: source contains {detail}",
+                )
+                self.assertNotEqual(
+                    entries[path]["supervision"],
+                    "none",
+                    f"{path}: source contains {detail}",
+                )
+
     def test_every_measurement_entry_has_a_live_guard(self):
         """Mutation-sensitive: deleting any entry-point guard fails this scan."""
 
@@ -190,6 +321,8 @@ class InventoryContract(unittest.TestCase):
                     self.assertIn("bench_supervision.py", source)
                 elif path.endswith(".py"):
                     self.assertIn("ensure_python_entrypoint(", source)
+                    if entry["supervision"] == "both-locks+quiet":
+                        self.assertIn("quiet=True", source)
                 elif path.endswith(".mjs"):
                     self.assertIn("bench_supervision.py", source)
                     self.assertIn("'verify'", source)

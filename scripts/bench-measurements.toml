@@ -197,8 +197,8 @@ supervision = "none"
 
 [[entry]]
 path = "scripts/bench_linkedin_post.py"
-role = "consumer"
-supervision = "none"
+role = "measurement"
+supervision = "both-locks+quiet"
 
 [[entry]]
 path = "scripts/bench_quality.sh"
