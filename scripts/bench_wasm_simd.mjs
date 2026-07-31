@@ -92,6 +92,14 @@ if (receipt.error || receipt.status !== 0) {
 }
 for (const fd of LOCK_FDS) closeSync(fd);
 delete process.env.LATTICE_BENCH_LOCK_FDS;
+const retained = spawnSync('python3', [SUPERVISION, 'verify-retained'], {
+  stdio: 'inherit',
+  env: process.env,
+});
+if (retained.error || retained.status !== 0) {
+  console.error('bench_wasm_simd: lock supervisor did not retain both locks');
+  process.exit(2);
+}
 
 // ---------------------------------------------------------------------------
 // CLI args

@@ -40,6 +40,17 @@ def manifest_entries() -> dict[str, dict[str, str]]:
 
 
 class InventoryContract(unittest.TestCase):
+    def test_canonical_lock_paths_are_pinned(self):
+        source = (REPO / "scripts" / "lib" / "bench-locks.py").read_text()
+        self.assertRegex(
+            source,
+            r'(?m)^BENCH_WINDOW = "/tmp/lion-bench-window\.lock"$',
+        )
+        self.assertRegex(
+            source,
+            r'(?m)^GPU_LOCK = "/tmp/lion-metal-gpu-test\.lock"$',
+        )
+
     def test_manifest_schema_is_explicit_and_nonduplicated(self):
         data = tomllib.loads(MANIFEST.read_text())
         self.assertEqual(data["schema"], 1)
@@ -172,6 +183,15 @@ class InventoryContract(unittest.TestCase):
         self.assertIn("stdio: supervisionStdio()", source)
         self.assertIn("closeSync(fd)", source)
         self.assertIn("delete process.env.LATTICE_BENCH_LOCK_FDS", source)
+        self.assertIn("'verify-retained'", source)
+
+    def test_retiring_entrypoints_probe_the_supervisor_copy(self):
+        for path in (
+            "scripts/lib/bench-supervision.sh",
+            "scripts/lib/bench-compare-impl.sh",
+        ):
+            with self.subTest(path=path):
+                self.assertIn("verify-retained", (REPO / path).read_text())
 
 
 class _SupervisorSandbox:
@@ -331,13 +351,25 @@ class RuntimeContract(unittest.TestCase):
             marker = Path(sb.tmp.name) / "python-entrypoint"
             entrypoint = sb.root / "scripts" / "entrypoint.py"
             entrypoint.write_text(
-                "import os, sys\n"
+                "import fcntl, os, sys\n"
                 "from pathlib import Path\n"
                 f"sys.path.insert(0, {str(sb.helper.parent)!r})\n"
                 "from bench_supervision import ensure_python_entrypoint\n"
                 "ensure_python_entrypoint('fixture')\n"
+                "states = []\n"
+                f"for path in ({str(sb.bench_lock)!r}, {str(sb.gpu_lock)!r}):\n"
+                "    fd = os.open(path, os.O_RDWR)\n"
+                "    try:\n"
+                "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                "    except OSError:\n"
+                "        states.append('blocked')\n"
+                "    else:\n"
+                "        states.append('acquired')\n"
+                "    finally:\n"
+                "        os.close(fd)\n"
                 f"Path({str(marker)!r}).write_text("
-                "'present' if 'LATTICE_BENCH_LOCK_FDS' in os.environ else 'retired')\n"
+                "('present' if 'LATTICE_BENCH_LOCK_FDS' in os.environ "
+                "else 'retired') + ':' + ','.join(states))\n"
             )
             result = subprocess.run(
                 [sys.executable, str(entrypoint)],
@@ -346,7 +378,7 @@ class RuntimeContract(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(marker.read_text(), "retired")
+            self.assertEqual(marker.read_text(), "retired:blocked,blocked")
 
     def test_durable_entrypoint_refuses_lock_only_outer_supervisor(self):
         with _SupervisorSandbox() as sb:
@@ -388,6 +420,43 @@ class RuntimeContract(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(marker.read_text(), "retired")
+
+    def test_shell_handoff_keeps_capabilities_for_nested_python_guard(self):
+        with _SupervisorSandbox() as sb:
+            marker = Path(sb.tmp.name) / "nested-python-entrypoint"
+            cargo_marker = Path(sb.tmp.name) / "cargo-capabilities"
+            python_entrypoint = sb.root / "scripts" / "nested.py"
+            python_entrypoint.write_text(
+                "import os, sys\n"
+                "from pathlib import Path\n"
+                f"sys.path.insert(0, {str(sb.helper.parent)!r})\n"
+                "from bench_supervision import ensure_python_entrypoint\n"
+                "ensure_python_entrypoint('fixture')\n"
+                f"Path({str(marker)!r}).write_text("
+                "'present' if 'LATTICE_BENCH_LOCK_FDS' in os.environ else 'retired')\n"
+            )
+            shell_entrypoint = sb.root / "scripts" / "nested.sh"
+            shell_entrypoint.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f"source {str(sb.root / 'scripts/lib/bench-supervision.sh')!r}\n"
+                'bench_supervise_entry "fixture" handoff "$@"\n'
+                "(\n"
+                "  bench_retire_lock_fds\n"
+                f"  printf '%s' \"${{LATTICE_BENCH_LOCK_FDS:-retired}}\" > {str(cargo_marker)!r}\n"
+                ")\n"
+                f"exec {sys.executable!r} {str(python_entrypoint)!r}\n"
+            )
+            shell_entrypoint.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(shell_entrypoint)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(cargo_marker.read_text(), "retired")
             self.assertEqual(marker.read_text(), "retired")
 
     def test_durable_shell_refuses_lock_only_outer_without_errexit(self):
@@ -438,16 +507,164 @@ process.exit(child.status ?? 2);
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_forged_nonancestor_receipt_is_refused(self):
+    def test_idle_unlocked_inherited_fds_are_refused(self):
         with _SupervisorSandbox() as sb:
-            status = Path(sb.tmp.name) / "forged.status"
+            for path in (sb.bench_lock, sb.gpu_lock):
+                path.touch()
+            status = Path(sb.tmp.name) / "idle.status"
             status.write_text(
-                "supervisor_pid=1\n"
-                "lock=bench-window (/tmp/fake): fabricated\n"
-                "lock=Metal GPU (/tmp/fake): fabricated\n"
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.bench_lock}): fabricated\n"
+                f"lock=Metal GPU ({sb.gpu_lock}): fabricated\n"
+            )
+            inherited = tuple(
+                os.open(path, os.O_RDWR) for path in (sb.bench_lock, sb.gpu_lock)
+            )
+            try:
+                result = subprocess.run(
+                    [sys.executable, str(sb.helper), "verify"],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "LATTICE_BENCH_LOCK_STATUS": str(status),
+                        "LATTICE_BENCH_LOCK_FDS": ",".join(map(str, inherited)),
+                    },
+                    pass_fds=inherited,
+                    timeout=30,
+                )
+            finally:
+                for fd in inherited:
+                    os.close(fd)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("was not already held", result.stderr)
+
+    def test_locked_noncanonical_paths_are_refused(self):
+        with _SupervisorSandbox() as sb:
+            fake_paths = (
+                Path(sb.tmp.name) / "fake-window.lock",
+                Path(sb.tmp.name) / "fake-gpu.lock",
+            )
+            inherited = tuple(
+                os.open(path, os.O_RDWR | os.O_CREAT) for path in fake_paths
+            )
+            status = Path(sb.tmp.name) / "fake-path.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({fake_paths[0]}): fabricated\n"
+                f"lock=Metal GPU ({fake_paths[1]}): fabricated\n"
+            )
+            try:
+                for fd in inherited:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = subprocess.run(
+                    [sys.executable, str(sb.helper), "verify"],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "LATTICE_BENCH_LOCK_STATUS": str(status),
+                        "LATTICE_BENCH_LOCK_FDS": ",".join(map(str, inherited)),
+                    },
+                    pass_fds=inherited,
+                    timeout=30,
+                )
+            finally:
+                for fd in inherited:
+                    os.close(fd)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(f"expected {sb.bench_lock}", result.stderr)
+
+    def test_swapped_canonical_lock_order_is_refused(self):
+        with _SupervisorSandbox() as sb:
+            for path in (sb.bench_lock, sb.gpu_lock):
+                path.touch()
+            inherited = tuple(
+                os.open(path, os.O_RDWR) for path in (sb.gpu_lock, sb.bench_lock)
+            )
+            status = Path(sb.tmp.name) / "swapped.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.gpu_lock}): fabricated\n"
+                f"lock=Metal GPU ({sb.bench_lock}): fabricated\n"
+            )
+            try:
+                for fd in inherited:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = subprocess.run(
+                    [sys.executable, str(sb.helper), "verify"],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "LATTICE_BENCH_LOCK_STATUS": str(status),
+                        "LATTICE_BENCH_LOCK_FDS": ",".join(map(str, inherited)),
+                    },
+                    pass_fds=inherited,
+                    timeout=30,
+                )
+            finally:
+                for fd in inherited:
+                    os.close(fd)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(f"expected {sb.bench_lock}", result.stderr)
+
+    def test_duplicate_lock_inode_is_refused(self):
+        with _SupervisorSandbox() as sb:
+            sb.bench_lock.touch()
+            os.link(sb.bench_lock, sb.gpu_lock)
+            fd = os.open(sb.bench_lock, os.O_RDWR)
+            twin = os.dup(fd)
+            status = Path(sb.tmp.name) / "duplicate-inode.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.bench_lock}): fabricated\n"
+                f"lock=Metal GPU ({sb.gpu_lock}): fabricated\n"
+            )
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = subprocess.run(
+                    [sys.executable, str(sb.helper), "verify"],
+                    capture_output=True,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "LATTICE_BENCH_LOCK_STATUS": str(status),
+                        "LATTICE_BENCH_LOCK_FDS": f"{fd},{twin}",
+                    },
+                    pass_fds=(fd, twin),
+                    timeout=30,
+                )
+            finally:
+                os.close(twin)
+                os.close(fd)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("distinct inodes", result.stderr)
+
+    def test_self_held_fds_without_retained_supervisor_are_refused(self):
+        with _SupervisorSandbox() as sb:
+            for path in (sb.bench_lock, sb.gpu_lock):
+                path.touch()
+            status = Path(sb.tmp.name) / "self-held.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.bench_lock}): acquired\n"
+                f"lock=Metal GPU ({sb.gpu_lock}): acquired\n"
+            )
+            marker = Path(sb.tmp.name) / "must-not-run"
+            code = (
+                "import fcntl, os, sys; from pathlib import Path; "
+                f"sys.path.insert(0, {str(sb.helper.parent)!r}); "
+                f"paths=({str(sb.bench_lock)!r}, {str(sb.gpu_lock)!r}); "
+                "fds=tuple(os.open(path, os.O_RDWR) for path in paths); "
+                "[fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB) for fd in fds]; "
+                "os.environ['LATTICE_BENCH_LOCK_FDS']=','.join(map(str, fds)); "
+                "from bench_supervision import ensure_python_entrypoint; "
+                "ensure_python_entrypoint('fixture'); "
+                f"Path({str(marker)!r}).write_text('ran')"
             )
             result = subprocess.run(
-                [sys.executable, str(sb.helper), "verify"],
+                [sys.executable, "-c", code],
                 capture_output=True,
                 text=True,
                 env={
@@ -457,7 +674,41 @@ process.exit(child.status ?? 2);
                 timeout=30,
             )
             self.assertEqual(result.returncode, 2)
-            self.assertRegex(result.stderr, r"not an ancestor|could not inspect")
+            self.assertIn("released after inherited descriptors closed", result.stderr)
+            self.assertFalse(marker.exists())
+
+    def test_forged_ancestor_receipt_without_fds_is_refused_before_command(self):
+        with _SupervisorSandbox() as sb:
+            status = Path(sb.tmp.name) / "forged-ancestor.status"
+            status.write_text(
+                f"supervisor_pid={os.getpid()}\n"
+                f"lock=bench-window ({sb.bench_lock}): fabricated\n"
+                f"lock=Metal GPU ({sb.gpu_lock}): fabricated\n"
+            )
+            marker = Path(sb.tmp.name) / "unsupervised-command-ran"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(sb.helper),
+                    "run",
+                    "--label",
+                    "forged-ancestor",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')",
+                ],
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "LATTICE_BENCH_LOCK_STATUS": str(status),
+                },
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("LATTICE_BENCH_LOCK_FDS is not set", result.stderr)
+            self.assertFalse(marker.exists())
 
     def test_unlocked_inherited_fds_do_not_borrow_another_holders_proof(self):
         """Mutation-sensitive: probing only by path accepts the wrong holder."""

@@ -14,6 +14,7 @@ import errno
 import fcntl
 import os
 import re
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -28,36 +29,16 @@ REFUSAL_EXIT = 2
 
 
 class SupervisionError(RuntimeError):
-    """The claimed lock receipt does not belong to this process tree."""
+    """The claimed lock capabilities do not prove benchmark supervision."""
 
 
-def _ancestors() -> set[int]:
-    pid = os.getppid()
-    seen: set[int] = set()
-    while pid > 1 and pid not in seen:
-        seen.add(pid)
-        try:
-            result = subprocess.run(
-                ["ps", "-o", "ppid=", "-p", str(pid)],
-                capture_output=True,
-                text=True,
-                timeout=5,
-                check=False,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise SupervisionError(f"could not inspect ancestor {pid}: {exc}") from exc
-        if result.returncode != 0:
-            raise SupervisionError(
-                f"could not inspect ancestor {pid}: ps exited {result.returncode}"
-            )
-        raw = result.stdout.strip()
-        if not raw:
-            break
-        try:
-            pid = int(raw)
-        except ValueError as exc:
-            raise SupervisionError(f"invalid parent PID reported by ps: {raw!r}") from exc
-    return seen
+def _canonical_lock_paths() -> tuple[Path, Path]:
+    config = runpy.run_path(str(LOCKS))
+    try:
+        paths = (Path(config["BENCH_WINDOW"]), Path(config["GPU_LOCK"]))
+    except (KeyError, TypeError) as exc:
+        raise SupervisionError("bench-locks.py has no canonical lock paths") from exc
+    return paths
 
 
 def _lock_paths(lock_lines: list[str]) -> list[Path]:
@@ -70,10 +51,21 @@ def _lock_paths(lock_lines: list[str]) -> list[Path]:
     return paths
 
 
-def _verify_inherited_fds(lock_lines: list[str]) -> tuple[int, ...] | None:
-    raw = os.environ.get(FDS_ENV)
-    if raw is None:
-        return None
+def _validated_receipt_paths(lock_lines: list[str]) -> tuple[Path, Path]:
+    receipt_paths = _lock_paths(lock_lines)
+    canonical_paths = _canonical_lock_paths()
+    for receipt_path, canonical_path in zip(
+        receipt_paths, canonical_paths, strict=True
+    ):
+        if receipt_path != canonical_path:
+            raise SupervisionError(
+                f"lock receipt names {receipt_path}; expected {canonical_path}"
+            )
+    return canonical_paths
+
+
+def _verify_inherited_fds(paths: tuple[Path, Path]) -> tuple[int, int]:
+    raw = os.environ[FDS_ENV]
     try:
         fds = tuple(int(value) for value in raw.split(","))
     except ValueError as exc:
@@ -81,53 +73,63 @@ def _verify_inherited_fds(lock_lines: list[str]) -> tuple[int, ...] | None:
     if len(fds) != 2 or len(set(fds)) != 2:
         raise SupervisionError(f"{FDS_ENV} must name exactly two descriptors")
 
-    paths = _lock_paths(lock_lines)
-    for fd, path in zip(fds, paths, strict=True):
-        try:
-            fd_stat = os.fstat(fd)
-            path_stat = path.stat()
-        except OSError as exc:
-            raise SupervisionError(
-                f"inherited lock descriptor {fd} cannot be matched to {path}: {exc}"
-            ) from exc
-        if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
-            raise SupervisionError(
-                f"inherited descriptor {fd} does not refer to receipt path {path}"
-            )
-
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            if exc.errno in (errno.EACCES, errno.EAGAIN):
+    probes: list[int] = []
+    inode_pairs: list[tuple[int, int]] = []
+    try:
+        for fd, path in zip(fds, paths, strict=True):
+            try:
+                probe = os.open(path, os.O_RDWR)
+                probes.append(probe)
+                fd_stat = os.fstat(fd)
+                path_stat = os.fstat(probe)
+            except OSError as exc:
                 raise SupervisionError(
-                    f"inherited descriptor {fd} does not carry the lock on {path}"
+                    f"inherited lock descriptor {fd} cannot be matched to {path}: {exc}"
                 ) from exc
-            raise SupervisionError(
-                f"could not verify inherited lock descriptor {fd}: {exc}"
-            ) from exc
+            fd_pair = (fd_stat.st_dev, fd_stat.st_ino)
+            path_pair = (path_stat.st_dev, path_stat.st_ino)
+            if fd_pair != path_pair:
+                raise SupervisionError(
+                    f"inherited descriptor {fd} does not refer to canonical path {path}"
+                )
+            inode_pairs.append(path_pair)
 
-        probe = os.open(path, os.O_RDWR)
-        try:
+        if len(set(inode_pairs)) != 2:
+            raise SupervisionError("canonical benchmark locks must use distinct inodes")
+
+        for probe, path in zip(probes, paths, strict=True):
             try:
                 fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError as exc:
-                if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                    raise SupervisionError(
-                        f"could not probe inherited lock {path}: {exc}"
-                    ) from exc
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    continue
+                raise SupervisionError(
+                    f"could not probe inherited lock {path}: {exc}"
+                ) from exc
             else:
                 fcntl.flock(probe, fcntl.LOCK_UN)
                 raise SupervisionError(
-                    f"inherited descriptor {fd} names {path}, but no lock is held"
+                    f"canonical lock {path} was not already held before verification"
                 )
-        finally:
+
+        for fd, path in zip(fds, paths, strict=True):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    raise SupervisionError(
+                        f"inherited descriptor {fd} does not carry the lock on {path}"
+                    ) from exc
+                raise SupervisionError(
+                    f"could not verify inherited lock descriptor {fd}: {exc}"
+                ) from exc
+    finally:
+        for probe in probes:
             os.close(probe)
-    return fds
+    return fds[0], fds[1]
 
 
-def verify_supervision() -> tuple[Path, tuple[int, ...]]:
-    """Return the validated status path/capabilities or raise."""
-
+def _read_receipt() -> tuple[Path, list[str]]:
     raw_path = os.environ.get(STATUS_ENV)
     if not raw_path:
         raise SupervisionError(f"{STATUS_ENV} is not set")
@@ -143,7 +145,7 @@ def verify_supervision() -> tuple[Path, tuple[int, ...]]:
             f"lock receipt {status} must contain exactly one supervisor_pid"
         )
     try:
-        supervisor_pid = int(pid_lines[0].split("=", 1)[1])
+        int(pid_lines[0].split("=", 1)[1])
     except ValueError as exc:
         raise SupervisionError(
             f"lock receipt {status} has an invalid supervisor PID"
@@ -154,22 +156,45 @@ def verify_supervision() -> tuple[Path, tuple[int, ...]]:
         raise SupervisionError(
             f"lock receipt {status} must contain both machine-wide locks"
         )
-    rendered = "\n".join(lock_lines)
-    for required in ("bench-window", "Metal GPU"):
-        if required not in rendered:
+    return status, lock_lines
+
+
+def verify_supervision() -> tuple[Path, tuple[int, ...]]:
+    """Return the validated status path/capabilities or raise."""
+
+    status, lock_lines = _read_receipt()
+    if FDS_ENV not in os.environ:
+        raise SupervisionError(f"{FDS_ENV} is not set")
+    paths = _validated_receipt_paths(lock_lines)
+    return status, _verify_inherited_fds(paths)
+
+
+def verify_retained_supervision() -> Path:
+    """Prove another descriptor still holds both locks after capability retirement."""
+
+    status, lock_lines = _read_receipt()
+    paths = _validated_receipt_paths(lock_lines)
+    for path in paths:
+        try:
+            probe = os.open(path, os.O_RDWR)
+        except OSError as exc:
+            raise SupervisionError(f"could not open retained lock {path}: {exc}") from exc
+        try:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    continue
+                raise SupervisionError(
+                    f"could not probe retained lock {path}: {exc}"
+                ) from exc
+            fcntl.flock(probe, fcntl.LOCK_UN)
             raise SupervisionError(
-                f"lock receipt {status} does not name the {required} lock"
+                f"canonical lock {path} was released after inherited descriptors closed"
             )
-
-    inherited = _verify_inherited_fds(lock_lines)
-    if inherited is not None:
-        return status, inherited
-
-    if supervisor_pid not in _ancestors():
-        raise SupervisionError(
-            f"lock supervisor {supervisor_pid} is not an ancestor of this run"
-        )
-    return status, ()
+        finally:
+            os.close(probe)
+    return status
 
 
 def _slug(label: str) -> str:
@@ -274,12 +299,13 @@ def ensure_python_entrypoint(label: str, *, quiet: bool = False) -> None:
         raise SystemExit(rc)
     try:
         _, inherited_fds = verify_supervision()
+        for fd in inherited_fds:
+            os.close(fd)
+        os.environ.pop(FDS_ENV, None)
+        verify_retained_supervision()
     except SupervisionError as exc:
         print(f"bench-supervision: {exc}; refusing to measure", file=sys.stderr)
         raise SystemExit(REFUSAL_EXIT) from exc
-    for fd in inherited_fds:
-        os.close(fd)
-    os.environ.pop(FDS_ENV, None)
     if quiet and os.environ.get(QUIET_ENV) != "1":
         print(
             f"bench-supervision: {label} requires ambient-idle gating, but its "
@@ -296,6 +322,9 @@ def main(argv: list[str] | None = None) -> int:
     verify = sub.add_parser("verify")
     verify.add_argument("--require-quiet", action="store_true")
     verify.set_defaults(action="verify")
+
+    retained = sub.add_parser("verify-retained")
+    retained.set_defaults(action="verify-retained")
 
     run = sub.add_parser("run")
     run.add_argument("--label", required=True)
@@ -322,6 +351,14 @@ def main(argv: list[str] | None = None) -> int:
                 "to measure",
                 file=sys.stderr,
             )
+            return REFUSAL_EXIT
+        return 0
+
+    if args.action == "verify-retained":
+        try:
+            verify_retained_supervision()
+        except SupervisionError as exc:
+            print(f"bench-supervision: {exc}; refusing to measure", file=sys.stderr)
             return REFUSAL_EXIT
         return 0
 

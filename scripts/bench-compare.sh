@@ -18,12 +18,11 @@
 # report and in the exit status, from a locked one. Two files cannot recurse
 # and there is no state to go stale. The body's own verify_locks does not stop
 # at a PID relation: --pass-lock-fds below hands the body the two acquired
-# lock descriptors, and the body proves identity (fstat against the recorded
-# lock paths) plus possession (a non-blocking flock re-acquire on the
-# inherited descriptor, and a probe open on the same path that must fail to
-# lock) via bench_supervision.py's _verify_inherited_fds before anything is
-# measured. A caller who fabricates a status file without the matching
-# inherited descriptors is refused, not merely one who fails an ancestry walk.
+# lock descriptors, and the body proves identity against the ordered canonical
+# lock paths plus prior possession: fresh opens must already be blocked before
+# either inherited descriptor is re-flocked. After retiring its copies, the
+# body also proves the supervisor retained both locks. A caller who fabricates
+# a status file without the matching inherited descriptors is refused.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 mkdir -p "$REPO/.cache"

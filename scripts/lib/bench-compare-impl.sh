@@ -166,12 +166,13 @@ done
 # never read as a held one, so absent descriptors are refused outright rather
 # than falling back to the PID relation.
 #
-# The actual proof is descriptor identity plus possession: fstat the inherited
-# fd against the lock path recorded in the receipt, non-blocking re-flock the
-# inherited fd (must succeed — same open file description), then flock a
-# FRESH open of the same path (must fail — someone else holds it). That check
-# is scripts/lib/bench_supervision.py's _verify_inherited_fds, reused here via
-# its own `verify` CLI rather than reimplemented.
+# The actual proof is descriptor identity plus possession: fstat both inherited
+# fds against the ordered canonical lock paths, reject duplicate inodes, and
+# probe both paths with FRESH opens before either inherited fd is re-flocked.
+# Both probes must fail while re-flocking both inherited fds must succeed. After
+# this process closes its copies, a second probe proves the supervisor retained
+# both locks. Those checks live in bench_supervision.py and are reused here via
+# its `verify` and `verify-retained` CLIs rather than reimplemented.
 LOCK_STATUS_FILE="$REPO/.cache/bench-locks-status.txt"
 LOCK_SUMMARY=""
 verify_locks() {
@@ -210,6 +211,11 @@ verify_locks() {
     eval "exec ${fd}<&-" 2>/dev/null || true
   done
   unset LATTICE_BENCH_LOCK_FDS
+  if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify-retained; then
+    echo "bench-compare: lock supervisor did not retain both locks after" \
+         "descriptor retirement — refusing to measure." >&2
+    exit 2
+  fi
 }
 verify_locks
 

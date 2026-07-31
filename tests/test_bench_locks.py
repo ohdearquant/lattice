@@ -245,20 +245,20 @@ class LockPrecondition(unittest.TestCase):
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
             self.assertIn("no lock status", r.stderr)
 
-    def test_status_file_naming_a_non_ancestor_is_refused(self):
-        """A status file is not evidence unless its PID is really an ancestor.
+    def test_status_file_without_inherited_lock_fds_is_refused(self):
+        """A status file without descriptor capabilities is only text.
 
-        Mutation-sensitive: replace the ancestry walk with a file-exists check
-        and this hand-written file satisfies it, which is the whole failure mode
-        the walk exists to remove. PID 1 is chosen because it always exists and
-        is never the parent chain of a test subprocess.
+        Mutation-sensitive: removing the descriptor precondition lets this
+        caller-controlled receipt reach the measurement body without either
+        machine-wide lock.
         """
         with _Sandbox() as sb:
             sb.status.parent.mkdir(parents=True, exist_ok=True)
             sb.status.write_text("supervisor_pid=1\nlock=fabricated\n")
             r = sb.run([sb.impl], BENCH_IDLE_FLOOR="0")
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
-            self.assertIn("ancestor", r.stderr)
+            self.assertIn("LATTICE_BENCH_LOCK_FDS", r.stderr)
+            self.assertNotIn("Run conditions", r.stdout)
 
     def test_deliberately_recorded_ancestor_pid_alone_is_refused(self):
         """A caller-supplied ancestor PID is a relation, never a proof.
