@@ -186,6 +186,21 @@ fail the 1,282-pair budget. Absolute movement prevents gains from cancelling
 losses. The `f64` epsilon is used only by the separate aggregate Recall@10 and
 agreement-rate floor comparisons; it is not part of either movement decision.
 
+The Binary recall calibration deliberately permits four distinct queries to lose
+one Recall@10 hit each: the one-hit local cap and four-hit total cap are both
+satisfied. That movement changes aggregate Recall@10 by
+`4 / (16 * 10) = 0.025`, about 2.5 percentage points; the aggregate and per-query
+floors still apply independently.
+
+The count representation has a class-wide collision: distinct rankings can
+preserve both top-k overlap cardinality and the total number of agreeing pairs.
+Such rankings are indistinguishable to this gate because it does not express
+top-k candidate identity or the complete rank permutation. A future top-k
+identity check would detect membership changes, while a rank fingerprint would
+also detect position changes that preserve both current counts. See
+[ADR-018](../../../docs/adr/ADR-018-quantized-vectors.md) for the gate decision and
+its limitations.
+
 `QuantizedData` holds any tier behind one enum. Promoting or demoting it always
 dequantizes to `f32` and quantizes into the destination tier. Promotion does not
 recover information discarded by a previous lower-precision representation.
