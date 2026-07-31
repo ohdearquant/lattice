@@ -631,6 +631,34 @@ mod tests {
         agreements as f64 / pairs as f64
     }
 
+    fn index_order_surrogate_quality(
+        corpus: &[Vec<f32>],
+        queries: &[Vec<f32>],
+        top_k: usize,
+    ) -> (f64, f64) {
+        let index_order: Vec<_> = (0..corpus.len()).collect();
+        let mut recall = 0.0;
+        let mut agreement = 0.0;
+        for query in queries {
+            let reference = reference_ranking(query, corpus);
+            recall += recall_at(&reference, &index_order, top_k);
+            agreement += pairwise_ranking_agreement(&reference, &index_order);
+        }
+        (
+            recall / queries.len() as f64,
+            agreement / queries.len() as f64,
+        )
+    }
+
+    fn retrieval_quality_floor(tier: QuantizationTier) -> (f64, f64) {
+        match tier {
+            QuantizationTier::Full => (1.0, 0.999),
+            QuantizationTier::Int8 => (0.98, 0.995),
+            QuantizationTier::Int4 => (0.85, 0.95),
+            QuantizationTier::Binary => (0.30, 0.70),
+        }
+    }
+
     /// Refuses to let a retrieval-fidelity fixture be scored when it cannot
     /// distinguish quality tiers from each other.
     ///
@@ -643,6 +671,9 @@ mod tests {
         queries: &[Vec<f32>],
         top_k: usize,
     ) -> std::result::Result<(), String> {
+        if top_k == 0 {
+            return Err("retrieval fixture has top_k=0".to_string());
+        }
         if queries.is_empty() {
             return Err("retrieval fixture has zero queries".to_string());
         }
@@ -653,11 +684,21 @@ mod tests {
             ));
         }
         for (query_index, query) in queries.iter().enumerate() {
-            let mut distinct_scores: Vec<f64> = corpus
-                .iter()
-                .map(|candidate| scalar_cosine_f64(query, candidate))
-                .filter(|score| score.is_finite())
-                .collect();
+            let mut ranked_scores = Vec::with_capacity(corpus.len());
+            for (candidate_index, candidate) in corpus.iter().enumerate() {
+                let score = scalar_cosine_f64(query, candidate);
+                if !score.is_finite() {
+                    return Err(format!(
+                        "retrieval fixture query {query_index} candidate {candidate_index} has \
+                         non-finite reference score {score}"
+                    ));
+                }
+                ranked_scores.push((candidate_index, score));
+            }
+            ranked_scores.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+            let mut distinct_scores: Vec<_> =
+                ranked_scores.iter().map(|(_, score)| *score).collect();
             distinct_scores.sort_unstable_by(f64::total_cmp);
             distinct_scores.dedup();
             if distinct_scores.len() <= top_k {
@@ -667,6 +708,37 @@ mod tests {
                      more than top_k={top_k}",
                     distinct_scores.len(),
                     corpus.len()
+                ));
+            }
+
+            for (rank, boundary) in ranked_scores.windows(2).enumerate() {
+                let higher_score = boundary[0].1;
+                let lower_score = boundary[1].1;
+                if higher_score as f32 <= lower_score as f32 {
+                    return Err(format!(
+                        "retrieval fixture query {query_index} has a near-tied ranking boundary \
+                         at ranks {rank} and {}: reference scores {higher_score} and \
+                         {lower_score} do not remain ordered at f32 precision",
+                        rank + 1
+                    ));
+                }
+            }
+        }
+
+        let (surrogate_recall, surrogate_agreement) =
+            index_order_surrogate_quality(corpus, queries, top_k);
+        for tier in [
+            QuantizationTier::Full,
+            QuantizationTier::Int8,
+            QuantizationTier::Int4,
+            QuantizationTier::Binary,
+        ] {
+            let (minimum_recall, minimum_agreement) = retrieval_quality_floor(tier);
+            if surrogate_recall >= minimum_recall && surrogate_agreement >= minimum_agreement {
+                return Err(format!(
+                    "retrieval fixture is non-discriminating: an all-tied index-order surrogate \
+                     passes the {tier:?} floor with Recall@{top_k}={surrogate_recall:.6} and \
+                     pairwise ranking agreement={surrogate_agreement:.6}"
                 ));
             }
         }
@@ -754,12 +826,7 @@ mod tests {
                 "{tier:?}: Recall@{TOP_K}={recall:.6}, pairwise ranking agreement={agreement:.6}"
             );
 
-            let (minimum_recall, minimum_agreement) = match tier {
-                QuantizationTier::Full => (1.0, 0.999),
-                QuantizationTier::Int8 => (0.98, 0.995),
-                QuantizationTier::Int4 => (0.85, 0.95),
-                QuantizationTier::Binary => (0.30, 0.70),
-            };
+            let (minimum_recall, minimum_agreement) = retrieval_quality_floor(tier);
             assert!(
                 recall >= minimum_recall,
                 "{tier:?} Recall@{TOP_K} {recall:.6} is below the measured-data floor {minimum_recall:.3}"
@@ -822,6 +889,131 @@ mod tests {
         let (corpus, queries) = fixed_retrieval_fixture();
         validate_retrieval_fixture(&corpus, &queries, 10)
             .expect("the real fixture is discriminating and must not be rejected");
+
+        let (recall, agreement) = index_order_surrogate_quality(&corpus, &queries, 10);
+        assert!((recall - 0.025).abs() < f64::EPSILON);
+        assert!((agreement - 0.526_646_752_450_980_4).abs() < 1e-15);
+        for (tier, minimum_recall, minimum_agreement) in [
+            ("Full", 1.0, 0.999),
+            ("Int8", 0.98, 0.995),
+            ("Int4", 0.85, 0.95),
+            ("Binary", 0.30, 0.70),
+        ] {
+            assert!(
+                recall < minimum_recall || agreement < minimum_agreement,
+                "index-order surrogate must fail the pinned {tier} floor"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_rejects_binary_index_aligned_collapse() {
+        const TOP_K: usize = 10;
+        let query = vec![1.0, 0.0];
+        let corpus: Vec<_> = (0..21)
+            .map(|index| vec![21.0 - index as f32, 1.0])
+            .collect();
+        let queries = vec![query.clone()];
+
+        let mut scores: Vec<_> = corpus
+            .iter()
+            .map(|candidate| scalar_cosine_f64(&query, candidate))
+            .collect();
+        scores.sort_unstable_by(f64::total_cmp);
+        scores.dedup();
+        assert_eq!(scores.len(), 21);
+
+        let reference = reference_ranking(&query, &corpus);
+        let binary: Vec<_> = corpus
+            .iter()
+            .map(|candidate| QuantizedData::from_f32(candidate, QuantizationTier::Binary))
+            .collect();
+        let prepared = PreparedQuery::from_f32(&query, QuantizationTier::Binary);
+        let first_code = match &binary[0] {
+            QuantizedData::Binary(value) => &value.data,
+            _ => unreachable!("binary conversion must produce the Binary variant"),
+        };
+        assert!(binary.iter().all(|candidate| {
+            let QuantizedData::Binary(value) = candidate else {
+                return false;
+            };
+            value.data == *first_code
+                && approximate_cosine_distance_prepared(&prepared, candidate).unwrap() == 0.0
+        }));
+        let actual = tier_ranking(&query, &binary, QuantizationTier::Binary);
+        assert_eq!(reference, (0..21).collect::<Vec<_>>());
+        assert_eq!(actual, reference);
+        assert_eq!(recall_at(&reference, &actual, TOP_K), 1.0);
+        assert_eq!(pairwise_ranking_agreement(&reference, &actual), 1.0);
+
+        let err = validate_retrieval_fixture(&corpus, &queries, TOP_K).expect_err(
+            "an index-aligned reference must not let a totally collapsed tier pass its floors",
+        );
+        assert!(
+            err.contains("index-order surrogate"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_rejects_mixed_non_finite_scores() {
+        for non_finite in [f32::NAN, f32::INFINITY] {
+            let (mut corpus, queries) = fixed_retrieval_fixture();
+            corpus[0][0] = non_finite;
+            let err = validate_retrieval_fixture(&corpus, &queries, 10)
+                .expect_err("the first non-finite reference score must invalidate the oracle");
+            assert!(
+                err.contains("query 0 candidate 0"),
+                "unexpected error: {err}"
+            );
+            assert!(err.contains("non-finite"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_rejects_zero_top_k() {
+        let (corpus, queries) = fixed_retrieval_fixture();
+        let err = validate_retrieval_fixture(&corpus, &queries, 0)
+            .expect_err("top_k=0 must be refused before recall divides by zero");
+        assert!(err.contains("top_k=0"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_rejects_near_tied_top_k_boundary() {
+        let query = vec![1.0, 0.0];
+        let corpus = vec![
+            vec![0.0, 1.0],
+            vec![1.0, 0.0],
+            vec![1.0, 0.0001],
+            vec![-1.0, 0.0],
+        ];
+        let best = scalar_cosine_f64(&query, &corpus[1]);
+        let runner_up = scalar_cosine_f64(&query, &corpus[2]);
+        let boundary_gap = best - runner_up;
+        assert!(boundary_gap > 0.0 && boundary_gap < 1e-6);
+
+        let err = validate_retrieval_fixture(&corpus, &[query], 1)
+            .expect_err("an f64-only near-tie at the evaluated cutoff must be refused");
+        assert!(err.contains("near-tied"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_rejects_near_tied_pairwise_boundary() {
+        let query = vec![1.0, 0.0];
+        let corpus = vec![
+            vec![-1.0, 0.0],
+            vec![1.0, 0.0],
+            vec![100.0, 1.0],
+            vec![100.0, 1.0001],
+        ];
+        let second = scalar_cosine_f64(&query, &corpus[2]);
+        let third = scalar_cosine_f64(&query, &corpus[3]);
+        assert!(second > third);
+        assert_eq!(second as f32, third as f32);
+
+        let err = validate_retrieval_fixture(&corpus, &[query], 1)
+            .expect_err("an f64-only near-tie evaluated by pairwise agreement must be refused");
+        assert!(err.contains("near-tied"), "unexpected error: {err}");
     }
 
     #[test]
