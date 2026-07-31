@@ -6387,20 +6387,17 @@ mod inner {
         /// **Unstable**: fallible single-token forward step; kernel dispatch strategy evolving.
         ///
         /// Run a single token through the full model. Returns logits [vocab_size].
-        /// `position` must equal the live cache cursor (`kv_cache.seq_len`).
         ///
         /// # Errors
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU dispatch
-        /// when `position` or the next KV-cache row is outside the session capacity,
-        /// or when `position` does not equal the live cache cursor.
+        /// when `position` or the next KV-cache row is outside the session capacity.
         pub fn try_forward_step(
             &mut self,
             token_id: u32,
             position: usize,
         ) -> Result<Vec<f32>, crate::error::InferenceError> {
             self.check_forward_step_capacity(position)?;
-            self.check_live_cursor("try_forward_step", position)?;
             self.cross_turn_prefix_cache.clear();
             Ok(self
                 .forward_step_inner(
@@ -6458,10 +6455,9 @@ mod inner {
         ///
         /// # Panics
         ///
-        /// Panics if `token_id >= vocab_size`, if `position` or the next
-        /// KV-cache row exceeds the session capacity, or if `position` does not
-        /// equal the live cache cursor. Use [`Self::try_forward_step`] to receive
-        /// a typed error. These checks run before GPU dispatch.
+        /// Panics if `token_id >= vocab_size`, or if `position` or the next
+        /// KV-cache row exceeds the session capacity. Use [`Self::try_forward_step`]
+        /// to receive a typed capacity error. These checks run before GPU dispatch.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -17101,6 +17097,24 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .collect()
         }
 
+        /// Byte-for-byte snapshot of every live GDN recurrent-state buffer.
+        fn snapshot_gdn_bytes(state: &MetalQwen35State) -> Vec<Vec<u8>> {
+            state
+                .session
+                .gdn_gpu_s_matrices
+                .iter()
+                .chain(state.session.gdn_gpu_conv_bufs.iter())
+                .map(|buf| {
+                    // SAFETY: StorageModeShared, and the verifier preflight runs
+                    // before creating a command buffer, so no GPU write is in flight.
+                    unsafe {
+                        let ptr = buf.contents() as *const u8;
+                        std::slice::from_raw_parts(ptr, buf.length() as usize).to_vec()
+                    }
+                })
+                .collect()
+        }
+
         #[test]
         fn forward_step_with_hidden_rejects_position_mismatched_with_cache_cursor() {
             use crate::speculative::MtpTargetVerifier as _;
@@ -17182,19 +17196,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
-        fn raw_forward_and_verifier_boundaries_reject_mismatched_live_cursor() {
+        fn mtp_verifier_boundaries_reject_mismatched_live_cursor() {
             use crate::speculative::MtpTargetVerifier as _;
 
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = Device::system_default() else {
                 eprintln!(
-                    "[METAL_TEST_SKIP] context=raw_forward_and_verifier_boundaries_reject_mismatched_live_cursor \
+                    "[METAL_TEST_SKIP] context=mtp_verifier_boundaries_reject_mismatched_live_cursor \
                      reason=no_metal_device"
                 );
                 assert!(
                     !enforce,
                     "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
-                     (raw_forward_and_verifier_boundaries_reject_mismatched_live_cursor)"
+                     (mtp_verifier_boundaries_reject_mismatched_live_cursor)"
                 );
                 return;
             };
@@ -17204,18 +17218,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.path_proof_enabled = true;
             state.reset_path_proof_counters();
             let kv_before = snapshot_kv_bytes(&state);
-            let gdn_before = state.snapshot_gdn_states();
-
-            let error = state
-                .try_forward_step(1, 1)
-                .expect_err("raw forward must reject a position beyond the live cursor");
-            let crate::error::InferenceError::InvalidInput(message) = error else {
-                panic!("expected InvalidInput for mismatched raw-forward cursor, got {error}");
-            };
-            assert!(message.contains("try_forward_step"), "{message}");
-            assert_eq!(state.session.kv_cache.seq_len, 0);
-            assert_eq!(snapshot_kv_bytes(&state), kv_before);
-            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+            let gdn_before = snapshot_gdn_bytes(&state);
 
             let error = state
                 .verify_tokens(&[1], 1)
@@ -17229,7 +17232,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
             assert_eq!(state.session.kv_cache.seq_len, 0);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
-            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
 
             let error = state
                 .verify_tokens_batched(&[1], 1)
@@ -17243,7 +17246,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(message.contains("verify_tokens_batched"), "{message}");
             assert_eq!(state.session.kv_cache.seq_len, 0);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
-            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
 
             let error = state
                 .verify_tokens_batch_gemm(&[1], 1)
@@ -17257,7 +17260,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(message.contains("verify_tokens_batch_gemm"), "{message}");
             assert_eq!(state.session.kv_cache.seq_len, 0);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
-            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(
                 state.hidden_readback_path_proof_snapshot(),
                 HiddenReadbackPathProofSnapshot::default(),
