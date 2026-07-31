@@ -321,9 +321,10 @@ The C2 serving consolidation subsequently moved both binaries' Metal requests on
 previous detached-thread shutdown behavior so that request/cancellation correctness and process
 lifecycle did not change in the same PR. This amendment closes that deliberate lifecycle gap.
 
-Every production client retains a clone of the shared owner. Its job sender is declared before
-the owner clone, so dropping the final client closes the queue before dropping the final owner.
-The final owner takes the worker's sole join handle, waits up to two seconds for
+Every production client retains a clone of the shared owner. Its `Drop` implementation explicitly
+takes and drops its job sender before automatic field destruction can drop the owner clone, so the
+sequence is independent of field declaration order. The final owner takes the worker's sole join
+handle, waits up to two seconds for
 `JoinHandle::is_finished`, and joins only after the thread is known to have exited. A completed
 panic is joined and reported distinctly. If the deadline expires, the handle is detached and
 shutdown continues; a backend call that stops polling cancellation therefore cannot hang process
@@ -339,11 +340,13 @@ SIGINT and Unix SIGTERM into one tracked-connection drain. Existing HTTP/1 conne
 five-second graceful interval. If that interval expires, the runner aborts every tracked connection
 task and waits up to three seconds for cancellation cleanup before returning a timeout error.
 Cooperative cancellation releases request-held client clones before the worker deadline begins.
-Both binaries then hard-exit on the timeout; this is the final bounded fallback if runtime-owned
-upgraded work or a non-cooperative task outlives the cleanup interval. Neither binary has
-signal-specific worker state or a second shutdown loop. Healthy outstanding jobs may finish during
-the graceful interval; a stuck request is cancelled rather than allowed to keep router state alive
-indefinitely.
+After any initial drain timeout, both binaries abort the remaining tasks, allow the cleanup interval,
+and then hard-exit with status 1 even if cancellation cleanup completed. This is the final bounded
+fallback for runtime-owned upgraded work or a non-cooperative task. Because the hard exit skips Rust
+destructors, it can truncate in-flight responses, leave files partially written, and discard
+unflushed telemetry. Neither binary has signal-specific worker state or a second shutdown loop.
+Healthy outstanding jobs may finish during the graceful interval; a stuck request is cancelled
+rather than allowed to keep router state alive indefinitely.
 
 **Resolves**: #833 — graceful queue-close and join on the normal path, with a documented,
 observable timeout-to-cancel and worker timeout-to-detach fallback.

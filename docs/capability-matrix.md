@@ -134,14 +134,15 @@ field), and (as of PR #662) cross-turn/prefix KV cache reuse over HTTP. As of AD
 this list -- `lattice serve` now has all three, built on the same shared
 `lattice_inference::serve` contract `lattice_serve` uses.
 
-The shared contract also owns the Metal worker lifecycle (#833). In both binaries, dropping the
-last client closes the job queue before the final owner waits for and joins the worker. The wait is
-bounded; a worker still inside a backend call after the deadline is detached so process shutdown
-cannot hang indefinitely. Both binaries use the same server runner, which gives tracked HTTP/1
-connections a bounded graceful interval on SIGINT and Unix SIGTERM, then aborts remaining
-connection tasks and waits up to three seconds for cancellation cleanup. Cooperative cancellation
-releases router state before worker shutdown begins; a runner timeout is a hard process-exit
-boundary in both binaries for any non-cooperative remainder.
+The shared contract also owns the Metal worker lifecycle (#833). In both binaries, each client's
+`Drop` explicitly closes its job sender before automatic field destruction can release its owner
+clone. The final owner waits up to two seconds for and joins the worker; a worker still inside a
+backend call after that deadline is detached so process shutdown cannot hang indefinitely. Both
+binaries use the same server runner, which gives tracked HTTP/1 connections up to five seconds to
+drain on SIGINT and Unix SIGTERM. After any drain timeout it aborts remaining connection tasks,
+allows up to three seconds for cancellation cleanup, and then exits with status 1 even if cleanup
+completed. That hard-exit fallback can truncate in-flight responses, leave files partially written,
+and discard unflushed telemetry because it skips Rust destructors.
 
 As of #656, `tools`/`tool_choice`/`n`/non-`text` `response_format`/unknown-role/non-text-content-part
 rejection now behave identically on both HTTP surfaces (all 400, none silently ignored or coerced) --

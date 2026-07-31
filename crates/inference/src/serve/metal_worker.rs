@@ -23,12 +23,13 @@
 //! # Bounded shutdown
 //!
 //! Every production [`MetalWorkerClient`] retains a clone of
-//! [`MetalWorkerOwner`]. Dropping the last client first closes the job
-//! queue, then dropping the last owner waits for the worker to exit and
-//! joins it. The wait has a two-second deadline: a backend call that stops
-//! polling cancellation can delay the worker, but cannot hang process
-//! shutdown indefinitely. On timeout the join handle is detached and the
-//! process remains free to exit.
+//! [`MetalWorkerOwner`]. The client's `Drop` implementation explicitly closes
+//! its job sender before automatic field destruction can drop the owner, so
+//! the sequence does not depend on field declaration order. The last owner
+//! then waits for the worker to exit and joins it. The wait has a two-second
+//! deadline: a backend call that stops polling cancellation can delay the
+//! worker, but cannot hang process shutdown indefinitely. On timeout the join
+//! handle is detached and the process remains free to exit.
 //!
 //! # Testability without a GPU
 //!
@@ -233,12 +234,11 @@ pub struct WorkerJob {
 
 /// Shared owner for the dedicated worker thread.
 ///
-/// Production [`MetalWorkerClient`] values retain an owner clone. Because
-/// the client's queue sender is declared before that clone, dropping the
-/// final client closes the queue before the final owner begins its bounded
-/// join. The last owner's `Drop` is the sole production shutdown trigger;
-/// there is no explicit method that can detach the join handle while a
-/// client still keeps the queue open.
+/// Production [`MetalWorkerClient`] values retain an owner clone. Each
+/// client's `Drop` explicitly releases its queue sender before automatic
+/// field destruction can release that owner clone. The last owner's `Drop`
+/// is the sole production shutdown trigger; there is no explicit method that
+/// can detach the join handle while a client still keeps the queue open.
 #[derive(Debug, Clone)]
 pub struct MetalWorkerOwner {
     _inner: Arc<MetalWorkerOwnerInner>,
@@ -341,9 +341,7 @@ impl MetalWorkerOwner {
 /// confined to that thread.
 #[derive(Debug, Clone)]
 pub struct MetalWorkerClient {
-    // Field order is the shutdown contract: the final sender closes before
-    // the final owner clone starts its bounded join.
-    jobs: mpsc::UnboundedSender<WorkerJob>,
+    jobs: Option<mpsc::UnboundedSender<WorkerJob>>,
     /// Bounded-admission cap (issue #932): `Semaphore::new(max_pending)`, one
     /// permit per outstanding job (queued + in-flight, i.e. from `submit`
     /// until `run_worker_loop` is done with it). `Arc`-shared with every
@@ -362,7 +360,7 @@ impl MetalWorkerClient {
         owner: MetalWorkerOwner,
     ) -> Self {
         Self {
-            jobs,
+            jobs: Some(jobs),
             admission,
             _owner: owner,
         }
@@ -419,7 +417,9 @@ impl MetalWorkerClient {
         // On failure `job` (including `tx` and the admission permit) is
         // simply dropped here, closing `rx` with zero events and freeing
         // the slot immediately -- see the doc comment above.
-        let _ = self.jobs.send(job);
+        if let Some(jobs) = self.jobs.as_ref() {
+            let _ = jobs.send(job);
+        }
         Ok(rx)
     }
 
@@ -432,6 +432,12 @@ impl MetalWorkerClient {
     /// the actual admission state.
     pub fn available_permits(&self) -> usize {
         self.admission.available_permits()
+    }
+}
+
+impl Drop for MetalWorkerClient {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
     }
 }
 
@@ -1371,7 +1377,7 @@ mod tests {
             let _ = queue_closed_tx.send(());
             let _ = allow_exit_rx.recv();
         });
-        let owner = test_owner(join_handle, Duration::from_secs(1));
+        let owner = test_owner(join_handle, Duration::from_secs(2));
         let client =
             MetalWorkerClient::with_owner(job_tx, Arc::new(Semaphore::new(1)), owner.clone());
         drop(owner);
@@ -1382,7 +1388,7 @@ mod tests {
             let _ = drop_done_tx.send(());
         });
         queue_closed_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(Duration::from_millis(500))
             .expect("dropping the last client must close the queue");
         assert!(
             matches!(
