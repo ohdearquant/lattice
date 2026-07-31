@@ -389,6 +389,24 @@ fn check_live_logits_budget(
     Ok(())
 }
 
+fn check_training_logits_budget(
+    samples: &[Sample],
+    vocab: usize,
+    gradcheck: bool,
+) -> Result<(), String> {
+    let (forwarded_samples, label) = if gradcheck {
+        (&samples[..samples.len().min(1)], "gradcheck")
+    } else {
+        (samples, "training")
+    };
+    check_live_logits_budget(
+        forwarded_samples,
+        vocab,
+        BACKWARD_LOGITS_WORKSPACE_ROWS,
+        label,
+    )
+}
+
 /// Validate the loaded model's depth against the driver's fixed `TOP_LAYER`
 /// range before any layer access. [`Qwen35Model::gqa_layer_weights`] and
 /// [`Qwen35Model::gdn_layer_weights`] index layer storage directly by
@@ -610,12 +628,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     println!("  {} samples loaded", train_samples.len());
 
     check_cache_budget(&train_samples, dims.hidden, dims.rope_dim, "train")?;
-    check_live_logits_budget(
-        &train_samples,
-        dims.vocab,
-        BACKWARD_LOGITS_WORKSPACE_ROWS,
-        "training",
-    )?;
+    check_training_logits_budget(&train_samples, dims.vocab, gradcheck)?;
 
     // Capture the frozen prefix output (h_in entering first_layer) per sample.
     println!("\nBuilding frozen-prefix cache (layers 0..{first_layer})...");
@@ -1375,6 +1388,34 @@ mod run_bounds_tests {
     }
 
     #[test]
+    fn check_training_logits_budget_respects_execution_mode() {
+        let vocab = 248_320;
+        let completion_positions = 2_162;
+        let samples = vec![
+            Sample {
+                tokens: vec![0u32; 2],
+                completion_start: 1,
+            },
+            Sample {
+                tokens: vec![0u32; completion_positions + 1],
+                completion_start: 1,
+            },
+        ];
+        let retained_bytes = completion_positions * vocab * std::mem::size_of::<f32>();
+        let backward_bytes = (completion_positions + 1) * vocab * std::mem::size_of::<f32>();
+        assert!(retained_bytes <= MAX_LOGITS_BYTES);
+        assert!(backward_bytes > MAX_LOGITS_BYTES);
+
+        check_training_logits_budget(&samples, vocab, true)
+            .expect("gradcheck only forwards the first training sample");
+        let err = check_training_logits_budget(&samples, vocab, false).unwrap_err();
+        assert!(
+            err.contains("training sample 2") && err.contains("2162 supervised positions"),
+            "expected training to reject its oversized second sample; got: {err}"
+        );
+    }
+
+    #[test]
     fn check_live_logits_budget_rejects_one_oversized_completion() {
         let vocab = 2_097_152;
         let samples = vec![
@@ -1485,6 +1526,28 @@ mod run_bounds_tests {
     }
 
     #[test]
+    fn check_live_logits_budget_rejects_byte_size_overflow() {
+        let sample = Sample {
+            tokens: vec![0u32; 2],
+            completion_start: 1,
+        };
+        assert!(usize::MAX.checked_mul(1).is_some());
+        assert!(usize::MAX.checked_mul(std::mem::size_of::<f32>()).is_none());
+
+        let err = check_live_logits_budget(
+            &[sample],
+            usize::MAX,
+            EVAL_LOGITS_WORKSPACE_ROWS,
+            "held-out",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("held-out") && err.contains("overflows"),
+            "expected checked byte-size rejection; got: {err}"
+        );
+    }
+
+    #[test]
     fn check_live_logits_budget_rejects_workspace_row_overflow() {
         let sample = Sample {
             tokens: vec![0u32; 2],
@@ -1538,6 +1601,21 @@ mod run_bounds_tests {
         assert!(
             err.contains("completion_start"),
             "expected past-end completion boundary rejection; got: {err}"
+        );
+    }
+
+    #[test]
+    fn check_live_logits_budget_rejects_empty_tokens() {
+        let sample = Sample {
+            tokens: Vec::new(),
+            completion_start: 1,
+        };
+        let err =
+            check_live_logits_budget(&[sample], 32, BACKWARD_LOGITS_WORKSPACE_ROWS, "training")
+                .unwrap_err();
+        assert!(
+            err.contains("completion_start") && err.contains("1 <= completion_start < 0"),
+            "expected empty-token completion boundary rejection; got: {err}"
         );
     }
 
