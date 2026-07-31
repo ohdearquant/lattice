@@ -173,7 +173,10 @@ class UploadContractTest(unittest.TestCase):
             for asset in (dmg, zip_file):
                 checksum = Path(f"{asset}.sha256")
                 self.assertTrue(checksum.is_file())
-                self.assertIn(str(asset), checksum.read_text(encoding="utf-8"))
+                checksum_text = checksum.read_text(encoding="utf-8")
+                self.assertIn(asset.name, checksum_text)
+                self.assertNotIn("/", checksum_text)
+                self.assertNotIn(str(artifacts), checksum_text)
 
     def test_real_packaged_assets_when_requested(self):
         artifact_dir_value = os.environ.get(

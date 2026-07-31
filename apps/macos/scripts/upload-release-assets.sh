@@ -33,7 +33,7 @@ for NAME in Lattice.dmg Lattice.zip; do
         exit 1
     fi
     CHECKSUM="$ASSET.sha256"
-    shasum -a 256 "$ASSET" > "$CHECKSUM"
+    (cd "$ARTIFACT_DIR" && shasum -a 256 "$NAME" > "${NAME}.sha256")
     UPLOAD_ARGS+=("$ASSET" "$CHECKSUM")
 done
 
