@@ -1,6 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use syn::parse::Parser;
+use syn::punctuated::Punctuated;
+use syn::visit::Visit;
+use syn::{Attribute, ItemFn, Meta, Token};
 
 #[derive(Clone, Copy)]
 enum CallSelector {
@@ -10,10 +14,18 @@ enum CallSelector {
 
 const DEVICE_SYSTEM_DEFAULT: CallSelector = CallSelector::Path(&["Device", "system_default"]);
 const NEW_COMMAND_BUFFER: CallSelector = CallSelector::Method("new_command_buffer");
+const NEW_COMMAND_BUFFER_UNRETAINED: CallSelector =
+    CallSelector::Method("new_command_buffer_with_unretained_references");
 const SHARED_LOCK_SELECTOR: CallSelector =
     CallSelector::Path(&["lattice_inference", "measurement", "gpu_test_lock"]);
 const LOCAL_LOCK_SELECTOR: CallSelector = CallSelector::Path(&["gpu_test_lock"]);
-const RAW_GPU_SELECTORS: &[CallSelector] = &[DEVICE_SYSTEM_DEFAULT, NEW_COMMAND_BUFFER];
+const COMMAND_BUFFER_SELECTORS: &[CallSelector] =
+    &[NEW_COMMAND_BUFFER, NEW_COMMAND_BUFFER_UNRETAINED];
+const RAW_GPU_SELECTORS: &[CallSelector] = &[
+    DEVICE_SYSTEM_DEFAULT,
+    NEW_COMMAND_BUFFER,
+    NEW_COMMAND_BUFFER_UNRETAINED,
+];
 const SHARED_LOCK_CALL: &str = "lattice_inference::measurement::gpu_test_lock()";
 const RAW_HARNESS_ENTRYPOINTS: &[(&str, CallSelector)] = &[
     (
@@ -83,7 +95,6 @@ const REVIEWED_TOP_LEVEL_METAL_TARGETS: &[&str] = &[
     "src/bin/eval_perplexity.rs",
     "src/bin/gramperf_profile.rs",
     "src/bin/lattice.rs",
-    "src/bin/lattice/prune_score.rs",
     "src/bin/lattice_serve.rs",
     "src/bin/ppl_metal.rs",
 ];
@@ -162,7 +173,6 @@ const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
     ("examples/profile_metal.rs", LEGACY_EXAMPLE),
     ("src/bin/chat_metal.rs", LONG_RUNNING),
     ("src/bin/lattice.rs", LONG_RUNNING),
-    ("src/bin/lattice/prune_score.rs", LONG_RUNNING),
     ("src/bin/lattice_serve.rs", LONG_RUNNING),
     (
         "tests/quarot_q4_composed_golden.rs",
@@ -183,6 +193,16 @@ fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    sources.sort();
+    sources
+}
+
+fn rust_target_roots(root: &Path) -> Vec<PathBuf> {
+    let mut sources = std::fs::read_dir(root)
+        .expect("read target directory")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
+        .collect::<Vec<_>>();
     sources.sort();
     sources
 }
@@ -216,11 +236,25 @@ fn assert_guard_fixture_rejected(source: &str, context: &str) {
     );
 }
 
-fn assert_command_buffer_fixture_rejected(source: &str, context: &str) {
-    let result = StructuredSource::parse(context, source, true).and_then(|parsed| {
+fn assert_guard_fixture_accepted(source: &str, context: &str) {
+    let parsed =
+        StructuredSource::parse(context, source, false).unwrap_or_else(|reason| panic!("{reason}"));
+    parsed
+        .validate_selector(
+            0..parsed.tokens.len(),
+            DEVICE_SYSTEM_DEFAULT,
+            SHARED_LOCK_SELECTOR,
+            GuardRequirement::Lexical,
+        )
+        .unwrap_or_else(|reason| panic!("source contract rejected {context}: {reason}"));
+}
+
+fn command_buffer_fixture_result(source: &str, context: &str) -> Result<(), String> {
+    StructuredSource::parse(context, source, true).and_then(|parsed| {
+        let functions = parsed.test_functions()?;
         parsed.reject_selector_in_macros(NEW_COMMAND_BUFFER)?;
         let mut found = false;
-        for function in parsed.test_functions() {
+        for function in functions {
             let calls = parsed.call_sites(function.body.clone(), NEW_COMMAND_BUFFER, true)?;
             if calls.is_empty() {
                 continue;
@@ -239,13 +273,20 @@ fn assert_command_buffer_fixture_rejected(source: &str, context: &str) {
         } else {
             Err(format!("{context}: protected work was not classified"))
         }
-    });
-    let Err(message) = result else {
+    })
+}
+
+fn assert_command_buffer_fixture_rejected_with(
+    source: &str,
+    context: &str,
+    expected_failure: &str,
+) {
+    let Err(message) = command_buffer_fixture_result(source, context) else {
         panic!("source contract accepted {context}");
     };
     assert!(
-        message.contains(context),
-        "source contract failure did not name {context}: {message}"
+        message.contains(expected_failure),
+        "source contract reported the wrong failure for {context}; expected `{expected_failure}`, got: {message}"
     );
 }
 
@@ -653,6 +694,15 @@ struct FunctionSpec {
     name: String,
     body: Range<usize>,
     attributes: Vec<AttributeSpec>,
+    test_registration: TestRegistration,
+    unclassifiable_macro: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum TestRegistration {
+    No,
+    Yes,
+    Unclassifiable(String),
 }
 
 #[derive(Clone, Debug)]
@@ -672,6 +722,646 @@ struct StructuredSource {
     file_attributes: Vec<AttributeSpec>,
     test_cfg: bool,
     external_cfg: CfgFormula,
+    unclassifiable_test_scope: Option<String>,
+}
+
+fn path_label(path: &syn::Path) -> String {
+    path.segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn classify_test_meta(meta: &Meta) -> TestRegistration {
+    let path = meta.path();
+    if path.is_ident("test") {
+        return TestRegistration::Yes;
+    }
+    if path.is_ident("cfg_attr") {
+        let Meta::List(list) = meta else {
+            return TestRegistration::Unclassifiable("cfg_attr".to_string());
+        };
+        let Ok(arguments) =
+            Punctuated::<Meta, Token![,]>::parse_terminated.parse2(list.tokens.clone())
+        else {
+            return TestRegistration::Unclassifiable("cfg_attr".to_string());
+        };
+        let mut registration = TestRegistration::No;
+        for emitted in arguments.iter().skip(1) {
+            match classify_test_meta(emitted) {
+                TestRegistration::No => {}
+                TestRegistration::Yes => registration = TestRegistration::Yes,
+                unclassifiable @ TestRegistration::Unclassifiable(_) => {
+                    return unclassifiable;
+                }
+            }
+        }
+        return registration;
+    }
+
+    let label = path_label(path);
+    if path.segments.len() == 1
+        && matches!(
+            label.as_str(),
+            "allow"
+                | "cfg"
+                | "cold"
+                | "deprecated"
+                | "doc"
+                | "forbid"
+                | "ignore"
+                | "inline"
+                | "must_use"
+                | "should_panic"
+                | "target_feature"
+                | "track_caller"
+                | "unsafe"
+                | "warn"
+        )
+    {
+        TestRegistration::No
+    } else {
+        TestRegistration::Unclassifiable(label)
+    }
+}
+
+fn classify_test_attributes(attributes: &[Attribute]) -> TestRegistration {
+    let mut registration = TestRegistration::No;
+    for attribute in attributes {
+        match classify_test_meta(&attribute.meta) {
+            TestRegistration::No => {}
+            TestRegistration::Yes => registration = TestRegistration::Yes,
+            unclassifiable @ TestRegistration::Unclassifiable(_) => return unclassifiable,
+        }
+    }
+    registration
+}
+
+fn macro_tokens_name_protected_work(tokens: &proc_macro2::TokenStream) -> bool {
+    let raw_dispatch = tokens.clone().into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Group(group) => macro_tokens_name_protected_work(&group.stream()),
+        proc_macro2::TokenTree::Ident(ident) => matches!(
+            ident.to_string().as_str(),
+            "new_command_buffer"
+                | "new_command_buffer_with_unretained_references"
+                | "system_default"
+        ),
+        _ => false,
+    });
+    if raw_dispatch {
+        return true;
+    }
+    let rendered = tokens.to_string();
+    [
+        "MetalForwardPass :: new",
+        "MetalQwen35State :: from_q4_dir",
+        "MetalQwen35State :: new",
+        "QwenModel :: from_directory",
+    ]
+    .iter()
+    .any(|selector| rendered.contains(selector))
+}
+
+fn unclassifiable_macro(mac: &syn::Macro) -> Option<String> {
+    let label = path_label(&mac.path);
+    if label == "include" {
+        return Some("unclassifiable include! in test-bearing scope".to_string());
+    }
+    let name = mac.path.segments.last()?.ident.to_string();
+    if matches!(
+        name.as_str(),
+        "cfg"
+            | "column"
+            | "concat"
+            | "env"
+            | "file"
+            | "include_bytes"
+            | "include_str"
+            | "line"
+            | "module_path"
+            | "option_env"
+            | "oslogstring"
+            | "stringify"
+    ) {
+        return None;
+    }
+    if matches!(
+        name.as_str(),
+        "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "assert_relative_eq"
+            | "dbg"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "debug"
+            | "eprint"
+            | "eprintln"
+            | "format"
+            | "format_args"
+            | "is_aarch64_feature_detected"
+            | "is_arm_feature_detected"
+            | "is_x86_feature_detected"
+            | "info"
+            | "json"
+            | "matches"
+            | "panic"
+            | "params"
+            | "print"
+            | "println"
+            | "prop_assert"
+            | "proptest"
+            | "todo"
+            | "thread_local"
+            | "unimplemented"
+            | "unreachable"
+            | "value_parser"
+            | "vec"
+            | "warn"
+            | "write"
+            | "writeln"
+    ) {
+        return macro_tokens_name_protected_work(&mac.tokens).then(|| {
+            format!("unclassifiable protected-work macro `{label}!` in test-bearing scope")
+        });
+    }
+    Some(format!(
+        "unclassifiable macro invocation `{label}!` in test-bearing scope"
+    ))
+}
+
+struct FunctionMacroCollector {
+    error: Option<String>,
+}
+
+impl<'ast> Visit<'ast> for FunctionMacroCollector {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if self.error.is_none() {
+            self.error = unclassifiable_macro(mac);
+        }
+    }
+}
+
+struct ItemMacroCollector {
+    error: Option<String>,
+}
+
+struct MacroCollector<'ast> {
+    macros: Vec<&'ast syn::Macro>,
+}
+
+impl<'ast> Visit<'ast> for MacroCollector<'ast> {
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        self.macros.push(mac);
+    }
+}
+
+fn macro_delimiter(mac: &syn::Macro) -> (char, usize, char, usize) {
+    match &mac.delimiter {
+        syn::MacroDelimiter::Paren(token) => (
+            '(',
+            token.span.open().byte_range().start,
+            ')',
+            token.span.close().byte_range().start,
+        ),
+        syn::MacroDelimiter::Brace(token) => (
+            '{',
+            token.span.open().byte_range().start,
+            '}',
+            token.span.close().byte_range().start,
+        ),
+        syn::MacroDelimiter::Bracket(token) => (
+            '[',
+            token.span.open().byte_range().start,
+            ']',
+            token.span.close().byte_range().start,
+        ),
+    }
+}
+
+impl<'ast> Visit<'ast> for ItemMacroCollector {
+    fn visit_item_fn(&mut self, _function: &'ast ItemFn) {}
+
+    fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if item.ident.is_none() && self.error.is_none() {
+            self.error = unclassifiable_macro(&item.mac);
+        }
+    }
+}
+
+fn unclassifiable_item_macro(file: &syn::File) -> Option<String> {
+    let mut collector = ItemMacroCollector { error: None };
+    collector.visit_file(file);
+    collector.error
+}
+
+fn unclassifiable_include(file: &syn::File, test_cfg: bool) -> Option<String> {
+    let mut collector = MacroCollector { macros: Vec::new() };
+    collector.visit_file(file);
+    collector.macros.into_iter().find_map(|mac| {
+        mac.path.is_ident("include").then(|| {
+            if test_cfg {
+                "unclassifiable include! in test-bearing scope".to_string()
+            } else {
+                "unclassifiable include! in Metal hazard scope".to_string()
+            }
+        })
+    })
+}
+
+fn module_functions<'ast>(items: &'ast [syn::Item], functions: &mut Vec<&'ast ItemFn>) {
+    for item in items {
+        match item {
+            syn::Item::Fn(function) => functions.push(function),
+            syn::Item::Mod(module) => {
+                if let Some((_, contents)) = &module.content {
+                    module_functions(contents, functions);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn inline_modules<'ast>(items: &'ast [syn::Item], modules: &mut Vec<&'ast syn::ItemMod>) {
+    for item in items {
+        if let syn::Item::Mod(module) = item
+            && let Some((_, contents)) = &module.content
+        {
+            modules.push(module);
+            inline_modules(contents, modules);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ModuleSource {
+    path: PathBuf,
+    external_cfg: CfgFormula,
+}
+
+fn syn_meta_arguments(list: &syn::MetaList, context: &str) -> Result<Vec<Meta>, String> {
+    Punctuated::<Meta, Token![,]>::parse_terminated
+        .parse2(list.tokens.clone())
+        .map(|arguments| arguments.into_iter().collect())
+        .map_err(|reason| format!("{context}: unclassifiable cfg syntax: {reason}"))
+}
+
+fn syn_cfg_predicate(meta: &Meta, test_cfg: bool, context: &str) -> Result<CfgFormula, String> {
+    match meta {
+        Meta::Path(path) => {
+            let label = path_label(path);
+            Ok(match label.as_str() {
+                "test" if test_cfg => CfgFormula::True,
+                "test" => CfgFormula::False,
+                "unix" => CfgFormula::True,
+                "windows" => CfgFormula::False,
+                _ => CfgFormula::Atom(label),
+            })
+        }
+        Meta::NameValue(value) => {
+            let label = path_label(&value.path);
+            let syn::Expr::Lit(expression) = &value.value else {
+                return Err(format!(
+                    "{context}: cfg value for `{label}` is not a literal"
+                ));
+            };
+            let syn::Lit::Str(value) = &expression.lit else {
+                return Err(format!(
+                    "{context}: cfg value for `{label}` is not a string"
+                ));
+            };
+            let value = value.value();
+            Ok(match (label.as_str(), value.as_str()) {
+                ("target_os", "macos") | ("target_family", "unix") => CfgFormula::True,
+                ("target_os", _) | ("target_family", "windows") => CfgFormula::False,
+                ("feature", "metal-gpu") => CfgFormula::True,
+                _ => CfgFormula::Atom(format!("{label}={value}")),
+            })
+        }
+        Meta::List(list) => {
+            let name = path_label(&list.path);
+            let arguments = syn_meta_arguments(list, context)?;
+            match name.as_str() {
+                "all" => Ok(CfgFormula::all(
+                    arguments
+                        .iter()
+                        .map(|argument| syn_cfg_predicate(argument, test_cfg, context))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )),
+                "any" => Ok(CfgFormula::any(
+                    arguments
+                        .iter()
+                        .map(|argument| syn_cfg_predicate(argument, test_cfg, context))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )),
+                "not" if arguments.len() == 1 => Ok(CfgFormula::not(syn_cfg_predicate(
+                    &arguments[0],
+                    test_cfg,
+                    context,
+                )?)),
+                "not" => Err(format!("{context}: cfg(not(...)) needs one predicate")),
+                _ => Ok(CfgFormula::Atom(name)),
+            }
+        }
+    }
+}
+
+fn syn_cfg_effect(meta: &Meta, test_cfg: bool, context: &str) -> Result<CfgFormula, String> {
+    let Meta::List(list) = meta else {
+        return Ok(CfgFormula::True);
+    };
+    let name = path_label(&list.path);
+    let arguments = syn_meta_arguments(list, context)?;
+    if name == "cfg" {
+        if arguments.len() != 1 {
+            return Err(format!("{context}: cfg attribute needs one predicate"));
+        }
+        return syn_cfg_predicate(&arguments[0], test_cfg, context);
+    }
+    if name != "cfg_attr" {
+        return Ok(CfgFormula::True);
+    }
+    if arguments.len() < 2 {
+        return Err(format!(
+            "{context}: cfg_attr attribute needs a predicate and emitted attribute"
+        ));
+    }
+    let predicate = syn_cfg_predicate(&arguments[0], test_cfg, context)?;
+    Ok(CfgFormula::all(
+        arguments
+            .iter()
+            .skip(1)
+            .map(|emitted| {
+                Ok(CfgFormula::any([
+                    CfgFormula::not(predicate.clone()),
+                    syn_cfg_effect(emitted, test_cfg, context)?,
+                ]))
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    ))
+}
+
+fn syn_attributes_formula(
+    attributes: &[Attribute],
+    test_cfg: bool,
+    context: &str,
+) -> Result<CfgFormula, String> {
+    Ok(CfgFormula::all(
+        attributes
+            .iter()
+            .map(|attribute| syn_cfg_effect(&attribute.meta, test_cfg, context))
+            .collect::<Result<Vec<_>, _>>()?,
+    ))
+}
+
+fn cfg_attr_emits_path(meta: &Meta, context: &str) -> Result<bool, String> {
+    let Meta::List(list) = meta else {
+        return Ok(false);
+    };
+    if !list.path.is_ident("cfg_attr") {
+        return Ok(false);
+    }
+    for emitted in syn_meta_arguments(list, context)?.iter().skip(1) {
+        if emitted.path().is_ident("path") || cfg_attr_emits_path(emitted, context)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn literal_module_path(attributes: &[Attribute], context: &str) -> Result<Option<PathBuf>, String> {
+    for attribute in attributes {
+        if cfg_attr_emits_path(&attribute.meta, context)? {
+            return Err(format!(
+                "{context}: unclassifiable cfg_attr-generated module path"
+            ));
+        }
+        if !attribute.path().is_ident("path") {
+            continue;
+        }
+        let Meta::NameValue(value) = &attribute.meta else {
+            return Err(format!("{context}: unclassifiable module path attribute"));
+        };
+        let syn::Expr::Lit(expression) = &value.value else {
+            return Err(format!("{context}: module path is not a string literal"));
+        };
+        let syn::Lit::Str(path) = &expression.lit else {
+            return Err(format!("{context}: module path is not a string literal"));
+        };
+        return Ok(Some(PathBuf::from(path.value())));
+    }
+    Ok(None)
+}
+
+struct ModuleGraph<'a> {
+    manifest_dir: &'a Path,
+    manifest_canonical: PathBuf,
+    test_cfg: bool,
+    sources: BTreeMap<PathBuf, CfgFormula>,
+    visiting: BTreeSet<PathBuf>,
+}
+
+impl ModuleGraph<'_> {
+    fn load(
+        &mut self,
+        path: &Path,
+        module_dir: &Path,
+        inherited_cfg: CfgFormula,
+    ) -> Result<(), String> {
+        let canonical = std::fs::canonicalize(path).map_err(|reason| {
+            format!(
+                "unclassifiable compiler-selected module {}: {reason}",
+                path.display()
+            )
+        })?;
+        if !canonical.starts_with(&self.manifest_canonical) {
+            return Err(format!(
+                "unclassifiable compiler-selected module outside crate boundary: {}",
+                canonical.display()
+            ));
+        }
+        if !self.visiting.insert(canonical.clone()) {
+            return Err(format!(
+                "module graph cycle while classifying {}",
+                canonical.display()
+            ));
+        }
+        let source = std::fs::read_to_string(&canonical).map_err(|reason| {
+            format!(
+                "could not read compiler-selected module {}: {reason}",
+                canonical.display()
+            )
+        })?;
+        let context = canonical
+            .strip_prefix(self.manifest_dir)
+            .unwrap_or(&canonical)
+            .to_string_lossy()
+            .into_owned();
+        let syntax = syn::parse_file(&source).map_err(|reason| {
+            format!("{context}: Rust syntax could not be classified: {reason}")
+        })?;
+        let file_cfg = CfgFormula::all([
+            inherited_cfg,
+            syn_attributes_formula(&syntax.attrs, self.test_cfg, &context)?,
+        ]);
+        if !file_cfg.satisfiable()? {
+            self.visiting.remove(&canonical);
+            return Ok(());
+        }
+        if let Some(existing) = self.sources.get_mut(&canonical) {
+            *existing = CfgFormula::any([existing.clone(), file_cfg]);
+            self.visiting.remove(&canonical);
+            return Ok(());
+        }
+        self.sources.insert(canonical.clone(), file_cfg.clone());
+        self.walk_items(&syntax.items, &canonical, module_dir, file_cfg)?;
+        self.visiting.remove(&canonical);
+        Ok(())
+    }
+
+    fn walk_items(
+        &mut self,
+        items: &[syn::Item],
+        source_path: &Path,
+        module_dir: &Path,
+        inherited_cfg: CfgFormula,
+    ) -> Result<(), String> {
+        let context = source_path
+            .strip_prefix(self.manifest_dir)
+            .unwrap_or(source_path)
+            .to_string_lossy()
+            .into_owned();
+        for item in items {
+            let syn::Item::Mod(module) = item else {
+                continue;
+            };
+            let module_cfg = CfgFormula::all([
+                inherited_cfg.clone(),
+                syn_attributes_formula(&module.attrs, self.test_cfg, &context)?,
+            ]);
+            if !module_cfg.satisfiable()? {
+                continue;
+            }
+            if let Some((_, contents)) = &module.content {
+                if literal_module_path(&module.attrs, &context)?.is_some() {
+                    return Err(format!(
+                        "{context}: unclassifiable path attribute on inline module `{}`",
+                        module.ident
+                    ));
+                }
+                self.walk_items(
+                    contents,
+                    source_path,
+                    &module_dir.join(module.ident.to_string()),
+                    module_cfg,
+                )?;
+                continue;
+            }
+            let direct_path = literal_module_path(&module.attrs, &context)?;
+            let target = if let Some(relative) = direct_path {
+                module_dir.join(relative)
+            } else {
+                let flat = module_dir.join(format!("{}.rs", module.ident));
+                let nested = module_dir.join(module.ident.to_string()).join("mod.rs");
+                match (flat.exists(), nested.exists()) {
+                    (true, false) => flat,
+                    (false, true) => nested,
+                    (true, true) => {
+                        return Err(format!(
+                            "{context}: ambiguous compiler-selected module `{}`",
+                            module.ident
+                        ));
+                    }
+                    (false, false) => {
+                        return Err(format!(
+                            "{context}: compiler-selected module `{}` could not be resolved",
+                            module.ident
+                        ));
+                    }
+                }
+            };
+            let child_module_dir = if target.file_name().is_some_and(|name| name == "mod.rs") {
+                target.parent().unwrap_or(module_dir).to_path_buf()
+            } else {
+                target
+                    .parent()
+                    .unwrap_or(module_dir)
+                    .join(module.ident.to_string())
+            };
+            self.load(&target, &child_module_dir, module_cfg)?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns the compiler-selected source closure for one Cargo target root.
+///
+/// The serialization boundary is bounded repository-owned tests, benches,
+/// examples, and measurement binaries that can submit Metal work, not a
+/// physical `src/**/*.rs` walk. Production modules are covered through those
+/// callers because they cannot execute independently. Long-running interactive
+/// and service targets are explicit exemptions: they must acquire the same
+/// fleet lock externally when used as measurements. The crate has no build
+/// script or executable Metal doctest, so neither is a current hazard entrypoint.
+fn module_source_closure(
+    manifest_dir: &Path,
+    root: &Path,
+    test_cfg: bool,
+) -> Result<Vec<ModuleSource>, String> {
+    let manifest_canonical = std::fs::canonicalize(manifest_dir).map_err(|reason| {
+        format!(
+            "could not resolve crate boundary {}: {reason}",
+            manifest_dir.display()
+        )
+    })?;
+    let mut graph = ModuleGraph {
+        manifest_dir,
+        manifest_canonical,
+        test_cfg,
+        sources: BTreeMap::new(),
+        visiting: BTreeSet::new(),
+    };
+    let module_dir = root
+        .parent()
+        .ok_or_else(|| format!("target root {} has no parent", root.display()))?;
+    graph.load(root, module_dir, CfgFormula::True)?;
+    Ok(graph
+        .sources
+        .into_iter()
+        .map(|(path, external_cfg)| ModuleSource { path, external_cfg })
+        .collect())
+}
+
+struct ParsedModuleSource {
+    relative: String,
+    parsed: StructuredSource,
+}
+
+fn parsed_module_closure(
+    manifest_dir: &Path,
+    root: &Path,
+    test_cfg: bool,
+) -> Result<Vec<ParsedModuleSource>, String> {
+    module_source_closure(manifest_dir, root, test_cfg)?
+        .into_iter()
+        .map(|module| {
+            let source = std::fs::read_to_string(&module.path).map_err(|reason| {
+                format!("could not read module {}: {reason}", module.path.display())
+            })?;
+            let relative = module
+                .path
+                .strip_prefix(manifest_dir)
+                .unwrap_or(&module.path)
+                .to_string_lossy()
+                .into_owned();
+            let parsed =
+                StructuredSource::parse_module_source(manifest_dir, &module, &source, test_cfg)?;
+            Ok(ParsedModuleSource { relative, parsed })
+        })
+        .collect()
 }
 
 impl CallSelector {
@@ -692,6 +1382,9 @@ impl CallSelector {
 
 impl StructuredSource {
     fn parse(context: &str, source: &str, test_cfg: bool) -> Result<Self, String> {
+        let syntax = syn::parse_file(source).map_err(|reason| {
+            format!("{context}: Rust syntax could not be classified: {reason}")
+        })?;
         let tokens = rust_tokens(source).map_err(|reason| format!("{context}: {reason}"))?;
         let (pairs, parents) =
             delimiter_structure(&tokens).map_err(|reason| format!("{context}: {reason}"))?;
@@ -706,42 +1399,54 @@ impl StructuredSource {
             file_attributes: Vec::new(),
             test_cfg,
             external_cfg: CfgFormula::True,
+            unclassifiable_test_scope: None,
         };
-        parsed.macro_ranges = parsed.find_macro_ranges();
-        parsed.functions = parsed.find_functions()?;
-        parsed.scopes = parsed.find_scopes()?;
+        parsed.macro_ranges = parsed.find_macro_ranges(&syntax)?;
+        parsed.functions = parsed.find_functions(&syntax)?;
+        parsed.scopes = parsed.find_scopes(&syntax)?;
         parsed.file_attributes = parsed.inner_attributes_at(0).0;
+        parsed.unclassifiable_test_scope = unclassifiable_include(&syntax, test_cfg);
+        if test_cfg && parsed.unclassifiable_test_scope.is_none() {
+            parsed.unclassifiable_test_scope = unclassifiable_item_macro(&syntax);
+        }
         Ok(parsed)
     }
 
-    fn find_macro_ranges(&self) -> Vec<Range<usize>> {
+    fn find_macro_ranges(&self, syntax: &syn::File) -> Result<Vec<Range<usize>>, String> {
+        let mut collector = MacroCollector { macros: Vec::new() };
+        collector.visit_file(syntax);
         let mut ranges = Vec::new();
-        for index in 0..self.tokens.len() {
-            if !self.tokens[index].is_punct('!') {
-                continue;
-            }
-            let mut opening = index + 1;
-            if self
+        for mac in collector.macros {
+            let (open, open_offset, close, close_offset) = macro_delimiter(mac);
+            let opening = self
                 .tokens
-                .get(opening)
-                .and_then(RustToken::ident)
-                .is_some()
-                && self
-                    .tokens
-                    .get(index.wrapping_sub(1))
-                    .and_then(RustToken::ident)
-                    == Some("macro_rules")
-            {
-                opening += 1;
+                .iter()
+                .position(|token| token.offset == open_offset && token.is_punct(open))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: macro opening delimiter could not be mapped",
+                        self.context
+                    )
+                })?;
+            let closing = self
+                .tokens
+                .iter()
+                .position(|token| token.offset == close_offset && token.is_punct(close))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: macro closing delimiter could not be mapped",
+                        self.context
+                    )
+                })?;
+            if self.pairs[opening] != Some(closing) {
+                return Err(format!(
+                    "{}: parsed macro delimiters do not match lexical delimiters",
+                    self.context
+                ));
             }
-            if self.tokens.get(opening).is_some_and(|token| {
-                token.is_punct('(') || token.is_punct('[') || token.is_punct('{')
-            }) && let Some(closing) = self.pairs.get(opening).and_then(|pair| *pair)
-            {
-                ranges.push(opening..closing + 1);
-            }
+            ranges.push(opening..closing + 1);
         }
-        ranges
+        Ok(ranges)
     }
 
     fn in_macro(&self, index: usize) -> bool {
@@ -847,50 +1552,54 @@ impl StructuredSource {
         self.outer_attributes_before(cursor).0
     }
 
-    fn find_body_opening(&self, item: usize) -> Option<usize> {
-        let parent = self.parents[item];
-        for index in item + 1..self.tokens.len() {
-            if self.parents[index] != parent {
-                continue;
-            }
-            if self.tokens[index].is_punct(';') {
-                return None;
-            }
-            if self.tokens[index].is_punct('{') {
-                return Some(index);
-            }
-        }
-        None
-    }
-
-    fn find_functions(&self) -> Result<Vec<FunctionSpec>, String> {
+    fn find_functions(&self, syntax: &syn::File) -> Result<Vec<FunctionSpec>, String> {
+        let mut collected = Vec::new();
+        module_functions(&syntax.items, &mut collected);
         let mut functions = Vec::new();
-        for index in 0..self.tokens.len() {
-            if self.tokens[index].ident() != Some("fn") || self.in_macro(index) {
-                continue;
-            }
-            let Some(name) = self.tokens.get(index + 1).and_then(RustToken::ident) else {
-                continue;
-            };
-            let Some(opening) = self.find_body_opening(index) else {
-                continue;
-            };
+        for function in collected {
+            let name = function.sig.ident.to_string();
+            let fn_offset = function.sig.fn_token.span.byte_range().start;
+            let item = self
+                .tokens
+                .iter()
+                .position(|token| token.offset == fn_offset && token.ident() == Some("fn"))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: function `{name}` could not be mapped to parsed source",
+                        self.context
+                    )
+                })?;
+            let opening_offset = function.block.brace_token.span.open().byte_range().start;
+            let opening = self
+                .tokens
+                .iter()
+                .position(|token| token.offset == opening_offset && token.is_punct('{'))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: function `{name}` body could not be mapped to parsed source",
+                        self.context
+                    )
+                })?;
             let closing = self.pairs[opening].ok_or_else(|| {
                 format!(
                     "{}: function `{name}` has no brace-balanced body",
                     self.context
                 )
             })?;
+            let mut macros = FunctionMacroCollector { error: None };
+            macros.visit_block(&function.block);
             functions.push(FunctionSpec {
-                name: name.to_string(),
+                name,
                 body: opening + 1..closing,
-                attributes: self.item_attributes_before(index),
+                attributes: self.item_attributes_before(item),
+                test_registration: classify_test_attributes(&function.attrs),
+                unclassifiable_macro: macros.error,
             });
         }
         Ok(functions)
     }
 
-    fn find_scopes(&self) -> Result<Vec<ScopeSpec>, String> {
+    fn find_scopes(&self, syntax: &syn::File) -> Result<Vec<ScopeSpec>, String> {
         let mut scopes = self
             .functions
             .iter()
@@ -899,19 +1608,40 @@ impl StructuredSource {
                 attributes: function.attributes.clone(),
             })
             .collect::<Vec<_>>();
-        for index in 0..self.tokens.len() {
-            if self.tokens[index].ident() == Some("mod") && !self.in_macro(index) {
-                let Some(opening) = self.find_body_opening(index) else {
-                    continue;
-                };
-                let closing = self.pairs[opening].ok_or_else(|| {
-                    format!("{}: inline module has no closing brace", self.context)
+        let mut modules = Vec::new();
+        inline_modules(&syntax.items, &mut modules);
+        for module in modules {
+            let Some((brace, _)) = &module.content else {
+                continue;
+            };
+            let item_offset = module.mod_token.span.byte_range().start;
+            let item = self
+                .tokens
+                .iter()
+                .position(|token| token.offset == item_offset && token.ident() == Some("mod"))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: inline module `{}` could not be mapped to parsed source",
+                        self.context, module.ident
+                    )
                 })?;
-                scopes.push(ScopeSpec {
-                    body: opening + 1..closing,
-                    attributes: self.item_attributes_before(index),
-                });
-            }
+            let opening_offset = brace.span.open().byte_range().start;
+            let opening = self
+                .tokens
+                .iter()
+                .position(|token| token.offset == opening_offset && token.is_punct('{'))
+                .ok_or_else(|| {
+                    format!(
+                        "{}: inline module `{}` body could not be mapped",
+                        self.context, module.ident
+                    )
+                })?;
+            let closing = self.pairs[opening]
+                .ok_or_else(|| format!("{}: inline module has no closing brace", self.context))?;
+            scopes.push(ScopeSpec {
+                body: opening + 1..closing,
+                attributes: self.item_attributes_before(item),
+            });
         }
         for opening in 0..self.tokens.len() {
             if !self.tokens[opening].is_punct('{') {
@@ -1131,34 +1861,6 @@ impl StructuredSource {
         ))
     }
 
-    fn meta_registers_test(&self, range: Range<usize>) -> bool {
-        if range.len() == 1 {
-            return self.tokens[range.start].ident() == Some("test");
-        }
-        if self.tokens[range.start].ident() != Some("cfg_attr") {
-            return false;
-        }
-        let opening = range.start + 1;
-        if !self
-            .tokens
-            .get(opening)
-            .is_some_and(|token| token.is_punct('('))
-            || self.pairs.get(opening).and_then(|pair| *pair) != Some(range.end - 1)
-        {
-            return false;
-        }
-        self.split_arguments(opening + 1..range.end - 1)
-            .into_iter()
-            .skip(1)
-            .any(|emitted| self.meta_registers_test(emitted))
-    }
-
-    fn attributes_register_test(&self, attributes: &[AttributeSpec]) -> bool {
-        attributes
-            .iter()
-            .any(|attribute| self.meta_registers_test(attribute.content.clone()))
-    }
-
     fn nearest_brace(&self, index: usize) -> Option<usize> {
         let mut parent = self.parents.get(index).and_then(|parent| *parent);
         while let Some(opening) = parent {
@@ -1254,6 +1956,13 @@ impl StructuredSource {
                 continue;
             }
             let Some(start) = self.selector_candidate(index, selector) else {
+                if fail_closed && matches!(selector, CallSelector::Method(_)) {
+                    return Err(format!(
+                        "{}: unclassifiable protected-work syntax near `{}`",
+                        self.context,
+                        selector.label()
+                    ));
+                }
                 continue;
             };
             if matches!(selector, CallSelector::Path(path) if path.len() == 1)
@@ -1290,6 +1999,9 @@ impl StructuredSource {
     }
 
     fn has_selector(&self, selector: CallSelector) -> Result<bool, String> {
+        if let Some(reason) = &self.unclassifiable_test_scope {
+            return Err(format!("{}: {reason}", self.context));
+        }
         self.reject_selector_in_macros(selector)?;
         Ok(!self
             .call_sites(0..self.tokens.len(), selector, false)?
@@ -1320,11 +2032,28 @@ impl StructuredSource {
             .any(|(index, token)| token.ident() == Some(identifier) && !self.in_macro(index))
     }
 
-    fn test_functions(&self) -> Vec<&FunctionSpec> {
-        self.functions
-            .iter()
-            .filter(|function| self.attributes_register_test(&function.attributes))
-            .collect()
+    fn test_functions(&self) -> Result<Vec<&FunctionSpec>, String> {
+        if let Some(reason) = &self.unclassifiable_test_scope {
+            return Err(format!("{}: {reason}", self.context));
+        }
+        let mut functions = Vec::new();
+        for function in &self.functions {
+            match &function.test_registration {
+                TestRegistration::No => continue,
+                TestRegistration::Unclassifiable(attribute) => {
+                    return Err(format!(
+                        "{}: unclassifiable test function attribute `{attribute}` on `{}`",
+                        self.context, function.name
+                    ));
+                }
+                TestRegistration::Yes => {}
+            }
+            if let Some(reason) = &function.unclassifiable_macro {
+                return Err(format!("{}: {reason} in `{}`", self.context, function.name));
+            }
+            functions.push(function);
+        }
+        Ok(functions)
     }
 
     fn path_attribute(&self, attributes: &[AttributeSpec]) -> Option<String> {
@@ -1410,6 +2139,23 @@ impl StructuredSource {
         let mut parsed = Self::parse(&relative, source, test_cfg)?;
         parsed.external_cfg =
             external_module_formula(manifest_dir, path, test_cfg, &mut BTreeSet::new())?;
+        Ok(parsed)
+    }
+
+    fn parse_module_source(
+        manifest_dir: &Path,
+        module: &ModuleSource,
+        source: &str,
+        test_cfg: bool,
+    ) -> Result<Self, String> {
+        let relative = module
+            .path
+            .strip_prefix(manifest_dir)
+            .unwrap_or(&module.path)
+            .to_string_lossy()
+            .into_owned();
+        let mut parsed = Self::parse(&relative, source, test_cfg)?;
+        parsed.external_cfg = module.external_cfg.clone();
         Ok(parsed)
     }
 }
@@ -1676,6 +2422,9 @@ impl StructuredSource {
     }
 
     fn construction_sites(&self, range: Range<usize>) -> Result<Vec<usize>, String> {
+        if let Some(reason) = &self.unclassifiable_test_scope {
+            return Err(format!("{}: {reason}", self.context));
+        }
         let mut sites = Vec::new();
         for selector in CONSTRUCTION_SELECTORS {
             sites.extend(self.call_sites(range.clone(), *selector, true)?);
@@ -1685,6 +2434,9 @@ impl StructuredSource {
     }
 
     fn has_top_level_metal_marker(&self) -> Result<bool, String> {
+        if let Some(reason) = &self.unclassifiable_test_scope {
+            return Err(format!("{}: {reason}", self.context));
+        }
         for selector in RAW_GPU_SELECTORS {
             if self.has_selector(*selector)? {
                 return Ok(true);
@@ -1702,20 +2454,22 @@ fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint(
     let mut actual = BTreeSet::new();
 
     for relative_dir in ["benches", "examples", "src/bin"] {
-        for path in rust_sources_under(&manifest_dir.join(relative_dir)) {
-            let source = std::fs::read_to_string(&path).expect("read measurement source");
+        for path in rust_target_roots(&manifest_dir.join(relative_dir)) {
             let relative = path
                 .strip_prefix(manifest_dir)
                 .expect("source under manifest directory")
                 .to_string_lossy()
                 .into_owned();
-            let parsed = StructuredSource::parse(&relative, &source, false)
+            let sources = parsed_module_closure(manifest_dir, &path, false)
                 .unwrap_or_else(|reason| panic!("{reason}"));
             let mut has_raw_gpu_work = false;
-            for selector in RAW_GPU_SELECTORS {
-                has_raw_gpu_work |= parsed
-                    .has_selector(*selector)
-                    .unwrap_or_else(|reason| panic!("{reason}"));
+            for source in &sources {
+                for selector in RAW_GPU_SELECTORS {
+                    has_raw_gpu_work |= source
+                        .parsed
+                        .has_selector(*selector)
+                        .unwrap_or_else(|reason| panic!("{reason}"));
+                }
             }
             if !has_raw_gpu_work {
                 continue;
@@ -1726,9 +2480,13 @@ fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint(
                 .iter()
                 .find_map(|(path, marker)| (*path == relative).then_some(*marker))
                 .unwrap_or_else(|| panic!("raw Metal harness {relative} is not classified"));
-            parsed
+            let root = sources
+                .iter()
+                .find(|source| source.relative == relative)
+                .unwrap_or_else(|| panic!("target root {relative} was not parsed"));
+            root.parsed
                 .validate_selector(
-                    0..parsed.tokens.len(),
+                    0..root.parsed.tokens.len(),
                     protected_entrypoint,
                     SHARED_LOCK_SELECTOR,
                     GuardRequirement::Lexical,
@@ -1753,20 +2511,21 @@ fn top_level_metal_entrypoint_inventory_is_explicit_and_fail_closed() {
     let mut discovered = BTreeSet::new();
     let mut all_targets = BTreeSet::new();
     for relative_dir in ["benches", "examples", "src/bin"] {
-        for path in rust_sources_under(&manifest_dir.join(relative_dir)) {
-            let source = std::fs::read_to_string(&path).expect("read measurement source");
+        for path in rust_target_roots(&manifest_dir.join(relative_dir)) {
             let relative = path
                 .strip_prefix(manifest_dir)
                 .expect("source under manifest directory")
                 .to_string_lossy()
                 .into_owned();
             all_targets.insert(relative.clone());
-            let parsed = StructuredSource::parse(&relative, &source, false)
+            let sources = parsed_module_closure(manifest_dir, &path, false)
                 .unwrap_or_else(|reason| panic!("{reason}"));
-            if parsed
-                .has_top_level_metal_marker()
-                .unwrap_or_else(|reason| panic!("{reason}"))
-            {
+            if sources.iter().any(|source| {
+                source
+                    .parsed
+                    .has_top_level_metal_marker()
+                    .unwrap_or_else(|reason| panic!("{reason}"))
+            }) {
                 discovered.insert(relative);
             }
         }
@@ -1834,38 +2593,48 @@ fn in_crate_raw_command_buffer_tests_are_explicit_and_guarded() {
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut discovered = BTreeSet::new();
     let mut violations = Vec::new();
-    for path in rust_sources_under(&manifest_dir.join("src")) {
-        let source = std::fs::read_to_string(&path).expect("read in-crate Rust source");
-        let relative = path
-            .strip_prefix(manifest_dir)
-            .expect("source under manifest directory")
-            .to_string_lossy()
-            .into_owned();
-        let parsed = StructuredSource::parse_path(manifest_dir, &path, &source, true)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        parsed
-            .reject_selector_in_macros(NEW_COMMAND_BUFFER)
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        for function in parsed.test_functions() {
-            let command_buffers = parsed
-                .call_sites(function.body.clone(), NEW_COMMAND_BUFFER, true)
+    let mut roots = vec![manifest_dir.join("src/lib.rs")];
+    roots.extend(rust_target_roots(&manifest_dir.join("tests")));
+    for root in roots {
+        for source in parsed_module_closure(manifest_dir, &root, true)
+            .unwrap_or_else(|reason| panic!("{reason}"))
+        {
+            let relative = source.relative;
+            let parsed = source.parsed;
+            let functions = parsed
+                .test_functions()
                 .unwrap_or_else(|reason| panic!("{reason}"));
-            if command_buffers.is_empty() {
-                continue;
+            for selector in COMMAND_BUFFER_SELECTORS {
+                parsed
+                    .reject_selector_in_macros(*selector)
+                    .unwrap_or_else(|reason| panic!("{reason}"));
             }
-            let site = format!("{relative}::{}", function.name);
-            discovered.insert(site.clone());
-            if exemptions.contains_key(site.as_str()) {
-                continue;
-            }
-            if let Err(reason) = parsed.validate_work_sites(
-                &command_buffers,
-                LOCAL_LOCK_SELECTOR,
-                GuardRequirement::Function {
-                    closing_brace: function.body.end,
-                },
-            ) {
-                violations.push(format!("{site}: {reason}"));
+            for function in functions {
+                let mut command_buffers = Vec::new();
+                for selector in COMMAND_BUFFER_SELECTORS {
+                    command_buffers.extend(
+                        parsed
+                            .call_sites(function.body.clone(), *selector, true)
+                            .unwrap_or_else(|reason| panic!("{reason}")),
+                    );
+                }
+                if command_buffers.is_empty() {
+                    continue;
+                }
+                let site = format!("{relative}::{}", function.name);
+                discovered.insert(site.clone());
+                if exemptions.contains_key(site.as_str()) {
+                    continue;
+                }
+                if let Err(reason) = parsed.validate_work_sites(
+                    &command_buffers,
+                    LOCAL_LOCK_SELECTOR,
+                    GuardRequirement::Function {
+                        closing_brace: function.body.end,
+                    },
+                ) {
+                    violations.push(format!("{site}: {reason}"));
+                }
             }
         }
     }
@@ -1897,6 +2666,7 @@ fn cfg_attr_registered_test() {
         .expect("parse cfg_attr test fixture");
     let discovered = parsed
         .test_functions()
+        .expect("classify cfg_attr test functions")
         .into_iter()
         .filter(|function| {
             !parsed
@@ -1908,6 +2678,214 @@ fn cfg_attr_registered_test() {
         .collect::<BTreeSet<_>>();
 
     assert_eq!(discovered, BTreeSet::from(["cfg_attr_registered_test"]));
+}
+
+#[test]
+fn const_expression_in_where_clause_does_not_hide_unguarded_dispatch() {
+    let source = r#"
+struct Queue;
+impl Queue { fn new_command_buffer(&self) {} }
+trait Marker<const N: usize> {}
+impl Marker<1> for () {}
+
+#[test]
+fn raw_dispatch() where (): Marker<{ 1 }> {
+    let queue = Queue;
+    let _command_buffer = queue.new_command_buffer();
+}
+"#;
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "src/forward/where_const_dispatch.rs",
+        "no live shared-lock binding encloses this work",
+    );
+}
+
+#[test]
+fn const_expression_in_return_type_does_not_hide_unguarded_dispatch() {
+    let source = r#"
+#[test]
+fn raw_dispatch() -> Result<(), Marker<{ 1 }>> {
+    let _command_buffer = queue.new_command_buffer();
+    Ok(())
+}
+"#;
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "tests/return_const_dispatch.rs",
+        "no live shared-lock binding encloses this work",
+    );
+}
+
+#[test]
+fn labeled_loop_does_not_hide_unguarded_dispatch() {
+    let source = r#"
+#[test]
+fn raw_dispatch() {
+    'gpu: loop {
+        let _command_buffer = queue.new_command_buffer();
+        break 'gpu;
+    }
+}
+"#;
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "tests/labeled_loop_dispatch.rs",
+        "no live shared-lock binding encloses this work",
+    );
+}
+
+#[test]
+fn closure_does_not_hide_unguarded_dispatch() {
+    let source = r#"
+#[test]
+fn raw_dispatch() {
+    let drive = || queue.new_command_buffer();
+    drive();
+}
+"#;
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "tests/closure_dispatch.rs",
+        "no live shared-lock binding encloses this work",
+    );
+}
+
+#[test]
+fn unknown_test_registration_attribute_fails_closed() {
+    let source = r#"
+#[tokio::test]
+async fn raw_dispatch() {
+    let queue = Queue;
+    let _command_buffer = queue.new_command_buffer();
+}
+"#;
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "tests/tokio_dispatch.rs",
+        "unclassifiable test function attribute `tokio::test`",
+    );
+}
+
+#[test]
+fn included_non_rust_source_in_test_scope_fails_closed() {
+    let fixture = tempfile::tempdir().expect("create include fixture");
+    let source_path = fixture.path().join("dispatch_test.rs");
+    let included_path = fixture.path().join("included_dispatch.inc");
+    let source = r#"
+#[test]
+fn raw_dispatch() {
+    include!("included_dispatch.inc");
+}
+"#;
+    std::fs::write(&source_path, source).expect("write include fixture source");
+    std::fs::write(
+        &included_path,
+        "let _command_buffer = queue.new_command_buffer();\n",
+    )
+    .expect("write included non-Rust source");
+
+    assert_command_buffer_fixture_rejected_with(
+        &std::fs::read_to_string(&source_path).expect("read include fixture source"),
+        "tests/dispatch_test.rs",
+        "unclassifiable include! in test-bearing scope",
+    );
+}
+
+#[test]
+fn compiler_selected_non_rust_module_is_inside_the_test_boundary() {
+    let fixture = tempfile::tempdir().expect("create non-Rust module fixture");
+    let src = fixture.path().join("src");
+    std::fs::create_dir(&src).expect("create fixture source directory");
+    std::fs::write(
+        src.join("lib.rs"),
+        "#[path = \"dispatch.inc\"]\nmod dispatch;\n",
+    )
+    .expect("write fixture crate root");
+    std::fs::write(
+        src.join("dispatch.inc"),
+        r#"
+#[test]
+fn raw_dispatch() {
+    let _command_buffer = queue.new_command_buffer();
+}
+"#,
+    )
+    .expect("write compiler-selected non-Rust module");
+
+    let sources = parsed_module_closure(fixture.path(), &src.join("lib.rs"), true)
+        .expect("parse compiler-selected module closure");
+    let child = sources
+        .iter()
+        .find(|source| source.relative.ends_with("src/dispatch.inc"))
+        .expect("non-Rust module belongs to the compiler-selected closure");
+    let function = child
+        .parsed
+        .test_functions()
+        .expect("classify non-Rust module tests")
+        .into_iter()
+        .find(|function| function.name == "raw_dispatch")
+        .expect("find raw dispatch test");
+    let work = child
+        .parsed
+        .call_sites(function.body.clone(), NEW_COMMAND_BUFFER, true)
+        .expect("classify non-Rust module work");
+    let error = child
+        .parsed
+        .validate_work_sites(
+            &work,
+            LOCAL_LOCK_SELECTOR,
+            GuardRequirement::Function {
+                closing_brace: function.body.end,
+            },
+        )
+        .expect_err("unguarded non-Rust module work must fail");
+    assert!(
+        error.contains("no live shared-lock binding encloses this work"),
+        "non-Rust module reported the wrong failure: {error}"
+    );
+}
+
+#[test]
+fn cfg_attr_generated_module_path_fails_closed() {
+    let fixture = tempfile::tempdir().expect("create cfg_attr path fixture");
+    let src = fixture.path().join("src");
+    std::fs::create_dir(&src).expect("create fixture source directory");
+    std::fs::write(
+        src.join("lib.rs"),
+        "#[cfg_attr(all(), path = \"dispatch.inc\")]\nmod dispatch;\n",
+    )
+    .expect("write fixture crate root");
+    std::fs::write(src.join("dispatch.inc"), "").expect("write cfg_attr-selected module source");
+
+    let error = module_source_closure(fixture.path(), &src.join("lib.rs"), true)
+        .err()
+        .expect("cfg_attr-generated path must fail closed");
+    assert!(
+        error.contains("unclassifiable cfg_attr-generated module path"),
+        "cfg_attr module path reported the wrong failure: {error}"
+    );
+}
+
+#[test]
+fn forwarded_receiver_and_identifier_macro_fails_closed() {
+    let source = r#"
+macro_rules! raw_dispatch {
+    ($receiver:expr, $method:ident) => {
+        $receiver.$method()
+    };
+}
+
+#[test]
+fn forwarded_dispatch() {
+    let _command_buffer = raw_dispatch!(queue, new_command_buffer);
+}
+"#;
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "src/forward/forwarded_macro_dispatch.rs",
+        "unclassifiable macro invocation `raw_dispatch!` in test-bearing scope",
+    );
 }
 
 #[test]
@@ -2150,13 +3128,13 @@ fn guard_lifetime_ignores_a_comment_decoy_before_live_work() {
     let source = r#"
 fn measurement() {
     {
-        let gpu_guard = lattice_inference::measurement::gpu_test_lock();
         // Device::system_default()
     }
+    let gpu_guard = lattice_inference::measurement::gpu_test_lock();
     let _device = Device::system_default();
 }
 "#;
-    assert_guard_fixture_rejected(source, "fixtures/comment_decoy.rs");
+    assert_guard_fixture_accepted(source, "fixtures/comment_decoy.rs");
 }
 
 #[test]
@@ -2167,7 +3145,11 @@ fn trivia_dispatch() {
     let command_buffer = queue.new_command_buffer /* comment */ ();
 }
 "#;
-    assert_command_buffer_fixture_rejected(source, "src/forward/trivia_dispatch.rs");
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "src/forward/trivia_dispatch.rs",
+        "no live shared-lock binding encloses this work",
+    );
 }
 
 #[test]
@@ -2192,7 +3174,11 @@ fn macro_dispatch() {
     dispatch!(queue.new_command_buffer());
 }
 "#;
-    assert_command_buffer_fixture_rejected(source, "src/forward/macro_dispatch.rs");
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "src/forward/macro_dispatch.rs",
+        "unclassifiable macro invocation `dispatch!` in test-bearing scope",
+    );
 }
 
 #[test]
@@ -2208,7 +3194,11 @@ macro_rules! raw_test {
 }
 raw_test!();
 "#;
-    assert_command_buffer_fixture_rejected(source, "src/forward/macro_generated_test.rs");
+    assert_command_buffer_fixture_rejected_with(
+        source,
+        "src/forward/macro_generated_test.rs",
+        "unclassifiable macro invocation `raw_test!` in test-bearing scope",
+    );
 }
 
 #[test]
@@ -2298,23 +3288,30 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
     let mut classified = exemptions.keys().cloned().collect::<BTreeSet<_>>();
     let mut violations = Vec::new();
     for relative_dir in ["benches", "examples", "src/bin", "tests"] {
-        for path in rust_sources_under(&manifest_dir.join(relative_dir)) {
-            let source = std::fs::read_to_string(&path).expect("read construction source");
+        for path in rust_target_roots(&manifest_dir.join(relative_dir)) {
             let relative = path
                 .strip_prefix(manifest_dir)
                 .expect("source under manifest directory")
                 .to_string_lossy()
                 .into_owned();
-            let parsed = if path.starts_with(manifest_dir.join("src")) {
-                StructuredSource::parse_path(manifest_dir, &path, &source, relative_dir == "tests")
-            } else {
-                StructuredSource::parse(&relative, &source, relative_dir == "tests")
-            }
-            .unwrap_or_else(|reason| panic!("{reason}"));
-            let construction_sites = parsed
-                .construction_sites(0..parsed.tokens.len())
+            let sources = parsed_module_closure(manifest_dir, &path, relative_dir == "tests")
                 .unwrap_or_else(|reason| panic!("{reason}"));
-            if construction_sites.is_empty() {
+            let mut source_results = Vec::new();
+            for source in &sources {
+                let construction_sites = source
+                    .parsed
+                    .construction_sites(0..source.parsed.tokens.len())
+                    .unwrap_or_else(|reason| panic!("{reason}"));
+                if construction_sites.is_empty() {
+                    continue;
+                }
+                source_results.push(source.parsed.validate_work_sites(
+                    &construction_sites,
+                    SHARED_LOCK_SELECTOR,
+                    GuardRequirement::Lexical,
+                ));
+            }
+            if source_results.is_empty() {
                 continue;
             }
             discovered.insert(relative.clone());
@@ -2322,67 +3319,61 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
             if exemptions.contains_key(&relative) {
                 continue;
             }
-            let direct_guard = parsed.validate_work_sites(
-                &construction_sites,
-                SHARED_LOCK_SELECTOR,
-                GuardRequirement::Lexical,
-            );
+            let root = sources
+                .iter()
+                .find(|source| source.relative == relative)
+                .unwrap_or_else(|| panic!("target root {relative} was not parsed"));
             let protected_wrapper = RAW_HARNESS_ENTRYPOINTS
                 .iter()
                 .find_map(|(path, marker)| (*path == relative).then_some(*marker))
                 .is_some_and(|marker| {
-                    parsed
+                    root.parsed
                         .validate_selector(
-                            0..parsed.tokens.len(),
+                            0..root.parsed.tokens.len(),
                             marker,
                             SHARED_LOCK_SELECTOR,
                             GuardRequirement::Lexical,
                         )
                         .is_ok()
                 });
-            match direct_guard {
-                Ok(()) => {
-                    classified.insert(relative);
-                }
-                Err(_) if protected_wrapper => {
-                    classified.insert(relative);
-                }
-                Err(reason) => violations.push(reason),
+            if protected_wrapper || source_results.iter().all(Result::is_ok) {
+                classified.insert(relative);
+            } else {
+                violations.extend(source_results.into_iter().filter_map(Result::err));
             }
         }
     }
 
-    let in_crate_relative = "src/forward/metal_qwen35.rs";
-    let in_crate_source =
-        std::fs::read_to_string(manifest_dir.join(in_crate_relative)).expect("read in-crate tests");
-    let in_crate = StructuredSource::parse_path(
-        manifest_dir,
-        &manifest_dir.join(in_crate_relative),
-        &in_crate_source,
-        true,
-    )
-    .unwrap_or_else(|reason| panic!("{reason}"));
-    for function in in_crate.test_functions() {
-        let construction_sites = in_crate
-            .construction_sites(function.body.clone())
-            .unwrap_or_else(|reason| panic!("{reason}"));
-        if construction_sites.is_empty() {
-            continue;
-        }
-        let site = format!("{in_crate_relative}::{}", function.name);
-        discovered.insert(site.clone());
-        let result = in_crate.validate_work_sites(
-            &construction_sites,
-            LOCAL_LOCK_SELECTOR,
-            GuardRequirement::Function {
-                closing_brace: function.body.end,
-            },
-        );
-        match result {
-            Ok(()) => {
-                classified.insert(site);
+    for source in parsed_module_closure(manifest_dir, &manifest_dir.join("src/lib.rs"), true)
+        .unwrap_or_else(|reason| panic!("{reason}"))
+    {
+        for function in source
+            .parsed
+            .test_functions()
+            .unwrap_or_else(|reason| panic!("{reason}"))
+        {
+            let construction_sites = source
+                .parsed
+                .construction_sites(function.body.clone())
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            if construction_sites.is_empty() {
+                continue;
             }
-            Err(reason) => violations.push(format!("{site}: {reason}")),
+            let site = format!("{}::{}", source.relative, function.name);
+            discovered.insert(site.clone());
+            let result = source.parsed.validate_work_sites(
+                &construction_sites,
+                LOCAL_LOCK_SELECTOR,
+                GuardRequirement::Function {
+                    closing_brace: function.body.end,
+                },
+            );
+            match result {
+                Ok(()) => {
+                    classified.insert(site);
+                }
+                Err(reason) => violations.push(format!("{site}: {reason}")),
+            }
         }
     }
 
