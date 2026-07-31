@@ -124,6 +124,27 @@ download_and_verify() {
     verify_directory "$directory"
 }
 
+release_draft_state() {
+    gh release view "$TAG" \
+        --repo "$REPOSITORY" \
+        --json isDraft \
+        --jq .isDraft
+}
+
+require_draft() {
+    local published_message="$1"
+    local state
+    state="$(release_draft_state)"
+    if [[ "$state" == "false" ]]; then
+        echo "ERROR: $published_message" >&2
+        return 1
+    fi
+    if [[ "$state" != "true" ]]; then
+        echo "ERROR: unexpected release draft state: $state" >&2
+        return 1
+    fi
+}
+
 verify_directory "$ARTIFACT_DIR"
 
 REF_INFO="$(
@@ -145,36 +166,25 @@ if [[ "$REF_TYPE" != "commit" || "$REF_SHA" != "$EXPECTED_SHA" ]]; then
     exit 1
 fi
 
-IS_DRAFT="$(
-    gh release view "$TAG" \
-        --repo "$REPOSITORY" \
-        --json isDraft \
-        --jq .isDraft
-)"
-
-if [[ "$IS_DRAFT" == "false" ]]; then
-    echo "ERROR: published release $TAG is immutable; create a new draft with a new tag and version" >&2
-    exit 1
-fi
-if [[ "$IS_DRAFT" != "true" ]]; then
-    echo "ERROR: unexpected release draft state: $IS_DRAFT" >&2
-    exit 1
-fi
+require_draft "release $TAG is already published; create a new draft with a new tag and version"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
+require_draft "release $TAG became published before upload; no assets were uploaded by this invocation"
 if upload_directory "$ARTIFACT_DIR"; then
     :
 else
     UPLOAD_STATUS=$?
-    echo "ERROR: draft release upload failed; the release remains unpublished" >&2
+    echo "ERROR: draft release upload failed; this script did not publish the release, but remote state must be rechecked" >&2
     exit "$UPLOAD_STATUS"
 fi
+require_draft "release $TAG became published while assets were uploading; uploaded assets may already have changed"
 if ! download_and_verify "$WORK_DIR/draft-verify"; then
-    echo "ERROR: draft release inventory verification failed; the release remains unpublished" >&2
+    echo "ERROR: draft release inventory verification failed; this script did not publish the release, but remote state must be rechecked" >&2
     exit 1
 fi
+require_draft "release $TAG became published during verification; this script will not edit its publication state"
 gh release edit "$TAG" \
     --repo "$REPOSITORY" \
     --draft=false

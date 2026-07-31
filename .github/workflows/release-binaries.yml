@@ -1,8 +1,9 @@
 name: release-binaries
 # Build every public release asset without write credentials, transfer the
 # complete set through workflow artifacts, then let one write-scoped job verify
-# and publish it. Releases must already exist as drafts; published releases are
-# immutable to this workflow and corrections require a new tag and version.
+# and publish it. Releases must already exist as drafts. The uploader rechecks
+# draft state around upload, but separate API requests cannot lock out another
+# actor that publishes the release concurrently.
 
 on:
   workflow_dispatch:
@@ -25,7 +26,7 @@ env:
 
 jobs:
   prepare:
-    name: resolve immutable release tag
+    name: resolve release tag commit
     runs-on: ubuntu-latest
     outputs:
       sha: ${{ steps.tag.outputs.sha }}
@@ -35,7 +36,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve immutable tag commit
+      - name: Resolve release tag commit
         id: tag
         env:
           TAG: ${{ inputs.tag }}
@@ -65,7 +66,7 @@ jobs:
           set -euo pipefail
           IS_DRAFT="$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)"
           if [ "$IS_DRAFT" != "true" ]; then
-            echo "::error::Published releases are immutable; create a new draft with a new tag and version."
+            echo "::error::Release is already published; create a new draft with a new tag and version."
             exit 1
           fi
 

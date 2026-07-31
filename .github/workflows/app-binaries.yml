@@ -100,6 +100,17 @@ jobs:
             echo "→ manual dispatch: app-binary and Swift builds REQUIRED"
             exit 0
           fi
+          if [ "${#CI_BASE_SHA}" -ne 40 ] ||
+             ! grep -Eq '^[0-9a-fA-F]{40}$' <<<"$CI_BASE_SHA"; then
+            echo "::error::Base SHA must be a nonempty 40-character commit SHA."
+            exit 1
+          fi
+          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "bins=true" >> "$GITHUB_OUTPUT"
+            echo "swift=true" >> "$GITHUB_OUTPUT"
+            echo "→ new ref has no base revision: app-binary and Swift builds REQUIRED"
+            exit 0
+          fi
           TRUSTED_DETECTOR=$(mktemp)
           trap 'rm -f "$TRUSTED_DETECTOR"' EXIT
           git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"
