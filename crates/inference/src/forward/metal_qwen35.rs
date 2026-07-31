@@ -6274,6 +6274,24 @@ mod inner {
             Ok(())
         }
 
+        fn check_raw_prefill_fresh_session(
+            &self,
+            entry_point: &str,
+        ) -> Result<(), crate::error::InferenceError> {
+            let seq_len = self.session.kv_cache.seq_len;
+            let gdn_state_is_initial = self.gdn_state_is_initial();
+            Self::validate_hidden_prefill_fresh_session(seq_len, gdn_state_is_initial).map_err(
+                |_| {
+                    crate::error::InferenceError::InvalidInput(format!(
+                        "{entry_point}: requires a fresh session (kv_cache.seq_len == 0 and GDN \
+                         recurrent state at its initial condition), found \
+                         kv_cache.seq_len={seq_len}; this call always dispatches from position \
+                         0. Call reset_state() first to start a new prompt."
+                    ))
+                },
+            )
+        }
+
         /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
         /// starting at `start_pos` — every position `start_pos..start_pos + token_count` must
         /// land inside the RoPE table / KV cache, and (when `gdn_pool_capacity` is `Some`)
@@ -6405,16 +6423,24 @@ mod inner {
         ///
         /// Run a single token through the full model. Returns logits [vocab_size].
         ///
+        /// `position` must equal the live cache cursor (`kv_cache.seq_len`). KV
+        /// placement and attention length derive from the live cursor while RoPE
+        /// uses the supplied `position`; sparse or out-of-order positions are not
+        /// supported.
+        ///
         /// # Errors
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU dispatch
-        /// when `position` or the next KV-cache row is outside the session capacity.
+        /// when `position` does not equal `kv_cache.seq_len`, or when `position`
+        /// or the next KV-cache row is outside the session capacity. On rejection,
+        /// session state is left unchanged.
         pub fn try_forward_step(
             &mut self,
             token_id: u32,
             position: usize,
         ) -> Result<Vec<f32>, crate::error::InferenceError> {
             self.check_forward_step_capacity(position)?;
+            self.check_live_cursor("try_forward_step", position)?;
             self.cross_turn_prefix_cache.clear();
             Ok(self
                 .forward_step_inner(
@@ -6472,9 +6498,10 @@ mod inner {
         ///
         /// # Panics
         ///
-        /// Panics if `token_id >= vocab_size`, or if `position` or the next
+        /// Panics if `token_id >= vocab_size`, if `position` does not equal the
+        /// live cache cursor (`kv_cache.seq_len`), or if `position` or the next
         /// KV-cache row exceeds the session capacity. Use [`Self::try_forward_step`]
-        /// to receive a typed capacity error. These checks run before GPU dispatch.
+        /// to receive a typed input error. These checks run before GPU dispatch.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -6656,12 +6683,21 @@ mod inner {
         /// max_prefill-sized batched chunks; LoRA-active prompts remain on the
         /// per-token forward_step fallback.
         ///
+        /// # Fresh-prompt semantics
+        ///
+        /// This call always dispatches from position 0. It requires a fresh
+        /// session (`kv_cache.seq_len == 0` and GDN recurrent state at its
+        /// initial condition), does not reset state on the caller's behalf,
+        /// and does not append to an existing prefix. Call [`Self::reset_state`]
+        /// before reusing a session for a new prompt.
+        ///
         /// # Panics
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. The check is O(seq_len) and
         /// runs once at the entry point before any GPU work. The tokenizer-bounded
         /// generate path never triggers this; it can only be reached by a library
-        /// consumer passing raw ids with an out-of-vocabulary value.
+        /// consumer passing raw ids with an out-of-vocabulary value. Also panics
+        /// before GPU dispatch if the session is not fresh (see above).
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -6672,6 +6708,9 @@ mod inner {
         /// no-op on those paths; it only matters for a consumer calling this
         /// entry point directly against a state with a live retained entry.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
+            if let Err(error) = self.check_raw_prefill_fresh_session("forward_prefill") {
+                panic!("{error}");
+            }
             self.cross_turn_prefix_cache.clear();
             self.forward_prefill_impl(token_ids, false)
         }
@@ -6765,15 +6804,24 @@ mod inner {
         /// `n * vocab_size * 4` bytes — for `vocab_size=248K` and `n=128` that's
         /// ~127MB. Callers should cap `n` accordingly (typical PPL window: 128).
         ///
+        /// # Fresh-prompt semantics
+        ///
+        /// This call always dispatches from position 0. It requires a fresh
+        /// session (`kv_cache.seq_len == 0` and GDN recurrent state at its
+        /// initial condition), does not reset state on the caller's behalf,
+        /// and does not append to an existing prefix. Call [`Self::reset_state`]
+        /// before reusing a session for a new prompt.
+        ///
         /// # Panics
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
         ///
         /// # Errors
         ///
-        /// Returns an error when more than one position is requested while a
-        /// LoRA adapter is active, because the batched all-position path does
-        /// not apply LoRA projections.
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
+        /// dispatch when the session is not fresh (see above). Returns an error
+        /// when more than one position is requested while a LoRA adapter is active,
+        /// because the batched all-position path does not apply LoRA projections.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -6783,6 +6831,7 @@ mod inner {
             &mut self,
             token_ids: &[u32],
         ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            self.check_raw_prefill_fresh_session("forward_prefill_all_logits")?;
             if token_ids.len() > 1 && self.lora.is_some() {
                 return Err(crate::error::InferenceError::Inference(
                     "forward_prefill_all_logits: all-position prefill does not apply LoRA \
@@ -17123,6 +17172,150 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 })
                 .collect()
+        }
+
+        fn mtp_loaded_live_hybrid_state_for_guard_test() -> MetalQwen35State {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_synthetic_mtp_for_test(&weights, &cfg, None);
+            assert!(state.has_mtp(), "fixture must load MTP state");
+            state.path_proof_enabled = true;
+
+            let mut seeded_gdn = state.snapshot_gdn_states();
+            assert_eq!(seeded_gdn.len(), 3, "fixture must contain three GDN layers");
+            seeded_gdn[0].0[0] = 1.0;
+            seeded_gdn[0].1[0] = -1.0;
+            state.restore_gdn_states(&seeded_gdn);
+
+            state
+                .try_forward_step(1, 0)
+                .expect("first raw step at the live cursor must succeed");
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+            assert!(!state.gdn_state_is_initial());
+            assert!(
+                !state.session.last_pre_final_hidden.is_empty(),
+                "MTP-loaded raw step must populate hidden readback state"
+            );
+            state.reset_path_proof_counters();
+            state
+        }
+
+        #[test]
+        fn raw_step_with_mtp_rejects_stale_live_cursor_without_mutation() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=raw_step_with_mtp_rejects_stale_live_cursor_without_mutation \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (raw_step_with_mtp_rejects_stale_live_cursor_without_mutation)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
+
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let position_before = state.session.position;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = snapshot_gdn_bytes(&state);
+            let hidden_before = state.session.last_pre_final_hidden.clone();
+            let hidden_proof_before = state.hidden_readback_path_proof_snapshot();
+
+            let error = state
+                .try_forward_step(2, 0)
+                .expect_err("an in-range stale raw step must be rejected");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for a stale raw step, got {error}");
+            };
+            assert!(message.contains("try_forward_step"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+
+            let panic =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.forward_step(2, 0)));
+            assert!(
+                panic.is_err(),
+                "infallible raw step wrapper must reject the same stale cursor"
+            );
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+        }
+
+        #[test]
+        fn raw_prefills_with_mtp_reject_live_session_without_mutation() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=raw_prefills_with_mtp_reject_live_session_without_mutation \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (raw_prefills_with_mtp_reject_live_session_without_mutation)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
+
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let position_before = state.session.position;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = snapshot_gdn_bytes(&state);
+            let hidden_before = state.session.last_pre_final_hidden.clone();
+            let hidden_proof_before = state.hidden_readback_path_proof_snapshot();
+
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.forward_prefill(&[2, 3])
+            }));
+            assert!(panic.is_err(), "raw prefill must reject a live session");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+
+            let error = state
+                .forward_prefill_all_logits(&[2, 3])
+                .expect_err("all-logits raw prefill must reject a live session");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for a live-session raw prefill, got {error}");
+            };
+            assert!(message.contains("forward_prefill_all_logits"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
         }
 
         #[test]
@@ -28168,6 +28361,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             });
 
             state.reset_state();
+            let real_prefill = state.forward_prefill(&[0u32]);
 
             // Plant a recognizable non-zero pattern into the live GDN GPU buffers so the
             // pre-draft / post-draft slot contents are observably distinct. The exact
@@ -28194,16 +28388,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 }
             }
 
-            let snap_before = state.snapshot_gdn_states();
+            let snap_pre_round = state.snapshot_gdn_states();
             assert!(
-                !snap_before.is_empty(),
+                !snap_pre_round.is_empty(),
                 "tiny hybrid fixture must have GDN layers"
             );
-
-            let real_prefill = state.forward_prefill(&[0u32]);
-            // Refresh the baseline AFTER prefill (which mutates GDN); this matches the
-            // exact state the self-spec round will see at `pos = kv.seq_len`.
-            let snap_pre_round = state.snapshot_gdn_states();
 
             // Precondition for the regression: GDN-only draft forwards must actually
             // mutate the live GDN buffers so we are checking that slot 0 is restored
@@ -31896,7 +32085,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // stream. This is the exact stale path: `forward_step`
             // advances `self.session.kv_cache` / GDN state directly, bypassing
             // both `reset_state()` (D3's guard) and the cache-aware save path.
-            let _ = state.forward_step(0, 0);
+            let live_cursor = state.session.kv_cache.seq_len;
+            let _ = state.forward_step(0, live_cursor);
 
             // The raw call must have invalidated the retained entry outright
             // (not just left it stale) — this is what D7 adds.
