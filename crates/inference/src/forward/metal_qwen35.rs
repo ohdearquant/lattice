@@ -19030,10 +19030,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         /// Direct generation's `logprobs: Some(_)` admission is rejected by
         /// `preflight_generate`'s `check_logprobs_not_set` call, strictly
-        /// before `configure_sampling_route` (and therefore any sampling-route
-        /// selection, which is the only thing that mutates
+        /// before either of the two paths that mutate
         /// `InferenceSession::compact_route` / `compact_topk` /
-        /// `compact_result`) ever runs. `generate()` propagates that `Err` via
+        /// `compact_result` can run: `reset_state()` and
+        /// `configure_sampling_route`. `generate()` propagates that `Err` via
         /// `?` immediately after the `preflight_generate` call, so a rejected
         /// request must leave route state untouched.
         ///
