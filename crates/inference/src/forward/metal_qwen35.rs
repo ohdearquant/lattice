@@ -1923,12 +1923,6 @@ mod inner {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum SamplingLogprobsGate {
-        NotRequired,
-        RequireAbsent,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct SamplingRouteEnvironment {
         compact: bool,
         selection: bool,
@@ -1955,7 +1949,6 @@ mod inner {
     fn plan_sampling_route(
         gen_cfg: &GenerateConfig,
         history_is_empty: bool,
-        logprobs_gate: SamplingLogprobsGate,
         environment: SamplingRouteEnvironment,
     ) -> SamplingRoutePlan {
         let block_route = choose_gpu_block_topk_route(
@@ -1969,10 +1962,12 @@ mod inner {
         } else {
             choose_gpu_topk_route(gen_cfg.top_k, environment.compact, environment.selection)
         };
-        let logprobs_eligible = match logprobs_gate {
-            SamplingLogprobsGate::NotRequired => true,
-            SamplingLogprobsGate::RequireAbsent => gen_cfg.logprobs.is_none(),
-        };
+        // Every caller (direct, streaming, prefix-cache generation) reaches
+        // this function only after its own `check_logprobs_not_set` preflight
+        // has already rejected `logprobs: Some(_)`, so this is a defense-in-
+        // depth re-check, not a caller-distinguishing policy: compact
+        // sampling cannot provide full-logit logprob semantics.
+        let logprobs_eligible = gen_cfg.logprobs.is_none();
         let use_compact = route != GpuTopkRoute::CpuFallback
             && (gen_cfg.repetition_penalty == 1.0 || history_is_empty)
             && gen_cfg.grammar.is_none()
@@ -8860,12 +8855,10 @@ mod inner {
             &mut self,
             gen_cfg: &GenerateConfig,
             history_is_empty: bool,
-            logprobs_gate: SamplingLogprobsGate,
         ) -> bool {
             let plan = plan_sampling_route(
                 gen_cfg,
                 history_is_empty,
-                logprobs_gate,
                 SamplingRouteEnvironment::current(),
             );
             apply_sampling_route_plan(
@@ -8928,11 +8921,7 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            let use_compact = self.configure_sampling_route(
-                gen_cfg,
-                all_ids.is_empty(),
-                SamplingLogprobsGate::NotRequired,
-            );
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -13275,11 +13264,7 @@ mod inner {
             // default (no logprobs requested) path pays no extra cost.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
-            let use_compact = self.configure_sampling_route(
-                gen_cfg,
-                all_ids.is_empty(),
-                SamplingLogprobsGate::RequireAbsent,
-            );
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -16259,11 +16244,7 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            let use_compact = self.configure_sampling_route(
-                gen_cfg,
-                all_ids.is_empty(),
-                SamplingLogprobsGate::RequireAbsent,
-            );
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
@@ -18875,7 +18856,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 let plan = plan_sampling_route(
                     &compact_sampling_config(top_k),
                     false,
-                    SamplingLogprobsGate::NotRequired,
                     compact_sampling_environment(),
                 );
                 assert_eq!(
@@ -18892,7 +18872,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let legacy_plan = plan_sampling_route(
                 &compact_sampling_config(50),
                 false,
-                SamplingLogprobsGate::NotRequired,
                 compact_sampling_environment(),
             );
             assert_eq!(
@@ -18905,40 +18884,36 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// `plan_sampling_route` no longer takes a caller-distinguishing logprobs
+        /// policy: every caller (direct, streaming, prefix-cache generation)
+        /// reaches this function only once its own `check_logprobs_not_set`
+        /// preflight has already rejected `logprobs: Some(_)` for paths that
+        /// don't support it, or (streaming) captures logprobs itself and must
+        /// keep full logits. Both configurations below are reachable states a
+        /// real caller can pass in: `logprobs: None` (every caller, after its
+        /// own preflight) and `logprobs: Some(_)` (the streaming caller, which
+        /// has no such preflight and captures logprobs directly).
         #[test]
-        fn sampling_route_plan_preserves_direct_and_streaming_logprobs_difference() {
-            let config = GenerateConfig {
+        fn sampling_route_plan_requires_full_logits_when_logprobs_requested() {
+            let no_logprobs = compact_sampling_config(1);
+            assert!(
+                plan_sampling_route(&no_logprobs, false, compact_sampling_environment())
+                    .use_compact,
+                "no logprobs requested must stay eligible for compact sampling"
+            );
+
+            let with_logprobs = GenerateConfig {
                 logprobs: Some(5),
                 ..compact_sampling_config(1)
             };
-
-            let direct = plan_sampling_route(
-                &config,
-                false,
-                SamplingLogprobsGate::NotRequired,
-                compact_sampling_environment(),
-            );
-            assert!(
-                direct.use_compact,
-                "the direct call site's historical route gate ignores logprobs"
-            );
-            assert_eq!(direct.compact_route, GpuTopkRoute::BlockArgmax);
-            assert_eq!(direct.compact_topk, 1);
-
-            let streaming = plan_sampling_route(
-                &config,
-                false,
-                SamplingLogprobsGate::RequireAbsent,
-                compact_sampling_environment(),
-            );
             assert_eq!(
-                streaming,
+                plan_sampling_route(&with_logprobs, false, compact_sampling_environment()),
                 SamplingRoutePlan {
                     use_compact: false,
                     compact_route: GpuTopkRoute::CpuFallback,
                     compact_topk: 0,
                 },
-                "streaming and prefix-cache generation require full logits for logprobs"
+                "a requested logprobs capture requires full logits"
             );
         }
 
@@ -18949,23 +18924,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 ..compact_sampling_config(8)
             };
             assert!(
-                !plan_sampling_route(
-                    &penalized,
-                    false,
-                    SamplingLogprobsGate::NotRequired,
-                    compact_sampling_environment(),
-                )
-                .use_compact,
+                !plan_sampling_route(&penalized, false, compact_sampling_environment(),)
+                    .use_compact,
                 "non-empty history with a repetition penalty requires full logits"
             );
             assert!(
-                plan_sampling_route(
-                    &penalized,
-                    true,
-                    SamplingLogprobsGate::NotRequired,
-                    compact_sampling_environment(),
-                )
-                .use_compact,
+                plan_sampling_route(&penalized, true, compact_sampling_environment(),).use_compact,
                 "an empty history preserves the existing repetition-penalty exception"
             );
 
@@ -18980,13 +18944,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 ..compact_sampling_config(8)
             };
             assert!(
-                !plan_sampling_route(
-                    &constrained,
-                    false,
-                    SamplingLogprobsGate::NotRequired,
-                    compact_sampling_environment(),
-                )
-                .use_compact,
+                !plan_sampling_route(&constrained, false, compact_sampling_environment(),)
+                    .use_compact,
                 "grammar-constrained decoding requires full logits"
             );
         }
@@ -19004,7 +18963,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let enabled = plan_sampling_route(
                 &compact_sampling_config(8),
                 false,
-                SamplingLogprobsGate::NotRequired,
                 compact_sampling_environment(),
             );
             assert!(apply_sampling_route_plan(
@@ -19024,7 +18982,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let disabled = plan_sampling_route(
                 &compact_sampling_config(8),
                 false,
-                SamplingLogprobsGate::NotRequired,
                 SamplingRouteEnvironment {
                     compact: false,
                     selection: true,
@@ -19063,6 +19020,66 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     .count(),
                 1,
                 "route chooser composition must have one production owner"
+            );
+        }
+
+        /// Direct generation's `logprobs: Some(_)` admission is rejected by
+        /// `preflight_generate`'s `check_logprobs_not_set` call, strictly
+        /// before `configure_sampling_route` (and therefore any sampling
+        /// route selection) ever runs -- `generate()` propagates that `Err`
+        /// via `?` immediately after the `preflight_generate` call, so
+        /// `configure_sampling_route` is unreachable on this path once the
+        /// guard rejects. This replaces a prior test that asserted a direct
+        /// caller's `logprobs: Some(_)` request could reach sampling-route
+        /// selection at all -- that state is impossible: this preflight
+        /// guard always runs first and always errors on it.
+        #[test]
+        fn direct_generate_rejects_logprobs_before_configuring_sampling_route() {
+            let cfg = GenerateConfig {
+                logprobs: Some(5),
+                ..Default::default()
+            };
+            let result = crate::model::qwen35::check_logprobs_not_set(&cfg);
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
+                "logprobs: Some(_) must be rejected with InvalidInput; got {result:?}"
+            );
+
+            let source = include_str!("metal_qwen35.rs");
+            let preflight_start = source
+                .find("fn preflight_generate(")
+                .expect("preflight_generate must exist in this file");
+            let preflight_body_end = source[preflight_start..]
+                .find("\n        }\n")
+                .expect("preflight_generate's body must close with `\\n        }\\n`");
+            let preflight_body = &source[preflight_start..preflight_start + preflight_body_end];
+            assert!(
+                preflight_body.contains("check_logprobs_not_set(gen_cfg)?"),
+                "preflight_generate must run check_logprobs_not_set as a fallible \
+                 preflight (via `?`), not merely call it"
+            );
+            assert!(
+                !preflight_body.contains("configure_sampling_route"),
+                "preflight_generate must not itself select a sampling route -- the \
+                 logprobs guard must fully resolve (pass or `?`-return) before any \
+                 route selection is reachable"
+            );
+
+            let generate_start = source
+                .find("pub fn generate(\n")
+                .expect("generate must exist in this file");
+            let generate_body = &source[generate_start..];
+            let preflight_call = generate_body
+                .find("self.preflight_generate(")
+                .expect("generate must call preflight_generate");
+            let configure_call = generate_body
+                .find("self.configure_sampling_route(")
+                .expect("generate must call configure_sampling_route");
+            assert!(
+                preflight_call < configure_call,
+                "generate() must call preflight_generate (which runs the logprobs \
+                 guard via `?`) strictly before configure_sampling_route, so a \
+                 rejected logprobs request never reaches sampling-route selection"
             );
         }
 
