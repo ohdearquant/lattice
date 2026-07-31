@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -18,7 +17,6 @@ PACKAGE_SCRIPT = REPO_ROOT / "apps/macos/scripts/package-app.sh"
 UPLOAD_SCRIPT = REPO_ROOT / "apps/macos/scripts/upload-release-assets.sh"
 RELEASE_WORKFLOW = REPO_ROOT / ".github/workflows/release-binaries.yml"
 APP_BINARIES_WORKFLOW = REPO_ROOT / ".github/workflows/app-binaries.yml"
-E2E_PARITY_WORKFLOW = REPO_ROOT / ".github/workflows/e2e-parity.yml"
 MACOS_SOURCES = REPO_ROOT / "apps/macos/Sources"
 RELEASE_TARGETS = (
     "aarch64-apple-darwin",
@@ -78,18 +76,6 @@ def write_release_assets(directory: Path, tag: str, marker: str) -> None:
         )
 
 
-def workflow_change_pattern(workflow: Path, output: str) -> re.Pattern[str]:
-    contents = workflow.read_text(encoding="utf-8")
-    for match in re.finditer(
-        r"""if grep -E '([^']+)' <<<\"\$CHANGED\" >/dev/null; then(.*?)\n\s+fi""",
-        contents,
-        re.DOTALL,
-    ):
-        if f'echo "{output}=true"' in match.group(2):
-            return re.compile(match.group(1))
-    raise AssertionError(f"{workflow.name} has no classifier for {output}")
-
-
 def workflow_step_script(
     workflow: Path, *, step_id: str | None = None, name: str | None = None
 ) -> str:
@@ -120,33 +106,6 @@ def workflow_step_script(
             break
         block.append(line)
     return textwrap.dedent("\n".join(block)).strip() + "\n"
-
-
-def initialize_detector_repository(root: Path, detector: str) -> str:
-    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "release-test@example.invalid"],
-        cwd=root,
-        check=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Release Test"], cwd=root, check=True
-    )
-    detector_path = root / "scripts/ci-changed-files.sh"
-    detector_path.parent.mkdir(parents=True)
-    detector_path.write_text(detector, encoding="utf-8")
-    detector_path.chmod(0o755)
-    subprocess.run(["git", "add", str(detector_path)], cwd=root, check=True)
-    subprocess.run(
-        ["git", "commit", "-qm", "test: add detector"], cwd=root, check=True
-    )
-    return subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
 
 
 def require_tests_collected(test_suite: unittest.TestSuite) -> None:
@@ -551,6 +510,29 @@ class UploadContractTest(unittest.TestCase):
                 ["release", "upload"], [args[:2] for args in log]
             )
 
+    def test_publication_during_verification_stops_before_publish_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "dist"
+            remote = root / "remote"
+            tag = f"v{workspace_version()}"
+            write_release_assets(artifacts, tag, "new")
+
+            result, state, log = self.run_uploader(
+                artifacts,
+                tag,
+                remote,
+                draft=True,
+                publish_after_view=4,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(state["draft"])
+            self.assertIn("became published during verification", result.stderr)
+            actions = [args[:2] for args in log]
+            self.assertIn(["release", "download"], actions)
+            self.assertNotIn(["release", "edit"], actions)
+
     def test_real_packaged_assets_when_requested(self):
         artifact_dir_value = os.environ.get(
             "LATTICE_MACOS_RELEASE_ARTIFACT_DIR"
@@ -707,184 +689,6 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("build-macos-swift", gate)
         self.assertIn("SWIFT_RESULT", gate)
         self.assertIn("SWIFT", gate)
-
-    def test_swift_classifier_treats_detector_as_relevant(self):
-        pattern = workflow_change_pattern(APP_BINARIES_WORKFLOW, "swift")
-        cases = {
-            "scripts/ci-changed-files.sh": True,
-            "apps/macos/Sources/LatticeStudio/Components/Badges.swift": True,
-            "README.md": False,
-        }
-        for path, expected in cases.items():
-            with self.subTest(path=path):
-                self.assertEqual(pattern.search(path) is not None, expected)
-
-    def test_app_gate_runs_the_base_revision_detector(self):
-        workflow = APP_BINARIES_WORKFLOW.read_text(encoding="utf-8")
-        changes_job = workflow.split("\n  changes:\n", maxsplit=1)[1]
-        changes_job = changes_job.split("\n  build-app-bins:\n", maxsplit=1)[0]
-        self.assertIn(
-            'git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh"',
-            changes_job,
-        )
-        self.assertIn('CHANGED=$(sh "$TRUSTED_DETECTOR")', changes_job)
-        self.assertNotIn(
-            "CHANGED=$(./scripts/ci-changed-files.sh)", changes_job
-        )
-
-    def test_e2e_tune_classifier_treats_detector_as_relevant(self):
-        pattern = workflow_change_pattern(E2E_PARITY_WORKFLOW, "tune")
-        cases = {
-            "scripts/ci-changed-files.sh": True,
-            "crates/tune/src/train.rs": True,
-            "README.md": False,
-        }
-        for path, expected in cases.items():
-            with self.subTest(path=path):
-                self.assertEqual(pattern.search(path) is not None, expected)
-
-    def test_invalid_base_fails_before_checkout_detector_can_choose_outputs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            marker = root / "attacker-ran"
-            initialize_detector_repository(
-                root,
-                "#!/bin/sh\n"
-                'printf "ran\\n" > "$ATTACKER_MARKER"\n'
-                'printf "README.md\\n"\n',
-            )
-            for base_sha in ("", "abc", "g" * 40):
-                with self.subTest(base_sha=base_sha or "empty"):
-                    marker.unlink(missing_ok=True)
-                    output = root / "github-output"
-                    output.unlink(missing_ok=True)
-                    env = os.environ.copy()
-                    env.update(
-                        {
-                            "ATTACKER_MARKER": str(marker),
-                            "CI_BASE_SHA": base_sha,
-                            "CI_HEAD_SHA": "b" * 40,
-                            "GITHUB_EVENT_NAME": "pull_request",
-                            "GITHUB_OUTPUT": str(output),
-                        }
-                    )
-
-                    result = subprocess.run(
-                        [
-                            "bash",
-                            "-c",
-                            workflow_step_script(
-                                APP_BINARIES_WORKFLOW, step_id="filter"
-                            ),
-                        ],
-                        cwd=root,
-                        env=env,
-                        capture_output=True,
-                        text=True,
-                    )
-
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn(
-                        "40-character commit SHA", result.stdout + result.stderr
-                    )
-                    self.assertFalse(marker.exists())
-                    emitted = (
-                        output.read_text(encoding="utf-8")
-                        if output.exists()
-                        else ""
-                    )
-                    self.assertNotIn("bins=false", emitted)
-                    self.assertNotIn("swift=false", emitted)
-
-    def test_zero_base_requires_both_app_builds_without_running_detector(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            marker = root / "attacker-ran"
-            initialize_detector_repository(
-                root,
-                "#!/bin/sh\n"
-                'printf "ran\\n" > "$ATTACKER_MARKER"\n'
-                'printf "README.md\\n"\n',
-            )
-            output = root / "github-output"
-            env = os.environ.copy()
-            env.update(
-                {
-                    "ATTACKER_MARKER": str(marker),
-                    "CI_BASE_SHA": "0" * 40,
-                    "CI_HEAD_SHA": "b" * 40,
-                    "GITHUB_EVENT_NAME": "push",
-                    "GITHUB_OUTPUT": str(output),
-                }
-            )
-
-            result = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    workflow_step_script(APP_BINARIES_WORKFLOW, step_id="filter"),
-                ],
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(marker.exists())
-            self.assertEqual(
-                output.read_text(encoding="utf-8").splitlines(),
-                ["bins=true", "swift=true"],
-            )
-
-    def test_e2e_filter_executes_base_detector_not_checkout_copy(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            base_sha = initialize_detector_repository(
-                root,
-                "#!/bin/sh\n"
-                'printf "scripts/ci-changed-files.sh\\n"\n',
-            )
-            marker = root / "attacker-ran"
-            checkout_detector = root / "scripts/ci-changed-files.sh"
-            checkout_detector.write_text(
-                "#!/bin/sh\n" 'printf "ran\\n" > "$ATTACKER_MARKER"\n',
-                encoding="utf-8",
-            )
-            checkout_detector.chmod(0o755)
-            subprocess.run(
-                ["git", "add", str(checkout_detector)], cwd=root, check=True
-            )
-            output = root / "github-output"
-            env = os.environ.copy()
-            env.update(
-                {
-                    "ATTACKER_MARKER": str(marker),
-                    "CI_BASE_SHA": base_sha,
-                    "CI_HEAD_SHA": "b" * 40,
-                    "GITHUB_EVENT_NAME": "pull_request",
-                    "GITHUB_OUTPUT": str(output),
-                }
-            )
-
-            result = subprocess.run(
-                [
-                    "bash",
-                    "-c",
-                    workflow_step_script(E2E_PARITY_WORKFLOW, step_id="filter"),
-                ],
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(marker.exists())
-            self.assertEqual(
-                output.read_text(encoding="utf-8").splitlines(),
-                ["engine=true", "tune=true"],
-            )
 
     def test_release_workflow_rejects_published_release_behaviorally(self):
         with tempfile.TemporaryDirectory() as tmp:

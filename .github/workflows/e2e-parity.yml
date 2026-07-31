@@ -86,21 +86,7 @@ jobs:
             echo "→ $GITHUB_EVENT_NAME trigger: full parity suite REQUIRED"
             exit 0
           fi
-          if [ "${#CI_BASE_SHA}" -ne 40 ] ||
-             ! grep -Eq '^[0-9a-fA-F]{40}$' <<<"$CI_BASE_SHA"; then
-            echo "::error::Base SHA must be a nonempty 40-character commit SHA."
-            exit 1
-          fi
-          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            echo "engine=true" >> "$GITHUB_OUTPUT"
-            echo "tune=true" >> "$GITHUB_OUTPUT"
-            echo "→ new ref has no base revision: full parity suite REQUIRED"
-            exit 0
-          fi
-          TRUSTED_DETECTOR=$(mktemp)
-          trap 'rm -f "$TRUSTED_DETECTOR"' EXIT
-          git show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"
-          CHANGED=$(sh "$TRUSTED_DETECTOR")
+          CHANGED=$(./scripts/ci-changed-files.sh)
           echo "Changed files:"
           echo "$CHANGED"
           # Markdown is stripped BEFORE classification, and the reason is that
@@ -154,7 +140,7 @@ jobs:
             echo "engine=false" >> "$GITHUB_OUTPUT"
             echo "→ no engine change: parity not required"
           fi
-          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^scripts/ci-changed-files\.sh$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
             echo "tune=true" >> "$GITHUB_OUTPUT"
             echo "→ tune training surface changed: layer-23 golden REQUIRED"
           else

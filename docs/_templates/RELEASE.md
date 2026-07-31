@@ -58,6 +58,10 @@ gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f ta
 
 Do not publish the draft manually while the asset workflow is running. Its draft-state checks are
 separate API reads, not a lock against another actor publishing concurrently.
+Publication during upload can leave the remote asset set partly or fully replaced before the
+workflow notices and stops. The release can be published after the final state read and before the
+workflow's publish edit. After a state-change or asset-verification failure, inspect the release
+state and every remote asset before retrying.
 
 ## Post-release
 
