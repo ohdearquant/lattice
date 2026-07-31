@@ -6756,6 +6756,23 @@ mod inner {
             )
         }
 
+        fn validate_hidden_prefill_fresh_session(
+            seq_len: usize,
+            gdn_state_is_initial: bool,
+        ) -> Result<(), crate::error::InferenceError> {
+            if seq_len != 0 || !gdn_state_is_initial {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "forward_prefill_with_hidden: requires a fresh session (kv_cache.seq_len \
+                     == 0 and GDN recurrent state at its initial condition), found \
+                     kv_cache.seq_len={seq_len}; this call always dispatches from position 0, so \
+                     calling it against a session with live state would overwrite the \
+                     existing KV prefix while leaving GDN state conditioned on the tokens it \
+                     overwrote. Call reset_state() first to start a new prompt."
+                )));
+            }
+            Ok(())
+        }
+
         /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
         /// starting at `start_pos` — every position `start_pos..start_pos + token_count` must
         /// land inside the RoPE table / KV cache, and (when `gdn_pool_capacity` is `Some`)
@@ -7204,17 +7221,10 @@ mod inner {
                     )));
                 }
             }
-            if self.session.kv_cache.seq_len != 0 || !self.gdn_state_is_initial() {
-                return Err(InferenceError::InvalidInput(format!(
-                    "forward_prefill_with_hidden: requires a fresh session (kv_cache.seq_len \
-                     == 0 and GDN recurrent state at its initial condition), found \
-                     kv_cache.seq_len={}; this call always dispatches from position 0, so \
-                     calling it against a session with live state would overwrite the \
-                     existing KV prefix while leaving GDN state conditioned on the tokens it \
-                     overwrote. Call reset_state() first to start a new prompt.",
-                    self.session.kv_cache.seq_len
-                )));
-            }
+            Self::validate_hidden_prefill_fresh_session(
+                self.session.kv_cache.seq_len,
+                self.gdn_state_is_initial(),
+            )?;
             self.check_forward_range_capacity(0, token_ids.len(), false)?;
             self.cross_turn_prefix_cache.clear();
 
@@ -20143,6 +20153,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(message.contains("test"), "{message}");
             assert!(message.contains("supplied position 4"), "{message}");
             assert!(message.contains("live cache cursor 3"), "{message}");
+        }
+
+        #[test]
+        fn validate_hidden_prefill_fresh_session_checks_kv_and_gdn_state() {
+            assert!(MetalQwen35State::validate_hidden_prefill_fresh_session(0, true).is_ok());
+            assert!(
+                MetalQwen35State::validate_hidden_prefill_fresh_session(1, true).is_err(),
+                "a live KV cursor must be rejected"
+            );
+            assert!(
+                MetalQwen35State::validate_hidden_prefill_fresh_session(0, false).is_err(),
+                "non-initial GDN state must be rejected even when the KV cursor is zero"
+            );
         }
 
         /// Deferred-run regression: full round-trip through the public
