@@ -2702,6 +2702,30 @@ mod tests {
 
     #[cfg(feature = "f16")]
     #[test]
+    fn test_f16_widening_skips_second_finite_scan() {
+        let path = temp_path("lattice_weights_f16_fused_scan");
+        let bits = [0x0000u16, 0x8000, 0x0001, 0x3c00];
+        let raw = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_raw_tensor(&path, "t", "F16", &[bits.len()], &raw);
+
+        crate::weights::ingress::reset_decoded_f32_finite_check_count();
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        sf.get_f32_tensor("t")
+            .expect("finite F16 values must widen");
+        assert_eq!(
+            crate::weights::ingress::decoded_f32_finite_check_count(),
+            0,
+            "fused F16 validation must not rescan widened values"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
     fn test_bf16_widening_preserves_finite_edge_values() {
         let path = temp_path("lattice_weights_bf16_fused_finite");
         let bits = [0x0000u16, 0x8000, 0x0001, 0x3f80];
@@ -2735,6 +2759,30 @@ mod tests {
                 .get()
                 .is_some(),
             "widening must publish its fused validation result"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_bf16_widening_skips_second_finite_scan() {
+        let path = temp_path("lattice_weights_bf16_fused_scan");
+        let bits = [0x0000u16, 0x8000, 0x0001, 0x3f80];
+        let raw = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_raw_tensor(&path, "t", "BF16", &[bits.len()], &raw);
+
+        crate::weights::ingress::reset_decoded_f32_finite_check_count();
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        sf.get_f32_tensor("t")
+            .expect("finite BF16 values must widen");
+        assert_eq!(
+            crate::weights::ingress::decoded_f32_finite_check_count(),
+            0,
+            "fused BF16 validation must not rescan widened values"
         );
 
         fs::remove_file(&path).ok();

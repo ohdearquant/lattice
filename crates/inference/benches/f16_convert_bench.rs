@@ -106,7 +106,7 @@ fn bench_safetensors_ingress_widen(c: &mut Criterion) {
 
     for (dtype, path) in &fixtures {
         group.bench_with_input(BenchmarkId::new(*dtype, N), path, |b, path| {
-            b.iter_batched(
+            b.iter_batched_ref(
                 || SafetensorsFile::open(path.as_path()).expect("open benchmark fixture"),
                 |weights| {
                     let (values, shape) = weights

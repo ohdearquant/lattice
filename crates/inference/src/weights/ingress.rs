@@ -20,6 +20,28 @@
 
 use crate::error::InferenceError;
 
+#[cfg(test)]
+thread_local! {
+    static DECODED_F32_FINITE_CHECK_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn reset_decoded_f32_finite_check_count() {
+    DECODED_F32_FINITE_CHECK_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn decoded_f32_finite_check_count() -> usize {
+    DECODED_F32_FINITE_CHECK_COUNT.get()
+}
+
+#[cfg(test)]
+fn record_decoded_f32_finite_check() {
+    DECODED_F32_FINITE_CHECK_COUNT.set(DECODED_F32_FINITE_CHECK_COUNT.get() + 1);
+}
+
 /// Sealed carrier for one tensor's ingested payload plus its provenance.
 ///
 /// Construction only happens through the payload-specific constructors, so
@@ -419,7 +441,11 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                 )));
             }
             if !known_finite
-                && let Some((idx, bad)) = values.iter().enumerate().find(|(_, v)| !v.is_finite())
+                && let Some((idx, bad)) = values.iter().enumerate().find(|(_, v)| {
+                    #[cfg(test)]
+                    record_decoded_f32_finite_check();
+                    !v.is_finite()
+                })
             {
                 return Err(error_kind.error(format!(
                     "{}: tensor {} ({dtype_label}) has non-finite value {bad} at element index \
@@ -540,8 +566,12 @@ mod tests {
     #[test]
     fn accepts_finite_values_including_signed_zero_and_subnormal() {
         let values = [0.0f32, -0.0, 1.0, -1.0, f32::MIN_POSITIVE / 2.0];
+        reset_decoded_f32_finite_check_count();
         let tensor = IngestedTensor::decoded_f32("test", "t", &[5], "F32", &values);
         assert!(validate_ingested_tensor(tensor).is_ok());
+        let checks = decoded_f32_finite_check_count();
+        assert_eq!(checks, values.len());
+        assert_ne!(checks, 0, "the test scan observable must collect checks");
     }
 
     #[test]
