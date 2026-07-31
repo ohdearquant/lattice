@@ -80,27 +80,43 @@ if ! chmod 0644 "$DATA_TMP"; then
   exit 1
 fi
 
+write_failed() {
+  echo "  ERROR: failed to write $1 to staged output $DATA_TMP" >&2
+  exit 1
+}
+
+append_lines() {
+  context="$1"
+  shift
+  printf "%s\n" "$@" >> "$DATA_TMP" || write_failed "$context"
+}
+
+append_row() {
+  context="$1"
+  shift
+  printf "%s\t%s\t%s\t%s\n" "$@" >> "$DATA_TMP" || write_failed "$context"
+}
+
 SHA="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 STAMP="$(date -u +%Y-%m-%dT%H:%MZ)"
 MACHINE="${BENCH_MACHINE:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
 ARCH="$(uname -m 2>/dev/null || echo unknown)"
 HARNESS_VERSION="$(git hash-object "$0" 2>/dev/null | cut -c1-12)"
 [[ -n "$HARNESS_VERSION" ]] || HARNESS_VERSION=unknown
-{
-  echo "# perplexity.tsv — Q4 quantization quality, lattice tiers vs MLX cross-check"
-  echo "# Regenerated $STAMP from $SHA (real GPU). Qwen3.5-0.8B, WikiText-2 raw test,"
-  echo "# Provenance: machine=$MACHINE arch=$ARCH harness=bench_quality.sh@$HARNESS_VERSION."
-  echo "#   window=$WINDOW stride=$STRIDE max_tokens=$MAX_TOKENS, QuaRot seed=$SEED."
-  echo "#   PPL is deterministic over a fixed corpus + window schedule (one run is canonical)."
-  echo "# ADR-044 reconciliation: ADR-044 step-4 recorded QuaRot Q4 as -1.61 PPL BETTER than"
-  echo "#   unrotated Q4 (full corpus). That was measured on a PRE-RoPE-fix forward path (May 2026)."
-  echo "#   A code-bisection on identical corpus/slice/seed shows the delta sign is set by code"
-  echo "#   version, not corpus: ADR-044-era binary = -0.81 (QuaRot better), current binary = +1.90"
-  echo "#   (QuaRot worse). Forward-path fixes improved the unrotated baseline ~4.5 PPL but QuaRot"
-  echo "#   only ~1.8 — QuaRot was compensating for baseline bugs since fixed. Offline QuaRot v0 is"
-  echo "#   net-negative by design (Hadamard forces symmetric Q4, worse fidelity floor); the missing"
-  echo "#   mechanism is online R3/R4 (issue #703). See also #616. Columns: engine<TAB>tier<TAB>ppl<TAB>tokens"
-} >> "$DATA_TMP"
+append_lines "result header" \
+  "# perplexity.tsv — Q4 quantization quality, lattice tiers vs MLX cross-check" \
+  "# Regenerated $STAMP from $SHA (real GPU). Qwen3.5-0.8B, WikiText-2 raw test," \
+  "# Provenance: machine=$MACHINE arch=$ARCH harness=bench_quality.sh@$HARNESS_VERSION." \
+  "#   window=$WINDOW stride=$STRIDE max_tokens=$MAX_TOKENS, QuaRot seed=$SEED." \
+  "#   PPL is deterministic over a fixed corpus + window schedule (one run is canonical)." \
+  "# ADR-044 reconciliation: ADR-044 step-4 recorded QuaRot Q4 as -1.61 PPL BETTER than" \
+  "#   unrotated Q4 (full corpus). That was measured on a PRE-RoPE-fix forward path (May 2026)." \
+  "#   A code-bisection on identical corpus/slice/seed shows the delta sign is set by code" \
+  "#   version, not corpus: ADR-044-era binary = -0.81 (QuaRot better), current binary = +1.90" \
+  "#   (QuaRot worse). Forward-path fixes improved the unrotated baseline ~4.5 PPL but QuaRot" \
+  "#   only ~1.8 — QuaRot was compensating for baseline bugs since fixed. Offline QuaRot v0 is" \
+  "#   net-negative by design (Hadamard forces symmetric Q4, worse fidelity floor); the missing" \
+  "#   mechanism is online R3/R4 (issue #703). See also #616. Columns: engine<TAB>tier<TAB>ppl<TAB>tokens"
 echo "=== Perplexity bench | Qwen3.5-0.8B | WikiText-2 test | window=$WINDOW stride=$STRIDE max_tokens=$MAX_TOKENS ==="
 
 echo "  Corpus: $CORPUS ($(wc -c < "$CORPUS") bytes)"
@@ -128,7 +144,7 @@ if [[ -z "$PPL" ]]; then
 fi
 echo "  PPL: $PPL"
 Q4PPL="$PPL"
-printf "lattice\tq4\t%s\t%s\n" "$PPL" "$MAX_TOKENS" >> "$DATA_TMP"
+append_row "lattice/q4 result" "lattice" "q4" "$PPL" "$MAX_TOKENS"
 
 # ---- Lattice Q4-QuaRot ----
 echo "─── Lattice Q4-QuaRot (lattice product) ───"
@@ -148,13 +164,13 @@ if [[ -z "$PPL" ]]; then
 fi
 echo "  PPL: $PPL"
 QRPPL="$PPL"
-printf "lattice\tq4-quarot\t%s\t%s\n" "$PPL" "$MAX_TOKENS" >> "$DATA_TMP"
+append_row "lattice/q4-quarot result" "lattice" "q4-quarot" "$PPL" "$MAX_TOKENS"
 
 # ---- QuaRot delta (INFORMATIONAL, not a gate — offline v0 is net-negative, see header/#703) ----
 if [[ -n "${Q4PPL:-}" ]] && [[ -n "${QRPPL:-}" ]]; then
   DELTA=$(awk -v q="$Q4PPL" -v r="$QRPPL" 'BEGIN{printf "%+.4f", r-q}')
   echo "  QuaRot delta (quarot-unrotated): $DELTA  [informational; positive = QuaRot worse]"
-  echo "# informational: quarot-unrotated delta = $DELTA at max_tokens=$MAX_TOKENS (offline v0 net-negative, #703)" >> "$DATA_TMP"
+  append_lines "QuaRot delta" "# informational: quarot-unrotated delta = $DELTA at max_tokens=$MAX_TOKENS (offline v0 net-negative, #703)"
 fi
 
 # ---- MLX Q8 + Q4 (cross-check) ----
@@ -231,10 +247,31 @@ for TIER in q8 q4; do
     echo "  ERROR: MLX cross-check produced an empty $TIER row (see /tmp/mlx_ppl.log)" >&2
     exit 1
   fi
-  printf "%s\n" "$MLX_ROW" >> "$DATA_TMP"
+  append_lines "MLX/$TIER result" "$MLX_ROW"
 done
 rm -f "$MLX_TMP"
 MLX_TMP=""
+fi
+
+if ! awk -F '\t' -v skip_mlx="$SKIP_MLX" '
+  /^#/ { next }
+  NF != 4 { bad = 1; next }
+  $3 !~ /^[0-9]+([.][0-9]+)?$/ || $4 !~ /^[0-9]+$/ { bad = 1; next }
+  $1 == "lattice" && $2 == "q4" { lattice_q4++; next }
+  $1 == "lattice" && $2 == "q4-quarot" { lattice_quarot++; next }
+  $1 == "mlx" && $2 == "q8" { mlx_q8++; next }
+  $1 == "mlx" && $2 == "q4" { mlx_q4++; next }
+  { bad = 1 }
+  END {
+    expected_mlx = skip_mlx == "0" ? 1 : 0
+    if (bad || lattice_q4 != 1 || lattice_quarot != 1 ||
+        mlx_q8 != expected_mlx || mlx_q4 != expected_mlx) {
+      exit 1
+    }
+  }
+' "$DATA_TMP"; then
+  echo "  ERROR: staged results failed schema/cardinality validation; refusing publication" >&2
+  exit 1
 fi
 
 echo ""
