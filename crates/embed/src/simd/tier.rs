@@ -631,6 +631,48 @@ mod tests {
         agreements as f64 / pairs as f64
     }
 
+    /// Refuses to let a retrieval-fidelity fixture be scored when it cannot
+    /// distinguish quality tiers from each other.
+    ///
+    /// Only the independent f64 reference ranking is checked here — ties
+    /// among *quantized* tier scores are the exact behaviour under test
+    /// (e.g. Binary legitimately collapses many candidates to the same
+    /// Hamming distance) and must never be rejected.
+    fn validate_retrieval_fixture(
+        corpus: &[Vec<f32>],
+        queries: &[Vec<f32>],
+        top_k: usize,
+    ) -> std::result::Result<(), String> {
+        if queries.is_empty() {
+            return Err("retrieval fixture has zero queries".to_string());
+        }
+        if corpus.len() < top_k {
+            return Err(format!(
+                "retrieval fixture corpus size {} is smaller than top_k={top_k}",
+                corpus.len()
+            ));
+        }
+        for (query_index, query) in queries.iter().enumerate() {
+            let mut distinct_scores: Vec<f64> = corpus
+                .iter()
+                .map(|candidate| scalar_cosine_f64(query, candidate))
+                .filter(|score| score.is_finite())
+                .collect();
+            distinct_scores.sort_unstable_by(f64::total_cmp);
+            distinct_scores.dedup();
+            if distinct_scores.len() <= top_k {
+                return Err(format!(
+                    "retrieval fixture query {query_index} is non-discriminating: only \
+                     {} distinct finite reference score(s) across {} candidates, need \
+                     more than top_k={top_k}",
+                    distinct_scores.len(),
+                    corpus.len()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn fixed_retrieval_fixture() -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         const DIMS: usize = 384;
         const CORPUS_SIZE: usize = 256;
@@ -648,6 +690,8 @@ mod tests {
     fn test_tier_retrieval_quality_against_independent_f32_ranking() {
         const TOP_K: usize = 10;
         let (corpus, queries) = fixed_retrieval_fixture();
+        validate_retrieval_fixture(&corpus, &queries, TOP_K)
+            .expect("retrieval fixture must be discriminating before scoring tiers against it");
 
         for tier in [
             QuantizationTier::Full,
@@ -731,6 +775,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_rejects_non_discriminating_corpus() {
+        const TOP_K: usize = 10;
+        const DIMS: usize = 384;
+        const CORPUS_SIZE: usize = 256;
+        const QUERY_COUNT: usize = 16;
+
+        // Every candidate is the *same* lossy, non-constant vector: the
+        // independent f64 reference score ties across the whole corpus, so
+        // recall@10 and pairwise agreement would collapse to a meaningless
+        // 1.0 for every tier if this fixture were ever scored.
+        let repeated_vector = generate_vector(DIMS, 0xC0A5_0000);
+        let corpus: Vec<Vec<f32>> = std::iter::repeat_n(repeated_vector, CORPUS_SIZE).collect();
+        let queries: Vec<Vec<f32>> = (0..QUERY_COUNT)
+            .map(|index| generate_vector(DIMS, 0x0A11_0000 + index as u64))
+            .collect();
+
+        let err = validate_retrieval_fixture(&corpus, &queries, TOP_K)
+            .expect_err("a corpus of identical vectors ties every reference score; the guard must refuse rather than let it be scored");
+        eprintln!("guard refused as expected: {err}");
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_rejects_zero_queries() {
+        let (corpus, _queries) = fixed_retrieval_fixture();
+        let err = validate_retrieval_fixture(&corpus, &[], 10)
+            .expect_err("zero queries must be refused rather than panic or silently pass");
+        eprintln!("guard refused as expected: {err}");
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_rejects_corpus_smaller_than_top_k() {
+        let (corpus, queries) = fixed_retrieval_fixture();
+        let small_corpus = corpus[..5].to_vec();
+        let err = validate_retrieval_fixture(&small_corpus, &queries, 10).expect_err(
+            "a corpus smaller than top_k must be refused rather than panic or return NaN",
+        );
+        eprintln!("guard refused as expected: {err}");
+    }
+
+    #[test]
+    fn test_validate_retrieval_fixture_accepts_the_real_fixture() {
+        let (corpus, queries) = fixed_retrieval_fixture();
+        validate_retrieval_fixture(&corpus, &queries, 10)
+            .expect("the real fixture is discriminating and must not be rejected");
     }
 
     #[test]
