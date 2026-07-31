@@ -2752,8 +2752,8 @@ mod inner {
     /// `group_size=6` model would silently drop attention output for 2 of every 6
     /// query heads in the group. `group_size` is validated to be in
     /// `1..=METAL_FLASH_MAX_GQA_GROUP` (8) by `validate_flash_decode_shape` before
-    /// either pipeline-construction call site (`new`, `from_q4_dir`) reaches this
-    /// function. This helper re-checks that invariant and returns `Err` for any
+    /// either constructor reaches the shared pipeline builder. This helper
+    /// re-checks that invariant and returns `Err` for any
     /// out-of-range input rather than rounding it: there is no variant with
     /// `MAX_GRP > 8`, so a `group_size >= 9` could only be mapped to `g8`, whose
     /// kernel guard would then silently write no attention. Failing closed here
@@ -3193,6 +3193,165 @@ mod inner {
         })
     }
 
+    fn build_pipelines(
+        device: &Device,
+        cfg: &Qwen35Config,
+    ) -> Result<MetalQwen35Pipelines, String> {
+        let prefill_grp_suffix =
+            prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
+
+        let opts = CompileOptions::new();
+        let library = device
+            .new_library_with_source(MSL_SOURCE, &opts)
+            .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
+
+        let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
+            let func = library
+                .get_function(name, None)
+                .map_err(|e| format!("function '{name}' not found: {e}"))?;
+            device
+                .new_compute_pipeline_state_with_function(&func)
+                .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
+        };
+
+        let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
+            // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
+            // The compile/pipeline `.ok()?` chain below falls back to the
+            // naive gemm_q4 on any device where the V3.0 source fails.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q4_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
+            // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
+            // gemv_q3_decode-only (M=1) path on any device/compile failure.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q3_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
+            // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q8_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        Ok(MetalQwen35Pipelines {
+            gemv_decode: make_pipeline("gemv_decode_m1")?,
+            gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
+            gemv_q8: make_pipeline("gemv_q8_decode")?,
+            gemv_q4: make_pipeline("gemv_q4_decode")?,
+            gemm_q4: make_pipeline("gemm_q4")?,
+            gemm_q4_tiled: make_optional_gemm_q4_tiled(),
+            gemv_q3: make_pipeline("gemv_q3_decode")?,
+            gemm_q3_tiled: make_optional_gemm_q3_tiled(),
+            rms_norm: make_pipeline("rms_norm_qwen35")?,
+            partial_rope: make_pipeline("partial_rope_interleaved")?,
+            per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
+            decode_attention: make_pipeline("decode_attention")?,
+            sigmoid_gate: make_pipeline("sigmoid_gate")?,
+            scatter_q_gate: make_pipeline("scatter_q_gate")?,
+            silu_mul: make_pipeline("silu_mul")?,
+            silu_mul_fused: make_pipeline("silu_mul_fused")?,
+            copy: make_pipeline("copy_buf")?,
+            copy_offset: make_pipeline("copy_buf_offset")?,
+            conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
+            gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
+            gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
+            gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
+            gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
+            gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
+            gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
+            gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
+            gdn_recurrence_q36: library
+                .get_function("gdn_recurrence_fused_q36", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_precompute_keys: library
+                .get_function("gdn_precompute_keys", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_recurrence_sharded: library
+                .get_function("gdn_recurrence_sharded", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_norm_silu: library
+                .get_function("gdn_norm_silu", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
+            copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
+            add_and_copy: make_pipeline("add_and_copy")?,
+            copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
+            fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
+            gemm_q8: make_pipeline("gemm_q8")?,
+            gemm_q8_tiled: make_optional_gemm_q8_tiled(),
+            topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
+            argmax_first: make_pipeline("logits_argmax_first")?,
+            argmax_merge: make_pipeline("logits_argmax_merge")?,
+            topk_select50_first: make_pipeline("logits_topk_select50_first")?,
+            topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
+            decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
+            decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
+            lora_gemv_a: make_pipeline("lora_gemv_a")?,
+            lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
+            // ADR-053: MoE Metal dispatch kernels
+            moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
+            moe_scale_add: make_pipeline("moe_scale_add")?,
+            moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
+            moe_zero_buf: make_pipeline("zero_buf")?,
+            scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
+            per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
+            partial_rope_batch: make_pipeline("partial_rope_batch")?,
+            copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
+            prefill_attention_batched: make_pipeline(&format!(
+                "prefill_attention_batched_causal_{prefill_grp_suffix}"
+            ))?,
+            copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
+            copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
+            decode_attention_f16: make_pipeline("decode_attention_f16")?,
+            decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
+            prefill_attention_batched_f16: make_pipeline(&format!(
+                "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
+            ))?,
+            lm_head_block_topk_f16: make_lm_head_block_pipelines(
+                device,
+                &library,
+                "lm_head_block_topk_f16",
+                cfg.hidden_size as u32,
+            )?,
+            lm_head_block_topk_q4: make_lm_head_block_pipelines(
+                device,
+                &library,
+                "lm_head_block_topk_q4",
+                cfg.hidden_size as u32,
+            )?,
+        })
+    }
+
     impl MetalQwen35Engine {
         /// Load immutable model resources from CPU weights. Does NOT allocate any session state.
         ///
@@ -3222,165 +3381,7 @@ mod inner {
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
-            // Group-size-specialized prefill attention kernel (occupancy win):
-            // group_size is fixed for a loaded model, so selection happens once
-            // here rather than per-dispatch. See `prefill_maxgrp_suffix`'s doc
-            // comment for the ship-safety rounding-up guarantee — validated
-            // in-range by `validate_flash_decode_shape` above.
-            let prefill_grp_suffix =
-                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
-
-            // Compile shaders
-            let opts = CompileOptions::new();
-            let library = device
-                .new_library_with_source(MSL_SOURCE, &opts)
-                .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
-
-            let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
-                let func = library
-                    .get_function(name, None)
-                    .map_err(|e| format!("function '{name}' not found: {e}"))?;
-                device
-                    .new_compute_pipeline_state_with_function(&func)
-                    .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
-            };
-
-            let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
-                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
-                // The compile/pipeline `.ok()?` chain below falls back to the
-                // naive gemm_q4 on any device where the V3.0 source fails.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q4_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
-                // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
-                // gemv_q3_decode-only (M=1) path on any device/compile failure.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q3_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
-                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let pipelines = MetalQwen35Pipelines {
-                gemv_decode: make_pipeline("gemv_decode_m1")?,
-                gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
-                gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q4: make_pipeline("gemv_q4_decode")?,
-                gemm_q4: make_pipeline("gemm_q4")?,
-                gemm_q4_tiled: make_optional_gemm_q4_tiled(),
-                gemv_q3: make_pipeline("gemv_q3_decode")?,
-                gemm_q3_tiled: make_optional_gemm_q3_tiled(),
-                rms_norm: make_pipeline("rms_norm_qwen35")?,
-                partial_rope: make_pipeline("partial_rope_interleaved")?,
-                per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
-                decode_attention: make_pipeline("decode_attention")?,
-                sigmoid_gate: make_pipeline("sigmoid_gate")?,
-                scatter_q_gate: make_pipeline("scatter_q_gate")?,
-                silu_mul: make_pipeline("silu_mul")?,
-                silu_mul_fused: make_pipeline("silu_mul_fused")?,
-                copy: make_pipeline("copy_buf")?,
-                copy_offset: make_pipeline("copy_buf_offset")?,
-                conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
-                gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
-                gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
-                gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
-                gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
-                gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
-                gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
-                gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
-                gdn_recurrence_q36: library
-                    .get_function("gdn_recurrence_fused_q36", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_precompute_keys: library
-                    .get_function("gdn_precompute_keys", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_recurrence_sharded: library
-                    .get_function("gdn_recurrence_sharded", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_norm_silu: library
-                    .get_function("gdn_norm_silu", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
-                copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
-                add_and_copy: make_pipeline("add_and_copy")?,
-                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
-                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
-                gemm_q8: make_pipeline("gemm_q8")?,
-                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
-                argmax_first: make_pipeline("logits_argmax_first")?,
-                argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_select50_first: make_pipeline("logits_topk_select50_first")?,
-                topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
-                decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
-                decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
-                lora_gemv_a: make_pipeline("lora_gemv_a")?,
-                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
-                // ADR-053: MoE Metal dispatch kernels
-                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
-                moe_scale_add: make_pipeline("moe_scale_add")?,
-                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
-                moe_zero_buf: make_pipeline("zero_buf")?,
-                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
-                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
-                partial_rope_batch: make_pipeline("partial_rope_batch")?,
-                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
-                prefill_attention_batched: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}"
-                ))?,
-                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
-                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
-                decode_attention_f16: make_pipeline("decode_attention_f16")?,
-                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
-                prefill_attention_batched_f16: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
-                ))?,
-                lm_head_block_topk_f16: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_f16",
-                    cfg.hidden_size as u32,
-                )?,
-                lm_head_block_topk_q4: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_q4",
-                    cfg.hidden_size as u32,
-                )?,
-            };
+            let pipelines = build_pipelines(&device, cfg)?;
 
             // Upload per-layer weights
             let quant_tag = match quant_format {
@@ -14284,14 +14285,6 @@ mod inner {
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
-            // Group-size-specialized prefill attention kernel (occupancy win):
-            // group_size is fixed for a loaded model, so selection happens once
-            // here rather than per-dispatch. See `prefill_maxgrp_suffix`'s doc
-            // comment for the ship-safety rounding-up guarantee — validated
-            // in-range by `validate_flash_decode_shape` above.
-            let prefill_grp_suffix =
-                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
-
             // Cache-capacity validation, matching `new_session` so a
             // `from_q4_dir` call cannot construct a runtime whose KV cap
             // outruns the RoPE table (`partial_rope_interleaved` indexes
@@ -14357,157 +14350,7 @@ mod inner {
                 ));
             }
 
-            // Compile shaders (same as new()).
-            let opts = CompileOptions::new();
-            let library = device
-                .new_library_with_source(MSL_SOURCE, &opts)
-                .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
-
-            let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
-                let func = library
-                    .get_function(name, None)
-                    .map_err(|e| format!("function '{name}' not found: {e}"))?;
-                device
-                    .new_compute_pipeline_state_with_function(&func)
-                    .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
-            };
-
-            let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
-                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
-                // The compile/pipeline `.ok()?` chain below falls back to the
-                // naive gemm_q4 on any device where the V3.0 source fails.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q4_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
-                // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
-                // gemv_q3_decode-only (M=1) path on any device/compile failure.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q3_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
-                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let pipelines = MetalQwen35Pipelines {
-                gemv_decode: make_pipeline("gemv_decode_m1")?,
-                gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
-                gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q4: make_pipeline("gemv_q4_decode")?,
-                gemm_q4: make_pipeline("gemm_q4")?,
-                gemm_q4_tiled: make_optional_gemm_q4_tiled(),
-                gemv_q3: make_pipeline("gemv_q3_decode")?,
-                gemm_q3_tiled: make_optional_gemm_q3_tiled(),
-                rms_norm: make_pipeline("rms_norm_qwen35")?,
-                partial_rope: make_pipeline("partial_rope_interleaved")?,
-                per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
-                decode_attention: make_pipeline("decode_attention")?,
-                sigmoid_gate: make_pipeline("sigmoid_gate")?,
-                scatter_q_gate: make_pipeline("scatter_q_gate")?,
-                silu_mul: make_pipeline("silu_mul")?,
-                silu_mul_fused: make_pipeline("silu_mul_fused")?,
-                copy: make_pipeline("copy_buf")?,
-                copy_offset: make_pipeline("copy_buf_offset")?,
-                conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
-                gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
-                gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
-                gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
-                gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
-                gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
-                gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
-                gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
-                gdn_recurrence_q36: library
-                    .get_function("gdn_recurrence_fused_q36", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_precompute_keys: library
-                    .get_function("gdn_precompute_keys", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_recurrence_sharded: library
-                    .get_function("gdn_recurrence_sharded", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_norm_silu: library
-                    .get_function("gdn_norm_silu", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
-                copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
-                add_and_copy: make_pipeline("add_and_copy")?,
-                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
-                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
-                gemm_q8: make_pipeline("gemm_q8")?,
-                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
-                argmax_first: make_pipeline("logits_argmax_first")?,
-                argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_select50_first: make_pipeline("logits_topk_select50_first")?,
-                topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
-                decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
-                decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
-                lora_gemv_a: make_pipeline("lora_gemv_a")?,
-                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
-                // ADR-053: MoE Metal dispatch kernels
-                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
-                moe_scale_add: make_pipeline("moe_scale_add")?,
-                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
-                moe_zero_buf: make_pipeline("zero_buf")?,
-                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
-                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
-                partial_rope_batch: make_pipeline("partial_rope_batch")?,
-                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
-                prefill_attention_batched: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}"
-                ))?,
-                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
-                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
-                decode_attention_f16: make_pipeline("decode_attention_f16")?,
-                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
-                prefill_attention_batched_f16: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
-                ))?,
-                lm_head_block_topk_f16: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_f16",
-                    cfg.hidden_size as u32,
-                )?,
-                lm_head_block_topk_q4: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_q4",
-                    cfg.hidden_size as u32,
-                )?,
-            };
+            let pipelines = build_pipelines(&device, cfg)?;
 
             let hidden = cfg.hidden_size;
             let q_dim = cfg.full_q_dim();
@@ -16927,6 +16770,92 @@ mod inner {
                     ),
                 "the release-build LATTICE_GDN_CPU fail-closed guard is independent \
                  of the retired debug reference functions and must remain"
+            );
+        }
+
+        #[test]
+        fn metal_constructors_share_one_pipeline_builder() {
+            let src = include_str!("metal_qwen35.rs");
+            let production_end = src
+                .find("    mod tests {")
+                .expect("mod tests must exist in this file");
+            let production_src = &src[..production_end];
+
+            let new_start = production_src
+                .find("pub fn new(weights: &ModelWeights, cfg: &Qwen35Config)")
+                .expect("in-memory Metal engine constructor must exist");
+            let new_end = new_start
+                + production_src[new_start..]
+                    .find("\n        pub fn new_session(")
+                    .expect("new_session must follow the in-memory constructor");
+            let new_body = &production_src[new_start..new_end];
+
+            let q4_start = production_src
+                .find("pub fn from_q4_dir(")
+                .expect("Q4-directory Metal constructor must exist");
+            let q4_end = q4_start
+                + production_src[q4_start..]
+                    .find("\n        pub fn chat_completion_streaming<")
+                    .expect("chat completion must follow the Q4-directory constructor");
+            let q4_body = &production_src[q4_start..q4_end];
+
+            for (name, body) in [("new", new_body), ("from_q4_dir", q4_body)] {
+                assert_eq!(
+                    body.matches("build_pipelines(&device, cfg)?").count(),
+                    1,
+                    "{name} must call the shared pipeline builder exactly once"
+                );
+                assert!(
+                    !body.contains("new_library_with_source(MSL_SOURCE")
+                        && !body.contains("let make_pipeline =")
+                        && !body.contains("MetalQwen35Pipelines {"),
+                    "{name} must not carry an independent pipeline-registration block"
+                );
+            }
+
+            assert_eq!(
+                production_src.matches("fn build_pipelines(").count(),
+                1,
+                "production code must define exactly one shared pipeline builder"
+            );
+            assert_eq!(
+                production_src
+                    .matches("build_pipelines(&device, cfg)?")
+                    .count(),
+                2,
+                "only the two constructors should invoke the shared pipeline builder"
+            );
+            assert_eq!(
+                production_src
+                    .matches("new_library_with_source(MSL_SOURCE, &opts)")
+                    .count(),
+                1,
+                "the main Qwen3.5 MSL source must compile in one registration block"
+            );
+        }
+
+        #[test]
+        fn shared_pipeline_builder_resolves_every_required_pipeline() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, _) = tiny_hybrid_fixture();
+
+            let pipelines = build_pipelines(&device, &cfg)
+                .expect("every required pipeline lookup in the shared builder must resolve");
+            assert_eq!(
+                pipelines.lm_head_block_topk_f16.len(),
+                LM_HEAD_LOCAL_KS.len()
+            );
+            assert_eq!(
+                pipelines.lm_head_block_topk_q4.len(),
+                LM_HEAD_LOCAL_KS.len()
             );
         }
 
