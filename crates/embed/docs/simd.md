@@ -160,21 +160,31 @@ precision. Applications should select tiers directly from workload-specific
 retention and retrieval-quality measurements.
 
 The fixed retrieval-fidelity regression pins each tier's healthy per-query
-Recall@10 and pairwise-agreement vector. In addition to inclusive aggregate and
-per-query floors, it sums absolute movement from that vector independently for
-each metric. The total allowance is one healthy min-to-max range: recall budgets
-are 0, 0, 0.2, and 0.4 for Full through Binary, while agreement budgets are 0,
-37/32,640, 242/32,640, and 1,282/32,640. Equality at a floor or budget is
-accepted; one `f64` epsilon prevents an exact floor boundary from failing only
-because of averaging.
+Recall@10 hit and pairwise-agreement counts. In addition to aggregate and
+per-query floors, its movement gate intersects two integer count-space bounds:
+total L1 movement may not exceed one healthy min-to-max span, and each query may
+not exceed the ceiling of one sixteenth of that span.
 
-For uniform movement across all 16 queries, the allowance is one sixteenth of
-the corresponding range. Binary therefore permits at most 80.125 aggregate
-agreement-pair changes per query, while a larger corpus-wide shift fails even when no
-query crosses an absolute floor. Absolute movement prevents one query's gain
-from cancelling another's loss and requires deliberate recalibration for a
-material improvement as well as a regression. Healthy fixture movement is zero;
-Full's zero-spread metrics retain zero movement allowance and remain exact.
+```text
+total_movement(metric) = sum(abs(candidate[query] - healthy[query]))
+total_budget(metric) = max(healthy) - min(healthy)
+query_cap(metric) = ceil(total_budget(metric) / 16)
+```
+
+| Tier   | Total recall-hit budget | Recall-hit cap/query | Total agreement-pair budget | Agreement-pair cap/query |
+| ------ | ----------------------: | -------------------: | --------------------------: | -----------------------: |
+| Full   |                       0 |                    0 |                           0 |                        0 |
+| Int8   |                       0 |                    0 |                          37 |                        3 |
+| Int4   |                       2 |                    1 |                         242 |                       16 |
+| Binary |                       4 |                    1 |                       1,282 |                       81 |
+
+Both bounds are inclusive integer comparisons. The ceiling admits the smallest
+whole-count local allowance compatible with a uniform share, while the retained
+total term prevents rounding from expanding the fixture-wide budget: 16 Binary
+queries moving 81 agreement pairs each fit their local caps but total 1,296 and
+fail the 1,282-pair budget. Absolute movement prevents gains from cancelling
+losses. The `f64` epsilon is used only by the separate aggregate Recall@10 and
+agreement-rate floor comparisons; it is not part of either movement decision.
 
 `QuantizedData` holds any tier behind one enum. Promoting or demoting it always
 dequantizes to `f32` and quantizes into the destination tier. Promotion does not

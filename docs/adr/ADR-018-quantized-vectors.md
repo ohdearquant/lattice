@@ -125,33 +125,44 @@ The recall bound allows one additional Recall@10 miss below the observed minimum
 bound extends one observed min-to-max range below the minimum; Full has no observed agreement
 spread and therefore remains exact. These fixture-derived margins detect whole-query collapse
 without replacing the aggregate gates. Every minimum floor is inclusive: a value at the floor is
-accepted. The comparison admits one `f64` epsilon so an exact boundary is not rejected solely
-because averaging rounded it down; non-finite values still fail.
+accepted. The aggregate Recall@10 and agreement-rate floor comparisons admit one `f64` epsilon so
+an exact rate boundary is not rejected solely because averaging rounded it down; non-finite values
+still fail. Movement limits use integer counts and do not use that epsilon.
 
 The gate also pins each tier's healthy 16-query vector as exact Recall@10 hit counts and agreeing
-pair counts. For each metric it sums the absolute per-query movement from that vector and permits
-at most one observed healthy min-to-max range across the entire fixture:
+pair counts. For each metric, acceptance is the intersection of a fixture-wide L1 budget and a
+per-query concentration cap, both computed and compared in integer count space:
 
 ```text
-movement(metric) = sum(abs(candidate[query] - healthy[query]))
-budget(metric) = max(healthy) - min(healthy)
+total_movement(metric) = sum(abs(candidate[query] - healthy[query]))
+total_budget(metric) = max(healthy) - min(healthy)
+query_cap(metric) = ceil(total_budget(metric) / 16)
 ```
 
-| Tier   | Total recall budget | Uniform recall budget/query | Total agreement budget | Uniform agreement budget/query |
-| ------ | ------------------: | --------------------------: | ---------------------: | -----------------------------: |
-| Full   |              0.0000 |                      0.0000 |               0.000000 |                       0.000000 |
-| Int8   |              0.0000 |                      0.0000 |               0.001134 |                       0.000071 |
-| Int4   |              0.2000 |                      0.0125 |               0.007414 |                       0.000463 |
-| Binary |              0.4000 |                      0.0250 |               0.039277 |                       0.002455 |
+| Tier   | Total recall-hit budget | Recall-hit cap/query | Total agreement-pair budget | Agreement-pair cap/query |
+| ------ | ----------------------: | -------------------: | --------------------------: | -----------------------: |
+| Full   |                       0 |                    0 |                           0 |                        0 |
+| Int8   |                       0 |                    0 |                          37 |                        3 |
+| Int4   |                       2 |                    1 |                         242 |                       16 |
+| Binary |                       4 |                    1 |                       1,282 |                       81 |
 
-The agreement totals are exactly 0, 37, 242, and 1,282 pair movements out of 32,640 for Full,
-Int8, Int4, and Binary. Under a uniform shift, the nonzero allowances are therefore 2.3125,
-15.125, and 80.125 agreement-pair changes per query. This is the deliberately accepted broad movement;
-a larger uniform shift fails even if every query still clears its absolute floor. The healthy
-fixture has zero movement and retains the full stated margin. Zero-spread metrics retain zero
-movement allowance, so Full's exact handling is unchanged. Absolute movement prevents gains on
-some queries from cancelling losses on others and makes a material improvement require the same
-deliberate fixture recalibration as a material regression.
+Both comparisons are inclusive. Ceiling division provides the smallest whole-count local allowance
+that admits the total budget's uniform share, while the retained total term prevents those rounded
+local caps from enlarging the fixture-wide allowance. For example, 16 Binary queries moving 81
+agreement pairs each stay within the local cap but total 1,296 and fail the 1,282-pair L1 budget.
+Absolute movement prevents gains on some queries from cancelling losses on others and makes a
+material improvement require the same deliberate fixture recalibration as a material regression.
+
+The Binary recall calibration deliberately permits four distinct queries to lose one Recall@10 hit
+each: the one-hit local cap and four-hit total cap are both satisfied. That movement changes aggregate
+Recall@10 by `4 / (16 * 10) = 0.025`, about 2.5 percentage points; the aggregate and per-query floors
+still apply independently.
+
+The count representation has a class-wide collision: distinct rankings can preserve both top-k
+overlap cardinality and the total number of agreeing pairs. Such rankings are indistinguishable to
+this gate because it does not express top-k candidate identity or the complete rank permutation. A
+future top-k identity check would detect membership changes, while a rank fingerprint would also
+detect position changes that preserve both current counts.
 
 Representation, tier identity, lossy-conversion, and distance-divergence assertions ensure a
 storage-conversion bypass or tier misrouting cannot satisfy the quality checks accidentally. The
