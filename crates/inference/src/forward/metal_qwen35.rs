@@ -6729,6 +6729,23 @@ mod inner {
             Ok(())
         }
 
+        fn check_forward_token_ids(
+            &self,
+            entry_point: &str,
+            token_ids: &[u32],
+        ) -> Result<(), crate::error::InferenceError> {
+            for (index, &token_id) in token_ids.iter().enumerate() {
+                if token_id as usize >= self.engine.config.vocab_size {
+                    return Err(crate::error::InferenceError::InvalidInput(format!(
+                        "{entry_point}: token_ids[{index}]={token_id} out of range: vocab_size \
+                         is {}",
+                        self.engine.config.vocab_size
+                    )));
+                }
+            }
+            Ok(())
+        }
+
         fn validate_live_cursor(
             entry_point: &str,
             supplied_position: usize,
@@ -7170,6 +7187,38 @@ mod inner {
             unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
         }
 
+        /// **Unstable**: fallible batch prompt prefill; kernel strategy may change.
+        ///
+        /// Returns logits for the last token while advancing KV and GDN state. This
+        /// is the non-panicking raw-prefill route; existing callers of
+        /// [`Self::forward_prefill`] can migrate by handling the returned
+        /// [`Result`]. Empty input retains `forward_prefill`'s existing zero-logit
+        /// result.
+        ///
+        /// # Fresh-prompt semantics
+        ///
+        /// This call always dispatches from position 0. It requires a fresh
+        /// session (`kv_cache.seq_len == 0` and GDN recurrent state at its initial
+        /// condition) and does not reset on the caller's behalf. Call
+        /// [`Self::reset_state`] before starting a new prompt on a reused session.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
+        /// dispatch for a non-fresh session, an out-of-vocabulary token, or a token
+        /// range beyond the session capacity. Rejection leaves session state
+        /// unchanged.
+        pub fn try_forward_prefill(
+            &mut self,
+            token_ids: &[u32],
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            self.check_raw_prefill_fresh_session("try_forward_prefill")?;
+            self.check_forward_token_ids("try_forward_prefill", token_ids)?;
+            self.check_forward_range_capacity(0, token_ids.len(), false)?;
+            self.cross_turn_prefix_cache.clear();
+            Ok(self.forward_prefill_impl(token_ids, false))
+        }
+
         /// **Unstable**: batch prompt prefill; prefill kernel and fallback threshold may change.
         ///
         /// Batch prefill: process all prompt tokens at once using GEMM.
@@ -7192,11 +7241,12 @@ mod inner {
         ///
         /// # Panics
         ///
-        /// Panics if any `token_ids[i] >= vocab_size`. The check is O(seq_len) and
-        /// runs once at the entry point before any GPU work. The tokenizer-bounded
-        /// generate path never triggers this; it can only be reached by a library
-        /// consumer passing raw ids with an out-of-vocabulary value. Also panics
-        /// before GPU dispatch if the session is not fresh (see above).
+        /// Panics when [`Self::try_forward_prefill`] returns an error: the session
+        /// is not fresh, a token is outside the vocabulary, or the token range
+        /// exceeds capacity. New code should use the fallible route and handle its
+        /// typed input error. This compatibility wrapper preserves the existing
+        /// return type for callers that treat those conditions as contract
+        /// violations.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -7207,11 +7257,10 @@ mod inner {
         /// no-op on those paths; it only matters for a consumer calling this
         /// entry point directly against a state with a live retained entry.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
-            if let Err(error) = self.check_raw_prefill_fresh_session("forward_prefill") {
-                panic!("{error}");
+            match self.try_forward_prefill(token_ids) {
+                Ok(logits) => logits,
+                Err(error) => panic!("{error}"),
             }
-            self.cross_turn_prefix_cache.clear();
-            self.forward_prefill_impl(token_ids, false)
         }
 
         /// **Unstable**: fallible prompt prefill with explicit hidden readback.
@@ -19798,6 +19847,26 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .collect()
         }
 
+        type CrossTurnCacheSnapshot = (
+            crate::kv_cache::CrossTurnPrefixEntry,
+            crate::attention::gdn::GdnSnapshot,
+            Vec<(usize, crate::attention::gdn::GdnSnapshot)>,
+        );
+
+        fn snapshot_cross_turn_cache(state: &MetalQwen35State) -> Option<CrossTurnCacheSnapshot> {
+            state.cross_turn_prefix_cache.entry.as_ref().map(|entry| {
+                (
+                    entry.generic.clone(),
+                    entry.gdn_snapshot.clone(),
+                    entry
+                        .checkpoints
+                        .iter()
+                        .map(|checkpoint| (checkpoint.len, checkpoint.snapshot.clone()))
+                        .collect(),
+                )
+            })
+        }
+
         fn mtp_loaded_live_hybrid_state_for_guard_test() -> MetalQwen35State {
             use crate::speculative::MtpTargetVerifier as _;
 
@@ -19842,7 +19911,24 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu = gpu_test_lock();
-            let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32)
+                .expect("tiny hybrid MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+            state
+                .generate_streaming_with_prefix_cache(
+                    crate::kv_cache::CrossTurnSlotId::DEFAULT,
+                    "ab",
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(9, 2),
+                    |_, _| true,
+                )
+                .expect("cache-aware warm-up must establish live state");
+            assert!(state.session.kv_cache.seq_len > 0);
+            assert!(!state.gdn_state_is_initial());
+            assert!(state.cross_turn_prefix_cache.entry.is_some());
+            state.reset_path_proof_counters();
 
             let seq_len_before = state.session.kv_cache.seq_len;
             let position_before = state.session.position;
@@ -19850,6 +19936,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let gdn_before = snapshot_gdn_bytes(&state);
             let hidden_before = state.session.last_pre_final_hidden.clone();
             let hidden_proof_before = state.hidden_readback_path_proof_snapshot();
+            let cross_turn_before = snapshot_cross_turn_cache(&state);
 
             let error = state
                 .try_forward_step(2, 0)
@@ -19863,6 +19950,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
             assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
             assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(snapshot_cross_turn_cache(&state), cross_turn_before);
             assert_eq!(
                 state.hidden_readback_path_proof_snapshot(),
                 hidden_proof_before
@@ -19910,6 +19998,23 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let hidden_before = state.session.last_pre_final_hidden.clone();
             let hidden_proof_before = state.hidden_readback_path_proof_snapshot();
 
+            let error = state
+                .try_forward_prefill(&[2, 3])
+                .expect_err("fallible raw prefill must reject a live session");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for a live-session raw prefill, got {error}");
+            };
+            assert!(message.contains("try_forward_prefill"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+
             let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 state.forward_prefill(&[2, 3])
             }));
@@ -19931,6 +20036,62 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 panic!("expected InvalidInput for a live-session raw prefill, got {error}");
             };
             assert!(message.contains("forward_prefill_all_logits"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn bench_prefill_helpers_reject_stale_cursor_without_mutation() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=bench_prefill_helpers_reject_stale_cursor_without_mutation \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (bench_prefill_helpers_reject_stale_cursor_without_mutation)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
+
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let position_before = state.session.position;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = snapshot_gdn_bytes(&state);
+            let hidden_before = state.session.last_pre_final_hidden.clone();
+            let hidden_proof_before = state.hidden_readback_path_proof_snapshot();
+
+            let isolated_error =
+                bench_support::forward_prefill_gdn_isolated_chunk(&mut state, &[2, 3], 0)
+                    .expect_err("isolated bench prefill must reject a stale cursor");
+            assert!(isolated_error.to_string().contains("isolated"));
+
+            let capture_error = bench_support::forward_prefill_gdn_isolated_chunk_capture(
+                &mut state,
+                &[2, 3],
+                0,
+                &[],
+            )
+            .expect_err("capture bench prefill must reject a stale cursor");
+            assert!(capture_error.to_string().contains("capture"));
+
+            let production_error =
+                bench_support::forward_prefill_production_chunk(&mut state, &[2, 3], 0)
+                    .expect_err("production bench prefill must reject a stale cursor");
+            assert!(production_error.to_string().contains("production"));
+
             assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
             assert_eq!(state.session.position, position_before);
             assert_eq!(snapshot_kv_bytes(&state), kv_before);
@@ -32190,7 +32351,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 &tokens,
                 0,
                 &capture_requests,
-            );
+            )
+            .expect("fresh benchmark state and in-range capture request");
             assert_eq!(
                 captures.len(),
                 capture_requests.len(),
@@ -37293,19 +37455,32 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// let mp = max_prefill(&state);
         /// let mut start = 0usize;
         /// for chunk in token_ids.chunks(mp) {
-        ///     total.accumulate(&forward_prefill_gdn_isolated_chunk(&mut state, chunk, start));
+        ///     let timing = forward_prefill_gdn_isolated_chunk(&mut state, chunk, start)?;
+        ///     total.accumulate(&timing);
         ///     start += chunk.len();
         /// }
         /// ```
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before cache
+        /// invalidation or GPU dispatch when `start_pos` is not the live cursor,
+        /// a token is out of range, the chunk is empty or too large, or its range
+        /// exceeds session capacity.
         pub fn forward_prefill_gdn_isolated_chunk(
             state: &mut MetalQwen35State,
             token_ids: &[u32],
             start_pos: usize,
-        ) -> GdnIsolatedChunkTiming {
-            assert_token_ids_in_vocab(state, token_ids);
-            state
+        ) -> Result<GdnIsolatedChunkTiming, crate::error::InferenceError> {
+            preflight_bench_prefill(
+                state,
+                "bench_support::forward_prefill_gdn_isolated_chunk",
+                token_ids,
+                start_pos,
+            )?;
+            Ok(state
                 .forward_prefill_chunk_gdn_isolated(token_ids, start_pos, &[])
-                .0
+                .0)
         }
 
         /// One (GDN layer, value head) target for a [`GdnLayerCapture`] read —
@@ -37348,20 +37523,31 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// recurrence inputs for each requested (layer, head) target. Capture
         /// cannot perturb the measured/production dispatch — see
         /// `MetalQwen35State::capture_gdn_chunk_scratch`'s doc comment.
+        ///
+        /// # Errors
+        ///
+        /// Returns the same pre-dispatch input errors as
+        /// [`forward_prefill_gdn_isolated_chunk`].
         pub fn forward_prefill_gdn_isolated_chunk_capture(
             state: &mut MetalQwen35State,
             token_ids: &[u32],
             start_pos: usize,
             capture: &[GdnCaptureRequest],
-        ) -> (GdnIsolatedChunkTiming, Vec<GdnLayerCapture>) {
-            assert_token_ids_in_vocab(state, token_ids);
-            state.forward_prefill_chunk_gdn_isolated(token_ids, start_pos, capture)
+        ) -> Result<(GdnIsolatedChunkTiming, Vec<GdnLayerCapture>), crate::error::InferenceError>
+        {
+            preflight_bench_prefill(
+                state,
+                "bench_support::forward_prefill_gdn_isolated_chunk_capture",
+                token_ids,
+                start_pos,
+            )?;
+            Ok(state.forward_prefill_chunk_gdn_isolated(token_ids, start_pos, capture))
         }
 
         /// The model's vocab size, exposed so harness bins can validate token ids
-        /// BEFORE the first forward call: the entry points in this module bypass
-        /// the public `forward_prefill_impl` path and its token-id validation, and
-        /// the embedding copy is an unsafe read indexed by token id.
+        /// before entering a measured region. Each forward helper also validates
+        /// token ids in its preflight because the embedding copy is an unsafe read
+        /// indexed by token id.
         pub fn vocab_size(state: &MetalQwen35State) -> usize {
             state.engine.config.vocab_size
         }
@@ -37376,19 +37562,29 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .map(|(i, &id)| (i, id))
         }
 
-        /// Both bench entry points bypass the public path's token-id validation,
-        /// so they re-validate here: the first forward would otherwise read
-        /// outside `embed_tokens` in the unsafe embedding copy instead of failing
-        /// loudly before measurement.
-        fn assert_token_ids_in_vocab(state: &MetalQwen35State, token_ids: &[u32]) {
-            let vocab = state.engine.config.vocab_size;
-            if let Some((i, id)) = first_out_of_vocab(token_ids, vocab) {
-                panic!(
-                    "token id {id} at index {i} is out of vocab range ({vocab}) — refusing \
-                     to run the unsafe embedding copy on unvalidated ids (tokenizer/model \
-                     mismatch?)"
-                );
+        fn preflight_bench_prefill(
+            state: &mut MetalQwen35State,
+            entry_point: &str,
+            token_ids: &[u32],
+            start_pos: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            if token_ids.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: token_ids must not be empty"
+                )));
             }
+            if token_ids.len() > state.session.max_prefill {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: chunk length {} exceeds max_prefill {}",
+                    token_ids.len(),
+                    state.session.max_prefill
+                )));
+            }
+            state.check_forward_token_ids(entry_point, token_ids)?;
+            state.check_forward_range_capacity(start_pos, token_ids.len(), false)?;
+            state.check_live_cursor(entry_point, start_pos)?;
+            state.cross_turn_prefix_cache.clear();
+            Ok(())
         }
 
         /// True iff this state's config supports the chunked GDN prefill path.
@@ -37397,29 +37593,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// the serial recurrence while the harness labels the arm "chunked".
         pub fn gdn_chunked_prefill_supported(state: &MetalQwen35State) -> bool {
             MetalQwen35State::supports_gdn_chunked_prefill(&state.engine.config)
-        }
-
-        #[cfg(test)]
-        mod tests {
-            use super::first_out_of_vocab;
-
-            #[test]
-            fn first_out_of_vocab_accepts_in_range() {
-                assert_eq!(first_out_of_vocab(&[0, 1, 99], 100), None);
-                assert_eq!(first_out_of_vocab(&[], 100), None);
-            }
-
-            #[test]
-            fn first_out_of_vocab_finds_first_offender() {
-                // Two offenders; the FIRST (index 1) must be reported.
-                assert_eq!(first_out_of_vocab(&[5, 200, 300], 100), Some((1, 200)));
-            }
-
-            #[test]
-            fn first_out_of_vocab_rejects_id_equal_to_vocab() {
-                // vocab_size itself is out of range (valid ids are 0..vocab_size).
-                assert_eq!(first_out_of_vocab(&[100], 100), Some((0, 100)));
-            }
         }
 
         /// The session's `max_prefill` (single-command-buffer chunk cap; 512 for all
@@ -37453,13 +37626,185 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// already inside `forward_prefill_batched_chunk`), so the caller times the
         /// call from outside with a plain CPU `Instant` — no internal
         /// instrumentation is needed or added.
+        ///
+        /// # Errors
+        ///
+        /// Returns the same pre-dispatch input errors as
+        /// [`forward_prefill_gdn_isolated_chunk`].
         pub fn forward_prefill_production_chunk(
             state: &mut MetalQwen35State,
             token_ids: &[u32],
             start_pos: usize,
-        ) {
-            assert_token_ids_in_vocab(state, token_ids);
+        ) -> Result<(), crate::error::InferenceError> {
+            preflight_bench_prefill(
+                state,
+                "bench_support::forward_prefill_production_chunk",
+                token_ids,
+                start_pos,
+            )?;
             let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false, false);
+            Ok(())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::first_out_of_vocab;
+
+            #[test]
+            fn first_out_of_vocab_accepts_in_range() {
+                assert_eq!(first_out_of_vocab(&[0, 1, 99], 100), None);
+                assert_eq!(first_out_of_vocab(&[], 100), None);
+            }
+
+            #[test]
+            fn first_out_of_vocab_finds_first_offender() {
+                // Two offenders; the FIRST (index 1) must be reported.
+                assert_eq!(first_out_of_vocab(&[5, 200, 300], 100), Some((1, 200)));
+            }
+
+            #[test]
+            fn first_out_of_vocab_rejects_id_equal_to_vocab() {
+                // vocab_size itself is out of range (valid ids are 0..vocab_size).
+                assert_eq!(first_out_of_vocab(&[100], 100), Some((0, 100)));
+            }
+        }
+    }
+}
+
+// Target-independent numerical support follows the macOS + Metal implementation.
+#[cfg(test)]
+mod public_scheduling_entry_point_tests {
+    use std::collections::BTreeSet;
+
+    fn item<'a>(source: &'a str, declaration: &str) -> &'a str {
+        let start = source
+            .find(declaration)
+            .unwrap_or_else(|| panic!("missing declaration {declaration}"));
+        let open = start
+            + source[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("missing body for {declaration}"));
+        let mut depth = 0usize;
+        for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated body for {declaration}");
+    }
+
+    fn public_functions(source: &str) -> Vec<(&str, &str)> {
+        let mut functions = Vec::new();
+        let mut rest = source;
+        while let Some(offset) = rest.find("pub fn ") {
+            rest = &rest[offset..];
+            let name_start = "pub fn ".len();
+            let name_end = rest[name_start..]
+                .find('(')
+                .map(|end| name_start + end)
+                .expect("public function has an argument list");
+            let declaration = &rest[..name_end + 1];
+            let body = item(rest, declaration);
+            functions.push((&rest[name_start..name_end], body));
+            rest = &rest[body.len()..];
+        }
+        functions
+    }
+
+    #[test]
+    fn every_public_stateful_scheduling_entry_point_has_preflight() {
+        let source = include_str!("metal_qwen35.rs");
+        let real = source
+            .split_once("mod inner {")
+            .expect("real Metal implementation exists")
+            .1
+            .split_once("// Target-independent numerical support follows")
+            .expect("real Metal implementation has a stable end marker")
+            .0;
+        let sinks = [
+            "forward_step_inner(",
+            "forward_prefill_impl(",
+            "forward_prefill_batched_chunk(",
+            "forward_prefill_chunk_gdn_isolated(",
+            "verify_tokens_batched(",
+        ];
+        let mut discovered: BTreeSet<&str> = public_functions(real)
+            .into_iter()
+            .filter(|(name, body)| {
+                name.starts_with("forward_prefill")
+                    || body.split_once('{').is_some_and(|(signature, _)| {
+                        signature.contains("position: usize")
+                            || signature.contains("start_pos: usize")
+                    })
+                    || sinks.iter().any(|sink| body.contains(sink))
+            })
+            .map(|(name, _)| name)
+            .collect();
+        discovered.extend(["rollback_cache_to", "verify_tokens"]);
+
+        let expected: BTreeSet<&str> = [
+            "forward_prefill",
+            "forward_prefill_all_logits",
+            "forward_prefill_gdn_isolated_chunk",
+            "forward_prefill_gdn_isolated_chunk_capture",
+            "forward_prefill_production_chunk",
+            "forward_prefill_with_hidden",
+            "forward_step",
+            "forward_step_with_hidden",
+            "prepare_hidden_for_bench",
+            "rollback_cache_to",
+            "try_forward_prefill",
+            "try_forward_step",
+            "verify_tokens",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(discovered, expected, "public scheduling population changed");
+
+        for (declaration, preflight) in [
+            ("pub fn try_forward_step(", "check_live_cursor"),
+            ("pub fn forward_step_with_hidden(", "check_live_cursor"),
+            ("pub fn forward_step(", "try_forward_step"),
+            (
+                "pub fn try_forward_prefill(",
+                "check_raw_prefill_fresh_session",
+            ),
+            ("pub fn forward_prefill(", "try_forward_prefill"),
+            (
+                "pub fn forward_prefill_with_hidden(",
+                "validate_hidden_prefill_fresh_session",
+            ),
+            (
+                "pub fn forward_prefill_all_logits(",
+                "check_raw_prefill_fresh_session",
+            ),
+            ("fn verify_tokens(", "check_live_cursor"),
+            ("fn rollback_cache_to(", "rollback_speculative_state_to"),
+            ("pub fn prepare_hidden_for_bench(", "forward_step"),
+            (
+                "pub fn forward_prefill_gdn_isolated_chunk(",
+                "preflight_bench_prefill",
+            ),
+            (
+                "pub fn forward_prefill_gdn_isolated_chunk_capture(",
+                "preflight_bench_prefill",
+            ),
+            (
+                "pub fn forward_prefill_production_chunk(",
+                "preflight_bench_prefill",
+            ),
+        ] {
+            assert!(
+                item(real, declaration).contains(preflight),
+                "{declaration} must route through {preflight}"
+            );
         }
     }
 }
@@ -38575,6 +38920,31 @@ impl MetalQwen35State {
         ))
     }
 
+    /// **Unstable**: Metal prefill stub; panics without macOS + metal-gpu.
+    ///
+    /// Use [`Self::try_forward_prefill`] for a typed capability error.
+    pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
+        match self.try_forward_prefill(token_ids) {
+            Ok(logits) => logits,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// **Unstable**: fallible Metal prefill stub.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`crate::error::InferenceError::Inference`] without
+    /// macOS + `metal-gpu` support.
+    pub fn try_forward_prefill(
+        &mut self,
+        _token_ids: &[u32],
+    ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
     /// **Unstable**: fallible Metal hidden-returning prefill stub.
     pub fn forward_prefill_with_hidden(
         &mut self,
@@ -38710,6 +39080,18 @@ mod non_metal_stub_tests {
             ("he".to_string(), "l".to_string()),
         ];
         BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap()
+    }
+
+    #[test]
+    fn non_metal_stub_try_forward_prefill_returns_capability_error() {
+        let mut state = MetalQwen35State;
+        let result = state.try_forward_prefill(&[1, 2]);
+        match result {
+            Err(InferenceError::Inference(message)) => {
+                assert!(message.contains("metal-gpu"), "{message}");
+            }
+            other => panic!("expected Metal capability error, got {other:?}"),
+        }
     }
 
     #[test]
