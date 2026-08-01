@@ -27,6 +27,8 @@ fn main() {
     use metal::*;
     use std::time::Instant;
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
     // -----------------------------------------------------------------------
     // MSL — baseline (old 3-pass kernel), renamed to decode_attention_reference
     // -----------------------------------------------------------------------
