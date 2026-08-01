@@ -141,6 +141,7 @@ struct StatusBadge: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("Badges") {
     VStack(alignment: .leading, spacing: Theme.Space.md) {
         Text("FORMAT BADGES")
@@ -171,3 +172,4 @@ struct StatusBadge: View {
     .padding(Theme.Space.lg)
     .background(Theme.Palette.canvas)
 }
+#endif
