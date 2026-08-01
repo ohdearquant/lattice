@@ -2,7 +2,7 @@
 
 **Status**: Accepted (clusters C1–C4 implemented and merged; see implementation record below)
 **Kind**: Aspirational
-**Date**: 2026-07-09 (status updated 2026-07-11)
+**Date**: 2026-07-09 (status updated 2026-07-11; amended 2026-07-28)
 
 **Implementation record** (verified against merged PRs at `origin/main @ 32697ed0e`):
 
@@ -30,7 +30,8 @@ own work independently; their state does not gate this ADR's acceptance.
 **Crate**: lattice-inference (`crates/inference/src/attention/`, `src/forward/`, `src/bin/`,
 `src/model/qwen35/`)
 **Research**: Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; adversarially verified at the audited commit; re-verified at `origin/main @ 0699e60cc`)
-**Issues**: #739, #740, #741 (attention-softmax); #744, #745, #746 (http-serve); related
+**Issues**: #739, #740, #741 (attention-softmax); #744, #745, #746 (http-serve); #1115
+(Metal measurement lock); related
 non-cluster audit items tracked in #764-#777 (per-family checklists and standalone items)
 **Depends on**: ADR-058 (CPU performance regression CI — superseded; retained for `make bench-compare` provenance), ADR-064 (CI gate taxonomy), ADR-066 (e2e parity gate, Accepted)
 
@@ -310,6 +311,62 @@ are unaffected. See `detect_format_prefers_safetensors_index_over_q4_files` in
 **Resolves**: #829 — one canonical model-format detector, zero remaining local
 re-implementations in `lattice.rs`, `lattice_serve.rs`, `chat_metal.rs`, or the three
 benchmark binaries.
+
+### Amendment (2026-07-28): Metal measurement-lock consolidation (#1115)
+
+The Metal test lock had three test-local implementations in `metal.rs`,
+`metal_qwen35.rs`, and `vision_s3b_vit_metal_gate_test.rs`, plus a fourth
+process-lifetime variant in `bench_gdn_prefill_ab.rs`. All used the same fleet
+path and 30-minute bound, but no implementation was callable by the raw Metal
+benches and examples because Cargo builds those targets as crates separate from
+the library.
+
+The canonical implementation lives in `src/measurement.rs` and is exported only
+under `cfg(all(target_os = "macos", feature = "metal-gpu"))`. Both the module and
+its sole function are `#[doc(hidden)]`; the function returns an opaque RAII
+guard, so its concrete type and fields do not become externally nameable
+surface. This narrowly public boundary is repository support, not production
+API. A library export is necessary because unit tests, integration tests,
+benches, examples, and binaries cannot share a `pub(crate)` item across their
+Cargo crate boundaries. A new support crate would add a dependency and package
+for one guard, while source-including one file into every target would create
+multiple compiled implementations rather than one callable contract.
+
+Behavior remains the established fail-loud contract: acquire the in-process
+mutex first, then poll an exclusive advisory lock on
+`/tmp/lion-metal-gpu-test.lock` every 500 ms; panic after 30 minutes with an
+`lsof` hint; hold both resources until the opaque guard drops. The eight raw
+Metal measurement harnesses identified in #1115 keep that guard live across
+their protected entry point. Cargo metadata supplies the binary, example,
+benchmark, integration-test, and library roots, so nested and manifest-path
+targets enter the same inventory as conventional targets. The construction
+inventory scans direct `MetalQwen35State::{new,from_q4_dir}` calls in those
+compiler-selected source closures. Every deferred construction waiver names the
+Cargo target kind, target name, target root, and exact source line and column;
+adding a second construction to an exempt function therefore creates a new,
+unclassified site. For non-exempt sites, the source check requires a simple
+named binding whose lexical scope encloses the protected entry point or entire
+test, and rejects any later use of that binding, including an immediate `drop`.
+
+This is a checked pre-expansion binding convention, not a proof of arbitrary
+Rust lifetime semantics, name-resolved call graphs, or macro expansion. In
+particular, a macro invocation whose protected identifiers are supplied only as
+metavariables is outside the lexical inventory; a regression fixture records
+that limitation explicitly. A separate direct raw-dispatch inventory examines
+test functions in Cargo-selected library and integration-test module closures
+and records recognized direct command-buffer method calls by source path and
+function name. Its brace-aware scope model carries recursive `cfg` and
+`cfg_attr` conditions from enclosing modules, functions, blocks, and guard
+bindings. Recognized direct syntax, malformed selected source, unresolved
+modules, and unclassifiable test registration fail closed. Helper-mediated work
+without a recognized marker remains outside this source-level guarantee and
+must be guarded through an explicit checked entrypoint or tracked as an exact
+site.
+
+**Partial completion**: #1115 — one shared Metal test/measurement guard, the four
+prior implementations migrated, and the verified direct raw Metal measurement
+harnesses serialized before GPU work. The remaining exact deferred measurement
+sites and process-lifetime exclusions are tracked in #1274.
 
 ## What we are NOT doing
 

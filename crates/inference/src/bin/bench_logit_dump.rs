@@ -32,6 +32,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::model::qwen35::Qwen35Model;
     use lattice_inference::model_format::{ModelFormat, detect_format};
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let home = std::env::var("HOME")?;
     let model_dir_str = std::env::var("LATTICE_MODEL_DIR")
         .unwrap_or_else(|_| format!("{home}/.lattice/models/qwen3.5-0.8b"));
