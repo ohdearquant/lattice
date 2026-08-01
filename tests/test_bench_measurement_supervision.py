@@ -15,7 +15,9 @@ import tempfile
 import time
 import tomllib
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 MANIFEST = REPO / "scripts" / "bench-measurements.toml"
@@ -35,6 +37,10 @@ MEASUREMENT_SIGNAL = re.compile(
     r"perf_counter(?:_ns)?\(|hrtime\.bigint\(|cargo bench|tok_per_sec|"
     r"elapsed_ns|elapsed_s|total_ms|tokens/s|tok/s|PPL:"
 )
+CARGO_BENCH_LITERAL = re.compile(r"\bcargo[ \t\r\n]+bench\b")
+CARGO_BENCH_ARGV_LITERAL = re.compile(
+    r'''["']cargo["']\s*,\s*(?:\[\s*)?["']bench["']'''
+)
 PYTHON_TIMING_CALLS = {
     "time.monotonic",
     "time.monotonic_ns",
@@ -44,7 +50,70 @@ PYTHON_TIMING_CALLS = {
     "time.process_time_ns",
     "time.time",
 }
-SCRIPT_SUFFIXES = {".mjs", ".py", ".sh"}
+PYTHON_COMMAND_CALLS = {
+    "Popen",
+    "call",
+    "check_call",
+    "check_output",
+    "os.popen",
+    "os.system",
+    "run",
+    "subprocess.Popen",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+    "subprocess.getoutput",
+    "subprocess.getstatusoutput",
+    "subprocess.run",
+    "system",
+}
+SCRIPT_EXTENSION_LANGUAGES = {
+    ".bash": "shell",
+    ".js": "node",
+    ".mjs": "node",
+    ".py": "python",
+    ".sh": "shell",
+}
+SCRIPT_SHEBANG_LANGUAGES = {
+    "#!/bin/bash": "shell",
+    "#!/bin/sh": "shell",
+    "#!/usr/bin/env bash": "shell",
+    "#!/usr/bin/env node": "node",
+    "#!/usr/bin/env python3": "python",
+    "#!/usr/bin/node": "node",
+    "#!/usr/bin/python3": "python",
+}
+SCRIPT_SUFFIXES = set(SCRIPT_EXTENSION_LANGUAGES)
+EXPLICIT_SCRIPT_EXCLUSIONS = frozenset(
+    {
+        "scripts/bench-measurements.toml",
+        "scripts/bench_decode_profiles.toml",
+        "scripts/bench_evidence/pr882/CANONICAL_POLICY_IDENTITY.md",
+        "scripts/bench_evidence/pr882/POLICY_SHA_TRANSITIONS.md",
+        "scripts/bench_evidence/pr882/report_ctx1024.json",
+        "scripts/bench_evidence/pr882/report_ctx512.json",
+        "scripts/bench_expected_cells.toml",
+        "scripts/lib/bench-host-id.py",
+        "scripts/lib/bench-informational-targets.sh",
+        "scripts/lib/bench-locks.py",
+        "scripts/lib/bench-quick-informational-targets.txt",
+        "scripts/lib/bench-supervision.sh",
+        "scripts/lib/bench_supervision.py",
+        "scripts/lib/ensure-noindex-marker.sh",
+        "scripts/lib/machine-state-probe.py",
+        "scripts/lib/quiet-probe.py",
+        "scripts/perf-policy.toml",
+        "scripts/perf_governor.README.md",
+    }
+    | INTERNAL_OR_TEST
+)
+
+
+@dataclass(frozen=True)
+class ScriptDecision:
+    state: str
+    reason: str
+    evidence: frozenset[str] = frozenset()
 
 
 def manifest_entries() -> dict[str, dict[str, str]]:
@@ -99,6 +168,11 @@ def _literal_strings(node: ast.AST) -> list[str]:
     return []
 
 
+def _contains_literal_cargo_bench(node: ast.AST) -> bool:
+    values = _literal_strings(node)
+    return bool(values and CARGO_BENCH_LITERAL.search(" ".join(values)))
+
+
 def _python_measurement_evidence(source: str, path: Path) -> set[str]:
     tree = ast.parse(source, filename=str(path))
     evidence: set[str] = set()
@@ -120,23 +194,25 @@ def _python_measurement_evidence(source: str, path: Path) -> set[str]:
             and "/api/generate" in node.value
         ):
             evidence.add("generation timing API")
-        if isinstance(node, (ast.List, ast.Tuple)):
-            values = _literal_strings(node)
-            if any(
-                first == "cargo" and second == "bench"
-                for first, second in zip(values, values[1:])
-            ):
+        if isinstance(node, (ast.List, ast.Tuple)) and _contains_literal_cargo_bench(
+            node
+        ):
+            evidence.add("cargo bench command")
+        if isinstance(node, ast.Call) and _dotted_name(node.func) in PYTHON_COMMAND_CALLS:
+            command_nodes = list(node.args[:1])
+            command_nodes.extend(
+                keyword.value
+                for keyword in node.keywords
+                if keyword.arg in {"args", "cmd", "command"}
+            )
+            if any(_contains_literal_cargo_bench(value) for value in command_nodes):
                 evidence.add("cargo bench command")
     return evidence
 
 
 def _shell_or_node_measurement_evidence(source: str) -> set[str]:
     evidence: set[str] = set()
-    if re.search(
-        r"(?m)^[ \t]*(?:if[ \t]+)?"
-        r"(?:[A-Z_][A-Z0-9_]*=[^ \t]+[ \t]+)*cargo[ \t]+bench\b",
-        source,
-    ):
+    if CARGO_BENCH_LITERAL.search(source) or CARGO_BENCH_ARGV_LITERAL.search(source):
         evidence.add("cargo bench command")
     if re.search(
         r"(?m)^[ \t]*(?:bench_supervise_entry\b|"
@@ -151,32 +227,134 @@ def _shell_or_node_measurement_evidence(source: str) -> set[str]:
     return evidence
 
 
-def discovered_measurement_evidence() -> dict[str, set[str]]:
-    """Collect direct driver evidence without trusting manifest roles.
+def _explicit_script_exclusion(relative: str) -> str | None:
+    path = Path(relative)
+    if "__pycache__" in path.parts and path.suffix == ".pyc":
+        return "generated Python bytecode cache, not source"
+    if relative not in EXPLICIT_SCRIPT_EXCLUSIONS:
+        return None
+    if relative.startswith("scripts/lib/"):
+        return "explicit internal helper; supervised callers are classified separately"
+    if relative in INTERNAL_OR_TEST:
+        return "explicit policy self-test or internal measurement body"
+    return "explicit non-executable policy, fixture, or documentation asset"
 
-    Literal source analysis cannot follow dynamically assembled commands,
-    imported helper call graphs, or renamed timing APIs. Unsupported shebang
-    languages and Python syntax errors fail the scan instead of being skipped.
-    """
 
-    evidence_by_path: dict[str, set[str]] = {}
-    for path in sorted((REPO / "scripts").rglob("*")):
-        if not path.is_file() or path.parent == REPO / "scripts" / "lib":
-            continue
-        if path.suffix not in SCRIPT_SUFFIXES:
-            if path.read_bytes()[:2] == b"#!":
-                raise AssertionError(
-                    f"unsupported script language for {path.relative_to(REPO)}"
-                )
-            continue
-        source = path.read_text()
-        if path.suffix == ".py":
+def _classify_script(path: Path, relative: str) -> ScriptDecision:
+    exclusion = _explicit_script_exclusion(relative)
+    if exclusion is not None:
+        return ScriptDecision("excluded", exclusion)
+    try:
+        source = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        detail = str(exc) or "exception carried no message"
+        return ScriptDecision("undecidable", f"source read failed: {type(exc).__name__}: {detail}")
+
+    lines = source.splitlines()
+    first_line = lines[0] if lines else ""
+    extension_language = SCRIPT_EXTENSION_LANGUAGES.get(path.suffix)
+    shebang_language = None
+    if first_line.startswith("#!"):
+        shebang_language = SCRIPT_SHEBANG_LANGUAGES.get(first_line)
+        if shebang_language is None:
+            return ScriptDecision("undecidable", f"unsupported shebang {first_line!r}")
+    if (
+        extension_language is not None
+        and shebang_language is not None
+        and extension_language != shebang_language
+    ):
+        return ScriptDecision(
+            "undecidable",
+            f"extension selects {extension_language}, shebang selects {shebang_language}",
+        )
+    language = extension_language or shebang_language
+    if language is None:
+        return ScriptDecision(
+            "undecidable",
+            f"no supported extension or shebang (suffix {path.suffix or '<none>'!r})",
+        )
+
+    try:
+        if language == "python":
             evidence = _python_measurement_evidence(source, path)
         else:
             evidence = _shell_or_node_measurement_evidence(source)
-        if evidence:
-            evidence_by_path[str(path.relative_to(REPO))] = evidence
-    return evidence_by_path
+    except SyntaxError as exc:
+        return ScriptDecision(
+            "undecidable",
+            f"Python syntax error at line {exc.lineno}: {exc.msg}",
+        )
+    if evidence:
+        return ScriptDecision(
+            "measurement",
+            f"{language} analysis found direct measurement evidence",
+            frozenset(evidence),
+        )
+    return ScriptDecision(
+        "not-measurement",
+        f"{language} analysis completed; no direct measurement pattern matched",
+        frozenset(
+            {
+                f"{language} source analysis completed",
+                "zero recognized direct measurement patterns",
+            }
+        ),
+    )
+
+
+def discovered_script_decisions(repo: Path | None = None) -> dict[str, ScriptDecision]:
+    root = repo or REPO
+    decisions: dict[str, ScriptDecision] = {}
+    for path in sorted((root / "scripts").rglob("*")):
+        if not path.is_file():
+            continue
+        relative = str(path.relative_to(root))
+        decisions[relative] = _classify_script(path, relative)
+    return decisions
+
+
+def discovered_measurement_evidence(
+    repo: Path | None = None,
+) -> dict[str, set[str]]:
+    """Collect direct driver evidence without trusting manifest roles.
+
+    The syntax-pattern method has no bounded recall for dynamic construction,
+    indirect call graphs, aliases, wrappers, generated code, or shell expansion.
+    Every searched file still records a decision; undecidable inputs fail closed.
+    """
+
+    decisions = discovered_script_decisions(repo)
+    undecidable = [
+        f"{path}: {decision.reason}"
+        for path, decision in decisions.items()
+        if decision.state == "undecidable"
+    ]
+    if undecidable:
+        raise AssertionError("undecidable script candidates:\n" + "\n".join(undecidable))
+    return {
+        path: set(decision.evidence)
+        for path, decision in decisions.items()
+        if decision.state == "measurement"
+    }
+
+
+def validate_direct_measurement_supervision() -> None:
+    entries = manifest_entries()
+    evidence_by_path = discovered_measurement_evidence()
+    if not evidence_by_path:
+        raise AssertionError("measurement evidence scan collected zero paths")
+    failures: list[str] = []
+    for path, evidence in evidence_by_path.items():
+        detail = ", ".join(sorted(evidence))
+        entry = entries.get(path)
+        if entry is None:
+            failures.append(f"{path}: unclassified {detail}")
+        elif entry["role"] != "measurement":
+            failures.append(f"{path}: source contains {detail}; role={entry['role']}")
+        elif entry["supervision"] == "none":
+            failures.append(f"{path}: source contains {detail}; supervision=none")
+    if failures:
+        raise AssertionError("\n".join(failures))
 
 
 class InventoryContract(unittest.TestCase):
@@ -275,14 +453,14 @@ class InventoryContract(unittest.TestCase):
             for path in (REPO / "scripts").iterdir()
             if path.is_file()
             and path.name.startswith("bench")
-            and path.suffix in {".py", ".sh", ".mjs"}
+            and path.suffix in SCRIPT_SUFFIXES
         }
         discovered.update(SPECIAL_ENTRYPOINTS)
         discovered.update(
             str(path.relative_to(REPO))
             for path in (REPO / "scripts").rglob("*")
             if path.is_file()
-            and path.suffix in {".py", ".sh", ".mjs"}
+            and path.suffix in SCRIPT_SUFFIXES
             and MEASUREMENT_SIGNAL.search(path.read_text())
         )
         discovered.difference_update(INTERNAL_OR_TEST)
@@ -291,23 +469,158 @@ class InventoryContract(unittest.TestCase):
     def test_direct_measurement_evidence_requires_supervision(self):
         """Source evidence, not manifest claims, determines this requirement."""
 
-        entries = manifest_entries()
-        evidence_by_path = discovered_measurement_evidence()
-        self.assertTrue(evidence_by_path, "measurement evidence scan collected zero paths")
-        for path, evidence in evidence_by_path.items():
-            detail = ", ".join(sorted(evidence))
-            with self.subTest(path=path, evidence=detail):
-                self.assertIn(path, entries, f"{path}: unclassified {detail}")
-                self.assertEqual(
-                    entries[path]["role"],
-                    "measurement",
-                    f"{path}: source contains {detail}",
+        validate_direct_measurement_supervision()
+
+    def test_no_shebang_javascript_measurement_is_discovered(self):
+        """Explicit Node invocation does not require a shebang or executable bit."""
+
+        fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scripts = fixture_repo / "scripts"
+        scripts.mkdir()
+        fixture = scripts / "bench_no_shebang.js"
+        fixture.write_text(
+            'require("node:child_process").execSync("cargo bench -p lattice-inference");\n'
+        )
+
+        evidence = discovered_measurement_evidence(fixture_repo)
+        self.assertEqual(
+            evidence["scripts/bench_no_shebang.js"], {"cargo bench command"}
+        )
+
+    def test_no_shebang_bash_measurement_is_discovered(self):
+        """Explicit Bash invocation does not require a shebang or executable bit."""
+
+        fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scripts = fixture_repo / "scripts"
+        scripts.mkdir()
+        fixture = scripts / "bench_no_shebang.bash"
+        fixture.write_text('bash -lc "cargo bench -p lattice-inference"\n')
+
+        evidence = discovered_measurement_evidence(fixture_repo)
+        self.assertEqual(
+            evidence["scripts/bench_no_shebang.bash"], {"cargo bench command"}
+        )
+
+    def test_literal_shell_benchmark_consumer_fails_real_supervision(self):
+        """A literal subprocess shell command cannot be declared a consumer."""
+
+        fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scripts = fixture_repo / "scripts"
+        scripts.mkdir()
+        fixture = scripts / "bench_literal_shell.py"
+        fixture.write_text(
+            "#!/usr/bin/env python3\n"
+            "import subprocess\n"
+            'subprocess.run("cargo bench -p lattice-inference", shell=True)\n'
+        )
+        manifest = scripts / "bench-measurements.toml"
+        manifest.write_text(
+            "[[entry]]\n"
+            'path = "scripts/bench_literal_shell.py"\n'
+            'role = "consumer"\n'
+            'supervision = "none"\n'
+        )
+        self.enterContext(mock.patch.object(sys.modules[__name__], "REPO", fixture_repo))
+        self.enterContext(mock.patch.object(sys.modules[__name__], "MANIFEST", manifest))
+
+        with self.assertRaises(AssertionError) as caught:
+            self.test_direct_measurement_evidence_requires_supervision()
+        self.assertIn("scripts/bench_literal_shell.py", str(caught.exception))
+        self.assertIn("cargo bench command", str(caught.exception))
+
+    def test_literal_shell_benchmark_call_forms_are_detected(self):
+        cases = {
+            "run": 'subprocess.run("cargo bench -p lattice-inference", shell=True)',
+            "popen": 'subprocess.Popen("cargo bench -p lattice-inference", shell=True)',
+            "check_output": (
+                'subprocess.check_output("cargo bench -p lattice-inference", shell=True)'
+            ),
+            "os_system": 'os.system("cargo bench -p lattice-inference")',
+            "shell_driver": (
+                'subprocess.run(["bash", "-lc", "cargo bench -p lattice-inference"])'
+            ),
+        }
+        for name, call in cases.items():
+            with self.subTest(name=name):
+                evidence = _python_measurement_evidence(
+                    f"import os\nimport subprocess\n{call}\n", Path(f"{name}.py")
                 )
-                self.assertNotEqual(
-                    entries[path]["supervision"],
-                    "none",
-                    f"{path}: source contains {detail}",
+                self.assertIn("cargo bench command", evidence)
+
+    def test_undecidable_input_fails_real_supervision_with_reason(self):
+        """An unanalyzable candidate is a named failure, never a negative."""
+
+        fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scripts = fixture_repo / "scripts"
+        scripts.mkdir()
+        fixture = scripts / "bench_unknown.rb"
+        fixture.write_text('system("cargo bench -p lattice-inference")\n')
+        manifest = scripts / "bench-measurements.toml"
+        manifest.write_text(
+            "[[entry]]\n"
+            'path = "scripts/bench_unknown.rb"\n'
+            'role = "consumer"\n'
+            'supervision = "none"\n'
+        )
+        self.enterContext(mock.patch.object(sys.modules[__name__], "REPO", fixture_repo))
+        self.enterContext(mock.patch.object(sys.modules[__name__], "MANIFEST", manifest))
+
+        with self.assertRaises(AssertionError) as caught:
+            self.test_direct_measurement_evidence_requires_supervision()
+        self.assertIn("scripts/bench_unknown.rb", str(caught.exception))
+        self.assertIn("no supported extension or shebang", str(caught.exception))
+
+        with mock.patch.object(Path, "read_bytes", side_effect=OSError()):
+            decision = _classify_script(
+                Path("scripts/bench_unreadable.py"),
+                "scripts/bench_unreadable.py",
+            )
+        self.assertEqual(decision.state, "undecidable")
+        self.assertIn("exception carried no message", decision.reason)
+
+    def test_invalid_python_and_unsupported_shebang_are_undecidable(self):
+        cases = {
+            "scripts/bench_invalid.py": (
+                "#!/usr/bin/env python3\nif True print('bad')\n",
+                "Python syntax error",
+            ),
+            "scripts/bench_ruby.py": (
+                "#!/usr/bin/env ruby\nputs 'cargo bench'\n",
+                "unsupported shebang",
+            ),
+            "scripts/bench_node.py": (
+                '#!/usr/bin/env node\nconsole.log("cargo bench")\n',
+                "extension selects python, shebang selects node",
+            ),
+        }
+        for relative, (source, reason) in cases.items():
+            with self.subTest(path=relative):
+                fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+                fixture = fixture_repo / relative
+                fixture.parent.mkdir(parents=True)
+                fixture.write_text(source)
+                with self.assertRaises(AssertionError) as caught:
+                    discovered_measurement_evidence(fixture_repo)
+                self.assertIn(relative, str(caught.exception))
+                self.assertIn(reason, str(caught.exception))
+
+    def test_script_discovery_records_every_file_decision(self):
+        decisions = discovered_script_decisions()
+        searched = {
+            str(path.relative_to(REPO))
+            for path in (REPO / "scripts").rglob("*")
+            if path.is_file()
+        }
+        self.assertEqual(set(decisions), searched)
+        for path, decision in decisions.items():
+            with self.subTest(path=path):
+                self.assertIn(
+                    decision.state,
+                    {"measurement", "not-measurement", "excluded", "undecidable"},
                 )
+                self.assertTrue(decision.reason)
+                if decision.state in {"measurement", "not-measurement"}:
+                    self.assertTrue(decision.evidence)
 
     def test_every_measurement_entry_has_a_live_guard(self):
         """Mutation-sensitive: deleting any entry-point guard fails this scan."""
