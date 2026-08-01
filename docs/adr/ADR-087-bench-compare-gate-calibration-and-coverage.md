@@ -18,15 +18,38 @@ independent of each other, and the third is the one that matters most.
 ADR-058's `Status` is `Superseded`. Its own 2026-06-24 status update states that the
 CPU-bench-as-gate design "was superseded by the e2e-parity approach" and that Criterion
 micro-benchmarks "are collected as trend data by `bench-update.yml` but are not a merge gate."
-The document contains zero occurrences of the string `bench-compare`, verified with a
-must-match control in the same invocation (`perf-baselines` occurs 14 times in that file, so
-the file was being read). Its subject is a workflow, `bench-regression.yml`, that its own
-status update confirms was never created.
+Its subject is a workflow, `bench-regression.yml`, that its own status update confirms was
+never created.
 
-The operative rule therefore lives in `CLAUDE.md`, and its citation points at a document that
-says close to the opposite. This is a provenance defect and not a validity defect: the rule's
-authority comes from `CLAUDE.md` and is unaffected. But a rule sourced to a record that
-contradicts it cannot be reasoned about, and a reader who follows the citation is misled.
+The string `bench-compare` has never appeared in ADR-058, in any revision. Verified with
+`git log -S` over the file's full history, with a must-match control in the same invocation
+(the same pickaxe finds two revisions touching `perf-baselines` in that file, so the search
+works).
+
+The history explains how this arose, and it is not a mis-stapled citation:
+
+- **2026-05-24**, `efdbe6657b` (#83) creates ADR-058 and, in the same commit, adds both the
+  `make bench-compare` rule and its `(ADR-058)` attribution to `CLAUDE.md`. The tool was never
+  described by the ADR it was filed under; the citation was a forward reference from the first
+  day, to a document whose subject was a different mechanism.
+- **2026-06-24**, `df809c43c3` marks ADR-058 `Superseded` while reconciling stale status
+  fields. The rule in `CLAUDE.md` requiring exactly the gate that update disclaims is left
+  standing.
+- **Since then**, `CLAUDE.md` has been edited twelve times. Three of those modified lines
+  containing `bench-compare` itself: a gate baseline-parse fix adding per-group overrides
+  (2026-07-02), the quiet-window rule (2026-07-16), and the run-conditions disclosure
+  (2026-07-21). Every one of them passed over the citation without reading it.
+
+The generalisable point is the third bullet. Superseding a decision record does not propagate
+to the instruction files that cite it, and a parenthetical citation is not re-read when the
+prose around it is edited. Twelve opportunities to notice, three of them by an editor working
+on the cited rule's own text, produced no notice, because each editor was changing the rule's
+content and the citation was not part of what they were changing.
+
+This is a provenance defect and not a validity defect: the operative rule lives in `CLAUDE.md`,
+its authority comes from that file being binding, and it is unaffected. But a rule sourced to a
+record that contradicts it cannot be reasoned about, and a reader who follows the citation is
+misled about what the rule is for.
 
 ### Problem 2: the gate's threshold has never been calibrated against its own null
 
