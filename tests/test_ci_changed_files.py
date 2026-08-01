@@ -10,6 +10,8 @@ import textwrap
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "ci-changed-files.sh"
 _ROOT = _SCRIPT.parent.parent
@@ -153,6 +155,142 @@ _EXPECTED_FILTER_ENVIRONMENT = (
         "${{ github.event.merge_group.head_sha || github.sha }}",
     ),
 )
+_CHECKOUT_ACTION = (
+    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+)
+_EXPECTED_CHANGE_JOB_KEYS = frozenset(("name", "runs-on", "outputs", "steps"))
+_EXPECTED_CHANGE_JOB_NAMES = {
+    ".github/workflows/ci.yml": "detect-code-changes",
+    ".github/workflows/cargo-audit.yml": "detect-dependency-changes",
+    ".github/workflows/app-binaries.yml": "detect-app-bin-changes",
+    ".github/workflows/e2e-parity.yml": "detect-engine-changes",
+}
+_EXPECTED_CHANGE_JOB_OUTPUTS = {
+    ".github/workflows/ci.yml": {
+        "code": "${{ steps.filter.outputs.code }}",
+        "oslist": "${{ steps.oslist.outputs.oslist }}",
+        "featureoslist": "${{ steps.oslist.outputs.featureoslist }}",
+    },
+    ".github/workflows/cargo-audit.yml": {
+        "deps": "${{ steps.filter.outputs.deps }}",
+    },
+    ".github/workflows/app-binaries.yml": {
+        "bins": "${{ steps.filter.outputs.bins }}",
+        "swift": "${{ steps.filter.outputs.swift }}",
+    },
+    ".github/workflows/e2e-parity.yml": {
+        "engine": "${{ steps.filter.outputs.engine }}",
+        "tune": "${{ steps.filter.outputs.tune }}",
+    },
+}
+_EXPECTED_SELECTOR_OUTPUTS = {
+    ".github/workflows/ci.yml": ("code",),
+    ".github/workflows/cargo-audit.yml": ("deps",),
+    ".github/workflows/app-binaries.yml": ("bins", "swift"),
+    ".github/workflows/e2e-parity.yml": ("engine", "tune"),
+}
+
+
+class _WorkflowLoader(yaml.SafeLoader):
+    pass
+
+
+_WorkflowLoader.yaml_implicit_resolvers = {
+    initial: [
+        resolver
+        for resolver in resolvers
+        if resolver[0] != "tag:yaml.org,2002:bool"
+    ]
+    for initial, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool",
+    re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$"),
+    list("tTfF"),
+)
+
+
+def _construct_unique_mapping(
+    loader: _WorkflowLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    mapping: dict[object, object] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        try:
+            duplicate = key in mapping
+        except TypeError as error:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found an unhashable key",
+                key_node.start_mark,
+            ) from error
+        if duplicate:
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r}",
+                key_node.start_mark,
+            )
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+_WorkflowLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def _require_mapping(value: object, location: str) -> dict[str, object]:
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) for key in value
+    ):
+        raise AssertionError(f"{location} must be a string-keyed mapping")
+    return value
+
+
+def _parse_workflow(contents: str, workflow: str) -> dict[str, object]:
+    try:
+        document = yaml.load(contents, Loader=_WorkflowLoader)
+    except yaml.YAMLError as error:
+        raise AssertionError(f"{workflow} is not valid workflow YAML: {error}") from error
+    return _require_mapping(document, f"{workflow} document")
+
+
+def _parsed_workflow_job(
+    document: dict[str, object],
+    job_id: str,
+    workflow: str,
+) -> dict[str, object]:
+    jobs = _require_mapping(document.get("jobs"), f"{workflow} jobs")
+    if job_id not in jobs:
+        raise AssertionError(f"workflow job {job_id!r} is missing")
+    return _require_mapping(jobs[job_id], f"{workflow} job {job_id!r}")
+
+
+def _parsed_workflow_step_by_id(
+    job: dict[str, object],
+    step_id: str,
+    workflow: str,
+) -> tuple[int, dict[str, object]]:
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        raise AssertionError(f"{workflow} job steps must be a sequence")
+    matches = []
+    for index, value in enumerate(steps):
+        step = _require_mapping(value, f"{workflow} step {index + 1}")
+        if step.get("id") == step_id:
+            matches.append((index, step))
+    if len(matches) != 1:
+        raise AssertionError(
+            f"workflow step id {step_id!r} must appear exactly once, "
+            f"found {len(matches)}"
+        )
+    return matches[0]
 
 
 def _workflow_job(contents: str, job_id: str) -> str:
@@ -206,22 +344,25 @@ def _workflow_run_script_from_contents(
     contents: str,
     job_id: str,
     step_id: str,
+    workflow: str = "workflow",
 ) -> str:
-    step = _workflow_step_by_id(_workflow_job(contents, job_id), step_id)
-    marker = "        run: |\n"
-    if marker not in step:
+    document = _parse_workflow(contents, workflow)
+    job = _parsed_workflow_job(document, job_id, workflow)
+    _, step = _parsed_workflow_step_by_id(job, step_id, workflow)
+    script = step.get("run")
+    if not isinstance(script, str):
         raise AssertionError(f"workflow step id {step_id!r} has no run script")
-    run_lines = []
-    for line in step.split(marker, maxsplit=1)[1].splitlines(keepends=True):
-        if line.strip() and not line.startswith("          "):
-            break
-        run_lines.append(line)
-    return textwrap.dedent("".join(run_lines))
+    return script
 
 
 def _workflow_run_script(workflow: Path, job_id: str, step_id: str) -> str:
     contents = workflow.read_text(encoding="utf-8")
-    return _workflow_run_script_from_contents(contents, job_id, step_id)
+    return _workflow_run_script_from_contents(
+        contents,
+        job_id,
+        step_id,
+        workflow.name,
+    )
 
 
 def _workflow_contract_key(workflow: str) -> str:
@@ -235,104 +376,99 @@ def _workflow_contract_key(workflow: str) -> str:
     return matches[0]
 
 
-def _yaml_direct_mapping(
-    contents: str,
-    indentation: int,
-    key: str,
-) -> tuple[tuple[str, str], ...]:
-    prefix = " " * indentation
-    header = re.search(
-        rf"^{re.escape(prefix)}{re.escape(key)}:\s*$",
-        contents,
-        re.MULTILINE,
-    )
-    if header is None:
-        return ()
-    entries = []
-    for raw_line in contents[header.end() :].splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        line_indentation = len(raw_line) - len(raw_line.lstrip(" "))
-        if line_indentation <= indentation:
-            break
-        if line_indentation != indentation + 2:
-            continue
-        entry_prefix = " " * (indentation + 2)
-        entry = re.fullmatch(
-            rf"{re.escape(entry_prefix)}([A-Za-z_][A-Za-z0-9_]*):\s*(.*)",
-            raw_line,
-        )
-        if entry is None:
-            raise AssertionError(f"{key} contains a non-scalar mapping entry")
-        entries.append((entry.group(1), entry.group(2)))
-    return tuple(entries)
-
-
-def _yaml_direct_keys(contents: str, indentation: int) -> tuple[str, ...]:
-    prefix = " " * indentation
-    keys = []
-    for raw_line in contents.splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-        line_indentation = len(raw_line) - len(raw_line.lstrip(" "))
-        if line_indentation != indentation:
-            continue
-        match = re.match(
-            rf"{re.escape(prefix)}([^ \t:#][^:\n]*):",
-            raw_line,
-        )
-        if match is not None:
-            keys.append(match.group(1).strip("'\""))
-    return tuple(keys)
-
-
-def _assert_filter_execution_envelope(contents: str, workflow: str) -> None:
+def _assert_filter_execution_envelope(contents: str, workflow: str) -> str:
     contract_key = _workflow_contract_key(workflow)
-    workflow_keys = _yaml_direct_keys(contents, 0)
-    if "defaults" in workflow_keys:
+    document = _parse_workflow(contents, workflow)
+    if "defaults" in document:
         raise AssertionError(f"{workflow} has workflow defaults reaching filter step")
-    if "<<" in workflow_keys:
-        raise AssertionError(f"{workflow} has an unknown workflow execution merge")
 
-    job = _workflow_job(contents, "changes")
-    job_keys = _yaml_direct_keys(job, 4)
-    if "defaults" in job_keys:
-        raise AssertionError(f"{workflow} has job defaults reaching filter step")
-    if "<<" in job_keys:
-        raise AssertionError(f"{workflow} has an unknown job execution merge")
-    if _yaml_direct_mapping(job, 4, "env"):
-        raise AssertionError(f"{workflow} has job environment reaching filter step")
-
-    workflow_environment = _yaml_direct_mapping(contents, 0, "env")
-    workflow_environment_keys = tuple(key for key, _ in workflow_environment)
-    if workflow_environment_keys != _EXPECTED_WORKFLOW_ENV_KEYS[contract_key]:
+    workflow_environment = _require_mapping(
+        document.get("env"),
+        f"{workflow} workflow environment",
+    )
+    workflow_environment_keys = frozenset(workflow_environment)
+    expected_workflow_environment_keys = frozenset(
+        _EXPECTED_WORKFLOW_ENV_KEYS[contract_key]
+    )
+    if workflow_environment_keys != expected_workflow_environment_keys:
         raise AssertionError(
             f"{workflow} workflow environment keys must be exactly "
             f"{_EXPECTED_WORKFLOW_ENV_KEYS[contract_key]!r}, found "
-            f"{workflow_environment_keys!r}"
+            f"{tuple(workflow_environment)!r}"
         )
 
-    step = _workflow_step_by_id(job, "filter")
-    metadata_keys = ("id", *_yaml_direct_keys(step, 8))
-    expected_metadata_keys = ("id", "env", "shell", "run")
+    job = _parsed_workflow_job(document, "changes", workflow)
+    job_keys = frozenset(job)
+    if job_keys != _EXPECTED_CHANGE_JOB_KEYS:
+        raise AssertionError(
+            f"{workflow} changes job schema must contain exactly "
+            f"{tuple(sorted(_EXPECTED_CHANGE_JOB_KEYS))!r}, found "
+            f"{tuple(sorted(job_keys))!r}"
+        )
+    if job.get("name") != _EXPECTED_CHANGE_JOB_NAMES[contract_key]:
+        raise AssertionError(
+            f"{workflow} changes job name must be "
+            f"{_EXPECTED_CHANGE_JOB_NAMES[contract_key]!r}"
+        )
+    if job.get("runs-on") != "ubuntu-latest":
+        raise AssertionError(
+            f"{workflow} changes job runs-on must be 'ubuntu-latest'"
+        )
+
+    outputs = _require_mapping(job.get("outputs"), f"{workflow} changes outputs")
+    expected_outputs = _EXPECTED_CHANGE_JOB_OUTPUTS[contract_key]
+    if outputs != expected_outputs:
+        raise AssertionError(
+            f"{workflow} changes job output mappings must be exactly "
+            f"{expected_outputs!r}, found {outputs!r}"
+        )
+
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        raise AssertionError(f"{workflow} changes job steps must be a sequence")
+    filter_index, step = _parsed_workflow_step_by_id(job, "filter", workflow)
+    if filter_index != 1:
+        raise AssertionError(
+            f"{workflow} filter step must immediately follow checkout"
+        )
+    checkout = _require_mapping(steps[0], f"{workflow} checkout step")
+    expected_checkout = {
+        "uses": _CHECKOUT_ACTION,
+        "with": {"fetch-depth": 0},
+    }
+    if checkout != expected_checkout:
+        raise AssertionError(
+            f"{workflow} changes job must start with the canonical checkout step"
+        )
+
+    metadata_keys = frozenset(step)
+    expected_metadata_keys = frozenset(("id", "env", "shell", "run"))
     if metadata_keys != expected_metadata_keys:
         raise AssertionError(
             f"{workflow} filter step metadata keys must be exactly "
-            f"{expected_metadata_keys!r}, found {metadata_keys!r}"
+            f"{tuple(sorted(expected_metadata_keys))!r}, found "
+            f"{tuple(sorted(metadata_keys))!r}"
         )
 
-    step_environment = _yaml_direct_mapping(step, 8, "env")
-    if step_environment != _EXPECTED_FILTER_ENVIRONMENT:
+    step_environment = _require_mapping(
+        step.get("env"),
+        f"{workflow} filter environment",
+    )
+    expected_filter_environment = dict(_EXPECTED_FILTER_ENVIRONMENT)
+    if step_environment != expected_filter_environment:
         raise AssertionError(
             f"{workflow} filter environment must be exactly "
-            f"{_EXPECTED_FILTER_ENVIRONMENT!r}, found {step_environment!r}"
+            f"{expected_filter_environment!r}, found {step_environment!r}"
         )
 
-    shell_lines = re.findall(r"^        shell:\s*(.*)$", step, re.MULTILINE)
-    if shell_lines != [_TRUSTED_FILTER_SHELL]:
+    if step.get("shell") != _TRUSTED_FILTER_SHELL:
         raise AssertionError(
             f"{workflow} filter shell command must be {_TRUSTED_FILTER_SHELL!r}"
         )
+    script = step.get("run")
+    if not isinstance(script, str):
+        raise AssertionError(f"{workflow} filter step must have a run script")
+    return script
 
 
 def _assert_safe_filter_prologue(script: str, workflow: str) -> tuple[str, ...]:
@@ -400,19 +536,107 @@ def _assert_safe_filter_prologue(script: str, workflow: str) -> tuple[str, ...]:
 
 
 def _assert_trusted_detector_execution(script: str, workflow: str) -> None:
+    detector_loads = tuple(_DETECTOR_LOAD.finditer(script))
+    if len(detector_loads) != 1:
+        raise AssertionError(
+            f"{workflow} must load the trusted detector exactly once"
+        )
     trusted_execution = (
         f'if {_TRUSTED_DETECTOR_EXECUTION} > "$CHANGED_FILE"; then'
     )
-    if script.splitlines().count(trusted_execution) != 1:
+    lines = script.splitlines()
+    if lines.count(trusted_execution) != 1:
         raise AssertionError(
             f"{workflow} must execute the trusted detector once with a clean "
             "environment and absolute shell"
         )
 
+    detector_load = detector_loads[0].group(0)
+    expected = (
+        detector_load,
+        "  :",
+        "else",
+        "  DETECTOR_STATUS=$?",
+        '  echo "::error::unable to load change detector from base revision '
+        '(status $DETECTOR_STATUS)" >&2',
+        '  exit "$DETECTOR_STATUS"',
+        "fi",
+        trusted_execution,
+        "  :",
+        "else",
+        "  DETECTOR_STATUS=$?",
+        '  echo "::error::change detector failed with status '
+        '$DETECTOR_STATUS" >&2',
+        '  exit "$DETECTOR_STATUS"',
+        "fi",
+        'CHANGED=$(<"$CHANGED_FILE")',
+    )
+    start = lines.index(detector_load)
+    actual = tuple(lines[start : start + len(expected)])
+    if actual != expected:
+        mismatch = next(
+            (
+                index
+                for index in range(max(len(actual), len(expected)))
+                if index >= len(actual)
+                or index >= len(expected)
+                or actual[index] != expected[index]
+            ),
+            0,
+        )
+        found = "<missing>" if mismatch >= len(actual) else repr(actual[mismatch])
+        required = (
+            "<end>" if mismatch >= len(expected) else repr(expected[mismatch])
+        )
+        raise AssertionError(
+            f"{workflow} violates ordered detector execution at line "
+            f"{mismatch + 1}: expected {required}, found {found}"
+        )
+
+    contract_key = _workflow_contract_key(workflow)
+    classification_lines = lines[start + len(expected) :]
+    if any(
+        line.lstrip().startswith("#") and line.rstrip().endswith("\\")
+        for line in classification_lines
+    ):
+        raise AssertionError(
+            f"{workflow} violates ordered selector classification with a "
+            "continued comment"
+        )
+    classification = tuple(
+        line.strip()
+        for line in classification_lines
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    selector_writes = tuple(
+        f'echo "{selector}={value}" >> "$GITHUB_OUTPUT"'
+        for selector in _EXPECTED_SELECTOR_OUTPUTS[contract_key]
+        for value in ("true", "false")
+    )
+    for statement in classification:
+        if re.search(
+            r"(?:^|[\s;&|()])(?:exit|return|exec)(?=$|[\s;&|()])",
+            statement,
+        ):
+            raise AssertionError(
+                f"{workflow} violates ordered selector classification with "
+                f"an early terminating statement: {statement!r}"
+            )
+        if "GITHUB_OUTPUT" in statement and statement not in selector_writes:
+            raise AssertionError(
+                f"{workflow} violates ordered selector classification with "
+                f"an unrecognized output statement: {statement!r}"
+            )
+    for write in selector_writes:
+        if classification.count(write) != 1:
+            raise AssertionError(
+                f"{workflow} selector classification must write {write!r} "
+                "exactly once after trusted detector execution"
+            )
+
 
 def _assert_safe_filter_workflow(contents: str, workflow: str) -> None:
-    _assert_filter_execution_envelope(contents, workflow)
-    script = _workflow_run_script_from_contents(contents, "changes", "filter")
+    script = _assert_filter_execution_envelope(contents, workflow)
     _assert_safe_filter_prologue(script, workflow)
     _assert_trusted_detector_execution(script, workflow)
 
@@ -475,11 +699,16 @@ class _FailOnEmptyTestProgram(unittest.TestProgram):
 
 
 def _engine_change_pattern(contents: str) -> re.Pattern[str]:
-    changes = _workflow_job(contents, "changes")
+    script = _workflow_run_script_from_contents(
+        contents,
+        "changes",
+        "filter",
+        _E2E_PARITY_WORKFLOW.name,
+    )
     match = re.search(
         r"""if\ grep\ -E\ '([^']+)'\ <<<"\$CHANGED"\ >/dev/null;\ then
             \s+echo\ "engine=true" """,
-        changes,
+        script,
         re.VERBOSE,
     )
     if match is None:
@@ -995,19 +1224,25 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
         for relative_path in _REQUIRED_WORKFLOWS:
             with self.subTest(workflow=relative_path):
                 contents = (_ROOT / relative_path).read_text(encoding="utf-8")
-                job = _workflow_job(contents, "changes")
-                step_entries = re.findall(
-                    r"^      -(?: .*)?$",
-                    job,
-                    re.MULTILINE,
+                document = _parse_workflow(contents, relative_path)
+                job = _parsed_workflow_job(document, "changes", relative_path)
+                steps = job.get("steps")
+                self.assertIsInstance(steps, list)
+                assert isinstance(steps, list)
+                self.assertGreaterEqual(len(steps), 2)
+                checkout = _require_mapping(
+                    steps[0],
+                    f"{relative_path} checkout step",
                 )
-
-                self.assertGreaterEqual(len(step_entries), 2)
                 self.assertRegex(
-                    step_entries[0],
-                    r"^      - uses: actions/checkout@[0-9a-f]{40}(?: # .*)?$",
+                    str(checkout.get("uses")),
+                    r"^actions/checkout@[0-9a-f]{40}$",
                 )
-                self.assertEqual(step_entries[1], "      - id: filter")
+                filter_step = _require_mapping(
+                    steps[1],
+                    f"{relative_path} filter step",
+                )
+                self.assertEqual(filter_step.get("id"), "filter")
 
     def test_change_filter_prologues_match_declared_ordered_grammar(
         self,
@@ -1024,6 +1259,168 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
                     relative_path,
                 )
 
+    def test_filter_execution_rejects_selector_or_exit_before_trusted_execution(
+        self,
+    ) -> None:
+        contents = _CI_WORKFLOW.read_text(encoding="utf-8")
+        _assert_safe_filter_workflow(contents, _CI_WORKFLOW.name)
+        trusted_execution = (
+            f"          if {_TRUSTED_DETECTOR_EXECUTION} "
+            '> "$CHANGED_FILE"; then\n'
+        )
+        self.assertIn(trusted_execution, contents)
+        mutations = {
+            "selector write": '          echo "code=false" >> "$GITHUB_OUTPUT"\n',
+            "exit": "          exit 0\n",
+        }
+
+        for name, statement in mutations.items():
+            workflow = contents.replace(
+                trusted_execution,
+                f"{statement}{trusted_execution}",
+                1,
+            )
+            with self.subTest(mutation=name), self.assertRaisesRegex(
+                AssertionError,
+                "ordered detector execution",
+            ):
+                _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
+
+    def test_filter_execution_rejects_preclassification_output_or_exit(
+        self,
+    ) -> None:
+        contents = _CI_WORKFLOW.read_text(encoding="utf-8")
+        _assert_safe_filter_workflow(contents, _CI_WORKFLOW.name)
+        changed = '          CHANGED=$(<"$CHANGED_FILE")\n'
+        self.assertIn(changed, contents)
+        mutations = {
+            "selector output": (
+                '          printf \'code=false\\n\' >> "$GITHUB_OUTPUT"\n'
+            ),
+            "exit": "          exit 0\n",
+        }
+
+        for name, statement in mutations.items():
+            workflow = contents.replace(
+                changed,
+                f"{changed}{statement}",
+                1,
+            )
+            with self.subTest(mutation=name), self.assertRaisesRegex(
+                AssertionError,
+                "ordered selector classification",
+            ):
+                _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
+
+    def test_changes_job_rejects_selector_output_literal(self) -> None:
+        contents = _CI_WORKFLOW.read_text(encoding="utf-8")
+        _assert_safe_filter_workflow(contents, _CI_WORKFLOW.name)
+        expected = "      code: ${{ steps.filter.outputs.code }}\n"
+        self.assertIn(expected, contents)
+        workflow = contents.replace(expected, '      code: "false"\n', 1)
+
+        with self.assertRaisesRegex(AssertionError, "output"):
+            _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
+
+    def test_changes_job_rejects_container(self) -> None:
+        contents = _CI_WORKFLOW.read_text(encoding="utf-8")
+        _assert_safe_filter_workflow(contents, _CI_WORKFLOW.name)
+        expected = "    runs-on: ubuntu-latest\n"
+        self.assertIn(expected, contents)
+        workflow = contents.replace(
+            expected,
+            f"{expected}    container: ubuntu:24.04\n",
+            1,
+        )
+
+        with self.assertRaisesRegex(AssertionError, "changes job schema"):
+            _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
+
+    def test_changes_job_rejects_unapproved_execution_schema(self) -> None:
+        contents = _CI_WORKFLOW.read_text(encoding="utf-8")
+        _assert_safe_filter_workflow(contents, _CI_WORKFLOW.name)
+        runner = "    runs-on: ubuntu-latest\n"
+        self.assertIn(runner, contents)
+        mutations = {
+            "runner": contents.replace(
+                runner,
+                "    runs-on: macos-latest\n",
+                1,
+            ),
+            "services": contents.replace(
+                runner,
+                f"{runner}    services: {{}}\n",
+                1,
+            ),
+            "defaults": contents.replace(
+                runner,
+                f"{runner}    defaults: {{run: {{shell: bash}}}}\n",
+                1,
+            ),
+            "condition": contents.replace(
+                runner,
+                f"{runner}    if: github.event_name == 'pull_request'\n",
+                1,
+            ),
+            "continue on error": contents.replace(
+                runner,
+                f"{runner}    continue-on-error: true\n",
+                1,
+            ),
+        }
+
+        for name, workflow in mutations.items():
+            expected_error = "runs-on" if name == "runner" else "changes job schema"
+            with self.subTest(field=name), self.assertRaisesRegex(
+                AssertionError,
+                expected_error,
+            ):
+                _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
+
+    def test_changes_job_rejects_job_environment_in_block_and_flow_styles(
+        self,
+    ) -> None:
+        contents = _CI_WORKFLOW.read_text(encoding="utf-8")
+        _assert_safe_filter_workflow(contents, _CI_WORKFLOW.name)
+        expected = "    runs-on: ubuntu-latest\n"
+        self.assertIn(expected, contents)
+        environments = {
+            "block": "    env:\n      PATH: /tmp/filter-bin\n",
+            "flow": "    env: {PATH: /tmp/filter-bin}\n",
+        }
+
+        for style, environment in environments.items():
+            workflow = contents.replace(
+                expected,
+                f"{expected}{environment}",
+                1,
+            )
+            with self.subTest(style=style), self.assertRaisesRegex(
+                AssertionError,
+                "changes job schema|job environment",
+            ):
+                _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
+
+    def test_filter_step_accepts_equivalent_flow_style_environment(self) -> None:
+        contents = _CI_WORKFLOW.read_text(encoding="utf-8")
+        _assert_safe_filter_workflow(contents, _CI_WORKFLOW.name)
+        block_environment = (
+            "        env:\n"
+            "          CI_BASE_SHA: ${{ github.event.pull_request.base.sha || "
+            "github.event.merge_group.base_sha || github.event.before }}\n"
+            "          CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || "
+            "github.sha }}\n"
+        )
+        flow_environment = (
+            '        env: {CI_BASE_SHA: "${{ github.event.pull_request.base.sha || '
+            'github.event.merge_group.base_sha || github.event.before }}", '
+            'CI_HEAD_SHA: "${{ github.event.merge_group.head_sha || github.sha }}"}\n'
+        )
+        self.assertIn(block_environment, contents)
+        workflow = contents.replace(block_environment, flow_environment, 1)
+
+        _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
+
     def test_detector_reader_event_matrix_is_complete(self) -> None:
         self.assertEqual(_DETECTOR_EVENTS, ("pull_request", "merge_group"))
 
@@ -1039,7 +1436,9 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
             f"{marker}",
             1,
         )
-        step = f"{step}          fi\n"
+        changed = '          CHANGED=$(<"$CHANGED_FILE")\n'
+        self.assertIn(changed, step)
+        step = step.replace(changed, f"{changed}          fi\n", 1)
         workflow = self._ci_workflow_with_filter_step(step)
 
         with self.assertRaisesRegex(AssertionError, "top level"):
@@ -1109,7 +1508,7 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
                 workflow = self._ci_workflow_with_filter_step(mutated_step)
                 with self.assertRaisesRegex(
                     AssertionError,
-                    "step metadata|shell command",
+                    "step metadata|shell command|valid workflow YAML",
                 ):
                     _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
 
@@ -1166,7 +1565,7 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
         for name, workflow in mutations.items():
             with self.subTest(scope=name), self.assertRaisesRegex(
                 AssertionError,
-                "defaults|environment|merge",
+                "defaults|environment|schema|valid workflow YAML",
             ):
                 _assert_safe_filter_workflow(workflow, _CI_WORKFLOW.name)
 
@@ -1174,14 +1573,14 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
         for relative_path in _REQUIRED_WORKFLOWS:
             with self.subTest(workflow=relative_path):
                 contents = (_ROOT / relative_path).read_text(encoding="utf-8")
-                step = _workflow_step_by_id(
-                    _workflow_job(contents, "changes"),
+                document = _parse_workflow(contents, relative_path)
+                job = _parsed_workflow_job(document, "changes", relative_path)
+                _, step = _parsed_workflow_step_by_id(
+                    job,
                     "filter",
+                    relative_path,
                 )
-                self.assertIn(
-                    f"        shell: {_TRUSTED_FILTER_SHELL}\n",
-                    step,
-                )
+                self.assertEqual(step.get("shell"), _TRUSTED_FILTER_SHELL)
 
     def test_filter_workflow_rejects_unsanitized_detector_commands(self) -> None:
         contents = _CI_WORKFLOW.read_text(encoding="utf-8")
