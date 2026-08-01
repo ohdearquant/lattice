@@ -76,8 +76,19 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
+
+_RUNNING_PYTHON = ".".join(str(part) for part in sys.version_info[:3])
+_PYTHON_REQUIREMENT_ERROR = (
+    f"{sys.argv[0]} requires Python 3.11 or newer; "
+    f"running Python {_RUNNING_PYTHON} at {sys.executable}"
+)
+try:
+    from datetime import UTC, datetime
+except ImportError:
+    raise SystemExit(_PYTHON_REQUIREMENT_ERROR) from None
+if sys.version_info[:2] < (3, 11):
+    raise SystemExit(_PYTHON_REQUIREMENT_ERROR)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = Path(__file__).resolve().parent
@@ -872,6 +883,10 @@ def build_decode_cell_aggregate(session: dict, policy: dict, rng_seed: int) -> t
         measured_cv = statistics.stdev(a_values) / statistics.fmean(a_values)
     else:
         measured_cv = None
+    if measured_cv is not None and (not math.isfinite(measured_cv) or measured_cv <= 0):
+        raise gate_math.GateMathError(
+            f"measured_cv must be a positive finite number, got {measured_cv!r}"
+        )
 
     metric_policy = gate_math.resolve_metric_policy(policy, "decode", "decode_tok_s")
     cell_class = metric_policy["noise_class"]
@@ -1078,6 +1093,7 @@ def main(argv: list[str] | None = None) -> int:
 
     policy = gate_math.load_policy()
     policy_sha = gate_math.policy_sha()
+    policy_file_sha = gate_math.policy_file_sha()
 
     session = run_paired_sessions(
         binary=args.binary,
@@ -1126,6 +1142,7 @@ def main(argv: list[str] | None = None) -> int:
             ).hexdigest(),
             "policy_version": policy["policy_version"],
             "policy_sha": policy_sha,
+            "policy_file_sha": policy_file_sha,
             "script_sha": sha256_file(Path(__file__)),
             "hardware_fingerprint": hardware_fingerprint(),
             "collected_at": datetime.now(UTC).isoformat(),
@@ -1237,6 +1254,7 @@ def main(argv: list[str] | None = None) -> int:
             "dirty": provenance.dirty,
             "policy_version": provenance.policy_version,
             "policy_sha": provenance.policy_sha,
+            "policy_file_sha": provenance.policy_file_sha,
             "hardware_fingerprint": provenance.hardware_fingerprint,
             "collected_at": provenance.collected_at,
         },

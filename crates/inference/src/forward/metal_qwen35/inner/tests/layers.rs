@@ -1,5 +1,8 @@
+use super::*;
+
 #[test]
 fn forward_step_gdn_only_does_not_advance_kv_cache() {
+    let _gpu_guard = gpu_test_lock();
     let Some(_) = metal::Device::system_default() else {
         return;
     };
@@ -22,6 +25,7 @@ fn forward_step_gdn_only_does_not_advance_kv_cache() {
 
 #[test]
 fn forward_step_gdn_only_returns_finite_logits() {
+    let _gpu_guard = gpu_test_lock();
     let Some(_) = metal::Device::system_default() else {
         return;
     };
@@ -77,6 +81,7 @@ fn forward_step_gdn_only_decay_gate_clamps_overflow() {
 
 #[test]
 fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
+    let _gpu_guard = gpu_test_lock();
     let Some(_) = Device::system_default() else {
         return;
     };
@@ -120,6 +125,7 @@ fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
 
 #[test]
 fn test_metal_qwen35_kv_cache_determinism_replay_5_tokens() {
+    let _gpu_guard = gpu_test_lock();
     let Some(_) = Device::system_default() else {
         return;
     };
@@ -160,8 +166,7 @@ fn test_metal_qwen35_kv_cache_determinism_replay_5_tokens() {
 
     assert_eq!(first_seq_len, tokens.len(), "first pass seq_len");
     assert_eq!(second_seq_len, tokens.len(), "second pass seq_len");
-    for (step, (first, second)) in first_logits.iter().zip(second_logits.iter()).enumerate()
-    {
+    for (step, (first, second)) in first_logits.iter().zip(second_logits.iter()).enumerate() {
         let max_abs_diff = first
             .iter()
             .zip(second.iter())

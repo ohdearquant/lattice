@@ -238,8 +238,11 @@ ureq = { version = "2", features = ["tls"], optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
+proc-macro2.workspace = true
 proptest = { workspace = true }
+syn.workspace = true
 tempfile = { workspace = true }
+naga.workspace = true
 # Drives real HTTP requests (built from `CHAT_COMPLETIONS_PARITY_CASES`
 # fixture bodies) through each binary's `Router` via `ServiceExt::oneshot`
 # for the cross-binary parity table (ADR-080 C2).
@@ -248,10 +251,6 @@ tempfile = { workspace = true }
 # kept at this use site (the version itself moved
 # to `[workspace.dependencies]`, feature selection stays local).
 tower = { workspace = true, features = ["util"] }
-
-[[bench]]
-name = "attention_bench"
-harness = true
 
 [[bench]]
 name = "differential_attention_bench"
@@ -277,19 +276,9 @@ harness = false
 name = "e2e_bench"
 harness = false
 
-# Disabled (bench = false) pending revival. This is a counting-allocator
-# baseline (OPT-002..005) that asserts exact per-op allocation indices. It was
-# authored against an f32 FlatKVCache; the lib has since migrated KV storage to
-# f16, so the cache read/write sites no longer typecheck. The naive fix —
-# f32<->f16 conversions at the cache boundary — would inject the very
-# allocations this bench counts, silently corrupting every measurement. Reviving
-# it means re-deriving the alloc baseline against the f16 decode path, which
-# belongs in a dedicated perf PR with bench output, not the CI-hardening gate.
-# Tracked: GTD lattice "revive inference_perf alloc baseline against f16 KV cache".
 [[bench]]
 name = "inference_perf"
 harness = false
-bench = false
 
 [[bench]]
 name = "topk_readback"
@@ -303,11 +292,6 @@ harness = false
 name = "decode_attn_bench"
 harness = false
 required-features = ["f16"]
-
-[[bench]]
-name = "compute_attention_bench"
-harness = false
-required-features = ["bench-internals"]
 
 [[bench]]
 name = "kv_cache_layout_bench"

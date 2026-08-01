@@ -3,11 +3,11 @@
 # lattice#1060, 2026-07-19).
 #
 # Format: one `<crate>:<bench-target>` key per line; `#` starts a comment.
-# scripts/lib/bench-informational-groups.sh (the production shell path) and
+# scripts/lib/bench-informational-targets.sh (the production shell path) and
 # scripts/perf-bench-gate.py --selftest (the validator) both read THIS file.
 # There is no other copy of the demoted-target set anywhere.
 #
-# Semantics: in QUICK mode, every Criterion group of a listed target is
+# Semantics: in QUICK mode, every Criterion benchmark of a listed target is
 # reported informationally — fully measured, rendered in the report's
 # informational section and the all-measurements table, excluded only from
 # the gating verdict and exit code. FULL mode (`scripts/bench-compare.sh
@@ -30,6 +30,11 @@
 # regression, so it ENFORCES. A demoted target is therefore reported AND
 # enforced at full resolution; the demotion only removes it from the quick
 # mode gate. Targets not listed here are classified gating in quick mode.
+#
+# bench-compare keeps each target's Criterion data in a separate output root.
+# That target boundary is required: Criterion permits `/` in group names and
+# uses `/` to join group/function/parameter in `--list`, so a flat listing
+# cannot reconstruct the top-level group without guessing.
 #
 # Demoting a target requires same-toolchain, same-commit A/A evidence in an
 # exclusive bench window, reviewed in a PR that edits this file.

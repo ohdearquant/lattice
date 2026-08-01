@@ -9,6 +9,7 @@ use super::*;
 /// device is absent.
 #[test]
 fn f16_kv_metal_path_executes_and_reports_capability() {
+    let _gpu_guard = gpu_test_lock();
     let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
     let Some(_) = Device::system_default() else {
         eprintln!("[METAL_F16_KV_CAPABILITY] supported=false reason=no_metal_device");
@@ -108,6 +109,7 @@ fn f16_kv_metal_path_executes_and_reports_capability() {
 /// dequant reference. Reverting the fix to `div_ceil(4)` fails this test.
 #[test]
 fn dispatch_matmul_q4_writes_all_rows() {
+    let _gpu_guard = gpu_test_lock();
     // Fail closed under enforce: a CI runner that provisions a Metal GPU but
     // silently skips here would make this regression gate verify nothing —
     // the same silent-skip class as the embed parity gate (#383). The

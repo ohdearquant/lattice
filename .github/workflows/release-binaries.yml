@@ -1,39 +1,78 @@
 name: release-binaries
-# Prebuilt `lattice` CLI binaries attached to GitHub releases (#633).
-#
-# Triggers only on a *published* GitHub release (never on tag push, so a
-# `git tag && git push` alone does not fire a build — a release must be
-# explicitly published via `gh release create` / the UI, matching the
-# existing bump-and-yank release flow in CLAUDE.md).
-#
-# Runners are chosen to build each target NATIVELY (no cross-compilation
-# toolchain): `macos-latest` is arm64 (aarch64-apple-darwin), `ubuntu-latest`
-# is x86_64 (x86_64-unknown-linux-gnu), `ubuntu-24.04-arm` is aarch64
-# (aarch64-unknown-linux-gnu) — the same three-runner shape `bench-update.yml`
-# already uses for CPU benches. Metal is macOS-only, so only the darwin leg
-# builds with `metal-gpu`; both Linux legs build CPU-only (`f16` alone) so the
-# CLI still installs and runs (NEON dispatch, no GPU) on Linux — see the
-# Raspberry Pi / ARM Linux README section this mirrors.
+# Build every public release asset without write credentials, transfer the
+# complete set through workflow artifacts, then let one write-scoped job verify
+# and publish it. Releases must already exist as drafts. The uploader rechecks
+# draft state around upload, but separate API requests cannot lock out another
+# actor that publishes the release concurrently.
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build+upload against (e.g. v0.4.2). Required for manual runs.'
+        description: 'Existing draft release tag (for example, v0.4.2)'
         required: true
+        type: string
+
+concurrency:
+  group: release-binaries-${{ inputs.tag }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write # required for `gh release upload`
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
 
 jobs:
+  prepare:
+    name: resolve release tag commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve release tag commit
+        id: tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Release workflow must be dispatched from main."
+            exit 1
+          fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must use vMAJOR.MINOR.PATCH form."
+            exit 1
+          fi
+          git fetch --force --no-tags origin "refs/tags/$TAG:refs/tags/$TAG"
+          SHA="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Release tag did not resolve to a commit SHA."
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Require an existing draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          IS_DRAFT="$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)"
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release is already published; create a new draft with a new tag and version."
+            exit 1
+          fi
+
   build:
     name: build (${{ matrix.target }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -51,13 +90,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
 
       - name: Pin the real toolchain bin on PATH
-        # See ci.yml: some macos-latest images ship a rustup-init shim as
-        # ~/.cargo/bin/cargo rather than the rustup proxy.
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -67,10 +105,10 @@ jobs:
       - name: Build lattice CLI (release)
         run: cargo build --release -p lattice-inference --bin lattice --features ${{ matrix.features }}
 
-      - name: Package tarball + sha256
+      - name: Package tarball and checksum
         id: package
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
@@ -86,14 +124,106 @@ jobs:
           echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
           echo "sha256_file=${ARCHIVE}.sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Upload to release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      - name: Stage CLI release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-cli-${{ matrix.target }}
+          path: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.sha256_file }}
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-app:
+    name: build macOS Studio app
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-macos-app
+
+      - name: Cache Swift release build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: apps/macos/.build
+          key: macos-app-${{ runner.os }}-${{ hashFiles('apps/macos/Package.swift', 'apps/macos/Package.resolved') }}
+          restore-keys: |
+            macos-app-${{ runner.os }}-
+
+      - name: Verify release tag matches workspace version
         run: |
           set -euo pipefail
-          gh release upload "$TAG" \
-            "${{ steps.package.outputs.archive }}" \
-            "${{ steps.package.outputs.sha256_file }}" \
-            --repo "${{ github.repository }}" \
-            --clobber
+          APP_VERSION="$(./apps/macos/scripts/package-app.sh --print-version)"
+          if [ "$TAG" != "v$APP_VERSION" ]; then
+            echo "::error::release tag $TAG does not match workspace version v$APP_VERSION"
+            exit 1
+          fi
+
+      - name: Build and package ad-hoc-signed macOS app
+        run: ./apps/macos/scripts/package-app.sh
+
+      - name: Generate macOS asset checksums
+        run: |
+          set -euo pipefail
+          cd apps/macos/dist
+          for ASSET in Lattice.dmg Lattice.zip; do
+            shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          done
+
+      - name: Stage macOS app release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-macos-app
+          path: |
+            apps/macos/dist/Lattice.dmg
+            apps/macos/dist/Lattice.dmg.sha256
+            apps/macos/dist/Lattice.zip
+            apps/macos/dist/Lattice.zip.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: verify and publish release assets
+    needs: [prepare, build, macos-app]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Download complete staged asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify, upload, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          TAG_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          ./apps/macos/scripts/upload-release-assets.sh \
+            "$TAG" \
+            "${{ github.repository }}" \
+            "$TAG_SHA" \
+            release-assets

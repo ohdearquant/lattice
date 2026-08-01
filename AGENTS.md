@@ -109,7 +109,6 @@ embed (12K)   tune (20K)                          ← embed uses inference; tune
 | `attention/`     | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
 | `forward/`       | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
 | `kv_cache/`      | KV cache for generation      | `FlatKVCache`, `PagedKVCache`                                                     |
-| `generate.rs`    | Autoregressive generation    | `GenerateConfig`                                                                  |
 | `speculative.rs` | Speculative decoding         | `NgramSpeculator`, `MtpVerifier`                                                  |
 | `lora_hook.rs`   | LoRA adapter injection trait | `LoraHook`, `NoopLoraHook`                                                        |
 | `rope.rs`        | Rotary positional encoding   | `RopeTable`                                                                       |
@@ -219,6 +218,21 @@ feature branch → PR → CI green → review → merge to main
 
 GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Runs on ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
 
+### Bench-Compare Disposition
+
+Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include a
+bench-compare disposition in its description. By default, run `make bench-compare` and paste its
+A/B table into the PR body. If the result shows no change, state that as the disposition.
+`crates/fann/` is covered because it feeds inference through the optional `mixture` feature; a
+fann-only diff that the bench build compiles out qualifies for the structural waiver below, on
+the same terms as any other diff.
+
+The only structural waiver is a diff compiled out of the bench binaries by a `cfg` gate. A waiver
+must name the gate, name the bench build's feature set, and state that the base and head bench
+binaries have identical effective source. "Cold path", "not benchmark-relevant", "additive only",
+and a bare `cfg(test)` that names no bench feature set are not valid waivers. If any changed line is
+compiled into the bench binaries, run the A/B.
+
 ### E2E Parity Gate
 
 PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
@@ -244,7 +258,7 @@ make publish         # publish (dependency order, sleeps for indexing)
 # E2E parity (HF reference vs lattice)
 make e2e-parity                          # run locally (needs torch + transformers)
 
-# Perf benchmarking (ADR-058, trend data)
+# Perf benchmarking (ADR-087, trend data)
 # bench-compare takes the machine-wide bench-window and GPU locks itself and
 # gates on ambient CPU idle — do NOT wrap it in an external bench-window helper.
 make bench-compare                       # A/B: origin/main vs HEAD (~2 min, --quick)

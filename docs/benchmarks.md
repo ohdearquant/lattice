@@ -6,6 +6,26 @@ this document — hardware varies. Run the benchmarks on your target machine.
 
 ## Running the Benchmarks
 
+### Regression gate modes
+
+Target classification and enforcement are separate:
+
+| Command                                                              | Comparison                                                                | Target classification                                                                                                          | Enforcement                                                                                                     |
+| -------------------------------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `make bench-compare`                                                 | `origin/main` against `HEAD`, quick resolution                            | Targets listed in `scripts/lib/bench-quick-informational-targets.txt` are informational; every other measured target is gating | Report-only                                                                                                     |
+| `scripts/bench-compare.sh --full --fail-on-regression <base> <head>` | Two explicit refs, full resolution                                        | Every measured target is gating; the quick informational manifest is ignored                                                   | Propagates the aggregate gate status                                                                            |
+| `make bench-gate`                                                    | The current checkout against the `perf-baselines` branch, full resolution | Every measured result is gating; the quick informational manifest is ignored                                                   | Exits `1` for a missing baseline or regression, `2` when the gate cannot judge, and `0` only for a genuine pass |
+
+Informational classification does not skip measurement or remove results from the report. It
+excludes that quick-mode target from the regression verdict. `scripts/bench-compare.sh` is
+report-only in either resolution unless `--fail-on-regression` is supplied.
+
+Exit `2` outranks not-measurable `3`, reserved for valid ambient samples below the idle floor. The
+gate script allows first-run exit `0` only without `--require-measurements`; `make bench-gate` always
+passes it and never creates a baseline. `make bench-ci` saves one locally, and `bench-update.yml`
+updates `perf-baselines` on `main`. This closes the exact fail-open: expecting a green first run
+makes legitimate exit `2` look like tooling breakage—a lane can then go green having measured nothing.
+
 ### Embedding SIMD operations (no model download required)
 
 ```sh
@@ -30,8 +50,6 @@ cargo bench -p lattice-inference
 Benchmarks in `crates/inference/benches/`:
 
 - `inference_bench.rs` — matmul, attention, layer norm, GELU, softmax at BERT-small dimensions
-- `attention_bench.rs` — multi-head attention at varying sequence lengths
-- `compute_attention_bench.rs` — raw attention kernel throughput
 - `decode_attn_bench.rs` — decoder attention path (Qwen3)
 - `kv_cache_layout_bench.rs` — KV cache access patterns (flat vs. paged)
 - `tokenizer_bench.rs` — tokenizer throughput for WordPiece/BPE/SentencePiece

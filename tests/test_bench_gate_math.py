@@ -298,10 +298,23 @@ class CvBandsTest(unittest.TestCase):
         n, _ = gm.required_n(0.01, bands, "B")
         self.assertEqual(n, 9)
 
-    def test_negative_cv_rejected(self):
+    def test_non_positive_cv_rejected(self):
         bands = self._bands()
-        with self.assertRaises(gm.GateMathError):
-            gm.required_n(-0.01, bands, "A")
+        for measured_cv in (-0.01, -0.0, 0.0):
+            with self.subTest(measured_cv=measured_cv):
+                with self.assertRaisesRegex(gm.GateMathError, "positive finite"):
+                    gm.required_n(measured_cv, bands, "A")
+
+    def test_tiny_positive_cv_uses_first_band(self):
+        bands = self._bands()
+        self.assertEqual(gm.required_n(math.nextafter(0.0, math.inf), bands, "A"), (7, 1.0))
+
+    def test_non_finite_cv_rejected(self):
+        bands = self._bands()
+        for measured_cv in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(measured_cv=measured_cv):
+                with self.assertRaisesRegex(gm.GateMathError, "positive finite"):
+                    gm.required_n(measured_cv, bands, "A")
 
     def test_invalid_class_rejected(self):
         bands = self._bands()
@@ -331,29 +344,9 @@ class CvBandsTest(unittest.TestCase):
         with self.assertRaises(gm.PolicyConfigError):
             gm.parse_cv_bands([{"max_cv": 1.0, "required_n_class_a": 7, "required_n_class_b": 9}])
 
-    def test_module_does_not_itself_refuse_an_absent_cv(self):
-        """Pin where the missing-CV guard actually lives, because the module
-        header used to claim it lived here.
-
-        `required_n` is typed to take a float. An absent CV therefore reaches
-        it either as a bare `TypeError` or, if a caller substitutes 0.0, as a
-        silent lookup that returns the CHEAPEST band -- the most permissive
-        answer available, from the function a reader would expect to refuse.
-        The refusal is the caller's:
-        `bench_decode_harness.validate_run_record` raises
-        `RunRecordValidationError` for a non-`unsupported` cell with no
-        `measured_cv` (covered by
-        `test_bench_run_record.test_missing_measured_cv_fails_closed`).
-
-        This test asserts the absence of a guard, which is unusual, and it is
-        deliberate: a safety property documented at a module but enforced by
-        its callers reads as fail-closed in isolation, so a new call site
-        inherits the belief without inheriting the guard. Pinning the real
-        locus keeps the header from drifting back.
-        """
+    def test_missing_cv_cannot_be_substituted_at_band_lookup(self):
         bands = self._bands()
-        self.assertEqual(gm.required_n(0.0, bands, "A"), (7, 1.0))
-        with self.assertRaises(TypeError):
+        with self.assertRaisesRegex(gm.GateMathError, "positive finite"):
             gm.required_n(None, bands, "A")  # type: ignore[arg-type]
 
     def test_band_boundaries_not_the_calibration_points(self):
@@ -363,6 +356,10 @@ class CvBandsTest(unittest.TestCase):
         bands = self._bands()
         self.assertEqual(gm.required_n(0.02, bands, "A"), (25, 1.0))
         self.assertEqual(gm.required_n(0.06, bands, "A"), (25, 2.0))
+        self.assertEqual(gm.required_n(0.015, bands, "A"), (7, 1.0))
+        self.assertEqual(gm.required_n(math.nextafter(0.015, math.inf), bands, "A"), (25, 1.0))
+        self.assertEqual(gm.required_n(0.05, bands, "A"), (25, 1.0))
+        self.assertEqual(gm.required_n(math.nextafter(0.05, math.inf), bands, "A"), (25, 2.0))
 
 
 # --------------------------------------------------------------------------
@@ -371,11 +368,18 @@ class CvBandsTest(unittest.TestCase):
 
 
 class LoadPolicyTest(unittest.TestCase):
+    def _path_for_text(self, directory: str, text: str) -> Path:
+        path = Path(directory) / "perf-policy.toml"
+        path.write_text(text)
+        return path
+
     def _sha_for_text(self, text: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "perf-policy.toml"
-            path.write_text(text)
-            return gm.policy_sha(path)
+            return gm.policy_sha(self._path_for_text(tmp, text))
+
+    def _file_sha_for_text(self, text: str) -> str:
+        with tempfile.TemporaryDirectory() as tmp:
+            return gm.policy_file_sha(self._path_for_text(tmp, text))
 
     def test_shipped_policy_file_loads(self):
         doc = gm.load_policy()
@@ -406,6 +410,13 @@ class LoadPolicyTest(unittest.TestCase):
         )
         self.assertNotEqual(changed, original)
         self.assertEqual(self._sha_for_text(changed), gm.policy_sha())
+        self.assertNotEqual(self._file_sha_for_text(changed), gm.policy_file_sha())
+
+    def test_policy_file_sha_is_exact_lowercase_digest(self):
+        digest = gm.policy_file_sha()
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, digest.lower())
+        int(digest, 16)
 
     def test_policy_sha_detects_band_and_threshold_tampering(self):
         original = gm.DEFAULT_POLICY_FILE.read_text()
@@ -450,6 +461,8 @@ class LoadPolicyTest(unittest.TestCase):
     def test_missing_file_rejected(self):
         with self.assertRaises(gm.PolicyConfigError):
             gm.load_policy(Path("/nonexistent/perf-policy.toml"))
+        with self.assertRaises(gm.PolicyConfigError):
+            gm.policy_file_sha(Path("/nonexistent/perf-policy.toml"))
 
 
 # --------------------------------------------------------------------------

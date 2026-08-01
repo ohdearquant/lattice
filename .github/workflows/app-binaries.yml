@@ -1,23 +1,31 @@
 name: app-binaries
-# Regression gate: build every binary the macOS Studio app ships, each with its
-# required-features. `cargo build --workspace` skips required-features bins, so
-# this is the only CI that compiles chat_metal / eval_perplexity / lattice_serve
-# / train_grad_full / generate_lora / embed with the features the app actually
-# builds them with.
+# Regression gate: compile the Swift release target and every binary the macOS
+# Studio app ships, each with its required-features. `cargo build --workspace`
+# skips required-features bins, so this is the only CI that compiles chat_metal
+# / eval_perplexity / lattice_serve / train_grad_full / generate_lora / embed
+# with the features the app actually builds them with.
 # See scripts/build-app-bins.sh for the rationale and the two regressions that
 # motivated it.
 #
 # Required-check shape (ADR-066 F-1): the workflow ALWAYS triggers on PRs and
 # merge groups (no `paths:` filter on either event), but the expensive macOS
-# build job only runs when app-binary-relevant files change. The cheap always-running
+# build jobs only run when their relevant files change. The cheap always-running
 # `app-binaries-gate` job is the status context to mark required — it passes
-# when there is nothing to build and mirrors the build result when there is.
+# when there is nothing to build and mirrors both build results when needed.
 # This avoids the trap where a path-filtered required check never reports on
 # docs-only PRs and wedges them on "Expected — waiting for status".
 
 on:
   pull_request:
     branches: [main]
+    # `ready_for_review` is load-bearing, not decorative. The macOS builds are
+    # skipped while a PR is a draft, and the DEFAULT type set is
+    # [opened, synchronize, reopened] — it contains no event for the
+    # draft-to-ready transition. Without this line, a PR marked ready that
+    # never pushes again would keep its draft-shaped run forever and could
+    # never report the required builds, wedging the PR on a gate that fails
+    # closed for drafts.
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
     paths:
@@ -26,16 +34,29 @@ on:
       - 'Cargo.lock'
       - 'scripts/build-app-bins.sh'
       - 'scripts/ci-changed-files.sh'
+      - 'apps/macos/Package.swift'
+      - 'apps/macos/Package.resolved'
+      - 'apps/macos/Sources/**'
       - 'apps/macos/scripts/package-app.sh'
+      - 'apps/macos/scripts/upload-release-assets.sh'
       - '.github/workflows/app-binaries.yml'
+      - '.github/workflows/release-binaries.yml'
+      - 'tests/test_macos_app_release.py'
   workflow_dispatch:
   merge_group:
     branches: [main]
     types: [checks_requested]
 
 # Cancel a PR's own superseded runs so they stop occupying the shared macOS
-# runner pool (~5 concurrent, account-wide) while a newer push on the same PR
-# waits behind them. Never cancel a push to main or a manual dispatch: neither
+# runner pool while a newer push on the same PR waits behind them. An earlier
+# revision of this comment put the pool at "~5 concurrent, account-wide". That
+# figure was inherited and never measured; ci.yml and e2e-parity.yml already
+# retracted it and this was the last copy still asserting it as fact. Measured
+# instead over a 39.6 h window on this repo: median macOS queue 0.0 min, p90
+# 32.5 min, max 87.8 min, against an ubuntu control at p90 5.7 min. Contention
+# is bursty rather than a fixed slot cap, so the reason to cancel superseded
+# runs is the tail, not a slot count.
+# Never cancel a push to main or a manual dispatch: neither
 # has a "next run" to fall back on if killed mid-flight. The event_name segment
 # keeps a push run and a workflow_dispatch run on the same ref out of each
 # other's queue: GitHub cancels a PENDING run whenever another run enters its
@@ -60,6 +81,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       bins: ${{ steps.filter.outputs.bins }}
+      swift: ${{ steps.filter.outputs.swift }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,14 +90,47 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
+          # Manual dispatch and the all-zero base sentinel skip detector
+          # extraction because neither provides a usable comparison base.
+          # Both conservatively require all downstream app-binary and Swift
+          # work before the contract check runs.
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "bins=true" >> "$GITHUB_OUTPUT"
-            echo "→ manual dispatch: app-binary build REQUIRED"
+            echo "swift=true" >> "$GITHUB_OUTPUT"
+            echo "→ manual dispatch: app-binary and Swift builds REQUIRED"
             exit 0
           fi
-          CHANGED=$(./scripts/ci-changed-files.sh)
+          if [[ ! "$CI_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base revision must be a nonempty 40-character hexadecimal commit ID" >&2
+            exit 2
+          fi
+          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "bins=true" >> "$GITHUB_OUTPUT"
+            echo "swift=true" >> "$GITHUB_OUTPUT"
+            echo "→ all-zero base revision: app-binary and Swift builds REQUIRED"
+            exit 0
+          fi
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
           echo "Changed files:"
           echo "$CHANGED"
           # here-string, not `echo | grep -q`: -q exits at first match, echo gets
@@ -88,11 +143,27 @@ jobs:
             echo "bins=false" >> "$GITHUB_OUTPUT"
             echo "→ no app-binary change: build skipped, gate passes"
           fi
+          if grep -E '^apps/macos/|^scripts/ci-changed-files\.sh$|^\.github/workflows/(app-binaries|release-binaries)\.yml$|^tests/test_macos_app_release\.py$' <<<"$CHANGED" >/dev/null; then
+            echo "swift=true" >> "$GITHUB_OUTPUT"
+            echo "→ macOS app surface changed: Swift release build REQUIRED"
+          else
+            echo "swift=false" >> "$GITHUB_OUTPUT"
+            echo "→ no macOS app change: Swift release build skipped"
+          fi
+      - name: Verify macOS app release contract
+        run: python3 tests/test_macos_app_release.py -v
 
+  # Deferred while a PR is a draft, matching the macOS legs of `ci` and
+  # `feature-matrix` and every macOS job in `e2e-parity`. A draft
+  # cannot merge, so a 45-minute macOS build on every draft push buys nothing
+  # the ready-flip does not buy later, while occupying a runner pool whose
+  # measured p90 queue is 32.5 min against an ubuntu control at 5.7 min.
+  # `app-binaries-gate` fails closed on drafts so a draft is never reported as
+  # having verified app-binary or Swift builds.
   build-app-bins:
     name: build app-shipped binaries
     needs: changes
-    if: needs.changes.outputs.bins == 'true'
+    if: needs.changes.outputs.bins == 'true' && github.event.pull_request.draft != true
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -104,11 +175,29 @@ jobs:
       - name: Build all app-shipped binaries (required-features included)
         run: ./scripts/build-app-bins.sh
 
+  build-macos-swift:
+    name: build macOS Studio Swift release
+    needs: changes
+    if: needs.changes.outputs.swift == 'true' && github.event.pull_request.draft != true
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Cache Swift release build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: apps/macos/.build
+          key: macos-swift-${{ runner.os }}-${{ hashFiles('apps/macos/Package.swift', 'apps/macos/Package.resolved') }}
+          restore-keys: |
+            macos-swift-${{ runner.os }}-
+      - name: Compile macOS Studio Swift release
+        run: swift build -c release --package-path apps/macos
+
   # Required status context (ADR-066 F-1). Fails closed on change-detection
   # failure, passes when nothing relevant changed, otherwise mirrors the build.
   app-binaries-gate:
     name: app-binaries-gate
-    needs: [changes, build-app-bins]
+    needs: [changes, build-app-bins, build-macos-swift]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -116,19 +205,48 @@ jobs:
         run: |
           CHANGES_RESULT="${{ needs.changes.result }}"
           BINS="${{ needs.changes.outputs.bins }}"
+          SWIFT="${{ needs.changes.outputs.swift }}"
           BUILD_RESULT="${{ needs.build-app-bins.result }}"
-          echo "changes=$CHANGES_RESULT bins=$BINS build=$BUILD_RESULT"
+          SWIFT_RESULT="${{ needs.build-macos-swift.result }}"
+          echo "changes=$CHANGES_RESULT bins=$BINS build=$BUILD_RESULT swift=$SWIFT swift_build=$SWIFT_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
           fi
-          if [ "$BINS" != "true" ]; then
-            echo "No app-binary change — build not required. PASS."
-            exit 0
-          fi
-          if [ "$BUILD_RESULT" != "success" ]; then
-            echo "::error::App-binary surface changed and build did not succeed (result=$BUILD_RESULT)."
+          if [ "$BINS" != "true" ] && [ "$BINS" != "false" ]; then
+            echo "::error::bins selector output is missing or invalid (value=$BINS)."
             exit 1
           fi
-          echo "App-binary surface changed; build PASSED."
+          if [ "$SWIFT" != "true" ] && [ "$SWIFT" != "false" ]; then
+            echo "::error::swift selector output is missing or invalid (value=$SWIFT)."
+            exit 1
+          fi
+          if [ "$BINS" = "false" ] && [ "$SWIFT" = "false" ]; then
+            echo "No app-binary or Swift change — builds not required. PASS."
+            exit 0
+          fi
+          # Fail closed on drafts, and only after the no-change PASS above: a
+          # docs-only draft defers nothing, so it must still pass. When the
+          # app-binary surface HAS changed, `build-app-bins` is skipped while
+          # the PR is a draft, and a skipped build must not read as a verified
+          # one — a pass in the shape of a verdict is the failure mode this
+          # gate exists to prevent. On merge_group, push, and workflow_dispatch
+          # there is no pull_request payload, so DRAFT is empty and this branch
+          # cannot fire.
+          DRAFT="${{ github.event.pull_request.draft }}"
+          if [ "$DRAFT" = "true" ]; then
+            echo "::error::Draft PR: required macOS builds are deferred, so the changed app surface is UNVERIFIED. Mark the PR ready for review to run them."
+            exit 1
+          fi
+          if [ "$BUILD_RESULT" != "success" ]; then
+            if [ "$BINS" = "true" ]; then
+              echo "::error::App-binary surface changed and build did not succeed (result=$BUILD_RESULT)."
+              exit 1
+            fi
+          fi
+          if [ "$SWIFT" = "true" ] && [ "$SWIFT_RESULT" != "success" ]; then
+            echo "::error::macOS Swift surface changed and release build did not succeed (result=$SWIFT_RESULT)."
+            exit 1
+          fi
+          echo "Required app-binary and Swift builds PASSED."
           exit 0

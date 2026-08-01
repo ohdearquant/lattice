@@ -2533,27 +2533,25 @@ mod serve {
     };
     use futures::StreamExt as _;
     use lattice_inference::Tokenizer;
-    // `ChatMessage` and `format_chat_template` are CPU-available (#668): this
-    // binary's own CPU (safetensors) serve path renders every request's
-    // ChatML prompt through them (`prepare_chat_request`, via the shared
-    // `serve::contract::normalize_messages`), the same shared renderer the
-    // Metal worker loop uses -- there is no second bespoke ChatML renderer
-    // in this file anymore. `to_chat_messages` below is a `#[cfg(test)]`-only
-    // helper local to this binary's own tests, not part of that production
-    // path.
-    use lattice_inference::forward::metal_qwen35::{ChatMessage, format_chat_template};
+    // The canonical ChatML renderer is CPU-available (#668): this binary's
+    // CPU serve path renders normalized contract messages through the same
+    // formatter core the Metal worker uses, with no bespoke template copy.
+    use lattice_inference::forward::metal_qwen35::ChatMessage;
+    #[cfg(test)]
+    use lattice_inference::forward::metal_qwen35::format_chat_template;
     #[cfg(feature = "metal-gpu")]
     use lattice_inference::model::qwen35_config::GenerateConfig;
     use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
-        ValidatedChatRequest as ContractValidatedChatRequest, normalize_request,
+        ValidatedChatRequest as ContractValidatedChatRequest, normalize_request_with_context,
         validate_context_window,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
-        ContentPart, Message, MessageContent, ResponseFormat,
+        ContentPart, Message, MessageContent, ResponseFormat, normalize_request,
     };
+    use lattice_inference::serve::{format_normalized_chat_template, into_engine_chat_messages};
     use serde::Serialize;
     use serde_json::Value;
     use std::sync::Arc;
@@ -3161,13 +3159,17 @@ mod serve {
     /// Validate `temperature` is in `[0.0, 2.0]`.
     #[cfg(test)]
     fn validate_temperature(value: Option<f32>) -> Result<f32, ApiError> {
-        lattice_inference::serve::contract::validate_temperature(value.unwrap_or(0.7))
+        lattice_inference::serve::contract::validate_temperature(
+            value.unwrap_or(GenerationDefaults::standard(1).temperature),
+        )
     }
 
     /// Validate `top_p` is in `(0.0, 1.0]`.
     #[cfg(test)]
     fn validate_top_p(value: Option<f32>) -> Result<f32, ApiError> {
-        lattice_inference::serve::contract::validate_top_p(value.unwrap_or(0.9))
+        lattice_inference::serve::contract::validate_top_p(
+            value.unwrap_or(GenerationDefaults::standard(1).top_p),
+        )
     }
 
     /// Validate the `logprobs` / `top_logprobs` pair (#585) and resolve the
@@ -3264,16 +3266,13 @@ mod serve {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// `#[cfg(test)]`-only alias for this binary's own role/content-part
-    /// test fixtures below. Production requests go through
-    /// `serve::contract::normalize_messages` directly (`prepare_chat_request`,
-    /// then rendered via the shared `format_chat_template`, #661/#668); this
-    /// exercises that same shared validator rather than a local copy of its
-    /// role/content-part logic, so those tests cannot drift from production
-    /// behavior.
+    /// `#[cfg(test)]`-only adapter for fixtures that exercise the engine
+    /// renderer. Validation and contract-to-engine conversion both delegate
+    /// to the same shared paths production uses.
     #[cfg(test)]
     fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> {
         lattice_inference::serve::contract::normalize_messages(messages)
+            .map(into_engine_chat_messages)
     }
 
     // -----------------------------------------------------------------------
@@ -3391,21 +3390,11 @@ mod serve {
         default_max_tokens: usize,
         max_tokens_cap: usize,
     ) -> Result<ContractValidatedChatRequest, ApiError> {
-        let defaults = GenerationDefaults {
-            max_tokens: default_max_tokens,
-            temperature: 0.7,
-            top_k: 50,
-            top_p: 0.9,
-            repetition_penalty: 1.1,
-            reasoning_budget: None,
-        };
-        let (validated, ()) = normalize_request(
+        normalize_request(
             req,
-            defaults,
+            GenerationDefaults::standard(default_max_tokens),
             ServeProfile::lattice(model_id, max_tokens_cap),
-            |_, _| Ok(()),
-        )?;
-        Ok(validated)
+        )
     }
 
     /// Output of the full pre-generation validation cascade, ready for
@@ -3423,10 +3412,10 @@ mod serve {
         stream: bool,
     }
 
-    /// Production entry point for the shared `normalize_request` cascade:
-    /// supplies the prompt-aware context-window check (rendering the chat
-    /// template, tokenizing it, then calling the shared
-    /// `validate_context_window`) as the `check_context` closure, in the
+    /// Production entry point for the shared context-aware normalization
+    /// cascade: supplies the prompt-aware context-window check (rendering the
+    /// chat template, tokenizing it, then calling the shared
+    /// `validate_context_window`) as the context check, in the
     /// exact order the original inline `chat_completions` cascade used:
     /// `stop` is validated *last*, after both the served-model hard
     /// requirements and the context-window check that guards against a
@@ -3450,20 +3439,12 @@ mod serve {
         tokenize_len: impl FnOnce(&str) -> usize,
         max_context: impl FnOnce() -> usize,
     ) -> Result<PreparedChatRequest, ApiError> {
-        let defaults = GenerationDefaults {
-            max_tokens: default_max_tokens,
-            temperature: 0.7,
-            top_k: 50,
-            top_p: 0.9,
-            repetition_penalty: 1.1,
-            reasoning_budget: None,
-        };
-        let (validated, prompt) = normalize_request(
+        let (validated, prompt) = normalize_request_with_context(
             req,
-            defaults,
+            GenerationDefaults::standard(default_max_tokens),
             ServeProfile::lattice(model_id, max_tokens_cap),
             |messages, max_tokens| {
-                let prompt = format_chat_template(messages);
+                let prompt = format_normalized_chat_template(messages);
                 let prompt_token_count = tokenize_len(&prompt);
                 validate_context_window(prompt_token_count, max_tokens, max_context())?;
                 Ok(prompt)
@@ -3480,6 +3461,7 @@ mod serve {
             stream,
             ..
         } = validated;
+        let messages = into_engine_chat_messages(messages);
 
         Ok(PreparedChatRequest {
             messages,
@@ -4911,7 +4893,10 @@ mod serve {
 
         #[test]
         fn validate_temperature_none_uses_default() {
-            assert_eq!(validate_temperature(None).unwrap(), 0.7);
+            assert_eq!(
+                validate_temperature(None).unwrap(),
+                GenerationDefaults::standard(1).temperature
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -4920,7 +4905,10 @@ mod serve {
 
         #[test]
         fn validate_top_p_none_uses_default() {
-            assert_eq!(validate_top_p(None).unwrap(), 0.9);
+            assert_eq!(
+                validate_top_p(None).unwrap(),
+                GenerationDefaults::standard(1).top_p
+            );
         }
 
         // -----------------------------------------------------------------------
@@ -5790,18 +5778,83 @@ mod serve {
             use super::*;
             use http_body_util::BodyExt;
             use std::sync::Mutex;
+            use std::sync::mpsc::RecvTimeoutError;
             use std::time::Duration;
 
             /// One real delta, then a bounded should_cancel-only poll loop.
-            /// `MAX_POLLS` * `POLL_INTERVAL` (10s) comfortably exceeds the
-            /// test's own 10s await-completion timeout below, so a broken
-            /// `should_cancel` wiring (the `move || false` mutation) makes
-            /// the outer `tokio::time::timeout` fire first with a clear
-            /// failure message, rather than this loop silently reporting
-            /// "exhausted" first in a way that could be confused with a
-            /// flake.
             const MAX_POLLS: usize = 4000;
             const POLL_INTERVAL: Duration = Duration::from_millis(5);
+            const PROBE_POLL_BUDGET: Duration = POLL_INTERVAL.saturating_mul(MAX_POLLS as u32);
+            const PROBE_COMPLETION_HEADROOM: Duration = Duration::from_secs(20);
+            const PROBE_COMPLETION_TIMEOUT: Duration =
+                PROBE_POLL_BUDGET.saturating_add(PROBE_COMPLETION_HEADROOM);
+            const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+            fn await_checkpoint(
+                rx: &std::sync::mpsc::Receiver<()>,
+                checkpoint: &str,
+                timeout: Duration,
+            ) {
+                match rx.recv_timeout(timeout) {
+                    Ok(()) => {}
+                    Err(RecvTimeoutError::Timeout) => {
+                        panic!(
+                            "fake generator timed out waiting for the {checkpoint} \
+                             checkpoint after {timeout:?}"
+                        );
+                    }
+                    Err(RecvTimeoutError::Disconnected) => {
+                        panic!(
+                            "fake generator's {checkpoint} checkpoint sender \
+                             disconnected before signaling"
+                        );
+                    }
+                }
+            }
+
+            fn probe_completion_timeout_message() -> String {
+                format!(
+                    "observed no ProbeOutcome within {PROBE_COMPLETION_TIMEOUT:?} \
+                     after the client disconnect; possible causes include a \
+                     generator scheduling delay or stall, or cancellation \
+                     propagation failing to complete within the \
+                     {PROBE_POLL_BUDGET:?} probe poll budget"
+                )
+            }
+
+            #[test]
+            fn completion_timeout_exceeds_probe_poll_budget() {
+                assert_eq!(PROBE_POLL_BUDGET, Duration::from_secs(20));
+                assert!(
+                    PROBE_COMPLETION_TIMEOUT > PROBE_POLL_BUDGET,
+                    "completion timeout {PROBE_COMPLETION_TIMEOUT:?} must exceed \
+                     the complete probe poll budget {PROBE_POLL_BUDGET:?}"
+                );
+            }
+
+            #[test]
+            #[should_panic(expected = "post-handler-return checkpoint")]
+            fn post_handler_return_checkpoint_timeout_fails_loudly() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                await_checkpoint(&rx, "post-handler-return", Duration::ZERO);
+                drop(tx);
+            }
+
+            #[test]
+            #[should_panic(expected = "post-body-drop checkpoint")]
+            fn post_body_drop_checkpoint_timeout_fails_loudly() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                await_checkpoint(&rx, "post-body-drop", Duration::ZERO);
+                drop(tx);
+            }
+
+            #[test]
+            fn completion_timeout_message_reports_observation_and_candidate_causes() {
+                let message = probe_completion_timeout_message();
+                assert!(message.contains("observed no ProbeOutcome"));
+                assert!(message.contains("generator scheduling delay or stall"));
+                assert!(message.contains("cancellation propagation"));
+            }
 
             /// Same rationale as `disconnect_cancellation`'s constant of the
             /// same value: the tiny test model's context window is a fixed
@@ -5813,8 +5866,10 @@ mod serve {
             /// `should_cancel`'s reading taken after the test's `checkpoint1`
             /// signal (sent the instant `chat_completions(..).await`
             /// returns, before the test reads any SSE frame or drops
-            /// anything) but before the `go` signal (sent only after
-            /// `drop(body)`). Must be `false` in correctly-wired code:
+            /// anything). The generator acknowledges that reading over a
+            /// oneshot channel, and the test waits for the acknowledgement
+            /// before it can drop the body or send `go`. Must be `false` in
+            /// correctly-wired code:
             /// `cancel_guard` is still alive at this point (held by
             /// `body_stream`'s `flat_map` closure, itself alive because the
             /// test hasn't dropped the body/receiver yet), so `cancel_rx`
@@ -5931,8 +5986,8 @@ mod serve {
             }
 
             /// Mutation-sensitive to BOTH known regressions
-            /// independently, via a test<->generator handshake that removes
-            /// the timing race a plain poll-and-time-it design would have
+            /// independently, via a two-way test<->generator handshake that
+            /// removes the timing race a plain poll-and-time-it design would have
             /// (an early, timing-dependent version of this test observed
             /// `CancelledAfterPolls(1)` even under mutation (a), because
             /// `cancel_guard` -- unused once its capture is removed --
@@ -5962,6 +6017,9 @@ mod serve {
                 let outcome_tx = Mutex::new(Some(outcome_tx));
                 let (checkpoint1_tx, checkpoint1_rx) = std::sync::mpsc::channel::<()>();
                 let checkpoint1_rx = Mutex::new(Some(checkpoint1_rx));
+                let (pre_drop_observed_tx, pre_drop_observed_rx) =
+                    tokio::sync::oneshot::channel::<bool>();
+                let pre_drop_observed_tx = Mutex::new(Some(pre_drop_observed_tx));
                 let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
                 let go_rx = Mutex::new(Some(go_rx));
 
@@ -5983,15 +6041,18 @@ mod serve {
                         // immediate post-`on_token` read, is what makes the
                         // next line's reading timing-independent).
                         if let Some(rx) = checkpoint1_rx.lock().unwrap().take() {
-                            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+                            await_checkpoint(&rx, "post-handler-return", HANDSHAKE_TIMEOUT);
                         }
                         let pre_drop_cancelled = should_cancel();
+                        if let Some(tx) = pre_drop_observed_tx.lock().unwrap().take() {
+                            let _ = tx.send(pre_drop_cancelled);
+                        }
 
                         // Block until the test signals it has dropped the
                         // body (or give up after 10s so a broken handshake
                         // fails this test instead of hanging the process).
                         if let Some(rx) = go_rx.lock().unwrap().take() {
-                            let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+                            await_checkpoint(&rx, "post-body-drop", HANDSHAKE_TIMEOUT);
                         }
 
                         let mut polls = 0usize;
@@ -6039,7 +6100,25 @@ mod serve {
                 // unused `cancel_guard` (mutation (a)) has already dropped;
                 // signal the generator it may take its `pre_drop_cancelled`
                 // reading.
-                let _ = checkpoint1_tx.send(());
+                checkpoint1_tx
+                    .send(())
+                    .expect("generator must still be waiting for the post-return checkpoint");
+                let observed_pre_drop_cancelled =
+                    tokio::time::timeout(HANDSHAKE_TIMEOUT, pre_drop_observed_rx)
+                        .await
+                        .expect(
+                            "generator must acknowledge its pre-drop cancellation \
+                             reading before the handshake timeout",
+                        )
+                        .expect(
+                            "generator must not drop the pre-drop observation \
+                             sender without acknowledging its reading",
+                        );
+                assert!(
+                    !observed_pre_drop_cancelled,
+                    "should_cancel must read false while the response body is \
+                     still alive"
+                );
                 let mut body = response.into_body();
 
                 // Frame 1: role chunk.
@@ -6060,16 +6139,13 @@ mod serve {
                 // waiting on `go_rx`, having already called `on_token` and
                 // taken its `pre_drop_cancelled` reading.
                 drop(body);
-                let _ = go_tx.send(());
+                go_tx
+                    .send(())
+                    .expect("generator must still be waiting for the post-drop checkpoint");
 
-                let outcome = tokio::time::timeout(Duration::from_secs(10), outcome_rx)
+                let outcome = tokio::time::timeout(PROBE_COMPLETION_TIMEOUT, outcome_rx)
                     .await
-                    .expect(
-                        "the fake generator's post-drop probe phase must signal \
-                         completion within 10s of the client disconnecting -- a \
-                         timeout here means should_cancel never observed the \
-                         disconnect at all",
-                    )
+                    .unwrap_or_else(|_| panic!("{}", probe_completion_timeout_message()))
                     .expect("probe outcome sender must not be dropped without sending");
 
                 assert!(
