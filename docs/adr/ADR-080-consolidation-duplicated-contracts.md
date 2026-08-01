@@ -324,13 +324,15 @@ lifecycle did not change in the same PR. This amendment closes that deliberate l
 Every production client retains a clone of the shared owner. Its `Drop` implementation explicitly
 takes and drops its job sender before automatic field destruction can drop the owner clone, so the
 sequence is independent of field declaration order. The final owner takes the worker's sole join
-handle, waits up to two seconds for
-`JoinHandle::is_finished`, and joins only after the thread is known to have exited. A completed
-panic is joined and reported distinctly. If the deadline expires, the handle is detached and
-shutdown continues; a backend call that stops polling cancellation therefore cannot hang process
-shutdown indefinitely. Last-client/last-owner drop is the sole production trigger: the bounded
-wait helper is private so a caller cannot detach the sole join handle while another client still
-keeps the queue open.
+handle, transfers it to a detached reaper, and waits up to two seconds for the reaper's result. The
+reaper performs the full join, including thread-local destructors, so that final cleanup is inside
+the same deadline instead of following a bounded poll. A completed panic is joined and reported
+distinctly. If the deadline expires, the reaper remains detached and shutdown continues; a backend
+call or destructor that does not return therefore cannot hang process shutdown indefinitely. If a
+reaper cannot be started, dropping its closure detaches the worker immediately and reports that
+fallback. Last-client/last-owner drop is the sole production trigger: the bounded wait helper is
+private so a caller cannot detach the sole join handle while another client still keeps the queue
+open.
 
 Both binaries use this one lifecycle. `lattice serve` drops its redundant explicit owner after
 startup because its client in router state retains the same owner. `lattice_serve` retains the

@@ -26,10 +26,11 @@
 //! [`MetalWorkerOwner`]. The client's `Drop` implementation explicitly closes
 //! its job sender before automatic field destruction can drop the owner, so
 //! the sequence does not depend on field declaration order. The last owner
-//! then waits for the worker to exit and joins it. The wait has a two-second
-//! deadline: a backend call that stops polling cancellation can delay the
-//! worker, but cannot hang process shutdown indefinitely. On timeout the join
-//! handle is detached and the process remains free to exit.
+//! then transfers the worker's join handle to a detached reaper. The owner
+//! waits up to two seconds for the reaper's result, so the deadline covers the
+//! full join, including thread-local destructors. A backend call or destructor
+//! that does not return therefore cannot hang process shutdown indefinitely;
+//! on timeout the reaper remains detached and the process remains free to exit.
 //!
 //! # Testability without a GPU
 //!
@@ -79,6 +80,7 @@ enum WorkerShutdown {
     AlreadyStopped,
     TimedOut,
     Panicked,
+    ReaperUnavailable,
 }
 
 /// Selects the context-window formula enforced before Metal generation.
@@ -268,19 +270,27 @@ impl MetalWorkerOwnerInner {
         };
 
         let started = Instant::now();
-        while !handle.is_finished() {
-            let remaining = timeout.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                drop(handle);
-                return WorkerShutdown::TimedOut;
-            }
-            std::thread::sleep(remaining.min(Duration::from_millis(5)));
-        }
+        let (joined_tx, joined_rx) = std::sync::mpsc::sync_channel(1);
+        let reaper = std::thread::Builder::new()
+            .name("lattice-metal-worker-reaper".to_string())
+            .spawn(move || {
+                let _ = joined_tx.send(handle.join());
+            });
+        let Ok(reaper) = reaper else {
+            return WorkerShutdown::ReaperUnavailable;
+        };
+        // Joining this helper would recreate the TLS-destructor tail that the
+        // result channel exists to keep outside the owner's deadline.
+        drop(reaper);
 
-        if handle.join().is_ok() {
-            WorkerShutdown::Joined
-        } else {
-            WorkerShutdown::Panicked
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match joined_rx.recv_timeout(remaining) {
+            Ok(Ok(())) => WorkerShutdown::Joined,
+            Ok(Err(_)) => WorkerShutdown::Panicked,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WorkerShutdown::TimedOut,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                WorkerShutdown::ReaperUnavailable
+            }
         }
     }
 }
@@ -292,7 +302,7 @@ impl Drop for MetalWorkerOwnerInner {
             WorkerShutdown::TimedOut => {
                 let _ = writeln!(
                     std::io::stderr().lock(),
-                    "[metal-worker] shutdown timed out after {} ms; detaching worker thread",
+                    "[metal-worker] shutdown timed out after {} ms; detaching worker join reaper",
                     self.drop_timeout.as_millis()
                 );
             }
@@ -300,6 +310,12 @@ impl Drop for MetalWorkerOwnerInner {
                 let _ = writeln!(
                     std::io::stderr().lock(),
                     "[metal-worker] worker thread panicked during shutdown"
+                );
+            }
+            WorkerShutdown::ReaperUnavailable => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[metal-worker] worker join reaper unavailable; detaching worker thread"
                 );
             }
         }
@@ -854,9 +870,29 @@ pub fn spawn_fake_with_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    struct BlockingThreadLocalDrop {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        finished: std::sync::mpsc::SyncSender<()>,
+    }
+
+    impl Drop for BlockingThreadLocalDrop {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            let _ = self.finished.send(());
+        }
+    }
+
+    thread_local! {
+        static BLOCKING_THREAD_LOCAL_DROP: RefCell<Option<BlockingThreadLocalDrop>> =
+            const { RefCell::new(None) };
+    }
 
     fn test_owner(
         join_handle: std::thread::JoinHandle<()>,
@@ -1365,6 +1401,77 @@ mod tests {
             "the join handle must be claimed exactly once"
         );
         assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn owner_shutdown_deadline_covers_blocking_thread_local_destructor() {
+        let (destructor_entered_tx, destructor_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_destructor_tx, release_destructor_rx) = std::sync::mpsc::sync_channel(1);
+        let (destructor_finished_tx, destructor_finished_rx) = std::sync::mpsc::sync_channel(1);
+        let join_handle = std::thread::spawn(move || {
+            BLOCKING_THREAD_LOCAL_DROP.with(|slot| {
+                *slot.borrow_mut() = Some(BlockingThreadLocalDrop {
+                    entered: destructor_entered_tx,
+                    release: release_destructor_rx,
+                    finished: destructor_finished_tx,
+                });
+            });
+        });
+        destructor_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the worker must enter its thread-local destructor");
+        let finished_deadline = Instant::now() + Duration::from_secs(1);
+        while !join_handle.is_finished() && Instant::now() < finished_deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            join_handle.is_finished(),
+            "the worker main function must finish while its thread-local destructor is blocked"
+        );
+
+        let owner = test_owner(join_handle, Duration::from_millis(20));
+        let (shutdown_done_tx, shutdown_done_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown_thread = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = owner._inner.wait_for_exit(Duration::from_millis(20));
+            let _ = shutdown_done_tx.send((result, started.elapsed()));
+        });
+        let before_watchdog = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .ok();
+
+        release_destructor_tx
+            .send(())
+            .expect("the blocked thread-local destructor must still accept its release");
+        destructor_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the thread-local destructor must finish after release");
+        let observed = match before_watchdog {
+            Some(result) => result,
+            None => shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown must finish after the destructor is released"),
+        };
+        shutdown_thread
+            .join()
+            .expect("shutdown helper thread must not panic");
+
+        let Some((result, elapsed)) = before_watchdog else {
+            panic!(
+                "the configured deadline must include thread-local destructor cleanup; \
+                 observed {observed:?}"
+            );
+        };
+        assert_eq!(
+            result,
+            WorkerShutdown::TimedOut,
+            "blocked thread-local cleanup must exhaust the configured deadline"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "shutdown exceeded the deadline watchdog: {:?}",
+            elapsed
+        );
     }
 
     #[test]

@@ -136,13 +136,15 @@ this list -- `lattice serve` now has all three, built on the same shared
 
 The shared contract also owns the Metal worker lifecycle (#833). In both binaries, each client's
 `Drop` explicitly closes its job sender before automatic field destruction can release its owner
-clone. The final owner waits up to two seconds for and joins the worker; a worker still inside a
-backend call after that deadline is detached so process shutdown cannot hang indefinitely. Both
-binaries use the same server runner, which gives tracked HTTP/1 connections up to five seconds to
-drain on SIGINT and Unix SIGTERM. After any drain timeout it aborts remaining connection tasks,
-allows up to three seconds for cancellation cleanup, and then exits with status 1 even if cleanup
-completed. That hard-exit fallback can truncate in-flight responses, leave files partially written,
-and discard unflushed telemetry because it skips Rust destructors.
+clone. The final owner transfers the worker's join handle to a detached reaper and waits up to two
+seconds for its result. That deadline covers the full join, including thread-local destructors; if
+the worker or a destructor is still running when it expires, the reaper remains detached so process
+shutdown cannot hang indefinitely. Both binaries use the same server runner, which gives tracked
+HTTP/1 connections up to five seconds to drain on SIGINT and Unix SIGTERM. After any drain timeout
+it aborts remaining connection tasks, allows up to three seconds for cancellation cleanup, and then
+exits with status 1 even if cleanup completed. That hard-exit fallback can truncate in-flight
+responses, leave files partially written, and discard unflushed telemetry because it skips Rust
+destructors.
 
 As of #656, `tools`/`tool_choice`/`n`/non-`text` `response_format`/unknown-role/non-text-content-part
 rejection now behave identically on both HTTP surfaces (all 400, none silently ignored or coerced) --
