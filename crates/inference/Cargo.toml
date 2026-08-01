@@ -238,8 +238,11 @@ ureq = { version = "2", features = ["tls"], optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
+proc-macro2.workspace = true
 proptest = { workspace = true }
+syn.workspace = true
 tempfile = { workspace = true }
+naga.workspace = true
 # Drives real HTTP requests (built from `CHAT_COMPLETIONS_PARITY_CASES`
 # fixture bodies) through each binary's `Router` via `ServiceExt::oneshot`
 # for the cross-binary parity table (ADR-080 C2).
@@ -289,11 +292,6 @@ harness = false
 name = "decode_attn_bench"
 harness = false
 required-features = ["f16"]
-
-[[bench]]
-name = "compute_attention_bench"
-harness = false
-required-features = ["bench-internals"]
 
 [[bench]]
 name = "kv_cache_layout_bench"

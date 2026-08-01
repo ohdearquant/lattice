@@ -348,6 +348,7 @@ struct ParamRowToggle: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("ParamRow") {
     @Previewable @State var rank: Double = 8
     @Previewable @State var lr: Double = 2e-4
@@ -373,3 +374,4 @@ struct ParamRowToggle: View {
     .background(Theme.Palette.canvas)
     .frame(width: 400)
 }
+#endif

@@ -20,6 +20,14 @@ use criterion::{BenchmarkId, Throughput, black_box};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use std::time::Duration;
 
+fn bench_locked_metal_decode(c: &mut Criterion) {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
+    bench_reference_decode(c);
+    bench_flash_decode(c);
+}
+
 // ---------------------------------------------------------------------------
 // MSL — baseline (old 3-pass QK-recomputing kernel)
 // ---------------------------------------------------------------------------
@@ -714,5 +722,5 @@ fn fail_wrong_build(_c: &mut Criterion) {
     std::process::exit(1);
 }
 
-criterion_group!(benches, bench_reference_decode, bench_flash_decode);
+criterion_group!(benches, bench_locked_metal_decode);
 criterion_main!(benches);
