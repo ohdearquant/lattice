@@ -90,6 +90,7 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
           # Manual dispatch and the all-zero base sentinel skip detector
@@ -115,14 +116,14 @@ jobs:
           TRUSTED_DETECTOR=$(mktemp)
           CHANGED_FILE=$(mktemp)
           trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
-          if git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
             :
           else
             DETECTOR_STATUS=$?
             echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
             exit "$DETECTOR_STATUS"
           fi
-          if sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
             :
           else
             DETECTOR_STATUS=$?
@@ -212,7 +213,15 @@ jobs:
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
           fi
-          if [ "$BINS" != "true" ] && [ "$SWIFT" != "true" ]; then
+          if [ "$BINS" != "true" ] && [ "$BINS" != "false" ]; then
+            echo "::error::bins selector output is missing or invalid (value=$BINS)."
+            exit 1
+          fi
+          if [ "$SWIFT" != "true" ] && [ "$SWIFT" != "false" ]; then
+            echo "::error::swift selector output is missing or invalid (value=$SWIFT)."
+            exit 1
+          fi
+          if [ "$BINS" = "false" ] && [ "$SWIFT" = "false" ]; then
             echo "No app-binary or Swift change — builds not required. PASS."
             exit 0
           fi

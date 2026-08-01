@@ -78,6 +78,7 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] || [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
@@ -99,14 +100,14 @@ jobs:
           TRUSTED_DETECTOR=$(mktemp)
           CHANGED_FILE=$(mktemp)
           trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
-          if git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
             :
           else
             DETECTOR_STATUS=$?
             echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
             exit "$DETECTOR_STATUS"
           fi
-          if sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
             :
           else
             DETECTOR_STATUS=$?
@@ -1246,6 +1247,14 @@ jobs:
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
           fi
+          if [ "$ENGINE" != "true" ] && [ "$ENGINE" != "false" ]; then
+            echo "::error::engine selector output is missing or invalid (value=$ENGINE)."
+            exit 1
+          fi
+          if [ "$TUNE" != "true" ] && [ "$TUNE" != "false" ]; then
+            echo "::error::tune selector output is missing or invalid (value=$TUNE)."
+            exit 1
+          fi
           # Drafts skip the resource-intensive parity jobs to keep hosted runner
           # capacity available to PRs that are ready to merge. Those skips reach
           # the arm checks below as result=skipped, which is correctly not "success",
@@ -1260,7 +1269,7 @@ jobs:
             echo "::error::Tune training surface changed and the layer-23 golden bridge did not succeed (result=$LAYER23_RESULT)."
             exit 1
           fi
-          if [ "$ENGINE" != "true" ]; then
+          if [ "$ENGINE" = "false" ]; then
             echo "No engine change — parity not required. PASS."
             exit 0
           fi
