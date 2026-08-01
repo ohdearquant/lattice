@@ -31,6 +31,8 @@ use std::path::Path;
 use crate::error::InferenceError;
 use crate::model::qwen35::qwen_required_tensor_names;
 use crate::model::qwen35_config::Qwen35Config;
+#[cfg(test)]
+use crate::quant::quarot::forward_equivalence::pre_admission_allocation_tracking;
 use crate::quant::quarot::forward_equivalence::{
     ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_prepared_forward_equivalence_qwen35,
     prepare_forward_equivalence_qwen35,
@@ -566,6 +568,8 @@ pub fn convert_quarot_qwen35(
         tolerance: opts.tolerance,
         seed: opts.rotation_seed,
     };
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_converter_boundary();
     let equivalence_snapshot =
         prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)?;
 
@@ -1328,6 +1332,43 @@ mod tests {
         let out_cfg_str = fs::read_to_string(output.join("config.json")).unwrap();
         let out_cfg = Qwen35Config::from_config_json_str(&out_cfg_str).unwrap();
         assert!(!out_cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn converter_call_site_rejects_over_budget_before_any_owned_allocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 0xA110_CA7E);
+
+        let tracking = pre_admission_allocation_tracking::start_at_converter_boundary();
+        let result = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                num_probe_tokens: 2_000_000,
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        let (allocation_calls, rejection_seen) = tracking.finish();
+
+        assert!(
+            rejection_seen,
+            "the converter call must reach budget rejection"
+        );
+        assert_eq!(
+            allocation_calls, 0,
+            "the converter allocated between its preparation boundary and budget rejection"
+        );
+        let error = result
+            .expect_err("the over-budget conversion must fail admission")
+            .to_string();
+        assert!(
+            error.contains("retained chain-logit budget"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

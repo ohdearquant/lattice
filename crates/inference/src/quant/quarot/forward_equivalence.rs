@@ -173,19 +173,21 @@ use crate::quant::quarot::rmsnorm_fusion::{
 use crate::quant::quarot::rotation::{absorb_input_rotation_f64, absorb_output_rotation_f64};
 
 #[cfg(test)]
-mod pre_admission_allocation_tracking {
+pub(crate) mod pre_admission_allocation_tracking {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
     #[derive(Clone, Copy)]
     struct State {
         armed: bool,
+        waiting_for_converter_boundary: bool,
         allocation_calls: usize,
         rejection_seen: bool,
     }
 
     const INACTIVE: State = State {
         armed: false,
+        waiting_for_converter_boundary: false,
         allocation_calls: 0,
         rejection_seen: false,
     };
@@ -232,19 +234,49 @@ mod pre_admission_allocation_tracking {
         }
     }
 
-    pub(super) struct Guard {
+    pub(crate) struct Guard {
         active: bool,
     }
 
     pub(super) fn start() -> Guard {
         STATE.with(|cell| {
-            assert!(!cell.get().armed, "allocation tracking already armed");
+            let state = cell.get();
+            assert!(
+                !state.armed && !state.waiting_for_converter_boundary,
+                "allocation tracking already active"
+            );
             cell.set(State {
                 armed: true,
                 ..INACTIVE
             });
         });
         Guard { active: true }
+    }
+
+    pub(crate) fn start_at_converter_boundary() -> Guard {
+        STATE.with(|cell| {
+            let state = cell.get();
+            assert!(
+                !state.armed && !state.waiting_for_converter_boundary,
+                "allocation tracking already active"
+            );
+            cell.set(State {
+                waiting_for_converter_boundary: true,
+                ..INACTIVE
+            });
+        });
+        Guard { active: true }
+    }
+
+    pub(crate) fn mark_converter_boundary() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.waiting_for_converter_boundary {
+                state.waiting_for_converter_boundary = false;
+                state.armed = true;
+                cell.set(state);
+            }
+        });
     }
 
     pub(super) fn mark_rejection() {
@@ -259,7 +291,7 @@ mod pre_admission_allocation_tracking {
     }
 
     impl Guard {
-        pub(super) fn finish(mut self) -> (usize, bool) {
+        pub(crate) fn finish(mut self) -> (usize, bool) {
             self.active = false;
             STATE.with(|cell| {
                 let state = cell.replace(INACTIVE);
