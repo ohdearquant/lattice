@@ -248,13 +248,14 @@ machine_state_probe() {
       python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
     )" || rc=$?
   fi
+  if [ "$rc" -ne 0 ] || [ -z "$record" ]; then
+    echo "bench-compare: machine-state checkpoint '$label' failed or returned" \
+         "no record — refusing to certify this A/B." >&2
+    exit 2
+  fi
   echo "[state] $label: $record"
   MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
 }$record"
-  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
-    echo "bench-compare: machine-state checkpoint '$label' failed — refusing to certify this A/B." >&2
-    exit 2
-  fi
 }
 
 quiet_gate() {
