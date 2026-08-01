@@ -1,4 +1,9 @@
-name: perf post-merge detection (informational)
+name: perf post-merge detection (informational, PAUSED)
+#
+# PAUSED 2026-08-01: this lane no longer runs automatically. It is on-demand only
+# (workflow_dispatch). The rest of this header describes the lane's design and is
+# unchanged; the reason for the pause and the conditions for lifting it are in the
+# block immediately above `on:`. Read that before restoring the trigger.
 #
 # WHAT THIS IS, AND WHAT IT IS NOT (lattice#1105).
 #
@@ -33,27 +38,63 @@ name: perf post-merge detection (informational)
 # range back to that recorded commit instead of putting the skipped change in
 # both arms. The first run falls back to the event parent and says so.
 
+# PAUSED 2026-08-01, NOT FIXED. The automatic push trigger is removed; the lane
+# still runs on demand via workflow_dispatch, unchanged in every other respect.
+#
+# Why. Across its 15 verdict-producing runs this lane reported a confirmed
+# regression every single time, on 15 unrelated merges. The cause is its
+# decision rule, not its plumbing: the rule fails a run when a group's LOWER
+# confidence bound exceeds 7%, applied one-sidedly across 263 group comparisons
+# per run. Criterion's confidence intervals are tight WITHIN a run (median width
+# across the 82 FAIL rows: 0.280 percentage points) while the same groups swing
+# widely BETWEEN runs, and a within-run interval cannot bound between-run
+# variability. With 263 groups and that spread, at least one positive excursion
+# past 7% is close to certain, so the rule converts roughly half of a symmetric
+# noise distribution into "confirmed regressions". The recurrence signature
+# confirms the reading: the same groups flag across unrelated merges
+# (simd_throughput_384/normalize in 7 of 15 runs), and if those were genuine
+# per-merge regressions that group would by now be about twice as slow, which it
+# is not. Large deltas are symmetric overall (85 head-slower vs 119 head-faster
+# past 7%), so this is not an arm-ordering artifact.
+#
+# Cost of leaving it on: roughly 88 minutes of wall clock per run, on each of two
+# runner jobs, for every qualifying merge, producing a verdict that cannot be
+# acted on. Excursions to 169 minutes were observed.
+#
+# What must be true before the push trigger returns. The rule needs a
+# between-run variance estimate rather than a within-run confidence interval;
+# it needs multiple-comparison handling across its 263 groups; and the
+# chronically unstable groups need identifying and either stabilising or
+# excluding. Any change to which groups are gated requires a repeated A/A on the
+# target machine class plus a re-derivation of the threshold FIRST. Restoring
+# the trigger without those changes would not restore a working detector, it
+# would resume a false alarm on every merge.
+#
+# The paths list below is retained verbatim, commented, so that restoring the
+# trigger is a revert of this block rather than a re-derivation of coverage.
+#
+# on:
+#   push:
+#     branches: [main]
+#     paths:
+#       - 'crates/inference/src/forward/cpu/**'
+#       - 'crates/inference/src/attention/**'
+#       - 'crates/inference/benches/elementwise_cpu_bench.rs'
+#       - 'crates/inference/Cargo.toml'
+#       - 'crates/embed/src/simd/**'
+#       - 'crates/embed/benches/simd.rs'
+#       - 'crates/embed/Cargo.toml'
+#       - 'Cargo.lock'
+#       # Root Cargo.toml can carry [profile.bench] (it does not today) and
+#       # .cargo/ can carry rustflags. Either can change codegen for both bench
+#       # targets without touching a single line of crate source, so both must
+#       # trigger this lane.
+#       - 'Cargo.toml'
+#       - '.cargo/**'
+#       # Harness-only changes are validated before merge and deliberately do not
+#       # trigger this lane: the head harness drives both A/B arms, so such a run
+#       # cannot attribute a measured delta to the merged diff.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'crates/inference/src/forward/cpu/**'
-      - 'crates/inference/src/attention/**'
-      - 'crates/inference/benches/elementwise_cpu_bench.rs'
-      - 'crates/inference/Cargo.toml'
-      - 'crates/embed/src/simd/**'
-      - 'crates/embed/benches/simd.rs'
-      - 'crates/embed/Cargo.toml'
-      - 'Cargo.lock'
-      # Root Cargo.toml can carry [profile.bench] (it does not today) and
-      # .cargo/ can carry rustflags. Either can change codegen for both bench
-      # targets without touching a single line of crate source, so both must
-      # trigger this lane.
-      - 'Cargo.toml'
-      - '.cargo/**'
-      # Harness-only changes are validated before merge and deliberately do not
-      # trigger this lane: the head harness drives both A/B arms, so such a run
-      # cannot attribute a measured delta to the merged diff.
   workflow_dispatch:
     inputs:
       base_ref:
