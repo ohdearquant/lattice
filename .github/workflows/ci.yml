@@ -83,9 +83,36 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
-          CHANGED=$(./scripts/ci-changed-files.sh)
+          if [[ ! "$CI_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base revision must be a nonempty 40-character hexadecimal commit ID" >&2
+            exit 2
+          fi
+          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "→ all-zero base revision: full matrix REQUIRED"
+            exit 0
+          fi
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
           echo "Changed files:"
           echo "$CHANGED"
           # Non-Rust set: **/*.md, docs/**, LICENSE*, .gitignore, and the
@@ -102,13 +129,16 @@ jobs:
           # apps/macos and a Rust path still leaves the Rust file in NON_DOCS
           # below, so code=true and the full matrix runs.
           #
-          # Two single greps against here-strings, not a `grep | grep -q` pipe:
+          # Keep the detector's self-relevance explicit instead of relying on
+          # its membership in the generic non-docs bucket below.
+          DETECTOR_CHANGED=$(grep -E '^scripts/ci-changed-files\.sh$' <<<"$CHANGED" || true)
+          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/|^scripts/ci-changed-files\.sh$)' <<<"$CHANGED" || true)
+          # Single greps against here-strings, not a `grep | grep -q` pipe:
           # a downstream `-q` can close its end of a pipe early and SIGPIPE the
           # upstream producer, and under `pipefail` that reports as the
           # pipeline's exit code instead of the match result (fail-open on a
           # large diff).
-          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/)' <<<"$CHANGED" || true)
-          if grep -q . <<<"$NON_DOCS"; then
+          if [ -n "$DETECTOR_CHANGED" ] || grep -q . <<<"$NON_DOCS"; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "→ non-docs files changed: full matrix REQUIRED"
           else
@@ -645,9 +675,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
       - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
         with:
           version: '1.7.12'
+      - name: Install workflow parser
+        run: python3 -m pip install "PyYAML==6.0.3"
       - name: merge-queue config tests
         run: python3 tests/test_ci_changed_files.py -v
       - name: post-merge benchmark progression tests
@@ -803,7 +838,11 @@ jobs:
             echo "::error::decode-harness-unit-tests did not succeed (result=$DECODE_HARNESS_RESULT)."
             exit 1
           fi
-          if [ "$CODE" != "true" ]; then
+          if [ "$CODE" != "true" ] && [ "$CODE" != "false" ]; then
+            echo "::error::code selector output is missing or invalid (value=$CODE)."
+            exit 1
+          fi
+          if [ "$CODE" = "false" ]; then
             echo "Docs-only change, heavy compile jobs not required. PASS."
             exit 0
           fi

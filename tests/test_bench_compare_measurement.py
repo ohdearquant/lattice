@@ -85,6 +85,13 @@ if [[ "${1:-}" == "--version" ]]; then
   exit 0
 fi
 
+if [[ "${1:-}" == "bench" && "${STUB_REQUIRE_LOCKED:-0}" == "1" ]]; then
+  case " $* " in
+    *" --locked "*) ;;
+    *) exit 86 ;;
+  esac
+fi
+
 write_baseline() {
   local bench="$1"
   local baseline_name="$2"
@@ -395,6 +402,31 @@ def _run(
 
 
 class BenchCompareMeasurementGuard(unittest.TestCase):
+    def test_every_bench_command_requires_the_committed_lockfile(self):
+        """Every A/B build and measurement must refuse dependency re-resolution."""
+        source = (LIB / "bench-compare-impl.sh").read_text()
+        commands = [
+            line for line in source.splitlines()
+            if re.search(r"\bcargo bench\b", line)
+            and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(commands), 6, commands)
+        self.assertTrue(
+            all(re.search(r"\bcargo bench --locked\b", line) for line in commands),
+            "every cargo bench command must pass --locked:\n" + "\n".join(commands),
+        )
+
+        result = _run(
+            ["--fail-on-regression"],
+            stub_cargo=STALE_CHANGE_CARGO,
+            extra_env={"STUB_REQUIRE_LOCKED": "1"},
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"locked benchmark harness failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+
     def test_enforcing_mode_refuses_a_run_that_measured_nothing(self):
         """A bench that exits 0 having printed no measurement must not certify.
 
