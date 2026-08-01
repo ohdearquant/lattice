@@ -208,6 +208,7 @@ for bench in rms_norm/896 simd_dot_product/scalar/384; do
     cp -R "$src/$bench/compare-base" "$dst/$bench/"
   fi
 done
+printf '%s\n' 'fixture rsync: partial baseline transfer' >&2
 exit 23
 """
 
@@ -352,6 +353,29 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                     f"report-only run accepted {name} state checkpoint\n"
                     f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
                 )
+
+    def test_reporter_mode_refuses_a_partial_baseline_copy(self):
+        """A partial baseline copy must void a report-only A/B."""
+        self.assertTrue(STALE_CHANGE_CARGO.strip())
+        self.assertTrue(PARTIAL_COPY_RSYNC.strip())
+        control = _run([], stub_cargo=STALE_CHANGE_CARGO)
+        self.assertEqual(
+            control.returncode,
+            0,
+            f"valid report-only fixture did not produce a usable A/B\n"
+            f"stdout:\n{control.stdout}\nstderr:\n{control.stderr}",
+        )
+        result = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            stub_rsync=PARTIAL_COPY_RSYNC,
+        )
+        self.assertEqual(
+            result.returncode,
+            2,
+            "report-only run accepted a partial baseline copy and could "
+            "return uncertified A/B output",
+        )
 
     def test_datetime_utc_entrypoints_reject_python_3_9_explicitly(self):
         """The declared Python minimum must fail before datetime.UTC imports."""
@@ -583,6 +607,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             "failed (rsync exit 23)",
             result.stderr,
         )
+        self.assertIn("fixture rsync: partial baseline transfer", result.stderr)
 
     def test_each_bench_target_gets_a_distinct_criterion_root(self):
         """Target identity must be structural, not reconstructed from group names.
