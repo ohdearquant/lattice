@@ -177,18 +177,31 @@ pub(crate) mod pre_admission_allocation_tracking {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Phase {
+        Inactive,
+        WaitingForConverterBoundary,
+        BeforeRejection,
+        AfterRejection,
+        WaitingForMaterializedWorkingSetBoundary,
+        MaterializedWorkingSetBoundary,
+        MaterializedWorkingSetBoundaryCompleted,
+    }
+
     #[derive(Clone, Copy)]
     struct State {
-        armed: bool,
-        waiting_for_converter_boundary: bool,
-        allocation_calls: usize,
+        phase: Phase,
+        before_rejection_allocation_calls: usize,
+        after_rejection_allocation_calls: usize,
+        materialized_working_set_allocation_calls: usize,
         rejection_seen: bool,
     }
 
     const INACTIVE: State = State {
-        armed: false,
-        waiting_for_converter_boundary: false,
-        allocation_calls: 0,
+        phase: Phase::Inactive,
+        before_rejection_allocation_calls: 0,
+        after_rejection_allocation_calls: 0,
+        materialized_working_set_allocation_calls: 0,
         rejection_seen: false,
     };
 
@@ -204,10 +217,26 @@ pub(crate) mod pre_admission_allocation_tracking {
     fn record_allocation() {
         let _ = STATE.try_with(|cell| {
             let mut state = cell.get();
-            if state.armed {
-                state.allocation_calls = state.allocation_calls.saturating_add(1);
-                cell.set(state);
+            match state.phase {
+                Phase::BeforeRejection => {
+                    state.before_rejection_allocation_calls =
+                        state.before_rejection_allocation_calls.saturating_add(1);
+                }
+                Phase::AfterRejection => {
+                    state.after_rejection_allocation_calls =
+                        state.after_rejection_allocation_calls.saturating_add(1);
+                }
+                Phase::MaterializedWorkingSetBoundary => {
+                    state.materialized_working_set_allocation_calls = state
+                        .materialized_working_set_allocation_calls
+                        .saturating_add(1);
+                }
+                Phase::Inactive
+                | Phase::WaitingForConverterBoundary
+                | Phase::WaitingForMaterializedWorkingSetBoundary
+                | Phase::MaterializedWorkingSetBoundaryCompleted => return,
             }
+            cell.set(state);
         });
     }
 
@@ -238,42 +267,64 @@ pub(crate) mod pre_admission_allocation_tracking {
         active: bool,
     }
 
-    pub(super) fn start() -> Guard {
+    pub(crate) struct Observation {
+        pub(crate) before_rejection_allocation_calls: usize,
+        pub(crate) after_rejection_allocation_calls: usize,
+        pub(crate) materialized_working_set_allocation_calls: usize,
+        pub(crate) rejection_seen: bool,
+        pub(crate) materialized_working_set_boundary_seen: bool,
+        pub(crate) materialized_working_set_boundary_completed: bool,
+    }
+
+    fn start_in_phase(phase: Phase) -> Guard {
         STATE.with(|cell| {
-            let state = cell.get();
-            assert!(
-                !state.armed && !state.waiting_for_converter_boundary,
+            assert_eq!(
+                cell.get().phase,
+                Phase::Inactive,
                 "allocation tracking already active"
             );
-            cell.set(State {
-                armed: true,
-                ..INACTIVE
-            });
+            cell.set(State { phase, ..INACTIVE });
         });
         Guard { active: true }
     }
 
+    pub(super) fn start() -> Guard {
+        start_in_phase(Phase::BeforeRejection)
+    }
+
     pub(crate) fn start_at_converter_boundary() -> Guard {
-        STATE.with(|cell| {
-            let state = cell.get();
-            assert!(
-                !state.armed && !state.waiting_for_converter_boundary,
-                "allocation tracking already active"
-            );
-            cell.set(State {
-                waiting_for_converter_boundary: true,
-                ..INACTIVE
-            });
-        });
-        Guard { active: true }
+        start_in_phase(Phase::WaitingForConverterBoundary)
+    }
+
+    pub(crate) fn start_at_materialized_working_set_boundary() -> Guard {
+        start_in_phase(Phase::WaitingForMaterializedWorkingSetBoundary)
     }
 
     pub(crate) fn mark_converter_boundary() {
         let _ = STATE.try_with(|cell| {
             let mut state = cell.get();
-            if state.waiting_for_converter_boundary {
-                state.waiting_for_converter_boundary = false;
-                state.armed = true;
+            if state.phase == Phase::WaitingForConverterBoundary {
+                state.phase = Phase::BeforeRejection;
+                cell.set(state);
+            }
+        });
+    }
+
+    pub(crate) fn mark_materialized_working_set_boundary() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.phase == Phase::WaitingForMaterializedWorkingSetBoundary {
+                state.phase = Phase::MaterializedWorkingSetBoundary;
+                cell.set(state);
+            }
+        });
+    }
+
+    pub(crate) fn mark_materialized_working_set_boundary_completed() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.phase == Phase::MaterializedWorkingSetBoundary {
+                state.phase = Phase::MaterializedWorkingSetBoundaryCompleted;
                 cell.set(state);
             }
         });
@@ -282,8 +333,8 @@ pub(crate) mod pre_admission_allocation_tracking {
     pub(super) fn mark_rejection() {
         let _ = STATE.try_with(|cell| {
             let mut state = cell.get();
-            if state.armed {
-                state.armed = false;
+            if state.phase == Phase::BeforeRejection {
+                state.phase = Phase::AfterRejection;
                 state.rejection_seen = true;
                 cell.set(state);
             }
@@ -291,11 +342,24 @@ pub(crate) mod pre_admission_allocation_tracking {
     }
 
     impl Guard {
-        pub(crate) fn finish(mut self) -> (usize, bool) {
+        pub(crate) fn finish(mut self) -> Observation {
             self.active = false;
             STATE.with(|cell| {
                 let state = cell.replace(INACTIVE);
-                (state.allocation_calls, state.rejection_seen)
+                Observation {
+                    before_rejection_allocation_calls: state.before_rejection_allocation_calls,
+                    after_rejection_allocation_calls: state.after_rejection_allocation_calls,
+                    materialized_working_set_allocation_calls: state
+                        .materialized_working_set_allocation_calls,
+                    rejection_seen: state.rejection_seen,
+                    materialized_working_set_boundary_seen: matches!(
+                        state.phase,
+                        Phase::MaterializedWorkingSetBoundary
+                            | Phase::MaterializedWorkingSetBoundaryCompleted
+                    ),
+                    materialized_working_set_boundary_completed: state.phase
+                        == Phase::MaterializedWorkingSetBoundaryCompleted,
+                }
             })
         }
     }
@@ -424,35 +488,10 @@ impl OriginalTensorSource for ReaderOriginalTensorSource<'_> {
     }
 }
 
-fn validate_forward_equivalence_inputs(
+pub(crate) fn preflight_forward_equivalence_probe_budget(
     cfg: &Qwen35Config,
-    rotation: &RandomizedHadamard,
     forward_cfg: &ForwardEquivalenceConfig,
 ) -> Result<(), InferenceError> {
-    if cfg.is_moe() {
-        return Err(InferenceError::Inference(
-            "assert_forward_equivalence_qwen35: MoE configs are deferred to v1 \
-             (the rotation/fusion pipeline rejects MoE upstream; this probe \
-             has no expert-mixing path)"
-                .to_string(),
-        ));
-    }
-    if forward_cfg.num_probe_tokens == 0 {
-        return Err(InferenceError::Inference(
-            "assert_forward_equivalence_qwen35: num_probe_tokens must be > 0".to_string(),
-        ));
-    }
-    if !forward_cfg.tolerance.is_finite() || forward_cfg.tolerance <= 0.0 {
-        return Err(InferenceError::Inference(format!(
-            "assert_forward_equivalence_qwen35: tolerance must be a positive finite value, got {}",
-            forward_cfg.tolerance
-        )));
-    }
-    if cfg.vocab_size == 0 {
-        return Err(InferenceError::Inference(
-            "assert_forward_equivalence_qwen35: cfg.vocab_size must be > 0".to_string(),
-        ));
-    }
     let logit_elements = forward_cfg
         .num_probe_tokens
         .checked_mul(cfg.vocab_size)
@@ -482,6 +521,39 @@ fn validate_forward_equivalence_inputs(
             forward_cfg.num_probe_tokens, cfg.vocab_size
         )));
     }
+    Ok(())
+}
+
+fn validate_forward_equivalence_inputs(
+    cfg: &Qwen35Config,
+    rotation: &RandomizedHadamard,
+    forward_cfg: &ForwardEquivalenceConfig,
+) -> Result<(), InferenceError> {
+    if cfg.is_moe() {
+        return Err(InferenceError::Inference(
+            "assert_forward_equivalence_qwen35: MoE configs are deferred to v1 \
+             (the rotation/fusion pipeline rejects MoE upstream; this probe \
+             has no expert-mixing path)"
+                .to_string(),
+        ));
+    }
+    if forward_cfg.num_probe_tokens == 0 {
+        return Err(InferenceError::Inference(
+            "assert_forward_equivalence_qwen35: num_probe_tokens must be > 0".to_string(),
+        ));
+    }
+    if !forward_cfg.tolerance.is_finite() || forward_cfg.tolerance <= 0.0 {
+        return Err(InferenceError::Inference(format!(
+            "assert_forward_equivalence_qwen35: tolerance must be a positive finite value, got {}",
+            forward_cfg.tolerance
+        )));
+    }
+    if cfg.vocab_size == 0 {
+        return Err(InferenceError::Inference(
+            "assert_forward_equivalence_qwen35: cfg.vocab_size must be > 0".to_string(),
+        ));
+    }
+    preflight_forward_equivalence_probe_budget(cfg, forward_cfg)?;
     if rotation.dim() != cfg.hidden_size {
         return Err(InferenceError::Inference(format!(
             "assert_forward_equivalence_qwen35: rotation.dim()={} != cfg.hidden_size={}",
@@ -1432,15 +1504,19 @@ mod tests {
 
         let tracking = pre_admission_allocation_tracking::start();
         let result = prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &forward_cfg);
-        let (allocation_calls, rejection_seen) = tracking.finish();
+        let observation = tracking.finish();
 
         assert!(
-            rejection_seen,
+            observation.rejection_seen,
             "the measured call must reach budget rejection"
         );
         assert_eq!(
-            allocation_calls, 0,
+            observation.before_rejection_allocation_calls, 0,
             "over-budget preparation allocated before rejecting"
+        );
+        assert!(
+            observation.after_rejection_allocation_calls > 0,
+            "the diagnostic allocation after budget rejection must be observed"
         );
         let error = result
             .err()

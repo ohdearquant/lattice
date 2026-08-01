@@ -35,7 +35,7 @@ use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::forward_equivalence::pre_admission_allocation_tracking;
 use crate::quant::quarot::forward_equivalence::{
     ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_prepared_forward_equivalence_qwen35,
-    prepare_forward_equivalence_qwen35,
+    preflight_forward_equivalence_probe_budget, prepare_forward_equivalence_qwen35,
 };
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader};
@@ -500,6 +500,15 @@ pub fn convert_quarot_qwen35(
         ));
     }
 
+    let forward_cfg = ForwardEquivalenceConfig {
+        num_probe_tokens: opts.num_probe_tokens,
+        tolerance: opts.tolerance,
+        seed: opts.rotation_seed,
+    };
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_converter_boundary();
+    preflight_forward_equivalence_probe_budget(&cfg, &forward_cfg)?;
+
     let reader = QuarotTensorReader::open(input_dir)?;
     let input_source = input_dir.display().to_string();
     let required_names = qwen_required_tensor_names(&cfg);
@@ -556,20 +565,20 @@ pub fn convert_quarot_qwen35(
 
     let was_tied = cfg.tie_word_embeddings;
     if was_tied {
+        working_set.reserve(1);
+    }
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_materialized_working_set_boundary();
+    if was_tied {
         materialize_lm_head_for_qwen35(&mut working_set, &cfg)?;
     }
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_materialized_working_set_boundary_completed();
 
     let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg)?;
     fusion_plan.push(qwen35_final_norm_fusion_target());
     let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
     let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
-    let forward_cfg = ForwardEquivalenceConfig {
-        num_probe_tokens: opts.num_probe_tokens,
-        tolerance: opts.tolerance,
-        seed: opts.rotation_seed,
-    };
-    #[cfg(test)]
-    pre_admission_allocation_tracking::mark_converter_boundary();
     let equivalence_snapshot =
         prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)?;
 
@@ -1335,12 +1344,13 @@ mod tests {
     }
 
     #[test]
-    fn converter_call_site_rejects_over_budget_before_any_owned_allocation() {
+    fn converter_rejects_probe_budget_before_tensor_materialization() {
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
         let output = tmp.path().join("output");
         let cfg = tiny_cfg(true);
-        write_input_dir(&cfg, &input, 0xA110_CA7E);
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
 
         let tracking = pre_admission_allocation_tracking::start_at_converter_boundary();
         let result = convert_quarot_qwen35(
@@ -1352,15 +1362,19 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (allocation_calls, rejection_seen) = tracking.finish();
+        let observation = tracking.finish();
 
         assert!(
-            rejection_seen,
+            observation.rejection_seen,
             "the converter call must reach budget rejection"
         );
         assert_eq!(
-            allocation_calls, 0,
-            "the converter allocated between its preparation boundary and budget rejection"
+            observation.before_rejection_allocation_calls, 0,
+            "the converter allocated between config preflight and budget rejection"
+        );
+        assert!(
+            observation.after_rejection_allocation_calls > 0,
+            "the diagnostic allocation after budget rejection must be observed"
         );
         let error = result
             .expect_err("the over-budget conversion must fail admission")
@@ -1368,6 +1382,45 @@ mod tests {
         assert!(
             error.contains("retained chain-logit budget"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn converter_does_not_clone_materialized_working_set() {
+        const REQUIRED_TIED_HEAD_ALLOCATION_CALLS: usize = 5;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 0xA110_CA7E);
+
+        let tracking =
+            pre_admission_allocation_tracking::start_at_materialized_working_set_boundary();
+        convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                num_probe_tokens: 2,
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let observation = tracking.finish();
+
+        assert!(
+            observation.materialized_working_set_boundary_seen,
+            "the converter must reach the materialized working-set boundary"
+        );
+        assert!(
+            observation.materialized_working_set_boundary_completed,
+            "the converter must close the materialized working-set boundary"
+        );
+        assert_eq!(
+            observation.materialized_working_set_allocation_calls,
+            REQUIRED_TIED_HEAD_ALLOCATION_CALLS,
+            "tied-head materialization performed unexpected owned allocations"
         );
     }
 
