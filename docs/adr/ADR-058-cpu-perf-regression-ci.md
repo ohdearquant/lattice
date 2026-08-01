@@ -288,7 +288,7 @@ environment-drift risk). Criterion micro-benchmarks are collected as trend data 
 a cross-run variance model measured on the actual runner pool, not the escalation path in
 this document.
 
-## Post-acceptance note (2026-07-30): enforcing local/post-merge comparisons are order-balanced
+## Post-acceptance note (2026-07-30): local/post-merge comparisons are order-balanced
 
 The later non-merge-blocking `perf-postmerge-gate.yml` lane reused the original single-pair
 Criterion rule through `bench-compare.sh --full --fail-on-regression`. Measurement on an isolated
@@ -296,17 +296,21 @@ host showed that this still admitted the defect above: monotonic session drift m
 arm slower, and a byte-identical A/A comparison crossed the 7% FAIL margin with a narrow
 within-run interval. Ambient-idle and lock checks did not detect that machine-state mode.
 
-Enforcing `bench-compare` runs therefore use the balanced sequence
+All `bench-compare` runs therefore use the balanced sequence
 `base₁ → head₁ → head₂ → base₂`. For every benchmark, `perf-bench-gate.py` combines the forward
 `head₁/base₁` and reverse `base₂/head₂` ratios in log space. Half their difference is the
 order-balanced source-effect estimate; half their sum is the observed order effect. The
 transformed Criterion endpoint envelope is widened by the full observed order-effect envelope
 before the unchanged 3%/7% rules are applied.
 
-This is deliberately not described as a calibrated cross-run 95% confidence interval. It is a
-same-session bracketing correction that cancels equal monotonic drift and carries the measured
-order term into the decision instead of silently assigning it to the head commit. If the order
-term alone exceeds the existing 7% FAIL margin, the run exits `3` (`NOT_MEASURABLE`) and the
-automated lane remains red; it does not report a source regression. Missing or mismatched reverse
-evidence exits `2`. Report-only contributor runs retain the faster two-arm sequence and continue
-to print the raw Criterion comparison without enforcing it.
+This is deliberately not described as a calibrated cross-run 95% confidence interval. It assumes
+the forward and reverse within-stratum order increments are additive and stable in log space,
+which is a common multiplicative timing effect on the raw scale. Equal log drift cancels exactly;
+unequal same-sign drift and a disturbance confined to one stratum are conservatively bracketed.
+Opposite-sign or source-dependent drift is not identifiable from one ABBA block: it can cancel in
+the reported order term and appear as a source effect, and the host-state checkpoints do not test
+that stationarity assumption. Replication, interleaving, or randomized order blocks are needed to
+detect it. If the order term alone exceeds the existing 7% FAIL margin, the run exits `3`
+(`NOT_MEASURABLE`) and every enforcing consumer remains red; it does not report a source
+regression. Missing or mismatched reverse evidence exits `2`. Report-only contributor runs collect
+the same balanced evidence but continue to print the gate status and exit zero.

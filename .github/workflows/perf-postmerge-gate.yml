@@ -158,7 +158,8 @@ jobs:
             echo "**Order control.** Enforcement runs \`base₁ → head₁ → head₂ →"
             echo "base₂\`. The gate combines both order strata in log space and"
             echo "returns NOT_MEASURABLE if the observed order-bias envelope"
-            echo "alone exceeds the unchanged 7% FAIL margin."
+            echo "alone exceeds the unchanged 7% FAIL margin. NOT_MEASURABLE"
+            echo "fails this job and does not advance the progression branch."
             echo
             echo "**Scope.** This lane DETECTS post-merge; it cannot gate the merge"
             echo "that introduced a regression, and it is not a required check."
@@ -243,7 +244,7 @@ jobs:
               f"verdict=not_measurable; {detail}"
           )
           PY
-            exit 0
+            exit 3
           fi
           if [ "$AB_RC" != "0" ]; then
             exit "${AB_RC:-2}"

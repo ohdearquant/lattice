@@ -7,7 +7,7 @@
 # Benchmark entry points call this before creating or building their measurement
 # trees. Indexing the resulting filesystem churn can overlap a timing phase, and
 # an asymmetric overlap can become an apparent code delta (or make the
-# order-balanced enforcing run honestly refuse as not measurable).
+# order-balanced run honestly refuse as not measurable).
 #
 # FAIL-CLOSED BY DESIGN. This guards measurement integrity, so it must never
 # report success without the marker actually being in place. A silently absent

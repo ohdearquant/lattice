@@ -39,7 +39,9 @@ Exit codes:
   3 — not measurable: the automated lane's before/between/after ambient sample
       stream is missing, malformed, duplicated, or below BENCH_IDLE_FLOOR; or
       the measured AB/BA order-bias envelope is itself larger than the FAIL
-      margin, so the run cannot distinguish a gate-sized source effect.
+      margin, so the run cannot distinguish a gate-sized source effect. This is
+      a non-success state: enforcing consumers must keep it nonzero. Across
+      independent targets, a confirmed regression (1) outranks this state.
 
 Status mode is opt-in. It requires exactly one perf-ambient-sample/v1 record for
 each voting phase (before, between, after), ignores other phase labels, and
@@ -390,11 +392,16 @@ def _geometric_mean(first: float, second: float) -> float:
 def order_balance_pair(forward: BenchResult, reverse: BenchResult) -> BenchResult:
     """Combine A→B and B→A Criterion comparisons from an ABBA run.
 
-    `forward` is head₁/base₁. `reverse` is base₂/head₂. In log-ratio space,
-    half their difference estimates the source effect while half their sum
-    estimates the directional order effect. The Criterion endpoint envelope
-    is transformed the same way, then widened by the complete order-effect
-    envelope so within-run CIs cannot hide the run-order term.
+    `forward` is head₁/base₁ and `reverse` is base₂/head₂. The model is
+    `f = s + d_f`, `r = -s + d_r`, where `s` is the source effect and
+    `d_f`/`d_r` are within-stratum order increments in log space. The split
+    identifies `s` exactly when `d_f == d_r`; that is a stable multiplicative
+    timing effect on the raw scale. Widening by the order envelope brackets
+    unequal same-sign increments and a disturbance confined to one stratum.
+
+    Opposite-sign or source-dependent increments can cancel in the order term
+    and be misattributed to the source. One ABBA block cannot detect that model
+    violation; replication, interleaving, or randomized order blocks are needed.
     """
     if forward.name != reverse.name:
         raise ValueError(
@@ -1095,7 +1102,7 @@ def parse_order_control(
     *,
     require_samples: bool,
 ) -> list[BenchResult]:
-    """Parse the B→A half of an enforcing ABBA run, refusing partial evidence."""
+    """Parse the B→A half of an ABBA run, refusing partial evidence."""
     if not root.exists():
         raise ValueError(f"order-control Criterion root does not exist: {root}")
 
@@ -1112,8 +1119,7 @@ def parse_order_control(
     change_by_id = {}
     for change_file in change_files:
         bench_id = artifact_bench_id(change_file, root, artifact_parts=1)
-        if bench_id in expected_ids:
-            change_by_id[bench_id] = change_file
+        change_by_id[bench_id] = change_file
     if change_by_id.keys() != expected_ids:
         missing = sorted(expected_ids - change_by_id.keys())
         extra = sorted(change_by_id.keys() - expected_ids)

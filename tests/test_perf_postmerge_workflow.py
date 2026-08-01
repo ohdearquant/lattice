@@ -74,6 +74,17 @@ class PerfPostmergeWorkflowTests(unittest.TestCase):
         self.assertNotIn("success()", record_step)
         self.assertIn("git push origin", record_step)
 
+    def test_not_measurable_fails_closed_at_workflow_consumer(self) -> None:
+        workflow = _WORKFLOW.read_text()
+        classify_step = workflow.split(
+            "- name: Classify the gate outcome", 1
+        )[1].split("- name: Record the outcome honestly", 1)[0]
+        not_measurable_branch = classify_step.split(
+            'if [ "$AB_RC" = "3" ]; then', 1
+        )[1].split("fi", 1)[0]
+        self.assertIn("exit 3", not_measurable_branch)
+        self.assertNotIn("exit 0", not_measurable_branch)
+
 
 if __name__ == "__main__":
     unittest.main()

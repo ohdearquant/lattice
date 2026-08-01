@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,6 +77,75 @@ def _run(root: Path, samples: Path, status: Path, target: str) -> subprocess.Com
 
 
 class PerfBenchGateStatusTests(unittest.TestCase):
+    def test_single_abba_block_cannot_detect_sign_changing_order_effects(
+        self,
+    ) -> None:
+        spec = importlib.util.spec_from_file_location("perf_bench_gate", GATE)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        forward = module.BenchResult(
+            "group/bench", 0.10, 0.10, 0.10, 110.0, 100.0
+        )
+        reverse = module.BenchResult(
+            "group/bench", -0.10, -0.10, -0.10, 90.0, 100.0
+        )
+
+        result = module.order_balance_pair(forward, reverse)
+
+        self.assertAlmostEqual(result.point_pct, 10.554160, places=6)
+        self.assertAlmostEqual(result.order_bias_bound_pct, 0.503782, places=6)
+        self.assertEqual(result.verdict(), "FAIL")
+
+    def test_extra_reverse_comparison_is_an_input_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "forward", 0.095)
+            control = _criterion_root(
+                root,
+                "reverse",
+                0.095,
+                baseline_name="compare-head",
+            )
+            extra = control / "group" / "unexpected" / "change"
+            extra.mkdir(parents=True)
+            (extra / "estimates.json").write_text(
+                '{"mean":{"point_estimate":0.0,'
+                '"confidence_interval":{"lower_bound":0.0,'
+                '"upper_bound":0.0}}}\n'
+            )
+            samples = root / "ambient.jsonl"
+            _samples(samples, {phase: 95.0 for phase in PHASES})
+            status = root / "status.json"
+            target = "lattice-inference:elementwise_cpu_bench"
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(GATE),
+                    str(criterion),
+                    "fixture/extra-order-control",
+                    "--target",
+                    target,
+                    "--require-measurements",
+                    "--require-order-balance",
+                    "--order-control-root",
+                    str(control),
+                    "--ambient-samples",
+                    str(samples),
+                    "--status-out",
+                    str(status),
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "error")
+            self.assertIn("order-control comparison set differs", payload["reason"])
+            self.assertIn("group/unexpected", payload["reason"])
+
     def test_malformed_reverse_numbers_are_input_errors_with_status(self) -> None:
         cases = (
             ("string point", ("point_estimate",), "corrupt"),

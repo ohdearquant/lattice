@@ -211,6 +211,11 @@ write_change() {
 }
 
 scenario="${STUB_SCENARIO:-directional-drift}"
+if [[ "$target" == "inference" && -n "${STUB_INFERENCE_SCENARIO:-}" ]]; then
+  scenario="$STUB_INFERENCE_SCENARIO"
+elif [[ "$target" == "embed" && -n "${STUB_EMBED_SCENARIO:-}" ]]; then
+  scenario="$STUB_EMBED_SCENARIO"
+fi
 if [[ "$scenario" == "directional-drift" ]]; then
   a1="100.0"
   b1="110.0"
@@ -418,8 +423,8 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stderr:\n{result.stderr}")
         self.assertNotIn("produced no measurements", result.stderr)
 
-    def test_reporter_mode_keeps_the_two_arm_order(self):
-        """Report-only feedback remains the fast raw A→B comparison."""
+    def test_report_only_mode_uses_balanced_order(self):
+        """Report-only evidence uses the same balanced ABBA measurement."""
         with tempfile.TemporaryDirectory() as temporary:
             order_file = Path(temporary) / "order.txt"
             result = _run(
@@ -427,7 +432,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                 stub_cargo=ORDER_BALANCE_CARGO,
                 extra_env={
                     "STUB_ORDER_FILE": str(order_file),
-                    "STUB_SCENARIO": "directional-drift",
+                    "STUB_SCENARIO": "true-regression",
                 },
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -439,11 +444,14 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                         for observation in observations
                         if observation.startswith(f"{target}:")
                     ],
-                    ["A", "B"],
+                    ["A", "B", "B", "A"],
                     observations,
                 )
-            self.assertIn("arm order: AB (base → head)", result.stdout)
-            self.assertNotIn("ABBA bound", result.stdout)
+            self.assertIn(
+                "arm order: ABBA (base₁ → head₁ → head₂ → base₂)",
+                result.stdout,
+            )
+            self.assertIn("ABBA bound", result.stdout)
 
     def test_enforcing_abba_refuses_identical_source_directional_drift(self):
         """A gate-sized second-arm drift is NOT_MEASURABLE, never regression.
@@ -506,6 +514,29 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                 f"expected regression (1), got {result.returncode}\n"
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
+            self.assertIn("gate reported a confirmed regression", result.stderr)
+
+    def test_confirmed_regression_outranks_unmeasurable_target(self):
+        """One target's exit 3 must not suppress another target's exit 1."""
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--full", "--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_INFERENCE_SCENARIO": "directional-drift",
+                    "STUB_EMBED_SCENARIO": "true-regression",
+                },
+            )
+            self.assertEqual(
+                result.returncode,
+                1,
+                "a confirmed regression was suppressed by an unmeasurable "
+                f"target\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("**⏸ NOT MEASURABLE**", result.stdout)
+            self.assertIn("**❌ 1 FAIL**", result.stdout)
             self.assertIn("gate reported a confirmed regression", result.stderr)
 
     def test_stale_change_cannot_mask_a_benchmark_removed_on_head(self):
@@ -635,8 +666,8 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stderr:\n{result.stderr}")
         roots = set(re.findall(r"criterion-home=(\S+)", result.stdout))
         self.assertEqual(
-            len(roots), 4,
-            f"expected isolated base/head roots per target, saw {roots}\n"
+            len(roots), 8,
+            f"expected isolated ABBA roots per target, saw {roots}\n"
             f"stdout:\n{result.stdout}")
         self.assertNotIn("<unset>", roots)
         self.assertTrue(any("/inference/criterion" in path for path in roots), roots)

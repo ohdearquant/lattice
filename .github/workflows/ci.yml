@@ -714,6 +714,8 @@ jobs:
       # "nothing measured" as "nothing regressed"), and runs no benchmark.
       - name: python3 scripts/perf-bench-gate.py --selftest
         run: python3 scripts/perf-bench-gate.py --selftest
+      - name: python3 tests/test_perf_bench_gate_status.py
+        run: python3 tests/test_perf_bench_gate_status.py -v
       # bench-compare.sh's measurement-integrity guard. Drives the shipping
       # script in a disposable repo against a stub cargo, so it exercises the
       # real parser-to-guard path; no benchmark runs and no real cargo is
