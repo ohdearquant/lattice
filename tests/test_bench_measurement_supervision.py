@@ -1212,12 +1212,27 @@ class RuntimeContract(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertEqual(calls, ["inference"])
         self.assertIn("fixture first target failed", result.stderr)
-        self.assertIn("refusing to accept", result.stderr)
+        self.assertIn("NOT MEASURABLE: lattice-inference benchmark failed", result.stderr)
 
     def test_bench_ci_healthy_targets_complete(self):
         result, calls = _run_bench_ci_fixture(fail_first=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(calls, ["inference", "embed"])
+
+    def test_recipe_outcome_one_is_not_reclassified_as_supervision_failure(self):
+        with _SupervisorSandbox() as sb:
+            entrypoint = sb.root / "scripts" / "outcome_entrypoint.sh"
+            entrypoint.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -uo pipefail\n"
+                f"source {str(sb.root / 'scripts/lib/bench-supervision.sh')!r}\n"
+                "measurement() { return 1; }\n"
+                'bench_supervise_entry "fixture" ordinary measurement "$@"\n'
+            )
+            entrypoint.chmod(0o755)
+            result = sb.run([str(entrypoint)], entrypoint=True)
+
+        self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_successful_parent_with_live_descendant_refuses_before_unlock(self):
         with _SupervisorSandbox() as sb:

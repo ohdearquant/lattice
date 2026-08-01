@@ -44,7 +44,9 @@ bench_supervise_entry() {
         set +e
     fi
     (
-        set -e
+        if [[ "$restore_errexit" -eq 1 ]]; then
+            set -e
+        fi
         bench_close_supervisor_witness
         "$measurement" "$@"
     )
@@ -55,12 +57,7 @@ bench_supervise_entry() {
     if ! python3 "$helper" verify; then
         return 2
     fi
-    if [[ "$measurement_rc" -ne 0 ]]; then
-        echo "bench-supervision: $label measurement command failed" \
-             "(exit $measurement_rc); refusing to accept an incomplete measurement" >&2
-        return 2
-    fi
-    return 0
+    return "$measurement_rc"
 }
 
 bench_quiet_checkpoint() {
