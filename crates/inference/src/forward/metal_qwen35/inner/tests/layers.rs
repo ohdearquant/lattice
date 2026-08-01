@@ -1,3 +1,5 @@
+use super::*;
+
 #[test]
 fn forward_step_gdn_only_does_not_advance_kv_cache() {
     let _gpu_guard = gpu_test_lock();

@@ -22170,8 +22170,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        // Keep relocated layer tests in this namespace so their harness identities stay stable.
-        include!("metal_qwen35/inner/tests/layers.rs");
+        mod layers;
 
         /// Issue #171 smoke test: the block-top-k Stage-1 (fused GEMV + block-local
         /// argmax) / Stage-2 (existing `argmax_merge`) dispatch must select the
