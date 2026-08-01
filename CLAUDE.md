@@ -151,7 +151,7 @@ current main during review, not just against the PR's own diff.
 - Do not run the full Criterion suite when you can filter to relevant groups.
 - Do not submit a perf PR without `make bench-compare` output.
 
-## Performance Workflow (ADR-058)
+## Performance Workflow (ADR-087)
 
 - **Every perf PR must include before/after numbers.** No exception. Run `make bench-compare` (or `scripts/bench-compare.sh <base> <head>`) to get an A/B table. Paste the output in the PR description.
 - Default to `--quick` (~2 min). Use `--full` only when CIs are too wide to tell.
