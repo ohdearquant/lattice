@@ -21155,6 +21155,23 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 forced_logits = forced.forward_step(token, position);
             }
 
+            let (_, common) = &forced.engine.layer_weights[0];
+            let MetalFfnWeights::Moe(moe) = &common.ffn else {
+                panic!("layer 0 must build MetalFfnWeights::Moe for an is_moe() config");
+            };
+            let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed else {
+                panic!("from_q4_dir must build RoutedExpertStorage::Cached");
+            };
+            for (label, cache) in [("gate_up", gate_up), ("down", down)] {
+                let (_, _, evictions) = cache.borrow().hit_miss_eviction_counts();
+                eprintln!("[moe-eviction-proof] cache={label} evictions={evictions}");
+                assert!(
+                    evictions > 0,
+                    "{label} cache must evict at least one resident expert before logit parity \
+                     can establish that eviction is numerically transparent"
+                );
+            }
+
             assert_eq!(baseline_logits.len(), forced_logits.len());
             for (i, (b, f)) in baseline_logits.iter().zip(forced_logits.iter()).enumerate() {
                 assert!(
