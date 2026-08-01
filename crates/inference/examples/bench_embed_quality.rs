@@ -20,8 +20,22 @@ use std::path::Path;
 #[cfg(feature = "backfill")]
 use std::time::Instant;
 
-#[cfg(feature = "backfill")]
+#[cfg(all(feature = "backfill", target_os = "macos", feature = "metal-gpu"))]
 fn main() {
+    let _gpu_guard = lattice_inference::measurement::gpu_test_lock();
+    run_bench();
+}
+
+#[cfg(all(
+    feature = "backfill",
+    not(all(target_os = "macos", feature = "metal-gpu"))
+))]
+fn main() {
+    run_bench();
+}
+
+#[cfg(feature = "backfill")]
+fn run_bench() {
     let home = std::env::var("HOME").unwrap();
     let db_path = format!("{home}/.lattice/lattice.db");
 

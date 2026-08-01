@@ -124,6 +124,27 @@ download_and_verify() {
     verify_directory "$directory"
 }
 
+release_draft_state() {
+    gh release view "$TAG" \
+        --repo "$REPOSITORY" \
+        --json isDraft \
+        --jq .isDraft
+}
+
+require_draft() {
+    local published_message="$1"
+    local state
+    state="$(release_draft_state)"
+    if [[ "$state" == "false" ]]; then
+        echo "ERROR: $published_message" >&2
+        return 1
+    fi
+    if [[ "$state" != "true" ]]; then
+        echo "ERROR: unexpected release draft state: $state" >&2
+        return 1
+    fi
+}
+
 verify_directory "$ARTIFACT_DIR"
 
 REF_INFO="$(
@@ -145,67 +166,25 @@ if [[ "$REF_TYPE" != "commit" || "$REF_SHA" != "$EXPECTED_SHA" ]]; then
     exit 1
 fi
 
-IS_DRAFT="$(
-    gh release view "$TAG" \
-        --repo "$REPOSITORY" \
-        --json isDraft \
-        --jq .isDraft
-)"
+require_draft "release $TAG is already published; create a new draft with a new tag and version"
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-if [[ "$IS_DRAFT" == "true" ]]; then
-    if upload_directory "$ARTIFACT_DIR"; then
-        :
-    else
-        UPLOAD_STATUS=$?
-        echo "ERROR: draft release upload failed; the release remains unpublished" >&2
-        exit "$UPLOAD_STATUS"
-    fi
-    if ! download_and_verify "$WORK_DIR/draft-verify"; then
-        echo "ERROR: draft release inventory verification failed; the release remains unpublished" >&2
-        exit 1
-    fi
-    gh release edit "$TAG" \
-        --repo "$REPOSITORY" \
-        --draft=false
-    exit 0
-fi
-
-if [[ "$IS_DRAFT" != "false" ]]; then
-    echo "ERROR: unexpected release draft state: $IS_DRAFT" >&2
-    exit 1
-fi
-
-if ! download_and_verify "$WORK_DIR/previous"; then
-    echo "ERROR: published release is not a complete recoverable asset set; refusing repair" >&2
-    exit 1
-fi
-
-REPAIR_STATUS=0
+require_draft "release $TAG became published before upload; no assets were uploaded by this invocation"
 if upload_directory "$ARTIFACT_DIR"; then
-    if download_and_verify "$WORK_DIR/repaired-verify"; then
-        exit 0
-    fi
-    REPAIR_STATUS=1
-    echo "ERROR: published release post-upload verification failed; restoring the previous asset set" >&2
+    :
 else
-    REPAIR_STATUS=$?
-    echo "ERROR: published release upload failed; restoring the previous asset set" >&2
+    UPLOAD_STATUS=$?
+    echo "ERROR: draft release upload failed; this script did not publish the release, but remote state must be rechecked" >&2
+    exit "$UPLOAD_STATUS"
 fi
-
-if ! upload_directory "$WORK_DIR/previous"; then
-    echo "ERROR: recovery upload failed; published release may require manual repair" >&2
+require_draft "release $TAG became published while assets were uploading; uploaded assets may already have changed"
+if ! download_and_verify "$WORK_DIR/draft-verify"; then
+    echo "ERROR: draft release inventory verification failed; this script did not publish the release, but remote state must be rechecked" >&2
     exit 1
 fi
-if ! download_and_verify "$WORK_DIR/recovery-verify"; then
-    echo "ERROR: recovery verification failed; published release requires manual repair" >&2
-    exit 1
-fi
-
-echo "ERROR: replacement failed; previous release asset set restored and verified" >&2
-if [[ "$REPAIR_STATUS" -eq 0 ]]; then
-    REPAIR_STATUS=1
-fi
-exit "$REPAIR_STATUS"
+require_draft "release $TAG became published during verification; this script will not edit its publication state"
+gh release edit "$TAG" \
+    --repo "$REPOSITORY" \
+    --draft=false

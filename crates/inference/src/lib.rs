@@ -64,6 +64,14 @@ pub mod grammar;
 pub mod kv_cache;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
 pub mod lora_hook;
+/// Repository-internal guards shared by Metal tests and measurement targets.
+///
+/// This module is hidden from generated documentation and is not a supported
+/// production API. It is exported because Cargo builds repository integration
+/// tests, benches, examples, and binaries as separate crates.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub mod measurement;
 /// Inference metrics and entropy accumulation. See [`model`].
 pub mod metrics;
 /// Adapter routing and mixture support built on top of [`lora_hook`] and [`sampling`].
