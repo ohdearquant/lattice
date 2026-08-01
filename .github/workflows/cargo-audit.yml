@@ -23,9 +23,9 @@ name: cargo audit
 # ships: `audit` for the root workspace's tracked `Cargo.lock`, and
 # `audit-native` for `npm/lattice-embed-native`, which declares its own
 # single-crate `[workspace]` (see that manifest's header comment) and is
-# gitignored at the repo root's `Cargo.lock` pattern, so it has no tracked
-# lockfile to scan directly. `audit-native` generates one at CI time with
-# `cargo generate-lockfile` and audits that. cargo-audit's config discovery
+# ignored by that directory's own `.gitignore`, so it has no tracked lockfile
+# to scan directly. `audit-native` generates one at CI time with `cargo
+# generate-lockfile` and audits that. cargo-audit's config discovery
 # walks up from the current directory the same way cargo's own config
 # discovery does, so running `cargo audit` from inside
 # npm/lattice-embed-native still picks up the root `.cargo/audit.toml`
