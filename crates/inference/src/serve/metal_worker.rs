@@ -1469,8 +1469,7 @@ mod tests {
         );
         assert!(
             elapsed < Duration::from_millis(250),
-            "shutdown exceeded the deadline watchdog: {:?}",
-            elapsed
+            "shutdown exceeded the deadline watchdog: {elapsed:?}"
         );
     }
 
