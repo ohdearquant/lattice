@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -73,6 +74,49 @@ def write_release_assets(directory: Path, tag: str, marker: str) -> None:
         (directory / f"{name}.sha256").write_text(
             f"{digest}  {name}\n", encoding="utf-8"
         )
+
+
+def workflow_step_script(
+    workflow: Path, *, step_id: str | None = None, name: str | None = None
+) -> str:
+    if (step_id is None) == (name is None):
+        raise ValueError("exactly one workflow step selector is required")
+    marker = f"- id: {step_id}" if step_id is not None else f"- name: {name}"
+    lines = workflow.read_text(encoding="utf-8").splitlines()
+    try:
+        marker_index = next(
+            index for index, line in enumerate(lines) if line.strip() == marker
+        )
+    except StopIteration as error:
+        raise AssertionError(f"{workflow.name} has no step {marker}") from error
+    try:
+        run_index = next(
+            index
+            for index in range(marker_index + 1, len(lines))
+            if lines[index].strip() == "run: |"
+        )
+    except StopIteration as error:
+        raise AssertionError(f"{workflow.name} step {marker} has no run block") from error
+
+    run_indent = len(lines[run_index]) - len(lines[run_index].lstrip())
+    block: list[str] = []
+    for line in lines[run_index + 1 :]:
+        indent = len(line) - len(line.lstrip())
+        if line.strip() and indent <= run_indent:
+            break
+        block.append(line)
+    return textwrap.dedent("\n".join(block)).strip() + "\n"
+
+
+def require_tests_collected(test_suite: unittest.TestSuite) -> None:
+    if test_suite.countTestCases() == 0:
+        raise SystemExit("ERROR: no tests collected")
+
+
+class FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        require_tests_collected(self.test)
+        super().runTests()
 
 
 class PackageScriptContractTest(unittest.TestCase):
@@ -146,6 +190,9 @@ class UploadContractTest(unittest.TestCase):
         remote_tag_sha: str | None = None,
         event_name: str = "workflow_dispatch",
         fail_uploads: int = 0,
+        interrupt_upload: bool = False,
+        publish_during_upload: bool = False,
+        publish_after_view: int = 0,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, object], list[list[str]]]:
         root = artifact_dir.parent
         bin_dir = root / "bin"
@@ -157,6 +204,7 @@ class UploadContractTest(unittest.TestCase):
                 #!/usr/bin/env python3
                 import json
                 import os
+                import signal
                 import shutil
                 import sys
                 from pathlib import Path
@@ -174,16 +222,26 @@ class UploadContractTest(unittest.TestCase):
                 if args[0] == "api":
                     print(f"commit {state['tag_sha']}")
                 elif args[:2] == ["release", "view"]:
+                    state["release_views"] += 1
+                    if state["release_views"] == state["publish_after_view"]:
+                        state["draft"] = False
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
                     print("true" if state["draft"] else "false")
                 elif args[:2] == ["release", "upload"]:
                     repo_index = args.index("--repo")
                     assets = [Path(value) for value in args[3:repo_index]]
+                    if state["publish_during_upload"]:
+                        state["draft"] = False
                     inject = state["fail_uploads"] > 0
                     if inject:
                         state["fail_uploads"] -= 1
                     for index, asset in enumerate(assets):
                         destination = remote / asset.name
                         destination.unlink(missing_ok=True)
+                        if state["interrupt_upload"] and index == 1:
+                            state["interrupted"] = True
+                            state_path.write_text(json.dumps(state), encoding="utf-8")
+                            os.killpg(os.getpgrp(), signal.SIGTERM)
                         if inject and index == 1:
                             state.setdefault("injected_exit_codes", []).append(42)
                             state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -216,6 +274,10 @@ class UploadContractTest(unittest.TestCase):
                 {
                     "draft": draft,
                     "fail_uploads": fail_uploads,
+                    "interrupt_upload": interrupt_upload,
+                    "publish_during_upload": publish_during_upload,
+                    "publish_after_view": publish_after_view,
+                    "release_views": 0,
                     "remote_dir": str(remote_dir),
                     "tag_sha": remote_tag_sha or tag_sha,
                 }
@@ -240,6 +302,7 @@ class UploadContractTest(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
+            start_new_session=True,
         )
         state = json.loads(state_path.read_text(encoding="utf-8"))
         log = []
@@ -316,7 +379,7 @@ class UploadContractTest(unittest.TestCase):
             self.assertIn("expected commit", result.stderr)
             self.assertEqual([args[0] for args in log], ["api"])
 
-    def test_published_repair_recovers_previous_set_after_upload_failure(self):
+    def test_published_release_is_refused_without_remote_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             artifacts = root / "dist"
@@ -333,22 +396,142 @@ class UploadContractTest(unittest.TestCase):
                 tag,
                 remote,
                 draft=False,
-                fail_uploads=1,
+                fail_uploads=2,
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(state["injected_exit_codes"], [42])
-            self.assertIn("previous release asset set restored", result.stderr)
+            self.assertIn("already published", result.stderr)
+            self.assertEqual(state["fail_uploads"], 2)
             self.assertEqual(
                 {path.name: path.read_bytes() for path in remote.iterdir()},
                 previous,
             )
-            uploads = [args for args in log if args[:2] == ["release", "upload"]]
-            downloads = [
-                args for args in log if args[:2] == ["release", "download"]
+            mutations = [
+                args
+                for args in log
+                if args[:2] in (["release", "upload"], ["release", "edit"])
             ]
-            self.assertEqual(len(uploads), 2)
-            self.assertGreaterEqual(len(downloads), 2)
+            self.assertEqual(mutations, [])
+
+    def test_interrupted_draft_upload_stays_unpublished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "dist"
+            remote = root / "remote"
+            tag = f"v{workspace_version()}"
+            write_release_assets(artifacts, tag, "new")
+
+            result, state, log = self.run_uploader(
+                artifacts,
+                tag,
+                remote,
+                draft=True,
+                interrupt_upload=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(state["draft"])
+            self.assertTrue(state["interrupted"])
+            self.assertNotIn(
+                ["release", "edit"], [args[:2] for args in log]
+            )
+
+    def test_failed_draft_upload_stays_unpublished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "dist"
+            remote = root / "remote"
+            tag = f"v{workspace_version()}"
+            write_release_assets(artifacts, tag, "new")
+
+            result, state, log = self.run_uploader(
+                artifacts,
+                tag,
+                remote,
+                draft=True,
+                fail_uploads=1,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(state["draft"])
+            self.assertEqual(state["injected_exit_codes"], [42])
+            self.assertNotIn(
+                ["release", "edit"], [args[:2] for args in log]
+            )
+
+    def test_publication_during_upload_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "dist"
+            remote = root / "remote"
+            tag = f"v{workspace_version()}"
+            write_release_assets(artifacts, tag, "new")
+
+            result, state, log = self.run_uploader(
+                artifacts,
+                tag,
+                remote,
+                draft=True,
+                publish_during_upload=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(state["draft"])
+            self.assertIn("may already have changed", result.stderr)
+            self.assertNotIn(
+                ["release", "edit"], [args[:2] for args in log]
+            )
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in remote.iterdir()},
+                {path.name: path.read_bytes() for path in artifacts.iterdir()},
+            )
+
+    def test_publication_before_upload_is_refused_without_remote_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "dist"
+            remote = root / "remote"
+            tag = f"v{workspace_version()}"
+            write_release_assets(artifacts, tag, "new")
+
+            result, state, log = self.run_uploader(
+                artifacts,
+                tag,
+                remote,
+                draft=True,
+                publish_after_view=2,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(state["draft"])
+            self.assertIn("before upload", result.stderr)
+            self.assertEqual(list(remote.iterdir()), [])
+            self.assertNotIn(
+                ["release", "upload"], [args[:2] for args in log]
+            )
+
+    def test_publication_during_verification_stops_before_publish_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = root / "dist"
+            remote = root / "remote"
+            tag = f"v{workspace_version()}"
+            write_release_assets(artifacts, tag, "new")
+
+            result, state, log = self.run_uploader(
+                artifacts,
+                tag,
+                remote,
+                draft=True,
+                publish_after_view=4,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(state["draft"])
+            self.assertIn("became published during verification", result.stderr)
+            actions = [args[:2] for args in log]
+            self.assertIn(["release", "download"], actions)
+            self.assertNotIn(["release", "edit"], actions)
 
     def test_real_packaged_assets_when_requested(self):
         artifact_dir_value = os.environ.get(
@@ -382,25 +565,6 @@ class UploadContractTest(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_published_repair_accepts_older_semver_tag(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            artifacts = root / "dist"
-            remote = root / "remote"
-            tag = "v0.0.0"
-            write_release_assets(artifacts, tag, "new")
-            write_release_assets(remote, tag, "old")
-
-            result, _, _ = self.run_uploader(
-                artifacts, tag, remote, draft=False
-            )
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(
-                {path.name: path.read_bytes() for path in remote.iterdir()},
-                {path.name: path.read_bytes() for path in artifacts.iterdir()},
-            )
 
     def test_rejects_malformed_release_tag_before_upload(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -460,6 +624,9 @@ class WorkflowContractTest(unittest.TestCase):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         self.assertNotIn("types: [published]", workflow)
         self.assertIn("workflow_dispatch:", workflow)
+        self.assertIn("Existing draft release tag", workflow)
+        self.assertIn("Require an existing draft release", workflow)
+        self.assertIn('if [ "$IS_DRAFT" != "true" ]; then', workflow)
         self.assertIn("group: release-binaries-${{ inputs.tag }}", workflow)
         self.assertIn("cancel-in-progress: false", workflow)
         self.assertIn("\n  prepare:\n", workflow)
@@ -523,6 +690,106 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn("SWIFT_RESULT", gate)
         self.assertIn("SWIFT", gate)
 
+    def test_release_workflow_rejects_published_release_behaviorally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake_gh = bin_dir / "gh"
+            fake_gh.write_text(
+                "#!/bin/sh\n" 'printf "false\\n"\n', encoding="utf-8"
+            )
+            fake_gh.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "GH_TOKEN": "fixture-token",
+                    "TAG": "v0.0.0",
+                    "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+                }
+            )
+            script = workflow_step_script(
+                RELEASE_WORKFLOW, name="Require an existing draft release"
+            ).replace("${{ github.repository }}", "ohdearquant/lattice")
+
+            result = subprocess.run(
+                ["bash", "-c", script],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("already published", result.stdout + result.stderr)
+
+    def test_release_docs_create_drafts(self):
+        documents = (
+            (REPO_ROOT / "docs/RELEASE.md", "VERSION"),
+            (REPO_ROOT / "docs/_templates/RELEASE.md", "VERSION"),
+        )
+        for document, version in documents:
+            with self.subTest(document=document.relative_to(REPO_ROOT)):
+                contents = document.read_text(encoding="utf-8")
+                draft = f"gh release create v{{{version}}} --draft"
+                self.assertIn(draft, contents)
+
+    def test_release_docs_dispatch_main_workflow_after_release_creation(self):
+        documents = (
+            (REPO_ROOT / "docs/RELEASE.md", "VERSION"),
+            (REPO_ROOT / "docs/_templates/RELEASE.md", "VERSION"),
+        )
+        for document, version in documents:
+            with self.subTest(document=document.relative_to(REPO_ROOT)):
+                contents = document.read_text(encoding="utf-8")
+                create = f"gh release create v{{{version}}}"
+                dispatch = (
+                    "gh workflow run release-binaries.yml "
+                    "--repo ohdearquant/lattice --ref main "
+                    f"-f tag=v{{{version}}}"
+                )
+                self.assertIn(create, contents)
+                self.assertIn(dispatch, contents)
+                self.assertLess(contents.index(create), contents.index(dispatch))
+
+    def test_release_recovery_uses_new_draft_before_yanking(self):
+        documents = (
+            (REPO_ROOT / "docs/RELEASE.md", "## Bump-and-Yank Recovery"),
+            (REPO_ROOT / "docs/_templates/RELEASE.md", "## Rollback"),
+        )
+        for document, heading in documents:
+            with self.subTest(document=document.relative_to(REPO_ROOT)):
+                contents = document.read_text(encoding="utf-8")
+                recovery = contents.split(heading, maxsplit=1)[1]
+                draft = "gh release create v{NEW_VERSION} --draft"
+                dispatch = (
+                    "gh workflow run release-binaries.yml "
+                    "--repo ohdearquant/lattice --ref main "
+                    "-f tag=v{NEW_VERSION}"
+                )
+                self.assertIn(draft, recovery)
+                self.assertIn(dispatch, recovery)
+                self.assertLess(recovery.index(draft), recovery.index(dispatch))
+                self.assertLess(recovery.index(dispatch), recovery.index("cargo yank"))
+                self.assertRegex(recovery, r"new (?:version.*tag|tag.*version)")
+
+
+class RunnerContractTest(unittest.TestCase):
+    def test_empty_collection_fails_closed(self):
+        with self.assertRaisesRegex(SystemExit, "no tests collected"):
+            require_tests_collected(unittest.TestSuite())
+
+    def test_entry_point_fails_when_filter_collects_no_tests(self):
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__)), "-k", "no_test_can_match_this"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no tests collected", result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
-    unittest.main()
+    FailOnEmptyTestProgram()

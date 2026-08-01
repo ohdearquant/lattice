@@ -517,7 +517,7 @@ bench_lora_mixture failed: Inference error: module 'q_proj' is a full-attention 
 Every Metal-GPU-touching command above (`chat_metal`, `ppl_metal`, `bench_lora_mixture`'s
 `DECODE_BENCH` half) was run wrapped in an exclusive advisory flock on
 `/tmp/lion-metal-gpu-test.lock`, mirroring `gpu_test_lock()` in
-`crates/inference/src/forward/metal_qwen35.rs`, so these runs never overlapped concurrent GPU
+`crates/inference/src/measurement.rs`, so these runs never overlapped concurrent GPU
 work from another process on the machine. macOS ships no `flock(1)`; any equivalent
 `fcntl.flock`/`flock(2)`-based wrapper that takes the same exclusive lock on that path before
 running the command satisfies the same discipline.

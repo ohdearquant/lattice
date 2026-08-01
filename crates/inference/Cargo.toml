@@ -250,7 +250,9 @@ ureq = { version = "2", features = ["tls"], optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
+proc-macro2.workspace = true
 proptest = { workspace = true }
+syn.workspace = true
 tempfile = { workspace = true }
 naga.workspace = true
 [[bench]]
