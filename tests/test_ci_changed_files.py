@@ -51,7 +51,7 @@ def _workflow_step(job: str, step_name: str) -> str:
         raise AssertionError(f"workflow step {step_name!r} is missing")
     body_start = start + len(marker)
     next_match = re.search(
-        r"^      - (?:name:|uses:)",
+        r"^(?:      -(?: .*)?| {0,4}\S.*)$",
         job[body_start:],
         re.MULTILINE,
     )
@@ -66,7 +66,7 @@ def _workflow_step_by_id(job: str, step_id: str) -> str:
         raise AssertionError(f"workflow step id {step_id!r} is missing")
     body_start = start + len(marker)
     next_match = re.search(
-        r"^      - (?:id:|name:|uses:)",
+        r"^(?:      -(?: .*)?| {0,4}\S.*)$",
         job[body_start:],
         re.MULTILINE,
     )
@@ -519,11 +519,6 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
         )
 
     def test_change_jobs_start_filter_immediately_after_checkout(self) -> None:
-        detector_load = (
-            'if git --no-replace-objects show '
-            '"${CI_BASE_SHA}:scripts/ci-changed-files.sh" '
-            '> "$TRUSTED_DETECTOR"; then'
-        )
         repository_command = re.compile(
             r"""(?mx)
             (?:^[ \t]*|[;&|][ \t]*)
@@ -558,8 +553,15 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
                     "changes",
                     "filter",
                 )
-                prefix, separator, _ = script.partition(detector_load)
-                self.assertEqual(separator, detector_load)
+                detector_load = re.search(
+                    r'^[ \t]*if git[^\n]* show '
+                    r'"\$\{CI_BASE_SHA\}:scripts/ci-changed-files\.sh" '
+                    r'> "\$TRUSTED_DETECTOR"; then$',
+                    script,
+                    re.MULTILINE,
+                )
+                self.assertIsNotNone(detector_load)
+                prefix = script[: detector_load.start()]
                 self.assertIsNone(
                     repository_command.search(prefix),
                     f"{relative_path} runs repository commands before detector loading",
