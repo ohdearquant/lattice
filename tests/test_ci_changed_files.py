@@ -518,20 +518,98 @@ class ChangeDetectorWorkflowTests(unittest.TestCase):
             ("engine=true", "tune=true"),
         )
 
-    def test_change_jobs_extract_detector_immediately_after_checkout(self) -> None:
+    def test_change_jobs_start_filter_immediately_after_checkout(self) -> None:
+        detector_load = (
+            'if git --no-replace-objects show '
+            '"${CI_BASE_SHA}:scripts/ci-changed-files.sh" '
+            '> "$TRUSTED_DETECTOR"; then'
+        )
+        repository_command = re.compile(
+            r"""(?mx)
+            (?:^[ \t]*|[;&|][ \t]*)
+            (?:(?:if|elif|while|until)[ \t]+)?
+            (?:
+                (?:source|\.)[ \t]+
+              | (?:bash|sh|python(?:3)?|node|deno|cargo|make|git)(?:[ \t]|$)
+              | (?:\./|\.\./|(?:\.github|apps|crates|scripts|tests)/)
+            )
+            """
+        )
+
         for relative_path in _REQUIRED_WORKFLOWS:
             with self.subTest(workflow=relative_path):
                 contents = (_ROOT / relative_path).read_text(encoding="utf-8")
                 job = _workflow_job(contents, "changes")
-                step_headers = re.findall(
-                    r"^      - ((?:uses|id|name): .+)$",
+                step_entries = re.findall(
+                    r"^      -(?: .*)?$",
                     job,
                     re.MULTILINE,
                 )
 
-                self.assertGreaterEqual(len(step_headers), 2)
-                self.assertRegex(step_headers[0], r"^uses: actions/checkout@")
-                self.assertEqual(step_headers[1], "id: filter")
+                self.assertGreaterEqual(len(step_entries), 2)
+                self.assertRegex(
+                    step_entries[0],
+                    r"^      - uses: actions/checkout@[0-9a-f]{40}(?: # .*)?$",
+                )
+                self.assertEqual(step_entries[1], "      - id: filter")
+
+                script = _workflow_run_script(
+                    _ROOT / relative_path,
+                    "changes",
+                    "filter",
+                )
+                prefix, separator, _ = script.partition(detector_load)
+                self.assertEqual(separator, detector_load)
+                self.assertIsNone(
+                    repository_command.search(prefix),
+                    f"{relative_path} runs repository commands before detector loading",
+                )
+
+    def test_app_binaries_full_selection_exceptions_are_exactly_enumerated(
+        self,
+    ) -> None:
+        script = _workflow_run_script(
+            _APP_BINARIES_WORKFLOW,
+            "changes",
+            "filter",
+        )
+        prefix, separator, _ = script.partition("TRUSTED_DETECTOR=$(mktemp)")
+        self.assertEqual(separator, "TRUSTED_DETECTOR=$(mktemp)")
+
+        exceptions = tuple(
+            (
+                condition,
+                tuple(
+                    re.findall(
+                        r'^  echo "((?:bins|swift)=true)" '
+                        r'>> "\$GITHUB_OUTPUT"$',
+                        body,
+                        re.MULTILINE,
+                    )
+                ),
+            )
+            for condition, body in re.findall(
+                r"^if ([^\n]+); then\n(.*?)^fi$",
+                prefix,
+                re.MULTILINE | re.DOTALL,
+            )
+            if re.search(r"^  exit 0$", body, re.MULTILINE) is not None
+        )
+
+        self.assertEqual(
+            exceptions,
+            (
+                (
+                    '[ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]',
+                    ("bins=true", "swift=true"),
+                ),
+                (
+                    f'[ "$CI_BASE_SHA" = "{_ZERO_SHA}" ]',
+                    ("bins=true", "swift=true"),
+                ),
+            ),
+        )
+        self.assertEqual(prefix.count("  exit 0\n"), 2)
 
     def test_unavailable_base_fails_without_selector_outputs(self) -> None:
         head = self._commit("README.md", "head\n")

@@ -92,6 +92,10 @@ jobs:
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
         run: |
           set -euo pipefail
+          # Manual dispatch and the all-zero base sentinel skip detector
+          # extraction because neither provides a usable comparison base.
+          # Both conservatively require all downstream app-binary and Swift
+          # work before the contract check runs.
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "bins=true" >> "$GITHUB_OUTPUT"
             echo "swift=true" >> "$GITHUB_OUTPUT"
