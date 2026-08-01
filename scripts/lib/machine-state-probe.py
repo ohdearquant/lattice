@@ -9,7 +9,18 @@ import json
 import re
 import subprocess
 import sys
-from datetime import UTC, datetime
+
+_RUNNING_PYTHON = ".".join(str(part) for part in sys.version_info[:3])
+_PYTHON_REQUIREMENT_ERROR = (
+    f"{sys.argv[0]} requires Python 3.11 or newer; "
+    f"running Python {_RUNNING_PYTHON} at {sys.executable}"
+)
+try:
+    from datetime import UTC, datetime
+except ImportError:
+    raise SystemExit(_PYTHON_REQUIREMENT_ERROR) from None
+if sys.version_info[:2] < (3, 11):
+    raise SystemExit(_PYTHON_REQUIREMENT_ERROR)
 
 SCHEMA = "lattice-machine-state-v1"
 
