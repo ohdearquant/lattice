@@ -223,6 +223,18 @@ with any citation that assumes it."
   negative was trusted. A provenance feature with no consumer records nothing, and correcting
   what it emits does not by itself change that.
 
+  This is not a missing requirement. `CLAUDE.md` already instructs authors to quote the
+  `Run conditions` block alongside the numbers, giving the reason: a figure that does not
+  record what produced it is indistinguishable from one produced on a quiet machine. The
+  number of bodies that comply with it is zero, across every body examined. So the gap is
+  between a requirement's existence and its enforcement, and the recommendation follows from
+  which of those two is missing: nothing is gained by restating the instruction, and the
+  emitter already produces the record, so the fix has to be a check that reads the body. Until
+  such a check
+  exists, a disposition citing bench-compare output should be read as unprovenanced by
+  default, on the same footing as the D3 reachability burden — the citation carries the
+  burden, not the reader.
+
 ## Direction of error
 
 Every decision in this ADR reduces work. D1 relaxes a gate, D2 admits a cheaper proof, D3
