@@ -178,6 +178,17 @@ class BenchTargetPolicyTests(unittest.TestCase):
             )
 
 
+def load_tests(
+    loader: unittest.TestLoader,
+    tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    del loader, pattern
+    if tests.countTestCases() == 0:
+        raise RuntimeError("no tests collected from tests.test_bench_targets")
+    return tests
+
+
 class _FailOnEmptyTestProgram(unittest.TestProgram):
     def runTests(self) -> None:
         if self.test.countTestCases() == 0:

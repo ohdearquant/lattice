@@ -51,6 +51,11 @@ STATE_PROBE = LIB / "machine-state-probe.py"
 HOST_ID = LIB / "bench-host-id.py"
 
 STUB_CARGO = """#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+elif [[ " $* " != *" --no-run "* ]]; then
+  printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
+fi
 exit 0
 """
 
@@ -366,6 +371,9 @@ class HeadModeReporting(unittest.TestCase):
                 f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]]; then\n'
                 f'  printf "%s\\n" changed > "{sb.root}/f1.txt"\n'
                 "fi\n"
+                'if [[ "${1:-}" != "--version" && " $* " != *" --no-run "* ]]; then\n'
+                "  printf '%s\\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'\n"
+                "fi\n"
                 "exit 0\n"
             )
             cargo.chmod(0o755)
@@ -390,6 +398,9 @@ class HeadModeReporting(unittest.TestCase):
                 f'  original="$(cat "{sb.root}/f1.txt")"\n'
                 f'  printf "%s" mutated-during-run > "{sb.root}/f1.txt"\n'
                 f'  printf "%s" "$original" > "{sb.root}/f1.txt"\n'
+                "fi\n"
+                'if [[ "${1:-}" != "--version" && " $* " != *" --no-run "* ]]; then\n'
+                "  printf '%s\\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'\n"
                 "fi\n"
                 "exit 0\n"
             )
@@ -423,6 +434,9 @@ class HeadModeReporting(unittest.TestCase):
                 "add f1.txt\n"
                 "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
                 "commit -qm committed-during-run\n"
+                "fi\n"
+                'if [[ "${1:-}" != "--version" && " $* " != *" --no-run "* ]]; then\n'
+                "  printf '%s\\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'\n"
                 "fi\n"
                 "exit 0\n"
             )
@@ -699,51 +713,22 @@ class MachineStateGate(unittest.TestCase):
             self.assertIn("machine-state checkpoint 'before base' failed", r.stderr)
             self.assertNotIn("Building + benching BASE", r.stdout)
 
-    def test_blocked_macos_checkpoint_reports_or_refuses_by_enforcement_mode(self):
-        with _Sandbox() as sb:
-            sb.force_platform("Darwin")
-            report_only = sb.run(
-                [sb.entry],
-                BENCH_IDLE_FLOOR="0",
-                STUB_GOVERNOR_RC="2",
-            )
-            self.assertEqual(
-                report_only.returncode,
-                0,
-                f"stdout:\n{report_only.stdout}\nstderr:\n{report_only.stderr}",
-            )
-            self.assertIn("Building + benching BASE", report_only.stdout)
-            self.assertIn("=== Run conditions ===", report_only.stdout)
-            self.assertIn("gate blocked (fixture block)", report_only.stdout)
-            self.assertIn(
-                "unsuitable as benchmark evidence",
-                report_only.stdout,
-            )
-            provenance = sb.root / ".cache" / "bench-run-provenance.txt"
-            states = [
-                json.loads(line.removeprefix("machine_state="))
-                for line in provenance.read_text().splitlines()
-                if line.startswith("machine_state=")
-            ]
-            self.assertEqual(len(states), 3)
-            self.assertTrue(
-                all(state["gate"]["status"] == "blocked" for state in states)
-            )
-
-        with _Sandbox() as sb:
-            sb.force_platform("Darwin")
-            enforcing = sb.run(
-                [sb.entry, "--fail-on-regression"],
-                BENCH_IDLE_FLOOR="0",
-                STUB_GOVERNOR_RC="2",
-            )
-            self.assertEqual(enforcing.returncode, 2, enforcing.stdout)
-            self.assertEqual(sb.machine_state_labels(), ["before base"])
-            self.assertIn(
-                "machine-state checkpoint 'before base' failed",
-                enforcing.stderr,
-            )
-            self.assertNotIn("Building + benching BASE", enforcing.stdout)
+    def test_blocked_macos_checkpoint_refuses_in_both_regression_modes(self):
+        for args in (["--fail-on-regression"], []):
+            with self.subTest(args=args), _Sandbox() as sb:
+                sb.force_platform("Darwin")
+                result = sb.run(
+                    [sb.entry, *args],
+                    BENCH_IDLE_FLOOR="0",
+                    STUB_GOVERNOR_RC="2",
+                )
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(sb.machine_state_labels(), ["before base"])
+                self.assertIn(
+                    "machine-state checkpoint 'before base' failed",
+                    result.stderr,
+                )
+                self.assertNotIn("Building + benching BASE", result.stdout)
 
 
 class ContentionDiagnostics(unittest.TestCase):
@@ -925,6 +910,17 @@ class AmbientLoadGate(unittest.TestCase):
                     "idle_pct": 87.25,
                 },
             )
+
+
+def load_tests(
+    loader: unittest.TestLoader,
+    tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    del loader, pattern
+    if tests.countTestCases() == 0:
+        raise RuntimeError("no tests collected from tests.test_bench_locks")
+    return tests
 
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):

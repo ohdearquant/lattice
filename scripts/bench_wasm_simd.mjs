@@ -15,9 +15,8 @@
 //   node scripts/bench_wasm_simd.mjs
 //   node scripts/bench_wasm_simd.mjs --dims 384,768 --reps 5000
 //
-// Skip-graceful: exits 0 with a one-line reason if cargo, the wasm32 target,
-// or wasm-bindgen are unavailable (mirrors scripts/wasm-parity.sh). Set
-// LATTICE_BENCH_WASM_SIMD_ENFORCE=1 to turn a skip into a hard failure.
+// Missing prerequisites make this declared measurement not measurable and
+// exit 2. A successful exit is reserved for a completed measurement.
 //
 // Methodology notes (also printed in the output header):
 //   - Each timed call passes fresh Float32Array inputs through wasm-bindgen's
@@ -104,15 +103,10 @@ function parseArgs(argv) {
 }
 
 const ARGS = parseArgs(process.argv.slice(2));
-const ENFORCE = process.env.LATTICE_BENCH_WASM_SIMD_ENFORCE;
 
-function skipOrFail(reason) {
-  if (ENFORCE) {
-    console.error(`bench_wasm_simd: FAIL (LATTICE_BENCH_WASM_SIMD_ENFORCE=1): ${reason}`);
-    process.exit(1);
-  }
-  console.log(`bench_wasm_simd: SKIPPED: ${reason}`);
-  process.exit(0);
+function notMeasurable(reason) {
+  console.error(`bench_wasm_simd: NOT MEASURABLE: ${reason}`);
+  process.exit(2);
 }
 
 function hasCmd(cmd) {
@@ -124,15 +118,15 @@ function hasCmd(cmd) {
   }
 }
 
-if (!hasCmd('cargo')) skipOrFail('cargo not found on PATH');
-if (!hasCmd('wasm-bindgen')) skipOrFail('wasm-bindgen (CLI) not found on PATH; install with: cargo install wasm-bindgen-cli --version 0.2.105');
+if (!hasCmd('cargo')) notMeasurable('cargo not found on PATH');
+if (!hasCmd('wasm-bindgen')) notMeasurable('wasm-bindgen (CLI) not found on PATH; install with: cargo install wasm-bindgen-cli --version 0.2.105');
 try {
   const installed = execFileSync('rustup', ['target', 'list', '--installed']).toString();
   if (!installed.includes('wasm32-unknown-unknown')) {
     execFileSync('rustup', ['target', 'add', 'wasm32-unknown-unknown'], { stdio: 'inherit' });
   }
 } catch {
-  skipOrFail('wasm32-unknown-unknown target not installed and could not be added (rustup unavailable?)');
+  notMeasurable('wasm32-unknown-unknown target not installed and could not be added (rustup unavailable?)');
 }
 
 // ---------------------------------------------------------------------------

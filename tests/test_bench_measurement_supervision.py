@@ -7,6 +7,7 @@ import ast
 import fcntl
 import os
 import re
+import shlex
 import signal
 import shutil
 import subprocess
@@ -225,6 +226,56 @@ def _shell_or_node_measurement_evidence(source: str) -> set[str]:
     if re.search(r"(?m)^[ \t]*(?:from[ \t]+mlx|import[ \t]+mlx)", source):
         evidence.add("MLX runtime import")
     return evidence
+
+
+def _top_level_python_calls(source: str, path: Path, name: str) -> list[ast.Call]:
+    tree = ast.parse(source, filename=str(path))
+    calls: list[ast.Call] = []
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_Call(self, node: ast.Call) -> None:
+            if _dotted_name(node.func) == name:
+                calls.append(node)
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return calls
+
+
+def _shell_commands(source: str) -> list[tuple[int, list[str]]]:
+    commands: list[tuple[int, list[str]]] = []
+    for line_number, line in enumerate(source.splitlines(), start=1):
+        candidate = line.rstrip()
+        if candidate.endswith("\\"):
+            candidate = candidate[:-1]
+        try:
+            tokens = shlex.split(candidate, comments=True, posix=True)
+        except ValueError:
+            continue
+        if tokens:
+            commands.append((line_number, tokens))
+    return commands
+
+
+def _shell_command_argv(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens) and re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]
+    ):
+        index += 1
+    return tokens[index:]
 
 
 def _explicit_script_exclusion(relative: str) -> str | None:
@@ -798,19 +849,46 @@ class InventoryContract(unittest.TestCase):
         for path, entry in manifest_entries().items():
             if entry["role"] != "measurement":
                 continue
-            source = (REPO / path).read_text()
+            source_path = REPO / path
+            source = source_path.read_text()
             with self.subTest(path=path):
                 if path == "scripts/bench-compare.sh":
-                    self.assertIn("bench_supervision.py", source)
+                    commands = _shell_commands(source)
+                    self.assertTrue(
+                        any(
+                            tokens[0] == "exec"
+                            and any("bench_supervision.py" in token for token in tokens)
+                            for _, tokens in commands
+                        )
+                    )
                 elif path.endswith(".py"):
-                    self.assertIn("ensure_python_entrypoint(", source)
+                    calls = _top_level_python_calls(
+                        source, source_path, "ensure_python_entrypoint"
+                    )
+                    self.assertTrue(calls)
                     if entry["supervision"] == "both-locks+quiet":
-                        self.assertIn("quiet=True", source)
+                        self.assertTrue(
+                            any(
+                                any(
+                                    keyword.arg == "quiet"
+                                    and isinstance(keyword.value, ast.Constant)
+                                    and keyword.value.value is True
+                                    for keyword in call.keywords
+                                )
+                                for call in calls
+                            )
+                        )
                 elif path.endswith(".mjs"):
                     self.assertIn("bench_supervision.py", source)
                     self.assertIn("'verify'", source)
                 else:
-                    self.assertIn("bench_supervise_entry", source)
+                    commands = _shell_commands(source)
+                    self.assertTrue(
+                        any(
+                            tokens[0] == "bench_supervise_entry"
+                            for _, tokens in commands
+                        )
+                    )
 
     def test_make_delegates_whole_durable_recipes(self):
         """The lock must cover the recipe, not one command inside Make quoting."""
@@ -849,18 +927,44 @@ class InventoryContract(unittest.TestCase):
 
         for path in ("scripts/bench-ci.sh", "scripts/bench-gate.sh"):
             source = (REPO / path).read_text()
+            commands = _shell_commands(source)
             with self.subTest(path=path):
-                self.assertIn('bench_supervise_entry "', source)
-                self.assertIn(" durable ", source)
-                self.assertGreaterEqual(source.count("bench_quiet_checkpoint"), 2)
-                self.assertIn("between targets", source)
-                final_probe = source.rfind("bench_quiet_checkpoint")
-                final_measurement = source.rfind("cargo bench")
+                supervisors = [
+                    tokens
+                    for _, tokens in commands
+                    if tokens[0] == "bench_supervise_entry"
+                ]
+                self.assertTrue(supervisors)
+                self.assertTrue(any("durable" in tokens for tokens in supervisors))
+                checkpoints = [
+                    (line_number, tokens)
+                    for line_number, tokens in commands
+                    if tokens[0] == "bench_quiet_checkpoint"
+                ]
+                self.assertGreaterEqual(len(checkpoints), 2)
+                self.assertTrue(
+                    any("between targets" in " ".join(tokens) for _, tokens in checkpoints)
+                )
+                measurements = [
+                    line_number
+                    for line_number, tokens in commands
+                    if _shell_command_argv(tokens)[:2] == ["cargo", "bench"]
+                ]
+                self.assertTrue(measurements)
+                final_probe = max(line_number for line_number, _ in checkpoints)
+                final_measurement = max(measurements)
                 self.assertGreater(final_probe, final_measurement)
                 if path == "scripts/bench-gate.sh":
+                    gate_calls = [
+                        line_number
+                        for line_number, tokens in commands
+                        if _shell_command_argv(tokens)[:2]
+                        == ["python3", "scripts/perf-bench-gate.py"]
+                    ]
+                    self.assertTrue(gate_calls)
                     self.assertLess(
                         final_probe,
-                        source.index("python3 scripts/perf-bench-gate.py"),
+                        min(gate_calls),
                     )
 
     def test_fake_quant_does_not_nest_its_old_gpu_only_lock(self):
@@ -961,7 +1065,207 @@ class _SupervisorSandbox:
         )
 
 
+def _run_bench_ci_fixture(*, fail_first: bool) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    with _SupervisorSandbox() as sb:
+        entrypoint = sb.root / "scripts" / "bench-ci.sh"
+        shutil.copy2(REPO / "scripts" / "bench-ci.sh", entrypoint)
+        quiet_probe = sb.root / "scripts" / "lib" / "quiet-probe.py"
+        quiet_probe.write_text("raise SystemExit(0)\n")
+
+        bindir = Path(sb.tmp.name) / "bin"
+        bindir.mkdir()
+        calls = Path(sb.tmp.name) / "cargo-calls"
+        cargo = bindir / "cargo"
+        cargo.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "if [[ \" $* \" == *\" lattice-inference \"* ]]; then\n"
+            f"  printf '%s\\n' inference >> {str(calls)!r}\n"
+            "  if [[ \"${FIXTURE_FAIL_FIRST:-0}\" == 1 ]]; then\n"
+            "    printf '%s\\n' 'fixture first target failed' >&2\n"
+            "    exit 7\n"
+            "  fi\n"
+            "else\n"
+            f"  printf '%s\\n' embed >> {str(calls)!r}\n"
+            "fi\n"
+        )
+        cargo.chmod(0o755)
+        env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "BENCH_IDLE_FLOOR": "0",
+            "FIXTURE_FAIL_FIRST": "1" if fail_first else "0",
+        }
+        for name in (
+            "LATTICE_BENCH_LOCK_STATUS",
+            "LATTICE_BENCH_LOCK_FDS",
+            "LATTICE_BENCH_SUPERVISOR_FD",
+        ):
+            env.pop(name, None)
+        result = subprocess.run(
+            ["bash", str(entrypoint)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        recorded = calls.read_text().splitlines() if calls.exists() else []
+        return result, recorded
+
+
+def _run_wasm_fixture(*, prerequisites: bool) -> subprocess.CompletedProcess[str]:
+    node = shutil.which("node")
+    if node is None:
+        raise unittest.SkipTest("node is unavailable")
+
+    with _SupervisorSandbox() as sb:
+        entrypoint = sb.root / "scripts" / "bench_wasm_simd.mjs"
+        shutil.copy2(REPO / "scripts" / "bench_wasm_simd.mjs", entrypoint)
+        quiet_probe = sb.root / "scripts" / "lib" / "quiet-probe.py"
+        quiet_probe.write_text("raise SystemExit(0)\n")
+
+        bindir = Path(sb.tmp.name) / "bin"
+        bindir.mkdir()
+        (bindir / "python3").symlink_to(sys.executable)
+        if prerequisites:
+            for name, body in {
+                "cargo": (
+                    "#!/bin/sh\n"
+                    "if [ \"${1:-}\" = --version ]; then echo 'cargo fixture'; fi\n"
+                    "exit 0\n"
+                ),
+                "rustup": (
+                    "#!/bin/sh\n"
+                    "echo wasm32-unknown-unknown\n"
+                ),
+                "rustc": (
+                    "#!/bin/sh\n"
+                    "echo 'rustc fixture'\n"
+                ),
+            }.items():
+                executable = bindir / name
+                executable.write_text(body)
+                executable.chmod(0o755)
+
+            module = (
+                "export function simdDotProduct() { return 0; }\n"
+                "export function simdSquaredEuclideanDistance() { return 0; }\n"
+                "export function simdCosineSimilarity() { return 0; }\n"
+                "export function simdNormalize() {}\n"
+            )
+            bindgen = bindir / "wasm-bindgen"
+            bindgen.write_text(
+                f"#!{sys.executable}\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "if '--version' in sys.argv:\n"
+                "    print('wasm-bindgen fixture')\n"
+                "    raise SystemExit(0)\n"
+                "out = Path(sys.argv[sys.argv.index('--out-dir') + 1])\n"
+                "out.mkdir(parents=True, exist_ok=True)\n"
+                "(out / 'package.json').write_text('{\"type\":\"module\"}\\n')\n"
+                f"(out / 'lattice_embed.js').write_text({module!r})\n"
+            )
+            bindgen.chmod(0o755)
+
+        env = {
+            **os.environ,
+            "PATH": str(bindir),
+            "BENCH_IDLE_FLOOR": "0",
+            "LATTICE_BENCH_WASM_SIMD_ENFORCE": "",
+        }
+        for name in (
+            "LATTICE_BENCH_LOCK_STATUS",
+            "LATTICE_BENCH_LOCK_FDS",
+            "LATTICE_BENCH_SUPERVISOR_FD",
+        ):
+            env.pop(name, None)
+        return subprocess.run(
+            [
+                sys.executable,
+                str(sb.helper),
+                "run",
+                "--label",
+                "fixture",
+                "--quiet",
+                "--entrypoint",
+                "--",
+                node,
+                str(entrypoint),
+                "--dims",
+                "1",
+                "--reps",
+                "1",
+                "--warmup",
+                "0",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+
 class RuntimeContract(unittest.TestCase):
+    def test_first_failed_bench_ci_target_refuses_before_later_targets(self):
+        result, calls = _run_bench_ci_fixture(fail_first=True)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(calls, ["inference"])
+        self.assertIn("fixture first target failed", result.stderr)
+        self.assertIn("refusing to accept", result.stderr)
+
+    def test_bench_ci_healthy_targets_complete(self):
+        result, calls = _run_bench_ci_fixture(fail_first=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(calls, ["inference", "embed"])
+
+    def test_successful_parent_with_live_descendant_refuses_before_unlock(self):
+        with _SupervisorSandbox() as sb:
+            pid_file = Path(sb.tmp.name) / "grandchild-pid"
+            grandchild = "import time; time.sleep(30)"
+            parent = (
+                "import subprocess, sys; from pathlib import Path; "
+                f"child=subprocess.Popen([sys.executable, '-c', {grandchild!r}], "
+                "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL); "
+                f"Path({str(pid_file)!r}).write_text(str(child.pid))"
+            )
+            result = sb.run([sys.executable, "-c", parent])
+            child_pid = int(pid_file.read_text())
+            try:
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("live process-group descendants", result.stderr)
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+                for path in (sb.bench_lock, sb.gpu_lock):
+                    fd = os.open(path, os.O_RDWR)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(fd)
+            finally:
+                try:
+                    os.kill(child_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_successful_parent_without_descendants_completes(self):
+        with _SupervisorSandbox() as sb:
+            result = sb.run([sys.executable, "-c", "raise SystemExit(0)"])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_missing_wasm_prerequisite_is_not_measurable(self):
+        result = _run_wasm_fixture(prerequisites=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("NOT MEASURABLE", result.stderr)
+        self.assertIn("cargo not found on PATH", result.stderr)
+
+    def test_wasm_fixture_with_prerequisites_completes(self):
+        result = _run_wasm_fixture(prerequisites=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("| dot_product | 1 |", result.stdout)
+
     def test_command_waits_for_each_machine_wide_lock(self):
         """Mutation-sensitive: dropping either acquire lets its subtest run early."""
 

@@ -29,11 +29,11 @@
 # appear in the report; CLASSIFIED GATING (vs informational) if a regression
 # in it contributes to the report's FAIL verdict; and ENFORCED only if that
 # FAIL verdict reaches the caller as a non-zero exit status. Classification
-# is not enforcement: by default this script computes a verdict, captures the
-# gate's exit status, and does not act on it, so --quick and --full are both
-# REPORT-ONLY.
-# Enforcement is opt-in per invocation via --fail-on-regression, which
-# propagates the gate's status instead; `make bench-gate` also enforces.
+# is not regression enforcement: by default this script reports a confirmed
+# regression without failing the caller. Measurement-integrity failures are
+# always refusals, because report-only still requires an A/B that actually ran.
+# Regression enforcement is opt-in via --fail-on-regression, which propagates
+# a confirmed-regression status; `make bench-gate` also enforces.
 # Use these words literally below.
 #
 # lattice#714 / lattice#1060: the lattice-embed `simd` bench TARGET is
@@ -64,11 +64,11 @@
 # to distinguish a real simd regression from machine noise. Three caveats
 # keep that from meaning "a regression cannot get past this".
 #
-# Enforcement: neither mode enforces BY DEFAULT. The gate's exit status is
-# captured into GATE_RC at the bottom and re-raised only under
-# --fail-on-regression, so by default a FAIL verdict is printed and the script
-# still exits 0 — which is why the demotion below is a resolution split rather
-# than a coverage hole in the default path. Two
+# Regression enforcement: neither mode enforces BY DEFAULT. The gate's
+# confirmed-regression status is re-raised only under --fail-on-regression;
+# broken or incomplete measurement evidence always exits nonzero. This is why
+# the demotion below is a resolution split rather than a coverage hole in the
+# default path. Two
 # callers do enforce: --fail-on-regression propagates the gate's status (exit
 # 1 confirmed regression, exit 2 the measurement itself is broken), and
 # `make bench-gate` runs the same two default targets unfiltered against the
@@ -220,8 +220,9 @@ machine_state_probe() {
   echo "[state] $label: $record"
   MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
 }$record"
-  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
-    echo "bench-compare: machine-state checkpoint '$label' failed — refusing to certify this A/B." >&2
+  if [ "$rc" -ne 0 ]; then
+    echo "bench-compare: machine-state checkpoint '$label' failed" \
+         "(exit $rc) — refusing to measure this A/B." >&2
     exit 2
   fi
 }
@@ -432,7 +433,7 @@ if [ "$FAIL_ON_REGRESSION" = "1" ]; then
     --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
 fi
 
-# --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
+# --- Measurement-integrity helpers ---
 # `cargo bench ... | grep -E "time:" || true` discards cargo's status TWICE: a
 # pipeline reports its LAST command (grep), and `|| true` then resets
 # PIPESTATUS to 0. So a bench that failed to build or died mid-run looked
@@ -454,22 +455,31 @@ run_bench() {
   local filter="$1"; shift
   BENCH_RC=0
   BENCH_LINES=0
-  local matched
+  local output matched
+  output="$(mktemp)"
   matched="$(mktemp)"
-  { "$@" 2>&1 | grep -E "$filter" | tee "$matched"; BENCH_RC=${PIPESTATUS[0]}; } || true
+  if "$@" >"$output" 2>&1; then
+    BENCH_RC=0
+  else
+    BENCH_RC=$?
+  fi
+  grep -E "$filter" "$output" >"$matched" || true
   BENCH_LINES="$(wc -l < "$matched" | tr -d ' ')"
-  rm -f "$matched"
+  if [ "$BENCH_RC" -ne 0 ]; then
+    cat "$output" >&2
+  else
+    cat "$matched"
+  fi
+  rm -f "$output" "$matched"
 }
 
 # A partial A/B is not weaker evidence that nothing regressed, it is no
 # evidence: the target that failed is precisely the one nobody measured. Exit 2
 # (measurement broken) rather than 1 (confirmed regression) because the two ask
-# the reader for opposite responses. The reporter keeps its tolerant behavior.
+# the reader for opposite responses. Report-only changes regression handling,
+# not whether missing evidence is accepted as a measurement.
 require_measured() {
   local what="$1" rc="$2" lines="${3:-}"
-  if [ "$FAIL_ON_REGRESSION" != "1" ]; then
-    return 0
-  fi
   if [ "$rc" -ne 0 ]; then
     echo "bench-compare: $what failed (exit $rc) — refusing to certify a partial A/B." >&2
     exit 2
@@ -647,7 +657,7 @@ echo "  resolution: ${QUICK_FLAGS:---full}"
 echo "  targets: lattice-inference:$BENCHES_INFERENCE, lattice-embed:$BENCHES_EMBED"
 echo "  inference features: ${CARGO_FEATURES_INFERENCE:-<none>}"
 echo "  filters: inference='${BENCH_GROUPS_INFERENCE:-<all>}' embed='${BENCH_GROUPS_EMBED:-<all>}'"
-echo "  enforcement: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "--fail-on-regression (gate status propagated)" || echo "report-only (gate status printed, exit 0)")"
+echo "  enforcement: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "--fail-on-regression (regression status propagated)" || echo "report-only (regressions reported; measurement failures still refuse)")"
 echo "  locks:"
 echo "$LOCK_SUMMARY"
 echo "  ambient load:"
@@ -719,9 +729,6 @@ run_target_gate \
 run_target_gate \
   "lattice-embed:$BENCHES_EMBED" "$EMBED_CRITERION_ROOT"
 
-echo ""
-echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
-
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;
   # exit 3 is a run whose ambient conditions make it unmeasurable. All must
@@ -736,6 +743,9 @@ if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   fi
   exit "$GATE_RC"
 fi
+
+echo ""
+echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
 )
 MEASUREMENT_RC=$?
 set -e

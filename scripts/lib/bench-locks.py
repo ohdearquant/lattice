@@ -80,6 +80,7 @@ TIMEOUT_S = 1800
 PENDING_DIR = "/tmp/lion-bench-window-pending"
 
 LOCK_EXIT = 75
+REFUSAL_EXIT = 2
 
 
 def _log(msg: str) -> None:
@@ -203,17 +204,20 @@ def acquire(path: str, name: str) -> tuple[int, str]:
             time.sleep(2)
 
 
-def _terminate_process_group(pgid: int) -> None:
+def _terminate_process_group(pgid: int) -> bool:
     """Keep the lock window closed until no in-group measurement can run."""
 
+    found_group = False
     while True:
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
-            return
+            return found_group
         except PermissionError:
             # A zombie-only group can report EPERM until its new parent reaps it.
-            pass
+            found_group = True
+        else:
+            found_group = True
         time.sleep(0.01)
 
 
@@ -270,8 +274,13 @@ def main() -> int:
             except BaseException:
                 _terminate_process_group(proc.pid)
                 raise
-            if returncode != 0:
-                _terminate_process_group(proc.pid)
+            live_descendants = _terminate_process_group(proc.pid)
+            if returncode == 0 and live_descendants:
+                _log(
+                    "measurement command exited with live process-group descendants; "
+                    "terminated them before releasing locks"
+                )
+                return REFUSAL_EXIT
             return returncode
 
         # close_fds defaults True, so neither lock fd reaches cmd or anything

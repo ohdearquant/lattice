@@ -42,6 +42,18 @@ fi
 exit 0
 """
 
+FAILING_CARGO = """#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+  exit 0
+fi
+if [[ " $* " == *" --no-run "* ]]; then
+  exit 0
+fi
+printf '%s\n' 'fixture cargo failed before producing a measurement' >&2
+exit 7
+"""
+
 STUB_GOVERNOR = """#!/usr/bin/env python3
 import json
 import sys
@@ -72,6 +84,11 @@ print(json.dumps({
         "kill_switch": "clear",
     },
 }, separators=(",", ":"), sort_keys=True))
+"""
+
+FAILING_STATE_PROBE = """#!/usr/bin/env python3
+print("malformed machine-state fixture")
+raise SystemExit(127)
 """
 
 # Test helpers invoking real Git must disable repository hooks.
@@ -140,6 +157,9 @@ else
   fi
 fi
 
+if [[ "${STUB_EMIT_CRITERION_HOME:-0}" == "1" ]]; then
+  echo "time: criterion-home=${CRITERION_HOME:-<unset>}"
+fi
 printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
 printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
 """
@@ -167,6 +187,7 @@ def _run(
     setup=None,
     extra_env=None,
     emit_criterion_home=False,
+    state_probe=None,
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -177,7 +198,7 @@ def _run(
         shutil.copytree(LIB, root / "scripts" / "lib")
         shutil.copy2(REPO / ".gitignore", root / ".gitignore")
         governor = root / "scripts" / "perf_governor.py"
-        governor.write_text(STUB_GOVERNOR)
+        governor.write_text(state_probe or STUB_GOVERNOR)
         governor.chmod(0o755)
         quiet_probe = root / "scripts" / "lib" / "quiet-probe.py"
         quiet_probe.write_text(
@@ -187,18 +208,21 @@ def _run(
             "print(f'[quiet] {label}: idle 100.0% (floor 0.0%) ok | top: fixture 0.0%')\n"
         )
         machine_probe = root / "scripts" / "lib" / "machine-state-probe.py"
-        machine_probe.write_text(
-            "#!/usr/bin/env python3\n"
-            "import datetime, json, sys\n"
-            "label = sys.argv[sys.argv.index('--label') + 1]\n"
-            "print(json.dumps({'schema':'lattice-machine-state-v1','label':label,"
-            "'captured_at_utc':datetime.datetime.now(datetime.UTC)"
-            ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
-            "'power':{'status':'unavailable','reason':'fixture'},"
-            "'thermal':{'status':'unavailable','reason':'fixture'},"
-            "'idle':{'status':'unavailable','reason':'fixture'}},"
-            "separators=(',', ':'), sort_keys=True))\n"
-        )
+        if state_probe is not None:
+            machine_probe.write_text(state_probe)
+        else:
+            machine_probe.write_text(
+                "#!/usr/bin/env python3\n"
+                "import datetime, json, sys\n"
+                "label = sys.argv[sys.argv.index('--label') + 1]\n"
+                "print(json.dumps({'schema':'lattice-machine-state-v1','label':label,"
+                "'captured_at_utc':datetime.datetime.now(datetime.UTC)"
+                ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
+                "'power':{'status':'unavailable','reason':'fixture'},"
+                "'thermal':{'status':'unavailable','reason':'fixture'},"
+                "'idle':{'status':'unavailable','reason':'fixture'}},"
+                "separators=(',', ':'), sort_keys=True))\n"
+            )
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -292,19 +316,46 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         self.assertIn("produced no measurements", result.stderr)
 
-    def test_reporter_mode_is_unchanged_by_the_guard(self):
-        """Without the flag the script stays tolerant: the guard must not bite.
-
-        The default caller is a human reading an A/B against an arbitrary ref,
-        where a missing bench target is ordinary. Pinning this stops a later
-        tightening from silently becoming the default.
-        """
+    def test_default_mode_refuses_a_run_that_measured_nothing(self):
+        """Report-only controls regression enforcement, not measurement validity."""
         result = _run([])
-        self.assertNotEqual(
+        self.assertEqual(
             result.returncode, 2,
-            f"reporter mode must not exit 2\nstdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}")
-        self.assertNotIn("produced no measurements", result.stderr)
+            f"expected exit 2 (not measurable), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("produced no measurements", result.stderr)
+
+    def test_default_mode_surfaces_a_failed_benchmark_command(self):
+        result = _run([], stub_cargo=FAILING_CARGO)
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (not measurable), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("failed (exit 7)", result.stderr)
+        self.assertIn(
+            "fixture cargo failed before producing a measurement", result.stderr
+        )
+
+    def test_default_mode_refuses_a_failed_machine_state_probe_before_base(self):
+        result = _run([], state_probe=FAILING_STATE_PROBE)
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (not measurable), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("machine-state checkpoint 'before base' failed", result.stderr)
+        self.assertNotIn("--- Building + benching BASE", result.stdout)
+
+    def test_default_mode_completes_a_healthy_measurement_fixture(self):
+        result = _run([], stub_cargo=STALE_CHANGE_CARGO)
+        self.assertEqual(
+            result.returncode, 0,
+            f"healthy report-only fixture failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        self.assertIn("Done.", result.stdout)
 
     def test_stale_change_cannot_mask_a_benchmark_removed_on_head(self):
         """A stale same-path comparison must not satisfy head completeness.
@@ -426,7 +477,9 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         #1090. The stub emits only its inherited CRITERION_HOME; no benchmark
         implementation is duplicated here.
         """
-        result = _run([], emit_criterion_home=True)
+        result = _run(
+            [], stub_cargo=STALE_CHANGE_CARGO, emit_criterion_home=True
+        )
         self.assertEqual(
             result.returncode, 0,
             f"reporter-mode probe failed\nstdout:\n{result.stdout}\n"
