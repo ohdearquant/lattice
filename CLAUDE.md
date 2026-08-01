@@ -53,9 +53,10 @@ The local script paths classified in `scripts/bench-measurements.toml` enter a
 cooperative wrapper on ordinary direct invocation. This prevents accidental
 unlocked runs but is not a same-user authentication boundary. Add new local
 measurement entry points to that inventory; the CI contract rejects an
-unclassified `scripts/bench*` entry. The Rust inventory in the same manifest
-covers only its declared path grammar; other Rust examples, binaries, and
-tests require manual classification. Use
+unclassified `scripts/bench*` entry. Source-pattern discovery is advisory: a
+lexical no-match does not prove that a script never measures. The Rust
+inventory in the same manifest covers only its declared path grammar; other
+Rust examples, binaries, and tests require manual classification. Use
 `scripts/bench-command.sh --label <name> -- <command>` for an ad-hoc raw CPU
 Criterion command. `make bench-ci` and `make bench-gate` also refuse below the
 ambient-idle floor because their baseline or result outlives the process that

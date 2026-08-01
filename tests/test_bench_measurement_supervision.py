@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Contract tests for the local measurement-path inventory and supervisor."""
+"""Tests for advisory measurement discovery and enforced local supervision."""
 
 from __future__ import annotations
 
@@ -291,11 +291,11 @@ def _classify_script(path: Path, relative: str) -> ScriptDecision:
             frozenset(evidence),
         )
     return ScriptDecision(
-        "not-measurement",
-        f"{language} analysis completed; no direct measurement pattern matched",
+        "advisory-no-match",
+        f"advisory {language} analysis found no direct measurement pattern",
         frozenset(
             {
-                f"{language} source analysis completed",
+                f"advisory {language} source analysis completed",
                 "zero recognized direct measurement patterns",
             }
         ),
@@ -316,11 +316,12 @@ def discovered_script_decisions(repo: Path | None = None) -> dict[str, ScriptDec
 def discovered_measurement_evidence(
     repo: Path | None = None,
 ) -> dict[str, set[str]]:
-    """Collect direct driver evidence without trusting manifest roles.
+    """Collect advisory direct-driver matches without trusting manifest roles.
 
     The syntax-pattern method has no bounded recall for dynamic construction,
     indirect call graphs, aliases, wrappers, generated code, or shell expansion.
-    Every searched file still records a decision; undecidable inputs fail closed.
+    Read, decode, language-selection, and parse errors fail closed. A successful
+    lexical no-match is advisory and does not prove that a script never measures.
     """
 
     decisions = discovered_script_decisions(repo)
@@ -487,6 +488,21 @@ class InventoryContract(unittest.TestCase):
             evidence["scripts/bench_no_shebang.js"], {"cargo bench command"}
         )
 
+    def test_node_argv_cargo_bench_detector_is_mutation_guarded(self):
+        fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scripts = fixture_repo / "scripts"
+        scripts.mkdir()
+        fixture = scripts / "bench_node_argv.js"
+        fixture.write_text(
+            "const {spawnSync} = require('node:child_process');\n"
+            "spawnSync('cargo', ['bench', '-p', 'lattice-inference']);\n"
+        )
+
+        evidence = discovered_measurement_evidence(fixture_repo)
+        self.assertEqual(
+            evidence["scripts/bench_node_argv.js"], {"cargo bench command"}
+        )
+
     def test_no_shebang_bash_measurement_is_discovered(self):
         """Explicit Bash invocation does not require a shebang or executable bit."""
 
@@ -530,22 +546,125 @@ class InventoryContract(unittest.TestCase):
 
     def test_literal_shell_benchmark_call_forms_are_detected(self):
         cases = {
-            "run": 'subprocess.run("cargo bench -p lattice-inference", shell=True)',
-            "popen": 'subprocess.Popen("cargo bench -p lattice-inference", shell=True)',
+            "Popen": 'Popen("cargo bench -p lattice-inference", shell=True)',
+            "call": 'call("cargo bench -p lattice-inference", shell=True)',
+            "check_call": (
+                'check_call("cargo bench -p lattice-inference", shell=True)'
+            ),
             "check_output": (
+                'check_output("cargo bench -p lattice-inference", shell=True)'
+            ),
+            "os.popen": 'os.popen("cargo bench -p lattice-inference")',
+            "os.system": 'os.system("cargo bench -p lattice-inference")',
+            "run": 'run("cargo bench -p lattice-inference", shell=True)',
+            "subprocess.Popen": (
+                'subprocess.Popen("cargo bench -p lattice-inference", shell=True)'
+            ),
+            "subprocess.call": (
+                'subprocess.call("cargo bench -p lattice-inference", shell=True)'
+            ),
+            "subprocess.check_call": (
+                'subprocess.check_call("cargo bench -p lattice-inference", shell=True)'
+            ),
+            "subprocess.check_output": (
                 'subprocess.check_output("cargo bench -p lattice-inference", shell=True)'
             ),
-            "os_system": 'os.system("cargo bench -p lattice-inference")',
+            "subprocess.getoutput": (
+                'subprocess.getoutput("cargo bench -p lattice-inference")'
+            ),
+            "subprocess.getstatusoutput": (
+                'subprocess.getstatusoutput("cargo bench -p lattice-inference")'
+            ),
+            "subprocess.run": (
+                'subprocess.run("cargo bench -p lattice-inference", shell=True)'
+            ),
+            "system": 'system("cargo bench -p lattice-inference")',
             "shell_driver": (
                 'subprocess.run(["bash", "-lc", "cargo bench -p lattice-inference"])'
             ),
         }
+        self.assertEqual(set(cases) - {"shell_driver"}, PYTHON_COMMAND_CALLS)
         for name, call in cases.items():
             with self.subTest(name=name):
                 evidence = _python_measurement_evidence(
                     f"import os\nimport subprocess\n{call}\n", Path(f"{name}.py")
                 )
                 self.assertIn("cargo bench command", evidence)
+
+    def test_python_non_command_detectors_are_mutation_guarded(self):
+        cases = {
+            "mlx_import": ("import mlx.core\n", "MLX runtime import"),
+            "mlx_from_import": (
+                "from mlx_lm import load\n",
+                "MLX runtime import",
+            ),
+            "generation_api": (
+                'endpoint = "http://127.0.0.1/api/generate"\n',
+                "generation timing API",
+            ),
+        }
+        for call in sorted(PYTHON_TIMING_CALLS):
+            cases[f"timer_{call}"] = (f"{call}()\n", "wall or monotonic timer")
+        for name, (source, expected) in cases.items():
+            with self.subTest(name=name):
+                evidence = _python_measurement_evidence(source, Path(f"{name}.py"))
+                self.assertIn(expected, evidence)
+
+    def test_python_literal_sequence_detector_is_mutation_guarded(self):
+        for name, source in {
+            "list": 'command = ["cargo", "bench", "-p", "lattice-inference"]\n',
+            "tuple": 'command = ("cargo", "bench", "-p", "lattice-inference")\n',
+        }.items():
+            with self.subTest(name=name):
+                evidence = _python_measurement_evidence(source, Path(f"{name}.py"))
+                self.assertIn("cargo bench command", evidence)
+
+    def test_shell_and_node_auxiliary_detectors_are_mutation_guarded(self):
+        cases = {
+            "shell_supervisor_function": (
+                'bench_supervise_entry "fixture" ordinary measure "$@"\n',
+                "measurement supervisor invocation",
+            ),
+            "shell_supervisor_cli": (
+                "exec python3 scripts/lib/bench_supervision.py run --label fixture -- true\n",
+                "measurement supervisor invocation",
+            ),
+            "shell_mlx_import": ("import mlx.core\n", "MLX runtime import"),
+            "shell_mlx_from_import": (
+                "from mlx_lm import load\n",
+                "MLX runtime import",
+            ),
+            "node_hrtime": (
+                "const start = process.hrtime.bigint();\n",
+                "JavaScript timer",
+            ),
+            "node_performance": (
+                "const start = performance.now();\n",
+                "JavaScript timer",
+            ),
+            "node_date": ("const start = Date.now();\n", "JavaScript timer"),
+        }
+        for name, (source, expected) in cases.items():
+            with self.subTest(name=name):
+                self.assertIn(expected, _shell_or_node_measurement_evidence(source))
+
+    def test_dynamic_python_command_construction_is_advisory_no_match(self):
+        fixture_repo = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        scripts = fixture_repo / "scripts"
+        scripts.mkdir()
+        fixture = scripts / "dynamic_dispatch.py"
+        fixture.write_text(
+            "import subprocess\n"
+            "cargo = ''.join(chr(value) for value in (99, 97, 114, 103, 111))\n"
+            "bench = ''.join(chr(value) for value in (98, 101, 110, 99, 104))\n"
+            "command = [cargo, bench, '-p', 'lattice-inference']\n"
+            "target = ''.join(chr(value) for value in (114, 117, 110))\n"
+            "getattr(subprocess, target)(command, check=True)\n"
+        )
+
+        decision = _classify_script(fixture, "scripts/dynamic_dispatch.py")
+        self.assertEqual(decision.state, "advisory-no-match")
+        self.assertIn("advisory", decision.reason)
 
     def test_undecidable_input_fails_real_supervision_with_reason(self):
         """An unanalyzable candidate is a named failure, never a negative."""
@@ -577,6 +696,52 @@ class InventoryContract(unittest.TestCase):
             )
         self.assertEqual(decision.state, "undecidable")
         self.assertIn("exception carried no message", decision.reason)
+
+    def test_empty_measurement_scan_fails_real_supervision(self):
+        with mock.patch.object(
+            sys.modules[__name__], "discovered_measurement_evidence", return_value={}
+        ):
+            with self.assertRaisesRegex(
+                AssertionError, "measurement evidence scan collected zero paths"
+            ):
+                validate_direct_measurement_supervision()
+
+    def test_unclassified_measurement_fails_real_supervision(self):
+        evidence = {"scripts/new_measurement.py": {"wall or monotonic timer"}}
+        with (
+            mock.patch.object(sys.modules[__name__], "manifest_entries", return_value={}),
+            mock.patch.object(
+                sys.modules[__name__],
+                "discovered_measurement_evidence",
+                return_value=evidence,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "scripts/new_measurement.py: unclassified wall or monotonic timer",
+            ):
+                validate_direct_measurement_supervision()
+
+    def test_measurement_with_no_supervision_fails_real_supervision(self):
+        path = "scripts/unsupervised_measurement.py"
+        entries = {path: {"role": "measurement", "supervision": "none"}}
+        evidence = {path: {"wall or monotonic timer"}}
+        with (
+            mock.patch.object(
+                sys.modules[__name__], "manifest_entries", return_value=entries
+            ),
+            mock.patch.object(
+                sys.modules[__name__],
+                "discovered_measurement_evidence",
+                return_value=evidence,
+            ),
+        ):
+            with self.assertRaisesRegex(
+                AssertionError,
+                "scripts/unsupervised_measurement.py: source contains wall or monotonic "
+                "timer; supervision=none",
+            ):
+                validate_direct_measurement_supervision()
 
     def test_invalid_python_and_unsupported_shebang_are_undecidable(self):
         cases = {
@@ -616,10 +781,15 @@ class InventoryContract(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(
                     decision.state,
-                    {"measurement", "not-measurement", "excluded", "undecidable"},
+                    {
+                        "measurement",
+                        "advisory-no-match",
+                        "excluded",
+                        "undecidable",
+                    },
                 )
                 self.assertTrue(decision.reason)
-                if decision.state in {"measurement", "not-measurement"}:
+                if decision.state in {"measurement", "advisory-no-match"}:
                     self.assertTrue(decision.evidence)
 
     def test_every_measurement_entry_has_a_live_guard(self):
