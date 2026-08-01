@@ -78,6 +78,7 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] || [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
@@ -86,7 +87,34 @@ jobs:
             echo "→ $GITHUB_EVENT_NAME trigger: full parity suite REQUIRED"
             exit 0
           fi
-          CHANGED=$(./scripts/ci-changed-files.sh)
+          if [[ ! "$CI_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base revision must be a nonempty 40-character hexadecimal commit ID" >&2
+            exit 2
+          fi
+          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "engine=true" >> "$GITHUB_OUTPUT"
+            echo "tune=true" >> "$GITHUB_OUTPUT"
+            echo "→ all-zero base revision: full parity suite REQUIRED"
+            exit 0
+          fi
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
           echo "Changed files:"
           echo "$CHANGED"
           # Markdown is stripped BEFORE classification, and the reason is that
@@ -140,7 +168,7 @@ jobs:
             echo "engine=false" >> "$GITHUB_OUTPUT"
             echo "→ no engine change: parity not required"
           fi
-          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^scripts/ci-changed-files\.sh$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
             echo "tune=true" >> "$GITHUB_OUTPUT"
             echo "→ tune training surface changed: layer-23 golden REQUIRED"
           else
@@ -1219,6 +1247,14 @@ jobs:
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
           fi
+          if [ "$ENGINE" != "true" ] && [ "$ENGINE" != "false" ]; then
+            echo "::error::engine selector output is missing or invalid (value=$ENGINE)."
+            exit 1
+          fi
+          if [ "$TUNE" != "true" ] && [ "$TUNE" != "false" ]; then
+            echo "::error::tune selector output is missing or invalid (value=$TUNE)."
+            exit 1
+          fi
           # Drafts skip the resource-intensive parity jobs to keep hosted runner
           # capacity available to PRs that are ready to merge. Those skips reach
           # the arm checks below as result=skipped, which is correctly not "success",
@@ -1233,7 +1269,7 @@ jobs:
             echo "::error::Tune training surface changed and the layer-23 golden bridge did not succeed (result=$LAYER23_RESULT)."
             exit 1
           fi
-          if [ "$ENGINE" != "true" ]; then
+          if [ "$ENGINE" = "false" ]; then
             echo "No engine change — parity not required. PASS."
             exit 0
           fi
