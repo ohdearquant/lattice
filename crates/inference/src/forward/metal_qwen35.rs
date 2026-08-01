@@ -17049,6 +17049,7 @@ mod inner {
             write_tiny_q4_fixture_per_row,
         };
         use super::*;
+        use crate::measurement::gpu_test_lock;
         use crate::model::qwen35::{
             CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, FullAttentionLayerWeights,
         };
@@ -18392,6 +18393,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_gemv_decode_numerical() {
+            let _gpu_guard = gpu_test_lock();
             // Run a small GEMM through both f32 and f16 paths, compare results.
             let Some(device) = Device::system_default() else {
                 return;
@@ -19448,6 +19450,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_gpu_argmax_parity_k1() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -19790,6 +19793,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // unrotated reference path, within Metal f16/Q8 quantization tolerance.
         #[test]
         fn mtp_draft_logit_equivalence_with_quarot_counter_rotation() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19850,6 +19854,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -20173,6 +20178,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn raw_step_with_mtp_rejects_stale_live_cursor_without_mutation() {
+            use crate::speculative::MtpTargetVerifier as _;
+
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = Device::system_default() else {
                 eprintln!(
@@ -20188,9 +20195,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _gpu = gpu_test_lock();
             let tokenizer = single_char_vocab_tokenizer();
-            let (cfg, weights) = tiny_hybrid_fixture();
-            let mut state = MetalQwen35State::new(&weights, &cfg, 32)
-                .expect("tiny hybrid MetalQwen35State fixture constructs");
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_synthetic_mtp_for_test(&weights, &cfg, None);
+            assert!(state.has_mtp(), "fixture must load MTP state");
             state.path_proof_enabled = true;
             state
                 .generate_streaming_with_prefix_cache(
@@ -20202,8 +20210,20 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 )
                 .expect("cache-aware warm-up must establish live state");
             assert!(state.session.kv_cache.seq_len > 0);
-            assert!(!state.gdn_state_is_initial());
             assert!(state.cross_turn_prefix_cache.entry.is_some());
+
+            let mut seeded_gdn = state.snapshot_gdn_states();
+            assert_eq!(seeded_gdn.len(), 3, "fixture must contain three GDN layers");
+            seeded_gdn[0].0[0] = 1.0;
+            seeded_gdn[0].1[0] = -1.0;
+            state.restore_gdn_states(&seeded_gdn);
+            state
+                .cross_turn_prefix_cache
+                .entry
+                .as_mut()
+                .expect("cache-aware warm-up must retain an entry")
+                .gdn_snapshot = seeded_gdn;
+            assert!(!state.gdn_state_is_initial());
             state.reset_path_proof_counters();
 
             let seq_len_before = state.session.kv_cache.seq_len;
@@ -20476,6 +20496,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 );
                 return;
             };
+            let _gpu = gpu_test_lock();
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 16)
                 .expect("tiny hybrid MetalQwen35State fixture constructs");
@@ -20677,6 +20698,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn forward_step_rejects_position_and_cache_capacity_before_dispatch() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -20706,6 +20728,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn verify_tokens_rejects_out_of_range_start_pos_before_dispatch() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -20810,6 +20833,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn verify_tokens_rejects_batch_exceeding_gdn_pool_capacity_before_dispatch() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -20843,6 +20867,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn forward_prefill_layer_traces_rejects_token_sequence_past_cache_capacity() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -20867,6 +20892,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_metal_qwen35_kv_cache_determinism_replay_5_tokens() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -20930,6 +20956,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// device is absent.
         #[test]
         fn f16_kv_metal_path_executes_and_reports_capability() {
+            let _gpu_guard = gpu_test_lock();
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = Device::system_default() else {
                 eprintln!("[METAL_F16_KV_CAPABILITY] supported=false reason=no_metal_device");
@@ -21016,6 +21043,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_metal_qwen35_engine_session_isolation() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -21090,6 +21118,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_token_nlls_matches_manual_forward_loop() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -21127,6 +21156,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_token_nlls_is_repeatable_under_self_reset() {
+            let _gpu_guard = gpu_test_lock();
             // The Metal harness resets recurrent state at the start of each
             // call. Two back-to-back calls on the same input must therefore
             // produce identical NLLs even though `forward_step` mutates the
@@ -21152,6 +21182,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_token_nlls_rejects_oversized_input() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -21173,6 +21204,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_token_nlls_rejects_out_of_vocab_token() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -21192,6 +21224,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_perplexity_equals_exp_mean_nll() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -21224,6 +21257,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_perplexity_matches_compute_token_nlls_on_single_window() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -21257,6 +21291,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_perplexity_rejects_window_above_max_cache_len() {
+            let _gpu_guard = gpu_test_lock();
             // Counterpart of the CPU test:
             // `compute_perplexity_rejects_window_above_rope_capacity`. The
             // Metal-side cap is the KV-cache size, not the RoPE table.
@@ -24285,6 +24320,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn from_q4_dir_rejects_max_cache_len_above_max_position_embeddings() {
+            let _gpu_guard = gpu_test_lock();
             // `from_q4_dir` was missing the
             // `max_cache_len <= cfg.max_position_embeddings` guard that
             // `new_session` enforces. Without it, `--max-cache-len 999999
@@ -24314,6 +24350,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn from_q4_dir_rejects_zero_max_cache_len() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -24333,6 +24370,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn from_q4_dir_rejects_tied_config_with_lm_head_artifact() {
+            let _gpu_guard = gpu_test_lock();
             // The prior fix only caught the
             // `tie_word_embeddings=false` + missing `lm_head.q4` half of
             // the artifact contract. The opposite mismatch —
@@ -24376,6 +24414,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn from_q4_dir_rejects_untied_config_without_lm_head_artifact() {
+            let _gpu_guard = gpu_test_lock();
             // The loader silently fell back to
             // `embed_tokens` when `tie_word_embeddings=false` and
             // `lm_head.q4` was missing. That is exactly the contamination
@@ -24407,6 +24446,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn lora_gemv_kernel_matches_cpu_reference() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -24528,6 +24568,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_adapter_and_dispatch_lora_if_active() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -24648,6 +24689,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn gemm_q4_tiled_enabled_on_apple7_plus() {
+            let _gpu_guard = gpu_test_lock();
             // Regression guard for the M>1 prefill GEMM. The simdgroup-matrix
             // tiled Q4 kernel (`gemm_q4_tiled`) must be enabled on every Apple7+
             // GPU (M1 and up). It was previously gated behind Apple9, silently
@@ -24817,6 +24859,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// If half precision is extended to accumulators, tiled_vs_ref would likely exceed 0.015.
         #[test]
         fn gemm_q4_tiled_vs_naive_numeric_differential() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -25016,6 +25059,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// dequant reference. Reverting the fix to `div_ceil(4)` fails this test.
         #[test]
         fn dispatch_matmul_q4_writes_all_rows() {
+            let _gpu_guard = gpu_test_lock();
             // Fail closed under enforce: a CI runner that provisions a Metal GPU but
             // silently skips here would make this regression gate verify nothing —
             // the same silent-skip class as the embed parity gate (#383). The
@@ -25215,6 +25259,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn gemm_q8_tiled_enabled_on_apple7_plus() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -25233,6 +25278,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn gemm_q8_tiled_vs_naive_numeric_differential() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -25432,6 +25478,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// Measured on M1 (2026-06-24): mixed abs=9.6e-1, ref_max=4.21e3, rel=2.3e-4 (bound 2 %).
         #[test]
         fn gemm_q4_tiled_edge_scale_activation_coverage() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -25661,6 +25708,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_short_a() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25676,6 +25724,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_short_b() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25691,6 +25740,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_zero_rank() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25712,6 +25762,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_zero_d_in() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25732,6 +25783,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_out_of_range_layer_idx() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25748,6 +25800,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_wrong_a_length_mismatched_dims() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25772,6 +25825,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_wrong_b_length_mismatched_dims() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25795,6 +25849,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_quarot_with_short_a() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25812,6 +25867,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_quarot_with_short_b() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -25830,6 +25886,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_wrong_shape_for_module() {
+            let _gpu_guard = gpu_test_lock();
             // q_proj expects d_out = 2 * full_q_dim() = 1024, not hidden = 512
             let Some(_) = metal::Device::system_default() else {
                 return;
@@ -25853,6 +25910,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_gdn_module_on_full_attention_layer() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -25879,6 +25937,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_unknown_module() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -25901,6 +25960,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_duplicate_projection() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -25926,6 +25986,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_empty_layers() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -25937,6 +25998,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_non_finite_scale() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -25980,6 +26042,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_in_proj_b_and_in_proj_a() {
+            let _gpu_guard = gpu_test_lock();
             use crate::model::qwen35_config::Qwen35Config;
             // Test the actual GDN-layer rejection branch (is_full=false)
             let mut gdn_cfg = Qwen35Config::qwen35_0_8b();
@@ -26023,6 +26086,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn lora_prefill_fallback_matches_sequential_with_adapter() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -26547,6 +26611,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn forward_step_gdn_only_does_not_advance_kv_cache() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -26569,6 +26634,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn forward_step_gdn_only_returns_finite_logits() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29030,94 +29096,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             r
         }
 
-        /// Serializes GPU-heavy model tests onto the single shared Metal device —
-        /// across BOTH test threads in this process and any other process on the
-        /// machine.
-        ///
-        /// In-process half: the Metal batched/decode attention kernels carry a
-        /// runtime-only nondeterminism that perturbs logit values by small
-        /// magnitudes on roughly 1-in-N runs. Static analysis of
-        /// `gdn_recurrence_fused` and `decode_attention` found both barrier-correct
-        /// (no uninitialized threadgroup reads, no intra-dispatch cross-threadgroup
-        /// device race, no untracked buffers), so the hazard has not been
-        /// root-caused — it is only observable via GPU frame capture (Xcode Metal
-        /// debugger), which no run here has done yet. Concurrent GPU execution
-        /// amplifies it, and it perturbs the *serial* GDN reference that the
-        /// cross-algorithm parity tests compare against — producing false-positive
-        /// failures under `cargo test`'s default multi-threading. Argmax stays
-        /// stable across the perturbation; only logit values drift (see the
-        /// chunked-prefill parity test below for the magnitude evidence). The
-        /// chunked scan itself is deterministic (see
-        /// `gdn_chunked_b_vs_b_self_consistency`); serializing device access keeps
-        /// the serial reference clean run-to-run.
-        ///
-        /// Machine-level half (#628/#629 post-mortem): the in-process mutex cannot
-        /// stop concurrent `cargo test` runs launched from another process on the
-        /// machine, and concurrent Metal load provably corrupts real-checkpoint
-        /// numerics (boundary-tie margins inflated ~3x during a confirmed
-        /// contention window). So the guard also holds an exclusive advisory
-        /// `flock` on a fixed machine-wide path, `/tmp/lion-metal-gpu-test.lock`,
-        /// making cross-process serialization automatic instead of a convention
-        /// agents must remember. Any harness touching the Metal GPU should
-        /// acquire the same path.
-        ///
-        /// Acquisition order is mutex-then-file, so at most one thread per
-        /// process ever contends the file lock. The file lock is polled with
-        /// `try_lock` so a wedged holder surfaces as a clear panic after a
-        /// generous timeout instead of a silent infinite hang.
-        struct GpuTestGuard {
-            _process: std::sync::MutexGuard<'static, ()>,
-            // Held for the guard's lifetime; dropping the File closes the fd,
-            // which releases the flock.
-            _machine: std::fs::File,
-        }
-
-        const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-        const GPU_MACHINE_LOCK_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(30 * 60);
-
-        fn gpu_test_lock() -> GpuTestGuard {
-            use std::sync::Mutex;
-            static GPU_LOCK: Mutex<()> = Mutex::new(());
-            let process = GPU_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(GPU_MACHINE_LOCK_PATH)
-                .unwrap_or_else(|e| {
-                    panic!("gpu_test_lock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}")
-                });
-            let deadline = std::time::Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
-            loop {
-                match file.try_lock() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        if std::time::Instant::now() >= deadline {
-                            panic!(
-                                "gpu_test_lock: another process has held \
-                                 {GPU_MACHINE_LOCK_PATH} for over {}s — a Metal \
-                                 test run elsewhere on this machine is wedged or \
-                                 genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
-                                GPU_MACHINE_LOCK_TIMEOUT.as_secs()
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(std::fs::TryLockError::Error(e)) => {
-                        panic!("gpu_test_lock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
-                    }
-                }
-            }
-            GpuTestGuard {
-                _process: process,
-                _machine: file,
-            }
-        }
-
         fn minimal_bpe_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
             use std::collections::HashMap;
             let mut vocab: HashMap<String, u32> = HashMap::new();
@@ -29431,6 +29409,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn self_spec_checkpoint_pool_allocated_when_env_set() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29449,6 +29428,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn generate_greedy_self_spec_output_token_count_within_budget() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -30403,6 +30383,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// caller has stopped consuming the stream.
         #[test]
         fn stop_reason_interrupt_on_stream_callback_false() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -30471,6 +30452,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// called.
         #[test]
         fn stop_reason_interrupt_when_cancelled_before_prefill_starts() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -30552,6 +30534,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// loop's own independent check, not the callback, is what halts it.
         #[test]
         fn stop_reason_interrupt_when_should_cancel_alone_stops_mid_decode() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -30636,6 +30619,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// greedy sampling picks at prefill.
         #[test]
         fn metal_generate_zero_budget_reports_length() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -30918,6 +30902,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// 1 and the callback would fire at least once instead of staying silent.
         #[test]
         fn metal_generate_streaming_zero_budget_reports_length() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -30982,6 +30967,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// iterations rather than being satisfied by the prefill token alone.
         #[test]
         fn streaming_text_accumulates_every_loop_delta_not_only_prefill() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -31037,6 +31023,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn self_spec_pool_holds_one_slot_per_verify_token_plus_base() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -31079,6 +31066,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// the check would fail.
         #[test]
         fn self_spec_slot0_holds_pre_draft_state_after_round() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -31246,6 +31234,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn snapshot_gdn_states_roundtrips_through_metal_buffers() {
+            let _gpu_guard = gpu_test_lock();
             use crate::speculative::MtpTargetVerifier;
             let Some(_) = metal::Device::system_default() else {
                 return;
@@ -31446,6 +31435,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn metal_qwen35_chunked_prefill_long_prompt_matches_step_loop() {
+            let _gpu_guard = gpu_test_lock();
             // Parity gate: chunked forward_prefill must agree with token-by-token
             // forward_step on a prompt longer than max_prefill (≈512).
             // Tests that RoPE offsets, KV cache rows, attention cache_len, and
@@ -31555,6 +31545,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn metal_qwen35_chunked_prefill_length_1_final_chunk_matches_step_loop() {
+            let _gpu_guard = gpu_test_lock();
             // Degenerate-boundary gate: a prompt of exactly max_prefill + 1 tokens
             // decomposes into chunks [max_prefill, 1]. The length-1 final chunk
             // goes through forward_prefill_batched_chunk with n=1 (single-iteration
@@ -31746,6 +31737,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn metal_qwen35_prefill_all_logits_long_prompt_no_longer_panics() {
+            let _gpu_guard = gpu_test_lock();
             // Regression gate: forward_prefill_all_logits must NOT panic when
             // n > max_prefill and LoRA is inactive. Old code panicked; new code
             // chunks the request and concatenates per-chunk all-position logits.

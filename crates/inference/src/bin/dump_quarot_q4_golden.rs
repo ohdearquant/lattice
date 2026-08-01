@@ -48,6 +48,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use std::path::PathBuf;
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
     /// Fixed prompt set. Kept in sync by hand with the committed fixture —
     /// this binary is the source of truth for prompt *content*; the fixture
     /// is the frozen source of truth for expected *token IDs*.

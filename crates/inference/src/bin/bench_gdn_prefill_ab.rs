@@ -66,57 +66,6 @@ fn main() {
     feature = "metal-gpu",
     feature = "bench-internals"
 ))]
-mod gpu_flock {
-    //! Mirrors `metal_qwen35::gpu_test_lock()` (same path, same timeout, same
-    //! panic-with-lsof hint) — that function is private to the lib crate (it lives
-    //! in a `#[cfg(test)]`-adjacent module), so a `src/bin` binary cannot call it
-    //! directly (bin targets are separate crates for privacy purposes; they only see
-    //! the lib's `pub` surface). This is a deliberate, minimal duplication of the
-    //! fleet-wide GPU serialization convention (the repo CLAUDE.md "Machine-Wide
-    //! GPU Test Lock"), not a divergent one: same lock file, same semantics.
-    const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-    const GPU_MACHINE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-    /// Acquires the exclusive flock and leaks it for the process lifetime
-    /// (this bin is a short-lived, single-shot measurement run — there is no other
-    /// Metal work in this process to serialize against once acquired).
-    pub fn acquire_for_process() {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(GPU_MACHINE_LOCK_PATH)
-            .unwrap_or_else(|e| panic!("gpu flock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}"));
-        let deadline = std::time::Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
-                        panic!(
-                            "gpu flock: another process has held {GPU_MACHINE_LOCK_PATH} for \
-                             over {}s — a Metal run elsewhere on this machine is wedged or \
-                             genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
-                            GPU_MACHINE_LOCK_TIMEOUT.as_secs()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                Err(std::fs::TryLockError::Error(e)) => {
-                    panic!("gpu flock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
-                }
-            }
-        }
-        // Leak: hold for the rest of the process. `file` intentionally never drops.
-        std::mem::forget(file);
-    }
-}
-
-#[cfg(all(
-    target_os = "macos",
-    feature = "metal-gpu",
-    feature = "bench-internals"
-))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::forward::metal_qwen35::bench_support::{self, GdnIsolatedChunkTiming};
@@ -136,9 +85,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- INVALIDATION GUARD: hold the fleet-wide Metal GPU flock BEFORE any Metal
     // work (model load below doesn't touch Metal, but MetalQwen35State::new does). ---
-    eprintln!("[bench] acquiring /tmp/lion-metal-gpu-test.lock ...");
+    eprintln!("[bench] acquiring shared Metal GPU lock ...");
     let flock_acquired_at = std::time::Instant::now();
-    gpu_flock::acquire_for_process();
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     eprintln!(
         "[bench] flock held ({:.1}s wait)",
         flock_acquired_at.elapsed().as_secs_f64()

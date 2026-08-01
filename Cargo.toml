@@ -81,6 +81,8 @@ mime = "0.3"
 # Testing
 proptest = "1.0"
 tempfile = "3.10"
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
+syn = { version = "2.0", features = ["full", "visit"] }
 # Offline WGSL parsing and semantic validation for the WGPU shader artifacts.
 # This matches the Naga major used transitively by wgpu 24.
 naga = { version = "24.0", features = ["wgsl-in"] }
