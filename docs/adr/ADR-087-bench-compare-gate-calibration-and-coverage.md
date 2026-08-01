@@ -1,6 +1,6 @@
 # ADR-087: bench-compare gate calibration, coverage, and admissible structural proof
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-08-01
 **Crate**: workspace (bench harness; governs PRs touching lattice-inference, lattice-embed, lattice-fann)
 
