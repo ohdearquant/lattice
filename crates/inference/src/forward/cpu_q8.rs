@@ -417,7 +417,7 @@ fn full_attention_step_q8(
         // (e.g. from an infinite Q8 scale via `0.0 * inf`) makes `sum_exp` NaN, and
         // real (unclamped) `.exp()` already reaches the shared row-finalizer's
         // full-row-zero outcome via that NaN-into-`sum_exp` propagation. Mirrors
-        // generate.rs::compute_attention (#409) and cpu_f16 moe_ffn_step_f16 (#411).
+        // attention::decode (#409) and cpu_f16 moe_ffn_step_f16 (#411).
         // ADR-080 C1 (#785): routed through `finalize_row` for
         // consolidation -- behavior-preserving, no output change.
         let mut sum_exp = 0.0f32;

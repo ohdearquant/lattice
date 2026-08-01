@@ -519,6 +519,12 @@ fn run_metal_q4(
     emit_json: bool,
     json_label: Option<&str>,
 ) -> Result<PerplexityReport, ExitCode> {
+    // `measurement` is only declared under cfg(macos, metal-gpu) (see
+    // src/measurement.rs), and this binary — unlike the bench_* harnesses —
+    // has no top-level cfg gate, so it must build on every platform/feature
+    // set. Gate the guard the same way its own dependency is gated.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let t_load = Instant::now();
     let mut state =
         match MetalQwen35State::from_q4_dir(q4_dir, tokenizer_path, cfg_loaded, max_cache_len) {

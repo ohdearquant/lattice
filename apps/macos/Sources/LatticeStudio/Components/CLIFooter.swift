@@ -78,6 +78,7 @@ struct CLIFooter: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("CLIFooter – chat") {
     VStack(spacing: 0) {
         Spacer()
@@ -101,3 +102,4 @@ struct CLIFooter: View {
     .frame(width: 760, height: 160)
     .background(Theme.Palette.canvas)
 }
+#endif
