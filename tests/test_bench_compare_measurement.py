@@ -410,10 +410,16 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             if re.search(r"\bcargo bench\b", line)
             and not line.lstrip().startswith("#")
         ]
-        self.assertEqual(len(commands), 6, commands)
+        self.assertTrue(commands, "found 0 cargo bench invocations")
+        self.assertEqual(
+            len(commands), 10,
+            f"found {len(commands)} cargo bench invocations:\n"
+            + "\n".join(commands),
+        )
         self.assertTrue(
             all(re.search(r"\bcargo bench --locked\b", line) for line in commands),
-            "every cargo bench command must pass --locked:\n" + "\n".join(commands),
+            f"found {len(commands)} cargo bench invocations; "
+            "every command must pass --locked:\n" + "\n".join(commands),
         )
 
         result = _run(
