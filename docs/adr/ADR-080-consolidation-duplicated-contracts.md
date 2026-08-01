@@ -109,7 +109,7 @@ principle, add a publish-order dependency for no cross-crate consumer, and contr
 
 **Evidence.** Six nominal softmax operations recur across 4-6 sites each: materialized masked CPU
 attention (`forward/cpu/softmax.rs`, `attention/standard.rs`), online causal softmax
-(`attention/decode.rs`, `attention/gqa.rs`, `generate.rs`, `attention/flash_causal.rs`), Qwen3.5
+(`attention/decode.rs`, `attention/gqa.rs`, `attention/flash_causal.rs`), Qwen3.5
 cached-decode/batched-prefill softmax (`model/qwen35/forward.rs`, `forward/cpu_f16.rs`,
 `forward/cpu_q8.rs`, `forward/neon_forward.rs`, `forward/batch_prefill.rs`,
 `forward/metal_qwen35.rs`), Qwen3 secondary full-prefill softmax (`model/qwen.rs`), standalone

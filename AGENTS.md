@@ -109,7 +109,6 @@ embed (12K)   tune (20K)                          ← embed uses inference; tune
 | `attention/`     | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
 | `forward/`       | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
 | `kv_cache/`      | KV cache for generation      | `FlatKVCache`, `PagedKVCache`                                                     |
-| `generate.rs`    | Autoregressive generation    | `GenerateConfig`                                                                  |
 | `speculative.rs` | Speculative decoding         | `NgramSpeculator`, `MtpVerifier`                                                  |
 | `lora_hook.rs`   | LoRA adapter injection trait | `LoraHook`, `NoopLoraHook`                                                        |
 | `rope.rs`        | Rotary positional encoding   | `RopeTable`                                                                       |

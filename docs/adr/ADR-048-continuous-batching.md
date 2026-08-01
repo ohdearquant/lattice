@@ -78,7 +78,7 @@ via `Arc<PagedKvBlock>` pointer swap (zero physical copy).
 ## Scope
 
 This ADR covers interfaces and data structures only. It does not mandate any implementation
-timeline for Phase 2, and does not touch the CPU inference path (`generate.rs`).
+timeline for Phase 2 and did not alter the then-existing generic CPU inference path.
 
 **In scope**:
 
@@ -295,8 +295,8 @@ must serialize the GDN state to a CPU buffer before releasing the Metal slot.
 
 ## References
 
-- `src/generate.rs` — current single-request generation loop; `forward_with_cache` is the
-  target for refactoring into the serving forward path
+- `src/model/qwen35/generation.rs` — current single-request generation loop and serving
+  forward-path integration point
 - `src/kv_cache/` — `PagedKVCache` (256-token pages, LRU eviction) — memory substrate
 - `src/attention/gdn.rs` — GDN recurrent state; per-sequence `S` matrix
 - `examples/bench_concurrent.rs` — confirms `forward_step` is synchronous (blocking

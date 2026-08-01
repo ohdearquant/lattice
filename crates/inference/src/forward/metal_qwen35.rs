@@ -1922,6 +1922,95 @@ mod inner {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SamplingRouteEnvironment {
+        compact: bool,
+        selection: bool,
+        approximate_top_p: bool,
+    }
+
+    impl SamplingRouteEnvironment {
+        fn current() -> Self {
+            Self {
+                compact: std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
+                selection: std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                approximate_top_p: std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SamplingRoutePlan {
+        use_compact: bool,
+        compact_route: GpuTopkRoute,
+        compact_topk: usize,
+    }
+
+    fn plan_sampling_route(
+        gen_cfg: &GenerateConfig,
+        history_is_empty: bool,
+        environment: SamplingRouteEnvironment,
+    ) -> SamplingRoutePlan {
+        let block_route = choose_gpu_block_topk_route(
+            gen_cfg.top_k,
+            gen_cfg.top_p,
+            environment.compact,
+            environment.approximate_top_p,
+        );
+        let route = if block_route != GpuTopkRoute::CpuFallback {
+            block_route
+        } else {
+            choose_gpu_topk_route(gen_cfg.top_k, environment.compact, environment.selection)
+        };
+        // This uniform `is_none()` check is not one policy for all three
+        // callers: direct and prefix-cache generation already rejected
+        // `logprobs: Some(_)` in their own `check_logprobs_not_set` preflight
+        // before ever reaching this function, so for them the check below is
+        // defense-in-depth and always sees `None`. Streaming has no such
+        // preflight -- it intentionally supports `logprobs: Some(_)` to
+        // capture per-token log-probabilities -- so for streaming this is the
+        // real, load-bearing full-logit gate: compact sampling cannot
+        // provide full-logit logprob semantics, so a logprobs capture
+        // request must force the full-logit (non-compact) path here.
+        let logprobs_eligible = gen_cfg.logprobs.is_none();
+        let use_compact = route != GpuTopkRoute::CpuFallback
+            && (gen_cfg.repetition_penalty == 1.0 || history_is_empty)
+            && gen_cfg.grammar.is_none()
+            && logprobs_eligible;
+
+        if use_compact {
+            SamplingRoutePlan {
+                use_compact,
+                compact_route: route,
+                compact_topk: match route {
+                    GpuTopkRoute::BlockArgmax => 1,
+                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
+                    _ => gen_cfg.top_k,
+                },
+            }
+        } else {
+            SamplingRoutePlan {
+                use_compact,
+                compact_route: GpuTopkRoute::CpuFallback,
+                compact_topk: 0,
+            }
+        }
+    }
+
+    fn apply_sampling_route_plan(
+        plan: SamplingRoutePlan,
+        compact_route: &mut GpuTopkRoute,
+        compact_topk: &mut usize,
+        compact_result: &mut Vec<crate::sampling::Candidate>,
+    ) -> bool {
+        *compact_route = plan.compact_route;
+        *compact_topk = plan.compact_topk;
+        if !plan.use_compact {
+            compact_result.clear();
+        }
+        plan.use_compact
+    }
+
     /// Resolves a `compact_route` to `(local_k, precompiled Stage-1 pipeline
     /// slot)`, or `None` if the route isn't a block-top-k route at all
     /// (`Argmax`/`Select64`/`HierarchicalK50`/`CpuFallback`) **or** if
@@ -2674,8 +2763,8 @@ mod inner {
     /// `group_size=6` model would silently drop attention output for 2 of every 6
     /// query heads in the group. `group_size` is validated to be in
     /// `1..=METAL_FLASH_MAX_GQA_GROUP` (8) by `validate_flash_decode_shape` before
-    /// either pipeline-construction call site (`new`, `from_q4_dir`) reaches this
-    /// function. This helper re-checks that invariant and returns `Err` for any
+    /// either constructor reaches the shared pipeline builder. This helper
+    /// re-checks that invariant and returns `Err` for any
     /// out-of-range input rather than rounding it: there is no variant with
     /// `MAX_GRP > 8`, so a `group_size >= 9` could only be mapped to `g8`, whose
     /// kernel guard would then silently write no attention. Failing closed here
@@ -3115,6 +3204,165 @@ mod inner {
         })
     }
 
+    fn build_pipelines(
+        device: &Device,
+        cfg: &Qwen35Config,
+    ) -> Result<MetalQwen35Pipelines, String> {
+        let prefill_grp_suffix =
+            prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
+
+        let opts = CompileOptions::new();
+        let library = device
+            .new_library_with_source(MSL_SOURCE, &opts)
+            .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
+
+        let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
+            let func = library
+                .get_function(name, None)
+                .map_err(|e| format!("function '{name}' not found: {e}"))?;
+            device
+                .new_compute_pipeline_state_with_function(&func)
+                .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
+        };
+
+        let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
+            // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
+            // The compile/pipeline `.ok()?` chain below falls back to the
+            // naive gemm_q4 on any device where the V3.0 source fails.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q4_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
+            // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
+            // gemv_q3_decode-only (M=1) path on any device/compile failure.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q3_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
+            // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q8_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        Ok(MetalQwen35Pipelines {
+            gemv_decode: make_pipeline("gemv_decode_m1")?,
+            gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
+            gemv_q8: make_pipeline("gemv_q8_decode")?,
+            gemv_q4: make_pipeline("gemv_q4_decode")?,
+            gemm_q4: make_pipeline("gemm_q4")?,
+            gemm_q4_tiled: make_optional_gemm_q4_tiled(),
+            gemv_q3: make_pipeline("gemv_q3_decode")?,
+            gemm_q3_tiled: make_optional_gemm_q3_tiled(),
+            rms_norm: make_pipeline("rms_norm_qwen35")?,
+            partial_rope: make_pipeline("partial_rope_interleaved")?,
+            per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
+            decode_attention: make_pipeline("decode_attention")?,
+            sigmoid_gate: make_pipeline("sigmoid_gate")?,
+            scatter_q_gate: make_pipeline("scatter_q_gate")?,
+            silu_mul: make_pipeline("silu_mul")?,
+            silu_mul_fused: make_pipeline("silu_mul_fused")?,
+            copy: make_pipeline("copy_buf")?,
+            copy_offset: make_pipeline("copy_buf_offset")?,
+            conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
+            gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
+            gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
+            gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
+            gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
+            gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
+            gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
+            gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
+            gdn_recurrence_q36: library
+                .get_function("gdn_recurrence_fused_q36", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_precompute_keys: library
+                .get_function("gdn_precompute_keys", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_recurrence_sharded: library
+                .get_function("gdn_recurrence_sharded", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_norm_silu: library
+                .get_function("gdn_norm_silu", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
+            copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
+            add_and_copy: make_pipeline("add_and_copy")?,
+            copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
+            fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
+            gemm_q8: make_pipeline("gemm_q8")?,
+            gemm_q8_tiled: make_optional_gemm_q8_tiled(),
+            topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
+            argmax_first: make_pipeline("logits_argmax_first")?,
+            argmax_merge: make_pipeline("logits_argmax_merge")?,
+            topk_select50_first: make_pipeline("logits_topk_select50_first")?,
+            topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
+            decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
+            decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
+            lora_gemv_a: make_pipeline("lora_gemv_a")?,
+            lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
+            // ADR-053: MoE Metal dispatch kernels
+            moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
+            moe_scale_add: make_pipeline("moe_scale_add")?,
+            moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
+            moe_zero_buf: make_pipeline("zero_buf")?,
+            scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
+            per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
+            partial_rope_batch: make_pipeline("partial_rope_batch")?,
+            copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
+            prefill_attention_batched: make_pipeline(&format!(
+                "prefill_attention_batched_causal_{prefill_grp_suffix}"
+            ))?,
+            copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
+            copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
+            decode_attention_f16: make_pipeline("decode_attention_f16")?,
+            decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
+            prefill_attention_batched_f16: make_pipeline(&format!(
+                "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
+            ))?,
+            lm_head_block_topk_f16: make_lm_head_block_pipelines(
+                device,
+                &library,
+                "lm_head_block_topk_f16",
+                cfg.hidden_size as u32,
+            )?,
+            lm_head_block_topk_q4: make_lm_head_block_pipelines(
+                device,
+                &library,
+                "lm_head_block_topk_q4",
+                cfg.hidden_size as u32,
+            )?,
+        })
+    }
+
     impl MetalQwen35Engine {
         /// Load immutable model resources from CPU weights. Does NOT allocate any session state.
         ///
@@ -3144,165 +3392,7 @@ mod inner {
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
-            // Group-size-specialized prefill attention kernel (occupancy win):
-            // group_size is fixed for a loaded model, so selection happens once
-            // here rather than per-dispatch. See `prefill_maxgrp_suffix`'s doc
-            // comment for the ship-safety rounding-up guarantee — validated
-            // in-range by `validate_flash_decode_shape` above.
-            let prefill_grp_suffix =
-                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
-
-            // Compile shaders
-            let opts = CompileOptions::new();
-            let library = device
-                .new_library_with_source(MSL_SOURCE, &opts)
-                .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
-
-            let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
-                let func = library
-                    .get_function(name, None)
-                    .map_err(|e| format!("function '{name}' not found: {e}"))?;
-                device
-                    .new_compute_pipeline_state_with_function(&func)
-                    .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
-            };
-
-            let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
-                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
-                // The compile/pipeline `.ok()?` chain below falls back to the
-                // naive gemm_q4 on any device where the V3.0 source fails.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q4_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
-                // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
-                // gemv_q3_decode-only (M=1) path on any device/compile failure.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q3_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
-                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let pipelines = MetalQwen35Pipelines {
-                gemv_decode: make_pipeline("gemv_decode_m1")?,
-                gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
-                gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q4: make_pipeline("gemv_q4_decode")?,
-                gemm_q4: make_pipeline("gemm_q4")?,
-                gemm_q4_tiled: make_optional_gemm_q4_tiled(),
-                gemv_q3: make_pipeline("gemv_q3_decode")?,
-                gemm_q3_tiled: make_optional_gemm_q3_tiled(),
-                rms_norm: make_pipeline("rms_norm_qwen35")?,
-                partial_rope: make_pipeline("partial_rope_interleaved")?,
-                per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
-                decode_attention: make_pipeline("decode_attention")?,
-                sigmoid_gate: make_pipeline("sigmoid_gate")?,
-                scatter_q_gate: make_pipeline("scatter_q_gate")?,
-                silu_mul: make_pipeline("silu_mul")?,
-                silu_mul_fused: make_pipeline("silu_mul_fused")?,
-                copy: make_pipeline("copy_buf")?,
-                copy_offset: make_pipeline("copy_buf_offset")?,
-                conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
-                gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
-                gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
-                gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
-                gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
-                gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
-                gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
-                gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
-                gdn_recurrence_q36: library
-                    .get_function("gdn_recurrence_fused_q36", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_precompute_keys: library
-                    .get_function("gdn_precompute_keys", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_recurrence_sharded: library
-                    .get_function("gdn_recurrence_sharded", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_norm_silu: library
-                    .get_function("gdn_norm_silu", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
-                copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
-                add_and_copy: make_pipeline("add_and_copy")?,
-                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
-                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
-                gemm_q8: make_pipeline("gemm_q8")?,
-                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
-                argmax_first: make_pipeline("logits_argmax_first")?,
-                argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_select50_first: make_pipeline("logits_topk_select50_first")?,
-                topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
-                decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
-                decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
-                lora_gemv_a: make_pipeline("lora_gemv_a")?,
-                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
-                // ADR-053: MoE Metal dispatch kernels
-                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
-                moe_scale_add: make_pipeline("moe_scale_add")?,
-                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
-                moe_zero_buf: make_pipeline("zero_buf")?,
-                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
-                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
-                partial_rope_batch: make_pipeline("partial_rope_batch")?,
-                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
-                prefill_attention_batched: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}"
-                ))?,
-                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
-                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
-                decode_attention_f16: make_pipeline("decode_attention_f16")?,
-                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
-                prefill_attention_batched_f16: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
-                ))?,
-                lm_head_block_topk_f16: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_f16",
-                    cfg.hidden_size as u32,
-                )?,
-                lm_head_block_topk_q4: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_q4",
-                    cfg.hidden_size as u32,
-                )?,
-            };
+            let pipelines = build_pipelines(&device, cfg)?;
 
             // Upload per-layer weights
             let quant_tag = match quant_format {
@@ -8548,7 +8638,7 @@ mod inner {
         ) -> GenerateOutput {
             let cfg = self.engine.config.clone();
 
-            // Mirror plain greedy `generate()` (generate.rs:235): max_new_tokens == 0
+            // Mirror canonical plain greedy generation: max_new_tokens == 0
             // means "generate nothing".  Return before sampling so we never emit a
             // token the caller did not ask for — including the case-A prefill-EOS path
             // below, which would otherwise emit one stop token for a zero budget.
@@ -8794,7 +8884,7 @@ mod inner {
         ) -> GenerateOutput {
             let cfg = self.engine.config.clone();
 
-            // Mirror plain greedy `generate()` (generate.rs:293) and the sibling
+            // Mirror canonical plain greedy generation and the sibling
             // `generate_greedy_mtp`: max_new_tokens == 0 means "generate nothing".
             // Return before sampling so we never emit a token the caller did not ask
             // for — including the case-A prefill-EOS path below, which would otherwise
@@ -9138,6 +9228,24 @@ mod inner {
             Ok(GenerateAdmission::Ready(prompt_ids))
         }
 
+        fn configure_sampling_route(
+            &mut self,
+            gen_cfg: &GenerateConfig,
+            history_is_empty: bool,
+        ) -> bool {
+            let plan = plan_sampling_route(
+                gen_cfg,
+                history_is_empty,
+                SamplingRouteEnvironment::current(),
+            );
+            apply_sampling_route_plan(
+                plan,
+                &mut self.session.compact_route,
+                &mut self.session.compact_topk,
+                &mut self.session.compact_result,
+            )
+        }
+
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
         ///
         /// Generate text from a prompt.
@@ -9190,44 +9298,7 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
-            );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            // Repetition penalty requires full logits — disable compact mode when active.
-            // Grammar-constrained decoding also requires full logits (CpuFallback).
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -13570,43 +13641,7 @@ mod inner {
             // default (no logprobs requested) path pays no extra cost.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
-            );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none()
-                && gen_cfg.logprobs.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -14621,14 +14656,6 @@ mod inner {
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
-            // Group-size-specialized prefill attention kernel (occupancy win):
-            // group_size is fixed for a loaded model, so selection happens once
-            // here rather than per-dispatch. See `prefill_maxgrp_suffix`'s doc
-            // comment for the ship-safety rounding-up guarantee — validated
-            // in-range by `validate_flash_decode_shape` above.
-            let prefill_grp_suffix =
-                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
-
             // Cache-capacity validation, matching `new_session` so a
             // `from_q4_dir` call cannot construct a runtime whose KV cap
             // outruns the RoPE table (`partial_rope_interleaved` indexes
@@ -14694,157 +14721,7 @@ mod inner {
                 ));
             }
 
-            // Compile shaders (same as new()).
-            let opts = CompileOptions::new();
-            let library = device
-                .new_library_with_source(MSL_SOURCE, &opts)
-                .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
-
-            let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
-                let func = library
-                    .get_function(name, None)
-                    .map_err(|e| format!("function '{name}' not found: {e}"))?;
-                device
-                    .new_compute_pipeline_state_with_function(&func)
-                    .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
-            };
-
-            let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
-                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
-                // The compile/pipeline `.ok()?` chain below falls back to the
-                // naive gemm_q4 on any device where the V3.0 source fails.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q4_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
-                // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
-                // gemv_q3_decode-only (M=1) path on any device/compile failure.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q3_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
-                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let pipelines = MetalQwen35Pipelines {
-                gemv_decode: make_pipeline("gemv_decode_m1")?,
-                gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
-                gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q4: make_pipeline("gemv_q4_decode")?,
-                gemm_q4: make_pipeline("gemm_q4")?,
-                gemm_q4_tiled: make_optional_gemm_q4_tiled(),
-                gemv_q3: make_pipeline("gemv_q3_decode")?,
-                gemm_q3_tiled: make_optional_gemm_q3_tiled(),
-                rms_norm: make_pipeline("rms_norm_qwen35")?,
-                partial_rope: make_pipeline("partial_rope_interleaved")?,
-                per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
-                decode_attention: make_pipeline("decode_attention")?,
-                sigmoid_gate: make_pipeline("sigmoid_gate")?,
-                scatter_q_gate: make_pipeline("scatter_q_gate")?,
-                silu_mul: make_pipeline("silu_mul")?,
-                silu_mul_fused: make_pipeline("silu_mul_fused")?,
-                copy: make_pipeline("copy_buf")?,
-                copy_offset: make_pipeline("copy_buf_offset")?,
-                conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
-                gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
-                gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
-                gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
-                gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
-                gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
-                gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
-                gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
-                gdn_recurrence_q36: library
-                    .get_function("gdn_recurrence_fused_q36", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_precompute_keys: library
-                    .get_function("gdn_precompute_keys", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_recurrence_sharded: library
-                    .get_function("gdn_recurrence_sharded", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_norm_silu: library
-                    .get_function("gdn_norm_silu", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
-                copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
-                add_and_copy: make_pipeline("add_and_copy")?,
-                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
-                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
-                gemm_q8: make_pipeline("gemm_q8")?,
-                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
-                argmax_first: make_pipeline("logits_argmax_first")?,
-                argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_select50_first: make_pipeline("logits_topk_select50_first")?,
-                topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
-                decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
-                decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
-                lora_gemv_a: make_pipeline("lora_gemv_a")?,
-                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
-                // ADR-053: MoE Metal dispatch kernels
-                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
-                moe_scale_add: make_pipeline("moe_scale_add")?,
-                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
-                moe_zero_buf: make_pipeline("zero_buf")?,
-                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
-                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
-                partial_rope_batch: make_pipeline("partial_rope_batch")?,
-                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
-                prefill_attention_batched: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}"
-                ))?,
-                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
-                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
-                decode_attention_f16: make_pipeline("decode_attention_f16")?,
-                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
-                prefill_attention_batched_f16: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
-                ))?,
-                lm_head_block_topk_f16: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_f16",
-                    cfg.hidden_size as u32,
-                )?,
-                lm_head_block_topk_q4: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_q4",
-                    cfg.hidden_size as u32,
-                )?,
-            };
+            let pipelines = build_pipelines(&device, cfg)?;
 
             let hidden = cfg.hidden_size;
             let q_dim = cfg.full_q_dim();
@@ -16590,43 +16467,7 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
-            );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none()
-                && gen_cfg.logprobs.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
@@ -17304,6 +17145,92 @@ mod inner {
                     ),
                 "the release-build LATTICE_GDN_CPU fail-closed guard is independent \
                  of the retired debug reference functions and must remain"
+            );
+        }
+
+        #[test]
+        fn metal_constructors_share_one_pipeline_builder() {
+            let src = include_str!("metal_qwen35.rs");
+            let production_end = src
+                .find("    mod tests {")
+                .expect("mod tests must exist in this file");
+            let production_src = &src[..production_end];
+
+            let new_start = production_src
+                .find("pub fn new(weights: &ModelWeights, cfg: &Qwen35Config)")
+                .expect("in-memory Metal engine constructor must exist");
+            let new_end = new_start
+                + production_src[new_start..]
+                    .find("\n        pub fn new_session(")
+                    .expect("new_session must follow the in-memory constructor");
+            let new_body = &production_src[new_start..new_end];
+
+            let q4_start = production_src
+                .find("pub fn from_q4_dir(")
+                .expect("Q4-directory Metal constructor must exist");
+            let q4_end = q4_start
+                + production_src[q4_start..]
+                    .find("\n        pub fn chat_completion_streaming<")
+                    .expect("chat completion must follow the Q4-directory constructor");
+            let q4_body = &production_src[q4_start..q4_end];
+
+            for (name, body) in [("new", new_body), ("from_q4_dir", q4_body)] {
+                assert_eq!(
+                    body.matches("build_pipelines(&device, cfg)?").count(),
+                    1,
+                    "{name} must call the shared pipeline builder exactly once"
+                );
+                assert!(
+                    !body.contains("new_library_with_source(MSL_SOURCE")
+                        && !body.contains("let make_pipeline =")
+                        && !body.contains("MetalQwen35Pipelines {"),
+                    "{name} must not carry an independent pipeline-registration block"
+                );
+            }
+
+            assert_eq!(
+                production_src.matches("fn build_pipelines(").count(),
+                1,
+                "production code must define exactly one shared pipeline builder"
+            );
+            assert_eq!(
+                production_src
+                    .matches("build_pipelines(&device, cfg)?")
+                    .count(),
+                2,
+                "only the two constructors should invoke the shared pipeline builder"
+            );
+            assert_eq!(
+                production_src
+                    .matches("new_library_with_source(MSL_SOURCE, &opts)")
+                    .count(),
+                1,
+                "the main Qwen3.5 MSL source must compile in one registration block"
+            );
+        }
+
+        #[test]
+        fn shared_pipeline_builder_resolves_every_required_pipeline() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, _) = tiny_hybrid_fixture();
+
+            let pipelines = build_pipelines(&device, &cfg)
+                .expect("every required pipeline lookup in the shared builder must resolve");
+            assert_eq!(
+                pipelines.lm_head_block_topk_f16.len(),
+                LM_HEAD_LOCAL_KS.len()
+            );
+            assert_eq!(
+                pipelines.lm_head_block_topk_q4.len(),
+                LM_HEAD_LOCAL_KS.len()
             );
         }
 
@@ -19104,7 +19031,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // ── Route-logic unit tests (pure Rust, no Metal device needed) ────────
 
         #[test]
-        fn test_choose_gpu_topk_route_all_cases() {
+        fn sampling_route_legacy_helper_all_cases() {
             // k=0 → always CPU
             assert_eq!(
                 choose_gpu_topk_route(0, true, true),
@@ -19165,6 +19092,355 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 choose_gpu_topk_route(1000, true, true),
                 GpuTopkRoute::CpuFallback,
                 "k=1000"
+            );
+        }
+
+        #[test]
+        fn sampling_route_block_helper_gate() {
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 0.9, true, false),
+                GpuTopkRoute::CpuFallback,
+                "top_p<1.0 without the approx gate must stay exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 0.9, true, true),
+                GpuTopkRoute::BlockTopK { local_k: 8 },
+                "top_p<1.0 WITH the explicit approx gate may take the block route"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(0, 1.0, true, false),
+                GpuTopkRoute::CpuFallback,
+                "top_k=0 means top-k DISABLED (full-distribution sampling), \
+                 not greedy; BlockArgmax here would collapse sampling to top-1"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(1, 1.0, true, false),
+                GpuTopkRoute::BlockArgmax
+            );
+            for &k in &[8u32, 16, 40, 64] {
+                assert_eq!(
+                    choose_gpu_block_topk_route(k as usize, 1.0, true, false),
+                    GpuTopkRoute::BlockTopK { local_k: k },
+                    "k={k} must map to BlockTopK"
+                );
+            }
+            assert_eq!(
+                choose_gpu_block_topk_route(50, 1.0, true, false),
+                GpuTopkRoute::CpuFallback,
+                "k=50 has no precompiled Stage-1 variant; must fall back exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 1.0, false, false),
+                GpuTopkRoute::CpuFallback,
+                "LATTICE_COMPACT_TOPK unset must stay exact regardless of k"
+            );
+        }
+
+        fn compact_sampling_config(top_k: usize) -> GenerateConfig {
+            GenerateConfig {
+                top_k,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                ..Default::default()
+            }
+        }
+
+        fn compact_sampling_environment() -> SamplingRouteEnvironment {
+            SamplingRouteEnvironment {
+                compact: true,
+                selection: true,
+                approximate_top_p: false,
+            }
+        }
+
+        #[test]
+        fn sampling_route_plan_composes_block_first_then_legacy_fallback() {
+            for (top_k, expected_route, expected_topk) in [
+                (1, GpuTopkRoute::BlockArgmax, 1),
+                (8, GpuTopkRoute::BlockTopK { local_k: 8 }, 8),
+                (16, GpuTopkRoute::BlockTopK { local_k: 16 }, 16),
+                (40, GpuTopkRoute::BlockTopK { local_k: 40 }, 40),
+                (64, GpuTopkRoute::BlockTopK { local_k: 64 }, 64),
+            ] {
+                let plan = plan_sampling_route(
+                    &compact_sampling_config(top_k),
+                    false,
+                    compact_sampling_environment(),
+                );
+                assert_eq!(
+                    plan,
+                    SamplingRoutePlan {
+                        use_compact: true,
+                        compact_route: expected_route,
+                        compact_topk: expected_topk,
+                    },
+                    "top_k={top_k}"
+                );
+            }
+
+            let legacy_plan = plan_sampling_route(
+                &compact_sampling_config(50),
+                false,
+                compact_sampling_environment(),
+            );
+            assert_eq!(
+                legacy_plan,
+                SamplingRoutePlan {
+                    use_compact: true,
+                    compact_route: GpuTopkRoute::HierarchicalK50,
+                    compact_topk: 50,
+                }
+            );
+        }
+
+        /// `plan_sampling_route` no longer takes a caller-distinguishing logprobs
+        /// policy: every caller (direct, streaming, prefix-cache generation)
+        /// reaches this function only once its own `check_logprobs_not_set`
+        /// preflight has already rejected `logprobs: Some(_)` for paths that
+        /// don't support it, or (streaming) captures logprobs itself and must
+        /// keep full logits. Both configurations below are reachable states a
+        /// real caller can pass in: `logprobs: None` (every caller, after its
+        /// own preflight) and `logprobs: Some(_)` (the streaming caller, which
+        /// has no such preflight and captures logprobs directly).
+        #[test]
+        fn sampling_route_plan_requires_full_logits_when_logprobs_requested() {
+            let no_logprobs = compact_sampling_config(1);
+            assert!(
+                plan_sampling_route(&no_logprobs, false, compact_sampling_environment())
+                    .use_compact,
+                "no logprobs requested must stay eligible for compact sampling"
+            );
+
+            let with_logprobs = GenerateConfig {
+                logprobs: Some(5),
+                ..compact_sampling_config(1)
+            };
+            assert_eq!(
+                plan_sampling_route(&with_logprobs, false, compact_sampling_environment()),
+                SamplingRoutePlan {
+                    use_compact: false,
+                    compact_route: GpuTopkRoute::CpuFallback,
+                    compact_topk: 0,
+                },
+                "a requested logprobs capture requires full logits"
+            );
+        }
+
+        #[test]
+        fn sampling_route_plan_preserves_grammar_and_repetition_gates() {
+            let penalized = GenerateConfig {
+                repetition_penalty: 1.1,
+                ..compact_sampling_config(8)
+            };
+            assert!(
+                !plan_sampling_route(&penalized, false, compact_sampling_environment(),)
+                    .use_compact,
+                "non-empty history with a repetition penalty requires full logits"
+            );
+            assert!(
+                plan_sampling_route(&penalized, true, compact_sampling_environment(),).use_compact,
+                "an empty history preserves the existing repetition-penalty exception"
+            );
+
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            let grammar = GrammarEngine::new(
+                &GrammarSpec::Gbnf("root ::= \"a\"\n".to_string()),
+                vec![b"a".to_vec()],
+            )
+            .expect("trivial grammar must compile");
+            let constrained = GenerateConfig {
+                grammar: Some(std::sync::Arc::new(grammar)),
+                ..compact_sampling_config(8)
+            };
+            assert!(
+                !plan_sampling_route(&constrained, false, compact_sampling_environment(),)
+                    .use_compact,
+                "grammar-constrained decoding requires full logits"
+            );
+        }
+
+        #[test]
+        fn sampling_route_state_transition_preserves_enabled_result_and_clears_fallback() {
+            let sentinel = crate::sampling::Candidate {
+                token_id: 17,
+                logit: 3.5,
+            };
+            let mut compact_route = GpuTopkRoute::CpuFallback;
+            let mut compact_topk = 0;
+            let mut compact_result = vec![sentinel];
+
+            let enabled = plan_sampling_route(
+                &compact_sampling_config(8),
+                false,
+                compact_sampling_environment(),
+            );
+            assert!(apply_sampling_route_plan(
+                enabled,
+                &mut compact_route,
+                &mut compact_topk,
+                &mut compact_result,
+            ));
+            assert_eq!(compact_route, GpuTopkRoute::BlockTopK { local_k: 8 });
+            assert_eq!(compact_topk, 8);
+            assert_eq!(
+                compact_result,
+                vec![sentinel],
+                "eligible routing preserves the existing compact_result until prefill replaces it"
+            );
+
+            let disabled = plan_sampling_route(
+                &compact_sampling_config(8),
+                false,
+                SamplingRouteEnvironment {
+                    compact: false,
+                    selection: true,
+                    approximate_top_p: true,
+                },
+            );
+            assert!(!apply_sampling_route_plan(
+                disabled,
+                &mut compact_route,
+                &mut compact_topk,
+                &mut compact_result,
+            ));
+            assert_eq!(compact_route, GpuTopkRoute::CpuFallback);
+            assert_eq!(compact_topk, 0);
+            assert!(
+                compact_result.is_empty(),
+                "fallback routing must clear stale compact candidates"
+            );
+        }
+
+        #[test]
+        fn sampling_route_configurator_owns_all_three_generation_call_sites() {
+            let source = include_str!("metal_qwen35.rs");
+            let production = source
+                .split_once("    // Tests\n")
+                .expect("inner test section marker must exist")
+                .0;
+            assert_eq!(
+                production.matches("self.configure_sampling_route(").count(),
+                3,
+                "direct, streaming, and prefix-cache generation must share the configurator"
+            );
+            assert_eq!(
+                production
+                    .matches("let block_route = choose_gpu_block_topk_route(")
+                    .count(),
+                1,
+                "route chooser composition must have one production owner"
+            );
+        }
+
+        /// Direct generation's `logprobs: Some(_)` admission is rejected by
+        /// `preflight_generate`'s `check_logprobs_not_set` call, strictly
+        /// before either of the two paths that mutate
+        /// `InferenceSession::compact_route` / `compact_topk` /
+        /// `compact_result` can run: `reset_state()` and
+        /// `configure_sampling_route`. `generate()` propagates that `Err` via
+        /// `?` immediately after the `preflight_generate` call, so a rejected
+        /// request must leave route state untouched.
+        ///
+        /// This replaces a prior test that only proved the ordering held in
+        /// the *source text* (`preflight_generate` found lexically before
+        /// `configure_sampling_route`, with an unbounded "rest of the file"
+        /// slice as the search space). A source-text match cannot tell
+        /// whether the matched `configure_sampling_route` call even belongs
+        /// to `generate()`, and it cannot catch a caller that stores
+        /// `preflight_generate`'s `Result` in a local, calls
+        /// `configure_sampling_route` unconditionally, and only applies `?`
+        /// afterward: textual order is preserved, the guard's `Err` is still
+        /// returned, yet route state has already been mutated. This test
+        /// proves the real invariant behaviourally instead: seed route state
+        /// to values `plan_sampling_route` would never leave in place for a
+        /// rejected request, run the real `generate()`, and assert the
+        /// seeded state survives untouched.
+        ///
+        /// Note the boundary this test does *not* cover: a `max_new_tokens:
+        /// 0` request short-circuits to `GenerateAdmission::Zero` inside
+        /// `preflight_generate` *before* `check_logprobs_not_set` ever runs,
+        /// so a zero-budget request with `logprobs: Some(_)` is never
+        /// rejected at all -- it returns `Ok` and never touches sampling
+        /// routing either way. That path is untested here and must not be
+        /// read as if this test covered it.
+        ///
+        /// Mutation sensitivity: reordering `generate()` to call
+        /// `configure_sampling_route` before applying `preflight_generate`'s
+        /// `?` -- even while keeping the *textual* preflight-before-configure
+        /// ordering -- lets this rejected request mutate `compact_route` /
+        /// `compact_topk` / `compact_result` before the error is returned, so
+        /// the "state unchanged" assertions below fail.
+        #[test]
+        fn direct_generate_rejects_logprobs_before_configuring_sampling_route() {
+            let Some(_) = metal::Device::system_default() else {
+                panic!(
+                    "this behavioural admission-order proof requires a real \
+                     Metal device and must fail closed rather than silently \
+                     skip -- a skipped run would report a pass over \
+                     assertions that never executed"
+                );
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // Sentinel values `plan_sampling_route` would never produce for
+            // this (rejected) request: a real route/topk pair, and a
+            // non-empty result buffer. If `configure_sampling_route` runs at
+            // all, `apply_sampling_route_plan` unconditionally overwrites
+            // `compact_route`/`compact_topk` from its plan and clears
+            // `compact_result` whenever `use_compact` is false -- which it
+            // always is here, since `logprobs: Some(_)` forces
+            // `logprobs_eligible = false`.
+            let sentinel_route = GpuTopkRoute::BlockArgmax;
+            let sentinel_topk = 7usize;
+            let sentinel_result = vec![crate::sampling::Candidate {
+                token_id: 99,
+                logit: 1.23,
+            }];
+            state.session.compact_route = sentinel_route;
+            state.session.compact_topk = sentinel_topk;
+            state.session.compact_result = sentinel_result.clone();
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: Some(0),
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
+                "logprobs: Some(_) with a nonzero budget must be rejected with \
+                 InvalidInput; got {result:?}"
+            );
+
+            assert_eq!(
+                state.session.compact_route, sentinel_route,
+                "a rejected logprobs request must not mutate compact_route -- \
+                 configure_sampling_route must be unreachable once the \
+                 preflight guard errors"
+            );
+            assert_eq!(
+                state.session.compact_topk, sentinel_topk,
+                "a rejected logprobs request must not mutate compact_topk"
+            );
+            assert_eq!(
+                state.session.compact_result, sentinel_result,
+                "a rejected logprobs request must not mutate compact_result"
             );
         }
 
@@ -26457,52 +26733,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // the lm_head two-stage block-top-k path (issue #171).
         // ===================================================================
 
-        /// Pure unit test for the route gate (no GPU). Design-spec "Routing
-        /// Rules": top_p < 1.0 must stay on the exact full-logit path
-        /// (`CpuFallback`) unless the explicit approximate gate is set, since
-        /// nucleus sampling over a truncated candidate set is not equivalent
-        /// to full-vocab nucleus sampling.
-        #[test]
-        fn choose_gpu_block_topk_route_gate() {
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 0.9, true, false),
-                GpuTopkRoute::CpuFallback,
-                "top_p<1.0 without the approx gate must stay exact"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 0.9, true, true),
-                GpuTopkRoute::BlockTopK { local_k: 8 },
-                "top_p<1.0 WITH the explicit approx gate may take the block route"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(0, 1.0, true, false),
-                GpuTopkRoute::CpuFallback,
-                "top_k=0 means top-k DISABLED (full-distribution sampling), \
-                 not greedy; BlockArgmax here would collapse sampling to top-1"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(1, 1.0, true, false),
-                GpuTopkRoute::BlockArgmax
-            );
-            for &k in &[8u32, 16, 40, 64] {
-                assert_eq!(
-                    choose_gpu_block_topk_route(k as usize, 1.0, true, false),
-                    GpuTopkRoute::BlockTopK { local_k: k },
-                    "k={k} must map to BlockTopK"
-                );
-            }
-            assert_eq!(
-                choose_gpu_block_topk_route(50, 1.0, true, false),
-                GpuTopkRoute::CpuFallback,
-                "k=50 has no precompiled Stage-1 variant; must fall back exact"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 1.0, false, false),
-                GpuTopkRoute::CpuFallback,
-                "LATTICE_COMPACT_TOPK unset must stay exact regardless of k"
-            );
-        }
-
         /// Same construction as `tiny_metal_qwen35_fixture` but with a
         /// caller-chosen vocab size and an all-zero embedding table (only
         /// component 0 of a token's embedding is ever set below — the same
@@ -26818,7 +27048,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// setting them directly here isolates this test to the
         /// `reset_state`/route-builder clearing bug rather than also
         /// depending on route *selection*, which already has its own
-        /// coverage in `choose_gpu_block_topk_route_gate`).
+        /// coverage in `sampling_route_block_helper_gate`).
         ///
         /// MUTATION-SENSITIVE: commenting out the `reset_state` compact-state
         /// clear (the `self.session.compact_topk = 0; self.session.compact_route
@@ -38289,8 +38519,8 @@ mod multimodal_preflight_tests {
 // `generate`, `generate_streaming_with_cancel`, and
 // `generate_streaming_with_prefix_cache_inner` all apply grammar masking via
 // `GrammarEngine::mask_logits`, which sets every disallowed logit position to
-// `f32::NEG_INFINITY`. `crate::model::qwen35::generation` and `crate::generate`
-// (the CPU paths) each guard every `mask_logits` call with a `has_finite_logit`
+// `f32::NEG_INFINITY`. `crate::model::qwen35::generation` (the canonical CPU path)
+// guards every `mask_logits` call with a `has_finite_logit`
 // check and fail closed with `InferenceError::GrammarConstraintBlocked` when
 // the grammar blocks every token — otherwise the sampler's non-finite-max short-circuit
 // would silently return the first candidate's token id (numerically safe, but
@@ -38415,11 +38645,10 @@ pub enum MtpRoundOutcome {
 ///   choice for the draft position, replaces the rejected draft).
 /// * `is_stop` – Returns `true` for EOS / stop-token IDs.
 ///
-/// # Stop-token contract (#613, matches plain greedy `generate()`)
+/// # Stop-token contract (#613, matches canonical plain greedy generation)
 ///
 /// Plain greedy never appends the terminating stop token to the output
-/// (generate.rs checks `config.eos_token_id == Some(token)` *before*
-/// `generated_ids.push(token)` and skips the push on a match). This function
+/// (it checks the stop condition before appending the token). This function
 /// honours the same invariant for every terminal case: a token that is itself
 /// a stop token is never included in the emitted vector.
 ///
@@ -39196,7 +39425,7 @@ mod mtp_greedy_round_tests {
     // greedily pick argmax at each position, stop when argmax is a stop
     // token (excluding that stop token from the output), or at max_len.
     //
-    // Stop-token contract (#613): matches generate.rs's fixed logic — the
+    // Stop-token contract (#613): the
     // is_stop check happens BEFORE the push, so a stop token is never
     // present in `token_ids`/`text`. The stop still consumes the position
     // (an "attempt" within max_len), it's just not emitted.
@@ -40102,7 +40331,7 @@ mod mtp_greedy_round_tests {
 // post-fix decision logic for each termination path WITHOUT re-deriving it from
 // the buggy pre-fix code, so it acts as an independent reference.
 //
-// Stop-token contract (#613, matches generate.rs / GenerateOutput docs): the
+// Stop-token contract (#613, matches canonical GenerateOutput docs): the
 // terminating token is EXCLUDED from token_ids/text at every termination path:
 //   A:  prefill argmax is stop → emit [], generated_tokens = 0.
 //   R:  rejection: target replacement is stop → emit [pending] (replacement excluded).
