@@ -592,13 +592,8 @@ pub fn convert_quarot_qwen35(
     fuse_rmsnorms(&mut working_set, &fusion_plan)?;
     absorb_rotations(&mut working_set, &rotation_plan, &rotation)?;
 
-    let forward_equivalence = assert_prepared_forward_equivalence_qwen35(
-        equivalence_snapshot,
-        &reader,
-        &working_set,
-        &cfg,
-        &rotation,
-    )?;
+    let forward_equivalence =
+        assert_prepared_forward_equivalence_qwen35(equivalence_snapshot, &reader, &working_set)?;
 
     if !opts.dry_run {
         fs::create_dir_all(output_dir).map_err(|e| {
@@ -1571,14 +1566,9 @@ mod tests {
         fuse_rmsnorms(&mut working_set, &fusion_plan).unwrap();
         absorb_rotations(&mut working_set, &rotation_plan, &rotation).unwrap();
 
-        let report = assert_prepared_forward_equivalence_qwen35(
-            passing_snapshot,
-            &reader,
-            &working_set,
-            &cfg,
-            &rotation,
-        )
-        .unwrap();
+        let report =
+            assert_prepared_forward_equivalence_qwen35(passing_snapshot, &reader, &working_set)
+                .unwrap();
         assert!(report.max_abs_error <= forward_cfg.tolerance);
 
         let chain_skipped = "model.language_model.layers.1.self_attn.k_proj.weight";
@@ -1587,14 +1577,9 @@ mod tests {
             .expect("full-attention k_proj must exist")
             .data[0] += 0.25;
 
-        let err = assert_prepared_forward_equivalence_qwen35(
-            refusing_snapshot,
-            &reader,
-            &working_set,
-            &cfg,
-            &rotation,
-        )
-        .unwrap_err();
+        let err =
+            assert_prepared_forward_equivalence_qwen35(refusing_snapshot, &reader, &working_set)
+                .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("per-tensor"), "unexpected error: {msg}");
     }

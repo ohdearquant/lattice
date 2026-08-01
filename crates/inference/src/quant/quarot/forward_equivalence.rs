@@ -419,9 +419,9 @@ pub struct ForwardEquivalenceConfig {
     pub seed: u64,
 }
 
-pub(crate) struct ForwardEquivalenceAdmission<'a> {
-    cfg: &'a Qwen35Config,
-    forward_cfg: &'a ForwardEquivalenceConfig,
+pub(crate) struct ForwardEquivalenceAdmission<'cfg, 'forward> {
+    cfg: &'cfg Qwen35Config,
+    forward_cfg: &'forward ForwardEquivalenceConfig,
 }
 
 impl Default for ForwardEquivalenceConfig {
@@ -466,7 +466,11 @@ pub struct ForwardEquivalenceReport {
 /// are needed after rotation. Matrix equivalence separately needs the
 /// original RMSNorm scales and one planned matrix at a time; the scales
 /// live here while matrices are streamed from [`QuarotTensorReader`].
-pub(crate) struct ForwardEquivalenceSnapshot {
+/// Borrowing the admitted configuration and prepared rotation prevents
+/// completion from substituting either after the original evidence is captured.
+pub(crate) struct ForwardEquivalenceSnapshot<'a> {
+    cfg: &'a Qwen35Config,
+    rotation: &'a RandomizedHadamard,
     probe_tokens: Vec<u32>,
     original_logits: Vec<Vec<f64>>,
     fusion_gammas: HashMap<String, TensorEntry>,
@@ -560,10 +564,10 @@ pub(crate) fn preflight_forward_equivalence_probe_budget(
     Ok(())
 }
 
-pub(crate) fn validate_forward_equivalence_admission<'a>(
-    cfg: &'a Qwen35Config,
-    forward_cfg: &'a ForwardEquivalenceConfig,
-) -> Result<ForwardEquivalenceAdmission<'a>, InferenceError> {
+pub(crate) fn validate_forward_equivalence_admission<'cfg, 'forward>(
+    cfg: &'cfg Qwen35Config,
+    forward_cfg: &'forward ForwardEquivalenceConfig,
+) -> Result<ForwardEquivalenceAdmission<'cfg, 'forward>, InferenceError> {
     if cfg.is_moe() {
         return reject_forward_equivalence_admission(format_args!(
             "assert_forward_equivalence_qwen35: MoE configs are deferred to v1 \
@@ -627,21 +631,21 @@ fn full_fusion_plan(cfg: &Qwen35Config) -> Result<Vec<RmsNormFusionTarget>, Infe
 /// the final norm. Retained chain-probe evidence is admitted against the
 /// 64 MiB budget before any probe tokens or logits are allocated. Planned
 /// matrices are not retained.
-pub(crate) fn prepare_forward_equivalence_qwen35(
+pub(crate) fn prepare_forward_equivalence_qwen35<'a>(
     original: &HashMap<String, TensorEntry>,
-    cfg: &Qwen35Config,
-    rotation: &RandomizedHadamard,
+    cfg: &'a Qwen35Config,
+    rotation: &'a RandomizedHadamard,
     forward_cfg: &ForwardEquivalenceConfig,
-) -> Result<ForwardEquivalenceSnapshot, InferenceError> {
+) -> Result<ForwardEquivalenceSnapshot<'a>, InferenceError> {
     let admission = validate_forward_equivalence_admission(cfg, forward_cfg)?;
     prepare_forward_equivalence_qwen35_after_admission(original, rotation, admission)
 }
 
-pub(crate) fn prepare_forward_equivalence_qwen35_after_admission(
+pub(crate) fn prepare_forward_equivalence_qwen35_after_admission<'cfg, 'forward>(
     original: &HashMap<String, TensorEntry>,
-    rotation: &RandomizedHadamard,
-    admission: ForwardEquivalenceAdmission<'_>,
-) -> Result<ForwardEquivalenceSnapshot, InferenceError> {
+    rotation: &'cfg RandomizedHadamard,
+    admission: ForwardEquivalenceAdmission<'cfg, 'forward>,
+) -> Result<ForwardEquivalenceSnapshot<'cfg>, InferenceError> {
     let ForwardEquivalenceAdmission { cfg, forward_cfg } = admission;
     validate_forward_equivalence_rotation(cfg, rotation)?;
 
@@ -671,6 +675,8 @@ pub(crate) fn prepare_forward_equivalence_qwen35_after_admission(
     }
 
     Ok(ForwardEquivalenceSnapshot {
+        cfg,
+        rotation,
         probe_tokens,
         original_logits,
         fusion_gammas,
@@ -725,33 +731,34 @@ pub fn assert_forward_equivalence_qwen35(
     forward_cfg: &ForwardEquivalenceConfig,
 ) -> Result<ForwardEquivalenceReport, InferenceError> {
     let snapshot = prepare_forward_equivalence_qwen35(original, cfg, rotation, forward_cfg)?;
-    assert_forward_equivalence_snapshot(snapshot, original, rotated, cfg, rotation)
+    assert_forward_equivalence_snapshot(snapshot, original, rotated)
 }
 
 /// Complete a prepared equivalence gate while streaming original planned
 /// matrices from the mmap-backed checkpoint reader.
+///
+/// Configuration and rotation come only from `snapshot`, preserving the
+/// preparation admission and dimension check through completion.
 pub(crate) fn assert_prepared_forward_equivalence_qwen35(
-    snapshot: ForwardEquivalenceSnapshot,
+    snapshot: ForwardEquivalenceSnapshot<'_>,
     reader: &QuarotTensorReader,
     rotated: &HashMap<String, TensorEntry>,
-    cfg: &Qwen35Config,
-    rotation: &RandomizedHadamard,
 ) -> Result<ForwardEquivalenceReport, InferenceError> {
     let original = ReaderOriginalTensorSource {
         reader,
-        tied_lm_head_from_embed: cfg.tie_word_embeddings,
+        tied_lm_head_from_embed: snapshot.cfg.tie_word_embeddings,
     };
-    assert_forward_equivalence_snapshot(snapshot, &original, rotated, cfg, rotation)
+    assert_forward_equivalence_snapshot(snapshot, &original, rotated)
 }
 
 fn assert_forward_equivalence_snapshot<S: OriginalTensorSource>(
-    snapshot: ForwardEquivalenceSnapshot,
+    snapshot: ForwardEquivalenceSnapshot<'_>,
     original: &S,
     rotated: &HashMap<String, TensorEntry>,
-    cfg: &Qwen35Config,
-    rotation: &RandomizedHadamard,
 ) -> Result<ForwardEquivalenceReport, InferenceError> {
     let ForwardEquivalenceSnapshot {
+        cfg,
+        rotation,
         probe_tokens,
         original_logits,
         fusion_gammas,
@@ -1492,6 +1499,42 @@ mod tests {
         assert_eq!(cfg.num_hidden_layers, 2);
         assert_eq!(cfg.layer_types[0], LayerType::LinearAttention);
         assert_eq!(cfg.layer_types[1], LayerType::FullAttention);
+    }
+
+    #[test]
+    #[allow(
+        clippy::type_complexity,
+        reason = "the explicit completion signature is the compile-time assertion"
+    )]
+    fn prepared_completion_cannot_accept_dense_to_moe_handoff() {
+        let dense_cfg = tied_tiny_test_cfg();
+        let original = build_working_set(&dense_cfg, 0xA11C_E5E5);
+        let rotation = RandomizedHadamard::new(0xD3A5_EA5E, dense_cfg.hidden_size).unwrap();
+        let forward_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: 1,
+            ..Default::default()
+        };
+        let snapshot =
+            prepare_forward_equivalence_qwen35(&original, &dense_cfg, &rotation, &forward_cfg)
+                .unwrap();
+        assert!(std::ptr::eq(snapshot.cfg, &dense_cfg));
+        assert!(std::ptr::eq(snapshot.rotation, &rotation));
+
+        let mut mismatched_moe_cfg = dense_cfg.clone();
+        mismatched_moe_cfg.num_experts = Some(1);
+        assert!(!dense_cfg.is_moe());
+        assert!(mismatched_moe_cfg.is_moe());
+
+        let completion: for<'snapshot, 'reader, 'rotated> fn(
+            ForwardEquivalenceSnapshot<'snapshot>,
+            &'reader QuarotTensorReader,
+            &'rotated HashMap<String, TensorEntry>,
+        ) -> Result<
+            ForwardEquivalenceReport,
+            InferenceError,
+        > = assert_prepared_forward_equivalence_qwen35;
+
+        let _ = (completion, snapshot, mismatched_moe_cfg);
     }
 
     #[test]
