@@ -118,6 +118,7 @@ private extension View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("ReadoutWell") {
     HStack(spacing: Theme.Space.sm) {
         ReadoutWell(
@@ -149,3 +150,4 @@ private extension View {
     .instrumentPanel()
     .background(Theme.Palette.canvas)
 }
+#endif

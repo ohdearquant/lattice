@@ -210,6 +210,7 @@ struct DataTable<Row: Identifiable>: View where Row.ID: Hashable {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("DataTable") {
     @Previewable @State var selected: String? = "1"
 
@@ -245,3 +246,4 @@ struct DataTable<Row: Identifiable>: View where Row.ID: Hashable {
     .background(Theme.Palette.canvas)
     .frame(width: 560, height: 200)
 }
+#endif

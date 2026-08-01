@@ -1,5 +1,6 @@
 #[test]
 fn forward_step_gdn_only_does_not_advance_kv_cache() {
+    let _gpu_guard = gpu_test_lock();
     let Some(_) = metal::Device::system_default() else {
         return;
     };
@@ -22,6 +23,7 @@ fn forward_step_gdn_only_does_not_advance_kv_cache() {
 
 #[test]
 fn forward_step_gdn_only_returns_finite_logits() {
+    let _gpu_guard = gpu_test_lock();
     let Some(_) = metal::Device::system_default() else {
         return;
     };
