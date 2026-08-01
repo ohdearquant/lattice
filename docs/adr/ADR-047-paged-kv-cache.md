@@ -191,7 +191,7 @@ not available in the CUDA ecosystem.
 | Risk                                              | Likelihood                                         | Mitigation                                                                               |
 | ------------------------------------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | Hash collision on token sequence                  | Very low (FxHash 64-bit on token ids, not strings) | `debug_assert` prefix length match after hit; log collision metrics                      |
-| LoRA adapter id not propagated to cache call site | Medium — call sites spread across `generate.rs`    | `PrefixPageCache::lookup` signature requires `AdapterId`; omitting it is a compile error |
+| LoRA adapter id not propagated to cache call site | Medium — call sites span generation backends       | `PrefixPageCache::lookup` signature requires `AdapterId`; omitting it is a compile error |
 | Arc ref-count overhead on prefix restore          | Low — one `clone()` per page per layer at restore  | Profile shows atomic increment < 5 ns; restore of 8 pages = 40 ns, negligible vs prefill |
 | Cache invalidation on model reload                | Low but silent                                     | `PrefixPageCache::clear()` called on model swap; cache is owned by session, not global   |
 | Prefix cache grows unbounded in long session      | Medium — embedding loops can insert many entries   | Bounded LRU capacity (default 128 entries); eviction is O(1) with `IndexMap`             |

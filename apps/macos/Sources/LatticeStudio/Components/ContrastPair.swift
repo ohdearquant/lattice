@@ -196,6 +196,7 @@ struct ContrastPair: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("ContrastPair") {
     @Previewable @State var isComplete: Bool = false
 
@@ -234,3 +235,4 @@ struct ContrastPair: View {
     .background(Theme.Palette.canvas)
     .frame(width: 480)
 }
+#endif
