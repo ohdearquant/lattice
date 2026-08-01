@@ -195,6 +195,9 @@ pub(crate) mod pre_admission_allocation_tracking {
         after_rejection_allocation_calls: usize,
         materialized_working_set_allocation_calls: usize,
         rejection_seen: bool,
+        reader_boundary_seen: bool,
+        materialized_working_set_boundary_seen: bool,
+        materialized_working_set_boundary_completed: bool,
     }
 
     const INACTIVE: State = State {
@@ -203,6 +206,9 @@ pub(crate) mod pre_admission_allocation_tracking {
         after_rejection_allocation_calls: 0,
         materialized_working_set_allocation_calls: 0,
         rejection_seen: false,
+        reader_boundary_seen: false,
+        materialized_working_set_boundary_seen: false,
+        materialized_working_set_boundary_completed: false,
     };
 
     std::thread_local! {
@@ -272,6 +278,7 @@ pub(crate) mod pre_admission_allocation_tracking {
         pub(crate) after_rejection_allocation_calls: usize,
         pub(crate) materialized_working_set_allocation_calls: usize,
         pub(crate) rejection_seen: bool,
+        pub(crate) reader_boundary_seen: bool,
         pub(crate) materialized_working_set_boundary_seen: bool,
         pub(crate) materialized_working_set_boundary_completed: bool,
     }
@@ -310,23 +317,39 @@ pub(crate) mod pre_admission_allocation_tracking {
         });
     }
 
+    pub(crate) fn mark_reader_boundary() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.phase != Phase::Inactive {
+                state.reader_boundary_seen = true;
+                cell.set(state);
+            }
+        });
+    }
+
     pub(crate) fn mark_materialized_working_set_boundary() {
         let _ = STATE.try_with(|cell| {
             let mut state = cell.get();
+            if state.phase != Phase::Inactive {
+                state.materialized_working_set_boundary_seen = true;
+            }
             if state.phase == Phase::WaitingForMaterializedWorkingSetBoundary {
                 state.phase = Phase::MaterializedWorkingSetBoundary;
-                cell.set(state);
             }
+            cell.set(state);
         });
     }
 
     pub(crate) fn mark_materialized_working_set_boundary_completed() {
         let _ = STATE.try_with(|cell| {
             let mut state = cell.get();
+            if state.phase != Phase::Inactive {
+                state.materialized_working_set_boundary_completed = true;
+            }
             if state.phase == Phase::MaterializedWorkingSetBoundary {
                 state.phase = Phase::MaterializedWorkingSetBoundaryCompleted;
-                cell.set(state);
             }
+            cell.set(state);
         });
     }
 
@@ -352,13 +375,11 @@ pub(crate) mod pre_admission_allocation_tracking {
                     materialized_working_set_allocation_calls: state
                         .materialized_working_set_allocation_calls,
                     rejection_seen: state.rejection_seen,
-                    materialized_working_set_boundary_seen: matches!(
-                        state.phase,
-                        Phase::MaterializedWorkingSetBoundary
-                            | Phase::MaterializedWorkingSetBoundaryCompleted
-                    ),
-                    materialized_working_set_boundary_completed: state.phase
-                        == Phase::MaterializedWorkingSetBoundaryCompleted,
+                    reader_boundary_seen: state.reader_boundary_seen,
+                    materialized_working_set_boundary_seen: state
+                        .materialized_working_set_boundary_seen,
+                    materialized_working_set_boundary_completed: state
+                        .materialized_working_set_boundary_completed,
                 }
             })
         }
@@ -396,6 +417,11 @@ pub struct ForwardEquivalenceConfig {
     pub tolerance: f64,
     /// Seed for the deterministic token sampler.
     pub seed: u64,
+}
+
+pub(crate) struct ForwardEquivalenceAdmission<'a> {
+    cfg: &'a Qwen35Config,
+    forward_cfg: &'a ForwardEquivalenceConfig,
 }
 
 impl Default for ForwardEquivalenceConfig {
@@ -492,68 +518,83 @@ pub(crate) fn preflight_forward_equivalence_probe_budget(
     cfg: &Qwen35Config,
     forward_cfg: &ForwardEquivalenceConfig,
 ) -> Result<(), InferenceError> {
-    let logit_elements = forward_cfg
-        .num_probe_tokens
-        .checked_mul(cfg.vocab_size)
-        .ok_or_else(forward_equivalence_logit_size_overflow)?;
-    let logit_bytes = logit_elements
-        .checked_mul(size_of::<f64>())
-        .ok_or_else(forward_equivalence_logit_size_overflow)?;
-    let row_descriptor_bytes = forward_cfg
+    let Some(logit_elements) = forward_cfg.num_probe_tokens.checked_mul(cfg.vocab_size) else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    let Some(logit_bytes) = logit_elements.checked_mul(size_of::<f64>()) else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    let Some(row_descriptor_bytes) = forward_cfg
         .num_probe_tokens
         .checked_mul(size_of::<Vec<f64>>())
-        .ok_or_else(forward_equivalence_logit_size_overflow)?;
-    let probe_token_bytes = forward_cfg
-        .num_probe_tokens
-        .checked_mul(size_of::<u32>())
-        .ok_or_else(forward_equivalence_logit_size_overflow)?;
-    let retained_bytes = logit_bytes
+    else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    let Some(probe_token_bytes) = forward_cfg.num_probe_tokens.checked_mul(size_of::<u32>()) else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    let Some(retained_bytes) = logit_bytes
         .checked_add(row_descriptor_bytes)
         .and_then(|bytes| bytes.checked_add(probe_token_bytes))
-        .ok_or_else(forward_equivalence_logit_size_overflow)?;
+    else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
     if retained_bytes > MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES {
-        #[cfg(test)]
-        pre_admission_allocation_tracking::mark_rejection();
-        return Err(InferenceError::Inference(format!(
+        return reject_forward_equivalence_admission(format_args!(
             "assert_forward_equivalence_qwen35: retained chain-logit budget exceeded \
              (num_probe_tokens={}, vocab_size={}, required_bytes={retained_bytes}, \
              max_bytes={MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES})",
             forward_cfg.num_probe_tokens, cfg.vocab_size
-        )));
+        ));
     }
     Ok(())
 }
 
-fn validate_forward_equivalence_inputs(
-    cfg: &Qwen35Config,
-    rotation: &RandomizedHadamard,
-    forward_cfg: &ForwardEquivalenceConfig,
-) -> Result<(), InferenceError> {
+pub(crate) fn validate_forward_equivalence_admission<'a>(
+    cfg: &'a Qwen35Config,
+    forward_cfg: &'a ForwardEquivalenceConfig,
+) -> Result<ForwardEquivalenceAdmission<'a>, InferenceError> {
     if cfg.is_moe() {
-        return Err(InferenceError::Inference(
+        return reject_forward_equivalence_admission(format_args!(
             "assert_forward_equivalence_qwen35: MoE configs are deferred to v1 \
              (the rotation/fusion pipeline rejects MoE upstream; this probe \
              has no expert-mixing path)"
-                .to_string(),
         ));
     }
     if forward_cfg.num_probe_tokens == 0 {
-        return Err(InferenceError::Inference(
-            "assert_forward_equivalence_qwen35: num_probe_tokens must be > 0".to_string(),
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: num_probe_tokens must be > 0"
         ));
     }
     if !forward_cfg.tolerance.is_finite() || forward_cfg.tolerance <= 0.0 {
-        return Err(InferenceError::Inference(format!(
+        return reject_forward_equivalence_admission(format_args!(
             "assert_forward_equivalence_qwen35: tolerance must be a positive finite value, got {}",
             forward_cfg.tolerance
-        )));
+        ));
     }
     if cfg.vocab_size == 0 {
-        return Err(InferenceError::Inference(
-            "assert_forward_equivalence_qwen35: cfg.vocab_size must be > 0".to_string(),
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: cfg.vocab_size must be > 0"
         ));
     }
     preflight_forward_equivalence_probe_budget(cfg, forward_cfg)?;
+    Ok(ForwardEquivalenceAdmission { cfg, forward_cfg })
+}
+
+fn validate_forward_equivalence_rotation(
+    cfg: &Qwen35Config,
+    rotation: &RandomizedHadamard,
+) -> Result<(), InferenceError> {
     if rotation.dim() != cfg.hidden_size {
         return Err(InferenceError::Inference(format!(
             "assert_forward_equivalence_qwen35: rotation.dim()={} != cfg.hidden_size={}",
@@ -564,10 +605,12 @@ fn validate_forward_equivalence_inputs(
     Ok(())
 }
 
-fn forward_equivalence_logit_size_overflow() -> InferenceError {
-    InferenceError::Inference(
-        "assert_forward_equivalence_qwen35: retained chain-logit size overflow".to_string(),
-    )
+fn reject_forward_equivalence_admission<T>(
+    message: std::fmt::Arguments<'_>,
+) -> Result<T, InferenceError> {
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_rejection();
+    Err(InferenceError::Inference(message.to_string()))
 }
 
 fn full_fusion_plan(cfg: &Qwen35Config) -> Result<Vec<RmsNormFusionTarget>, InferenceError> {
@@ -590,7 +633,17 @@ pub(crate) fn prepare_forward_equivalence_qwen35(
     rotation: &RandomizedHadamard,
     forward_cfg: &ForwardEquivalenceConfig,
 ) -> Result<ForwardEquivalenceSnapshot, InferenceError> {
-    validate_forward_equivalence_inputs(cfg, rotation, forward_cfg)?;
+    let admission = validate_forward_equivalence_admission(cfg, forward_cfg)?;
+    prepare_forward_equivalence_qwen35_after_admission(original, rotation, admission)
+}
+
+pub(crate) fn prepare_forward_equivalence_qwen35_after_admission(
+    original: &HashMap<String, TensorEntry>,
+    rotation: &RandomizedHadamard,
+    admission: ForwardEquivalenceAdmission<'_>,
+) -> Result<ForwardEquivalenceSnapshot, InferenceError> {
+    let ForwardEquivalenceAdmission { cfg, forward_cfg } = admission;
+    validate_forward_equivalence_rotation(cfg, rotation)?;
 
     let probe_tokens = deterministic_probe_tokens(
         forward_cfg.seed,

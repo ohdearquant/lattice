@@ -31,11 +31,13 @@ use std::path::Path;
 use crate::error::InferenceError;
 use crate::model::qwen35::qwen_required_tensor_names;
 use crate::model::qwen35_config::Qwen35Config;
-#[cfg(test)]
-use crate::quant::quarot::forward_equivalence::pre_admission_allocation_tracking;
 use crate::quant::quarot::forward_equivalence::{
     ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_prepared_forward_equivalence_qwen35,
-    preflight_forward_equivalence_probe_budget, prepare_forward_equivalence_qwen35,
+    prepare_forward_equivalence_qwen35_after_admission, validate_forward_equivalence_admission,
+};
+#[cfg(test)]
+use crate::quant::quarot::forward_equivalence::{
+    pre_admission_allocation_tracking, prepare_forward_equivalence_qwen35,
 };
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader};
@@ -507,8 +509,10 @@ pub fn convert_quarot_qwen35(
     };
     #[cfg(test)]
     pre_admission_allocation_tracking::mark_converter_boundary();
-    preflight_forward_equivalence_probe_budget(&cfg, &forward_cfg)?;
+    let forward_admission = validate_forward_equivalence_admission(&cfg, &forward_cfg)?;
 
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_reader_boundary();
     let reader = QuarotTensorReader::open(input_dir)?;
     let input_source = input_dir.display().to_string();
     let required_names = qwen_required_tensor_names(&cfg);
@@ -579,8 +583,11 @@ pub fn convert_quarot_qwen35(
     fusion_plan.push(qwen35_final_norm_fusion_target());
     let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
     let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
-    let equivalence_snapshot =
-        prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)?;
+    let equivalence_snapshot = prepare_forward_equivalence_qwen35_after_admission(
+        &working_set,
+        &rotation,
+        forward_admission,
+    )?;
 
     fuse_rmsnorms(&mut working_set, &fusion_plan)?;
     absorb_rotations(&mut working_set, &rotation_plan, &rotation)?;
@@ -1382,6 +1389,82 @@ mod tests {
         assert!(
             error.contains("retained chain-logit budget"),
             "unexpected error: {error}"
+        );
+    }
+
+    fn assert_config_rejected_before_tensor_materialization(
+        opts: ConversionOptions,
+        expected_error: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 0x0A11_CE55);
+
+        let tracking = pre_admission_allocation_tracking::start_at_converter_boundary();
+        let result = convert_quarot_qwen35(&input, &output, &opts);
+        let observation = tracking.finish();
+
+        assert!(
+            observation.rejection_seen,
+            "the converter call must reach config admission rejection"
+        );
+        assert_eq!(
+            observation.before_rejection_allocation_calls, 0,
+            "config admission allocated before rejection"
+        );
+        assert!(
+            observation.after_rejection_allocation_calls > 0,
+            "the diagnostic allocation after config rejection must be observed"
+        );
+        assert!(
+            !observation.reader_boundary_seen,
+            "config admission rejection must precede reader access"
+        );
+        assert!(
+            !observation.materialized_working_set_boundary_seen,
+            "config admission rejection must precede tensor materialization"
+        );
+        let error = result
+            .expect_err("invalid forward-equivalence config must fail admission")
+            .to_string();
+        assert!(error.contains(expected_error), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn converter_rejects_zero_probe_count_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                num_probe_tokens: 0,
+                dry_run: true,
+                ..Default::default()
+            },
+            "num_probe_tokens must be > 0",
+        );
+    }
+
+    #[test]
+    fn converter_rejects_zero_tolerance_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                tolerance: 0.0,
+                dry_run: true,
+                ..Default::default()
+            },
+            "tolerance must be a positive finite value",
+        );
+    }
+
+    #[test]
+    fn converter_rejects_nan_tolerance_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                tolerance: f64::NAN,
+                dry_run: true,
+                ..Default::default()
+            },
+            "tolerance must be a positive finite value",
         );
     }
 
