@@ -20,6 +20,7 @@ mod tests;
 pub use binary::BinaryVector;
 pub use cosine::{
     batch_cosine_one_vs_many, batch_cosine_similarity, cosine_similarity, cosine_similarity_fused,
+    cosine_similarity_pre_normalized, query_norm,
 };
 pub use distance::{euclidean_distance, squared_euclidean_distance};
 pub use dot_product::{
