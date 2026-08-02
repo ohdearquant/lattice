@@ -249,6 +249,7 @@ The `perf-baselines` branch is still updated by `bench-update.yml` on merge to m
 ## Commands
 
 ```bash
+make setup           # install rustfmt + clippy for the pinned toolchain
 make ci              # full local CI (fmt + clippy + deno lint + test + build)
 make fmt             # cargo fmt + deno fmt on markdown
 make lint-docs       # deno doc lint only
