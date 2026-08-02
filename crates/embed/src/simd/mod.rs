@@ -10,6 +10,7 @@ mod cosine;
 mod distance;
 mod dot_product;
 mod int4;
+mod manhattan;
 mod normalize;
 mod quantized;
 mod tier;
@@ -28,6 +29,7 @@ pub use dot_product::{
     resolved_dot_product_batch4_kernel, resolved_dot_product_kernel,
 };
 pub use int4::{Int4Params, Int4Vector};
+pub use manhattan::manhattan_distance;
 pub use normalize::normalize;
 pub use quantized::{
     I8DotKernel, QuantizationParams, QuantizedVector, cosine_similarity_i8, dot_product_i8,
