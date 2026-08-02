@@ -44,6 +44,12 @@ else
         exit 1
     fi
 
+    resolved_base=$(git rev-parse "${base_sha}^{commit}")
+    if [ "$resolved_base" = "$actual_head" ]; then
+        echo "event base $base_sha and event head $head_sha resolve to the same commit; refusing degenerate range" >&2
+        exit 1
+    fi
+
     if ! git merge-base --is-ancestor "$base_sha" "$head_sha"; then
         echo "event base $base_sha is not an ancestor of event head $head_sha" >&2
         exit 1
