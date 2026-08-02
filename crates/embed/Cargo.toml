@@ -135,6 +135,11 @@ name = "embed"
 path = "src/bin/embed.rs"
 required-features = ["native"]
 
+[[bin]]
+name = "embed-drift"
+path = "src/bin/embed-drift.rs"
+required-features = ["native"]
+
 [[example]]
 name = "basic_embed"
 required-features = ["native"]

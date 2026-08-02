@@ -17,6 +17,8 @@
 
 pub mod backfill;
 mod cache;
+#[cfg(feature = "native")]
+pub mod drift;
 mod error;
 pub mod migration;
 mod model;
