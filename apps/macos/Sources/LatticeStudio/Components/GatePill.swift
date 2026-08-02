@@ -103,6 +103,7 @@ struct GatePill: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("GatePill") {
     VStack(spacing: Theme.Space.sm) {
         HStack(spacing: Theme.Space.sm) {
@@ -128,3 +129,4 @@ struct GatePill: View {
     .instrumentPanel()
     .background(Theme.Palette.canvas)
 }
+#endif

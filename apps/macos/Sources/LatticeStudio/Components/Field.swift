@@ -143,6 +143,7 @@ struct LatticeNumericField: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("Field") {
     VStack(alignment: .leading, spacing: Theme.Space.md) {
         Text("TEXT FIELD")
@@ -194,3 +195,4 @@ struct LatticeNumericField: View {
     .frame(width: 480)
     .background(Theme.Palette.canvas)
 }
+#endif

@@ -832,6 +832,7 @@ mod inner {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::measurement::gpu_test_lock;
         use crate::weights::{QwenLayerWeights, Tensor1D, Tensor2D};
 
         /// ADR-066 D3.1 / ADR-080 C1 (PR #794): a capability-gated
@@ -1406,57 +1407,6 @@ kernel void rms_norm_pre_854_oracle(
 
         fn test_random_positive_vec(rng: &mut TestLcg, len: usize) -> Vec<f32> {
             (0..len).map(|_| 0.5 + rng.next_f32().abs()).collect()
-        }
-
-        /// Serializes GPU-driving tests onto the single shared Metal device,
-        /// in-process and machine-wide (mirrors `forward::metal_qwen35`'s
-        /// `gpu_test_lock`; the in-process `Mutex` here is a separate instance
-        /// but the machine-wide `flock` on the same fixed path still
-        /// serializes correctly across both, since `flock` mutual exclusion
-        /// is per-path, not per-`Mutex`-instance).
-        struct GpuTestGuard {
-            _process: std::sync::MutexGuard<'static, ()>,
-            _machine: std::fs::File,
-        }
-
-        fn gpu_test_lock() -> GpuTestGuard {
-            use std::sync::Mutex;
-            static GPU_LOCK: Mutex<()> = Mutex::new(());
-            let process = GPU_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-            const LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-            const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(LOCK_PATH)
-                .unwrap_or_else(|e| panic!("gpu_test_lock: cannot open {LOCK_PATH}: {e}"));
-            let deadline = std::time::Instant::now() + LOCK_TIMEOUT;
-            loop {
-                match file.try_lock() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        if std::time::Instant::now() >= deadline {
-                            panic!(
-                                "gpu_test_lock: another process has held {LOCK_PATH} for over \
-                                 {}s -- inspect `lsof {LOCK_PATH}`",
-                                LOCK_TIMEOUT.as_secs()
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(std::fs::TryLockError::Error(e)) => {
-                        panic!("gpu_test_lock: flock on {LOCK_PATH} failed: {e}")
-                    }
-                }
-            }
-            GpuTestGuard {
-                _process: process,
-                _machine: file,
-            }
         }
     }
 }
