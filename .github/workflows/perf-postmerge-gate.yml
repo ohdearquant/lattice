@@ -44,18 +44,33 @@ name: perf post-merge detection (informational, PAUSED)
 # Why. Across its 15 verdict-producing runs this lane reported a confirmed
 # regression every single time, on 15 unrelated merges. The cause is its
 # decision rule, not its plumbing: the rule fails a run when a group's LOWER
-# confidence bound exceeds 7%, applied one-sidedly across 263 group comparisons
-# per run. Criterion's confidence intervals are tight WITHIN a run (median width
-# across the 82 FAIL rows: 0.280 percentage points) while the same groups swing
-# widely BETWEEN runs, and a within-run interval cannot bound between-run
-# variability. With 263 groups and that spread, at least one positive excursion
-# past 7% is close to certain, so the rule converts roughly half of a symmetric
-# noise distribution into "confirmed regressions". The recurrence signature
-# confirms the reading: the same groups flag across unrelated merges
-# (simd_throughput_384/normalize in 7 of 15 runs), and if those were genuine
-# per-merge regressions that group would by now be about twice as slow, which it
-# is not. Large deltas are symmetric overall (85 head-slower vs 119 head-faster
-# past 7%), so this is not an arm-ordering artifact.
+# confidence bound exceeds 7%, applied one-sidedly across the 263-264 group
+# comparisons a run declares, per architecture. Criterion's confidence intervals
+# are tight WITHIN a run while the same groups swing widely BETWEEN runs, and a
+# within-run interval cannot bound between-run variability. With that many
+# groups and that spread, at least one positive excursion past 7% is close to
+# certain, so the rule converts roughly half of a symmetric noise distribution
+# into "confirmed regressions".
+#
+# Figures below are stated over a named population, because two earlier numerals
+# in this header were quoted over populations that were never their own. The
+# settled population is x86_64-linux alone: 15 reports declaring 263 comparisons
+# twelve times and 264 three times, 3948 in total. Over that: 220 FAIL rows,
+# 5.6%. Within-run intervals are tight — median CI width 0.280 percentage points
+# across the FAIL rows accumulated through run 7 of the 15, which is the subset
+# that median was computed on and not the full set.
+#
+# The recurrence signature confirms the reading: the same groups flag across
+# unrelated merges (simd_throughput_384/normalize in 7 of 15 runs), and if those
+# were genuine per-merge regressions that group would by now be about twice as
+# slow, which it is not.
+#
+# Large deltas are not sign-aligned, which is what rules out an arm-ordering
+# artifact: past 7% the x86_64 split is 232 head-slower against 273 head-faster.
+# Read that per architecture and never pooled. aarch64 leans slower (44 against
+# 30) while x86_64 leans faster, so a pooled figure is partly cancellation and
+# overstates how symmetric the distribution is. The conclusion survives either
+# way; the pooled version of it does not survive scrutiny.
 #
 # Cost of leaving it on: roughly 88 minutes of wall clock per run, on each of two
 # runner jobs, for every qualifying merge, producing a verdict that cannot be
@@ -63,7 +78,7 @@ name: perf post-merge detection (informational, PAUSED)
 #
 # What must be true before the push trigger returns. The rule needs a
 # between-run variance estimate rather than a within-run confidence interval;
-# it needs multiple-comparison handling across its 263 groups; and the
+# it needs multiple-comparison handling across its 263-264 groups; and the
 # chronically unstable groups need identifying and either stabilising or
 # excluding. Any change to which groups are gated requires a repeated A/A on the
 # target machine class plus a re-derivation of the threshold FIRST. Restoring
