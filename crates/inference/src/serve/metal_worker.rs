@@ -385,12 +385,12 @@ fn check_prompt_fits_window(
 /// `image_message_index`, which splices `vision_start_token_id`, `num_pads` copies
 /// of `image_token_id`, then `vision_end_token_id` between that turn's own
 /// `text_before` (`content`) and `text_after` (`image.text_after`) -- preserving
-/// the caller's original content-part order (PR #1021 review round 3: a prior
-/// version unconditionally inserted the vision span ahead of the turn's entire
-/// text, so `[text("before"), image, text("after")]` decoded as
-/// image -> "beforeafter" instead of "before" -> image -> "after"). Sharing the
-/// turn primitives with [`format_chat_template`] (PR #1021 review round 5) means
-/// there is exactly one definition of the ChatML layout (`<|im_start|>{role}\n` /
+/// the caller's original content-part order: splicing the vision span ahead of
+/// the turn's entire text instead would decode `[text("before"), image,
+/// text("after")]` as image -> "beforeafter" instead of
+/// "before" -> image -> "after". Sharing the turn primitives with
+/// [`format_chat_template`] means there is exactly one definition of the
+/// ChatML layout (`<|im_start|>{role}\n` /
 /// `<|im_end|>\n`); editing it here automatically keeps the text-only path in
 /// sync, and vice versa. Tokenizes in exactly two calls (the text before the
 /// spliced ids, then the text after) rather than one call per ChatML segment, so
@@ -417,19 +417,19 @@ fn build_vision_prompt_ids(
     }
     push_chat_turn_open(&mut before, messages[image_message_index].role.as_str());
     // The image message's own text that preceded the image part in the
-    // caller's original content-part order (PR #1021 review round 3):
-    // without this, a `[text("before"), image, ...]` message loses "before"
-    // entirely -- the vision span spliced right after the role header with
-    // no text ahead of it at all.
+    // caller's original content-part order: without this, a
+    // `[text("before"), image, ...]` message loses "before" entirely -- the
+    // vision span spliced right after the role header with no text ahead of
+    // it at all.
     before.push_str(&messages[image_message_index].content);
 
     let mut after = String::new();
     // The image message's text that followed the image part in the
-    // caller's original content-part order (PR #1021 review round 3):
+    // caller's original content-part order:
     // `messages[image_message_index].content` is that message's
     // *before*-image text (already rendered into `before` above), so the
     // vision span must be followed by `image.text_after`, not `content`
-    // again -- reusing `content` here is exactly the bug that decoded
+    // again -- reusing `content` here would decode
     // `[text("before"), image, text("after")]` as image -> "beforeafter"
     // instead of "before" -> image -> "after".
     after.push_str(
@@ -531,23 +531,22 @@ fn build_vision_request(
         .ok_or_else(|| bad_request("checkpoint has no vision_end_token_id".into()))?;
 
     // Checked before any decode/preprocess work: a client that disconnected between dequeue and
-    // here must not pay for the (potentially large) image decode below (PR #1021 review round 1
-    // major finding).
+    // here must not pay for the (potentially large) image decode below.
     if should_cancel() {
         return Err(VisionBuildStop::Cancelled);
     }
-    // Only the serve path opts into the serving-latency patch budget (PR #1021 review round 5):
-    // the shared preprocessor no longer applies it by default, so the public embedding API keeps
-    // accepting whatever it accepted before that budget existed.
+    // Only the serve path opts into the serving-latency patch budget: the shared preprocessor
+    // does not apply it by default, so the public embedding API keeps accepting whatever it
+    // accepted before that budget existed.
     let (pixel_values, grid) = preprocess_qwen35_image(
         image_bytes,
         vision_cfg,
         Some(crate::vision::qwen35_vit::serve_max_vision_patches()),
     )
     .map_err(|e| {
-        // The dimension guard (ADR-069 S6 review round 1 blocker) gets its own HTTP code,
-        // distinct from ordinary image-rejection reasons, so a caller can tell "this image is
-        // fundamentally too large to serve" apart from "this image/data URI was malformed".
+        // The dimension guard (ADR-069 S6) gets its own HTTP code, distinct from ordinary
+        // image-rejection reasons, so a caller can tell "this image is fundamentally too large
+        // to serve" apart from "this image/data URI was malformed".
         let code = if matches!(e, VisionError::DimensionsExceeded(_)) {
             "image_dimensions_exceeded"
         } else {
@@ -746,10 +745,10 @@ fn run_worker_loop(
 }
 
 /// A vision-capable checkpoint's `model.visual.*` tensors, loaded either eagerly at startup
-/// or lazily on the worker's first image request (PR #1021 review round 6, issue 7): eagerly
-/// reading and (for Q4 checkpoints) dequantizing all ~153 visual tensors -- about 384 MiB f32
-/// for Qwen3.5-0.8B -- taxed every text-only server's startup and steady-state memory, even
-/// though the overwhelming majority of requests never touch an image.
+/// or lazily on the worker's first image request: eagerly reading and (for Q4 checkpoints)
+/// dequantizing all ~153 visual tensors -- about 384 MiB f32 for Qwen3.5-0.8B -- would tax
+/// every text-only server's startup and steady-state memory, even though the overwhelming
+/// majority of requests never touch an image.
 ///
 /// This type's `get_or_load` takes `&mut self` and is only ever called from inside
 /// [`run_worker_loop`]'s single-threaded, one-job-at-a-time loop, which is what makes the
@@ -941,9 +940,9 @@ impl MetalWorker {
                         // incremental `on_token` hook exists on this entry point yet) -- the full
                         // answer arrives as one delta rather than a token-by-token stream (known
                         // ADR-069 S6 v0 limitation) -- but it does poll `should_cancel` once per
-                        // decode step internally (PR #1021 review round 3 major finding), so a
-                        // disconnected client still stops the decode loop early instead of
-                        // running to `max_new_tokens`/context-full.
+                        // decode step internally, so a disconnected client still stops the
+                        // decode loop early instead of running to
+                        // `max_new_tokens`/context-full.
                         let output = state
                             .generate_multimodal_vision_with_cancel(
                                 &request,
@@ -1303,8 +1302,7 @@ mod tests {
         }
     }
 
-    // ── PR #1021 review round 1 major finding: `build_vision_request`
-    //    cancellation ordering ─────────────────────────────────────────────
+    // ── `build_vision_request` cancellation ordering ───────────────────────
 
     fn tiny_vision_cfg() -> crate::model::qwen35_config::VisionModelConfig {
         crate::model::qwen35_config::VisionModelConfig {
@@ -1375,10 +1373,10 @@ mod tests {
         buf
     }
 
-    /// PR #1021 review round 3 major finding: `build_vision_prompt_ids` unconditionally
-    /// inserted the vision span ahead of a message's *entire* text, so a message shaped
-    /// `[text("before"), image, text("after")]` decoded as image -> "beforeafter" instead of
-    /// "before" -> image -> "after". Drives `build_vision_prompt_ids` directly with a
+    /// `build_vision_prompt_ids` must splice the vision span after a message's pre-image
+    /// text, not ahead of the message's *entire* text: a message shaped
+    /// `[text("before"), image, text("after")]` must decode as "before" -> image -> "after",
+    /// not image -> "beforeafter". Drives `build_vision_prompt_ids` directly with a
     /// single-char vocab so both text tokens are individually addressable, then asserts their
     /// token ids appear on the correct side of the spliced vision span.
     ///
@@ -1414,9 +1412,9 @@ mod tests {
         assert_eq!(ids, vec![10, 101, 100, 100, 102, 11]);
     }
 
-    /// PR #1021 review round 1 major finding: the pre-fix code only checked `should_cancel`
-    /// *after* `build_vision_request` had already run the full decode/preprocess/ViT/merger
-    /// pass, so a disconnected client still paid for the entire vision prefill. Proves the fix:
+    /// `build_vision_request` must check `should_cancel` *before* running the full
+    /// decode/preprocess/ViT/merger pass, not only after: checking only afterward would let a
+    /// disconnected client pay for the entire vision prefill regardless. Proof:
     /// with `should_cancel` already `true`, `build_vision_request` must stop before touching the
     /// (deliberately invalid) image bytes at all -- if it decoded first, this would fail with an
     /// image-decode error instead of `Cancelled`, and `should_cancel` would be observed more than
@@ -1478,10 +1476,10 @@ mod tests {
         let mut vision_state = LazyVision::Loaded(empty_vision_weights());
         let cfg = vision_test_qwen35_config();
         let tokenizer = minimal_tokenizer();
-        // Must actually carry `image: Some(..)` at `image_message_index` (PR #1021 review round
-        // 3): `build_vision_prompt_ids` now reads `image.text_after` for the post-image text
-        // instead of reusing `content`, matching the real invariant every production caller
-        // already holds (`image_message_index` is only ever the index of a message
+        // Must actually carry `image: Some(..)` at `image_message_index`:
+        // `build_vision_prompt_ids` reads `image.text_after` for the post-image text instead of
+        // reusing `content`, matching the invariant every production caller already holds
+        // (`image_message_index` is only ever the index of a message
         // `image_positions` filtered to `Some(image)`).
         let messages = vec![ChatMessage {
             role: ChatRole::User,
@@ -1577,9 +1575,9 @@ mod tests {
         );
     }
 
-    /// PR #1021 review round 7 major finding: lazy vision-weight loading must not run before
-    /// the in-flight cancellation check. `build_vision_request` itself now defers
-    /// `get_or_load` past its own cancellation + preprocess + window-preflight checks (the
+    /// Lazy vision-weight loading must not run before the in-flight cancellation check.
+    /// `build_vision_request` defers `get_or_load` past its own cancellation + preprocess +
+    /// window-preflight checks (the
     /// worker's job-dispatch closure also cancel-checks before ever calling into this
     /// function at all -- this test covers the function-level ordering guarantee).
     /// `model_dir` deliberately has no manifest, so if `get_or_load` ran despite
@@ -2518,7 +2516,7 @@ mod tests {
         handle.join().expect("worker thread must not panic");
     }
 
-    // ── Issue 7 (PR #1021 review round 6): LazyVision lazy-load contract ──
+    // ── LazyVision lazy-load contract ───────────────────────────────────
 
     /// Resolves a real Qwen3.5-0.8B checkpoint directory the same way
     /// `vision_serve_e2e_test.rs` does (`LATTICE_VISION_S3_MODEL_DIR`, falling back to the

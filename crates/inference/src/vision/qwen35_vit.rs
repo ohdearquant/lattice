@@ -41,8 +41,8 @@ const QWEN35_IMAGE_MEAN: f32 = 0.5;
 const QWEN35_IMAGE_STD: f32 = 0.5;
 
 /// Maximum accepted image width/height in pixels, enforced by
-/// [`preprocess_qwen35_image`] before any pixel data is decoded (ADR-069 S6 review round 1
-/// blocker). Nothing in `VisionModelConfig` bounds this naturally: `num_position_embeddings`
+/// [`preprocess_qwen35_image`] before any pixel data is decoded (ADR-069 S6).
+/// Nothing in `VisionModelConfig` bounds this naturally: `num_position_embeddings`
 /// only sizes the learned position-embedding table, which [`build_pos_embed_and_rope_tables`]
 /// bilinearly *interpolates* to whatever patch grid the input image produces, so it places no
 /// ceiling on `GridThw::num_patches()`. Left unbounded, the serve layer's compressed-byte
@@ -53,20 +53,20 @@ const QWEN35_IMAGE_STD: f32 = 0.5;
 /// the checkpoint: 2048x2048 is exactly `64 * (patch_size=16 * spatial_merge_size=2)` for the
 /// real 0.8B checkpoint's factor, i.e. a 128x128 = 16,384-patch grid pre-merge. This cap alone
 /// is NOT the resource bound -- the O(n^2) full-attention cost bound is
-/// [`DEFAULT_MAX_VISION_PATCHES`] below (round-2 review); this dimension cap remains as the
+/// [`DEFAULT_MAX_VISION_PATCHES`] below; this dimension cap remains only the
 /// outer decoder-level limit the
 /// `image` crate can enforce during header parsing.
 const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
 
 /// Default value for the *serving-only* pre-merge patch-count budget applied by
-/// [`serve_max_vision_patches`] (ADR-069 S6 review round 2 blocker, scoped to the serve path only
-/// as of review round 5 -- see [`preprocess_qwen35_image`]'s `max_patches` parameter doc). The
+/// [`serve_max_vision_patches`] (ADR-069 S6, scoped to the serve path only -- see
+/// [`preprocess_qwen35_image`]'s `max_patches` parameter doc). The
 /// dimension cap above is not sufficient on its own to bound *serving latency* because the ViT's
 /// full attention materializes a per-head `scores[n, n]` f32 matrix (`multihead_attention_full`
 /// via `gemm_bt`): at the 2048x2048 dimension boundary with the real checkpoint's `patch_size=16`,
 /// `n = 128^2 = 16,384` and that single allocation is `16,384^2 * 4 = 1 GiB`, before compute.
 ///
-/// PR #1021 review round 3 major finding: the score-allocation bound above (originally
+/// The score-allocation bound above (originally
 /// `n = 4,096`, a 1024x1024 image) does not bound *wall-clock serving time* on the single
 /// serialized Metal worker -- a real, end-to-end timed `qwen35_vit_forward_metal` pass at
 /// `n = 4,096` on this development machine (Apple M2 Max) measured **78.8 s**, monopolizing the
@@ -82,18 +82,18 @@ const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
 /// (576 patches, 4.81 s, well over budget). Overridable per-machine via
 /// [`LATTICE_VISION_MAX_PATCHES_ENV`] without a rebuild.
 ///
-/// Review round 5 finding: this budget is a *serving* policy, not a property of the checkpoint or
+/// This budget is a *serving* policy, not a property of the checkpoint or
 /// the ViT forward pass itself, so it must never be applied inside [`preprocess_qwen35_image`] by
-/// default -- doing so silently regressed the public embedding path (a default-aligned 512x512
-/// image, 1,024 pre-merge patches, is well within what the checkpoint and the ViT forward can
-/// process, but was being rejected). Only [`crate::serve::metal_worker`] reads
+/// default -- doing so would silently reject the public embedding path's default-aligned 512x512
+/// image (1,024 pre-merge patches), which is well within what the checkpoint and the ViT forward
+/// can process. Only [`crate::serve::metal_worker`] reads
 /// [`serve_max_vision_patches`] and passes it explicitly as `preprocess_qwen35_image`'s
 /// `max_patches` argument; every other caller (the public embedding path in
 /// [`super::pooled_embed`], golden-fixture tests) passes `None` and is bound only by
 /// `MAX_IMAGE_DIMENSION_PIXELS`.
 const DEFAULT_MAX_VISION_PATCHES: usize = 256;
 
-/// Environment variable overriding [`DEFAULT_MAX_VISION_PATCHES`] (PR #1021 review round 3): the
+/// Environment variable overriding [`DEFAULT_MAX_VISION_PATCHES`]: the
 /// measured default above is specific to the development machine it was measured on, so an
 /// operator serving on different hardware (or accepting a different latency/image-size
 /// tradeoff) can retune the cap without a rebuild. A missing, unparseable, or zero value falls
@@ -152,7 +152,7 @@ impl GridThw {
 /// admit whatever the checkpoint and [`MAX_IMAGE_DIMENSION_PIXELS`] allow, matching this
 /// function's behavior before that serving budget existed: this is the public embedding API's
 /// contract ([`super::pooled_embed`]) and must not silently pick up a serving-only latency policy
-/// (review round 5 finding -- round 4 applied [`serve_max_vision_patches`]'s value here
+/// (applying [`serve_max_vision_patches`]'s value here
 /// unconditionally, rejecting a default-aligned 512x512 Qwen image before embedding).
 ///
 /// # Errors
@@ -173,7 +173,7 @@ pub fn preprocess_qwen35_image(
     // container (e.g. the PNG IHDR chunk) to report width/height, and with `limits` set both
     // the PNG and JPEG decoders (the only formats this crate enables) enforce
     // `max_image_width`/`max_image_height` at that same header-parse step, before any pixel
-    // data is read. Rejects an oversized image (ADR-069 S6 review round 1 blocker) without
+    // data is read. Rejects an oversized image (ADR-069 S6) without
     // paying for full decode or the pixel-tensor allocation below.
     let mut dim_reader = ImageReader::new(Cursor::new(image_bytes))
         .with_guessed_format()
@@ -194,13 +194,13 @@ pub fn preprocess_qwen35_image(
         }
     };
 
-    // Attention-budget guard, still header-only (ADR-069 S6 review round 2 blocker): the
+    // Attention-budget guard, still header-only (ADR-069 S6): the
     // dimension cap alone admits grids whose per-head `scores[n, n]` full-attention allocation
     // reaches 1 GiB (see DEFAULT_MAX_VISION_PATCHES docs). Conservative ceil-division so unaligned
     // dimensions (rejected later anyway) cannot round the estimate below the true patch count.
     // A zero patch_size falls through to the InvalidConfig rejection below.
     //
-    // Serve-only as of review round 5: this block runs at all only when the caller opts in via
+    // Serve-only: this block runs at all only when the caller opts in via
     // `max_patches`. The public embedding path passes `None` and is unaffected.
     if let (true, Some(max_patches)) = (cfg.patch_size > 0, max_patches) {
         let est_patches = (header_w as usize)
@@ -257,7 +257,7 @@ pub fn preprocess_qwen35_image(
     };
 
     let in_channels = cfg.in_channels;
-    // Locally visible invariant (PR #1021 review round 6, issue 8): the loop below decodes
+    // Locally visible invariant: the loop below decodes
     // every image to a fixed 3-channel `RgbImage` and indexes `pixel[c]` for `c in
     // 0..in_channels`, so `in_channels` must never exceed 3 here. `VisionModelConfig::validate`
     // is the real fail-closed gate (rejects `in_channels != 3` at config/load time, before this
@@ -719,7 +719,7 @@ mod tests {
         buf
     }
 
-    /// ADR-069 S6 review round 1 blocker: a compressed-byte clamp at the HTTP boundary does not
+    /// ADR-069 S6: a compressed-byte clamp at the HTTP boundary does not
     /// bound decoded pixel dimensions. This reproduces the reviewer's concrete construction (an
     /// all-black 4064x4064 RGB PNG, well under every byte clamp, 32-divisible so it would
     /// otherwise pass the patch-alignment check too) and asserts `preprocess_qwen35_image`
@@ -751,8 +751,8 @@ mod tests {
         );
     }
 
-    /// The real 0.8B checkpoint's patch geometry, which the patch-budget
-    /// guard's boundary numbers are quoted in (round-2 review blocker).
+    /// The real 0.8B checkpoint's patch geometry that the patch-budget
+    /// guard's boundary numbers are quoted against.
     fn real_geometry_cfg() -> VisionModelConfig {
         VisionModelConfig {
             patch_size: 16,
@@ -772,9 +772,9 @@ mod tests {
             // 2048x2048 passes the MAX_IMAGE_DIMENSION_PIXELS cap exactly, but at the
             // real patch_size=16 it is a 128x128 = 16,384-patch grid whose per-head
             // full-attention scores allocation is 16,384^2 * 4 = 1 GiB. The *serve-path* patch
-            // budget must reject it from the header alone (round-2 review blocker) -- this test
-            // exercises the serve path by passing `Some(serve_max_vision_patches())` explicitly
-            // (round 5: the guard is no longer applied unless the caller opts in).
+            // budget must reject it from the header alone, so this test exercises the serve path
+            // by passing `Some(serve_max_vision_patches())` explicitly -- the guard only applies
+            // when a caller opts in.
             let cfg = real_geometry_cfg();
             let png = make_black_test_png(2048, 2048);
             assert!(
@@ -796,7 +796,7 @@ mod tests {
         // Pinned to the unset-env default -- see the sibling test above for why.
         with_max_patches_env(None, || {
             // 256x256 at patch_size=16 is exactly DEFAULT_MAX_VISION_PATCHES = 256 pre-merge
-            // patches (PR #1021 review round 3: re-measured from a real, end-to-end timed Metal
+            // patches (re-measured from a real, end-to-end timed Metal
             // ViT forward on this development machine -- see DEFAULT_MAX_VISION_PATCHES's doc
             // comment for the measured numbers) -- the largest square grid the default *serve*
             // budget admits. Must preprocess successfully on the serve path (not be rejected by
@@ -814,7 +814,7 @@ mod tests {
         });
     }
 
-    /// Review round 5 blocking finding: the public embedding path
+    /// Invariant: the public embedding path
     /// ([`super::super::pooled_embed`]) must accept exactly what it accepted before round 4's
     /// serve-only patch budget was (wrongly) applied inside the shared preprocessor by default.
     /// A default-aligned 512x512 Qwen image (patch_size=16, 1,024 pre-merge patches) exceeds the
@@ -831,9 +831,9 @@ mod tests {
         assert_eq!(patches.len(), 1024 * patch_len);
     }
 
-    /// Review round 5: the companion half of the regression pair above -- the serve path (which
+    /// The companion half of the regression pair above: the serve path (which
     /// explicitly passes `Some(serve_max_vision_patches())`, as `serve/metal_worker.rs` does)
-    /// must still reject the same over-budget 512x512 image with the error surface round 4 added.
+    /// must still reject the same over-budget 512x512 image via `VisionError::DimensionsExceeded`.
     #[test]
     fn preprocess_serve_path_still_rejects_512x512_image_over_serve_budget() {
         with_max_patches_env(None, || {
@@ -891,7 +891,7 @@ mod tests {
         });
     }
 
-    /// PR #1021 review round 3 major finding: the patch cap must be configurable per-machine
+    /// The patch cap must be configurable per-machine
     /// without a rebuild. Setting the env var below the default must make a request that the
     /// default would admit get rejected instead -- proving the override actually reaches the
     /// admission guard, not just the standalone `serve_max_vision_patches()` accessor.

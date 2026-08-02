@@ -725,7 +725,7 @@ jobs:
           fi
           grep -Eq '^test result: ok\. 7 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
 
-      # S6 serve vision E2E gate (PR #1021 review round 6, issues 3+4+5): the real
+      # S6 serve vision E2E gate: the real
       # `lattice_serve` HTTP surface, driven end to end over Metal with an image
       # content-part request, asserting the vision-dispatch marker fires for the image
       # request and not for a text-only control request on the same running server --

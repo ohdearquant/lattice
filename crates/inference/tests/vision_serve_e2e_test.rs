@@ -16,12 +16,12 @@
 //!
 //! GPU discipline: acquires the same machine-wide advisory flock
 //! (`/tmp/lion-metal-gpu-test.lock`) the in-crate `gpu_test_lock()` uses, via the shared
-//! `test-utils` seam (`lattice_inference::serve::gpu_test_lock`, PR #1021 review round 6
-//! issue 6) -- this test drives Metal in a *child process*, so the in-crate lock (private to
+//! `test-utils` seam (`lattice_inference::serve::gpu_test_lock`)
+//! -- this test drives Metal in a *child process*, so the in-crate lock (private to
 //! `metal_qwen35.rs`'s own `#[cfg(test)]` module) cannot cover it, and previously reimplemented
 //! the same lock path/timeout/polling protocol independently instead of sharing it.
 //!
-//! Dispatch proof (PR #1021 review round 6, issue 3): a passing HTTP 200 with non-empty text
+//! Dispatch proof: a passing HTTP 200 with non-empty text
 //! does not by itself prove the request took the vision path -- a regression that silently
 //! drops the image and falls back to a plausible-looking text-only answer would still pass
 //! that check. This test instead captures the server's stderr and asserts the vision-dispatch
@@ -134,7 +134,7 @@ fn wait_for_health(port: u16, deadline: Instant) -> bool {
 }
 
 /// The structured, single-line marker `serve::metal_worker` emits at the moment a request
-/// routes to the vision-aware decode path (PR #1021 review round 6, issue 3). Kept as one
+/// routes to the vision-aware decode path. Kept as one
 /// named constant so the test and the production emit site can't drift on wording without a
 /// compile-time-visible diff -- this test asserts on the fixed prefix, not the whole line.
 const VISION_DISPATCH_MARKER: &str = "route=vision dispatch=multimodal";

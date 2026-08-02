@@ -203,7 +203,7 @@ required-features = ["f16", "metal-gpu"]
 name = "bench_gdn_state"
 required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 
-# Uses `serve::base64_codec::encode_standard` (PR #1021 review round 5), which is gated
+# Uses `serve::base64_codec::encode_standard`, which is gated
 # `cfg(any(test, feature = "test-utils"))` -- this integration test is a separate compilation
 # unit from the lib crate, so it only sees that function through the `test-utils` feature arm.
 [[test]]

@@ -1,10 +1,10 @@
 //! Standard-alphabet (RFC 4648 §4) base64 encode/decode, no external crate: the HTTP servers
 //! already clamp the input string to a small fixed size before [`decode_standard`] ever runs
 //! (`MAX_CONTENT_PART_BYTES` in `lattice_serve.rs`), so an image-sized hand-rolled codec is
-//! simpler than pulling in a dependency for this one call site (PR #1021 review round 5: this
-//! codec used to be reimplemented three times independently -- `lattice_serve.rs`'s production
+//! simpler than pulling in a dependency for this one call site: reimplementing this
+//! codec three times independently -- `lattice_serve.rs`'s production
 //! decoder, its own `#[cfg(test)]` encoder, and `tests/vision_serve_e2e_test.rs`'s separate
-//! encoder -- with no compiler-enforced connection between them).
+//! encoder -- would leave no compiler-enforced connection between them.
 
 /// Decodes a standard-alphabet base64 string. Fails closed on every malformed input
 /// (non-multiple-of-4 length, invalid alphabet character, misplaced `=` padding) rather than

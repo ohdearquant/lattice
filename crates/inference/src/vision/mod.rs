@@ -108,7 +108,7 @@ pub enum VisionError {
     /// A configuration value is invalid (zero dimension, indivisible sizes, etc.).
     InvalidConfig(String),
     /// The image's decoded pixel dimensions exceed the serving-side limit enforced before full
-    /// decode (ADR-069 S6 review round 1 blocker): compressed-byte clamps at the HTTP boundary
+    /// decode (ADR-069 S6): compressed-byte clamps at the HTTP boundary
     /// bound the encoded stream, not the pixels a small, highly-compressible image can decode
     /// to. Distinct from `InvalidConfig` so callers (the serve layer) can map it to a dedicated
     /// HTTP error code instead of the generic image-rejection one.

@@ -1,5 +1,5 @@
-//! Machine-wide Metal GPU test serialization, exposed through the `test-utils` seam (PR #1021
-//! review round 6, issue 6) so a separate-compilation-unit integration test (a `tests/*.rs`
+//! Machine-wide Metal GPU test serialization, exposed through the `test-utils` seam
+//! so a separate-compilation-unit integration test (a `tests/*.rs`
 //! binary, which cannot see this crate's own `#[cfg(test)]`-only internals -- see
 //! `model::qwen35::test_support`'s doc comment for the same cross-compilation-unit reasoning)
 //! can serialize against the exact same lock every in-crate Metal test uses, instead of

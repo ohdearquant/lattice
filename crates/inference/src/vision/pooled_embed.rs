@@ -69,7 +69,7 @@ pub fn embed_image_from_bytes_f16(
         InferenceError::InvalidInput("checkpoint has no vision_end_token_id".into())
     })?;
 
-    // Public embedding API: no serving-latency budget applies here (PR #1021 review round 5) --
+    // Public embedding API: no serving-latency budget applies here --
     // only the serve path (`serve/metal_worker.rs`) opts into `serve_max_vision_patches()`.
     let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg, None)
         .map_err(|e| InferenceError::InvalidInput(format!("image preprocessing failed: {e}")))?;

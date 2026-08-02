@@ -1842,7 +1842,7 @@ mod imp {
     /// Flattened message content: text plus at most one decoded image
     /// (ADR-069 S6, extending #641/#649's text-only shape). `text_before`/
     /// `text_after` preserve the caller's original content-part ordering
-    /// around the (at most one) image part -- PR #1021 review round 3: a
+    /// around the (at most one) image part: a
     /// message with no image concatenates everything into `text_before`
     /// (`text_after` stays empty); a message with an image splits at the
     /// image part instead of collapsing all text into one blob ahead of it.
@@ -1943,7 +1943,7 @@ mod imp {
                     match part {
                         // Text before the (at most one) image part accumulates in
                         // `text_before`; text after it accumulates in `text_after`
-                        // (PR #1021 review round 3) -- preserving original order
+                        // -- preserving original order
                         // instead of collapsing every text part into one string.
                         Part::Text { text: t } => {
                             if image.is_some() {
@@ -2002,7 +2002,7 @@ mod imp {
         };
         Ok(match image {
             Some(bytes) => {
-                // PR #1021 review round 6, issue 9: the Qwen3.5 chat template only splices
+                // The Qwen3.5 chat template only splices
                 // image content into the 'user' turn -- 'system' and 'assistant' turns render
                 // as plain-text content regardless of what the caller sends, so an image on
                 // either of those roles would silently reach `ChatMessage::with_image` and
@@ -2118,12 +2118,12 @@ mod imp {
         format: String,
         model_max_context: usize,
         /// The checkpoint's `vision_config`, if any, straight from the one `Qwen35Config` parse
-        /// each branch below already performs (PR #1021 review round 5: the loader closure
-        /// previously re-parsed `config.json` a second time, via `Qwen35Config::from_model_dir`,
-        /// solely to recover this field, and silently downgraded a second-parse failure to
-        /// text-only serving via `.ok()`. Threading it out of the single parse here removes both
+        /// each branch below already performs: re-parsing `config.json` a second time, via
+        /// `Qwen35Config::from_model_dir`, solely to recover this field would duplicate I/O and
+        /// risk silently downgrading a second-parse failure to text-only serving via `.ok()`.
+        /// Threading it out of the single parse here removes both
         /// the duplicate I/O and that silent-fallback path -- a config load failure is now always
-        /// the loud `Err` this function already returns for every other config problem).
+        /// the loud `Err` this function already returns for every other config problem.
         vision_config: Option<VisionModelConfig>,
     }
 
@@ -2484,7 +2484,7 @@ mod imp {
             cfg.enable_thinking = false;
         }
         let cfg = cfg;
-        // PR #1021 review round 3 major finding: reject an image-bearing request combined with
+        // Reject an image-bearing request combined with
         // an admitted `response_format.json_schema` or a nonzero `reasoning_budget` HERE, at
         // admission, before any worker dispatch. The vision decode path's preflight
         // (`multimodal_generate_preflight`) rejects both unconditionally, and the worker maps
@@ -3328,7 +3328,7 @@ mod imp {
         // runs one generation at a time.
         let max_pending: usize = parse_max_pending(&args)?;
 
-        // `--preload-vision` (PR #1021 review round 6, issue 7): by default, a vision-capable
+        // `--preload-vision`: by default, a vision-capable
         // checkpoint's `model.visual.*` tensors (~153 tensors, ~384 MiB f32 for Qwen3.5-0.8B,
         // more after Q4 dequantization) are NOT read from disk at startup -- they load lazily
         // on the worker's first image request, so text-only serving pays zero extra startup
@@ -3371,7 +3371,7 @@ mod imp {
                     model_max_context,
                     vision_config,
                 } = load_model(&model_dir_for_loader, &tokenizer_path, format)?;
-                // ADR-069 S6 / PR #1021 review round 6, issue 7: a vision-capable checkpoint's
+                // ADR-069 S6: a vision-capable checkpoint's
                 // `model.visual.*` tensors load lazily on the worker's first image request by
                 // default (`LazyVision::Pending`) -- reuses the `vision_config` `load_model`
                 // above already parsed (round 5: this used to re-parse config.json a second
@@ -3755,7 +3755,7 @@ mod imp {
             ]);
             let flattened = content_parts(&content, 0).expect("mixed content must parse");
             // Text before the image part and text after it are kept
-            // separate (PR #1021 review round 3) so a downstream renderer
+            // separate so a downstream renderer
             // can splice the vision span at its true position instead of
             // collapsing both into one blob ahead of the image.
             assert_eq!(flattened.text_before, "before ");
@@ -3786,7 +3786,7 @@ mod imp {
             assert_eq!(image.text_after, "");
         }
 
-        /// PR #1021 review round 6, issue 9: the Qwen3.5 chat template only splices image
+        /// The Qwen3.5 chat template only splices image
         /// content into 'user' turns; 'system' and 'assistant' turns render as plain text
         /// regardless of what the caller sends, so an image on either role must be rejected
         /// at request validation with a 400 naming the offending role, not silently reach the
@@ -4145,7 +4145,7 @@ mod imp {
             );
         }
 
-        /// PR #1021 review round 3 major finding: an image content part combined with an
+        /// An image content part combined with an
         /// admitted strict `response_format.json_schema` must be rejected at admission with a
         /// 400, not dispatched to the vision decode path (whose preflight rejects grammar
         /// unconditionally, and whose worker previously mapped that rejection to a 500).
@@ -4170,7 +4170,7 @@ mod imp {
             assert_eq!(code, "image_unsupported_combination");
         }
 
-        /// PR #1021 review round 3 major finding: an image content part combined with a
+        /// An image content part combined with a
         /// nonzero `reasoning_budget` must be rejected at admission with a 400 for the same
         /// reason as the grammar case above.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

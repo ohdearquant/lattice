@@ -127,7 +127,7 @@ impl VisionModelConfig {
         // declaring `in_channels >= 4` would otherwise pass this validation and panic the
         // sole Metal worker on the first ordinary image request (`pixel[3]` is out of bounds
         // for a 3-element `Rgb<u8>`). Fail closed here instead of silently truncating or
-        // padding channels (PR #1021 review round 6, issue 8).
+        // padding channels.
         if self.in_channels != 3 {
             return Err(InferenceError::Inference(format!(
                 "invalid vision_config: in_channels must be 3 (RGB); got {} -- the image \
@@ -1966,7 +1966,7 @@ mod tests {
 
     #[test]
     fn parser_rejects_present_vision_config_with_in_channels_four() {
-        // PR #1021 review round 6, issue 8: a shape-consistent checkpoint declaring
+        // A shape-consistent checkpoint declaring
         // in_channels=4 must be rejected here, at config validation -- not left to panic
         // the sole Metal worker on the first ordinary image request (the preprocessor
         // decodes to a fixed 3-channel RgbImage and indexes pixel[3] out of bounds).

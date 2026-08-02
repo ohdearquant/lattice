@@ -996,7 +996,7 @@ impl ChatRole {
 pub struct ChatImage {
     pub bytes: Vec<u8>,
     /// Text that followed the image part within the same message, in the
-    /// caller's original content-part order (PR #1021 review round 3: the
+    /// caller's original content-part order: the
     /// image's own message can carry text both before AND after it, e.g.
     /// `[text("before"), image, text("after")]` -- `ChatMessage::content`
     /// carries the "before" text, this field carries "after" so the vision
@@ -1045,7 +1045,7 @@ impl ChatMessage {
     /// **Unstable**: construct a message carrying an image (ADR-069 S6).
     /// `text_before`/`text_after` are the message's text parts that sat
     /// before/after the single `image_url` part in the caller's original
-    /// content-part order (PR #1021 review round 3 ordering fix).
+    /// content-part order.
     pub fn with_image(
         role: ChatRole,
         text_before: impl Into<String>,
@@ -1064,9 +1064,9 @@ impl ChatMessage {
 }
 
 /// Renders a ChatML turn header -- `<|im_start|>{role}\n` -- the one place this layout is
-/// defined (PR #1021 review round 5: previously reimplemented independently in
-/// `serve::metal_worker::build_vision_prompt_ids`, which risked silently drifting from this
-/// renderer if only one side was ever edited). [`format_chat_template`] uses this for a whole
+/// defined: reimplementing it independently in
+/// `serve::metal_worker::build_vision_prompt_ids` would risk silently drifting from this
+/// renderer if only one side was ever edited. [`format_chat_template`] uses this for a whole
 /// turn; the vision path's segmented renderer (`serve::metal_worker::build_vision_prompt_ids`)
 /// uses it to open the turn that its image span interrupts mid-content.
 pub(crate) fn push_chat_turn_open(out: &mut String, role: &str) {
@@ -1098,12 +1098,12 @@ pub(crate) fn render_chat_turn(out: &mut String, msg: &ChatMessage) {
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] if any message carries an image
-/// (PR #1021 review round 6, issues 1+10): this renderer only ever emits
-/// `msg.content` for each turn, so a `ChatMessage::with_image` value silently
-/// lost its image bytes and `image.text_after` here before this fix, with no
-/// error at all -- a text-only entry point that happened to receive a valid,
-/// image-bearing `ChatMessage` produced a plausible-looking text-only
+/// Returns [`InferenceError::InvalidInput`] if any message carries an image:
+/// this renderer only ever emits
+/// `msg.content` for each turn, so silently accepting a `ChatMessage::with_image` value would
+/// drop its image bytes and `image.text_after` here, with no
+/// error at all -- a text-only entry point that receives a valid,
+/// image-bearing `ChatMessage` would produce a plausible-looking text-only
 /// completion instead of failing loudly. Rather than splitting `ChatMessage`
 /// into two types (API churn disproportionate to the fix), every public
 /// entry point that renders through this function now rejects image-bearing
@@ -1137,7 +1137,7 @@ mod format_chat_template_image_rejection_tests {
     // live at module top level for exactly this reason (#668).
     use super::{ChatMessage, ChatRole, format_chat_template};
 
-    /// PR #1021 review round 6, issues 1+10: a text-only entry point must reject an
+    /// A text-only entry point must reject an
     /// image-bearing message instead of silently rendering only its text and dropping the
     /// image bytes + `image.text_after`.
     #[test]
@@ -10065,14 +10065,14 @@ mod inner {
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             // Thin `should_cancel = || false` wrapper over the cancel-aware entry point below --
-            // same pattern as `generate_streaming`/`generate_streaming_with_cancel` (PR #1021
-            // review round 3 major finding: this path previously had no cancel-aware variant at
-            // all, so a disconnected client's job ran the vision decode loop to completion --
-            // up to the full remaining context window -- on the single serialized worker).
+            // same pattern as `generate_streaming`/`generate_streaming_with_cancel`. Without a
+            // cancel-aware variant at this entry point, a disconnected client's job would run
+            // the vision decode loop to completion -- up to the full remaining context window --
+            // on the single serialized worker.
             self.generate_multimodal_vision_with_cancel(request, tokenizer, gen_cfg, || false)
         }
 
-        /// Cancel-aware [`Self::generate_multimodal_vision`] (PR #1021 review round 3): mirrors
+        /// Cancel-aware [`Self::generate_multimodal_vision`]: mirrors
         /// [`Self::generate_streaming_with_prefix_cache_and_cancel`]'s contract on this entry
         /// point -- `should_cancel` is polled once per decode-loop iteration, before that
         /// iteration's GPU work, so a disconnected client stops paying for further decode steps
@@ -10257,8 +10257,8 @@ mod inner {
             let mut visual_row = 0usize;
             let mut last_logits = Vec::new();
             for (pos, &token_id) in prompt_ids.iter().enumerate() {
-                // Checked before each prefill step's GPU work (PR #1021 review round 5 major
-                // finding): unlike the text-only path's single batched `forward_prefill` dispatch
+                // Checked before each prefill step's GPU work: unlike the text-only path's
+                // single batched `forward_prefill` dispatch
                 // (which can only be checked before/after the whole call), multimodal prefill is
                 // already a per-token loop, so it is polled at the same per-step granularity as
                 // the decode loop below -- a disconnected client stops paying for further prefill
@@ -10352,9 +10352,8 @@ mod inner {
             while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
                 // Checked before this iteration's GPU work, independent of whether it ends up
                 // producing a token -- mirrors `generate_streaming_with_prefix_cache_and_cancel`'s
-                // decode-loop check (PR #1021 review round 3 major finding: this loop previously
-                // had no cancellation check at all, so a disconnected client's job ran to
-                // `max_new_tokens`/context-full on the single serialized worker).
+                // decode-loop check. Without a cancellation check here, a disconnected client's
+                // job would run to `max_new_tokens`/context-full on the single serialized worker.
                 if should_cancel() {
                     stop_reason = StopReason::Interrupt;
                     break;
@@ -26503,8 +26502,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// PR #1021 review round 3 major finding: the multimodal decode loop did not honor
-        /// cancellation once generation started, so a disconnected client's job ran to
+        /// The multimodal decode loop must honor cancellation once generation has started:
+        /// without that check, a disconnected client's job would run to
         /// `max_new_tokens`/context-full on the single serialized worker. Forces `should_cancel`
         /// `true` after two decode steps and asserts the loop stops there (well short of the
         /// generous `max_new_tokens` requested) with `stop_reason: Some(StopReason::Interrupt)`
@@ -26576,12 +26575,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// PR #1021 review round 5 major finding: the multimodal *prefill* loop (every prompt
+        /// The multimodal *prefill* loop (every prompt
         /// token, image-pad or text, injected via `forward_step_injected_mrope`/
-        /// `forward_step_mrope`) ran to completion with no cancellation check at all -- the first
-        /// `should_cancel` poll in `generate_multimodal_vision_impl` was in the decode loop, well
-        /// after the entire image+text prompt had already been forced through the serialized
-        /// Metal worker. Forces `should_cancel` `true` after two prefill steps (well short of
+        /// `forward_step_mrope`) must poll `should_cancel` during prefill itself, not only in
+        /// the decode loop that follows: polling only in the decode loop would force the entire
+        /// image+text prompt through the serialized
+        /// Metal worker before cancellation is ever observed. Forces `should_cancel` `true` after two prefill steps (well short of
         /// `vision_gate_fixture`'s 7-token prompt) and asserts the loop stops there with
         /// `stop_reason: Some(StopReason::Interrupt)` and zero generated tokens -- proving
         /// cancellation is observed *during* prefill, not merely before it starts or after it
@@ -26985,9 +26984,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// PR #1021 review round 7 major finding: the multimodal prefill loop computed the
-        /// terminal RMSNorm/lm_head/[vocab_size] readback for every prompt position even
-        /// though only the final position's logits are ever sampled. `emit_head=false` (see
+        /// The multimodal prefill loop must not compute the terminal
+        /// RMSNorm/lm_head/[vocab_size] readback for every prompt position, since only the
+        /// final position's logits are ever sampled. `emit_head=false` (see
         /// `forward_step_inner_impl_with_head`'s doc comment) skips that tail for every
         /// non-final position while the per-layer GQA/GDN/MLP work -- the only work that feeds
         /// the residual stream, KV cache, or GDN recurrent state -- still runs unconditionally.
