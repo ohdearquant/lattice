@@ -4,12 +4,8 @@
 //!   cargo run -p lattice-transport --example drift_compare --release -- \
 //!       /tmp/emb_v030.json /tmp/emb_main.json
 //!
-//! For each model present in both files the tool reports:
-//!   - Wasserstein distance (OT scalar)
-//!   - max_displacement from the transport summary
-//!   - mean_displacement from the transport summary
-//!   - max pairwise (1 - cosine) across the 5 index-aligned vector pairs
-//!     (ground-truth per-vector drift; OT is the distribution-level measure)
+//! For each model present in both files the tool reports debiased Sinkhorn
+//! divergence and max pairwise `1 - cosine` across index-aligned vectors.
 
 use std::collections::HashMap;
 
@@ -62,11 +58,15 @@ fn main() {
     models.sort();
 
     println!("\nDrift comparison: {baseline_path} (baseline) vs {current_path} (current)");
+    println!("Sinkhorn divergence is debiased, so identical inputs read as zero.");
     println!(
-        "{:<45} {:>12} {:>16} {:>16} {:>16}",
-        "model", "wasserstein", "max_displacement", "mean_displacement", "max_1-cos"
+        "max 1-cos uses f32 and saturates near 1.0; it cannot resolve below roughly 1e-7 and is not proof of identity."
     );
-    println!("{}", "-".repeat(111));
+    println!(
+        "{:<45} {:>20} {:>16}",
+        "model", "sinkhorn_divergence", "max_1-cos"
+    );
+    println!("{}", "-".repeat(85));
 
     for model_name in &models {
         let base_vecs = &baseline[*model_name];
@@ -87,6 +87,9 @@ fn main() {
 
         let report = detect_drift_records(&base_records, &curr_records, &config)
             .unwrap_or_else(|e| panic!("drift detection failed for {model_name}: {e}"));
+        let sinkhorn_divergence = report.sinkhorn_divergence.unwrap_or_else(|| {
+            panic!("drift detection did not compute Sinkhorn divergence for {model_name}")
+        });
 
         // Pairwise (index-aligned) cosine drift: 1.0 - cosine(base_i, curr_i).
         let max_cos_drift: f32 = base_vecs
@@ -95,14 +98,7 @@ fn main() {
             .map(|(a, b)| 1.0 - cosine(a.as_slice(), b.as_slice()))
             .fold(0.0f32, f32::max);
 
-        println!(
-            "{:<45} {:>12.6e} {:>16.6e} {:>16.6e} {:>16.6e}",
-            model_name,
-            report.wasserstein_distance,
-            report.summary.max_displacement,
-            report.summary.mean_displacement,
-            max_cos_drift,
-        );
+        println!("{model_name:<45} {sinkhorn_divergence:>20.6e} {max_cos_drift:>16.6e}");
     }
 
     println!();
