@@ -249,6 +249,7 @@ The `perf-baselines` branch is still updated by `bench-update.yml` on merge to m
 ## Commands
 
 ```bash
+make setup           # install rustfmt + clippy for the pinned toolchain
 make ci              # full local CI (fmt + clippy + deno lint + test + build)
 make fmt             # cargo fmt + deno fmt on markdown
 make lint-docs       # deno doc lint only
@@ -258,7 +259,7 @@ make publish         # publish (dependency order, sleeps for indexing)
 # E2E parity (HF reference vs lattice)
 make e2e-parity                          # run locally (needs torch + transformers)
 
-# Perf benchmarking (ADR-058, trend data)
+# Perf benchmarking (ADR-087, trend data)
 # bench-compare takes the machine-wide bench-window and GPU locks itself and
 # gates on ambient CPU idle — do NOT wrap it in an external bench-window helper.
 make bench-compare                       # A/B: origin/main vs HEAD (~2 min, --quick)

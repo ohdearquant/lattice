@@ -139,7 +139,7 @@ const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
     "src/forward/metal_qwen35.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
     "src/forward/metal_qwen35.rs::lora_gemv_kernel_matches_cpu_reference",
     "src/forward/metal_qwen35.rs::load_adapter_and_dispatch_lora_if_active",
-    "src/forward/metal_qwen35.rs::dispatch_matmul_q4_writes_all_rows",
+    "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
 ];
 const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalQwen35State", "new"]),
