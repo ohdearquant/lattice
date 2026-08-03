@@ -27,8 +27,9 @@ Exit codes:
   2 — parse error / bad input, or (with --require-measurements) the gate
       refusing to certify a run it could not judge: no comparison data, or
       no gating comparison among the parsed results, or a benchmark in the
-      selected baseline set with no head comparison. An automated lane must not
-      read "nothing was measured" as "nothing regressed".
+      selected baseline set with no head comparison, or a head benchmark with
+      no selected baseline. An automated lane must not read "nothing was
+      measured" as "nothing regressed".
   3 — not measurable: the automated lane's before/between/after ambient sample
       stream is missing, malformed, duplicated, or below BENCH_IDLE_FLOOR.
 
@@ -1526,6 +1527,75 @@ def run_selftest() -> int:
             failures.append("require-measurements: a parsed gating comparison "
                             "was rejected — the flag over-fails")
 
+        no_coverage_root = Path(td) / "no-baseline-coverage" / "criterion"
+        _fabricate_bench(
+            no_coverage_root / "existing_group" / "existing_bench",
+            "compare-base",
+        )
+        head_only = no_coverage_root / "new_group" / "new_bench" / "new"
+        head_only.mkdir(parents=True)
+        (head_only / "estimates.json").write_text(
+            json.dumps({"mean": {"point_estimate": 100.0}})
+        )
+        no_coverage_ambient = no_coverage_root.parent / "ambient.jsonl"
+        no_coverage_ambient.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "schema": AMBIENT_SAMPLE_SCHEMA,
+                        "phase": phase,
+                        "idle_pct": 95.0,
+                    }
+                )
+                + "\n"
+                for phase in REQUIRED_AMBIENT_PHASES
+            )
+        )
+        no_coverage_status = no_coverage_root.parent / "status.json"
+        no_coverage = _run(
+            no_coverage_root,
+            "--require-measurements",
+            "--target",
+            "lattice-inference:elementwise_cpu_bench",
+            "--ambient-samples",
+            str(no_coverage_ambient),
+            "--status-out",
+            str(no_coverage_status),
+        )
+        if no_coverage.returncode != 2:
+            failures.append(
+                "head-baseline-completeness: head benchmark without baseline exited "
+                f"{no_coverage.returncode} instead of 2"
+            )
+        if "NO COVERAGE" not in no_coverage.stderr:
+            failures.append(
+                "head-baseline-completeness: refusal did not label unbaselined "
+                "head benchmarks NO COVERAGE"
+            )
+        no_coverage_payload = json.loads(no_coverage_status.read_text())
+        if (
+            no_coverage_payload["verdict"] != "error"
+            or no_coverage_payload["exit_code"] != 2
+            or "NO COVERAGE" not in no_coverage_payload["reason"]
+        ):
+            failures.append(
+                "head-baseline-completeness: status surface rendered unbaselined "
+                "head benchmark as a pass"
+            )
+        if (
+            "  - lattice-inference:elementwise_cpu_bench: new_group/new_bench"
+            not in no_coverage.stderr
+        ):
+            failures.append(
+                "head-baseline-completeness: refusal did not name exact head-only "
+                "bench ID 'new_group/new_bench'"
+            )
+        if "produced no head comparison" in no_coverage.stderr:
+            failures.append(
+                "inventory-direction: head-without-baseline was collapsed into "
+                "the baseline-without-head refusal"
+            )
+
         # A target can be intentionally all-informational only when the exact
         # target key accompanies both the root and the demotion. This remains a
         # measured target and is valid in an enforcing multi-target run; another
@@ -1622,6 +1692,16 @@ def run_selftest() -> int:
                     "baseline-completeness: refusal did not name exact missing "
                     f"bench ID {expected_id!r}"
                 )
+        if "produced no head comparison" not in coverage.stderr:
+            failures.append(
+                "inventory-direction: baseline-without-head refusal lost its "
+                "direction-specific description"
+            )
+        if "NO COVERAGE" in coverage.stderr:
+            failures.append(
+                "inventory-direction: baseline-without-head was collapsed into "
+                "the head-without-baseline NO COVERAGE disposition"
+            )
         for unrelated_id in ("stale_default/bench", "stale_named/bench"):
             if unrelated_id in coverage.stderr:
                 failures.append(
@@ -2199,10 +2279,11 @@ def main() -> int:
                          "(default: full).")
     ap.add_argument("--require-measurements", action="store_true",
                     help="Fail (exit 2) instead of passing when the run produced no gating "
-                         "comparison to judge or a selected-base benchmark has no head "
-                         "comparison. Without this, an absent baseline exits 0, which is "
-                         "right for a first run but wrong for an automated lane: it cannot "
-                          "tell 'nothing regressed' from 'nothing was measured'.")
+                         "comparison to judge, a selected-base benchmark has no head "
+                         "comparison, or a head benchmark has no selected baseline. "
+                         "Without this, an absent baseline exits 0, which is right for a "
+                         "first run but wrong for an automated lane: it cannot tell "
+                         "'nothing regressed' from 'nothing was measured'.")
     ap.add_argument("--ambient-samples", type=Path,
                     help="JSONL before/between/after ambient samples. Requires "
                          "--status-out; an invalid or busy run exits 3.")
@@ -2410,6 +2491,47 @@ def main() -> int:
         print(f"error: invalid --baseline-name: {error}", file=sys.stderr)
         return finish("error", EXIT_ERROR, f"invalid baseline name: {error}")
 
+    all_change_files = find_change_files(args.criterion_root)
+    change_file_ids = {
+        change_file: artifact_bench_id(
+            change_file, args.criterion_root, artifact_parts=1
+        )
+        for change_file in all_change_files
+    }
+    head_ids = {
+        artifact_bench_id(head_file, args.criterion_root, artifact_parts=1)
+        for head_file in args.criterion_root.rglob("new/estimates.json")
+    }
+    # Existing comparison artifacts can belong to preserved, unrelated baseline trees;
+    # only a head artifact with no comparison at all proves the first-run coverage gap.
+    all_change_ids = set(change_file_ids.values())
+    missing_baseline_ids = sorted(head_ids - baseline_ids - all_change_ids)
+
+    def refuse_missing_baseline() -> int:
+        print(
+            f"error: NO COVERAGE: --require-measurements set but "
+            f"{len(missing_baseline_ids)} benchmark(s) ran in the head with no "
+            f"estimate in selected baseline {args.baseline_name!r}:",
+            file=sys.stderr,
+        )
+        for bench_id in missing_baseline_ids:
+            print(
+                f"  - {args.target + ': ' if args.target else ''}{bench_id}",
+                file=sys.stderr,
+            )
+        print(
+            "Record a baseline for these benchmarks before enforcing the A/B gate.",
+            file=sys.stderr,
+        )
+        return finish(
+            "error",
+            EXIT_ERROR,
+            f"NO COVERAGE: {len(missing_baseline_ids)} head benchmarks have no selected baseline",
+        )
+
+    if require_measurements and missing_baseline_ids:
+        return refuse_missing_baseline()
+
     if require_measurements and not baseline_ids:
         print(
             f"error: --require-measurements set but selected baseline "
@@ -2421,13 +2543,6 @@ def main() -> int:
         )
         return finish("error", EXIT_ERROR, "the selected baseline set is empty")
 
-    all_change_files = find_change_files(args.criterion_root)
-    change_file_ids = {
-        change_file: artifact_bench_id(
-            change_file, args.criterion_root, artifact_parts=1
-        )
-        for change_file in all_change_files
-    }
     # Enforcing A/B runs judge only the exact selected base set. A persistent
     # Criterion root can contain change output from other named baselines or
     # bench targets; letting those rows into this run can create either a stale
