@@ -53,7 +53,7 @@ tracing = "0.1"
 # its own ureq/download stack to non-wasm targets, so a plain `--features wasm`
 # build stays download-free; edge/cross builds drop it with
 # `--no-default-features --features native`. See issue #1095.
-lattice-inference = { version = "0.7.0", path = "../inference", optional = true, default-features = false, features = [
+lattice-inference = { version = "0.7.1", path = "../inference", optional = true, default-features = false, features = [
     "std",
     "f16",
 ] }
@@ -124,7 +124,13 @@ download = ["native", "lattice-inference/download"]
 # enabling this feature on a non-wasm target is a no-op rather than a build error.
 wasm = ["native", "dep:wasm-bindgen", "dep:console_error_panic_hook"]
 metal-gpu = ["lattice-inference/metal-gpu"]
-avx512 = []  # Requires nightly Rust (stdarch_x86_avx512)
+# Deprecated no-op: the AVX-512 VNNI int8 kernel this used to gate is now
+# compiled unconditionally on x86_64 (runtime-dispatched via
+# `SimdConfig::avx512vnni_enabled`, same pattern as the ungated f32 AVX-512F
+# kernel in dot_product.rs) and no longer needs an opt-in Cargo feature. Kept
+# as a no-op because it is part of the published surface (removing it would
+# break manifests that list `--features avx512`).
+avx512 = []
 # Deprecated no-op: gated a bench module for a service removed long ago, but the
 # feature is part of the published 0.4.x surface (removing it would break manifests
 # that list it). Remove in 0.5.0.

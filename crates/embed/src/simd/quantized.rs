@@ -588,7 +588,7 @@ unsafe fn dot_product_i8_neon_unrolled(a: &[i8], b: &[i8]) -> f32 {
 ///
 /// # Safety
 /// Requires AVX-512BW.
-#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 #[inline]
 unsafe fn mm512_sign_epi8(b: __m512i, a: __m512i) -> __m512i {
@@ -609,7 +609,7 @@ unsafe fn mm512_sign_epi8(b: __m512i, a: __m512i) -> __m512i {
 /// # Safety
 /// Caller must provide AVX-512F/VNNI/BW and equal `[-127, 127]` slices; bounds are chunked.
 /// See [`docs/simd.md`](../../docs/simd.md#int8-vectors) for signed-product transformation details.
-#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f", enable = "avx512vnni", enable = "avx512bw")]
 unsafe fn dot_product_i8_avx512vnni(a: &[i8], b: &[i8]) -> f32 {
     const SIMD_WIDTH: usize = 64; // 64 int8s per 512-bit register
@@ -795,11 +795,8 @@ fn resolve_i8_dot_kernel() -> I8DotKernel {
 
     #[cfg(target_arch = "x86_64")]
     {
-        #[cfg(feature = "avx512")]
-        {
-            if config.avx512vnni_enabled {
-                return dot_product_i8_avx512vnni_kernel;
-            }
+        if config.avx512vnni_enabled {
+            return dot_product_i8_avx512vnni_kernel;
         }
         if config.avx2_enabled {
             return dot_product_i8_avx2_kernel;
@@ -815,7 +812,7 @@ fn dot_product_i8_neon_kernel(a: &[i8], b: &[i8]) -> f32 {
     unsafe { dot_product_i8_neon_unrolled(a, b) }
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+#[cfg(target_arch = "x86_64")]
 fn dot_product_i8_avx512vnni_kernel(a: &[i8], b: &[i8]) -> f32 {
     debug_assert!(a.iter().all(|&v| v != i8::MIN));
     debug_assert!(b.iter().all(|&v| v != i8::MIN));
@@ -1137,10 +1134,10 @@ mod simd_parity_tests {
     }
 
     // FP-034: AVX-512 VNNI vs scalar parity for INT8 dot product.
-    // Gated on the `avx512` build feature: the VNNI kernel only compiles then.
-    // Runs only when the host advertises AVX-512F+BW+VNNI, matching the kernel's
+    // Compiled unconditionally on x86_64 (the kernel is no longer feature-gated);
+    // runs only when the host advertises AVX-512F+BW+VNNI, matching the kernel's
     // safety contract and SimdConfig::avx512vnni_enabled.
-    #[cfg(all(target_arch = "x86_64", feature = "avx512"))]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_i8_avx512vnni_scalar_parity() {
         if std::arch::is_x86_feature_detected!("avx512f")

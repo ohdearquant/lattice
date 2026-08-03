@@ -516,6 +516,77 @@ pub fn cosine_similarity_fused(a: &[f32], b: &[f32]) -> f32 {
     cosine_kernel()(a, b)
 }
 
+/// The query-side norm for [`cosine_similarity_pre_normalized`].
+///
+/// Computed with the same dot-product kernel the scoring path uses, so the
+/// hoisted norm and the per-candidate scoring agree bit for bit.
+#[inline]
+pub fn query_norm(query: &[f32]) -> f32 {
+    if query.is_empty() {
+        return 0.0;
+    }
+    super::dot_product::resolved_dot_product_kernel()(query, query).sqrt()
+}
+
+/// Cosine similarity against a query whose norm the caller already knows.
+///
+/// This is the shape a scan loop wants. `‖query‖` is fixed across every
+/// candidate, but [`cosine_similarity`] takes only the two slices, so it
+/// recomputes that norm on every call and spends a third accumulator stream
+/// producing a value the caller already has. Hoisting it with [`query_norm`]
+/// leaves two accumulators of real work per candidate.
+///
+/// Obtain `query_norm` from [`query_norm`]. Passing a value that is not
+/// `‖query‖` rescales the result rather than erroring, which is what makes an
+/// already-normalized query cheap: pass `1.0`.
+///
+/// Returns `0.0` on a length mismatch, an empty slice, or a zero norm on
+/// either side, matching [`cosine_similarity`].
+///
+/// ```
+/// use lattice_embed::simd::{cosine_similarity, cosine_similarity_pre_normalized, query_norm};
+///
+/// let q = [1.0_f32, 2.0, 3.0];
+/// let c = [4.0_f32, 5.0, 6.0];
+/// let n = query_norm(&q);
+/// let a = cosine_similarity_pre_normalized(&q, &c, n);
+/// let b = cosine_similarity(&q, &c);
+/// assert!((a - b).abs() < 1e-6);
+/// ```
+#[inline]
+pub fn cosine_similarity_pre_normalized(query: &[f32], candidate: &[f32], query_norm: f32) -> f32 {
+    if query.len() != candidate.len() || query.is_empty() || query_norm == 0.0 {
+        return 0.0;
+    }
+    cosine_pre_normalized_with(
+        super::dot_product::resolved_dot_product_kernel(),
+        query,
+        candidate,
+        query_norm,
+    )
+}
+
+/// Shared body, taking an already-resolved kernel.
+///
+/// Scan loops resolve the kernel once and pass it in, so the per-candidate cost
+/// stays two dot products with no `OnceLock` read in the loop.
+#[inline]
+fn cosine_pre_normalized_with(
+    dot_kernel: super::dot_product::DotKernel,
+    query: &[f32],
+    candidate: &[f32],
+    query_norm: f32,
+) -> f32 {
+    if query.len() != candidate.len() || query.is_empty() || query_norm == 0.0 {
+        return 0.0;
+    }
+    let norm_c = dot_kernel(candidate, candidate).sqrt();
+    if norm_c == 0.0 {
+        return 0.0;
+    }
+    dot_kernel(query, candidate) / (query_norm * norm_c)
+}
+
 /// **Unstable**: one-query/many-candidate cosine similarity.
 ///
 /// Results retain candidate order and use `0.0` for dimensional mismatches.
@@ -524,8 +595,8 @@ pub fn batch_cosine_one_vs_many(query: &[f32], candidates: &[&[f32]]) -> Vec<f32
         return vec![0.0_f32; candidates.len()];
     }
 
-    use super::dot_product::resolved_dot_product_kernel;
-    let dot_kernel = resolved_dot_product_kernel();
+    // Resolve the kernel once, outside the candidate loop.
+    let dot_kernel = super::dot_product::resolved_dot_product_kernel();
 
     let norm_q = dot_kernel(query, query).sqrt();
     if norm_q == 0.0 {
@@ -534,14 +605,105 @@ pub fn batch_cosine_one_vs_many(query: &[f32], candidates: &[&[f32]]) -> Vec<f32
 
     candidates
         .iter()
-        .map(|&c| {
-            if c.len() != query.len() {
-                return 0.0;
-            }
-            let dot_qc = dot_kernel(query, c);
-            let norm_c = dot_kernel(c, c).sqrt();
-            let denom = norm_q * norm_c;
-            if denom == 0.0 { 0.0 } else { dot_qc / denom }
-        })
+        .map(|&c| cosine_pre_normalized_with(dot_kernel, query, c, norm_q))
         .collect()
+}
+
+#[cfg(test)]
+mod pre_normalized_tests {
+    use super::*;
+
+    fn vecs(dim: usize, seed: u32) -> (Vec<f32>, Vec<f32>) {
+        let mut s = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            (s as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        (
+            (0..dim).map(|_| next()).collect(),
+            (0..dim).map(|_| next()).collect(),
+        )
+    }
+
+    /// The whole justification for the API: hoisting the query norm must not
+    /// change the answer. If it did, callers could not substitute it into a
+    /// scan loop.
+    #[test]
+    fn pre_normalized_agrees_with_cosine_similarity() {
+        for dim in [1usize, 3, 4, 7, 8, 15, 16, 17, 31, 64, 127, 384, 768, 1536] {
+            for seed in 0..4u32 {
+                let (q, c) = vecs(dim, seed);
+                let want = cosine_similarity(&q, &c);
+                let got = cosine_similarity_pre_normalized(&q, &c, query_norm(&q));
+                assert!(
+                    (got - want).abs() <= 1e-4,
+                    "dim={dim} seed={seed}: pre_normalized {got} vs cosine_similarity {want}"
+                );
+            }
+        }
+    }
+
+    /// An already-normalized query is the cheap case: norm 1.0 must reduce to
+    /// the plain dot product.
+    #[test]
+    fn unit_norm_query_reduces_to_dot_product() {
+        let (q, c) = vecs(384, 7);
+        let n = query_norm(&q);
+        let unit: Vec<f32> = q.iter().map(|x| x / n).collect();
+
+        let got = cosine_similarity_pre_normalized(&unit, &c, 1.0);
+        let want = cosine_similarity(&unit, &c);
+        assert!(
+            (got - want).abs() <= 1e-4,
+            "unit-norm shortcut disagreed: {got} vs {want}"
+        );
+    }
+
+    #[test]
+    fn degenerate_inputs_return_zero_not_nan() {
+        let zero = vec![0.0f32; 8];
+        let other = vec![1.0f32; 8];
+        let short = vec![1.0f32; 3];
+
+        assert_eq!(query_norm(&[]), 0.0);
+        assert_eq!(cosine_similarity_pre_normalized(&zero, &other, 0.0), 0.0);
+        assert_eq!(
+            cosine_similarity_pre_normalized(&other, &zero, query_norm(&other)),
+            0.0
+        );
+        assert_eq!(
+            cosine_similarity_pre_normalized(&other, &short, query_norm(&other)),
+            0.0
+        );
+        assert_eq!(cosine_similarity_pre_normalized(&[], &[], 1.0), 0.0);
+
+        for v in [
+            cosine_similarity_pre_normalized(&zero, &zero, 0.0),
+            cosine_similarity_pre_normalized(&other, &other, query_norm(&other)),
+        ] {
+            assert!(v.is_finite(), "produced a non-finite similarity: {v}");
+        }
+    }
+
+    /// `batch_cosine_one_vs_many` is now implemented on top of the new function,
+    /// so it must still agree with per-pair `cosine_similarity`.
+    #[test]
+    fn batch_one_vs_many_still_matches_per_pair() {
+        let (q, _) = vecs(256, 11);
+        let cands: Vec<Vec<f32>> = (0..8).map(|s| vecs(256, 100 + s).1).collect();
+        let refs: Vec<&[f32]> = cands.iter().map(Vec::as_slice).collect();
+
+        let batch = batch_cosine_one_vs_many(&q, &refs);
+        assert_eq!(batch.len(), refs.len());
+        for (i, c) in refs.iter().enumerate() {
+            let want = cosine_similarity(&q, c);
+            assert!(
+                (batch[i] - want).abs() <= 1e-4,
+                "candidate {i}: batch {} vs per-pair {want}",
+                batch[i]
+            );
+        }
+    }
 }

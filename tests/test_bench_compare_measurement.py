@@ -18,6 +18,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -91,6 +92,51 @@ print("malformed machine-state fixture")
 raise SystemExit(127)
 """
 
+STUB_MACHINE_PROBE = """#!/usr/bin/env python3
+import datetime
+import json
+import sys
+
+label = sys.argv[sys.argv.index("--label") + 1]
+print(json.dumps({
+    "schema": "lattice-machine-state-v1",
+    "label": label,
+    "captured_at_utc": datetime.datetime.now(datetime.UTC).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    ),
+    "power": {"status": "unavailable", "reason": "fixture"},
+    "thermal": {"status": "unavailable", "reason": "fixture"},
+    "idle": {"status": "unavailable", "reason": "fixture"},
+}, separators=(",", ":"), sort_keys=True))
+"""
+
+def _stub_machine_probe_with_first_failure(failure_statement):
+    if not failure_statement:
+        raise ValueError("failure statement must be non-empty")
+    marker = "print(json.dumps({"
+    if marker not in STUB_MACHINE_PROBE:
+        raise ValueError("machine-state fixture print marker is missing")
+    return STUB_MACHINE_PROBE.replace(
+        marker,
+        "if label == 'before base':\n"
+        f"    {failure_statement}\n"
+        f"{marker}",
+        1,
+    )
+
+
+FAILED_MACHINE_STATE_PROBES = {
+    "nonzero": _stub_machine_probe_with_first_failure("raise SystemExit(19)"),
+    "empty": _stub_machine_probe_with_first_failure("raise SystemExit(0)"),
+}
+
+PYTHON_ENTRYPOINTS_USING_DATETIME_UTC = (
+    REPO / "scripts" / "lib" / "machine-state-probe.py",
+    REPO / "scripts" / "perf-bench-gate.py",
+    REPO / "scripts" / "bench_decode_harness.py",
+    REPO / "scripts" / "bench_cpu_flagship_supervisor.py",
+)
+
 # Test helpers invoking real Git must disable repository hooks.
 GIT = ("git", "-c", "core.hooksPath=/dev/null")
 
@@ -100,6 +146,13 @@ set -euo pipefail
 if [[ "${1:-}" == "--version" ]]; then
   printf '%s\n' 'cargo 1.94.1 (fixture)'
   exit 0
+fi
+
+if [[ "${1:-}" == "bench" && "${STUB_REQUIRE_LOCKED:-0}" == "1" ]]; then
+  case " $* " in
+    *" --locked "*) ;;
+    *) exit 86 ;;
+  esac
 fi
 
 write_baseline() {
@@ -175,6 +228,7 @@ for bench in rms_norm/896 simd_dot_product/scalar/384; do
     cp -R "$src/$bench/compare-base" "$dst/$bench/"
   fi
 done
+printf '%s\n' 'fixture rsync: partial baseline transfer' >&2
 exit 23
 """
 
@@ -187,7 +241,7 @@ def _run(
     setup=None,
     extra_env=None,
     emit_criterion_home=False,
-    state_probe=None,
+    stub_machine_state=None,
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -198,7 +252,9 @@ def _run(
         shutil.copytree(LIB, root / "scripts" / "lib")
         shutil.copy2(REPO / ".gitignore", root / ".gitignore")
         governor = root / "scripts" / "perf_governor.py"
-        governor.write_text(state_probe or STUB_GOVERNOR)
+        governor.write_text(
+            STUB_GOVERNOR if stub_machine_state is None else stub_machine_state
+        )
         governor.chmod(0o755)
         quiet_probe = root / "scripts" / "lib" / "quiet-probe.py"
         quiet_probe.write_text(
@@ -208,21 +264,11 @@ def _run(
             "print(f'[quiet] {label}: idle 100.0% (floor 0.0%) ok | top: fixture 0.0%')\n"
         )
         machine_probe = root / "scripts" / "lib" / "machine-state-probe.py"
-        if state_probe is not None:
-            machine_probe.write_text(state_probe)
-        else:
-            machine_probe.write_text(
-                "#!/usr/bin/env python3\n"
-                "import datetime, json, sys\n"
-                "label = sys.argv[sys.argv.index('--label') + 1]\n"
-                "print(json.dumps({'schema':'lattice-machine-state-v1','label':label,"
-                "'captured_at_utc':datetime.datetime.now(datetime.UTC)"
-                ".strftime('%Y-%m-%dT%H:%M:%SZ'),"
-                "'power':{'status':'unavailable','reason':'fixture'},"
-                "'thermal':{'status':'unavailable','reason':'fixture'},"
-                "'idle':{'status':'unavailable','reason':'fixture'}},"
-                "separators=(',', ':'), sort_keys=True))\n"
-            )
+        machine_probe.write_text(
+            STUB_MACHINE_PROBE
+            if stub_machine_state is None
+            else stub_machine_state
+        )
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
@@ -302,6 +348,147 @@ def _run(
 
 
 class BenchCompareMeasurementGuard(unittest.TestCase):
+    def test_reporter_mode_refuses_failed_machine_state_checkpoints(self):
+        """A missing state record must void a report-only A/B."""
+        self.assertGreater(len(FAILED_MACHINE_STATE_PROBES), 0)
+        control = _run([], stub_cargo=STALE_CHANGE_CARGO)
+        self.assertEqual(
+            control.returncode,
+            0,
+            f"valid report-only fixture did not produce a usable A/B\n"
+            f"stdout:\n{control.stdout}\nstderr:\n{control.stderr}",
+        )
+        for name, probe in FAILED_MACHINE_STATE_PROBES.items():
+            with self.subTest(probe=name):
+                self.assertTrue(name)
+                self.assertTrue(probe.strip())
+                result = _run(
+                    [],
+                    stub_cargo=STALE_CHANGE_CARGO,
+                    stub_machine_state=probe,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    2,
+                    f"report-only run accepted {name} state checkpoint\n"
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+
+    def test_reporter_mode_refuses_a_partial_baseline_copy(self):
+        """A partial baseline copy must void a report-only A/B."""
+        self.assertTrue(STALE_CHANGE_CARGO.strip())
+        self.assertTrue(PARTIAL_COPY_RSYNC.strip())
+        control = _run([], stub_cargo=STALE_CHANGE_CARGO)
+        self.assertEqual(
+            control.returncode,
+            0,
+            f"valid report-only fixture did not produce a usable A/B\n"
+            f"stdout:\n{control.stdout}\nstderr:\n{control.stderr}",
+        )
+        result = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            stub_rsync=PARTIAL_COPY_RSYNC,
+        )
+        self.assertEqual(
+            result.returncode,
+            2,
+            "report-only run accepted a partial baseline copy and could "
+            "return uncertified A/B output",
+        )
+
+    def test_datetime_utc_entrypoints_reject_python_3_9_explicitly(self):
+        """The declared Python minimum must fail before datetime.UTC imports."""
+        bootstrap = (
+            "import runpy,sys;"
+            "target=sys.argv[1];"
+            "sys.argv=[target];"
+            "sys.version_info=(3,9,6);"
+            "runpy.run_path(target,run_name='__main__')"
+        )
+        self.assertTrue(bootstrap)
+        self.assertGreater(len(PYTHON_ENTRYPOINTS_USING_DATETIME_UTC), 0)
+        for entrypoint in PYTHON_ENTRYPOINTS_USING_DATETIME_UTC:
+            with self.subTest(entrypoint=entrypoint.name):
+                self.assertTrue(str(entrypoint))
+                result = subprocess.run(
+                    [sys.executable, "-c", bootstrap, str(entrypoint)],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                self.assertEqual(
+                    result.returncode,
+                    1,
+                    f"unsupported interpreter was not rejected by {entrypoint}\n"
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn("requires Python 3.11 or newer", result.stderr)
+                self.assertIn("running Python 3.9.6", result.stderr)
+                self.assertIn(sys.executable, result.stderr)
+
+    def test_machine_state_probe_handles_missing_datetime_utc(self):
+        """A Python 3.9-shaped datetime module must yield the minimum diagnostic."""
+        bootstrap = (
+            "import runpy,sys;"
+            "target=sys.argv[1];"
+            "sys.argv=[target,'--label','compatibility-control'];"
+            "sys.version_info=(3,9,6);"
+            "runpy.run_path(target,run_name='__main__')"
+        )
+        datetime_stub = "class datetime:\n    pass\n"
+        self.assertTrue(bootstrap)
+        self.assertTrue(datetime_stub)
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "datetime.py").write_text(datetime_stub)
+            python_path = os.pathsep.join(
+                part
+                for part in (tmp, os.environ.get("PYTHONPATH"))
+                if part
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    bootstrap,
+                    str(REPO / "scripts" / "lib" / "machine-state-probe.py"),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "PYTHONPATH": python_path},
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("requires Python 3.11 or newer", result.stderr)
+        self.assertIn("running Python 3.9.6", result.stderr)
+        self.assertIn(sys.executable, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_every_bench_command_requires_the_committed_lockfile(self):
+        """Every A/B build and measurement must refuse dependency re-resolution."""
+        source = (LIB / "bench-compare-impl.sh").read_text()
+        commands = [
+            line for line in source.splitlines()
+            if re.search(r"\bcargo bench\b", line)
+            and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(commands), 6, commands)
+        self.assertTrue(
+            all(re.search(r"\bcargo bench --locked\b", line) for line in commands),
+            "every cargo bench command must pass --locked:\n" + "\n".join(commands),
+        )
+
+        result = _run(
+            ["--fail-on-regression"],
+            stub_cargo=STALE_CHANGE_CARGO,
+            extra_env={"STUB_REQUIRE_LOCKED": "1"},
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            f"locked benchmark harness failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+
     def test_enforcing_mode_refuses_a_run_that_measured_nothing(self):
         """A bench that exits 0 having printed no measurement must not certify.
 
@@ -339,7 +526,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         )
 
     def test_default_mode_refuses_a_failed_machine_state_probe_before_base(self):
-        result = _run([], state_probe=FAILING_STATE_PROBE)
+        result = _run([], stub_machine_state=FAILING_STATE_PROBE)
         self.assertEqual(
             result.returncode, 2,
             f"expected exit 2 (not measurable), got {result.returncode}\n"
@@ -467,6 +654,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             "failed (rsync exit 23)",
             result.stderr,
         )
+        self.assertIn("fixture rsync: partial baseline transfer", result.stderr)
 
     def test_each_bench_target_gets_a_distinct_criterion_root(self):
         """Target identity must be structural, not reconstructed from group names.

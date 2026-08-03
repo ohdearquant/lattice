@@ -713,22 +713,33 @@ class MachineStateGate(unittest.TestCase):
             self.assertIn("machine-state checkpoint 'before base' failed", r.stderr)
             self.assertNotIn("Building + benching BASE", r.stdout)
 
-    def test_blocked_macos_checkpoint_refuses_in_both_regression_modes(self):
-        for args in (["--fail-on-regression"], []):
-            with self.subTest(args=args), _Sandbox() as sb:
+    def test_blocked_macos_checkpoint_refuses_in_every_mode(self):
+        modes = {
+            "report-only": [],
+            "fail-on-regression": ["--fail-on-regression"],
+        }
+        self.assertGreater(len(modes), 0)
+        for mode, extra_args in modes.items():
+            with self.subTest(mode=mode), _Sandbox() as sb:
+                self.assertTrue(mode)
                 sb.force_platform("Darwin")
                 result = sb.run(
-                    [sb.entry, *args],
+                    [sb.entry, *extra_args],
                     BENCH_IDLE_FLOOR="0",
                     STUB_GOVERNOR_RC="2",
                 )
-                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(
+                    result.returncode,
+                    2,
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
                 self.assertEqual(sb.machine_state_labels(), ["before base"])
                 self.assertIn(
                     "machine-state checkpoint 'before base' failed",
                     result.stderr,
                 )
                 self.assertNotIn("Building + benching BASE", result.stdout)
+                self.assertNotIn("=== Run conditions ===", result.stdout)
 
 
 class ContentionDiagnostics(unittest.TestCase):
