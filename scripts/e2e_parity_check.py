@@ -53,6 +53,11 @@ import time
 import traceback
 from pathlib import Path
 
+if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from bench_supervision import ensure_python_entrypoint
+
+    ensure_python_entrypoint("e2e-parity")
 
 # Each entry is (prompt, match_window).
 #
