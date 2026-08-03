@@ -1636,6 +1636,8 @@ dependencies = [
  "futures",
  "half",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "image",
  "indexmap",
  "lattice-fann",
