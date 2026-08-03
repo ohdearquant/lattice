@@ -576,18 +576,24 @@ pub fn convert_quarot_qwen35(
     if was_tied {
         materialize_lm_head_for_qwen35(&mut working_set, &cfg)?;
     }
+
+    let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
+    // The historical `working_set.clone()` regression sat exactly here, between
+    // materialization and this prepare call (see git history at this path). Keep
+    // the `MaterializedWorkingSetBoundary` phase open through the call below so
+    // `converter_does_not_clone_materialized_working_set` observes allocations
+    // at the former clone site instead of stopping at materialization.
+    let equivalence_snapshot = prepare_forward_equivalence_qwen35_after_admission(
+        &working_set,
+        &rotation,
+        forward_admission,
+    )?;
     #[cfg(test)]
     pre_admission_allocation_tracking::mark_materialized_working_set_boundary_completed();
 
     let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg)?;
     fusion_plan.push(qwen35_final_norm_fusion_target());
     let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
-    let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
-    let equivalence_snapshot = prepare_forward_equivalence_qwen35_after_admission(
-        &working_set,
-        &rotation,
-        forward_admission,
-    )?;
 
     fuse_rmsnorms(&mut working_set, &fusion_plan)?;
     absorb_rotations(&mut working_set, &rotation_plan, &rotation)?;
@@ -1465,7 +1471,11 @@ mod tests {
 
     #[test]
     fn converter_does_not_clone_materialized_working_set() {
-        const REQUIRED_TIED_HEAD_ALLOCATION_CALLS: usize = 5;
+        // Spans tied-head materialization through
+        // `prepare_forward_equivalence_qwen35_after_admission` — the step that
+        // replaced the historical full-working-set clone — so a reintroduced
+        // clone at that former site is observed, not skipped.
+        const REQUIRED_MATERIALIZATION_AND_PREPARE_ALLOCATION_CALLS: usize = 152;
 
         let tmp = tempfile::tempdir().unwrap();
         let input = tmp.path().join("input");
@@ -1497,8 +1507,9 @@ mod tests {
         );
         assert_eq!(
             observation.materialized_working_set_allocation_calls,
-            REQUIRED_TIED_HEAD_ALLOCATION_CALLS,
-            "tied-head materialization performed unexpected owned allocations"
+            REQUIRED_MATERIALIZATION_AND_PREPARE_ALLOCATION_CALLS,
+            "tied-head materialization and forward-equivalence preparation performed \
+             unexpected owned allocations (a reintroduced working-set clone would show up here)"
         );
     }
 
