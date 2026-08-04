@@ -293,17 +293,39 @@ rather than only the number it produced.
   `[[bench]]` sections declared across `crates/*/Cargo.toml`, and files matching
   `crates/*/benches/*.rs`. The 31 was already off by one when it was written.
 - **Trigger set size.** This record states 452 files from `git ls-files 'crates/inference/*'
-  'crates/embed/*' 'crates/fann/*'`. That command yields 473 on the current checkout, and the
-  equivalent read at the record's own date yields 472. The 452 does not reproduce under the
-  command it is attributed to. This amendment states that and does not assert what produced it.
+  'crates/embed/*' 'crates/fann/*'`. That command yields 473 on the current checkout. At
+  `63a50832e3cfaabcb72a10a7c4639069844f64fe` — the ref this record names for its own
+  measurements, at line 13 — the equivalent read yields **465**
+  (`git ls-tree -r --name-only 63a50832e3cfaabcb72a10a7c4639069844f64fe -- crates/inference/
+  crates/embed/ crates/fann/ | wc -l`). The unreproduced gap is therefore 13, not the 20 an
+  end-of-day comparison suggests. The 452 does not reproduce under the command it is attributed
+  to, and this amendment states that without asserting what produced it.
+
+  The first draft of this correction compared against a commit chosen by calendar date rather
+  than the ref the record names, and reported 472. Both numbers are real reads of the repository
+  and they differ by eight commits of the same afternoon. **A record that names its own
+  measurement ref is re-derived at that ref**; a same-day read is a different measurement wearing
+  the same date. The correction of a numeral is not exempt from the discipline the numeral
+  failed, and a section whose entire subject is that counts must be checkable at a named ref is
+  the worst possible place to pick a ref by date.
 
 ### The result is unchanged, and now reproduces under both surfaces
 
-Measured on 2026-08-04 across the 34 pull requests open at the time of measurement, which
-excludes the one carrying this amendment because it did not yet exist and is in any case
-documentation only: 26 trigger the rule. Under the surface
-as originally written, zero are reached. Under the corrected surface, one is reached, PR #1289,
-and it is reached through `crates/embed/src/lib.rs` alone.
+Measured over the population recorded in
+[`ADR-087-amendment-1-population-snapshot.md`](ADR-087-amendment-1-population-snapshot.md),
+which pins the cutoff, every open pull request number, and each one's head OID: 35 open, of
+which 26 trigger the rule. Under the surface as originally written, zero are reached. Under the
+corrected surface, one is reached, PR #1289, and it is reached through `crates/embed/src/lib.rs`
+alone. The snapshot classifies on both `filename` and `previous_filename`, so those counts
+already carry the rename fix described below, and they are unchanged by it.
+
+**The counts are stated against a committed snapshot rather than a date, because a date does not
+identify a population that changes hourly.** An earlier version of this paragraph read "the 34
+pull requests open at the time of measurement" and gave no way to say which 34. That number was
+also self-falsifying: opening the pull request that carries this amendment made the population
+35 while the sentence claiming 34 sat inside it. A count of a moving population is a claim no
+later reader can check and no author can re-check, so it is recorded as a list or it is not
+recorded.
 
 So the conclusion of Problem 3 survives its own evidence being corrected. What changes is the
 predicate that is about to decide 25 dispositions.
@@ -321,6 +343,30 @@ open: `crates/inference/src/forward/cpu/softmax.rs:44` reaches
 absent from the surface because the surface is file-level and direct by construction. It is the
 disclosed bound working as disclosed, not a second omission, and it is recorded here so that a
 reader who finds it does not have to re-derive whether it was missed.
+
+### Correction 3: this record's Consequences say an unreached PR waits, and that is superseded
+
+The second bullet under **Consequences** reads: _"The remaining PRs do not merge on a structural
+proof, and they do not merge on an A/B either, because the A/B did not observe them. They wait
+on the instrument."_
+
+That disposition is **withdrawn and replaced** by D3-A below. It was written when the only two
+admissible artifacts were a structural proof and an A/B table, so a PR the instrument could not
+observe had nothing it could offer and waiting was the only honest option left. D3-A adds a
+third admissible artifact — a pinned unreachability statement — and a PR carrying one is not
+waiting on the instrument, it has said the true thing about the instrument.
+
+This is stated explicitly rather than left to inference because the two texts give **opposite
+dispositions to the same population**, and an amendment that adds a path without retiring the
+one it replaces leaves the next reader to pick. Whichever they pick, roughly two dozen pull
+requests move or do not move on it. An unretracted sentence is not a dead letter; it is the
+sentence a reader who does not reach the amendment will apply.
+
+The bound is exact. What is withdrawn is the _wait_, not the _burden_. D3 is untouched: the
+reachability burden still sits with any citation of bench-compare output, and an unreachability
+statement discharges the bench-evidence requirement only by being checkable, which is what the
+pinning rule in step 1 is for. A PR whose statement does not pin, or whose pins have moved, has
+not discharged anything and is back where the old bullet left it.
 
 ### D3-A: the reach predicate has two granularities, and file-level reach only opens the second
 
@@ -343,10 +389,26 @@ executes? Discharged only by naming, for every changed hunk in every reached fil
 benched path cannot observe it. Three forms are admissible:
 
 - the hunk adds an item and modifies none, with the added item shown to be absent from the
-  bench's import and call surface;
+  bench's import and call surface — **and, where the added item introduces contents of its own,
+  those contents discharged under this same list, recursively**;
 - the hunk is behind a `cfg` the bench build does not enable, with the bench build's resolved
   feature set stated rather than assumed;
 - the hunk changes only text the compiler discards, shown by the diff itself.
+
+**Form 1 is a test on behaviour, not on tokens, and it is recursive for a reason.** A module
+declaration is two words in a diff and an arbitrary quantity of code behind them. Read
+lexically, `pub mod x;` adds one item, modifies none, and appears nowhere in the bench's import
+list, so it discharges — while `x` may contain a `#[global_allocator]`, a `#[no_mangle]` or
+`#[export_name]` symbol, a linker or codegen attribute, a `static` with an initializer, a trait
+`impl` on a type the bench already uses, or a macro the bench's dependencies expand. Every one of
+those changes what the benched binary does without appearing at the bench's import surface at
+all, because their effect is by construction not by reference. The absent-from-the-import-surface
+check is necessary and is nowhere near sufficient: it is an allowlist over the names a diff
+mentions, and the risk lives in what the named thing contains.
+
+So an item addition discharges only when its contents are enumerated and each is itself
+discharged. If the contents are not read, Form 1 is not available and the PR runs the A/B. This
+is deliberately the expensive reading: the cheap one is indistinguishable from not looking.
 
 Anything else fails step 2 and the PR runs the A/B. Not admissible at either step: an argument
 that a change is small, cold, or obviously harmless. That is the reading D3 exists to prevent,
@@ -363,19 +425,35 @@ the A/B instead of arguing about it.
 Step 1: reached, through `crates/embed/src/lib.rs`, and no other file in the surface.
 
 Step 2: the change to that file is two lines, `#[cfg(feature = "native")]` and `pub mod drift;`,
-inserted between existing module declarations. No existing item is modified. The bench's only
-reference into this file's surface is the `EmbeddingModel` re-export at `:34`, which the diff
-does not touch, and `mod model;` is likewise untouched. This discharges under the first form.
+inserted between existing module declarations. No existing item is modified. The bench's three
+import paths into this crate resolve through **four** root-level declarations, and all four are
+checked rather than only the one named in an earlier version of this section:
+`use lattice_embed::EmbeddingModel` resolves through the re-export at `:34`, which in turn
+depends on the private `mod model;` at `:22`; `use lattice_embed::service::{…}` resolves through
+`pub mod service;` at `:23`; and `use lattice_embed::simd::{…}` resolves through `pub mod simd;`
+at `:24`. The diff modifies none of the four. Counting the re-export alone understates the
+root-module surface the bench depends on, and a change to `:22`, `:23` or `:24` would be
+invisible to a check that looked only at `:34`.
+
+**That is as far as the declaration gets it, and it is not far enough.** Under Form 1 as
+corrected above, an item addition discharges only when the added item's contents are themselves
+enumerated and discharged. `drift`'s contents are not read here, so Form 1 is unavailable and
+step 2 is undischarged. An earlier version of this example concluded the opposite — it read the
+two-line hunk lexically, found the added name absent from the bench's import surface, and
+discharged. That conclusion was the lexical hole, demonstrated on the one PR the predicate had
+to decide.
 
 Step 3: `native` is in `lattice-embed`'s default feature set, so the added module does compile
-into the bench build. The claim is that no benched symbol changed. It is not a claim that the
-emitted binary is identical.
+into the bench build. Even had step 2 discharged, the claim available would be that no benched
+symbol changed, never that the emitted binary is identical.
 
-Disposition: PR #1289 runs the A/B regardless. It is the only reached PR in the current
-population, and running one comparison is cheaper than establishing that its step 3 residual
-does not matter. That is an operational call about a population of one, and it is recorded
-separately from the predicate so that a later reader does not mistake it for the predicate
-producing a different answer than it does.
+Disposition: PR #1289 runs the A/B. Under the corrected Form 1 that is what the predicate
+requires rather than an operational preference, which is a stronger footing than the earlier
+version of this section had: it previously reached the same disposition by judgement, on the
+grounds that one comparison is cheaper than arguing about a residual in a population of one. Same
+outcome, different authority. Where the predicate and a convenience argument agree, the
+predicate is what gets recorded, because the convenience argument does not survive a population
+of twenty.
 
 ### D5: direction for the target and trigger sets
 
@@ -403,8 +481,16 @@ All reads are at `origin/main` at `e842a892d950f3d3b2687eaf6cc573e0587785a7` unl
 named, and use `git ls-tree` rather than `git ls-files` where the question is about a ref rather
 than about a checkout.
 
+An earlier version of this block asserted that method and then listed one command that did not
+follow it: a bare `grep` over two bench files, which reads whatever the working tree happens to
+hold. A stated ref discipline is not evidence that the commands beneath it observe the ref, and a
+single checkout-relative read inside a ref-qualified list is invisible precisely because the
+surrounding commands are correct. Every read below is now ref-qualified in the command itself, so
+the discipline is checkable from the commands rather than from the sentence introducing them.
+
     # bench imports, both default targets
-    grep -n '^use ' crates/inference/benches/elementwise_cpu_bench.rs crates/embed/benches/simd.rs
+    git show <ref>:crates/inference/benches/elementwise_cpu_bench.rs | grep -n '^use '
+    git show <ref>:crates/embed/benches/simd.rs                     | grep -n '^use '
 
     # surface file counts
     git ls-tree -r --name-only origin/main -- crates/inference/src/forward/cpu/ | grep -c '\.rs$'
@@ -418,24 +504,64 @@ than about a checkout.
     # trigger set
     git ls-tree -r --name-only origin/main -- crates/inference/ crates/embed/ crates/fann/ | wc -l
 
-    # open-PR join
+    # open-PR join — BOTH name fields, see below
     gh pr list --state open --limit 100 --json number
-    gh api "repos/<slug>/pulls/<n>/files?per_page=300" --jq '.[].filename'
+    gh api "repos/<slug>/pulls/<n>/files?per_page=300" --jq '.[] | .filename, .previous_filename'
 
-The classification predicate is an anchored alternation with a trailing separator on every
-directory prefix and an end anchor on every exact path:
+**The join reads both name fields, and the first draft of it did not.** GitHub represents a
+rename with a new `filename` and an old `previous_filename`, so a projection of `.[].filename`
+alone reports only where a file landed and never where it came from. This repository contains a
+real instance: PR #1038 carries
+`{"filename": "crates/tune/src/train_support.rs", "previous_filename":
+"crates/tune/src/bin/train_common/mod.rs", "status": "renamed"}`. A diff that renamed a file
+_out of_ the reachable surface, or renamed a crate root _into_ a path the surface does not list
+and then changed it, would touch the surface at its old name while the join saw only the
+unmatched new one. Step 1 would answer "no" and step 2 would never be owed. The failure is
+silent and runs in the permissive direction, which is the direction this record already names as
+the one nobody investigates.
 
-    ^(crates/inference/src/forward/cpu/|crates/embed/src/simd/|crates/embed/src/service/|crates/embed/src/lib\.rs$|crates/embed/src/model\.rs$)
+Two consequences follow. Deletions and renames are classified on **both** names. And a diff that
+changes a crate's `[lib] path`, or otherwise moves a crate root, is a **mandatory step-1 reach**
+regardless of what the surface list says, until the new root has been derived into the surface —
+because the surface names crate roots by path, and a moved root makes every one of those entries
+stale in a way no path comparison can detect.
 
-Both arms were run in the same invocation before any count was taken. Must-match:
-`crates/inference/src/forward/cpu/softmax.rs`, `crates/embed/src/simd/dot.rs`,
-`crates/embed/src/lib.rs`, `crates/embed/src/model.rs`. Must-not-match:
-`crates/inference/src/forward/cpu_f16.rs`, which is the prefix error this record already
+The classification predicate is a path-prefix test plus an exact-path set, evaluated as string
+operations rather than as a regular expression:
+
+    reached(p) := p.startswith("crates/inference/src/forward/cpu/")
+               or p.startswith("crates/embed/src/simd/")
+               or p.startswith("crates/embed/src/service/")
+               or p == "crates/embed/src/lib.rs"
+               or p == "crates/embed/src/model.rs"
+
+An earlier form of this predicate was a single anchored alternation in which the two exact paths
+carried a `$` anchor and the three directories carried a trailing separator. That form is
+correct under an engine where `$` matches only at end of string, and the record did not say
+which engine. Stating the predicate as prefix tests and equality tests removes the dependency
+rather than documenting it: **the two exact entries are equality, not suffix matching**, and the
+three directory entries match only at a path boundary.
+
+All nine control arms were evaluated in one invocation, against the tracked file list at
+`e842a892d950f3d3b2687eaf6cc573e0587785a7`, before any count was taken. Must-match:
+`crates/inference/src/forward/cpu/softmax.rs`, `crates/embed/src/simd/dot_product.rs`,
+`crates/embed/src/service/mod.rs`, `crates/embed/src/lib.rs`, `crates/embed/src/model.rs`.
+Must-not-match: `crates/inference/src/forward/cpu_f16.rs`, the prefix error this record already
 discloses and which a missing trailing separator reintroduces;
-`crates/embed/src/model_loader.rs`, which is the same error in the new exact-path entries;
 `crates/inference/src/attention/softmax_row.rs`, which must stay out because the surface is
-direct rather than transitive; and `crates/fann/src/lib.rs`. All eight arms returned their
-expected values.
+direct rather than transitive; `crates/fann/src/lib.rs`; and `crates/embed/src/model.rs.bak`,
+**which is synthetic and is labelled as such** — no such file exists in the repository, and it
+is present only to test that the two exact entries reject a suffix extension.
+
+Every must-match arm is additionally asserted to be a **tracked path at that ref**, in the same
+invocation. An earlier form of these controls named `crates/embed/src/simd/dot.rs` and
+`crates/embed/src/model_loader.rs`, neither of which exists in this repository — the real file is
+`dot_product.rs` — and presented both as repository paths. Those arms exercised the predicate
+against strings and returned the expected answers, so the stated result was not false; what was
+false was the implication that the predicate had been checked against the files it claims to
+classify. A must-match arm on a path that does not exist tests a regular expression, not a
+surface. Eight arms in two directions read as thorough, which is exactly why nobody re-derived
+them.
 
 ### Direction of error for this amendment
 
