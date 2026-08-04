@@ -84,12 +84,40 @@ check_version_available() {
     pkgdir="$1"
     name=$(node -p "require('$pkgdir/package.json').name")
     version=$(node -p "require('$pkgdir/package.json').version")
-    if npm view "$name@$version" version >/dev/null 2>&1; then
+    view_out=$(npm view "$name@$version" version --json 2>/dev/null)
+    view_status=$?
+    if [ "$view_status" -eq 0 ]; then
         echo "ERROR: $name@$version is already published on npm and cannot be republished." >&2
         echo "       npm name@version tuples are immutable. Bump the version in" >&2
         echo "       $pkgdir/package.json (and every sibling package that must move in" >&2
         echo "       lockstep) before publishing -- this is a coordinated release decision," >&2
         echo "       not something this script infers automatically." >&2
+        exit 1
+    fi
+    # A nonzero exit means either "not found" (the only case that establishes
+    # availability) or a lookup failure (DNS/TLS, registry 5xx, auth) that tells
+    # us nothing about whether the version is free. `npm view --json` puts the
+    # error body on stdout as {"error":{"code":...}}; only E404 counts as
+    # not-found (verified against npm 11.8.0's actual output for a missing
+    # package -- see fix_r4_report.md). Anything else must fail the release
+    # closed rather than be silently treated as "available".
+    error_code=$(printf '%s' "$view_out" | node -e "
+        let input = '';
+        process.stdin.on('data', c => input += c);
+        process.stdin.on('end', () => {
+            try {
+                console.log(JSON.parse(input).error.code || '');
+            } catch {
+                console.log('');
+            }
+        });
+    " 2>/dev/null)
+    if [ "$error_code" != "E404" ]; then
+        echo "ERROR: preflight lookup for $name@$version failed and did not return npm's" >&2
+        echo "       not-found response (E404), so availability could not be established." >&2
+        echo "       This can be a DNS/TLS failure, a registry 5xx, or an auth problem --" >&2
+        echo "       none of which mean the version is free to publish. Raw npm view output:" >&2
+        echo "$view_out" >&2
         exit 1
     fi
 }

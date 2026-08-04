@@ -114,3 +114,47 @@ test('rejects an ordinary unexpected extra file', () => {
 test('rejects empty stdin', () => {
   assert.throws(() => execFileSync('node', [SCRIPT], { input: '', encoding: 'utf8' }))
 })
+
+test('rejects a payload file under a README-named directory', () => {
+  // README.docs/ is a directory, not the root README file npm auto-includes. A
+  // dot-star matcher would treat 'README.docs/payload.txt' as an exempt README
+  // (crossing the '/'); a segment matcher must not.
+  const dir = makeFixture({
+    'package.json': basePackageJson(['test.node', 'README.docs']),
+    'test.node': '',
+    'README.docs/payload.txt': 'arbitrary payload smuggled via a README-named dir\n',
+  })
+  try {
+    assert.throws(() => packAndAssert(dir))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('accepts a root README whose suffix contains a line terminator', () => {
+  // JavaScript `.` does not match line terminators, but minimatch `*` does not
+  // exclude them either -- npm itself includes this file, so the guard must too.
+  const dir = makeFixture({
+    'package.json': basePackageJson(['test.node']),
+    'test.node': '',
+    'README.\nnotes': 'line-terminator suffix readme\n',
+  })
+  try {
+    assert.doesNotThrow(() => packAndAssert(dir))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('accepts a bare README with no extension', () => {
+  const dir = makeFixture({
+    'package.json': basePackageJson(['test.node']),
+    'test.node': '',
+    README: 'bare readme, no extension\n',
+  })
+  try {
+    assert.doesNotThrow(() => packAndAssert(dir))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
