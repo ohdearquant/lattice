@@ -3,8 +3,6 @@
 This document traces a token through the Qwen3.5 inference forward pass,
 referencing the real module and function names from `crates/inference/src/`.
 The path described here is the **Qwen3.5 path** (`crate::model::qwen35`).
-The older `crate::generate::generate` / `crate::sampling::Sampler::sample`
-path is a separate code path and is not described here.
 
 ---
 
@@ -29,17 +27,20 @@ state is threaded through all subsequent sampling calls.
 - `KvCache` — key/value cache for full-attention layers.
 - `ForwardScratch` — reusable activation buffers (hidden, q, k, v, …).
 
-### 4. Prefill loop — `crate::model::qwen35::generation::prefill_tokens`
+### 4. Prompt prefill — `Qwen35Model::prefill_tokens_batched_for_generate`
 
-`prefill_tokens` iterates over each prompt token and calls
-`model.forward_step(token_id, pos, …)` for each position, populating the
-KV cache and GDN state.
+For dense models, `generate` first calls `prefill_tokens_batched_for_generate`,
+which processes all prompt positions in one batched layer pass and returns only
+the final position's logits. MoE models return `UnsupportedModel` from that path
+before mutating recurrent state, so generation falls back to the serial
+`prefill_tokens` loop. The serial loop calls `forward_step(token_id, pos, …)`
+once per prompt token while populating the KV cache and GDN state.
 
 ### 5. Single-token forward entry — `crate::model::qwen35::Qwen35Model::forward_step`
 
-`forward_step` is the core per-token entry point used for both prefill and
-decode. It grows scratch buffer capacity if the current token position
-requires it.
+`forward_step` is the core per-token entry point used for decode and the serial
+MoE prefill fallback. It grows scratch buffer capacity if the current token
+position requires it.
 
 ### 6. Embedding lookup — `crate::model::qwen35::Qwen35Model::forward_step`
 
@@ -148,8 +149,8 @@ the vocabulary weight matrix, producing a logit vector of size `vocab_size`.
 
 ### 22–23. Sampling — `crate::model::qwen35::sampling::sample_token`
 
-`sample_token` is the Qwen3.5 sampling entry point, called after each
-prefill step and in the decode loop.
+`sample_token` is the Qwen3.5 sampling entry point, called once after the
+completed prompt prefill and again on each decode step.
 
 It applies, in order:
 
@@ -162,12 +163,3 @@ It applies, in order:
 
 The drawn token id is appended to the generated sequence and becomes the
 input to the next `forward_step` call.
-
----
-
-## Scope note
-
-This walkthrough covers the Qwen3.5 code path only. The codebase also
-contains an older generation path (`crate::generate::generate`) with its own
-sampler (`crate::sampling::Sampler::sample`); that path is not described here
-and must not be conflated with the Qwen3.5 path above.
