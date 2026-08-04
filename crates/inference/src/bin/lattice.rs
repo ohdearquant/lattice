@@ -2591,6 +2591,10 @@ mod serve {
 
     #[cfg(feature = "metal-gpu")]
     impl MetalHandle {
+        fn supports_vision(&self) -> bool {
+            self.client.supports_vision()
+        }
+
         /// Normalizes
         /// [`lattice_inference::serve::metal_worker::WorkerEvent::Cancelled`]
         /// (the job was skipped at dequeue time: the client's `cancel`
@@ -2763,6 +2767,19 @@ mod serve {
         }
     }
 
+    #[cfg(feature = "metal-gpu")]
+    fn map_metal_generation_error(error: ApiError) -> ApiError {
+        match error {
+            error @ (ApiError::ServiceUnavailable { .. } | ApiError::BadRequest { .. }) => error,
+            other => {
+                eprintln!("generation error (metal): {other:?}");
+                ApiError::Internal {
+                    message: "inference failed".to_string(),
+                }
+            }
+        }
+    }
+
     /// The two ways `AppState` can run generation: the original CPU
     /// (safetensors) path via `Arc<Qwen35Model>`, or the Metal GPU (native
     /// Q4) path via a worker-thread handle. Both variants funnel into the
@@ -2844,6 +2861,16 @@ mod serve {
             }
         }
 
+        pub fn supports_vision(&self) -> bool {
+            match self {
+                ModelBackend::Cpu(_) => false,
+                #[cfg(feature = "metal-gpu")]
+                ModelBackend::Metal { handle, .. } => handle.supports_vision(),
+                #[cfg(all(feature = "test-utils", test))]
+                ModelBackend::CpuFakeGenerate { .. } => false,
+            }
+        }
+
         /// Load a native Q4 checkpoint on the shared Metal worker thread
         /// (`lattice_inference::serve::metal_worker::MetalWorker`, issue
         /// #832 — the same shared owner `lattice_serve.rs` uses) and return
@@ -2856,7 +2883,7 @@ mod serve {
             max_pending: usize,
         ) -> Result<(Self, usize), String> {
             use lattice_inference::serve::metal_worker::{
-                ContextWindowPolicy, MetalWorker, StartupError, WorkerMetadata,
+                ContextWindowPolicy, MetalWorker, StartupError, VisionRuntime, WorkerMetadata,
             };
 
             let tokenizer_path = tokenizer_dir
@@ -2888,9 +2915,12 @@ mod serve {
             // HTTP-layer `check_context_window` preflight that already runs
             // first in `prepare_chat_request`.
             let max_context = super::MetalChatBackend::MAX_CACHE_LEN;
+            let vision_config = super::load_q4_config(&model_dir)?;
+            let vision_runtime =
+                VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
             let model_dir_for_loader = model_dir.clone();
             let tokenizer_path_for_loader = tokenizer_path.clone();
-            let (owner, client, _meta) = MetalWorker::spawn(
+            let (owner, client, _meta) = MetalWorker::spawn_with_vision(
                 move || {
                     let cfg = super::load_q4_config(&model_dir_for_loader)?;
                     let state =
@@ -2911,6 +2941,7 @@ mod serve {
                         },
                     ))
                 },
+                vision_runtime,
                 max_pending,
             )
             .map_err(|e| match e {
@@ -3269,7 +3300,7 @@ mod serve {
     #[cfg(test)]
     fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> {
         lattice_inference::serve::contract::normalize_messages(messages)
-            .map(into_engine_chat_messages)
+            .and_then(into_engine_chat_messages)
     }
 
     // -----------------------------------------------------------------------
@@ -3433,13 +3464,14 @@ mod serve {
         model_id: &str,
         default_max_tokens: usize,
         max_tokens_cap: usize,
+        vision_supported: bool,
         tokenize_len: impl FnOnce(&str) -> usize,
         max_context: impl FnOnce() -> usize,
     ) -> Result<PreparedChatRequest, ApiError> {
         let (validated, prompt) = normalize_request_with_context(
             req,
             GenerationDefaults::standard(default_max_tokens),
-            ServeProfile::lattice(model_id, max_tokens_cap),
+            ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
             |messages, max_tokens| {
                 let prompt = format_normalized_chat_template(messages);
                 let prompt_token_count = tokenize_len(&prompt);
@@ -3458,7 +3490,7 @@ mod serve {
             stream,
             ..
         } = validated;
-        let messages = into_engine_chat_messages(messages);
+        let messages = into_engine_chat_messages(messages)?;
 
         Ok(PreparedChatRequest {
             messages,
@@ -3621,6 +3653,7 @@ mod serve {
             &state.model_id,
             state.default_max_tokens,
             state.max_tokens_cap,
+            state.model.supports_vision(),
             |p| state.model.tokenize_len(p),
             || state.model.max_context(),
         )?;
@@ -3909,22 +3942,9 @@ mod serve {
                 ModelBackend::Metal { handle, .. } => handle
                     .generate_streaming(chat_messages, gen_cfg, |_delta| true)
                     .await
-                    .map_err(|e| match e {
-                        // #939: admission rejection (#932's outstanding-job
-                        // cap) must surface as the shared 503 `server_busy`
-                        // envelope unchanged -- collapsing it into
-                        // `ApiError::Internal` here made every non-streaming
-                        // Metal admission rejection an indistinguishable 500.
-                        ApiError::ServiceUnavailable { message } => {
-                            ApiError::ServiceUnavailable { message }
-                        }
-                        other => {
-                            eprintln!("generation error (metal): {other:?}");
-                            ApiError::Internal {
-                                message: "inference failed".to_string(),
-                            }
-                        }
-                    })?,
+                    // Preserve admission 503s and request-dependent worker
+                    // rejections (including image geometry/context 400s).
+                    .map_err(map_metal_generation_error)?,
                 // ADR-080 C2 added
                 // this variant for the streaming arm's cancellation probe
                 // only, so non-streaming used to bypass the injected
@@ -5033,7 +5053,7 @@ mod serve {
             assert!(matches!(
                 err,
                 ApiError::BadRequest {
-                    code: "unsupported_feature",
+                    code: "vision_unsupported",
                     ..
                 }
             ));
@@ -5174,7 +5194,7 @@ mod serve {
             let err = to_chat_messages(&messages).unwrap_err();
             match err {
                 ApiError::BadRequest { message, code } => {
-                    assert_eq!(code, "unsupported_feature");
+                    assert_eq!(code, "vision_unsupported");
                     assert_eq!(message, "image input requires a vision-capable model");
                 }
                 other => panic!("expected BadRequest, got {other:?}"),
@@ -5195,7 +5215,8 @@ mod serve {
                     assert_eq!(code, "unsupported_feature");
                     assert_eq!(
                         message,
-                        "content part type 'file' is not supported; only 'text' parts are accepted"
+                        "content part type 'file' is not supported; only 'text' and 'image_url' \
+                         parts are accepted"
                     );
                 }
                 other => panic!("expected BadRequest, got {other:?}"),
@@ -5518,7 +5539,8 @@ mod serve {
                 ..bare_req()
             };
             let prepared =
-                prepare_chat_request(&req, "served-model", 256, 4096, |_| 1, || 4096).unwrap();
+                prepare_chat_request(&req, "served-model", 256, 4096, false, |_| 1, || 4096)
+                    .unwrap();
             assert_eq!(prepared.stop_strings, vec!["\n\n".to_string()]);
         }
 
@@ -5545,8 +5567,9 @@ mod serve {
                 stop: Some(serde_json::json!([])), // malformed: empty array is rejected
                 ..bare_req()
             };
-            let err = prepare_chat_request(&req, "served-model", 256, 4096, |_| 4096, || 4096)
-                .unwrap_err();
+            let err =
+                prepare_chat_request(&req, "served-model", 256, 4096, false, |_| 4096, || 4096)
+                    .unwrap_err();
             assert!(matches!(
                 err,
                 ApiError::BadRequest {
@@ -5588,6 +5611,138 @@ mod serve {
                 max_tokens_cap,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        mod vision_content_parts_1135 {
+            use super::*;
+            use axum::body::Body;
+            use base64::Engine as _;
+            use lattice_inference::serve::metal_worker::{
+                ContextWindowPolicy, spawn_fake_with_vision,
+            };
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use tower::ServiceExt as _;
+
+            fn inline_png_data_uri() -> String {
+                let image = image::RgbImage::new(32, 32);
+                let mut bytes = Vec::new();
+                image
+                    .write_to(
+                        &mut std::io::Cursor::new(&mut bytes),
+                        image::ImageFormat::Png,
+                    )
+                    .expect("PNG fixture must encode");
+                format!(
+                    "data:image/png;base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                )
+            }
+
+            fn request(data_uri: &str) -> axum::http::Request<Body> {
+                let body = serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "before"},
+                            {"type": "image_url", "image_url": {"url": data_uri}},
+                            {"type": "text", "text": "after"}
+                        ]
+                    }]
+                });
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request fixture must build")
+            }
+
+            #[test]
+            fn worker_bad_request_remains_a_client_error() {
+                let error = map_metal_generation_error(ApiError::BadRequest {
+                    message: "image geometry is unsupported".to_string(),
+                    code: "invalid_image",
+                });
+                assert!(matches!(
+                    error,
+                    ApiError::BadRequest {
+                        code: "invalid_image",
+                        ..
+                    }
+                ));
+            }
+
+            #[tokio::test]
+            async fn vision_model_accepts_image_and_enqueues_it_on_the_shared_worker() {
+                let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                    .tokenizer()
+                    .clone();
+                let image_seen = Arc::new(AtomicBool::new(false));
+                let seen = Arc::clone(&image_seen);
+                let client = spawn_fake_with_vision(
+                    ContextWindowPolicy::PromptAndMaxTokens,
+                    4096,
+                    tokenizer.clone(),
+                    move |messages, _cfg, prompt_tokens, _on_token, _should_cancel| {
+                        let image = messages[0]
+                            .image
+                            .as_ref()
+                            .expect("image must reach the common worker job");
+                        assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+                        assert_eq!(image.text_offset, "before".len());
+                        assert_eq!(messages[0].content, "beforeafter");
+                        seen.store(true, Ordering::SeqCst);
+                        Ok(GenerateOutput {
+                            text: "ok".to_string(),
+                            token_ids: vec![0],
+                            prompt_tokens,
+                            generated_tokens: 1,
+                            stopped: true,
+                            stop_reason: None,
+                            token_logprobs: vec![],
+                        })
+                    },
+                );
+                let state = AppState {
+                    model: ModelBackend::Metal {
+                        handle: MetalHandle { client },
+                        tokenizer: Arc::new(tokenizer),
+                        max_context: 4096,
+                    },
+                    default_max_tokens: 16,
+                    max_tokens_cap: 64,
+                    model_id: "test-model".to_string(),
+                    request_counter: Arc::new(AtomicU64::new(0)),
+                };
+
+                let response = router(state)
+                    .oneshot(request(&inline_png_data_uri()))
+                    .await
+                    .expect("router must return a response");
+                assert_eq!(response.status(), StatusCode::OK);
+                assert!(image_seen.load(Ordering::SeqCst));
+            }
+
+            #[tokio::test]
+            async fn text_only_model_rejects_the_same_image_with_capability_code() {
+                let response = router(tiny_state(64))
+                    .oneshot(request(&inline_png_data_uri()))
+                    .await
+                    .expect("router must return a response");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("error body must be readable");
+                let value: serde_json::Value =
+                    serde_json::from_slice(&body).expect("error body must be JSON");
+                assert_eq!(value["error"]["code"], "vision_unsupported");
+                assert_eq!(
+                    value["error"]["message"],
+                    "image input requires a vision-capable model"
+                );
             }
         }
 

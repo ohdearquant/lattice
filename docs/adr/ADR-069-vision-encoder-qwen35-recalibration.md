@@ -224,3 +224,38 @@ them:
 R1's "before merging S3" reading maps to: the cosine-vs-HF criterion binds S3a; S3b's criterion is
 parity with the verified CPU reference. S4-S6 stage definitions are unchanged; S5's injection work
 composes with S3b (Metal) for the end-to-end path but may develop against S3a outputs.
+
+## Amendment 2 — Shared HTTP image contract and Metal-worker routing (2026-07-29)
+
+The HTTP portion of S6 is implemented once in `serve/contract.rs` and consumed by both
+`lattice serve` and `lattice_serve`; neither binary owns a second image parser or capability rule.
+Admission is derived from the loaded worker's concrete `Qwen35Config`: `vision_config` plus
+`image_token_id`, `vision_start_token_id`, and `vision_end_token_id` must all be present. CPU and
+text-only checkpoints therefore keep returning 400 `vision_unsupported`; a supported q4 or
+sharded-safetensors manifest must contain the exact expected visual tensor inventory, with every
+referenced file openable, before the worker advertises capability.
+
+The accepted wire shape is deliberately narrow:
+
+- one `image_url` part in one user message per request;
+- inline `data:image/png;base64,...` or `data:image/jpeg;base64,...` only;
+- non-streaming requests only until multimodal generation can emit incremental deltas;
+- at most 48,000 decoded bytes, 2,048 pixels per dimension, 256 pre-merge patches, and 16 MiB of
+  preprocessed f32 patch data;
+- text parts before and after the image preserve the image's original UTF-8 byte position; and
+- remote fetch, multiple images, video, and dynamic resizing remain deferred.
+
+The common worker lazily loads vision weights on the first admitted image job, performs bounded
+decode/preprocessing, Metal ViT forward, merger, and then calls the existing
+`generate_multimodal_vision_with_cancel` decoder path. It polls client cancellation after bounded
+preprocessing, between lazily loaded vision tensors, at every Metal ViT block and attention head,
+throughout the CPU merger, and during decoder prefill and decode; image streaming remains rejected
+rather than buffering an answer behind a misleading streaming response. Plain-text jobs keep the
+existing template, prefix-cache, streaming, and cancellation path. Cross-binary HTTP tests assert
+that the same
+inline PNG reaches the common worker only for a vision-capable backend, while text-only backends
+return the same machine code. The model-gated `vision_serve_e2e_test` additionally asserts that a
+real HTTP image request emits the production multimodal-dispatch marker, that every encoder GEMM
+for the 256-patch golden image actually dispatched to Metal instead of silently taking the CPU
+fallback, and that the request returns generated text, while a text-only control request does not
+emit that marker. The Studio composer portion of S6 remains separate UI work.

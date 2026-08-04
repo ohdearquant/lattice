@@ -34,27 +34,49 @@ pub mod contract;
 /// Convert normalized contract messages into the engine's chat representation.
 ///
 /// Both HTTP binaries cross the contract/backend boundary through this one
-/// adapter so role mapping cannot drift between them.
+/// adapter so role mapping cannot drift between them. A caller-constructed
+/// normalized value that attaches an image to a non-user role is rejected
+/// rather than allowed to reach the engine.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] when a caller-constructed normalized
+/// message attaches an image to a non-user role.
 pub fn into_engine_chat_messages(
     messages: Vec<contract::NormalizedChatMessage>,
-) -> Vec<crate::forward::metal_qwen35::ChatMessage> {
+) -> Result<Vec<crate::forward::metal_qwen35::ChatMessage>, ApiError> {
     messages
         .into_iter()
-        .map(|message| match message.role {
-            contract::NormalizedChatRole::System => {
-                crate::forward::metal_qwen35::ChatMessage::system(message.content)
+        .map(|message| match (message.role, message.image) {
+            (contract::NormalizedChatRole::System, None) => Ok(
+                crate::forward::metal_qwen35::ChatMessage::system(message.content),
+            ),
+            (contract::NormalizedChatRole::User, None) => Ok(
+                crate::forward::metal_qwen35::ChatMessage::user(message.content),
+            ),
+            (contract::NormalizedChatRole::Assistant, None) => Ok(
+                crate::forward::metal_qwen35::ChatMessage::assistant(message.content),
+            ),
+            (contract::NormalizedChatRole::User, Some(image)) => {
+                Ok(crate::forward::metal_qwen35::ChatMessage::user_with_image(
+                    message.content,
+                    image.bytes,
+                    image.text_offset,
+                ))
             }
-            contract::NormalizedChatRole::User => {
-                crate::forward::metal_qwen35::ChatMessage::user(message.content)
-            }
-            contract::NormalizedChatRole::Assistant => {
-                crate::forward::metal_qwen35::ChatMessage::assistant(message.content)
-            }
+            (_, Some(_)) => Err(ApiError::BadRequest {
+                message: "image content is supported only on user messages".to_string(),
+                code: "invalid_image_role",
+            }),
         })
         .collect()
 }
 
 /// Render normalized contract messages with the engine's canonical chat template.
+///
+/// For image-bearing messages this is the preliminary text-only rendering
+/// used by adapter-level context checks. The Metal worker later inserts the
+/// checkpoint's vision token IDs at the normalized image position.
 pub fn format_normalized_chat_template(messages: &[contract::NormalizedChatMessage]) -> String {
     crate::forward::metal_qwen35::format_chat_template_parts(
         messages
@@ -1784,18 +1806,22 @@ mod tests {
             contract::NormalizedChatMessage {
                 role: contract::NormalizedChatRole::System,
                 content: "system-content".to_string(),
+                image: None,
             },
             contract::NormalizedChatMessage {
                 role: contract::NormalizedChatRole::User,
                 content: "user-content".to_string(),
+                image: None,
             },
             contract::NormalizedChatMessage {
                 role: contract::NormalizedChatRole::Assistant,
                 content: "assistant-content".to_string(),
+                image: None,
             },
         ];
         let rendered = format_normalized_chat_template(&normalized);
-        let owned = into_engine_chat_messages(normalized);
+        let owned =
+            into_engine_chat_messages(normalized).expect("valid messages must reach the engine");
         assert_eq!(
             rendered,
             crate::forward::metal_qwen35::format_chat_template(&owned)
@@ -1818,6 +1844,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn contract_to_engine_message_adapter_preserves_image_and_position() {
+        let owned = into_engine_chat_messages(vec![contract::NormalizedChatMessage {
+            role: contract::NormalizedChatRole::User,
+            content: "beforeafter".to_string(),
+            image: Some(contract::NormalizedChatImage {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                text_offset: "before".len(),
+            }),
+        }])
+        .expect("valid user image must reach the engine");
+        let image = owned[0]
+            .image
+            .as_ref()
+            .expect("normalized image must reach the engine message");
+        assert_eq!(image.bytes, [0x89, b'P', b'N', b'G']);
+        assert_eq!(image.text_offset, "before".len());
+    }
+
+    #[test]
+    fn contract_to_engine_message_adapter_rejects_non_user_image_without_panicking() {
+        let error = into_engine_chat_messages(vec![contract::NormalizedChatMessage {
+            role: contract::NormalizedChatRole::System,
+            content: "policy".to_string(),
+            image: Some(contract::NormalizedChatImage {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                text_offset: 0,
+            }),
+        }])
+        .expect_err("caller-constructed invalid normalized state must fail closed");
+        assert!(matches!(
+            error,
+            ApiError::BadRequest {
+                code: "invalid_image_role",
+                ..
+            }
+        ));
+    }
     #[test]
     fn finish_reason_stopped_true_is_stop() {
         assert_eq!(finish_reason(true), "stop");

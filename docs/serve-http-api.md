@@ -198,11 +198,20 @@ pub struct ChatCompletionRequest {
 }
 ```
 
-`message.content` accepts either a plain string or an OpenAI-style content-parts array, but only
-`{"type": "text", "text": "..."}` parts — an image/audio/file part is rejected with 400, not
-silently dropped. `messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and
-`"developer"` are explicitly named and rejected (`"role 'tool' is not supported by this server"`);
-anything else gets a generic `"unsupported role '...'"` message.
+`message.content` accepts either a plain string or an OpenAI-style content-parts array. Text parts
+use `{"type": "text", "text": "..."}`. A vision-capable Metal checkpoint also accepts one
+`{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` part on a user
+message; JPEG uses `data:image/jpeg;base64,...`. The image may appear between text parts and keeps
+that position in the rendered multimodal prompt. The decoded payload is capped at 48,000 bytes,
+and each serving image is capped at 256 pre-merge patches and 16 MiB of preprocessed patch data.
+Image requests must use `stream: false` (or omit `stream`) until the multimodal decoder supports
+incremental deltas. Remote URLs are never fetched, multi-image requests are rejected, and a
+text-only/CPU model returns 400 `vision_unsupported`. Audio/file parts remain unsupported rather
+than being silently dropped.
+
+`messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and `"developer"` are
+explicitly named and rejected (`"role 'tool' is not supported by this server"`); anything else
+gets a generic `"unsupported role '...'"` message.
 
 The struct's own doc comment on the `stream` field currently reads "SSE streaming — not yet
 supported; rejected with 400" — **this is stale and wrong**. Streaming is fully implemented (see

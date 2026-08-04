@@ -90,8 +90,8 @@ mod imp {
     };
     use lattice_inference::serve::into_engine_chat_messages;
     use lattice_inference::serve::metal_worker::{
-        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
-        WorkerMetadata,
+        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, VisionRuntime,
+        WorkerEvent, WorkerMetadata,
     };
     use lattice_inference::serve::metrics::ServeMetrics;
     /// Only used by the test module's `.tokenize(..)` calls on a real (tiny)
@@ -197,9 +197,9 @@ mod imp {
     /// #551 fallback when the loaded model's config has no derivable context.
     const FALLBACK_MODEL_MAX_CONTEXT: usize = 4096;
 
-    /// #649: image input is accepted in the OpenAI wire shape but this server
-    /// has no vision tower, so it must fail closed with a clear message
-    /// rather than silently dropping the part or coercing it to text.
+    /// Capability-error wording pinned by text-only backend tests. Image
+    /// content is admitted only when the loaded worker advertises a complete
+    /// vision configuration.
     #[cfg(test)]
     const IMAGE_REQUIRES_VISION_MESSAGE: &str = "image input requires a vision-capable model";
 
@@ -1924,7 +1924,8 @@ mod imp {
         let validated = match normalize_request(
             &req,
             s.defaults,
-            ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context),
+            ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context)
+                .with_vision_support(s.jobs.supports_vision()),
         ) {
             Ok(validated) => validated,
             Err(err) => {
@@ -1981,7 +1982,23 @@ mod imp {
             cfg.enable_thinking = false;
         }
         let streaming = validated.stream;
-        let messages = into_engine_chat_messages(validated.messages);
+        let messages = match into_engine_chat_messages(validated.messages) {
+            Ok(messages) => messages,
+            Err(err) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    "/v1/chat/completions",
+                    StatusCode::BAD_REQUEST.as_u16(),
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some(err.code()),
+                );
+                return err.into_response();
+            }
+        };
         let cfg = cfg;
         let model_id = s.model_id.to_string();
         let id = format!("chatcmpl-{}", unix_nanos());
@@ -2809,6 +2826,9 @@ mod imp {
         // did.
         let model_dir_for_loader = model_dir.clone();
         let tokenizer_path_for_vocab = tokenizer_path.clone();
+        let vision_config = Qwen35Config::from_model_dir(&model_dir)
+            .map_err(|e| format!("config.json load failed: {e}"))?;
+        let vision_runtime = VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
         let (
             owner,
             jobs,
@@ -2817,7 +2837,7 @@ mod imp {
                 model_max_context,
                 ..
             },
-        ) = match MetalWorker::spawn(
+        ) = match MetalWorker::spawn_with_vision(
             move || {
                 let LoadedModel {
                     metal,
@@ -2835,6 +2855,7 @@ mod imp {
                     },
                 ))
             },
+            vision_runtime,
             max_pending,
         ) {
             Ok(triple) => triple,
@@ -2947,7 +2968,9 @@ mod imp {
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use lattice_inference::serve::ApiError;
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
-        use lattice_inference::serve::metal_worker::{WorkerJob, spawn_fake, test_client_and_jobs};
+        use lattice_inference::serve::metal_worker::{
+            WorkerJob, spawn_fake, spawn_fake_with_vision, test_client_and_jobs,
+        };
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::sync::Arc;
 
@@ -3097,7 +3120,8 @@ mod imp {
             let err = normalize_messages(std::slice::from_ref(&msg)).unwrap_err();
             assert_eq!(
                 err.message(),
-                "content part type 'file' is not supported; only 'text' parts are accepted"
+                "content part type 'file' is not supported; only 'text' and 'image_url' parts are \
+                 accepted"
             );
         }
 
@@ -3319,6 +3343,23 @@ mod imp {
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        fn inline_png_data_uri() -> String {
+            use base64::Engine as _;
+            let image = image::RgbImage::new(32, 32);
+            let mut bytes = Vec::new();
+            image
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .expect("PNG fixture must encode");
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         async fn error_message_of(response: Response) -> (StatusCode, String) {
             let status = response.status();
             let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -3405,9 +3446,81 @@ mod imp {
             );
             let response =
                 chat_completions(State(test_app_state()), test_json_headers(), body).await;
-            let (status, message) = error_message_of(response).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(message, IMAGE_REQUIRES_VISION_MESSAGE);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("error response must be JSON");
+            assert_eq!(value["error"]["code"], "vision_unsupported");
+            assert_eq!(
+                value["error"]["message"],
+                serde_json::Value::String(IMAGE_REQUIRES_VISION_MESSAGE.to_string())
+            );
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_vision_model_enqueues_image_on_shared_worker() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            let image_seen = Arc::new(AtomicBool::new(false));
+            let seen = Arc::clone(&image_seen);
+            let jobs = spawn_fake_with_vision(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                4096,
+                tokenizer,
+                move |messages, _cfg, prompt_tokens, _on_token, _should_cancel| {
+                    let image = messages[0]
+                        .image
+                        .as_ref()
+                        .expect("image must reach the common worker job");
+                    assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+                    assert_eq!(image.text_offset, "before".len());
+                    assert_eq!(messages[0].content, "beforeafter");
+                    seen.store(true, Ordering::SeqCst);
+                    Ok(GenerateOutput {
+                        text: "ok".to_string(),
+                        token_ids: vec![0],
+                        prompt_tokens,
+                        generated_tokens: 1,
+                        stopped: true,
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    })
+                },
+            );
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: GenerationDefaults::standard(16),
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: Arc::new(vec![]),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
+            let body = Body::from(
+                serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "before"},
+                            {"type": "image_url", "image_url": {"url": inline_png_data_uri()}},
+                            {"type": "text", "text": "after"}
+                        ]
+                    }]
+                })
+                .to_string(),
+            );
+
+            let response = chat_completions(State(state), test_json_headers(), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(image_seen.load(Ordering::SeqCst));
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

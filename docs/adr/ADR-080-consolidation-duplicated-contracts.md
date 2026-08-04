@@ -347,7 +347,7 @@ inventory scans direct `MetalQwen35State::{new,from_q4_dir}` calls in those
 compiler-selected source closures. Every deferred construction waiver names the
 Cargo target kind, target name, target root, and exact source line and column;
 adding a second construction to an exempt function therefore creates a new,
-unclassified site. For non-exempt sites, the source check requires a simple
+unclassifiable site. For non-exempt sites, the source check requires a simple
 named binding whose lexical scope encloses the protected entry point or entire
 test, and rejects any later use of that binding, including an immediate `drop`.
 
