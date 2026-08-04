@@ -9,8 +9,9 @@
 //! secondary BGE-small sanity signal; raw entropic transport cost is not a drift threshold
 //! because identical small point sets have a non-zero self-cost.
 //!
-//! Missing checkpoints remain visible skips for ordinary workspace tests. The dedicated gate
-//! sets `LATTICE_DRIFT_GATE_ENFORCE=1`, which turns any missing checkpoint into a failure.
+//! Missing checkpoints remain visible skips for ordinary workspace tests. The dedicated CI gate
+//! invokes the `embed-drift` binary with `--enforce`, which turns any missing checkpoint into a
+//! failure.
 //!
 //! Run:
 //! ```bash

@@ -200,14 +200,97 @@ fn model_weights_path(model: EmbeddingModel) -> Result<PathBuf> {
     Ok(root.join(model.to_string()).join("model.safetensors"))
 }
 
+/// Cosine similarity for the drift comparison, with zero/near-zero norms
+/// treated as maximum drift rather than identity.
+///
+/// This deliberately does not reuse [`crate::simd::cosine_similarity`]'s
+/// contract, which returns `0.0` (cosine of orthogonal, i.e. "no similarity")
+/// for a zero-norm input — the correct default for a similarity-search
+/// caller. The drift gate instead needs "no similarity" to read as "no
+/// resemblance to baseline" so a collapsed current embedding (e.g. from a
+/// broken forward pass producing an all-zero vector) is caught as drift
+/// rather than reported as an identical match. Returning `-1.0` (a "1 -
+/// cosine" drift of 2.0, the metric's maximum) for either input's norm
+/// collapsing below the noise floor achieves that without touching the
+/// public cosine kernel's contract.
 fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a = a.iter().map(|value| value * value).sum::<f32>().sqrt();
     let norm_b = b.iter().map(|value| value * value).sum::<f32>().sqrt();
-    let denominator = norm_a * norm_b;
-    if denominator < 1e-12 {
-        1.0
+    if !norm_a.is_finite() || !norm_b.is_finite() || norm_a < 1e-12 || norm_b < 1e-12 {
+        -1.0
     } else {
-        (dot / denominator).clamp(-1.0, 1.0)
+        (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(embeddings: Vec<Vec<f32>>) -> BaselineFixture {
+        let texts = embeddings
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("text-{i}"))
+            .collect();
+        BaselineFixture {
+            model: EmbeddingModel::AllMiniLmL6V2.to_string(),
+            texts,
+            embeddings,
+        }
+    }
+
+    /// F2 regression: a collapsed (all-zero) current embedding versus a
+    /// unit-norm baseline must classify as maximum drift, not as identical
+    /// (drift 0). Before the fix, `cosine_f32` returned 1.0 whenever
+    /// `norm_a * norm_b < 1e-12`, so this exact input produced drift 0 and
+    /// exited 0 even with `--enforce`.
+    #[test]
+    fn zero_norm_current_versus_nonzero_baseline_is_maximum_drift() {
+        let baseline = fixture(vec![vec![1.0, 0.0, 0.0]]);
+        let current = vec![vec![0.0, 0.0, 0.0]];
+        let outcome = compare_embeddings(&baseline, &current).expect("comparison must succeed");
+        match outcome {
+            ModelDriftOutcome::Checked {
+                max_one_minus_cos,
+                worst_index,
+            } => {
+                assert_eq!(worst_index, 0);
+                assert!(
+                    max_one_minus_cos >= MAX_COSINE_DRIFT,
+                    "zero-norm current embedding must exceed the drift threshold, got {max_one_minus_cos}"
+                );
+                assert!(max_one_minus_cos.is_finite());
+            }
+            other => panic!("expected Checked outcome, got {other:?}"),
+        }
+    }
+
+    /// Deliberate near-threshold case: a tiny, deterministic perturbation
+    /// that pushes `1 - cosine` just above `MAX_COSINE_DRIFT` must still be
+    /// classified as drift, confirming the threshold comparison (not the
+    /// zero-norm guard) governs ordinary near-boundary inputs.
+    #[test]
+    fn near_threshold_perturbation_is_classified_as_drift() {
+        // For a small-angle perturbation, 1 - cos(theta) ~= theta^2 / 2.
+        // Pick theta so that theta^2/2 is just over MAX_COSINE_DRIFT (1e-3).
+        let theta: f32 = 0.0475; // theta^2/2 ~= 1.128e-3 > 1e-3
+        let baseline = fixture(vec![vec![1.0, 0.0]]);
+        let current = vec![vec![theta.cos(), theta.sin()]];
+        let outcome = compare_embeddings(&baseline, &current).expect("comparison must succeed");
+        match outcome {
+            ModelDriftOutcome::Checked {
+                max_one_minus_cos,
+                worst_index,
+            } => {
+                assert_eq!(worst_index, 0);
+                assert!(
+                    max_one_minus_cos > MAX_COSINE_DRIFT,
+                    "expected near-threshold perturbation to exceed {MAX_COSINE_DRIFT}, got {max_one_minus_cos}"
+                );
+            }
+            other => panic!("expected Checked outcome, got {other:?}"),
+        }
     }
 }

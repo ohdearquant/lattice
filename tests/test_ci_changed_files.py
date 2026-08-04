@@ -2110,27 +2110,36 @@ class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):
 
     def test_job_reports_failures_without_gating_the_workflow(self) -> None:
         self.assertIn("continue-on-error: true", self.job)
-        self.assertIn("-- --model bge-small-en-v1.5 --download-only", self.job)
-        self.assertIn("LATTICE_DRIFT_GATE_ENFORCE: '1'", self.job)
+        self._assert_provisions_all_four_models(self.job)
         self.assertIn(
-            "-- --nocapture > embed-drift-x86.log 2>&1",
+            "cargo run --release -p lattice-embed --bin embed-drift "
+            "-- --enforce --json",
             self.job,
         )
-        self.assertIn('exit "$status"', self.job)
+
+    def _assert_provisions_all_four_models(self, job: str) -> None:
+        for model in (
+            "bge-small-en-v1.5",
+            "multilingual-e5-small",
+            "all-minilm-l6-v2",
+            "paraphrase-multilingual-minilm-l12-v2",
+        ):
+            self.assertIn(model, job)
         self.assertIn(
-            "grep -Fq 'Loaded drift baseline:' embed-drift-x86.log",
-            self.job,
-        )
-        self.assertIn(
-            "grep -Fq '[bge-small drift gate] max(1-cosine)=' "
-            "embed-drift-x86.log",
-            self.job,
+            "cargo run --release -p lattice-embed --bin embed \\\n"
+            '              -- --model "$model" --download-only',
+            job,
         )
 
     def test_observation_does_not_replace_the_required_arm_gate(self) -> None:
         arm_job = _workflow_job(self.contents, "embed-drift")
         self.assertIn("runs-on: ubuntu-24.04-arm", arm_job)
-        self.assertIn("LATTICE_DRIFT_GATE_ENFORCE: '1'", arm_job)
+        self._assert_provisions_all_four_models(arm_job)
+        self.assertIn(
+            "cargo run --release -p lattice-embed --bin embed-drift "
+            "-- --enforce --json",
+            arm_job,
+        )
 
         parity_gate = _workflow_job(self.contents, "parity-gate")
         self.assertIn("embed-drift,", parity_gate)
