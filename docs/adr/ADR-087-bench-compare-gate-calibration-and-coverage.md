@@ -332,6 +332,12 @@ is decidable from the surface list with no reading of the diff. If no, the PR ma
 unreachability statement naming this record. If yes, the file-level answer is a trigger and not
 a verdict, and step 2 is owed.
 
+An unreachability statement names the pull request head it was evaluated at and the ref the
+surface was read from, and is void if either moves. Neither operand is stable. A PR head moves
+on every push, and the surface itself gained a file within three days of the record it is
+derived from, which is the `manhattan.rs` case above. A statement that pins neither cannot be
+checked later by anyone, including its author.
+
 **Step 2, symbol-level, not mechanical.** Does the diff perturb anything the benched code path
 executes? Discharged only by naming, for every changed hunk in every reached file, why the
 benched path cannot observe it. Three forms are admissible:
