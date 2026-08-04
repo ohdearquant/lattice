@@ -13429,6 +13429,15 @@ mod inner {
                 !MSL_SOURCE.contains(concat!("kernel void add_", "buf(")),
                 "the retired standalone add kernel must not be present in qwen35.metal"
             );
+            for retired_kernel in [
+                concat!("kernel void logits_topk_", "select50_first("),
+                concat!("kernel void logits_topk_", "select50_merge("),
+            ] {
+                assert!(
+                    !MSL_SOURCE.contains(retired_kernel),
+                    "the retired hierarchical k=50 kernel must not be present in qwen35.metal: {retired_kernel}"
+                );
+            }
 
             assert!(
                 production_src.contains("std::env::var_os(\"LATTICE_GDN_CPU\")")
@@ -15577,11 +15586,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 3,
                 "direct, streaming, and prefix-cache generation must share the configurator"
             );
+            let route_chooser_owners = production
+                .lines()
+                .filter(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.starts_with("let ")
+                        && trimmed.contains(" = choose_gpu_block_topk_route(")
+                })
+                .count();
             assert_eq!(
-                production
-                    .matches("let block_route = choose_gpu_block_topk_route(")
-                    .count(),
-                1,
+                route_chooser_owners, 1,
                 "route chooser composition must have one production owner"
             );
         }
