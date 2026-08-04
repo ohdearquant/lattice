@@ -59,4 +59,3 @@ version: version = "0.8.0"
      Checked [   0.000s] 0 checks: 0 pass, 253 skip
      Summary no semver update required
     Finished [   5.485s] lattice-tune
-ARM B RC=0

@@ -59,4 +59,3 @@ version: version = "0.7.1"
      Checked [   0.049s] 196 checks: 196 pass, 57 skip
      Summary no semver update required
     Finished [   6.599s] lattice-tune
-ARM A RC=0
