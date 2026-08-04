@@ -85,9 +85,29 @@ name: perf post-merge detection (informational, PAUSED)
 # population, and is not the population the signed Delta-point split is
 # drawn from.
 #
-# Cost of leaving it on: roughly 88 minutes of wall clock per run, on each of two
-# runner jobs, for every qualifying merge, producing a verdict that cannot be
-# acted on. Excursions to 169 minutes were observed.
+# Cost of leaving it on, over the same 15 x86_64-linux / 14 aarch64-linux
+# reports named above. Enumeration: `gh run list --repo ohdearquant/lattice
+# --workflow=perf-postmerge-gate.yml --limit 100 --json
+# databaseId,headSha,event,createdAt,conclusion` returns 23 runs: 1
+# workflow_dispatch, 1 cancelled push, 21 completed push runs. Of those 21,
+# 16 carry a confirmed-regression x86_64-linux verdict; this population
+# drops the earliest, run 29879966073, whose A/B baseline falls back to the
+# event parent rather than the last-measured-commit baseline the other 15
+# share (see the "first run" note above), leaving the same 15 runs -- and
+# the same 14 with a completed aarch64-linux leg -- used above.
+#
+# Per-job on-runner duration of the "Full-mode A/B, failing on a confirmed
+# regression" step (`gh run view <id> --json jobs --jq '.jobs[] |
+# {name,steps}'`, startedAt/completedAt of that step): x86_64-linux median
+# 87m42s, range 86m04s-88m29s (n=15); aarch64-linux median 82m30s, range
+# 77m30s-83m04s (n=14).
+#
+# Separately: queue-inclusive workflow latency (workflow createdAt to the
+# later of the two jobs' completedAt, same 15 runs) is a different clock:
+# median 88m25s, range 86m40s-177m47s. The earlier-cited 168m39s (run
+# 30479549447) is not even the largest excursion in this population; run
+# 30452387834 queued to 177m47s. That tail is scheduling/runner-availability
+# variance upstream of job start, not on-runner execution time.
 #
 # What must be true before the push trigger returns. The rule needs a
 # between-run variance estimate rather than a within-run confidence interval;
