@@ -2,11 +2,12 @@
 # bench-compare-impl.sh — A/B benchmark comparison across two git refs.
 #
 # INVOKE scripts/bench-compare.sh, NOT THIS FILE. This is the measurement body;
-# the entry point runs it under scripts/lib/bench-locks.py, which holds the
-# machine-wide bench-window and Metal GPU locks for the whole run. Running this
-# file by accident is refused below. Running it deliberately, by a caller
-# willing to prepare the status file, is not prevented — see the comment above
-# verify_locks for exactly what that check establishes.
+# the entry point runs it through scripts/lib/bench_supervision.py, whose
+# dedicated process verifies and retains the machine-wide bench-window and
+# Metal GPU lock descriptors. This body receives only a cooperative handoff
+# pipe. Running this file by accident, or deliberately with only a fabricated
+# status file, is refused below — see the comment above verify_locks for the
+# exact boundary.
 #
 # Usage:
 #   scripts/bench-compare.sh                        # origin/main vs HEAD (quick)
@@ -28,11 +29,11 @@
 # appear in the report; CLASSIFIED GATING (vs informational) if a regression
 # in it contributes to the report's FAIL verdict; and ENFORCED only if that
 # FAIL verdict reaches the caller as a non-zero exit status. Classification
-# is not enforcement: by default this script computes a verdict, captures the
-# gate's exit status, and does not act on it, so --quick and --full are both
-# REPORT-ONLY.
-# Enforcement is opt-in per invocation via --fail-on-regression, which
-# propagates the gate's status instead; `make bench-gate` also enforces.
+# is not regression enforcement: by default this script reports a confirmed
+# regression without failing the caller. Measurement-integrity failures are
+# always refusals, because report-only still requires an A/B that actually ran.
+# Regression enforcement is opt-in via --fail-on-regression, which propagates
+# a confirmed-regression status; `make bench-gate` also enforces.
 # Use these words literally below.
 #
 # lattice#714 / lattice#1060: the lattice-embed `simd` bench TARGET is
@@ -63,11 +64,11 @@
 # to distinguish a real simd regression from machine noise. Three caveats
 # keep that from meaning "a regression cannot get past this".
 #
-# Enforcement: neither mode enforces BY DEFAULT. The gate's exit status is
-# captured into GATE_RC at the bottom and re-raised only under
-# --fail-on-regression, so by default a FAIL verdict is printed and the script
-# still exits 0 — which is why the demotion below is a resolution split rather
-# than a coverage hole in the default path. Two
+# Regression enforcement: neither mode enforces BY DEFAULT. The gate's
+# confirmed-regression status is re-raised only under --fail-on-regression;
+# broken or incomplete measurement evidence always exits nonzero. This is why
+# the demotion below is a resolution split rather than a coverage hole in the
+# default path. Two
 # callers do enforce: --fail-on-regression propagates the gate's status (exit
 # 1 confirmed regression, exit 2 the measurement itself is broken), and
 # `make bench-gate` runs the same two default targets unfiltered against the
@@ -147,27 +148,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# --- Refuse to measure unless the recorded supervisor is one of our ancestors ---
-# scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
-# which records its own PID here after taking both locks. This requires that PID
-# to be one of THIS process's ancestors before measuring.
-#
-# WHAT THAT ACTUALLY PROVES, stated exactly, because the tempting overclaim is
-# one word wider than the truth. The file supplies the PID and the OS supplies
-# the chain, so the check establishes a RELATION: the named process is really an
-# ancestor of this one. It refuses a status file left over from a finished run,
-# a file copied from a different run or machine, and accidental direct
-# invocation of this body, which are the ways this actually gets run without
-# isolation. It does NOT stop a caller who deliberately records an ancestor's
-# PID, their own shell's included: the recorded PID is still caller-supplied,
-# and ancestry confirms the relation, not that the named process holds anything.
-#
-# Closing that needs the lock DESCRIPTOR rather than a PID — an fstat identity
-# check on an inherited fd, followed by a non-blocking flock on it, which leaves
-# the lock held on that description whichever branch is taken. That arrives with
-# the nested-acquirer work, where a child that must hold a lock exists to
-# receive the descriptor. Until then this is the strong refusal, not a proof.
-LOCK_STATUS_FILE="$REPO/.cache/bench-locks-status.txt"
+# --- Verify the descriptor-free handoff from the dedicated supervisor ---
+# scripts/bench-compare.sh routes this body through bench_supervision.py. That
+# parent verifies and retains both inherited lock capabilities, samples their
+# path identities before and after this process, and gives this shell only a
+# non-lock pipe. The shell's receipt, pipe-writer, and contention samples are
+# cooperative point-in-time diagnostics; they neither authenticate the holder
+# nor prove lock lifetime.
+LOCK_STATUS_FILE="${LATTICE_BENCH_LOCK_STATUS:-$REPO/.cache/bench-locks-status.txt}"
 LOCK_SUMMARY=""
 verify_locks() {
   if [ ! -f "$LOCK_STATUS_FILE" ]; then
@@ -175,50 +163,31 @@ verify_locks() {
     echo "  Run scripts/bench-compare.sh, not this file directly." >&2
     exit 2
   fi
-  local sup
-  sup="$(sed -n 's/^supervisor_pid=//p' "$LOCK_STATUS_FILE" | head -1)"
-  case "$sup" in
-    ''|*[!0-9]*)
-      echo "bench-compare: lock status names no supervisor PID — refusing." >&2
-      exit 2
-      ;;
-  esac
-  local pid="$PPID"
-  local hops=0
-  local parent
-  local walked=1
-  while [ "$pid" -gt 1 ] && [ "$hops" -lt 64 ]; do
-    if [ "$pid" = "$sup" ]; then
-      LOCK_SUMMARY="$(sed -n 's/^lock=/  /p' "$LOCK_STATUS_FILE")"
-      return 0
-    fi
-    # A failing ps must reach the refusal below rather than abort the script.
-    # Under `set -o pipefail` the failure propagates out of the assignment and
-    # `set -e` exits with ps's own status, skipping the diagnostic entirely: the
-    # caller sees a bare 1 or 126 and no message. That is still fail-closed, but
-    # silently, and it fires on the ordinary case of an ancestor exiting during
-    # the walk, not only where process inspection is denied.
-    if ! parent="$(ps -o ppid= -p "$pid" 2>/dev/null)"; then
-      walked=0
-      break
-    fi
-    pid="$(printf '%s' "$parent" | tr -d ' ')"
-    case "$pid" in ''|*[!0-9]*) walked=0; break ;; esac
-    hops=$((hops + 1))
-  done
-  if [ "$walked" -eq 0 ]; then
-    echo "bench-compare: could not walk this process's ancestry to the end" \
-         "(ps failed or returned nothing) — refusing to measure." >&2
-    echo "  Supervisor $sup was not seen before the walk stopped, so whether it" \
-         "is an ancestor is unknown, and unknown is refused." >&2
-  else
-    echo "bench-compare: lock supervisor $sup is not an ancestor of this run" \
-         "(stale or copied $LOCK_STATUS_FILE) — refusing to measure." >&2
+  LOCK_SUMMARY="$(sed -n 's/^lock=/  /p' "$LOCK_STATUS_FILE")"
+
+  if [ -z "${LATTICE_BENCH_SUPERVISOR_FD:-}" ]; then
+    echo "bench-compare: no supervisor handoff pipe" \
+         "(LATTICE_BENCH_SUPERVISOR_FD is unset) — refusing to measure." >&2
+    echo "  Run scripts/bench-compare.sh, not this file directly." >&2
+    exit 2
   fi
-  echo "  Run scripts/bench-compare.sh, not this file directly." >&2
-  exit 2
+
+  if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
+    echo "bench-compare: cooperative supervisor handoff failed —" \
+         "refusing to measure." >&2
+    exit 2
+  fi
 }
 verify_locks
+
+set +e
+(
+set -e
+supervisor_fd="${LATTICE_BENCH_SUPERVISOR_FD:-}"
+if [[ "$supervisor_fd" =~ ^[0-9]+$ ]]; then
+  eval "exec ${supervisor_fd}<&-"
+fi
+unset LATTICE_BENCH_SUPERVISOR_FD
 
 # --- Machine-state and ambient-load gates ---
 # A lock excludes peers; it says nothing about ambient load, thermal pressure,
@@ -248,13 +217,14 @@ machine_state_probe() {
       python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
     )" || rc=$?
   fi
+  if [ "$rc" -ne 0 ] || [ -z "$record" ]; then
+    echo "bench-compare: machine-state checkpoint '$label' failed or returned" \
+         "no record — refusing to certify this A/B." >&2
+    exit 2
+  fi
   echo "[state] $label: $record"
   MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
 }$record"
-  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
-    echo "bench-compare: machine-state checkpoint '$label' failed — refusing to certify this A/B." >&2
-    exit 2
-  fi
 }
 
 quiet_gate() {
@@ -448,14 +418,66 @@ BENCH_BASELINE_NAME="compare-base"
 # Keep Criterion evidence target-qualified without giving up Cargo's shared
 # compilation target. CRITERION_HOME controls only Criterion's report/baseline
 # tree; Cargo continues to use each worktree's normal target directory.
+#
+# Root paths are keyed by BENCH TARGET, not just by crate: BENCHES_INFERENCE
+# is caller-overridable (BENCHES_EMBED is a fixed "simd" today, keyed the same
+# way for consistency should that change), so two runs that pick different
+# targets must never share a directory — Criterion's own report tree keys by
+# group/function only, and two different bench targets can and do declare
+# same-named or different groups into what would otherwise be one shared
+# directory. A target name reaches the filesystem as a path component here,
+# so it is sanitized first: anything outside [A-Za-z0-9._-] becomes '_', and
+# a name that sanitizes to nothing refuses rather than silently keying every
+# such target into the same empty-string directory.
+sanitize_target_component() {
+  local raw="$1" clean
+  clean="$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '_')"
+  if [ -z "$clean" ]; then
+    echo "bench-compare: bench target name '$raw' sanitizes to an empty path" \
+         "component — refusing." >&2
+    exit 2
+  fi
+  printf '%s' "$clean"
+}
+
 BENCH_CRITERION_ROOT="$REPO/.cache/bench-compare-criterion"
-BASE_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/inference/criterion"
-BASE_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/embed/criterion"
-INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/inference/criterion"
-EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/embed/criterion"
-mkdir -p \
-  "$BASE_INFERENCE_CRITERION_ROOT" "$BASE_EMBED_CRITERION_ROOT" \
-  "$INFERENCE_CRITERION_ROOT" "$EMBED_CRITERION_ROOT"
+BENCHES_INFERENCE_KEY="$(sanitize_target_component "$BENCHES_INFERENCE")"
+BENCHES_EMBED_KEY="$(sanitize_target_component "$BENCHES_EMBED")"
+BASE_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/inference/$BENCHES_INFERENCE_KEY/criterion"
+BASE_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/embed/$BENCHES_EMBED_KEY/criterion"
+INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/inference/$BENCHES_INFERENCE_KEY/criterion"
+EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/embed/$BENCHES_EMBED_KEY/criterion"
+
+# Each arm's root is wiped immediately before the phase that populates it, not
+# just created if absent: keying stops two DIFFERENT targets from sharing a
+# directory, but says nothing about a group a PRIOR run under the same key
+# left behind (renamed, removed, or from before this fix shipped). An `rm -rf`
+# whose argument came back empty or unmoored is the exact failure this repo's
+# rules exist to prevent, so the path is asserted non-empty and confined under
+# $BENCH_CRITERION_ROOT before anything is removed; both are already
+# guaranteed by sanitize_target_component and the fixed prefix construction
+# above, this is the second, independent check at the point of deletion.
+clear_criterion_root() {
+  local root="$1"
+  if [ -z "$root" ]; then
+    echo "bench-compare: internal error — empty Criterion root path passed to" \
+         "clear_criterion_root; refusing to remove anything." >&2
+    exit 2
+  fi
+  case "$root" in
+    "$BENCH_CRITERION_ROOT"/*) ;;
+    *)
+      echo "bench-compare: internal error — '$root' is not under the expected" \
+           "Criterion cache root '$BENCH_CRITERION_ROOT'; refusing to remove it." >&2
+      exit 2
+      ;;
+  esac
+  rm -rf -- "$root"
+  mkdir -p -- "$root"
+}
+
+clear_criterion_root "$BASE_INFERENCE_CRITERION_ROOT"
+clear_criterion_root "$BASE_EMBED_CRITERION_ROOT"
 if [ "$FAIL_ON_REGRESSION" = "1" ]; then
   python3 "$GATE_SCRIPT" "$BASE_INFERENCE_CRITERION_ROOT" \
     --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
@@ -463,7 +485,7 @@ if [ "$FAIL_ON_REGRESSION" = "1" ]; then
     --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
 fi
 
-# --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
+# --- Measurement-integrity helpers ---
 # `cargo bench ... | grep -E "time:" || true` discards cargo's status TWICE: a
 # pipeline reports its LAST command (grep), and `|| true` then resets
 # PIPESTATUS to 0. So a bench that failed to build or died mid-run looked
@@ -485,22 +507,31 @@ run_bench() {
   local filter="$1"; shift
   BENCH_RC=0
   BENCH_LINES=0
-  local matched
+  local output matched
+  output="$(mktemp)"
   matched="$(mktemp)"
-  { "$@" 2>&1 | grep -E "$filter" | tee "$matched"; BENCH_RC=${PIPESTATUS[0]}; } || true
+  if "$@" >"$output" 2>&1; then
+    BENCH_RC=0
+  else
+    BENCH_RC=$?
+  fi
+  grep -E "$filter" "$output" >"$matched" || true
   BENCH_LINES="$(wc -l < "$matched" | tr -d ' ')"
-  rm -f "$matched"
+  if [ "$BENCH_RC" -ne 0 ]; then
+    cat "$output" >&2
+  else
+    cat "$matched"
+  fi
+  rm -f "$output" "$matched"
 }
 
 # A partial A/B is not weaker evidence that nothing regressed, it is no
 # evidence: the target that failed is precisely the one nobody measured. Exit 2
 # (measurement broken) rather than 1 (confirmed regression) because the two ask
-# the reader for opposite responses. The reporter keeps its tolerant behavior.
+# the reader for opposite responses. Report-only changes regression handling,
+# not whether missing evidence is accepted as a measurement.
 require_measured() {
   local what="$1" rc="$2" lines="${3:-}"
-  if [ "$FAIL_ON_REGRESSION" != "1" ]; then
-    return 0
-  fi
   if [ "$rc" -ne 0 ]; then
     echo "bench-compare: $what failed (exit $rc) — refusing to certify a partial A/B." >&2
     exit 2
@@ -527,14 +558,14 @@ BASE_PHASE_RC=0
   # tolerance is right for a human comparing against an old ref and wrong for
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
   # same channel and one of them silently deletes half the comparison.
-  if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
+    run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
-  run_bench "time:" env CRITERION_HOME="$BASE_EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:" env CRITERION_HOME="$BASE_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_PHASE_RC=$?
 # `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
@@ -561,8 +592,8 @@ HEAD_CRITERION="$(criterion_version "$HEAD_DIR")"
 copy_base_artifacts() {
   local what="$1"; shift
   local rc=0
-  rsync "$@" 2>/dev/null || rc=$?
-  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  rsync "$@" || rc=$?
+  if [ "$rc" -ne 0 ]; then
     echo "bench-compare: $what failed (rsync exit $rc) — refusing to certify a partial A/B." >&2
     return 2
   fi
@@ -584,6 +615,12 @@ prepare_target_root() {
   fi
 }
 
+# Wiped here, immediately before the head phase populates them (base-arm
+# baseline copy, then head's own run) — same rationale as the base-side clear
+# above, applied to the head-side roots at the point the head phase begins.
+clear_criterion_root "$INFERENCE_CRITERION_ROOT"
+clear_criterion_root "$EMBED_CRITERION_ROOT"
+
 prepare_target_root \
   "lattice-inference:$BENCHES_INFERENCE" \
   "$BASE_INFERENCE_CRITERION_ROOT" "$INFERENCE_CRITERION_ROOT"
@@ -594,14 +631,14 @@ prepare_target_root \
 HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
-  if cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
+    run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
     require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
@@ -678,7 +715,7 @@ echo "  resolution: ${QUICK_FLAGS:---full}"
 echo "  targets: lattice-inference:$BENCHES_INFERENCE, lattice-embed:$BENCHES_EMBED"
 echo "  inference features: ${CARGO_FEATURES_INFERENCE:-<none>}"
 echo "  filters: inference='${BENCH_GROUPS_INFERENCE:-<all>}' embed='${BENCH_GROUPS_EMBED:-<all>}'"
-echo "  enforcement: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "--fail-on-regression (gate status propagated)" || echo "report-only (gate status printed, exit 0)")"
+echo "  enforcement: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "--fail-on-regression (regression status propagated)" || echo "report-only (regressions reported; measurement failures still refuse)")"
 echo "  locks:"
 echo "$LOCK_SUMMARY"
 echo "  ambient load:"
@@ -686,12 +723,115 @@ echo "$QUIET_SAMPLES" | sed 's/^/    /'
 echo "  machine state:"
 echo "$MACHINE_STATE_SAMPLES" | sed 's/^/    /'
 
+# --- Reconcile reported groups against the bench target's declared groups ---
+# Path-keying and the clears above stop a stray group from surviving into a
+# target's root by construction. This is the independent check at the point
+# of reporting: it does not trust that construction, it verifies the outcome.
+# Before the gate reads a root, compare the Criterion groups actually present
+# in it (the first path component of every change/estimates.json — exactly
+# what perf-bench-gate.py's find_change_files/parse_bench walk to build the
+# report) against the groups the target's bench SOURCE declares. A group
+# present but undeclared refuses the run rather than being reported: this is
+# the third state the run can end in — not pass, not a confirmed regression,
+# but "the instrument's output does not match its subject."
+#
+# Declared groups are read by grepping the bench source for literal
+# `benchmark_group("...")` arguments — lexical, not semantic. This misses:
+#   - a group name built at runtime (format!, a variable, a match arm)
+#     instead of written as a string literal;
+#   - a benchmark registered directly via `c.bench_function(...)` with no
+#     enclosing group, which gets its own top-level directory named after the
+#     function rather than a declared group name.
+# Neither pattern occurs today in elementwise_cpu_bench.rs, f16_convert_bench
+# .rs, or embed's simd.rs: every group.bench_function/group.bench_with_input
+# call in those three files sits inside a benchmark_group(...) block, and a
+# bare `c.bench_function` (not `group.bench_function`) does not appear in any
+# of them (checked by grep over the three files during this fix). A future
+# bench target using either pattern needs this derivation extended — until
+# then, a group registered that way is invisible to this guard, so it is a
+# lower bound on what gets caught, not a proof that nothing can slip past it.
+bench_source_for_target() {
+  local head_dir="$1" crate_dir="$2" bench_name="$3"
+  local benches_dir candidate base_resolved resolved
+  benches_dir="$head_dir/crates/$crate_dir/benches"
+  candidate="$benches_dir/$bench_name.rs"
+  if [ ! -d "$benches_dir" ] || [ ! -f "$candidate" ]; then
+    echo "bench-compare: expected bench source '$candidate' does not exist —" \
+         "refusing to reconcile without a declared-group source." >&2
+    exit 2
+  fi
+  if ! base_resolved="$(cd "$benches_dir" && pwd -P)"; then
+    echo "bench-compare: cannot resolve '$benches_dir' — refusing." >&2
+    exit 2
+  fi
+  resolved="$base_resolved/$(basename "$candidate")"
+  case "$resolved" in
+    "$base_resolved"/*) ;;
+    *)
+      echo "bench-compare: bench source '$candidate' resolves outside" \
+           "'$base_resolved' — refusing." >&2
+      exit 2
+      ;;
+  esac
+  printf '%s' "$resolved"
+}
+
+declared_groups_from_source() {
+  local bench_source="$1"
+  command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
+    | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' \
+    | LC_ALL=C sort -u
+}
+
+reconcile_criterion_groups() {
+  local target="$1" criterion_root="$2" bench_source="$3"
+  local declared actual stray
+
+  declared="$(declared_groups_from_source "$bench_source")"
+  if [ -z "$declared" ]; then
+    echo "bench-compare: $target: found zero declared Criterion groups in" \
+         "$bench_source — refusing. An empty declared set would let every" \
+         "reported group pass unreconciled, which is worse than not" \
+         "reconciling at all." >&2
+    exit 2
+  fi
+
+  if [ ! -d "$criterion_root" ]; then
+    return 0
+  fi
+
+  actual="$(
+    find "$criterion_root" -type f -path '*/change/estimates.json' -print 2>/dev/null \
+      | while IFS= read -r f; do
+          rel="${f#"$criterion_root"/}"
+          printf '%s\n' "${rel%%/*}"
+        done \
+      | LC_ALL=C sort -u
+  )"
+  if [ -z "$actual" ]; then
+    return 0
+  fi
+
+  stray="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$declared"))"
+  if [ -n "$stray" ]; then
+    echo "bench-compare: $target: $criterion_root reports group(s) this" \
+         "target does not declare — refusing to certify this report." >&2
+    echo "  undeclared group(s) found:" >&2
+    printf '%s\n' "$stray" | sed 's/^/    - /' >&2
+    echo "  declared groups (from $bench_source):" >&2
+    printf '%s\n' "$declared" | sed 's/^/    - /' >&2
+    exit 2
+  fi
+}
+
 echo ""
 echo "=== Target-qualified gate reports ==="
 GATE_RC=0
 run_target_gate() {
-  local target="$1" criterion_root="$2"
+  local target="$1" criterion_root="$2" bench_source="$3"
   local gate_rc=0 policy_rc=0 policy_invalid=0
+
+  reconcile_criterion_groups "$target" "$criterion_root" "$bench_source"
   local gate_args=(
     --baseline-name compare-base
     --target "$target"
@@ -746,12 +886,11 @@ run_target_gate() {
 }
 
 run_target_gate \
-  "lattice-inference:$BENCHES_INFERENCE" "$INFERENCE_CRITERION_ROOT"
+  "lattice-inference:$BENCHES_INFERENCE" "$INFERENCE_CRITERION_ROOT" \
+  "$(bench_source_for_target "$HEAD_DIR" "inference" "$BENCHES_INFERENCE")"
 run_target_gate \
-  "lattice-embed:$BENCHES_EMBED" "$EMBED_CRITERION_ROOT"
-
-echo ""
-echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
+  "lattice-embed:$BENCHES_EMBED" "$EMBED_CRITERION_ROOT" \
+  "$(bench_source_for_target "$HEAD_DIR" "embed" "$BENCHES_EMBED")"
 
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;
@@ -767,3 +906,16 @@ if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   fi
   exit "$GATE_RC"
 fi
+
+echo ""
+echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
+)
+MEASUREMENT_RC=$?
+set -e
+
+if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
+  echo "bench-compare: final cooperative supervisor sample failed —" \
+       "refusing to certify it." >&2
+  exit 2
+fi
+exit "$MEASUREMENT_RC"

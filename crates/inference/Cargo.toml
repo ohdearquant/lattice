@@ -21,7 +21,16 @@ default = ["std", "download", "serve"]
 # keep including `lattice_serve` without needing an extra flag. Library
 # consumers building with `default-features = false` no longer pull an HTTP
 # server into their dependency tree (the lib itself never uses it).
-serve = ["dep:axum", "dep:tokio", "dep:futures", "dep:mime", "dep:http-body-util"]
+serve = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:futures",
+    "dep:mime",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:tower",
+]
 std = []
 f16 = []
 metal-gpu = ["dep:metal", "dep:objc"]
@@ -63,6 +72,8 @@ thiserror.workspace = true
 tracing.workspace = true
 clap = { workspace = true }
 axum = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 mime = { workspace = true, optional = true }
 # Distinguishes a request-body length-limit rejection (`LengthLimitError`)
 # from any other body-buffering failure in the `serve` HTTP handlers.
@@ -71,6 +82,7 @@ mime = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
 # `ureq` (the `download` feature's HTTP client) is declared in the non-wasm
 # `[target]` table below, not here -- see the rationale there.
 sha2.workspace = true
@@ -83,7 +95,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lattice-fann = { version = "0.7.0", path = "../fann", optional = true }
+lattice-fann = { version = "0.7.1", path = "../fann", optional = true }
 
 # `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s `real_path_of_open_file`, which reports the
 # real path of an already-open shard descriptor for diagnostics and error text. Containment is
@@ -238,17 +250,11 @@ ureq = { version = "2", features = ["tls"], optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }
+proc-macro2.workspace = true
 proptest = { workspace = true }
+syn.workspace = true
 tempfile = { workspace = true }
-# Drives real HTTP requests (built from `CHAT_COMPLETIONS_PARITY_CASES`
-# fixture bodies) through each binary's `Router` via `ServiceExt::oneshot`
-# for the cross-binary parity table (ADR-080 C2).
-# Already an axum 0.8 transitive dependency (axum's `Router` implements
-# `tower::Service`); `util` is the feature gating `ServiceExt`/`oneshot`,
-# kept at this use site (the version itself moved
-# to `[workspace.dependencies]`, feature selection stays local).
-tower = { workspace = true, features = ["util"] }
-
+naga.workspace = true
 [[bench]]
 name = "differential_attention_bench"
 harness = false
@@ -291,11 +297,6 @@ harness = false
 required-features = ["f16"]
 
 [[bench]]
-name = "compute_attention_bench"
-harness = false
-required-features = ["bench-internals"]
-
-[[bench]]
 name = "kv_cache_layout_bench"
 harness = false
 required-features = ["bench-internals"]
@@ -321,6 +322,10 @@ harness = false
 
 [[bench]]
 name = "elementwise_cpu_bench"
+harness = false
+
+[[bench]]
+name = "grammar_mask_bench"
 harness = false
 
 [[bench]]

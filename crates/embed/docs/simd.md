@@ -152,11 +152,54 @@ dimensions.
 | `Int4`   | two unsigned nibbles per byte |                 0.5 |                    8x | Cool data and pre-filtering    |
 | `Binary` | one sign bit per dimension    |               0.125 |                   32x | Cold data and coarse filtering |
 
-`QuantizationTier::from_age_seconds` is a simple recency heuristic, not a
-measurement of vector quality: under one hour selects `Full`; one hour through
-under one day selects `Int8`; one day through under one week selects `Int4`;
-one week or older selects `Binary`. Applications can select tiers directly when
-their retention or recall policy differs.
+`QuantizationTier::from_age_seconds` is a placeholder recency heuristic with no
+retrieval-quality basis: under one hour selects `Full`; one hour through under
+one day selects `Int8`; one day through under one week selects `Int4`; one week
+or older selects `Binary`. Age does not establish that a vector tolerates lower
+precision. Applications should select tiers directly from workload-specific
+retention and retrieval-quality measurements.
+
+The fixed retrieval-fidelity regression pins each tier's healthy per-query
+Recall@10 hit and pairwise-agreement counts. In addition to aggregate and
+per-query floors, its movement gate intersects two integer count-space bounds:
+total L1 movement may not exceed one healthy min-to-max span, and each query may
+not exceed the ceiling of one sixteenth of that span.
+
+```text
+total_movement(metric) = sum(abs(candidate[query] - healthy[query]))
+total_budget(metric) = max(healthy) - min(healthy)
+query_cap(metric) = ceil(total_budget(metric) / 16)
+```
+
+| Tier   | Total recall-hit budget | Recall-hit cap/query | Total agreement-pair budget | Agreement-pair cap/query |
+| ------ | ----------------------: | -------------------: | --------------------------: | -----------------------: |
+| Full   |                       0 |                    0 |                           0 |                        0 |
+| Int8   |                       0 |                    0 |                          37 |                        3 |
+| Int4   |                       2 |                    1 |                         242 |                       16 |
+| Binary |                       4 |                    1 |                       1,282 |                       81 |
+
+Both bounds are inclusive integer comparisons. The ceiling admits the smallest
+whole-count local allowance compatible with a uniform share, while the retained
+total term prevents rounding from expanding the fixture-wide budget: 16 Binary
+queries moving 81 agreement pairs each fit their local caps but total 1,296 and
+fail the 1,282-pair budget. Absolute movement prevents gains from cancelling
+losses. The `f64` epsilon is used only by the separate aggregate Recall@10 and
+agreement-rate floor comparisons; it is not part of either movement decision.
+
+The Binary recall calibration deliberately permits four distinct queries to lose
+one Recall@10 hit each: the one-hit local cap and four-hit total cap are both
+satisfied. That movement changes aggregate Recall@10 by
+`4 / (16 * 10) = 0.025`, about 2.5 percentage points; the aggregate and per-query
+floors still apply independently.
+
+The count representation has a class-wide collision: distinct rankings can
+preserve both top-k overlap cardinality and the total number of agreeing pairs.
+Such rankings are indistinguishable to this gate because it does not express
+top-k candidate identity or the complete rank permutation. A future top-k
+identity check would detect membership changes, while a rank fingerprint would
+also detect position changes that preserve both current counts. See
+[ADR-018](../../../docs/adr/ADR-018-quantized-vectors.md) for the gate decision and
+its limitations.
 
 `QuantizedData` holds any tier behind one enum. Promoting or demoting it always
 dequantizes to `f32` and quantizes into the destination tier. Promotion does not

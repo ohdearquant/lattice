@@ -151,6 +151,7 @@ private struct LatticeIconButtonBody: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("ButtonStyles") {
     VStack(alignment: .leading, spacing: Theme.Space.md) {
         Text("PRIMARY")
@@ -197,3 +198,4 @@ private struct LatticeIconButtonBody: View {
     .padding(Theme.Space.lg)
     .background(Theme.Palette.canvas)
 }
+#endif

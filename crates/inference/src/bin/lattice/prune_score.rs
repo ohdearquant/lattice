@@ -178,6 +178,7 @@ fn run_metal(args: &Args) -> Result<bool, String> {
     use lattice_inference::model::qwen35_config::{LayerType, Qwen35Config};
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
+    let _gpu_guard = lattice_inference::measurement::gpu_test_lock();
     validate_args(args)?;
 
     let tokenizer_path = args.tokenizer_dir.join("tokenizer.json");

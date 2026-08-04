@@ -6,38 +6,46 @@ Read `AGENTS.md` first for coding conventions, crate structure, and design princ
 
 ### Measure First, Code Second
 
-Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like. One honesty note on `crates/fann/`: the default bench build does not enable the optional `mixture` feature, so a fann-only diff is usually compiled out of the bench binaries and its disposition will correctly be the structural waiver below — the gate still requires stating that explicitly. A fann change whose effects reach the default bench binaries (or any future mixture-enabled bench target) runs the A/B like everyone else.
+Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like. One honesty note on `crates/fann/`: the default bench build does not enable the optional `mixture` feature, so a fann-only diff is usually compiled out of the two default bench targets — but default-target compilation status alone is not sufficient to claim the waiver. `crates/fann/` also declares its own feature-gated `router_online` bench target (requires the `online-router` feature; `crates/fann/Cargo.toml:45-48`), which directly exercises FANN training and network APIs. A fann diff takes the same all-declared-target reachability search as any other crate: search every declared target, including `router_online`, and if a reachable one exists, run it instead of claiming the waiver.
 
 ```bash
-make bench-compare                         # origin/main vs HEAD (~2 min, default)
+make bench-compare                         # origin/main vs HEAD (--quick, the default; not separately measured)
 make bench-compare BASE=main HEAD=pr/x     # explicit refs
-scripts/bench-compare.sh --full main       # tight CIs (~15 min)
+scripts/bench-compare.sh --full main       # tight CIs; see the timing note below before booking a window
 ```
 
 Paste the output in the PR description. If nothing changed, say "bench-compare showed no change (p > 0.05 on all groups)." If something regressed, explain why it's acceptable or revert it.
 
-This process caught a 15% decode throughput regression (157 → 130 tok/s) that had been attributed to "GPU contention noise" for days. The f32 dot_product unrolling that caused it was identified in under 2 minutes via A/B comparison.
+This process caught a decode throughput regression that had been attributed to "GPU contention noise" for days: an A/B comparison against the parent commit identified the f32 dot_product unrolling as the cause. The original figures are not quoted here because that run's conditions were not recorded.
 
 ### Keep the Machine Quiet During A/B Runs — Quiet Means Zero Disk Activity, Not Just Zero Builds
 
-`scripts/bench-compare.sh` now enforces the machine side of this itself, so do not wrap it in an external bench-window helper. It takes both machine-wide advisory locks (the bench window and the Metal GPU lock) unconditionally for the whole run, samples ambient CPU idle before the base phase, between phases, and after the head phase, and refuses to certify a run that fell below the idle floor at any of them. The floor is settable with `BENCH_IDLE_FLOOR`; if you move it, say so wherever the numbers are quoted. Every run prints a `Run conditions` block recording the refs, the effective bench targets and features, the resolution, the lock dispositions, and the measured idle samples — quote that block along with the numbers, because a figure that does not record what produced it is indistinguishable from one produced on a quiet machine.
+`scripts/bench-compare.sh` now enforces the machine side of this itself, so do not wrap it in an external bench-window helper. It takes both machine-wide advisory locks (the bench window and the Metal GPU lock) unconditionally for the whole run. At each of the three boundaries — before base, between phases, and after head — macOS runs hold a mandatory 30-second cooldown, then require AC power, nominal thermal state, at least 30 seconds of HID idle, and the portable ambient-CPU idle floor. Linux CI records that the macOS-only probes are unavailable and still applies the CPU-idle gate. The CPU floor is settable with `BENCH_IDLE_FLOOR`; if you move it, say so wherever the numbers are quoted. Every run prints a `Run conditions` block recording the refs, effective bench targets and features, resolution, lock dispositions, machine-state checkpoints, and measured idle samples — quote that block along with the numbers, because a figure that does not record what produced it is indistinguishable from one produced on a quiet machine.
 
 Both locks are taken regardless of what the run benches. That is deliberate: deciding whether a target is GPU-driving would mean maintaining an enumeration of bench names, feature combinations, and transitive dependencies that pull Metal in without saying so, and every miss would pass the check while the GPU spins. Serializing a CPU-only bench against GPU work is correct rather than merely tolerable, since GPU work during a CPU bench is exactly the ambient load the idle floor exists to exclude.
 
-What the locks and the probe cannot see is disk activity, so the rest of this section still applies to you rather than to the script. A bench window means no concurrent builds AND no git checkouts, worktree adds, large file copies, or downloads. Filesystem indexing churn (Spotlight `mdworker`, `fseventsd`) from a repository checkout lands asymmetrically in whichever measurement phase it overlaps, and base-then-head runs make that asymmetry read as a code regression. Two consecutive A/B runs were corrupted this way — worktree checkouts overlapping the head phase produced swings up to +250% in groups the diff could not reach.
+What the locks and the probe cannot see is disk activity, so the rest of this section still applies to you rather than to the script. A bench window means no concurrent builds AND no git checkouts, worktree adds, large file copies, or downloads. Filesystem indexing churn (Spotlight `mdworker`, `fseventsd`) from a repository checkout lands asymmetrically in whichever measurement phase it overlaps, and base-then-head runs make that asymmetry read as a code regression. A/B runs have been corrupted this way: worktree checkouts overlapping the head phase produce large apparent swings in groups the diff could not reach.
 
-Before re-running a corrupted A/B, check structural reachability first: is the changed code even compiled into the bench binaries? A diff confined to a `cfg`-gated module (e.g. `#[cfg(all(target_os = "macos", feature = "metal-gpu"))]`) is compiled out of a default-feature bench build entirely — base and head binaries are then built from identical effective source, and no rerun can attribute any delta to the diff.
+Before re-running a corrupted A/B, check structural reachability first, and run that check before booking a window rather than after spending one. The question is not whether the changed code is compiled into the bench binaries. It is whether any bench group ever executes it. Two different situations both answer no, and both are equally fatal to the measurement. A diff confined to a `cfg`-gated module (e.g. `#[cfg(all(target_os = "macos", feature = "metal-gpu"))]`), or to a bench target excluded by its own `required-features` list under default features, is compiled out of a default-feature bench build entirely, so base and head binaries are built from identical effective source. A diff that is compiled in but sits on a call path no bench group reaches is just as unmeasurable: the binaries genuinely differ, and every group still times identical executed code. Compilation is the wrong predicate. Reachability is the right one, and a change can pass the compilation test while failing the one that matters.
 
-To be precise about how this interacts with the "no exceptions" rule above: the bench-compare disposition section of the PR is still mandatory for every `crates/inference/`, `crates/embed/`, or `crates/fann/` PR. The compiled-out proof is the one narrow case where that section may contain the structural argument (name the `cfg` gate, name the bench build's feature set, state that base and head bench binaries have identical effective source) instead of an A/B table. If any changed line is compiled into the bench binaries — even an additive field or a cold-path function — the proof does not apply and you run the A/B, in a quiet window, like always.
+To be precise about how this interacts with the "no exceptions" rule above: the bench-compare disposition section of the PR is still mandatory for every `crates/inference/`, `crates/embed/`, or `crates/fann/` PR. An unreachability proof is the one narrow case where that section may contain a structural argument instead of an A/B table, and it carries a heavier burden than the old compiled-out wording did.
+
+The proof must name the population it searched, because the two targets `bench-compare` runs by default are not the population. `crates/inference` declares 23 bench targets and the default disposition path runs one of them, so "the default A/B showed nothing" is a statement about coverage, not about the change. Search every declared bench target for one that reaches the changed code — Cargo selects bench targets by `required-features` as well as by `cfg`, so search both. If a reachable target exists, run it (`--bench <name>`, plus whatever features its `cfg` gate or `required-features` entry require) instead of claiming a waiver. Only when no declared target reaches the change does the waiver apply, and then the proof states which targets were searched, and either names the `cfg` gate or `required-features` entry together with the bench build's feature set, or names the call path that does not exist. State the residual risk in the same paragraph: an unreachable change is not a safe change, it is an unmeasured one, and saying so is the point of the disposition.
+
+"Run it" assumes the reachable target sits inside `bench-compare`'s paired machinery. It doesn't always: `scripts/lib/bench-compare-impl.sh` drives exactly two packages, `lattice-inference` and `lattice-embed`, each through `cargo bench`'s Criterion `--save-baseline`/`--baseline` pair, and `Makefile`'s `bench-compare` target reaches only that script. A reachable target outside those two packages, or one that never calls into Criterion in the first place (a plain `fn main()` binary, not `criterion_group!`/`criterion_main!`, so there is no baseline to save or diff against), has no route through that pair — `crates/fann`'s `router_online` is both at once: it lives in `lattice-fann`, not `lattice-inference`/`lattice-embed`, and its body is a plain `fn main()` (`crates/fann/benches/router_online.rs:412`) with no Criterion dependency anywhere in `lattice-fann`'s manifest. For that target, the disposition still requires a before/after comparison; it's just not `bench-compare`'s. Check out base, run the target once under `scripts/bench-command.sh --label <name> --durable -- <command>` (`--durable` is required for this: it takes the same two machine-wide locks `bench-compare.sh` uses, plus a CPU-idle floor check before the command; the after-check runs only if the command exits zero — a nonzero exit returns that status immediately and skips the after-sample, so a failed run is gated only on entry — omitting `--durable` still takes both locks but runs no idle check at all. Even with `--durable`, this is a narrower gate than `bench-compare.sh`'s — it has no macOS cooldown, AC-power, thermal, or HID-idle checkpoint, so treat it as lock-serialized and CPU-idle-gated, not as the full quiet-machine discipline), record its output, then repeat at head and diff the two outputs by hand. A single run of such a target — head only, or base only — is supplemental: it shows the change executes, not how it moved anything, and it does not substitute for the paired before/after comparison the disposition requires.
+
+This reachability search covers runtime source changes: it answers whether a call path reaches an edited line, which presupposes the edit is a line a call path could reach. It does not cover the change's build inputs. A manifest change (including a `[[bench]]` table or a `required-features` list), a dependency or lockfile bump — `crates/inference/Cargo.toml`'s `criterion` entry is a direct input to the locked bench invocation (`cargo bench --locked`, `scripts/lib/bench-compare-impl.sh:509-510`) — a feature or default-feature change, a `[profile.*]` change, a build script, generated source, or a change to a bench target's own definition or to the bench harness has no absent call path to name and no `cfg` or `required-features` gate to name closed: the change alters what gets compiled or how the runner invokes it before any function body executes. No `cfg`-gate or absent-call-path proof is available for these, and their absence from a call graph is not evidence that they don't move the numbers. The structural waiver applies only to runtime source changes whose performance-relevant build inputs — manifest, dependency and lockfile versions, feature set, profile, build script and generated output, bench-target definitions, and harness — are identical between base and head; run a measured target whenever one of those inputs differs and can affect a bench.
+
+A reachability verdict costs minutes of reading and decides whether a bench window is worth booking at all. Run it first. A `--full` A/B on the two default targets measured 41 minutes for the base arm alone (264 groups, Apple silicon laptop, 2026-08-02), and the embed `simd` target was 97% of that; the head arm repeats the same work. Treat 41 minutes as a slow-side bound rather than a clean figure: that run's idle probe certified before the base arm and then failed at the following phase boundary, so the arm's tail was measured on a machine that had gone loud. Booking that against a change no group executes spends a window sized off the measured base-arm bound above — doubled for the head arm, which repeats the same work — to produce a table that cannot say anything; the doubled figure is a derivation, not a measurement.
 
 ### Bench by Group, Not All at Once
 
-The full Criterion suite takes 15-30 min. Never run it all. Filter to the groups your PR touches:
+Never run the full Criterion suite; see the measured slow-side bound above. Filter to the groups your PR touches:
 
 ```bash
-cargo bench -p lattice-embed --bench simd -- "simd_dot_product"     # one group
-cargo bench -p lattice-embed --bench simd -- "int8_raw|normalize"   # multiple groups
-cargo bench -p lattice-inference --bench elementwise_cpu_bench      # inference CPU ops
+scripts/bench-command.sh --label embed-simd -- cargo bench -p lattice-embed --bench simd -- "simd_dot_product"
+scripts/bench-command.sh --label embed-simd -- cargo bench -p lattice-embed --bench simd -- "int8_raw|normalize"
+scripts/bench-command.sh --label inference-cpu -- cargo bench -p lattice-inference --bench elementwise_cpu_bench
 ```
 
 For the A/B workflow, pass the same Criterion filter through `make bench-compare`:
@@ -48,6 +56,19 @@ make bench-compare BENCH_GROUPS_EMBED="simd_dot_product|int8_raw"
 ```
 
 Leaving these variables unset keeps the default `elementwise_cpu_bench` and `simd` bench targets.
+
+The local script paths classified in `scripts/bench-measurements.toml` enter a
+cooperative wrapper on ordinary direct invocation. This prevents accidental
+unlocked runs but is not a same-user authentication boundary. Add new local
+measurement entry points to that inventory; the CI contract rejects an
+unclassified `scripts/bench*` entry. Source-pattern discovery is advisory: a
+lexical no-match does not prove that a script never measures. The Rust
+inventory in the same manifest covers only its declared path grammar; other
+Rust examples, binaries, and tests require manual classification. Use
+`scripts/bench-command.sh --label <name> -- <command>` for an ad-hoc raw CPU
+Criterion command. `make bench-ci` and `make bench-gate` also refuse below the
+ambient-idle floor because their baseline or result outlives the process that
+produced it.
 
 Quick mode (`--quick`) is sufficient for direction + magnitude. Full mode only when you need tight CIs for a PR description or ADR evidence.
 
@@ -64,7 +85,7 @@ import numpy as np, mlx.core as mx, mlx.nn as nn
 # 4. Compare: which candidate has max-diff < 1e-4?
 ```
 
-This process closed a 0.77 PPL gap on Qwen3.5-0.8B that had been misdiagnosed as "f32-vs-bf16 precision drift" for days. The actual bug was a RoPE pairing convention mismatch — interleaved `(2i, 2i+1)` vs stride-half `(i, half+i)`. Verified in 5 seconds: stride-half max-diff `8e-6`, interleaved `67.5`. PPL dropped from 16.62 → 15.89 (MLX gold 15.86).
+The template above constructs no input and prints no max-diff; the figures below are a recorded result from one past investigation that followed it, not an output the template itself reproduces. That investigation closed a 0.77 PPL gap on Qwen3.5-0.8B (16.62 pre-fix vs. 15.86 MLX gold) that had been misdiagnosed as "f32-vs-bf16 precision drift" for days. The actual bug was a RoPE pairing convention mismatch — interleaved `(2i, 2i+1)` vs stride-half `(i, half+i)`. Verified in 5 seconds: stride-half max-diff `8e-6`, interleaved `67.5`. PPL dropped from 16.62 → 15.89 (MLX gold 15.86).
 
 **Quantitative bounds reject hypotheses cheaply.** Before chasing "FP precision drift" or other plausible-sounding causes, check the literature for typical magnitude:
 
@@ -80,11 +101,11 @@ If the gap you're investigating exceeds these bounds, the cause is structural (a
 
 When a test fails intermittently or fails alongside unrelated work, run the discriminating experiment before writing the issue: ONE test, solo, `--test-threads=1`, idle GPU, exact main SHA. Concurrent GPU load corrupts both timing and numerics, so a "pre-existing failure on main" verified while other GPU work runs is not verified at all.
 
-This split a two-test failure report cleanly: one test failed deterministically at every prompt length under solo idle-GPU conditions (real chunk-boundary accumulation drift, its own issue), while the other passed solo in 65 seconds (a load flake, a different issue). Filing them as one regression would have sent the fix to the wrong place.
+This split a two-test failure report cleanly: one test failed deterministically at every prompt length under solo idle-GPU conditions (real chunk-boundary accumulation drift, its own issue), while the other passed solo (a load flake, a different issue). Filing them as one regression would have sent the fix to the wrong place.
 
 ### Machine-Wide GPU Test Lock
 
-All Metal-touching tests in this repo serialize through `gpu_test_lock()` (crates/inference/src/forward/metal_qwen35.rs), which holds two locks: an in-process mutex (thread serialization within one test binary) and an exclusive advisory flock on `/tmp/lion-metal-gpu-test.lock` (cross-process serialization, machine-wide convention). Any harness on this machine that drives the GPU for measurements — other repos' test suites, bench runners, one-off scripts — should acquire the same flock before touching Metal. Concurrent GPU work corrupts both timing and numerics: contended confirmation batches inflated top-k logit margins ~3x and produced false failure reports (#628, #629).
+Metal lock coverage is enforced by `crates/inference/tests/metal_measurement_lock_contract.rs`: discovered `MetalQwen35State` construction sites must acquire the shared lock before construction or name an explicit exemption, while raw measurement markers use an exact inventory. This is not a claim that every Metal-touching target is locked; long-running processes and explicitly listed legacy targets are exempt. Locking callers serialize through the single `gpu_test_lock()` implementation in `crates/inference/src/measurement.rs`. The module is a `#[doc(hidden)]`, Metal-only export because Cargo builds integration tests, benches, examples, and binaries as crates separate from `lattice-inference`; it is not production API. The guard holds two locks: an in-process mutex (thread serialization within one test binary) and an exclusive advisory flock on `/tmp/lion-metal-gpu-test.lock` (cross-process serialization, machine-wide convention). Any harness on this machine that drives the GPU for measurements — other repos' test suites, bench runners, one-off scripts — should acquire the same flock before touching Metal. Concurrent GPU work corrupts both timing and numerics: contended confirmation batches inflated top-k logit margins enough to produce false failure reports (#628, #629).
 
 The lock blocks for up to 30 minutes, then panics with an `lsof /tmp/lion-metal-gpu-test.lock` hint rather than hanging silently. If a run appears stuck at test start, another process is holding the GPU; check who with `lsof` before killing anything.
 
@@ -151,17 +172,17 @@ current main during review, not just against the PR's own diff.
 - Do not run the full Criterion suite when you can filter to relevant groups.
 - Do not submit a perf PR without `make bench-compare` output.
 
-## Performance Workflow (ADR-058)
+## Performance Workflow (ADR-087)
 
 - **Every perf PR must include before/after numbers.** No exception. Run `make bench-compare` (or `scripts/bench-compare.sh <base> <head>`) to get an A/B table. Paste the output in the PR description.
-- Default to `--quick` (~2 min). Use `--full` only when CIs are too wide to tell.
+- Default to `--quick` (not separately measured; see the measured `--full` slow-side bound above before booking a window). Use `--full` only when CIs are too wide to tell.
 - After merging to main, `bench-update.yml` auto-updates the `perf-baselines` branch (trend data, not a gate). PRs are gated by `e2e-parity.yml` (greedy token agreement vs HF).
 - For local baseline tracking: `make bench-ci` saves a local baseline, `make bench-gate` compares against the `perf-baselines` branch.
 - Do not claim "X% faster" without a measurement from this session. Stale numbers from prior sessions are not evidence.
 
 ## Crate Ownership
 
-Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `inference` (via the optional `mixture` feature) and `tune`. Only `fann` and `transport` are leaf crates; `transport` has no internal dependents (`embed` uses it in dev-tests only).
+Changes to `inference` affect `embed` in an ordinary build, and affect `tune` only under `inference-hook` or `train-backward` — neither is in tune's default set, so a default `cargo build -p lattice-tune` does not compile `lattice-inference` at all. Changes to `fann` affect `tune` unconditionally and `inference` only under the optional `mixture` feature, which is likewise off by default. Only `fann` and `transport` are leaf crates; `transport` has no internal dependents (`embed` uses it in dev-tests only). When sizing the blast radius of a change, read the consuming crate's default feature set rather than the arrow: two of these four edges are absent from a default build.
 
 ## Publishing
 

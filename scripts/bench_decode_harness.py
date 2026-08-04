@@ -130,12 +130,34 @@ import statistics
 import subprocess
 import sys
 import time
-import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+
+_RUNNING_PYTHON = ".".join(str(part) for part in sys.version_info[:3])
+_PYTHON_REQUIREMENT_ERROR = (
+    f"{sys.argv[0]} requires Python 3.11 or newer; "
+    f"running Python {_RUNNING_PYTHON} at {sys.executable}"
+)
+try:
+    import tomllib
+    from datetime import UTC, datetime
+except ImportError:
+    raise SystemExit(_PYTHON_REQUIREMENT_ERROR) from None
+if sys.version_info[:2] < (3, 11):
+    raise SystemExit(_PYTHON_REQUIREMENT_ERROR)
+
+if (
+    __name__ == "__main__"
+    and len(sys.argv) > 1
+    and sys.argv[1] == "run"
+    and not {"-h", "--help"}.intersection(sys.argv[2:])
+):
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from bench_supervision import ensure_python_entrypoint
+
+    ensure_python_entrypoint("decode-harness", quiet=True)
 
 sys.modules.setdefault("bench_decode_harness", sys.modules[__name__])
 
