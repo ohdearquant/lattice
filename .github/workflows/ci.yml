@@ -824,6 +824,72 @@ jobs:
         with:
           package: lattice-fann,lattice-transport,lattice-inference,lattice-embed,lattice-tune
           feature-group: default-features
+      # Pure observer, added after the gate above and byte-for-byte unable to
+      # change its verdict. Under 0.x semver a workspace minor bump (e.g.
+      # 0.7.1 -> 0.8.0) reads to cargo-semver-checks as an assumed-major
+      # change, so every check is skipped and the action above still reports
+      # success — a green run that verified nothing. This block re-runs the
+      # check for one crate and discloses, on the step summary and as a
+      # workflow annotation, when the executed-check count is zero. Every
+      # step here is continue-on-error: an observer must never be able to
+      # fail the job it only reports on.
+      #
+      # Scoped to lattice-transport alone rather than repeating the gate's
+      # five-package check. The condition this observer detects is
+      # workspace-global by construction: every crate shares one
+      # `[workspace.package] version`, so a version bump voids the gate for
+      # all five simultaneously through that single shared value, and one
+      # crate's real `Checked N checks` line answers the question for the
+      # rest. lattice-transport and lattice-fann are the workspace's leaf
+      # crates (no internal path deps to build first); measured locally with
+      # a warm target dir (the state this step actually runs in, since the
+      # gate step above already built rustdoc JSON for all five crates in
+      # this same job) via
+      # `cargo semver-checks check-release -p <crate> --default-features`,
+      # lattice-transport finished in ~0.75-0.79s across two runs versus
+      # lattice-fann's ~1.0-1.2s, so lattice-transport is the cheaper pick.
+      # The disclosure step below is told which crate this is via
+      # --observed-package so its own text states the scope it actually
+      # checked, rather than implying workspace-wide coverage.
+      - name: Confirm cargo-semver-checks is on PATH
+        continue-on-error: true
+        run: |
+          if ! command -v cargo-semver-checks >/dev/null 2>&1; then
+            echo "::warning::cargo-semver-checks not found on PATH after the action step; installing it directly via 'cargo install --locked' so the disclosure re-run below can proceed"
+            cargo install cargo-semver-checks --locked
+          fi
+      # CARGO_TERM_COLOR=never is prevention, not the guarantee: the parser
+      # also strips ANSI escapes itself (scripts/semver-checks-disclose.py),
+      # since the tool can colour its output for reasons other than this
+      # variable and a parser that only works when an upstream env var was
+      # set correctly is not one that can be trusted on its own.
+      - name: Re-run semver-checks to capture executed-check counts
+        continue-on-error: true
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo semver-checks check-release -p lattice-transport --default-features \
+            > "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" 2>&1 || true
+      # Every other Python step in this workflow uses bare python3 (see
+      # decode-harness-unit-tests below); match that convention rather than
+      # introducing a different one for this one step.
+      - name: Disclose zero-check semver-checks runs
+        continue-on-error: true
+        run: |
+          set +e
+          python3 scripts/semver-checks-disclose.py "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" --summary-out "$GITHUB_STEP_SUMMARY" --observed-package lattice-transport
+          status=$?
+          # 0 = ran to completion silently or with its own disclosure+warning;
+          # 1 = ran to completion and emitted its own could-not-read
+          # disclosure+warning. Any OTHER status means the interpreter or the
+          # script itself never got that far — command-not-found (127),
+          # permission denied (126), a bad argv, etc. — so this step must
+          # announce its own failure, or continue-on-error lets it vanish
+          # without a trace: a real run measured exactly that, a bare exit
+          # 127 with no annotation and a green, silent job.
+          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+            echo "::warning::semver-checks disclosure step did not run to completion (exit $status) — this job's zero-check instrument produced no verdict at all, healthy or otherwise."
+          fi
 
   # REQUIRED status check (see the rollout note at the top of this file).
   # Always runs, always reports. `ci`, `feature-matrix`, and `msrv` are matrix
