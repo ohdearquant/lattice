@@ -99,6 +99,17 @@ inference (~118K)                                 ← optional dep on fann (`mix
 embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
+Three of those four edges are feature-gated, and the gates do not all default the
+same way, so "depends on" in the diagram is not one relationship. `tune` depends on
+`fann` unconditionally. The other three are optional deps: `embed` to `inference` is
+enabled through `native`, which is in embed's default set, so it is present in an
+ordinary build; `inference` to `fann` is behind `mixture` and `tune` to `inference` is
+behind `inference-hook` or `train-backward`, and neither of those is in its crate's
+default set. A default `cargo build -p lattice-tune` therefore does not compile
+`lattice-inference` at all — six targets pull it in through `required-features` and
+that is the whole of its reach. Check the manifest before assuming an edge is live in
+the build you are looking at.
+
 ### lattice-inference — Transformer kernel
 
 | Module           | Purpose                      | Key Exports                                                                       |

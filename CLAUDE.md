@@ -174,7 +174,7 @@ current main during review, not just against the PR's own diff.
 
 ## Crate Ownership
 
-Changes to `inference` affect `embed` and `tune`. Changes to `fann` affect `inference` (via the optional `mixture` feature) and `tune`. Only `fann` and `transport` are leaf crates; `transport` has no internal dependents (`embed` uses it in dev-tests only).
+Changes to `inference` affect `embed` in an ordinary build, and affect `tune` only under `inference-hook` or `train-backward` — neither is in tune's default set, so a default `cargo build -p lattice-tune` does not compile `lattice-inference` at all. Changes to `fann` affect `tune` unconditionally and `inference` only under the optional `mixture` feature, which is likewise off by default. Only `fann` and `transport` are leaf crates; `transport` has no internal dependents (`embed` uses it in dev-tests only). When sizing the blast radius of a change, read the consuming crate's default feature set rather than the arrow: two of these four edges are absent from a default build.
 
 ## Publishing
 
