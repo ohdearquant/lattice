@@ -157,8 +157,21 @@ class _Sandbox:
             'name = "criterion"\n'
             'version = "0.5.1"\n'
         )
+        # Declared-group reconciliation reads crates/<crate>/benches/<target>.rs
+        # from the checked-out worktree; the default targets need a stub here
+        # or bench-compare-impl.sh refuses with no declared-group source.
+        inference_benches = self.root / "crates" / "inference" / "benches"
+        inference_benches.mkdir(parents=True)
+        (inference_benches / "elementwise_cpu_bench.rs").write_text(
+            'let mut group = c.benchmark_group("rms_norm");\n'
+        )
+        embed_benches = self.root / "crates" / "embed" / "benches"
+        embed_benches.mkdir(parents=True)
+        (embed_benches / "simd.rs").write_text(
+            'let mut group = c.benchmark_group("simd_dot_product");\n'
+        )
         subprocess.run(
-            [*GIT, "-C", str(self.root), "add", "-f", "Cargo.lock"],
+            [*GIT, "-C", str(self.root), "add", "-f", "Cargo.lock", "crates"],
             check=True,
         )
         for i in range(2):

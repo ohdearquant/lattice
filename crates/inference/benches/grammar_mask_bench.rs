@@ -6,7 +6,7 @@
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use lattice_inference::grammar::engine::{
-    context_recheck_simulated, enable_mask_profiling, take_mask_profile,
+    context_recheck_candidates, context_recheck_simulated, enable_mask_profiling, take_mask_profile,
 };
 use lattice_inference::grammar::pda::GrammarState;
 use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
@@ -66,6 +66,22 @@ fn fixture() -> (GrammarEngine, GrammarState, usize) {
     // the loop *ran*, not that it did work.
     let expected_simulated = (CONTEXT_TOKEN_COUNT / STATE_COUNT) as u64;
     assert_eq!(context_recheck_simulated(), expected_simulated);
+    // `context_recheck_simulated` alone does not discriminate the candidate
+    // *set* the loop iterated: every non-matching-group candidate is already
+    // blocked by the precomputed bitmask before it can reach
+    // `simulate_token`, so it reads `expected_simulated` whether the loop
+    // walked this state's local group or the global union across all
+    // states. `context_recheck_candidates` counts loop entries instead
+    // (before that bitmask short-circuit), so it is sized by which set was
+    // iterated: this state's local group is exactly
+    // `CONTEXT_TOKEN_COUNT / STATE_COUNT` candidates (state-local routing,
+    // what this PR implements), whereas the global union is all
+    // `CONTEXT_TOKEN_COUNT` context-dependent candidates across every state
+    // (the pre-PR fallback). A regression that routes the loop back onto
+    // the global union changes this count from `expected_simulated` to
+    // `CONTEXT_TOKEN_COUNT` while `context_recheck_simulated` stays flat.
+    let expected_candidates = expected_simulated;
+    assert_eq!(context_recheck_candidates(), expected_candidates);
     assert_eq!(
         probe_logits
             .iter()

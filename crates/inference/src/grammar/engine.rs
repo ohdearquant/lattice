@@ -29,7 +29,10 @@
 //! # Performance
 //!
 //! - `mask_logits`: O(vocab_size / 64) bitmask scan + O(k × stack_depth) for
-//!   context-dependent tokens, where k ≈ 1% of vocab_size.
+//!   context-dependent tokens, where k is the current grammar state's
+//!   precomputed candidate count when a state-local list was stored, or the
+//!   global union across all states when it was withheld under the
+//!   partition's aggregate capacity budget.
 //! - `advance`: O(stack_depth) PDA step; typical depth 2–8.
 //! - `new`: O(|states| × vocab_size × max_token_len) — called once.
 
@@ -63,8 +66,25 @@ thread_local! {
     static MASK_PROFILE: std::cell::RefCell<MaskProfile> =
         const { std::cell::RefCell::new(MaskProfile::new()) };
     static CONTEXT_RECHECK_SIMULATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CONTEXT_RECHECK_CANDIDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BUILD_PROFILE: std::cell::RefCell<BuildProfile> =
         const { std::cell::RefCell::new(BuildProfile::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTEXT_RECHECK_CANDIDATES_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_context_recheck_candidates_for_test() {
+    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn take_context_recheck_candidates_for_test() -> u64 {
+    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// Aggregated per-decode-step grammar-masking cost, accumulated across every
@@ -133,6 +153,7 @@ pub fn enable_mask_profiling() {
     MASK_PROFILING_ENABLED.with(|e| e.set(true));
     MASK_PROFILE.with(|p| *p.borrow_mut() = MaskProfile::new());
     CONTEXT_RECHECK_SIMULATED.with(|c| c.set(0));
+    CONTEXT_RECHECK_CANDIDATES.with(|c| c.set(0));
 }
 
 /// Disable mask profiling and return the accumulated [`MaskProfile`].
@@ -152,6 +173,22 @@ pub fn take_mask_profile() -> MaskProfile {
 /// this does not disable profiling, so it can be read mid-run.
 pub fn context_recheck_simulated() -> u64 {
     CONTEXT_RECHECK_SIMULATED.with(std::cell::Cell::get)
+}
+
+/// Number of times the context-dependent recheck loop body was entered
+/// (i.e. the size of the candidate set the loop iterated over) since the
+/// last [`enable_mask_profiling`] call. Counted at loop entry, before the
+/// precomputed-bitmask short-circuit (`logits[token_id] ==
+/// f32::NEG_INFINITY`) skips a candidate. Distinguishes *which candidate
+/// set* the loop iterated (state-local vs. the conservative global union)
+/// from [`context_recheck_simulated`], which only counts candidates that
+/// survived that short-circuit to reach `simulate_token` — a metric that
+/// reads identically for either candidate set whenever the bitmask already
+/// rejects every out-of-group candidate. Tracked separately from
+/// [`MaskProfile`] for the same semver reason as
+/// [`context_recheck_simulated`].
+pub fn context_recheck_candidates() -> u64 {
+    CONTEXT_RECHECK_CANDIDATES.with(std::cell::Cell::get)
 }
 
 fn mask_profiling_enabled() -> bool {
@@ -408,7 +445,10 @@ impl GrammarEngine {
     /// The hot path is a bitmask scan over `vocab_size / 64` words (~3,880
     /// iterations for Qwen3's 248,320 tokens), taking under 40 µs on modern
     /// Apple Silicon.  Context-dependent tokens add O(k × stack_depth)
-    /// overhead (k ≈ 1% of vocab).
+    /// overhead, where k is the precomputed candidate count for this grammar
+    /// state when a state-local list was stored. A state whose list was
+    /// withheld under the partition's aggregate capacity budget conservatively
+    /// falls back to k being the union across every state.
     pub fn mask_logits(
         &self,
         state: &mut GrammarState,
@@ -439,7 +479,13 @@ impl GrammarEngine {
                 // Re-check context-dependent tokens at runtime.
                 let t1 = profiling.then(std::time::Instant::now);
                 let mut simulated = 0u64;
-                for &token_id in self.partition.context_dependent_ids() {
+                let mut visited = 0u64;
+                for &token_id in self.partition.context_dependent_ids_for_state(state_id) {
+                    #[cfg(test)]
+                    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(|count| count.set(count.get() + 1));
+                    if profiling {
+                        visited += 1;
+                    }
                     if token_id >= self.vocab_size {
                         continue;
                     }
@@ -476,6 +522,7 @@ impl GrammarEngine {
                         p.context_recheck_ns += ns;
                     });
                     CONTEXT_RECHECK_SIMULATED.with(|c| c.set(c.get() + simulated));
+                    CONTEXT_RECHECK_CANDIDATES.with(|c| c.set(c.get() + visited));
                 }
             }
             None => {
@@ -973,6 +1020,41 @@ mod tests {
             .expect_err("the public simulation path must reject the same mismatch");
         assert!(simulation_error.0.contains("logits length 1"));
         assert!(simulation_error.0.contains("vocabulary size 2"));
+    }
+
+    #[test]
+    fn mask_logits_rechecks_only_the_current_states_candidates() {
+        let spec = GrammarSpec::Gbnf("root ::= \"abcd\"\n".to_string());
+        let vocab = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"ax".to_vec(),
+            b"bx".to_vec(),
+            b"cx".to_vec(),
+            b"dx".to_vec(),
+        ];
+        let engine = GrammarEngine::new(&spec, vocab).expect("fixture grammar must compile");
+        let mut state = engine.initial_state();
+        assert!(engine.advance(&mut state, 0), "token 'a' must advance");
+
+        reset_context_recheck_candidates_for_test();
+        let mut actual = vec![0.0; 8];
+        engine
+            .mask_logits(&mut state, &mut actual)
+            .expect("fixture logits match the vocabulary");
+        assert_eq!(
+            take_context_recheck_candidates_for_test(),
+            1,
+            "state after 'a' must inspect only the 'bx' partial token"
+        );
+
+        let mut oracle = vec![0.0; 8];
+        engine
+            .mask_by_simulation(&state, &mut oracle)
+            .expect("fixture logits match the vocabulary");
+        assert_eq!(actual, oracle);
     }
 
     #[test]
