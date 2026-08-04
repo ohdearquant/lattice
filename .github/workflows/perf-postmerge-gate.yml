@@ -31,12 +31,17 @@ name: perf post-merge detection (informational, PAUSED)
 # absence of a FAIL as evidence of a small change's absence.
 #
 # WHY AN A/B AGAINST THE LAST MEASURED COMMIT rather than perf-baselines:
-# bench-update.yml rewrites perf-baselines on every perf-path push to main, so a
-# regression can be absorbed before a scheduled comparison. This lane instead
-# advances one lightweight branch per architecture only after its own A/B
-# succeeds. If GitHub drops an intermediate pending run, the next run widens its
-# range back to that recorded commit instead of putting the skipped change in
-# both arms. The first run falls back to the event parent and says so.
+# bench-update.yml rewrites perf-baselines on nearly every perf-path push to
+# main -- 121 of its 123 recorded push-triggered runs (`gh run list
+# --workflow=bench-update.yml --json event,conclusion`); the other 2 failed the
+# bench step and their publish job was skipped, so perf-baselines was not
+# rewritten for those 2 pushes -- so a regression can usually be absorbed
+# before a scheduled comparison. This lane instead advances one lightweight
+# branch per architecture only after its own A/B succeeds. If GitHub drops an
+# intermediate pending run, the next run widens its range back to that
+# recorded commit instead of putting the skipped change in both arms. When
+# that state branch has no recorded commit yet, the run falls back to the
+# triggering push's event-before SHA instead.
 
 # PAUSED 2026-08-01, NOT FIXED. The automatic push trigger is removed; the lane
 # still runs on demand via workflow_dispatch, unchanged in every other respect.
@@ -89,25 +94,61 @@ name: perf post-merge detection (informational, PAUSED)
 # reports named above. Enumeration: `gh run list --repo ohdearquant/lattice
 # --workflow=perf-postmerge-gate.yml --limit 100 --json
 # databaseId,headSha,event,createdAt,conclusion` returns 23 runs: 1
-# workflow_dispatch, 1 cancelled push, 21 completed push runs. Of those 21,
-# 16 carry a confirmed-regression x86_64-linux verdict; this population
-# drops the earliest, run 29879966073, whose A/B baseline falls back to the
-# event parent rather than the last-measured-commit baseline the other 15
-# share (see the "first run" note above), leaving the same 15 runs -- and
-# the same 14 with a completed aarch64-linux leg -- used above.
+# workflow_dispatch, 1 cancelled push, 21 completed push runs.
+#
+# Of those 21, every x86_64-linux leg's gate step exits either 1 (confirmed
+# regression) or 2 (refused to certify -- no comparison data, checked via
+# `AB_RC:` in each job's "Classify the gate outcome" log): 15 exit 1, 6 exit
+# 2. None exit 0 (clean pass) or 3 (not measurable). The 15-run population
+# used throughout this header is the 15 exit-1 runs.
+#
+# Correction: an earlier version of this text said the run excluded from the
+# 15 was the earliest, 29879966073, on the ground that its baseline fell back
+# to the event parent instead of a last-measured-commit branch the other 15
+# use.
+# That claim does not survive checking the run's own log. Its "Resolve the
+# A/B endpoints" step printed `A/B endpoints: 05291c5ddb02... ->
+# d7929307de...`, and `05291c5d` is `git rev-parse d7929307de^` -- its
+# ordinary immediate parent, reached via the same event-before code path
+# every one of the other 14 runs in this population also used (checked the
+# same log line in each; none differ). The `scripts/perf-postmerge-base.py` /
+# `perf-postmerge-measured-*` state-branch mechanism referenced two
+# paragraphs up postdates this entire 15-run population -- it first appears
+# in a run's log on 2026-07-31, after run 30489540763, the last of the 15.
+# 29879966073 belongs in the population on identical footing to the rest.
+#
+# The run actually excluded is 30472160128 (created 2026-07-29T16:44:53Z, a
+# member of neither the 15 nor the 14): its x86_64-linux gate step ran the
+# full ~87 minutes but exited 2, producing zero rows in its `Delta point`
+# table, so it cannot contribute to the row counts, FAIL rate, sign split, or
+# recurrence figures above -- those were in fact already computed over the
+# corrected 15-run population (reproduced independently: 12x263 + 3x264 =
+# 3948 total rows, 220 FAIL rows, 5.6%, sign split 232/273, recurrence 3/6/7,
+# all match this header's existing figures exactly), so only this paragraph's
+# prose needed correcting, not the numbers past it.
 #
 # Per-job on-runner duration of the "Full-mode A/B, failing on a confirmed
 # regression" step (`gh run view <id> --json jobs --jq '.jobs[] |
 # {name,steps}'`, startedAt/completedAt of that step): x86_64-linux median
-# 87m42s, range 86m04s-88m29s (n=15); aarch64-linux median 82m30s, range
-# 77m30s-83m04s (n=14).
+# 87m42s, range 86m04s-88m29s (n=15); aarch64-linux median 82m32s, range
+# 82m20s-83m04s (n=14). The aarch64 range previously read 77m30s-83m04s: the
+# low end was run 29881462420's aarch64 leg, the one CANCELLED leg the "14
+# completed" population is defined to exclude -- its 77m30s runtime is how
+# long it ran before cancellation, not a completed-leg data point.
 #
 # Separately: queue-inclusive workflow latency (workflow createdAt to the
 # later of the two jobs' completedAt, same 15 runs) is a different clock:
 # median 88m25s, range 86m40s-177m47s. The earlier-cited 168m39s (run
 # 30479549447) is not even the largest excursion in this population; run
-# 30452387834 queued to 177m47s. That tail is scheduling/runner-availability
-# variance upstream of job start, not on-runner execution time.
+# 30452387834 queued to 177m47s. Checked what the two largest excursions
+# actually spend their time on, via each job's own startedAt: run
+# 30452387834's jobs did not start until 89m39s after workflow createdAt,
+# then ran their normal ~83-88m; run 30479549447's jobs waited 80m before
+# starting. Both tails are time before the job starts running, not slow
+# on-runner execution -- consistent with "queue-inclusive latency", though
+# this header does not establish WHY those two runs queued that long
+# (concurrent same-ref run, hosted-runner pool contention, or something
+# else).
 #
 # What must be true before the push trigger returns. The rule needs a
 # between-run variance estimate rather than a within-run confidence interval;
@@ -115,8 +156,11 @@ name: perf post-merge detection (informational, PAUSED)
 # chronically unstable groups need identifying and either stabilising or
 # excluding. Any change to which groups are gated requires a repeated A/A on the
 # target machine class plus a re-derivation of the threshold FIRST. Restoring
-# the trigger without those changes would not restore a working detector, it
-# would resume a false alarm on every merge.
+# the trigger without those changes would not restore a working detector: of
+# the 21 historical push runs, 15 produced a confirmed-regression x86_64-linux
+# verdict and the other 6 refused to certify rather than passing cleanly (see
+# "Cost of leaving it on" above) -- on this record, resuming the trigger would
+# reproduce a false alarm on most merges, not a working signal on any of them.
 #
 # The paths list below is retained verbatim, commented, so that restoring the
 # trigger is a revert of this block rather than a re-derivation of coverage.
