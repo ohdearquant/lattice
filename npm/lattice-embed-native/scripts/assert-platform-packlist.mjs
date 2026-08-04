@@ -1,9 +1,13 @@
 // Pack-list guard for a per-platform binary subpackage (e.g.
 // `npm/darwin-arm64/`): asserts the tarball (`npm pack --dry-run --json`,
 // piped in on stdin) contains `package.json`, EXACTLY ONE `.node` file, and
-// nothing else besides an npm-auto-included README (npm bundles any README*
-// it finds in the packed directory regardless of the package.json "files"
+// nothing else besides an npm-auto-included README (npm always bundles the
+// root README file itself -- case- and extension-flexible, e.g. `README`,
+// `README.md`, `readme.custom` -- regardless of the package.json "files"
 // allowlist, so a two-file expectation is wrong whenever one is present).
+// This does NOT extend to arbitrary README-prefixed files: an allowlisted
+// `readme-not-a-readme.js` is not npm's special case and must still be
+// rejected.
 // Run from the main package root via `npm run packlist:darwin-arm64` (see
 // package.json), which `cd`s into the subpackage directory first, or from
 // the prebuild workflow's per-suffix loop. The `napi artifacts` step (`npm
@@ -37,7 +41,14 @@ assert.equal(
 )
 
 const allowed = new Set(['package.json', nodeFiles[0]])
-const unexpected = files.filter(path => !allowed.has(path) && !/^readme/i.test(path))
+const readmePattern = /^README(\.[A-Za-z0-9]+)?$/i
+const readmeFiles = files.filter(path => !allowed.has(path) && readmePattern.test(path))
+assert.ok(
+  readmeFiles.length <= 1,
+  `platform package must contain at most one root README file, found ${readmeFiles.length} (${readmeFiles.join(', ')})`
+)
+
+const unexpected = files.filter(path => !allowed.has(path) && !readmePattern.test(path))
 assert.equal(
   unexpected.length,
   0,
