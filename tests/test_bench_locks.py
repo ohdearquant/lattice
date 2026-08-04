@@ -992,27 +992,56 @@ class SupervisionShellHelperFailures(unittest.TestCase):
     explicit ``exit 2`` is ever reached.
     """
 
-    def _call(self, function_call: str, *, argv0: str) -> subprocess.CompletedProcess:
-        helper_body = (LIB / "bench-supervision.sh").read_text()
-        script = f"set -e\n{helper_body}\n{function_call}\n"
-        return subprocess.run(
-            ["bash", "-c", script, argv0],
-            capture_output=True, text=True, timeout=30)
-
     def test_root_resolution_failure_exits_2(self):
         """Mutation-sensitive: revert the `if ! repo=... ; then ... fi` guard
         around either `cd` in bench-supervision.sh and this run's exit code
-        flips from 2 to a raw 1 (or an unhandled `set -e` abort)."""
-        fake_source = (
-            "/tmp/lattice-bench-supervision-root-never-existed/"
-            "scripts/lib/bench-supervision.sh"
-        )
-        r = self._call('bench_quiet_checkpoint test-label', argv0=fake_source)
+        flips from 2 to a raw 1 (or an unhandled `set -e` abort).
+
+        `BASH_SOURCE[0]` for a function *defined inline inside a `bash -c`
+        string* is not reliably the argv0 passed alongside that string --
+        that binding is bash-build-dependent (confirmed to differ between
+        the Homebrew and system bash on this machine). A test that sets
+        argv0 to a nonexistent path and expects the guard's `cd` to fail on
+        that basis can pass locally and fail on CI (or vice versa) purely
+        because of which bash resolved BASH_SOURCE[0] to an empty string,
+        making `dirname` default to the process's cwd -- a real directory
+        the `cd` happily enters, so the guard never fires.
+
+        `BASH_SOURCE[0]` set by the `source` builtin, by contrast, is
+        pinned to the exact path given to `source` on every bash build:
+        there is no argv0 indirection to lose. So this test sources a real,
+        on-disk copy of the helper (giving BASH_SOURCE[0] a value no bash
+        version can second-guess), then deletes that copy's repo-root
+        ancestor *after* sourcing but *before* calling the function --
+        the function body was already parsed into memory, but the `cd`
+        it performs at call time now targets a directory that provably
+        does not exist, regardless of the test process's own cwd.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            vanished_root = Path(tmp) / "vanished-repo-root"
+            (vanished_root / "scripts" / "lib").mkdir(parents=True)
+            shutil.copy2(
+                LIB / "bench-supervision.sh",
+                vanished_root / "scripts" / "lib" / "bench-supervision.sh")
+            helper_path = vanished_root / "scripts" / "lib" / "bench-supervision.sh"
+            script = (
+                'set -e\n'
+                f'source "{helper_path}"\n'
+                f'rm -rf "{vanished_root}"\n'
+                'bench_quiet_checkpoint test-label\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30)
         self.assertEqual(
             r.returncode, 2,
             f"expected exit 2, got {r.returncode}\nstdout:\n{r.stdout}\n"
             f"stderr:\n{r.stderr}")
-        self.assertIn("FATAL", r.stderr)
+        self.assertIn(
+            "FATAL: cannot resolve the repository root", r.stderr,
+            "exit 2 alone does not pin this to the root-resolution guard; "
+            "bench_quiet_checkpoint's other failure branch (the quiet-probe "
+            "refusal) also exits 2 with a different message, so the "
+            f"guard-specific text must be present.\nstderr:\n{r.stderr}")
 
     def test_closed_stderr_diagnostic_still_exits_2(self):
         """Mutation-sensitive: drop the `|| :` from the FATAL echo in
