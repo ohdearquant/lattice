@@ -400,39 +400,19 @@ pub(crate) fn reject_if_mmap_file_trust_boundary_weak(
     Ok(())
 }
 
-/// `O_NONBLOCK`, verified against this platform's `fcntl.h` (no `libc` crate
-/// dependency, mirroring [`current_uid`]'s direct `getuid()` FFI pattern).
-/// Darwin: `0x00000004` (`bsd/sys/fcntl.h`). Linux: `0o4000` octal --
-/// architecture-independent for every target this workspace builds
-/// (`asm-generic/fcntl.h`); the handful of Linux ports with a divergent
-/// value (sparc, mips, alpha, parisc) are not lattice build targets.
-#[cfg(target_os = "macos")]
-const O_NONBLOCK: i32 = 0x0000_0004;
-#[cfg(all(unix, not(target_os = "macos")))]
-const O_NONBLOCK: i32 = 0o4000;
-
-/// `O_NOFOLLOW`, verified the same way as [`O_NONBLOCK`] above (no `libc`
-/// crate dependency, direct per-platform header value). Darwin:
-/// `0x00000100` (`bsd/sys/fcntl.h`). Linux: `0o0400000` octal
-/// (`asm-generic/fcntl.h`), architecture-independent for every target this
-/// workspace builds -- same caveat as `O_NONBLOCK` above for the handful of
-/// non-target Linux ports with a divergent value.
-#[cfg(target_os = "macos")]
-const O_NOFOLLOW: i32 = 0x0000_0100;
-#[cfg(all(unix, not(target_os = "macos")))]
-const O_NOFOLLOW: i32 = 0o400000;
-
-/// `ELOOP` ("too many levels of symbolic links" -- also the errno `open()`
-/// returns for an `O_NOFOLLOW` open whose final path component is a
-/// symlink), verified per-platform the same way as `O_NOFOLLOW` above:
-/// `std::io::ErrorKind::FilesystemLoop` is not yet stable
-/// (rust-lang/rust#86442), so this compares `raw_os_error()` directly.
-/// Darwin: `62` (`sys/errno.h`). Linux: `40` (`asm-generic/errno.h`),
-/// architecture-independent for every target this workspace builds.
-#[cfg(target_os = "macos")]
-const ELOOP: i32 = 62;
-#[cfg(all(unix, not(target_os = "macos")))]
-const ELOOP: i32 = 40;
+/// `O_NONBLOCK`, `O_NOFOLLOW`, and `ELOOP` come from `libc` rather than a
+/// per-platform hand transcription. `O_NOFOLLOW` in particular is not a
+/// single Linux-wide value: glibc/musl `x86_64` uses `0x20000`, while
+/// `aarch64` uses `0x8000` -- a divergence a "Linux is architecture
+/// independent" comment previously missed, verified by inspecting `libc`
+/// 0.2.189's per-target source (`src/unix/linux_like/linux/gnu/b64/x86_64/mod.rs`
+/// vs. `.../gnu/b64/aarch64/mod.rs`; same split holds for the musl variants
+/// under `src/unix/linux_like/linux/musl/b64/`). `O_NONBLOCK` (`0o4000`) and
+/// `ELOOP` (`40`) do not diverge between those two targets, but taking all
+/// three from `libc` removes the need to track that per constant, per
+/// architecture, by hand.
+#[cfg(unix)]
+use libc::{ELOOP, O_NOFOLLOW, O_NONBLOCK};
 
 // POSIX-common `fcntl` command values, identical across every unix this
 // workspace targets.
