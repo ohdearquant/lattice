@@ -965,6 +965,9 @@ fn classify_test_meta(meta: &Meta) -> TestRegistration {
     if path.is_ident("test") {
         return TestRegistration::Yes;
     }
+    if path_label(path) == "tokio::test" {
+        return TestRegistration::Yes;
+    }
     if path.is_ident("cfg_attr") {
         let Meta::List(list) = meta else {
             return TestRegistration::Unclassifiable("cfg_attr".to_string());
@@ -2994,18 +2997,23 @@ path = "tools/explicit_example.rs"
 }
 
 #[test]
-fn cfg_attr_test_function_is_included_in_raw_dispatch_inventory() {
+fn cfg_attr_and_tokio_test_functions_are_included_in_raw_dispatch_inventory() {
     let source = r#"
 #[cfg_attr(test, test)]
 fn cfg_attr_registered_test() {
     let command_buffer = queue.new_command_buffer();
 }
+
+#[tokio::test]
+async fn tokio_registered_test() {
+    let command_buffer = queue.new_command_buffer();
+}
 "#;
-    let parsed = StructuredSource::parse("fixtures/cfg_attr_test.rs", source, true)
-        .expect("parse cfg_attr test fixture");
+    let parsed = StructuredSource::parse("fixtures/registered_tests.rs", source, true)
+        .expect("parse registered test fixture");
     let discovered = parsed
         .test_functions()
-        .expect("classify cfg_attr test functions")
+        .expect("classify registered test functions")
         .into_iter()
         .filter(|function| {
             !parsed
@@ -3016,7 +3024,10 @@ fn cfg_attr_registered_test() {
         .map(|function| function.name.as_str())
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(discovered, BTreeSet::from(["cfg_attr_registered_test"]));
+    assert_eq!(
+        discovered,
+        BTreeSet::from(["cfg_attr_registered_test", "tokio_registered_test"])
+    );
 }
 
 #[test]
@@ -3093,7 +3104,7 @@ fn raw_dispatch() {
 #[test]
 fn unknown_test_registration_attribute_fails_closed() {
     let source = r#"
-#[tokio::test]
+#[custom_runtime::test]
 async fn raw_dispatch() {
     let queue = Queue;
     let _command_buffer = queue.new_command_buffer();
@@ -3101,8 +3112,8 @@ async fn raw_dispatch() {
 "#;
     assert_command_buffer_fixture_rejected_with(
         source,
-        "tests/tokio_dispatch.rs",
-        "unclassifiable test function attribute `tokio::test`",
+        "tests/custom_runtime_dispatch.rs",
+        "unclassifiable test function attribute `custom_runtime::test`",
     );
 }
 

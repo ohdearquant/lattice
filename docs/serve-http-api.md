@@ -81,14 +81,19 @@ pub fn router(state: AppState) -> Router {
 There is no `/v1/models`, `/v1/completions`, or any admin/metrics endpoint. If you need a model
 listing endpoint, that's `lattice_serve` (the other binary), not this one.
 
-Shut down with Ctrl-C — it's a graceful shutdown, not an immediate kill:
+Shut down with Ctrl-C, or with SIGTERM on Unix:
 
 ```
 ^CShutdown signal received, draining connections...
 ```
 
-(confirmed live: the process exits cleanly after printing this, rather than dropping in-flight
-connections.)
+The server stops accepting connections and gives tracked HTTP/1 connections up to five seconds to
+drain. If every connection cooperates, the process exits normally. If that interval expires, the
+server aborts the remaining connection tasks, allows up to three more seconds for cancellation
+cleanup, and then exits with status 1 even if cleanup completed during that second interval. This
+hard exit is a last resort: because it skips Rust destructors, it can truncate in-flight responses,
+leave files partially written, and discard unflushed telemetry. A second signal does not shorten
+these fixed shutdown intervals.
 
 ## Auth, rate limiting, and concurrency
 
