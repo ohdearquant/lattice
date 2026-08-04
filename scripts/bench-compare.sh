@@ -24,7 +24,18 @@
 # so callers must cooperate by leaving lock names intact. A direct invocation
 # with only a fabricated status file is refused at the handoff sample.
 set -euo pipefail
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+if ! REPO="$(cd "$(dirname "$0")/.." && pwd)"; then
+  echo "bench-compare: FATAL: cannot resolve the repository root (the" >&2 || :
+  echo "script's parent directory was removed or is unreachable). Refusing" >&2 || :
+  echo "to continue without a resolved root." >&2 || :
+  exit 2
+fi
+if ! mkdir -p "$REPO/.cache" 2>/dev/null; then
+  echo "bench-compare: FATAL: cannot create $REPO/.cache (unwritable parent," >&2 || :
+  echo "or a non-directory already occupies that path). Refusing to continue" >&2 || :
+  echo "rather than run the A/B without its lock-status directory." >&2 || :
+  exit 2
+fi
 source "$REPO/scripts/lib/bench-python.sh"
 PYTHON_BIN="$(bench_require_python3 "bench-compare.sh")" || exit 1
 exec "$PYTHON_BIN" "$REPO/scripts/lib/bench_supervision.py" run \

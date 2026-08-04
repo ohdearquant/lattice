@@ -18,7 +18,11 @@ bench_supervise_entry() {
     shift 3
 
     local repo helper python_bin
-    repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    if ! repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; then
+        printf 'bench-supervision: FATAL: cannot resolve the repository root from %s; ' "${BASH_SOURCE[0]}" >&2 || :
+        printf 'refusing to continue.\n' >&2 || :
+        exit 2
+    fi
     helper="$repo/scripts/lib/bench_supervision.py"
     python_bin="$(bench_require_python3 "${0##*/}")" || exit 1
 
@@ -66,9 +70,13 @@ bench_supervise_entry() {
 bench_quiet_checkpoint() {
     local label="$1"
     local repo
-    repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    if ! repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; then
+        printf 'bench-supervision: FATAL: cannot resolve the repository root from %s; ' "${BASH_SOURCE[0]}" >&2 || :
+        printf 'refusing to continue.\n' >&2 || :
+        exit 2
+    fi
     if ! python3 "$repo/scripts/lib/quiet-probe.py" --label "$label"; then
-        echo "bench-supervision: machine was not quiet at $label; refusing to continue" >&2
+        echo "bench-supervision: machine was not quiet at $label; refusing to continue" >&2 || :
         exit 2
     fi
 }
