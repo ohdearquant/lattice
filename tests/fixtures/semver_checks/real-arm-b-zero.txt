@@ -1,0 +1,62 @@
+version: version = "0.8.0"
+    Building lattice-embed v0.8.0 (current)
+       Built [  21.157s] (current)
+     Parsing lattice-embed v0.8.0 (current)
+      Parsed [   0.012s] (current)
+    Building lattice-embed v0.7.1 (baseline)
+       Built [   5.995s] (baseline)
+     Parsing lattice-embed v0.7.1 (baseline)
+      Parsed [   0.012s] (baseline)
+    Checking lattice-embed v0.7.1 -> v0.8.0 (major change)
+     Checked [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+    Finished [  32.625s] lattice-embed
+    Building lattice-fann v0.8.0 (current)
+       Built [   6.367s] (current)
+     Parsing lattice-fann v0.8.0 (current)
+      Parsed [   0.003s] (current)
+    Building lattice-fann v0.7.1 (baseline)
+       Built [   0.422s] (baseline)
+     Parsing lattice-fann v0.7.1 (baseline)
+      Parsed [   0.002s] (baseline)
+    Checking lattice-fann v0.7.1 -> v0.8.0 (major change)
+     Checked [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+    Finished [   7.364s] lattice-fann
+    Building lattice-inference v0.8.0 (current)
+       Built [  13.248s] (current)
+     Parsing lattice-inference v0.8.0 (current)
+      Parsed [   0.097s] (current)
+    Building lattice-inference v0.7.1 (baseline)
+       Built [   3.061s] (baseline)
+     Parsing lattice-inference v0.7.1 (baseline)
+      Parsed [   0.093s] (baseline)
+    Checking lattice-inference v0.7.1 -> v0.8.0 (major change)
+     Checked [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+    Finished [  18.351s] lattice-inference
+    Building lattice-transport v0.8.0 (current)
+       Built [   4.724s] (current)
+     Parsing lattice-transport v0.8.0 (current)
+      Parsed [   0.005s] (current)
+    Building lattice-transport v0.7.1 (baseline)
+       Built [   0.456s] (baseline)
+     Parsing lattice-transport v0.7.1 (baseline)
+      Parsed [   0.004s] (baseline)
+    Checking lattice-transport v0.7.1 -> v0.8.0 (major change)
+     Checked [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+    Finished [   6.126s] lattice-transport
+    Building lattice-tune v0.8.0 (current)
+       Built [   3.409s] (current)
+     Parsing lattice-tune v0.8.0 (current)
+      Parsed [   0.008s] (current)
+    Building lattice-tune v0.7.1 (baseline)
+       Built [   0.902s] (baseline)
+     Parsing lattice-tune v0.7.1 (baseline)
+      Parsed [   0.008s] (baseline)
+    Checking lattice-tune v0.7.1 -> v0.8.0 (major change)
+     Checked [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+    Finished [   5.485s] lattice-tune
+ARM B RC=0

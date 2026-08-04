@@ -39,9 +39,11 @@ _CHECKED_RE = re.compile(
     r"Checked\s*\[[^\]]*\]\s*(\d+)\s*checks:\s*(\d+)\s*pass,\s*(\d+)\s*skip"
 )
 
-# "Checking lattice-embed v0.7.1 -> v0.8.0 (major change)"
+# "    Checking lattice-embed v0.7.1 -> v0.8.0 (major change)"
+# Real cargo-semver-checks output indents this line (verified against a real
+# captured run with `od -c`); anchoring on column 0 silently matches nothing.
 _CHECKING_RE = re.compile(
-    r"^Checking\s+(\S+)\s+v(\S+)\s*->\s*v(\S+)", re.MULTILINE
+    r"^[ \t]*Checking\s+(\S+)\s+v(\S+)\s*->\s*v(\S+)", re.MULTILINE
 )
 
 
@@ -99,6 +101,24 @@ def _describe_transitions(transitions: list[Transition]) -> str:
     return ", ".join(f"{t.package} {t.version_from} -> {t.version_to}" for t in transitions)
 
 
+def could_not_read_summary(detail: str) -> str:
+    """The disclosure line for 'this instrument could not read its input'.
+
+    Used both when a captured file parses with no 'Checked' line (broken
+    capture) and when the file could not even be opened (missing/unreadable
+    capture step). Both are instrument failures, never a zero-checks finding
+    — the wording stays unmistakably distinct from the zero-checks line so a
+    broken instrument can never read as either healthy silence or a real
+    disclosure.
+    """
+    return (
+        "**SEMVER DISCLOSURE: could not read check output** — "
+        f"{detail} This is NOT a report of zero checks; the disclosure "
+        "instrument itself failed and cannot say anything about coverage "
+        "this run.\n"
+    )
+
+
 def compose_summary(result: ParseResult) -> str | None:
     """Return the $GITHUB_STEP_SUMMARY text, or None to stay silent.
 
@@ -106,12 +126,9 @@ def compose_summary(result: ParseResult) -> str | None:
     this function must return None so the step writes nothing at all.
     """
     if not result.parse_ok:
-        return (
-            "**SEMVER DISCLOSURE: could not read check output** — no "
-            "`Checked [...] N checks: ...` line was found in the captured "
-            "cargo-semver-checks run. This is NOT a report of zero checks; "
-            "the disclosure instrument itself failed to parse the output "
-            "and cannot say anything about coverage this run.\n"
+        return could_not_read_summary(
+            "no `Checked [...] N checks: ...` line was found in the "
+            "captured cargo-semver-checks run."
         )
 
     if result.total_checks > 0:
@@ -129,15 +146,21 @@ def compose_summary(result: ParseResult) -> str | None:
 
 
 def _run_selftest() -> int:
+    # Indentation here matches a real captured `cargo semver-checks
+    # check-release` run byte-for-byte (verified with `od -c`): both the
+    # "Checking" and "Checked" lines carry leading whitespace, "Checking" by
+    # 4 spaces and "Checked" by 1. A fixture built from paraphrased prose
+    # instead of the real tool output can drift from that indentation and
+    # still pass against a regex with the same wrong assumption baked in.
     healthy = "\n".join(
-        f"Checking lattice-{name} v0.7.1 -> v0.7.1 (no change; assume minor)\n"
-        " Checked [ 0.023s] 196 checks: 196 pass, 57 skip\n"
+        f"    Checking lattice-{name} v0.7.1 -> v0.7.1 (no change; assume minor)\n"
+        " Checked [   0.023s] 196 checks: 196 pass, 57 skip\n"
         " Summary no semver update required"
         for name in ("fann", "transport", "inference", "embed", "tune")
     )
     zero = "\n".join(
-        f"Checking lattice-{name} v0.7.1 -> v0.8.0 (major change)\n"
-        " Checked [ 0.000s] 0 checks: 0 pass, 253 skip\n"
+        f"    Checking lattice-{name} v0.7.1 -> v0.8.0 (major change)\n"
+        " Checked [   0.000s] 0 checks: 0 pass, 253 skip\n"
         " Summary no semver update required"
         for name in ("fann", "transport", "inference", "embed", "tune")
     )
@@ -185,9 +208,22 @@ def main(argv: list[str] | None = None) -> int:
     if not args.captured_output:
         parser.error("captured_output is required unless --selftest is given")
 
-    text = Path(args.captured_output).read_text()
-    result = parse_semver_checks_output(text)
-    summary = compose_summary(result)
+    # A missing or unreadable capture file must take the SAME could-not-read
+    # path as a captured-but-unparseable one, not raise before compose_summary
+    # is reached. In the workflow this step carries continue-on-error: true,
+    # so an uncaught exception here would make the job go green and
+    # completely silent — the one outcome this instrument must never produce.
+    try:
+        text = Path(args.captured_output).read_text()
+    except OSError as exc:
+        summary = could_not_read_summary(
+            f"reading '{args.captured_output}' raised {exc.__class__.__name__}: {exc}."
+        )
+        parse_ok = False
+    else:
+        result = parse_semver_checks_output(text)
+        summary = compose_summary(result)
+        parse_ok = result.parse_ok
 
     if summary is None:
         return 0
@@ -204,7 +240,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(summary, file=sys.stderr)
 
-    return 0 if result.parse_ok else 1
+    return 0 if parse_ok else 1
 
 
 if __name__ == "__main__":
