@@ -29,7 +29,10 @@
 //!    at `GrammarEngine::new` time.
 //! 2. `VocabPartition::apply_mask(state_id, logits)` — called per decode step.
 //! 3. `VocabPartition::context_dependent_ids_for_state(state_id)` — returns
-//!    only the token ids that need runtime PDA inspection in the current state.
+//!    the token ids that need runtime PDA inspection in the current state,
+//!    when a state-local list was stored; a state whose list was withheld
+//!    under the aggregate capacity budget falls back to the global union
+//!    across every state.
 
 use crate::grammar::pda::{CompiledGrammar, GrammarState, SimResult, simulate_token};
 

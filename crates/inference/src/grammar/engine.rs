@@ -29,7 +29,10 @@
 //! # Performance
 //!
 //! - `mask_logits`: O(vocab_size / 64) bitmask scan + O(k × stack_depth) for
-//!   context-dependent tokens in the current grammar state.
+//!   context-dependent tokens, where k is the current grammar state's
+//!   precomputed candidate count when a state-local list was stored, or the
+//!   global union across all states when it was withheld under the
+//!   partition's aggregate capacity budget.
 //! - `advance`: O(stack_depth) PDA step; typical depth 2–8.
 //! - `new`: O(|states| × vocab_size × max_token_len) — called once.
 
@@ -443,7 +446,9 @@ impl GrammarEngine {
     /// iterations for Qwen3's 248,320 tokens), taking under 40 µs on modern
     /// Apple Silicon.  Context-dependent tokens add O(k × stack_depth)
     /// overhead, where k is the precomputed candidate count for this grammar
-    /// state rather than the union across every state.
+    /// state when a state-local list was stored. A state whose list was
+    /// withheld under the partition's aggregate capacity budget conservatively
+    /// falls back to k being the union across every state.
     pub fn mask_logits(
         &self,
         state: &mut GrammarState,
