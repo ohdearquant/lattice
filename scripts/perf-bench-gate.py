@@ -690,6 +690,20 @@ def artifact_bench_id(estimate_file: Path, root: Path, artifact_parts: int) -> s
     return Path(*relative_parts[:-trim]).as_posix()
 
 
+def _below_benchmark_dir(estimate_file: Path, root: Path, artifact_parts: int) -> bool:
+    """True if estimate_file sits below a Criterion benchmark directory.
+
+    Root-level debris (e.g. a bare `cargo bench` writing `new/estimates.json`
+    or `change/estimates.json` directly under the Criterion root) has no
+    benchmark directory to attribute to and must be excluded before calling
+    artifact_bench_id, mirroring the length guard find_selected_baseline_files
+    already applies to the selected-baseline inventory.
+    """
+    relative_parts = estimate_file.relative_to(root).parts
+    trim = artifact_parts + 1
+    return len(relative_parts) > trim
+
+
 def selected_baseline_bench_ids(root: Path, baseline_name: str) -> set[str]:
     """Return bench IDs measured by the exact named base arm."""
     artifact_parts = len(_baseline_parts(baseline_name))
@@ -1596,7 +1610,7 @@ def run_selftest() -> int:
                 "the baseline-without-head refusal"
             )
 
-        # lattice#1298 F1: a stale/non-selected change/ dir must not exempt an
+        # A stale/non-selected change/ dir must not exempt an
         # uncovered head artifact. existing_group/existing_bench compares
         # cleanly against the selected baseline; stale_group/stale_bench has a
         # head new/ artifact and a change/ comparison, but that change/ is
@@ -1885,11 +1899,11 @@ def run_selftest() -> int:
                 "same-path output"
             )
 
-        # lattice#1298 F1's fix (reconciling missing_baseline_ids against
-        # baseline_ids instead of any change/ presence) means an unrelated
-        # named-baseline bench surviving cleanup now correctly reports its own
-        # NO COVERAGE gap. Test that survival-of-cleanup property in isolation
-        # so it does not also contaminate the single-direction check above.
+        # Reconciling missing_baseline_ids against baseline_ids instead of any
+        # change/ presence means an unrelated named-baseline bench surviving
+        # cleanup now correctly reports its own NO COVERAGE gap. Test that
+        # survival-of-cleanup property in isolation so it does not also
+        # contaminate the single-direction check above.
         freshness_unrelated_root = Path(td) / "freshness-unrelated" / "criterion"
         unrelated_bench = freshness_unrelated_root / "legacy_group" / "legacy_bench"
         _fabricate_bench(unrelated_bench, "previous-run")
@@ -2529,16 +2543,26 @@ def main() -> int:
         print(f"error: invalid --baseline-name: {error}", file=sys.stderr)
         return finish("error", EXIT_ERROR, f"invalid baseline name: {error}")
 
-    all_change_files = find_change_files(args.criterion_root)
+    all_change_files = [
+        change_file
+        for change_file in find_change_files(args.criterion_root)
+        if _below_benchmark_dir(change_file, args.criterion_root, artifact_parts=1)
+    ]
     change_file_ids = {
         change_file: artifact_bench_id(
             change_file, args.criterion_root, artifact_parts=1
         )
         for change_file in all_change_files
     }
+    # Root-level new/estimates.json (a bare `cargo bench` writing directly under
+    # the Criterion root, or stray debris) has no benchmark directory to
+    # attribute to; silently excluded here, the same disposition
+    # find_selected_baseline_files already gives the mirror-image root-level
+    # case in the selected-baseline inventory, rather than crashing the gate.
     head_ids = {
         artifact_bench_id(head_file, args.criterion_root, artifact_parts=1)
         for head_file in args.criterion_root.rglob("new/estimates.json")
+        if _below_benchmark_dir(head_file, args.criterion_root, artifact_parts=1)
     }
     # A stale/non-selected change/estimates.json is not evidence of coverage: the
     # enforcing filter below only trusts a change file whose id is in baseline_ids,
