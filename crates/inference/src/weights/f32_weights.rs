@@ -970,9 +970,32 @@ pub(crate) const MAX_WEIGHT_MAP_ENTRIES: usize = 1_000_000;
 /// An unsharded checkpoint puts metadata for every tensor in this one header, so it can
 /// run larger than a single shard's slice of `model.safetensors.index.json`. Real dense
 /// and MoE checkpoints, including the largest single-file presets this crate loads,
-/// produce headers on the order of a few hundred KiB to low single-digit MiB; 8 MiB
-/// (8,388,608) leaves several times that headroom.
-const MAX_SAFETENSORS_HEADER_BYTES: usize = 8_388_608;
+/// produce headers on the order of a few hundred KiB to low single-digit MiB, so
+/// compatibility alone would tolerate a much larger cap.
+///
+/// This value is set by a second, tighter bound: what the parser retains after
+/// `open()` returns, not what a real header looks like. Every tensor's `shape` is
+/// stored as a `Vec<usize>` (8 bytes/element on this crate's supported targets), and
+/// [`validate_safetensors_layout`]'s element-count product accepts a zero-length
+/// dimension (`checked_mul` by 0 is always in range), so a tensor entry needs no
+/// corresponding tensor-data bytes once any one of its `shape` entries is `0`. A
+/// header can therefore spend nearly its whole byte budget on a single tensor's
+/// `shape` array of 8-byte elements written as one-digit decimals (`"0,"` is 2 input
+/// bytes per retained element). Measured `Vec<usize>` growth under repeated `push`
+/// (this crate's `parse_usize_array` never calls `with_capacity`) lands on the next
+/// power of two at or above the element count, so at a power-of-two byte cap this
+/// construction retains almost exactly 4x the cap: 4 MiB of header bounds worst-case
+/// retained shape-array bytes to 16 MiB. (Tensor names, `TensorMeta`'s fixed fields,
+/// and the `HashMap` bucket overhead were checked too: at 120 bytes/entry plus a
+/// short name, spreading the same byte budget across many small tensor entries
+/// instead retains less per input byte than the single-oversized-shape
+/// construction, so they do not set the bound.)
+///
+/// This sizing assumes the ordinary Rust allocator contract: growing a `Vec` past
+/// available memory via plain `push` is not a `Result` calling code can recover
+/// from, so the input-side byte cap is what keeps retained parser state bounded,
+/// not error handling downstream of the allocation.
+const MAX_SAFETENSORS_HEADER_BYTES: usize = 4_194_304;
 
 /// Upper bound on JSON container nesting depth (`{` / `[`) while parsing a safetensors
 /// header, tracked by [`JsonParser::depth`] and enforced in [`JsonParser::skip_value`].
