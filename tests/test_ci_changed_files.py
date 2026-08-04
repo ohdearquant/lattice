@@ -2118,22 +2118,24 @@ class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):
         )
 
     def _assert_provisions_all_four_models(self, job: str) -> None:
+        provision_step = _workflow_step(job, "Provision embedding model weights")
         for model in (
             "bge-small-en-v1.5",
             "multilingual-e5-small",
             "all-minilm-l6-v2",
             "paraphrase-multilingual-minilm-l12-v2",
         ):
-            self.assertIn(model, job)
+            self.assertIn(model, provision_step)
         self.assertIn(
             "cargo run --release -p lattice-embed --bin embed \\\n"
             '              -- --model "$model" --download-only',
-            job,
+            provision_step,
         )
 
     def test_observation_does_not_replace_the_required_arm_gate(self) -> None:
         arm_job = _workflow_job(self.contents, "embed-drift")
         self.assertIn("runs-on: ubuntu-24.04-arm", arm_job)
+        self.assertNotIn("continue-on-error: true", arm_job)
         self._assert_provisions_all_four_models(arm_job)
         self.assertIn(
             "cargo run --release -p lattice-embed --bin embed-drift "
