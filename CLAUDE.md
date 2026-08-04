@@ -9,7 +9,7 @@ Read `AGENTS.md` first for coding conventions, crate structure, and design princ
 Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like. One honesty note on `crates/fann/`: the default bench build does not enable the optional `mixture` feature, so a fann-only diff is usually compiled out of the two default bench targets — but default-target compilation status alone is not sufficient to claim the waiver. `crates/fann/` also declares its own feature-gated `router_online` bench target (requires the `online-router` feature; `crates/fann/Cargo.toml:45-48`), which directly exercises FANN training and network APIs. A fann diff takes the same all-declared-target reachability search as any other crate: search every declared target, including `router_online`, and if a reachable one exists, run it instead of claiming the waiver.
 
 ```bash
-make bench-compare                         # origin/main vs HEAD (~2 min, default)
+make bench-compare                         # origin/main vs HEAD (--quick, the default; not separately measured)
 make bench-compare BASE=main HEAD=pr/x     # explicit refs
 scripts/bench-compare.sh --full main       # tight CIs; see the timing note below before booking a window
 ```
@@ -158,7 +158,7 @@ current main during review, not just against the PR's own diff.
 ## Performance Workflow (ADR-087)
 
 - **Every perf PR must include before/after numbers.** No exception. Run `make bench-compare` (or `scripts/bench-compare.sh <base> <head>`) to get an A/B table. Paste the output in the PR description.
-- Default to `--quick` (~2 min). Use `--full` only when CIs are too wide to tell.
+- Default to `--quick` (not separately measured; see the measured `--full` slow-side bound above before booking a window). Use `--full` only when CIs are too wide to tell.
 - After merging to main, `bench-update.yml` auto-updates the `perf-baselines` branch (trend data, not a gate). PRs are gated by `e2e-parity.yml` (greedy token agreement vs HF).
 - For local baseline tracking: `make bench-ci` saves a local baseline, `make bench-gate` compares against the `perf-baselines` branch.
 - Do not claim "X% faster" without a measurement from this session. Stale numbers from prior sessions are not evidence.

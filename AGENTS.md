@@ -261,9 +261,9 @@ make e2e-parity                          # run locally (needs torch + transforme
 # Perf benchmarking (ADR-087, trend data)
 # bench-compare takes the machine-wide bench-window and GPU locks itself and
 # gates on ambient CPU idle — do NOT wrap it in an external bench-window helper.
-make bench-compare                       # A/B: origin/main vs HEAD (~2 min, --quick)
+make bench-compare                       # A/B: origin/main vs HEAD (--quick, the default; not separately measured)
 make bench-compare BASE=main HEAD=pr/x   # A/B: explicit refs
-scripts/bench-compare.sh --full main     # A/B with tight CIs (~15 min)
+scripts/bench-compare.sh --full main     # A/B with tight CIs; see CLAUDE.md's measured slow-side bound (under "Measure First, Code Second") before booking a window
 make bench-ci                            # save local Criterion baseline
 make bench-gate                          # compare against perf-baselines branch
 ```
