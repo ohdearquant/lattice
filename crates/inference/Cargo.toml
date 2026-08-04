@@ -95,7 +95,7 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lattice-fann = { version = "0.7.1", path = "../fann", optional = true }
+lattice-fann = { version = "0.7.2", path = "../fann", optional = true }
 
 # Two independent unix-only uses: (1) `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s
 # `real_path_of_open_file`, which reports the real path of an already-open shard descriptor
