@@ -10,8 +10,9 @@
 #   bash scripts/ensure-noindex-marker-selftest.sh
 #
 # The invariant under test, stated once: WHEN THE GUARD EXITS 0, A REGULAR
-# MARKER FILE EXISTS. When one cannot be established, the guard exits nonzero
-# and the caller never measures. Both halves are asserted on every case.
+# MARKER FILE EXISTS. When one cannot be established, the guard exits 2 (the
+# input/instrumentation-error class, not a regression verdict) and the caller
+# never measures. Both halves are asserted on every case.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -109,7 +110,7 @@ check_marker "  -> replaced by a regular file" "$D" file
 
 # 7. Marker path occupied by a directory: cannot become a file, must not proceed.
 D="$SB/isdir/.cache"; mkdir -p "$D/.metadata_never_index/occupied"
-run "$D"; check "non-empty dir at marker path fails closed" 1 $?
+run "$D"; check "non-empty dir at marker path fails closed" 2 $?
 
 # 8. FAIL-CLOSED PROOF. An unwritable .cache cannot hold a marker at all, so the
 #    guard must refuse rather than let an unprotected A/B proceed. This is the
@@ -118,7 +119,7 @@ if [ "$(id -u)" -eq 0 ]; then
   echo "  SKIP: unwritable-dir case (running as root bypasses permissions)"
 else
   D="$SB/readonly/.cache"; mkdir -p "$D"; chmod a-w "$D"
-  run "$D"; check "unwritable dir fails closed" 1 $?
+  run "$D"; check "unwritable dir fails closed" 2 $?
   check_marker "  -> no marker was created" "$D" absent
   case "$OUT" in
     *FATAL*) echo "  PASS:   -> diagnostic names the failure"; pass=$((pass+1)) ;;

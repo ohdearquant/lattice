@@ -12,7 +12,14 @@
 # FAIL-CLOSED BY DESIGN. This guards measurement integrity, so it must never
 # report success without the marker actually being in place. A silently absent
 # marker is worse than no protection at all, because the A/B still runs and its
-# numbers still look trustworthy. Every failure path exits non-zero.
+# numbers still look trustworthy. Every failure path exits 2: this is an
+# input/instrumentation-error failure (it fires before any worktree or
+# benchmark exists), never a regression verdict. Exit 1 in the caller chain
+# (bench-compare-impl.sh -> bench-locks.py -> perf-postmerge-gate.yml) is
+# reserved for the gate's own confirmed-regression status; a caller running
+# this guard under `set -e` propagates our exit code verbatim, so 1 here would
+# be misread downstream as "confirmed regression" rather than "could not set
+# up measurement protection".
 set -euo pipefail
 
 DIR="${1:?usage: ensure-noindex-marker.sh <dir>}"
@@ -25,7 +32,16 @@ mkdir -p "$DIR"
 # a redirect, and the redirect then follows the link to a target that may not be
 # creatable. Replace anything that is not a plain file.
 if [ -L "$MARKER" ] || { [ -e "$MARKER" ] && [ ! -f "$MARKER" ]; }; then
-  rm -f "$MARKER"
+  # `rm -f` on a non-empty directory fails (and, un-normalized, would exit 1
+  # under set -e below -- the same code the gate uses for a confirmed
+  # regression). Convert it to our own exit 2 explicitly rather than let a
+  # coreutils exit status leak through the contract.
+  if ! rm -f "$MARKER" 2>/dev/null; then
+    echo "[noindex] FATAL: $MARKER exists and is not a plain file (and could" >&2
+    echo "[noindex] not be removed, e.g. a non-empty directory). Refusing to" >&2
+    echo "[noindex] continue rather than measure unprotected." >&2
+    exit 2
+  fi
 fi
 
 # Idempotent: an existing regular marker is left untouched, not re-truncated.
@@ -34,8 +50,8 @@ if [ ! -f "$MARKER" ] && ! : > "$MARKER"; then
   echo "[noindex] Without it Spotlight indexes this directory. Its build churn can" >&2
   echo "[noindex] land asymmetrically across timing phases and read as a" >&2
   echo "[noindex] code delta. Refusing to continue rather than measure unprotected." >&2
-  exit 1
+  exit 2
 fi
 
 # Post-condition: prove the marker is really there before reporting success.
-[ -f "$MARKER" ] || { echo "[noindex] FATAL: $MARKER missing after creation" >&2; exit 1; }
+[ -f "$MARKER" ] || { echo "[noindex] FATAL: $MARKER missing after creation" >&2; exit 2; }

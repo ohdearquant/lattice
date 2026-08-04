@@ -34,14 +34,17 @@ Exit codes:
   2 — parse error / bad input, or (with --require-measurements) the gate
       refusing to certify a run it could not judge: no comparison data, or
       no gating comparison among the parsed results, or a benchmark in the
-      selected baseline set with no head comparison. An automated lane must not
-      read "nothing was measured" as "nothing regressed".
+      selected baseline set with no head comparison. Also covers invalid
+      ambient instrumentation for an automated lane: the before/between/after
+      sample stream is missing, malformed, or duplicated. An automated lane
+      must not read "nothing was measured" as "nothing regressed".
   3 — not measurable: the automated lane's before/between/after ambient sample
-      stream is missing, malformed, duplicated, or below BENCH_IDLE_FLOOR; or
-      the measured AB/BA order-bias envelope is itself larger than the FAIL
-      margin, so the run cannot distinguish a gate-sized source effect. This is
-      a non-success state: enforcing consumers must keep it nonzero. Across
-      independent targets, a confirmed regression (1) outranks this state.
+      stream parsed and was complete, but idle was below BENCH_IDLE_FLOOR in
+      at least one phase; or the measured AB/BA order-bias envelope is itself
+      larger than the FAIL margin, so the run cannot distinguish a gate-sized
+      source effect. This is a non-success state: enforcing consumers must
+      keep it nonzero. Across independent targets, a confirmed regression (1)
+      outranks this state.
 
 Status mode is opt-in. It requires exactly one perf-ambient-sample/v1 record for
 each voting phase (before, between, after), ignores other phase labels, and
@@ -2761,7 +2764,9 @@ def main() -> int:
                           "tell 'nothing regressed' from 'nothing was measured'.")
     ap.add_argument("--ambient-samples", type=Path,
                     help="JSONL before/between/after ambient samples. Requires "
-                         "--status-out; an invalid or busy run exits 3.")
+                         "--status-out; a missing, malformed, or duplicated "
+                         "stream exits 2 (bad input), a busy-below-floor "
+                         "reading on a valid stream exits 3.")
     ap.add_argument("--status-out", type=Path,
                     help="Atomically write pass/regression/error/not_measurable JSON.")
     ap.add_argument("--prepare-head", action="store_true",

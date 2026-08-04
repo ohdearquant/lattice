@@ -310,7 +310,11 @@ unequal same-sign drift and a disturbance confined to one stratum are conservati
 Opposite-sign or source-dependent drift is not identifiable from one ABBA block: it can cancel in
 the reported order term and appear as a source effect, and the host-state checkpoints do not test
 that stationarity assumption. Replication, interleaving, or randomized order blocks are needed to
-detect it. If the order term alone exceeds the existing 7% FAIL margin, the run exits `3`
-(`NOT_MEASURABLE`) and every enforcing consumer remains red; it does not report a source
-regression. Missing or mismatched reverse evidence exits `2`. Report-only contributor runs collect
-the same balanced evidence but continue to print the gate status and exit zero.
+detect it. If the order-bias envelope (the bound derived from the forward/reverse pair, not a
+single raw term) alone exceeds the existing 7% FAIL margin, the run exits `3` (`NOT_MEASURABLE`)
+and every enforcing consumer remains red; it does not report a source regression. Missing or
+mismatched reverse evidence exits `2`. Report-only contributor runs collect the same balanced
+evidence and continue to print the gate status; a completed report-only measurement does not
+propagate gate classification into the process exit code, but a local prerequisite failure (for
+example the quiet-probe check) still exits `2` — "report-only" governs whether the verdict gates,
+not whether the run can fail operationally.

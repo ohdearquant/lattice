@@ -433,6 +433,38 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stderr:\n{result.stderr}",
         )
 
+    def test_noindex_marker_failure_is_not_a_confirmed_regression(self):
+        """A pre-measurement integrity failure must not read as a regression.
+
+        scripts/lib/ensure-noindex-marker.sh runs under `set -e` in
+        bench-compare-impl.sh before either worktree or benchmark exists
+        (bench-compare-impl.sh:396-397). If that guard ever exits 1 again, the
+        raw status propagates unchanged through bench-locks.py's
+        subprocess.call and this script's exec, and
+        perf-postmerge-gate.yml:280-282 would report it as a confirmed
+        regression with revert advice -- although no benchmark ever ran.
+
+        Mutation-sensitive: revert the guard's normalization (exit 2 -> exit
+        1) in scripts/lib/ensure-noindex-marker.sh and this run's exit code
+        flips from 2 to 1, exactly the collision this test exists to catch.
+        """
+        def occupy_marker(root):
+            # Mirrors ensure-noindex-marker-selftest.sh case 7: a directory
+            # sitting at the marker path cannot become the marker file and
+            # cannot be silently removed, so the guard must refuse.
+            occupied = root / ".cache" / ".metadata_never_index" / "occupied"
+            occupied.mkdir(parents=True)
+
+        result = _run(["--fail-on-regression"], setup=occupy_marker)
+        self.assertEqual(
+            result.returncode, 2,
+            "a pre-measurement instrumentation failure must exit 2 (input/"
+            "instrumentation error), never 1 (confirmed regression); got "
+            f"{result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("[noindex] FATAL", result.stderr)
+        self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
     def test_enforcing_mode_refuses_a_run_that_measured_nothing(self):
         """A bench that exits 0 having printed no measurement must not certify.
 
