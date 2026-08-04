@@ -71,15 +71,18 @@ name: perf post-merge detection (informational, PAUSED)
 # group would by now be about twice as slow, which it is not.
 #
 # Large deltas are not sign-aligned, which is what rules out an arm-ordering
-# artifact: past 7% CI-lower, the Delta point split is 232 head-slower against
-# 273 head-faster over the 15 x86_64-linux reports (3948 rows), and 44
-# head-slower against 30 head-faster over the 14 completed aarch64-linux
-# reports (3685 rows; the 15th report is absent, so this is a 14-report
-# denominator, not a matching 15). Read that per architecture and never
-# pooled. aarch64 leans slower while x86_64 leans faster, so a pooled figure
-# is partly cancellation and overstates how symmetric the distribution is.
-# The conclusion survives either way; the pooled version of it does not
-# survive scrutiny.
+# artifact: for Delta point excursions above +7% or below -7%, the split is
+# 232 head-slower against 273 head-faster over the 15 x86_64-linux reports
+# (3948 rows), and 44 head-slower against 30 head-faster over the 14
+# completed aarch64-linux reports (3685 rows; the 15th report is absent, so
+# this is a 14-report denominator, not a matching 15). Read that per
+# architecture and never pooled. aarch64 leans slower while x86_64 leans
+# faster, so a pooled figure is partly cancellation and overstates how
+# symmetric the distribution is. The conclusion survives either way; the
+# pooled version of it does not survive scrutiny. Separately, the CI-lower >
+# 7% FAIL population (220 rows, all positive by construction of the
+# one-sided rule) is the population the 5.6% FAIL rate above is stated over,
+# and is not the population this split is drawn from.
 #
 # Cost of leaving it on: roughly 88 minutes of wall clock per run, on each of two
 # runner jobs, for every qualifying merge, producing a verdict that cannot be
