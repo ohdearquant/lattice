@@ -1,8 +1,12 @@
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+use super::generation::check_context_budget;
 use super::generation::{
     check_grammar_not_set, check_logprobs_not_set, check_prompt_ids_in_vocab,
     check_prompt_not_empty, check_reasoning_budget_not_set, check_stop_strings_not_set,
 };
 use crate::error::InferenceError;
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+use crate::model::qwen35_config::decode_cap;
 use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
@@ -11,16 +15,69 @@ use crate::tokenizer::common::Tokenizer;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GenerationEntryContract {
     StandaloneCpu,
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    MetalDirect,
+    #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+    MetalStreaming,
 }
 
 impl GenerationEntryContract {
-    fn validate(self, gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
+    fn validate_prompt_ids(
+        self,
+        prompt_ids: &[u32],
+        vocab_size: usize,
+    ) -> Result<(), InferenceError> {
+        match self {
+            Self::StandaloneCpu => check_prompt_ids_in_vocab(prompt_ids, vocab_size),
+            #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+            Self::MetalDirect | Self::MetalStreaming => Ok(()),
+        }
+    }
+
+    fn validate_capabilities(self, gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
         match self {
             Self::StandaloneCpu => {
                 check_grammar_not_set(gen_cfg)?;
                 check_logprobs_not_set(gen_cfg)?;
                 check_stop_strings_not_set(gen_cfg)?;
                 check_reasoning_budget_not_set(gen_cfg)
+            }
+            #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+            Self::MetalDirect => {
+                check_reasoning_budget_not_set(gen_cfg)?;
+                check_logprobs_not_set(gen_cfg)
+            }
+            #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+            Self::MetalStreaming => Ok(()),
+        }
+    }
+
+    fn validate_context(
+        self,
+        prompt_len: usize,
+        gen_cfg: &GenerateConfig,
+        max_context: usize,
+    ) -> Result<usize, InferenceError> {
+        match self {
+            Self::StandaloneCpu => {
+                if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
+                    return Err(InferenceError::Inference(format!(
+                        "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
+                         model context window ({max_context})",
+                        gen_cfg.max_new_tokens
+                    )));
+                }
+                Ok(gen_cfg.max_new_tokens)
+            }
+            #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+            Self::MetalDirect | Self::MetalStreaming => {
+                check_context_budget(
+                    prompt_len,
+                    gen_cfg.reasoning_budget,
+                    gen_cfg.max_new_tokens,
+                    max_context,
+                )?;
+                Ok(decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens))
             }
         }
     }
@@ -55,7 +112,7 @@ pub(crate) fn prepare_generation(
     let prompt_len = prompt_ids.len();
 
     check_prompt_not_empty(prompt_len)?;
-    check_prompt_ids_in_vocab(&prompt_ids, vocab_size)?;
+    contract.validate_prompt_ids(&prompt_ids, vocab_size)?;
 
     if gen_cfg.max_new_tokens == 0 {
         return Ok(GenerationPreparation::Complete(GenerateOutput {
@@ -69,22 +126,15 @@ pub(crate) fn prepare_generation(
         }));
     }
 
-    contract.validate(gen_cfg)?;
-
-    if prompt_len.saturating_add(gen_cfg.max_new_tokens) > max_context {
-        return Err(InferenceError::Inference(format!(
-            "prompt ({prompt_len} tokens) plus max_new_tokens ({}) exceeds \
-             model context window ({max_context})",
-            gen_cfg.max_new_tokens
-        )));
-    }
+    contract.validate_capabilities(gen_cfg)?;
+    let effective_capacity = contract.validate_context(prompt_len, gen_cfg, max_context)?;
 
     Ok(GenerationPreparation::Ready(GenerationPlan {
         rng_state,
         prompt_ids,
         prompt_len,
         required_capacity: prompt_len
-            .saturating_add(gen_cfg.max_new_tokens)
+            .saturating_add(effective_capacity)
             .saturating_add(1),
     }))
 }
@@ -132,6 +182,24 @@ mod tests {
             vocab_size,
             max_context,
             GenerationEntryContract::StandaloneCpu,
+        )
+    }
+
+    fn prepare_with_contract(
+        tokenizer: &BpeTokenizer,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        vocab_size: usize,
+        max_context: usize,
+        contract: GenerationEntryContract,
+    ) -> Result<GenerationPreparation, InferenceError> {
+        prepare_generation(
+            tokenizer,
+            prompt,
+            gen_cfg,
+            vocab_size,
+            max_context,
+            contract,
         )
     }
 
@@ -270,6 +338,132 @@ mod tests {
                 .expect_err("standalone CPU contract must reject unwired features");
             assert!(matches!(err, InferenceError::InvalidInput(_)));
         }
+    }
+
+    #[test]
+    fn metal_direct_contract_preserves_its_capability_set_and_guard_order() {
+        let tokenizer = tokenizer(&[("a", 0)]);
+        let grammar = GrammarEngine::new(
+            &GrammarSpec::Gbnf("root ::= \"a\"\n".to_string()),
+            vec![b"a".to_vec()],
+        )
+        .expect("test grammar compiles");
+        let supported = GenerateConfig {
+            max_new_tokens: 1,
+            grammar: Some(Arc::new(grammar)),
+            stop_strings: vec!["stop".to_string()],
+            enable_mtp: Some(true),
+            ..Default::default()
+        };
+        let result = prepare_with_contract(
+            &tokenizer,
+            "a",
+            &supported,
+            1,
+            2,
+            GenerationEntryContract::MetalDirect,
+        )
+        .expect("Metal direct supports grammar, stop strings, and MTP routing");
+        assert!(matches!(result, GenerationPreparation::Ready(_)));
+
+        let rejected = GenerateConfig {
+            max_new_tokens: 1,
+            reasoning_budget: Some(1),
+            logprobs: Some(0),
+            ..Default::default()
+        };
+        let err = prepare_with_contract(
+            &tokenizer,
+            "a",
+            &rejected,
+            1,
+            usize::MAX,
+            GenerationEntryContract::MetalDirect,
+        )
+        .expect_err("Metal direct must reject reasoning before logprobs");
+        assert!(matches!(
+            err,
+            InferenceError::InvalidInput(ref message)
+                if message.starts_with("reasoning_budget is not yet supported")
+        ));
+    }
+
+    #[test]
+    fn metal_streaming_contract_accepts_its_wired_features() {
+        let tokenizer = tokenizer(&[("a", 0)]);
+        let grammar = GrammarEngine::new(
+            &GrammarSpec::Gbnf("root ::= \"a\"\n".to_string()),
+            vec![b"a".to_vec()],
+        )
+        .expect("test grammar compiles");
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            grammar: Some(Arc::new(grammar)),
+            logprobs: Some(0),
+            stop_strings: vec!["stop".to_string()],
+            reasoning_budget: Some(1),
+            enable_mtp: Some(true),
+            ..Default::default()
+        };
+        let result = prepare_with_contract(
+            &tokenizer,
+            "a",
+            &gen_cfg,
+            1,
+            4,
+            GenerationEntryContract::MetalStreaming,
+        )
+        .expect("Metal streaming supports the wired feature set and leaves MTP inert");
+        let GenerationPreparation::Ready(plan) = result else {
+            panic!("nonzero budget must return a ready plan");
+        };
+
+        assert_eq!(plan.required_capacity, 5);
+    }
+
+    #[test]
+    fn metal_contracts_preserve_no_prompt_id_admission() {
+        let tokenizer = tokenizer(&[("z", 2)]);
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            ..Default::default()
+        };
+
+        for contract in [
+            GenerationEntryContract::MetalDirect,
+            GenerationEntryContract::MetalStreaming,
+        ] {
+            let result = prepare_with_contract(&tokenizer, "z", &gen_cfg, 2, 2, contract)
+                .expect("Metal preparation must preserve its existing admission ordering");
+            assert!(matches!(result, GenerationPreparation::Ready(_)));
+        }
+    }
+
+    #[test]
+    fn metal_streaming_context_uses_reasoning_aware_decode_cap() {
+        let tokenizer = tokenizer(&[("a", 0)]);
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 1,
+            reasoning_budget: Some(1),
+            ..Default::default()
+        };
+        let err = prepare_with_contract(
+            &tokenizer,
+            "a",
+            &gen_cfg,
+            1,
+            3,
+            GenerationEntryContract::MetalStreaming,
+        )
+        .expect_err("prompt plus reasoning-aware decode cap must fit the context");
+
+        assert!(matches!(
+            err,
+            InferenceError::Inference(ref message)
+                if message
+                    == "prompt (1 tokens) plus effective decode cap (3 tokens; \
+                        max_new_tokens=1, reasoning_budget=1) exceeds model context window (3)"
+        ));
     }
 
     #[test]
