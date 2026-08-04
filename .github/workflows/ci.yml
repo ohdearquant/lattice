@@ -83,9 +83,36 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
-          CHANGED=$(./scripts/ci-changed-files.sh)
+          if [[ ! "$CI_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base revision must be a nonempty 40-character hexadecimal commit ID" >&2
+            exit 2
+          fi
+          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "→ all-zero base revision: full matrix REQUIRED"
+            exit 0
+          fi
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
           echo "Changed files:"
           echo "$CHANGED"
           # Non-Rust set: **/*.md, docs/**, LICENSE*, .gitignore, and the
@@ -102,13 +129,16 @@ jobs:
           # apps/macos and a Rust path still leaves the Rust file in NON_DOCS
           # below, so code=true and the full matrix runs.
           #
-          # Two single greps against here-strings, not a `grep | grep -q` pipe:
+          # Keep the detector's self-relevance explicit instead of relying on
+          # its membership in the generic non-docs bucket below.
+          DETECTOR_CHANGED=$(grep -E '^scripts/ci-changed-files\.sh$' <<<"$CHANGED" || true)
+          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/|^scripts/ci-changed-files\.sh$)' <<<"$CHANGED" || true)
+          # Single greps against here-strings, not a `grep | grep -q` pipe:
           # a downstream `-q` can close its end of a pipe early and SIGPIPE the
           # upstream producer, and under `pipefail` that reports as the
           # pipeline's exit code instead of the match result (fail-open on a
           # large diff).
-          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/)' <<<"$CHANGED" || true)
-          if grep -q . <<<"$NON_DOCS"; then
+          if [ -n "$DETECTOR_CHANGED" ] || grep -q . <<<"$NON_DOCS"; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "→ non-docs files changed: full matrix REQUIRED"
           else
@@ -166,7 +196,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
         with:
           components: rustfmt, clippy
-      - uses: denoland/setup-deno@667a34cdef165d8d2b2e98dde39547c9daac7282 # v2.0.4
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.x
       - name: Pin the real toolchain bin on PATH
@@ -301,6 +331,26 @@ jobs:
       - name: inference — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
+      # The worker module is macOS/metal-gpu-gated, but this lifecycle test
+      # uses only a blocking thread-local destructor and never acquires a
+      # Metal device. Run it explicitly so compiling the test is not mistaken
+      # for exercising the deadline, and fail if the exact selector goes stale.
+      - name: inference — Metal worker shutdown deadline (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/metal-worker-shutdown-deadline-test.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu \
+            --lib serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor \
+            -- --exact >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -q 'test serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor ... ok' "$log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings
@@ -432,8 +482,8 @@ jobs:
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a
       # grammar that blocked every token silently emitted token 0 instead of
-      # failing closed, unlike the CPU paths (`crate::generate` /
-      # `model::qwen35::generation`), which have always guarded every
+      # failing closed, unlike the canonical CPU path
+      # (`model::qwen35::generation`), which has always guarded every
       # `mask_logits` call this way. These three hardware-gated integration
       # tests prove each real public Metal generation entry point (`generate`,
       # `generate_streaming`, `generate_streaming_with_prefix_cache`) now
@@ -645,9 +695,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
       - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
         with:
           version: '1.7.12'
+      - name: Install workflow parser
+        run: python3 -m pip install "PyYAML==6.0.3"
       - name: merge-queue config tests
         run: python3 tests/test_ci_changed_files.py -v
       - name: post-merge benchmark progression tests
@@ -662,8 +717,8 @@ jobs:
   # are never imported by these test files -- adapters are exercised only
   # through pure parsing helpers and the harness's own deterministic fake
   # adapters), no engine binary or model weights required — cheap
-  # ubuntu-only, so it is ungated like typos/actionlint above rather than
-  # routed through ci-gate. (The four adapter test files were not wired into
+  # ubuntu-only and routed through ci-gate below so any failure blocks merge.
+  # (The four adapter test files were not wired into
   # any CI job before this issue's step-2 migrations landed; this closes
   # that gap for all of them at once rather than repeating the same
   # omission per migrated script.)
@@ -720,19 +775,28 @@ jobs:
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      # bench_quality.sh's canonical-artifact publication guard. Runs the
+      # shipping script in a disposable repo with stub lattice/MLX scorers,
+      # proving failures preserve the tracked TSV and a complete run publishes
+      # all rows; no benchmark, model, GPU, network, or cargo build is used.
+      - name: bash scripts/bench_quality_selftest.sh
+        run: bash scripts/bench_quality_selftest.sh
       - name: python3 tests/test_bench_targets.py
         run: python3 tests/test_bench_targets.py -v
 
-      # bench-compare.sh's isolation guards: the lock proof (the measurement
-      # body refuses unless the supervisor that recorded the lock status is one
-      # of its own ancestors) and the ambient-load gate (below the idle floor a
-      # run is refused, not warned about). Same disposable-repo, stub-cargo
-      # shape as above — no benchmark runs and no real cargo is invoked. Wired
-      # here rather than left to a local run, because a guard whose only
-      # coverage is somebody remembering to run its test is the same shape as
-      # the lock the guard replaced.
+      # Local benchmark-supervision guards: bench-compare's dedicated supervisor
+      # verifies inherited descriptor capabilities; cooperating entrypoints
+      # sample receipt paths, an open pipe writer, and lock contention at handoff.
+      # Those point-in-time diagnostics neither authenticate a holder nor prove
+      # lock lifetime. The ambient-load gate refuses below the idle floor. Same
+      # disposable-repo, stub-cargo shape as above — no benchmark runs and no
+      # real cargo is invoked.
       - name: python3 tests/test_bench_locks.py
         run: python3 tests/test_bench_locks.py -v
+      # Advisory local measurement inventory + fail-closed lock/idle supervision.
+      # Uses disposable lock paths and stub commands; no benchmark runs.
+      - name: python3 tests/test_bench_measurement_supervision.py
+        run: python3 tests/test_bench_measurement_supervision.py -v
       - name: python3 tests/test_perf_governor.py
         run: python3 tests/test_perf_governor.py -v
 
@@ -767,12 +831,13 @@ jobs:
   # safe required context: a matrix job skipped at job level never creates
   # its per-combination check runs at all, and a plain gated job that skips
   # reports success even if `changes` itself blew up. This job passes when
-  # there is nothing to check (docs-only) and mirrors the five gated jobs'
+  # there is nothing to compile (docs-only), still requires the unconditional
+  # harness unit tests, and mirrors the other gated jobs'
   # results when there is, exactly like `parity-gate` in e2e-parity.yml and
   # `app-binaries-gate` in app-binaries.yml.
   ci-gate:
     name: ci-gate
-    needs: [changes, ci, feature-matrix, msrv, semver-checks]
+    needs: [changes, ci, feature-matrix, msrv, semver-checks, decode-harness-unit-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -784,12 +849,21 @@ jobs:
           FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
           MSRV_RESULT="${{ needs.msrv.result }}"
           SEMVER_RESULT="${{ needs.semver-checks.result }}"
-          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
+          DECODE_HARNESS_RESULT="${{ needs.decode-harness-unit-tests.result }}"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT decode-harness-unit-tests=$DECODE_HARNESS_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed, failing closed."
             exit 1
           fi
-          if [ "$CODE" != "true" ]; then
+          if [ "$DECODE_HARNESS_RESULT" != "success" ]; then
+            echo "::error::decode-harness-unit-tests did not succeed (result=$DECODE_HARNESS_RESULT)."
+            exit 1
+          fi
+          if [ "$CODE" != "true" ] && [ "$CODE" != "false" ]; then
+            echo "::error::code selector output is missing or invalid (value=$CODE)."
+            exit 1
+          fi
+          if [ "$CODE" = "false" ]; then
             echo "Docs-only change, heavy compile jobs not required. PASS."
             exit 0
           fi
@@ -819,5 +893,5 @@ jobs:
             echo "::error::semver-checks did not succeed (result=$SEMVER_RESULT)."
             exit 1
           fi
-          echo "Code changed; ci, feature-matrix, msrv, and semver-checks all PASSED."
+          echo "Code changed; ci, feature-matrix, msrv, semver-checks, and decode-harness-unit-tests all PASSED."
           exit 0

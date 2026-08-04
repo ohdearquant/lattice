@@ -4,7 +4,7 @@
 //! context-dependent in different PDA states. This isolates the cost of the
 //! runtime recheck set without model files or tokenizer fixtures.
 
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use lattice_inference::grammar::engine::{
     context_recheck_candidates, context_recheck_simulated, enable_mask_profiling, take_mask_profile,
 };
@@ -96,20 +96,42 @@ fn fixture() -> (GrammarEngine, GrammarState, usize) {
 }
 
 fn bench_context_rechecks(c: &mut Criterion) {
-    let (engine, state, vocab_size) = fixture();
+    let (engine, mut state, vocab_size) = fixture();
     let mut group = c.benchmark_group("grammar_mask");
     group.throughput(Throughput::Elements(vocab_size as u64));
     group.bench_function("state_sparse_context_rechecks", |b| {
-        b.iter_batched_ref(
-            || (state.clone(), vec![0.0; vocab_size]),
-            |(state, logits)| {
+        // One buffer, allocated and first-touched here and reused for every
+        // iteration below. A fresh `vec![0.0; vocab_size]` per iteration
+        // (the prior approach) is backed by lazily-faulted zero pages, so
+        // every iteration would pay a first-touch page-fault cost that a
+        // real decode loop's reused logits buffer never pays. Reusing this
+        // buffer and resetting it in place (a write to already-resident
+        // memory) keeps the measured region representative of a hot buffer.
+        let mut logits = vec![0.0f32; vocab_size];
+        engine
+            .mask_logits(black_box(&mut state), black_box(logits.as_mut_slice()))
+            .expect("fixture logits match the vocabulary");
+
+        b.iter_custom(|iters| {
+            enable_mask_profiling();
+            for _ in 0..iters {
+                logits.iter_mut().for_each(|l| *l = 0.0);
                 engine
-                    .mask_logits(black_box(state), black_box(logits.as_mut_slice()))
+                    .mask_logits(black_box(&mut state), black_box(logits.as_mut_slice()))
                     .expect("fixture logits match the vocabulary");
                 black_box(logits.as_slice());
-            },
-            BatchSize::LargeInput,
-        );
+            }
+            // `mask_logits` is `find_state_id` + the full-vocabulary
+            // `apply_mask` bitmask scan + the context-dependent recheck
+            // loop this benchmark is named for. Criterion's wall-clock
+            // timing of the whole call (the prior approach) is dominated by
+            // the first two, not the recheck loop. `context_recheck_ns`
+            // is engine.rs's own `Instant::now()` window around only the
+            // recheck loop (see `mask_logits`'s `t1` timer), so reporting
+            // it instead isolates the cost this benchmark claims to measure.
+            let profile = take_mask_profile();
+            Duration::from_nanos(profile.context_recheck_ns)
+        });
     });
     group.finish();
 }

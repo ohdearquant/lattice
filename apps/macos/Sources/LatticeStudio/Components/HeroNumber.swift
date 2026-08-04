@@ -95,6 +95,7 @@ struct HeroNumber: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("HeroNumber") {
     VStack(alignment: .leading, spacing: Theme.Space.xl) {
         // 56pt hero — primary loss display
@@ -114,3 +115,4 @@ struct HeroNumber: View {
     .background(Theme.Palette.canvas)
     .frame(width: 320)
 }
+#endif

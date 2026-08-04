@@ -43,6 +43,7 @@ struct KeyCapChip: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("KeyCapChip") {
     VStack(alignment: .leading, spacing: Theme.Space.sm) {
         HStack(spacing: Theme.Space.sm) {
@@ -87,3 +88,4 @@ struct KeyCapChip: View {
     .background(Theme.Palette.canvas)
     .frame(width: 260)
 }
+#endif

@@ -35,9 +35,9 @@ Invariants enforced by this script:
   reduction, matching the Rust quantizer's fail-closed behavior; `--self-
   check` proves the guard is wired.
 - `run-arm` is the complete write -> eval -> delete loop: it writes the
-  arm checkpoint, evaluates perplexity under the machine-wide Metal GPU
-  advisory lock, records the parsed result in the manifest, then deletes
-  the arm's weights (keeping only the manifest and console log).
+  arm checkpoint, enters the cooperative measurement wrapper, records the
+  parsed result in the manifest, then deletes the arm's weights (keeping only
+  the manifest and console log).
 
 Usage:
     uv run python3 scripts/fake_quant_pilot.py self-test --all
@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
@@ -60,6 +59,17 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+if (
+    __name__ == "__main__"
+    and len(sys.argv) > 1
+    and sys.argv[1] == "run-arm"
+    and not {"-h", "--help"}.intersection(sys.argv[2:])
+):
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from bench_supervision import ensure_python_entrypoint
+
+    ensure_python_entrypoint("fake-quant-pilot", quiet=True)
 
 import numpy as np
 from safetensors.numpy import save as safetensors_save
@@ -82,11 +92,6 @@ GROUP_SIZE_REAL = 32
 # written here are deleted after a successful eval; only manifest.json and
 # the console log persist.
 SCRATCH_ROOT = Path("/private/tmp/fq_pilot")
-
-# Machine-wide Metal GPU advisory lock (fleet convention). Any process
-# driving the GPU for measurements serializes through this flock.
-GPU_LOCK_PATH = "/tmp/lion-metal-gpu-test.lock"
-GPU_LOCK_TIMEOUT_S = 30 * 60
 
 # Arms per the registered protocol + pilot amendment (binding, do not alter
 # the semantics here without a corresponding amendment to PILOT_AMENDMENT.md).
@@ -799,32 +804,9 @@ def cmd_quantize(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def run_eval_under_gpu_lock(cmd: list[str], cwd: Path) -> dict:
-    """Run `cmd` while holding the machine-wide Metal GPU advisory flock
-    (fleet convention: /tmp/lion-metal-gpu-test.lock — any process driving
-    the GPU for measurements serializes through it; concurrent GPU work
-    corrupts both timing and numerics). Blocks up to 30 minutes, then fails
-    loud rather than hanging. Parses the evaluator's stdout for the
-    `@@lattice {"ev":"perplexity",...}` structured event line and returns
-    it parsed."""
-    deadline = time.time() + GPU_LOCK_TIMEOUT_S
-    with open(GPU_LOCK_PATH, "w") as lock_fh:
-        while True:
-            try:
-                fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.time() > deadline:
-                    raise SystemExit(
-                        f"timed out waiting for {GPU_LOCK_PATH}; "
-                        f"check holder with: lsof {GPU_LOCK_PATH}"
-                    ) from None
-                time.sleep(5)
-
-        try:
-            proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
-        finally:
-            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+def run_eval_under_supervision(cmd: list[str], cwd: Path) -> dict:
+    """Run `cmd` after the cooperative entry-point handoff sample."""
+    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
 
     sys.stdout.write(proc.stdout)
     sys.stderr.write(proc.stderr)
@@ -876,8 +858,8 @@ def cmd_run_arm(args: argparse.Namespace) -> int:
         "--label",
         arm,
     ]
-    print(f"=== running evaluator under GPU lock: {' '.join(eval_cmd)} ===")
-    ppl_event = run_eval_under_gpu_lock(eval_cmd, cwd=REPO_ROOT)
+    print(f"=== running evaluator through measurement supervision: {' '.join(eval_cmd)} ===")
+    ppl_event = run_eval_under_supervision(eval_cmd, cwd=REPO_ROOT)
 
     manifest["evaluator_invocation"] = " ".join(eval_cmd)
     manifest["perplexity"] = ppl_event
