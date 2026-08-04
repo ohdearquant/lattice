@@ -3,17 +3,23 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "semver-checks-disclose.py"
+CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
 FIXTURES = REPO / "tests" / "fixtures" / "semver_checks"
 REAL_HEALTHY = FIXTURES / "real-arm-a-healthy.txt"
 REAL_ZERO = FIXTURES / "real-arm-b-zero.txt"
+REAL_ANSI_ZERO = FIXTURES / "ci-log-ansi-zero.txt"
 
 _CRATES = ("fann", "transport", "inference", "embed", "tune")
 
@@ -184,6 +190,159 @@ class SemverChecksDiscloseTests(unittest.TestCase):
             text = summary.read_text()
             self.assertIn("could not read check output", text)
             self.assertNotIn("0 checks executed", text)
+
+    def test_real_ansi_colored_capture_still_discloses_the_version_transition(
+        self,
+    ) -> None:
+        # Real GitHub Actions log output is colourized: escape codes sit both
+        # before "Checking" and between "Checking" and the package name
+        # (verified against a real captured CI log). A parser that only
+        # tolerates whitespace, not escape codes, silently drops the version
+        # transition here instead of raising an error.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, summary = _run_path(REAL_ANSI_ZERO, root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(summary.exists())
+            text = summary.read_text()
+            self.assertIn("SEMVER: 0 checks executed", text)
+            self.assertIn("0.7.1 -> 0.8.0", text)
+            self.assertNotIn("version transition unavailable", text)
+            # The captured escape bytes must not leak into the disclosure —
+            # a "clean" extraction that just happens to still contain \x1b
+            # would corrupt the step summary and the workflow annotation.
+            self.assertNotIn("\x1b", text)
+
+    def test_zero_disclosure_also_emits_a_workflow_warning(self) -> None:
+        # $GITHUB_STEP_SUMMARY is not a readable carrier in practice (measured
+        # on a real run: check_runs[].output.summary came back null via the
+        # GitHub API, and the step summary appeared nowhere in the job log).
+        # The annotations channel, driven by `::warning::` on stdout, DID
+        # return content on that same run — so the disclosure must land there
+        # too, not only in the file this script also writes.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, _summary = _run(_zero_fixture(), root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("::warning::", result.stdout)
+            self.assertIn("SEMVER: 0 checks executed", result.stdout)
+            self.assertIn("0.7.1 -> 0.8.0", result.stdout)
+            # A workflow command must be one line: GitHub does not parse a
+            # `::warning::` spanning multiple lines as a single annotation.
+            warning_lines = [
+                line for line in result.stdout.splitlines() if "::warning::" in line
+            ]
+            self.assertEqual(len(warning_lines), 1)
+
+    def test_could_not_read_also_emits_a_workflow_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, _summary = _run(_unparseable_fixture(), root)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("::warning::", result.stdout)
+            self.assertIn("could not read check output", result.stdout)
+
+    def test_healthy_run_emits_no_workflow_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, _summary = _run(_healthy_fixture(), root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("::warning::", result.stdout)
+
+    def test_capture_step_disables_ansi_color(self) -> None:
+        # Prevention, not the guarantee (the parser's own ANSI strip is the
+        # guarantee, covered by test_real_ansi_colored_capture_still_
+        # discloses_the_version_transition above) — but real CI output is
+        # colourized by default (workflow-level CARGO_TERM_COLOR: always at
+        # the top of this file), so the capture step must override that
+        # locally rather than relying on the tool's own auto-detection.
+        with open(CI_WORKFLOW) as fh:
+            workflow = yaml.safe_load(fh)
+        steps = workflow["jobs"]["semver-checks"]["steps"]
+        capture_steps = [
+            step
+            for step in steps
+            if step.get("name") == "Re-run semver-checks to capture executed-check counts"
+        ]
+        self.assertEqual(
+            len(capture_steps), 1, "expected exactly one capture step in ci.yml"
+        )
+        self.assertEqual(
+            capture_steps[0].get("env", {}).get("CARGO_TERM_COLOR"), "never"
+        )
+
+    def test_disclosure_steps_use_bare_python3_matching_repo_convention(self) -> None:
+        # Every existing Python step in ci.yml is bare `python3` (e.g.
+        # decode-harness-unit-tests below invokes `python3 tests/...`); this
+        # workflow never uses `uv` anywhere else. `uv run python3 ...` is
+        # command-not-found (exit 127) on a runner that never installed uv —
+        # exactly the failure a real run of this job measured. Assert the
+        # convention directly rather than only through the script-cannot-run
+        # simulation below, since a sandbox that happens to have uv installed
+        # locally can mask this defect by finding a real interpreter anyway.
+        with open(CI_WORKFLOW) as fh:
+            workflow = yaml.safe_load(fh)
+        steps = workflow["jobs"]["semver-checks"]["steps"]
+        for step in steps:
+            run = step.get("run", "")
+            if "semver-checks-disclose.py" not in run:
+                continue
+            self.assertNotIn(
+                "uv run", run, f"step {step.get('name')!r} must use bare python3"
+            )
+            self.assertIn("python3 scripts/semver-checks-disclose.py", run)
+
+    def test_disclosure_step_still_warns_when_the_script_cannot_run(self) -> None:
+        # Extracted from the live workflow rather than restated here: a copy
+        # of the shell logic proves only that the copy behaves, and the two
+        # drift silently. This grades the actual step ci.yml will run.
+        #
+        # continue-on-error on this step hides a nonzero step conclusion from
+        # the job, so a step that dies invisibly (command-not-found, a
+        # missing script, a bad interpreter) must announce that itself. This
+        # simulates exactly that: `python3` on PATH always exits 127, standing
+        # in for "the interpreter or script never ran at all" — the failure
+        # measured on a real run, where the job stayed green with no
+        # annotation at all.
+        with open(CI_WORKFLOW) as fh:
+            workflow = yaml.safe_load(fh)
+        steps = workflow["jobs"]["semver-checks"]["steps"]
+        disclose_steps = [
+            step for step in steps if step.get("name") == "Disclose zero-check semver-checks runs"
+        ]
+        self.assertEqual(
+            len(disclose_steps), 1, "expected exactly one disclosure step in ci.yml"
+        )
+        script = disclose_steps[0]["run"]
+        self.assertIn("::warning::", script)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_python3 = fake_bin / "python3"
+            fake_python3.write_text("#!/bin/sh\nexit 127\n")
+            fake_python3.chmod(fake_python3.stat().st_mode | stat.S_IEXEC)
+
+            step_script = root / "step.sh"
+            step_script.write_text(script)
+
+            env = dict(os.environ)
+            env["PATH"] = f"{fake_bin}:{env['PATH']}"
+            env["RUNNER_TEMP"] = str(root)
+            result = subprocess.run(
+                ["bash", str(step_script)],
+                text=True,
+                capture_output=True,
+                env=env,
+                cwd=REPO,
+            )
+            self.assertIn(
+                "::warning::",
+                result.stdout,
+                f"a script that never ran must still self-report; stdout={result.stdout!r} stderr={result.stderr!r}",
+            )
+            self.assertIn("did not run to completion", result.stdout)
 
 
 if __name__ == "__main__":

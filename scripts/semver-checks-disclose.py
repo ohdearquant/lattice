@@ -46,6 +46,20 @@ _CHECKING_RE = re.compile(
     r"^[ \t]*Checking\s+(\S+)\s+v(\S+)\s*->\s*v(\S+)", re.MULTILINE
 )
 
+# Real CI output is colourized (verified against a real captured GitHub
+# Actions log): "ESC[1mESC[32m    CheckingESC[0m lattice-embed ...", with
+# escape codes both before "Checking" and between "Checking" and the package
+# name. Neither the whitespace class in _CHECKING_RE nor a column-0 anchor
+# can see through that. The capture step also sets CARGO_TERM_COLOR=never,
+# but this strip runs regardless — the tool can colour for reasons other
+# than that one variable, and a parser that only works when a upstream env
+# var was set correctly is not a parser that can be trusted on its own.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
 
 @dataclass
 class Transition:
@@ -71,6 +85,7 @@ def parse_semver_checks_output(text: str) -> ParseResult:
     zero checks — callers must treat parse_ok=False differently from
     total_checks == 0.
     """
+    text = _strip_ansi(text)
     checked_matches = _CHECKED_RE.findall(text)
     if not checked_matches:
         return ParseResult(parse_ok=False)
@@ -143,6 +158,23 @@ def compose_summary(result: ParseResult) -> str | None:
         "once the bumped version is published and becomes the crates.io "
         "baseline.\n"
     )
+
+
+def as_workflow_warning(summary: str) -> str:
+    """Collapse a disclosure into a single-line `::warning::` workflow command.
+
+    $GITHUB_STEP_SUMMARY is not a readable carrier in practice: on a real run,
+    `check_runs[].output.summary` for this job came back null via the GitHub
+    API, and the step summary appeared nowhere in the job log either. The
+    annotations channel (`::warning::`, surfaced through
+    repos/{owner}/{repo}/check-runs/{id}/annotations) DID return content on
+    the same run, so this is the channel that actually makes the disclosure
+    readable — by a person scanning a green check list, or by an automated
+    reader. Workflow commands must be a single line; GitHub also truncates
+    and reformats embedded newlines unpredictably, so collapse to whitespace
+    up front rather than relying on that behavior.
+    """
+    return "::warning::" + " ".join(summary.split())
 
 
 def _run_selftest() -> int:
@@ -227,6 +259,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if summary is None:
         return 0
+
+    # Both channels, always together: the step summary for a human reading
+    # the job page, and a `::warning::` workflow command (printed to stdout,
+    # which is how GitHub Actions recognizes workflow commands) so the
+    # disclosure also lands in the log and the annotations API.
+    print(as_workflow_warning(summary))
 
     summary_out = args.summary_out
     if summary_out is None:
