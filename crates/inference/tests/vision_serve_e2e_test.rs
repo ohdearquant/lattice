@@ -16,6 +16,7 @@
 #![cfg(all(target_os = "macos", feature = "metal-gpu"))]
 
 use base64::Engine as _;
+use lattice_inference::measurement::gpu_test_lock;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -23,8 +24,6 @@ use std::time::{Duration, Instant};
 const VISION_DISPATCH_MARKER: &str = "route=vision dispatch=multimodal";
 const METAL_DISPATCH_FIELD: &str = "metal_gemm_dispatches=";
 const GEMM_CALL_FIELD: &str = "metal_gemm_calls=";
-const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-const GPU_MACHINE_LOCK_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 fn enforce() -> bool {
     std::env::var("LATTICE_VISION_S3_GATE_ENFORCE").as_deref() == Ok("1")
@@ -81,48 +80,6 @@ fn require_model_dir() -> Option<PathBuf> {
          tried={MODEL_DIR_ENV} and ~/.lattice/models/qwen3.5-0.8b"
     );
     None
-}
-
-struct GpuTestGuard {
-    _process: std::sync::MutexGuard<'static, ()>,
-    _machine: std::fs::File,
-}
-
-fn gpu_test_lock() -> GpuTestGuard {
-    use std::sync::Mutex;
-
-    static GPU_LOCK: Mutex<()> = Mutex::new(());
-    let process = GPU_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(GPU_MACHINE_LOCK_PATH)
-        .unwrap_or_else(|err| panic!("cannot open GPU lock {GPU_MACHINE_LOCK_PATH}: {err}"));
-    let deadline = Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
-    loop {
-        match file.try_lock() {
-            Ok(()) => break,
-            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                panic!(
-                    "GPU lock {GPU_MACHINE_LOCK_PATH} remained held for {}s",
-                    GPU_MACHINE_LOCK_TIMEOUT.as_secs()
-                );
-            }
-            Err(std::fs::TryLockError::Error(err)) => {
-                panic!("cannot lock {GPU_MACHINE_LOCK_PATH}: {err}");
-            }
-        }
-    }
-    GpuTestGuard {
-        _process: process,
-        _machine: file,
-    }
 }
 
 struct ChildGuard(Child);
