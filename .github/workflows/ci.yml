@@ -429,6 +429,34 @@ jobs:
           fi
           cat "$log"
           grep -Eq '^test result: ok\. 5 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #1263: `compact_metal_candidate_path_applies_min_p` lives in the
+      # `#[cfg(all(target_os = "macos", feature = "metal-gpu"))] mod inner`
+      # module of metal_qwen35.rs, so the macOS metal-gpu clippy/build legs
+      # above compile and lint it, but no test-running step's filter ever
+      # matched it: the Q4 step (`--lib q4`) and the fused_attention step
+      # (`--lib forward::metal::`) are both substring filters against this
+      # test's full path
+      # (`forward::metal_qwen35::inner::min_p_compact_sampling_tests::compact_metal_candidate_path_applies_min_p`),
+      # neither "q4" nor "forward::metal::" (the module is `metal_qwen35`,
+      # not `metal`) occurs in it, and the grammar/f16-KV steps below filter
+      # on unrelated test names. Compiled-and-linted-but-never-run means
+      # dropping the min-p forwarding call at metal_qwen35.rs:12951 would
+      # turn no CI command red. This test needs no live Metal device (it
+      # only exercises `sample_from_candidates`'s CPU-side candidate math),
+      # so unlike the Q4/grammar/f16-KV steps it does not set
+      # LATTICE_METAL_TEST_ENFORCE. The exact "1 passed" grep guards against
+      # a silently zero-matching filter the same way those steps do.
+      - name: inference — compact Metal min-p forwarding gate (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-compact-min-p-test.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib min_p_compact_sampling_tests:: -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a
       # grammar that blocked every token silently emitted token 0 instead of

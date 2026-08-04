@@ -1653,34 +1653,92 @@ mod tests {
         );
     }
 
+    /// Reproduces the reviewer's mutation for #1263: changing the shared
+    /// `if min_p > 0.0` branch condition in `sample_min_p_top_p_with_scratch`
+    /// to `if false` left the *previous* version of this test green, because
+    /// both top-k survivors cleared `min_p` and top-p kept both regardless.
+    /// A test that cannot fail when min-p is disabled proves nothing about
+    /// min-p, so the assertion here is chosen to require min-p's exclusion:
+    /// see [`min_p_interacts_with_penalty_temperature_top_k_and_top_p`] for
+    /// the derivation and the discriminating replacement.
     #[test]
-    fn min_p_interacts_with_penalty_temperature_top_k_and_top_p() {
-        let logits = [4.0, 3.0, 2.5];
-        let mut seen = [false; 3];
+    fn min_p_interacts_with_penalty_temperature_and_top_k() {
+        let logits = [8.0, 3.0, 0.0];
 
-        for seed in [0xdead_beef_cafe_babe, 0x1234_5678_9abc_def0] {
+        // penalty=4 on token 0 (raw logit 8.0 > 0, so 8.0 / 4.0 = 2.0) drops it
+        // below token 1 (3.0), so top-k=2 keeps {token 1: 3.0, token 0: 2.0}
+        // and excludes token 2 (0.0) regardless of min-p.
+        for seed in [0x1234_5678_9abc_def0, 0x9e37_79b9_7f4a_7c15] {
             let mut sampler = Sampler::new(SamplingConfig {
                 temperature: 2.0,
                 top_k: 2,
                 top_p: 0.9,
                 min_p: 0.7,
-                repetition_penalty: 2.0,
+                repetition_penalty: 4.0,
             })
             .with_seed(seed);
             sampler.seed_history(&[0]);
             let token = sampler.sample(&logits);
-            assert!(
-                token == 1 || token == 2,
-                "penalty → temperature → top-k → min-p → top-p must exclude token {token}"
+            assert_ne!(
+                token, 2,
+                "penalty → temperature → top-k must exclude token 2"
             );
-            seen[token as usize] = true;
         }
+    }
 
-        assert!(
-            seen[1] && seen[2],
-            "temperature must keep both top-k survivors above the min-p floor, \
-             and top-p must leave both reachable"
-        );
+    /// Discriminating replacement for the #1263 finding: after penalty (4x on
+    /// token 0), temperature (2.0) and top-k (2), the surviving candidates are
+    /// token 1 (scaled logit 1.5) and token 0 (scaled logit 1.0). Their
+    /// relative weight is `exp(1.0 - 1.5) = exp(-0.5) ≈ 0.6065`, which sits
+    /// BELOW `min_p = 0.7`: min-p prunes token 0, leaving only token 1
+    /// reachable. With min-p disabled (0.0), both survive top-p=0.9
+    /// (`token 1` gets ≈0.6225 of the renormalised mass, `token 0` the rest),
+    /// and a draw with `r >= 0.6225` reaches token 0.
+    ///
+    /// The two seeds below were chosen (via the crate's own
+    /// `xorshift64_next`/`uniform_f32_from_u64`) to produce first draws
+    /// `r ≈ 0.9941` and `r ≈ 0.8598`, both comfortably above the 0.6225 cut —
+    /// so disabling min-p changes the sampled token for both, which is the
+    /// discriminating behavior a min-p test must exercise.
+    #[test]
+    fn min_p_interacts_with_penalty_temperature_top_k_and_top_p() {
+        let logits = [8.0, 3.0, 0.0];
+        let config_min_p_on = SamplingConfig {
+            temperature: 2.0,
+            top_k: 2,
+            top_p: 0.9,
+            min_p: 0.7,
+            repetition_penalty: 4.0,
+        };
+        let config_min_p_off = SamplingConfig {
+            min_p: 0.0,
+            ..config_min_p_on
+        };
+
+        for seed in [0x1234_5678_9abc_def0, 0x9e37_79b9_7f4a_7c15] {
+            let mut sampler_on = Sampler::new(config_min_p_on.clone()).with_seed(seed);
+            sampler_on.seed_history(&[0]);
+            let token_on = sampler_on.sample(&logits);
+
+            let mut sampler_off = Sampler::new(config_min_p_off.clone()).with_seed(seed);
+            sampler_off.seed_history(&[0]);
+            let token_off = sampler_off.sample(&logits);
+
+            assert_eq!(
+                token_on, 1,
+                "min_p=0.7 must prune token 0 (weight ≈0.6065 < 0.7), \
+                 leaving only token 1 reachable"
+            );
+            assert_eq!(
+                token_off, 0,
+                "with min_p disabled, top-p=0.9 keeps both survivors and this \
+                 seed's draw (r >= 0.6225) must reach token 0"
+            );
+            assert_ne!(
+                token_on, token_off,
+                "min-p must change the sampled token for seed {seed:#x}"
+            );
+        }
     }
 
     #[test]
