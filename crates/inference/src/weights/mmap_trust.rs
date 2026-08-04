@@ -359,11 +359,15 @@ pub(crate) fn reject_if_mmap_file_trust_boundary_weak(
              mmap, so a principal able to write to it could truncate or replace \
              it in place between validation and the GPU reading the mapped \
              pages; shape/bounds validation alone cannot defend against that. \
-             Fix the file's permissions (not group/other writable) and, unless \
-             it is root-owned, its ownership (owned by the deploying user) \
-             before retrying.",
+             Accepted owners are this process's uid ({process_uid}) and root \
+             (0); this file's owner is uid {file_uid}. To comply, make the file \
+             non-group/other-writable (`chmod go-w {}`) and, unless it is \
+             root-owned, transfer ownership (`sudo chown {process_uid} {}`), \
+             then retry.",
             path.display(),
             mode & 0o777,
+            path.display(),
+            path.display(),
         ));
     }
 
