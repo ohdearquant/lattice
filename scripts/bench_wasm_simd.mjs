@@ -43,6 +43,28 @@ const REPO = path.resolve(HERE, '..');
 const SUPERVISION = path.join(REPO, 'scripts', 'lib', 'bench_supervision.py');
 const SUPERVISOR_FD = Number(process.env.LATTICE_BENCH_SUPERVISOR_FD ?? '');
 
+// Resolve a Python interpreter that satisfies the bench harness's version
+// floor (scripts/lib/bench_supervision.py: 3.11+) instead of trusting
+// whichever `python3` happens to be first on PATH -- macOS ships
+// /usr/bin/python3 at 3.9, which is too old.
+function resolvePython3() {
+  for (const candidate of ['python3.13', 'python3.12', 'python3.11', 'python3']) {
+    const probe = spawnSync(
+      candidate,
+      ['-c', 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'],
+      { stdio: 'ignore' },
+    );
+    if (!probe.error && probe.status === 0) return candidate;
+  }
+  console.error(
+    'bench_wasm_simd: no Python >= 3.11 found on PATH (tried python3.13, ' +
+      'python3.12, python3.11, python3); install one (e.g. ' +
+      '`brew install python@3.12`) and ensure it is reachable.',
+  );
+  process.exit(1);
+}
+const PYTHON3 = resolvePython3();
+
 function supervisionStdio() {
   const stdio = ['inherit', 'inherit', 'inherit'];
   if (!Number.isInteger(SUPERVISOR_FD) || SUPERVISOR_FD < 3) return stdio;
@@ -53,7 +75,7 @@ function supervisionStdio() {
 
 if (!process.env.LATTICE_BENCH_LOCK_STATUS) {
   const child = spawnSync(
-    'python3',
+    PYTHON3,
     [
       SUPERVISION,
       'run',
@@ -74,7 +96,7 @@ if (!process.env.LATTICE_BENCH_LOCK_STATUS) {
   process.exit(child.status ?? 2);
 }
 
-const receipt = spawnSync('python3', [SUPERVISION, 'verify', '--require-quiet'], {
+const receipt = spawnSync(PYTHON3, [SUPERVISION, 'verify', '--require-quiet'], {
   // Node closes non-stdio descriptors by default. Preserve the non-lock
   // liveness pipe only for this cooperative handoff sample.
   stdio: supervisionStdio(),
@@ -259,7 +281,7 @@ for (const dim of ARGS.dims) {
   }
 }
 
-const completed = spawnSync('python3', [SUPERVISION, 'verify'], {
+const completed = spawnSync(PYTHON3, [SUPERVISION, 'verify'], {
   stdio: supervisionStdio(),
   env: {
     ...process.env,
