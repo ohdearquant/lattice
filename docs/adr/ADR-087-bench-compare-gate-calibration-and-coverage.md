@@ -247,3 +247,192 @@ admission requires enumeration rather than judgement. And D3 is written to preve
 this ADR most invites, which is that a gate found to be uncalibrated and structurally silent
 was therefore never binding. It was binding, it remains binding, and what changed is that its
 output is no longer admissible as evidence without a reachability showing.
+
+## Amendment 1 (2026-08-04): reachable-surface correction and the granularity of the reach predicate
+
+### Why the surface needed re-checking
+
+D3 puts the reachability burden on any citation of bench-compare output. Interim practice now
+goes further: a PR whose changes the default A/B cannot observe may state that fact, citing the
+derivation in this record, in place of an A/B table. That promotes the reachable surface from a
+supporting measurement into the predicate that decides whether a PR owes bench evidence at all.
+A surface used that way has to be right, and this one was not.
+
+### Correction 1: two directly imported files were missing from the surface
+
+Problem 3 names three things the embed `simd` bench imports: `lattice_embed::simd`,
+`lattice_embed::service`, and `EmbeddingModel`. The surface derived in the next sentence covers
+the first two and drops the third.
+
+`EmbeddingModel` is imported at `crates/embed/benches/simd.rs:9` and constructed at `:52`. It is
+defined at `crates/embed/src/model.rs:70` and re-exported at `crates/embed/src/lib.rs:34`. Both
+files are reached directly, in exactly the sense that admitted the two directories, and neither
+matches the classification predicate as it was written.
+
+The corrected surface has five entries, three directory prefixes and two exact paths:
+
+    crates/inference/src/forward/cpu/
+    crates/embed/src/simd/
+    crates/embed/src/service/
+    crates/embed/src/lib.rs
+    crates/embed/src/model.rs
+
+Measured at `origin/main` on 2026-08-04: 14 files under `forward/cpu/`, 11 under `embed/src/simd/`,
+4 under `embed/src/service/`, plus the two exact paths, for 31 files.
+
+This record states 28 for the first three prefixes, as 14 plus 14. The embed side is 15 today
+rather than 14 because `crates/embed/src/simd/manhattan.rs` was added after this record was
+written. The 14 was correct on its date. A hardcoded file count in a decision record went stale
+in three days here, which is the argument for stating a derivation command beside any count
+rather than only the number it produced.
+
+### Correction 2: two numerals do not reproduce under the commands named
+
+- **Bench target count.** This record states 31 declared bench targets. Measured 30 at
+  `origin/main` on 2026-08-04, and 30 at the record's own date, under both available readings:
+  `[[bench]]` sections declared across `crates/*/Cargo.toml`, and files matching
+  `crates/*/benches/*.rs`. The 31 was already off by one when it was written.
+- **Trigger set size.** This record states 452 files from `git ls-files 'crates/inference/*'
+  'crates/embed/*' 'crates/fann/*'`. That command yields 473 on the current checkout, and the
+  equivalent read at the record's own date yields 472. The 452 does not reproduce under the
+  command it is attributed to. This amendment states that and does not assert what produced it.
+
+### The result is unchanged, and now reproduces under both surfaces
+
+Measured on 2026-08-04 across the 34 open pull requests: 26 trigger the rule. Under the surface
+as originally written, zero are reached. Under the corrected surface, one is reached, PR #1289,
+and it is reached through `crates/embed/src/lib.rs` alone.
+
+So the conclusion of Problem 3 survives its own evidence being corrected. What changes is the
+predicate that is about to decide 25 dispositions.
+
+The omission understated reach, which is the direction that supports this record's conclusion.
+The closing section of this record names that direction as the one in which errors are not
+investigated. It was right about itself.
+
+One further scope note, and it is not a correction. This record already declares that it
+measures direct file-surface reachability and that transitive calls out of `forward::cpu` are
+established in neither direction. That declaration holds. A concrete instance of what it leaves
+open: `crates/inference/src/forward/cpu/softmax.rs:44` reaches
+`crates/inference/src/attention/softmax_row.rs` through a function-scoped import inside
+`softmax_attention_scalar`, which is production code on a directly benched path. That file is
+absent from the surface because the surface is file-level and direct by construction. It is the
+disclosed bound working as disclosed, not a second omission, and it is recorded here so that a
+reader who finds it does not have to re-derive whether it was missed.
+
+### D3-A: the reach predicate has two granularities, and file-level reach only opens the second
+
+The surface is file-level. The judgement it feeds is not. Stating only one of those leaves the
+next reader to pick, and the two picks disagree on real PRs. The predicate is therefore:
+
+**Step 1, file-level, mechanical.** Does the diff touch any path in the corrected surface? This
+is decidable from the surface list with no reading of the diff. If no, the PR may carry an
+unreachability statement naming this record. If yes, the file-level answer is a trigger and not
+a verdict, and step 2 is owed.
+
+**Step 2, symbol-level, not mechanical.** Does the diff perturb anything the benched code path
+executes? Discharged only by naming, for every changed hunk in every reached file, why the
+benched path cannot observe it. Three forms are admissible:
+
+- the hunk adds an item and modifies none, with the added item shown to be absent from the
+  bench's import and call surface;
+- the hunk is behind a `cfg` the bench build does not enable, with the bench build's resolved
+  feature set stated rather than assumed;
+- the hunk changes only text the compiler discards, shown by the diff itself.
+
+Anything else fails step 2 and the PR runs the A/B. Not admissible at either step: an argument
+that a change is small, cold, or obviously harmless. That is the reading D3 exists to prevent,
+and it would re-enter here if this step were left to judgement without a closed list.
+
+**Step 3, residual, always stated.** A discharged symbol-level claim still leaves a
+compiled-artifact residual. Adding an item to a crate the bench links changes what the compiler
+sees, and layout and inlining are not invariant under additions. The statement says that rather
+than claiming the benched path is provably unchanged. Where the residual is load-bearing, run
+the A/B instead of arguing about it.
+
+### Worked example: PR #1289 under D3-A
+
+Step 1: reached, through `crates/embed/src/lib.rs`, and no other file in the surface.
+
+Step 2: the change to that file is two lines, `#[cfg(feature = "native")]` and `pub mod drift;`,
+inserted between existing module declarations. No existing item is modified. The bench's only
+reference into this file's surface is the `EmbeddingModel` re-export at `:34`, which the diff
+does not touch, and `mod model;` is likewise untouched. This discharges under the first form.
+
+Step 3: `native` is in `lattice-embed`'s default feature set, so the added module does compile
+into the bench build. The claim is that no benched symbol changed. It is not a claim that the
+emitted binary is identical.
+
+Disposition: PR #1289 runs the A/B regardless. It is the only reached PR in the current
+population, and running one comparison is cheaper than establishing that its step 3 residual
+does not matter. That is an operational call about a population of one, and it is recorded
+separately from the predicate so that a later reader does not mistake it for the predicate
+producing a different answer than it does.
+
+### D5: direction for the target and trigger sets
+
+D3 identifies the mismatch. This sets the direction for closing it, and any implementation
+remains subject to the D3 condition that a target change is an instrument change requiring an
+A/A null re-run before the new member gates anything.
+
+- **Widen where a bench target already exists.** `BENCHES_INFERENCE` is overridable by
+  environment variable. `BENCHES_EMBED` is a bare assignment at
+  `scripts/lib/bench-compare-impl.sh:413` with no parameter expansion, so widening the embed
+  side is a code change and not a configuration change.
+- **`lattice-fann` is a widen case, not a narrow case.** An earlier characterization of fann as
+  code the instrument cannot compile is wrong. `crates/fann/Cargo.toml` declares a bench target
+  `router_online` with `required-features = ["online-router"]`, and
+  `crates/fann/benches/router_online.rs` imports `lattice_fann::training` and
+  `lattice_fann::{Activation, Network, NetworkBuilder}`. The instrument can reach fann. The
+  default target set does not include it, and the feature is not on by default. Removing fann
+  from the trigger set would discard a bench that exists.
+- **Narrow the trigger only where no bench target reaches the code at all.** That set is
+  established per path by the same derivation used here, not by inspection.
+
+### Evidence and method for this amendment
+
+All reads are at `origin/main` at `e842a892d950f3d3b2687eaf6cc573e0587785a7` unless a ref is
+named, and use `git ls-tree` rather than `git ls-files` where the question is about a ref rather
+than about a checkout.
+
+    # bench imports, both default targets
+    grep -n '^use ' crates/inference/benches/elementwise_cpu_bench.rs crates/embed/benches/simd.rs
+
+    # surface file counts
+    git ls-tree -r --name-only origin/main -- crates/inference/src/forward/cpu/ | grep -c '\.rs$'
+    git ls-tree -r --name-only origin/main -- crates/embed/src/simd/         | grep -c '\.rs$'
+    git ls-tree -r --name-only origin/main -- crates/embed/src/service/      | grep -c '\.rs$'
+
+    # declared bench targets, both readings
+    git show origin/main:crates/<c>/Cargo.toml | grep -c '^\[\[bench\]\]'   # summed over crates
+    git ls-tree -r --name-only origin/main | grep -c '^crates/.*/benches/.*\.rs$'
+
+    # trigger set
+    git ls-tree -r --name-only origin/main -- crates/inference/ crates/embed/ crates/fann/ | wc -l
+
+    # open-PR join
+    gh pr list --state open --limit 100 --json number
+    gh api "repos/<slug>/pulls/<n>/files?per_page=300" --jq '.[].filename'
+
+The classification predicate is an anchored alternation with a trailing separator on every
+directory prefix and an end anchor on every exact path:
+
+    ^(crates/inference/src/forward/cpu/|crates/embed/src/simd/|crates/embed/src/service/|crates/embed/src/lib\.rs$|crates/embed/src/model\.rs$)
+
+Both arms were run in the same invocation before any count was taken. Must-match:
+`crates/inference/src/forward/cpu/softmax.rs`, `crates/embed/src/simd/dot.rs`,
+`crates/embed/src/lib.rs`, `crates/embed/src/model.rs`. Must-not-match:
+`crates/inference/src/forward/cpu_f16.rs`, which is the prefix error this record already
+discloses and which a missing trailing separator reintroduces;
+`crates/embed/src/model_loader.rs`, which is the same error in the new exact-path entries;
+`crates/inference/src/attention/softmax_row.rs`, which must stay out because the surface is
+direct rather than transitive; and `crates/fann/src/lib.rs`. All eight arms returned their
+expected values.
+
+### Direction of error for this amendment
+
+The surface correction increases reach, which increases work, and that is the direction that
+does not get skipped for convenience. The symbol-level step gives work back, and it is the only
+step here that rests on judgement rather than on a list. That step is therefore where a future
+permissive error will live, which is why its admissible forms are closed and why step 3 requires
+a residual statement even when step 2 succeeds.
