@@ -56,21 +56,30 @@ name: perf post-merge detection (informational, PAUSED)
 # in this header were quoted over populations that were never their own. The
 # settled population is x86_64-linux alone: 15 reports declaring 263 comparisons
 # twelve times and 264 three times, 3948 in total. Over that: 220 FAIL rows,
-# 5.6%. Within-run intervals are tight — median CI width 0.280 percentage points
-# across the FAIL rows accumulated through run 7 of the 15, which is the subset
-# that median was computed on and not the full set.
+# 5.6%. Within-run intervals are tight — median CI width 0.4650 percentage
+# points across the 82 FAIL rows accumulated through run 7 of the 15 (derived
+# from the seven x86_64-linux job logs for those runs, `Delta point` table,
+# rows with CI-lower > 7%, sorted CI-upper minus CI-lower, middle pair
+# 0.46/0.47), which is the subset that median was computed on and not the
+# full set.
 #
-# The recurrence signature confirms the reading: the same groups flag across
-# unrelated merges (simd_throughput_384/normalize in 7 of 15 runs), and if those
-# were genuine per-merge regressions that group would by now be about twice as
-# slow, which it is not.
+# The recurrence signature: simd_throughput_384/normalize flags a CI-lower
+# past 7% in 3 of the 15 x86_64-linux reports and 6 of the 14 available
+# aarch64-linux reports (the aarch64 report for run 29881462420 is absent);
+# the union across either architecture is 7 of 15 workflow runs. Read per
+# architecture, not pooled: if those were genuine per-merge regressions that
+# group would by now be about twice as slow, which it is not.
 #
 # Large deltas are not sign-aligned, which is what rules out an arm-ordering
-# artifact: past 7% the x86_64 split is 232 head-slower against 273 head-faster.
-# Read that per architecture and never pooled. aarch64 leans slower (44 against
-# 30) while x86_64 leans faster, so a pooled figure is partly cancellation and
-# overstates how symmetric the distribution is. The conclusion survives either
-# way; the pooled version of it does not survive scrutiny.
+# artifact: past 7% CI-lower, the Delta point split is 232 head-slower against
+# 273 head-faster over the 15 x86_64-linux reports (3948 rows), and 44
+# head-slower against 30 head-faster over the 14 completed aarch64-linux
+# reports (3685 rows; the 15th report is absent, so this is a 14-report
+# denominator, not a matching 15). Read that per architecture and never
+# pooled. aarch64 leans slower while x86_64 leans faster, so a pooled figure
+# is partly cancellation and overstates how symmetric the distribution is.
+# The conclusion survives either way; the pooled version of it does not
+# survive scrutiny.
 #
 # Cost of leaving it on: roughly 88 minutes of wall clock per run, on each of two
 # runner jobs, for every qualifying merge, producing a verdict that cannot be
