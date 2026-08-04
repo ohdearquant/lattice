@@ -2370,9 +2370,6 @@ pub struct GenerateConfig {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
-    /// Relative probability floor. Tokens below `min_p * max_probability` are removed.
-    /// `0.0` or NaN disables filtering; all other values clamp to `[0.0, 1.0]`.
-    pub min_p: f32,
     pub repetition_penalty: f32,
     /// Random seed for sampling. `None` = seed from system time.
     pub seed: Option<u64>,
@@ -2412,7 +2409,6 @@ impl std::fmt::Debug for GenerateConfig {
             .field("temperature", &self.temperature)
             .field("top_k", &self.top_k)
             .field("top_p", &self.top_p)
-            .field("min_p", &self.min_p)
             .field("repetition_penalty", &self.repetition_penalty)
             .field("seed", &self.seed)
             .field("stop_token_ids", &self.stop_token_ids)
@@ -2433,7 +2429,6 @@ impl Default for GenerateConfig {
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
-            min_p: 0.0,
             repetition_penalty: 1.1,
             seed: None,
             stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
@@ -2617,7 +2612,6 @@ mod tests {
         assert!((gen_cfg.temperature - 0.7).abs() < 1e-6);
         assert_eq!(gen_cfg.top_k, 50);
         assert!((gen_cfg.top_p - 0.9).abs() < 1e-6);
-        assert_eq!(gen_cfg.min_p, 0.0);
         assert!((gen_cfg.repetition_penalty - 1.1).abs() < 1e-6);
         assert!(
             gen_cfg.stop_token_ids.contains(&QWEN_CHAT_IM_END_TOKEN_ID),

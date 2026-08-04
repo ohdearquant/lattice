@@ -18,7 +18,11 @@ pub(crate) fn sample_token(
     previous_ids: &[u32],
     rng_state: &mut u64,
 ) -> u32 {
-    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
+    // `GenerateConfig` cannot carry `min_p` (it is exhaustively constructible
+    // through the public API at published `0.7.1`; adding any field is a
+    // major break -- see `crate::sampling::Sampler::with_min_p`), and no
+    // production entry point sets it yet, so this path is always disabled.
+    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0)
 }
 
 /// Reference oracle: the original allocating implementation of `sample_token`,
@@ -33,6 +37,7 @@ pub(crate) fn sample_token_reference(
     cfg: &GenerateConfig,
     previous_ids: &[u32],
     rng_state: &mut u64,
+    min_p: f32,
 ) -> u32 {
     let vocab_size = logits.len();
     let mut adjusted = logits.to_vec();
@@ -94,7 +99,7 @@ pub(crate) fn sample_token_reference(
         return greedy_token(&adjusted);
     };
 
-    apply_min_p(&mut probs, cfg.min_p);
+    apply_min_p(&mut probs, min_p);
 
     if cfg.top_p < 1.0 {
         apply_top_p(&mut probs, cfg.top_p);
@@ -279,7 +284,6 @@ mod tests {
             temperature,
             top_k,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         }
@@ -573,7 +577,6 @@ mod tests {
             temperature,
             top_k,
             top_p,
-            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
@@ -585,7 +588,6 @@ mod tests {
             temperature,
             top_k,
             top_p,
-            min_p: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -608,11 +610,11 @@ mod tests {
         let logits = [0.0, 0.49_f32.ln(), 0.1_f32.ln()];
         let seed = 0x5870_5870_5870_5870;
         let draws = 128;
+        let min_p = 0.5;
         let cfg = GenerateConfig {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
-            min_p: 0.5,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -620,19 +622,24 @@ mod tests {
             temperature: cfg.temperature,
             top_k: cfg.top_k,
             top_p: cfg.top_p,
-            min_p: cfg.min_p,
             repetition_penalty: cfg.repetition_penalty,
         })
-        .with_seed(seed);
+        .with_seed(seed)
+        .with_min_p(min_p);
         let sampler_tokens: Vec<u32> = (0..draws).map(|_| sampler.sample(&logits)).collect();
 
+        // `sample_token` cannot carry `min_p` through `GenerateConfig` (see its
+        // doc comment), so the optimized path is exercised directly through the
+        // shared engine it delegates to, with `min_p` passed explicitly.
         let mut optimized_rng = seed;
         let optimized_tokens: Vec<u32> = (0..draws)
-            .map(|_| sample_token(&logits, &cfg, &[], &mut optimized_rng))
+            .map(|_| {
+                crate::sampling::sample_full_logits(&logits, &cfg, &[], &mut optimized_rng, min_p)
+            })
             .collect();
         let mut reference_rng = seed;
         let reference_tokens: Vec<u32> = (0..draws)
-            .map(|_| sample_token_reference(&logits, &cfg, &[], &mut reference_rng))
+            .map(|_| sample_token_reference(&logits, &cfg, &[], &mut reference_rng, min_p))
             .collect();
 
         assert!(
@@ -774,7 +781,6 @@ mod tests {
             temperature,
             top_k,
             top_p,
-            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
@@ -787,7 +793,6 @@ mod tests {
             temperature,
             top_k,
             top_p,
-            min_p: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -850,7 +855,7 @@ mod tests {
 
         for step in 0..steps {
             let token_opt = sample_token(&logits, &cfg, &history_opt, &mut rng_opt);
-            let token_ref = sample_token_reference(&logits, &cfg, &history_ref, &mut rng_ref);
+            let token_ref = sample_token_reference(&logits, &cfg, &history_ref, &mut rng_ref, 0.0);
             assert_eq!(
                 token_opt, token_ref,
                 "optimized sample_token diverged from sample_token_reference at step {step}"
@@ -894,7 +899,7 @@ mod tests {
 
         let mut rng_ref = seed;
         let tokens_ref: Vec<u32> = (0..n)
-            .map(|_| sample_token_reference(&logits, &cfg, &previous_ids, &mut rng_ref))
+            .map(|_| sample_token_reference(&logits, &cfg, &previous_ids, &mut rng_ref, 0.0))
             .collect();
 
         assert_eq!(

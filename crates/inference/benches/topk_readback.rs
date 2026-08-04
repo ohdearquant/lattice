@@ -547,7 +547,6 @@ fn bench_sampling_pipeline(c: &mut Criterion) {
                     temperature: 0.7,
                     top_k: 256,
                     top_p: 0.9,
-                    min_p: 0.0,
                     repetition_penalty: 1.1,
                 })
                 .with_seed(0xDEAD_BEEF)
