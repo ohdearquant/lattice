@@ -2201,8 +2201,8 @@ mod tests {
     /// First-token prompt penalty: seeded prompt tokens must be penalized on the
     /// very first `sample` call.
     ///
-    /// Mutation-sensitive: reverting `seed_history` (or not calling it in
-    /// `generate.rs`) leaves `recent_tokens` empty, so token 1 is NOT penalized
+    /// Mutation-sensitive: reverting `seed_history` at a generation entry point
+    /// leaves `recent_tokens` empty, so token 1 is NOT penalized
     /// and wins with logit 10.0, failing this assertion.
     #[test]
     fn test_seed_history_penalizes_prompt_token_on_first_sample() {

@@ -23,6 +23,7 @@ fn run_bench() {
     use lattice_inference::forward::metal::MetalForwardPass;
     use lattice_inference::pool::{l2_normalize, last_token_pool};
 
+    let _gpu_guard = lattice_inference::measurement::gpu_test_lock();
     let home = std::env::var("HOME").unwrap();
     let model_dir = format!("{home}/.lattice/models/qwen3-embedding-0.6b");
     let dir = Path::new(&model_dir);

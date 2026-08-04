@@ -10,6 +10,7 @@ mod cosine;
 mod distance;
 mod dot_product;
 mod int4;
+mod manhattan;
 mod normalize;
 mod quantized;
 mod tier;
@@ -20,6 +21,7 @@ mod tests;
 pub use binary::BinaryVector;
 pub use cosine::{
     batch_cosine_one_vs_many, batch_cosine_similarity, cosine_similarity, cosine_similarity_fused,
+    cosine_similarity_pre_normalized, query_norm,
 };
 pub use distance::{euclidean_distance, squared_euclidean_distance};
 pub use dot_product::{
@@ -27,6 +29,7 @@ pub use dot_product::{
     resolved_dot_product_batch4_kernel, resolved_dot_product_kernel,
 };
 pub use int4::{Int4Params, Int4Vector};
+pub use manhattan::manhattan_distance;
 pub use normalize::normalize;
 pub use quantized::{
     I8DotKernel, QuantizationParams, QuantizedVector, cosine_similarity_i8, dot_product_i8,
