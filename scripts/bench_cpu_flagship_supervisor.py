@@ -76,8 +76,33 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
+
+_RUNNING_PYTHON = ".".join(str(part) for part in sys.version_info[:3])
+_PYTHON_REQUIREMENT_ERROR = (
+    f"{sys.argv[0]} requires Python 3.11 or newer; "
+    f"running Python {_RUNNING_PYTHON} at {sys.executable}"
+)
+try:
+    from datetime import UTC, datetime
+except ImportError:
+    raise SystemExit(_PYTHON_REQUIREMENT_ERROR) from None
+if sys.version_info[:2] < (3, 11):
+    raise SystemExit(_PYTHON_REQUIREMENT_ERROR)
+
+if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from bench_supervision import ensure_python_entrypoint
+
+    requested_run_kind = "baseline"
+    for index, arg in enumerate(sys.argv[1:], start=1):
+        if arg == "--run-kind" and index + 1 < len(sys.argv):
+            requested_run_kind = sys.argv[index + 1]
+        elif arg.startswith("--run-kind="):
+            requested_run_kind = arg.split("=", 1)[1]
+    ensure_python_entrypoint(
+        "cpu-flagship", quiet=requested_run_kind != "demonstration"
+    )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = Path(__file__).resolve().parent

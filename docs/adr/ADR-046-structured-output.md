@@ -72,7 +72,7 @@ immediately before `sampler.sample(logits)` on every step. The `mask_logits` cal
 - `GrammarSpec`: `JsonSchema(serde_json::Value)` and `Gbnf(String)` variants
 - `GrammarEngine`: vocabulary analysis, bitmask precomputation, per-step state machine
 - `GrammarState`: runtime PDA stack + current grammar position, cloned per decode sequence
-- Integration with `GenerateConfig` in `generate.rs` (CPU path)
+- Integration with the canonical Qwen3.5 `GenerateConfig` on CPU
 - Integration with `Qwen35Config::GenerateConfig` in `metal_qwen35.rs` (Metal path)
 - JSON Schema support limited to: `object`, `array`, `string` (with `enum`), `number`,
   `integer`, `boolean`, `null`, `anyOf`/`oneOf`, nested `$ref` resolved within the same document
@@ -137,13 +137,13 @@ pub struct GrammarState {
 
 ### Integration Points
 
-**`generate.rs` (CPU path)**: `GenerateConfig` gains:
+**Canonical Qwen3.5 CPU path**: `GenerateConfig` gains:
 
 ```rust
 pub grammar: Option<Arc<GrammarEngine>>,
 ```
 
-In the decode loop, after `forward_with_cache` returns `logits: &[f32]`, the masking call happens
+In the decode loop, after the forward path returns `logits: &[f32]`, the masking call happens
 before sampling:
 
 ```rust
