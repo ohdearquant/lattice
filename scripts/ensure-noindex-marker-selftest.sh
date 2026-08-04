@@ -197,5 +197,17 @@ else
   echo "  FAIL: target guard does not precede slopefit build (guard=$slopefit_guard_ln build=$slopefit_build_ln)"; fail=$((fail+1))
 fi
 
+# 13. CLOSED STDERR. Every FATAL diagnostic writes to fd 2 under `set -e`
+#     (originally `set -euo pipefail`, self-test drops -e above but the
+#     guard script itself keeps it). If fd 2 is closed by the caller, an
+#     unguarded `echo ... >&2` is itself a failing command and would abort
+#     the guard with the shell's raw exit 1 -- the code this contract
+#     reserves for a confirmed regression -- before the guard's own
+#     explicit `exit 2` is reached. No argument is the cheapest way to
+#     force a FATAL diagnostic.
+OUT="(stderr closed; not captured)"
+rc=$(/bin/bash -c "\"$SRC\" 2>&-; echo \$?" | tail -1)
+check "no-argument FATAL survives closed stderr" 2 "$rc"
+
 echo "=== $pass passed, $fail failed ==="
 [ "$fail" -eq 0 ]

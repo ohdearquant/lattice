@@ -23,16 +23,16 @@
 set -euo pipefail
 
 if [ "$#" -lt 1 ] || [ -z "${1:-}" ]; then
-  echo "[noindex] FATAL: usage: ensure-noindex-marker.sh <dir>" >&2
+  echo "[noindex] FATAL: usage: ensure-noindex-marker.sh <dir>" >&2 || :
   exit 2
 fi
 DIR="$1"
 MARKER="$DIR/.metadata_never_index"
 
 if ! mkdir -p "$DIR" 2>/dev/null; then
-  echo "[noindex] FATAL: cannot create $DIR (unwritable parent, or a" >&2
-  echo "[noindex] non-directory already occupies that path). Refusing to" >&2
-  echo "[noindex] continue rather than measure unprotected." >&2
+  echo "[noindex] FATAL: cannot create $DIR (unwritable parent, or a" >&2 || :
+  echo "[noindex] non-directory already occupies that path). Refusing to" >&2 || :
+  echo "[noindex] continue rather than measure unprotected." >&2 || :
   exit 2
 fi
 
@@ -46,21 +46,21 @@ if [ -L "$MARKER" ] || { [ -e "$MARKER" ] && [ ! -f "$MARKER" ]; }; then
   # regression). Convert it to our own exit 2 explicitly rather than let a
   # coreutils exit status leak through the contract.
   if ! rm -f "$MARKER" 2>/dev/null; then
-    echo "[noindex] FATAL: $MARKER exists and is not a plain file (and could" >&2
-    echo "[noindex] not be removed, e.g. a non-empty directory). Refusing to" >&2
-    echo "[noindex] continue rather than measure unprotected." >&2
+    echo "[noindex] FATAL: $MARKER exists and is not a plain file (and could" >&2 || :
+    echo "[noindex] not be removed, e.g. a non-empty directory). Refusing to" >&2 || :
+    echo "[noindex] continue rather than measure unprotected." >&2 || :
     exit 2
   fi
 fi
 
 # Idempotent: an existing regular marker is left untouched, not re-truncated.
 if [ ! -f "$MARKER" ] && ! : > "$MARKER"; then
-  echo "[noindex] FATAL: cannot create $MARKER" >&2
-  echo "[noindex] Without it Spotlight indexes this directory. Its build churn can" >&2
-  echo "[noindex] land asymmetrically across timing phases and read as a" >&2
-  echo "[noindex] code delta. Refusing to continue rather than measure unprotected." >&2
+  echo "[noindex] FATAL: cannot create $MARKER" >&2 || :
+  echo "[noindex] Without it Spotlight indexes this directory. Its build churn can" >&2 || :
+  echo "[noindex] land asymmetrically across timing phases and read as a" >&2 || :
+  echo "[noindex] code delta. Refusing to continue rather than measure unprotected." >&2 || :
   exit 2
 fi
 
 # Post-condition: prove the marker is really there before reporting success.
-[ -f "$MARKER" ] || { echo "[noindex] FATAL: $MARKER missing after creation" >&2; exit 2; }
+[ -f "$MARKER" ] || { echo "[noindex] FATAL: $MARKER missing after creation" >&2 || :; exit 2; }

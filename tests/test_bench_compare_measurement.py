@@ -493,6 +493,71 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertIn("FATAL", result.stderr)
         self.assertNotIn("gate reported a confirmed regression", result.stderr)
 
+    def test_cache_mkdir_failure_with_closed_stderr_still_exits_2(self):
+        """A fatal diagnostic write must not itself preempt the exit status.
+
+        Every FATAL echo in scripts/bench-compare.sh writes to fd 2. Under
+        `set -e`, a write that fails (fd 2 closed by the caller) is itself a
+        failing command, and an unguarded `echo ... >&2` would abort the
+        script right there with the shell's own exit 1 -- the status this
+        contract reserves for a confirmed regression -- before the script
+        ever reaches its explicit `exit 2`.
+
+        Mutation-sensitive: drop the `|| :` from any FATAL echo in the
+        mkdir-failure branch and this closed-stderr run flips from 2 to 1.
+        """
+        def occupy_cache(root):
+            (root / ".cache").write_text("occupied")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            (root / "scripts").mkdir(parents=True)
+            shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
+            shutil.copytree(LIB, root / "scripts" / "lib")
+            occupy_cache(root)
+            result = subprocess.run(
+                ["bash", "-c",
+                 f'exec "{root / "scripts" / SCRIPT.name}" HEAD~1 HEAD 2>&-'],
+                capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            result.returncode, 2,
+            "a fatal diagnostic write failing under closed stderr must not "
+            f"leak the shell's raw exit 1; got {result.returncode}\n"
+            f"stdout:\n{result.stdout}")
+
+    def test_repo_root_resolution_failure_is_not_a_confirmed_regression(self):
+        """An unguarded `REPO="$(cd ... && pwd)"` must not leak raw exit 1.
+
+        scripts/bench-compare.sh:27 resolves its own repository root via a
+        command substitution before anything else runs. If that `cd` ever
+        fails -- e.g. the checkout's parent directory disappeared between
+        bash opening the script and this line executing -- the unguarded
+        form aborts under `set -e` with the shell's own exit 1, the status
+        this contract reserves for a confirmed regression.
+
+        The failure is reproduced deterministically (not via a real,
+        inherently racy delete-mid-exec) by handing bash the script's body
+        on the command line with $0 set to a path whose parent never
+        existed, so the `cd` fails for the same reason a raced deletion
+        would: the resolved directory is not there.
+
+        Mutation-sensitive: revert the guard around the REPO= assignment in
+        scripts/bench-compare.sh and this run's exit code flips from 2 to a
+        raw 1 (or an unhandled `set -e` abort), never a controlled refusal.
+        """
+        script_body = SCRIPT.read_text()
+        fake_path = "/tmp/lattice-repo-root-resolution-never-existed/scripts/bench-compare.sh"
+        result = subprocess.run(
+            ["bash", "-c", script_body, fake_path],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            result.returncode, 2,
+            "repository-root resolution failure must exit 2 (input/"
+            "instrumentation error), never a raw 1 (confirmed regression); "
+            f"got {result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+
     def test_enforcing_mode_refuses_a_run_that_measured_nothing(self):
         """A bench that exits 0 having printed no measurement must not certify.
 
