@@ -5,22 +5,85 @@
 set -uo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/scripts/bench_quality.sh"
+SRC_ROOT="${SRC%/scripts/bench_quality.sh}"
 SB_ROOT="$(mktemp -d)"
 SB="$SB_ROOT/repo"
 trap 'chmod -R u+w "$SB_ROOT" 2>/dev/null; rm -rf "$SB_ROOT"' EXIT
 
-mkdir -p "$SB/scripts" "$SB/docs/bench_results" "$SB/target/release" \
-  "$SB/q4" "$SB/quarot" "$SB/tokenizer" "$SB/fake-bin"
+mkdir -p "$SB/scripts/lib" "$SB/docs/bench_results" "$SB/target/release" \
+  "$SB/q4" "$SB/quarot" "$SB/tokenizer" "$SB/fake-bin" "$SB/tmp"
 cp "$SRC" "$SB/scripts/bench_quality.sh"
+if ! cp \
+  "$SRC_ROOT/scripts/lib/bench-supervision.sh" \
+  "$SRC_ROOT/scripts/lib/bench_supervision.py" \
+  "$SRC_ROOT/scripts/lib/bench-locks.py" \
+  "$SB/scripts/lib/"; then
+  echo "failed to copy supervision helpers into fixture" >&2
+  exit 1
+fi
+
+if ! cat > "$SB/scripts/lib/quiet-probe.py" <<'PY'
+#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+if len(sys.argv) != 3 or sys.argv[1] != "--label" or sys.argv[2] not in {
+    "quality-perplexity: before",
+    "quality-perplexity: after",
+}:
+    raise SystemExit(f"unexpected quiet-check arguments: {sys.argv[1:]}")
+with Path(os.environ["BENCH_SELFTEST_QUIET_LOG"]).open("a", encoding="utf-8") as log:
+    log.write(sys.argv[2] + "\n")
+PY
+then
+  echo "failed to create fixture quiet-check shim" >&2
+  exit 1
+fi
+
+if ! python3 - \
+  "$SB/scripts/lib/bench-locks.py" \
+  "$SB/bench-window.lock" \
+  "$SB/metal-gpu.lock" \
+  "$SB/bench-window-pending" <<'PY'
+import re
+import runpy
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+names = ("BENCH_WINDOW", "GPU_LOCK", "PENDING_DIR")
+values = sys.argv[2:]
+source = path.read_text()
+for name, value in zip(names, values):
+    source, count = re.subn(
+        rf'(?m)^{name} = "[^"]*"$',
+        f"{name} = {value!r}",
+        source,
+        count=1,
+    )
+    if count != 1:
+        raise SystemExit(f"expected one {name} assignment, found {count}")
+path.write_text(source)
+loaded = runpy.run_path(str(path))
+if [loaded[name] for name in names] != values:
+    raise SystemExit("fixture supervision paths are not disposable")
+PY
+then
+  echo "failed to isolate supervision paths inside fixture" >&2
+  exit 1
+fi
 
 CANONICAL="$SB/docs/bench_results/perplexity.tsv"
 EXPECTED="$SB/expected.tsv"
 CORPUS="$SB/docs/bench_results/wiki.test.raw"
 MKTEMP_LOG="$SB/mktemp.log"
 PUBLISH_LOG="$SB/publish.log"
+QUIET_LOG="$SB/quiet.log"
 REAL_MKTEMP="$(command -v mktemp)"
 REAL_MV="$(command -v mv)"
 printf "committed canonical sentinel\n" > "$EXPECTED"
+: > "$QUIET_LOG"
 
 cat > "$SB/target/release/eval_perplexity" <<'EOF'
 #!/usr/bin/env bash
@@ -111,11 +174,18 @@ run_bench() {
   : > "$PUBLISH_LOG"
   OUT="$(
     cd "$SB" && env \
+      -u LATTICE_BENCH_LOCK_STATUS \
+      -u LATTICE_BENCH_LOCK_FDS \
+      -u LATTICE_BENCH_SUPERVISOR_FD \
+      -u LATTICE_BENCH_QUIET \
       PATH="$SB/fake-bin:$PATH" \
+      TMPDIR="$SB/tmp" \
       Q4_DIR="$SB/q4" \
       QUAROT_DIR="$SB/quarot" \
       TOK_DIR="$SB/tokenizer" \
       BENCH_MACHINE="bench-quality-selftest" \
+      BENCH_SELFTEST_QUIET_LOG="$QUIET_LOG" \
+      MLX_LOG="$SB/mlx_ppl.log" \
       MKTEMP_LOG="$MKTEMP_LOG" \
       PUBLISH_LOG="$PUBLISH_LOG" \
       REAL_MKTEMP="$REAL_MKTEMP" \
@@ -302,15 +372,23 @@ if [[ "$SKIP_MLX_RC" -eq 0 ]] \
   echo "    OK: SKIP_MLX publishes exactly the two lattice rows"
 fi
 
+QUIET_OK=0
+if grep -qFx "quality-perplexity: before" "$QUIET_LOG" \
+  && grep -qFx "quality-perplexity: after" "$QUIET_LOG"; then
+  QUIET_OK=1
+  echo "    OK: durable supervision invokes both quiet checkpoints"
+fi
+
 if [[ "$CONTENT_OK" -eq 1 ]] \
   && [[ "$TEMPLATE_OK" -eq 1 ]] \
   && [[ "$PUBLISH_OK" -eq 1 ]] \
-  && [[ "$SKIP_MLX_OK" -eq 1 ]]; then
+  && [[ "$SKIP_MLX_OK" -eq 1 ]] \
+  && [[ "$QUIET_OK" -eq 1 ]]; then
   echo "  PASS: complete run renames same-directory staged result onto canonical"
   pass=$((pass + 1))
 else
   echo "  FAIL: complete run renames same-directory staged result onto canonical" >&2
-  echo "        content=$CONTENT_OK template=$TEMPLATE_OK publish=$PUBLISH_OK skip_mlx=$SKIP_MLX_OK exit=$SUCCESS_RC" >&2
+  echo "        content=$CONTENT_OK template=$TEMPLATE_OK publish=$PUBLISH_OK skip_mlx=$SKIP_MLX_OK quiet=$QUIET_OK exit=$SUCCESS_RC" >&2
   echo "        output: $(tr '\n' '|' <<<"$OUT" | tail -c 500)" >&2
   fail=$((fail + 1))
 fi

@@ -2,11 +2,12 @@
 # bench-compare-impl.sh — A/B benchmark comparison across two git refs.
 #
 # INVOKE scripts/bench-compare.sh, NOT THIS FILE. This is the measurement body;
-# the entry point runs it under scripts/lib/bench-locks.py, which holds the
-# machine-wide bench-window and Metal GPU locks for the whole run. Running this
-# file by accident is refused below. Running it deliberately, by a caller
-# willing to prepare the status file, is not prevented — see the comment above
-# verify_locks for exactly what that check establishes.
+# the entry point runs it through scripts/lib/bench_supervision.py, whose
+# dedicated process verifies and retains the machine-wide bench-window and
+# Metal GPU lock descriptors. This body receives only a cooperative handoff
+# pipe. Running this file by accident, or deliberately with only a fabricated
+# status file, is refused below — see the comment above verify_locks for the
+# exact boundary.
 #
 # Usage:
 #   scripts/bench-compare.sh                        # origin/main vs HEAD (quick)
@@ -30,11 +31,11 @@
 # appear in the report; CLASSIFIED GATING (vs informational) if a regression
 # in it contributes to the report's FAIL verdict; and ENFORCED only if that
 # FAIL verdict reaches the caller as a non-zero exit status. Classification
-# is not enforcement: by default this script computes a verdict, captures the
-# gate's exit status, and does not act on it, so --quick and --full are both
-# REPORT-ONLY.
-# Enforcement is opt-in per invocation via --fail-on-regression, which
-# propagates the gate's status instead; `make bench-gate` also enforces.
+# is not regression enforcement: by default this script reports a confirmed
+# regression without failing the caller. Measurement-integrity failures are
+# always refusals, because report-only still requires an A/B that actually ran.
+# Regression enforcement is opt-in via --fail-on-regression, which propagates
+# a confirmed-regression status; `make bench-gate` also enforces.
 # Use these words literally below.
 #
 # lattice#714 / lattice#1060: the lattice-embed `simd` bench TARGET is
@@ -156,27 +157,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# --- Refuse to measure unless the recorded supervisor is one of our ancestors ---
-# scripts/bench-compare.sh runs this body under scripts/lib/bench-locks.py,
-# which records its own PID here after taking both locks. This requires that PID
-# to be one of THIS process's ancestors before measuring.
-#
-# WHAT THAT ACTUALLY PROVES, stated exactly, because the tempting overclaim is
-# one word wider than the truth. The file supplies the PID and the OS supplies
-# the chain, so the check establishes a RELATION: the named process is really an
-# ancestor of this one. It refuses a status file left over from a finished run,
-# a file copied from a different run or machine, and accidental direct
-# invocation of this body, which are the ways this actually gets run without
-# isolation. It does NOT stop a caller who deliberately records an ancestor's
-# PID, their own shell's included: the recorded PID is still caller-supplied,
-# and ancestry confirms the relation, not that the named process holds anything.
-#
-# Closing that needs the lock DESCRIPTOR rather than a PID — an fstat identity
-# check on an inherited fd, followed by a non-blocking flock on it, which leaves
-# the lock held on that description whichever branch is taken. That arrives with
-# the nested-acquirer work, where a child that must hold a lock exists to
-# receive the descriptor. Until then this is the strong refusal, not a proof.
-LOCK_STATUS_FILE="$REPO/.cache/bench-locks-status.txt"
+# --- Verify the descriptor-free handoff from the dedicated supervisor ---
+# scripts/bench-compare.sh routes this body through bench_supervision.py. That
+# parent verifies and retains both inherited lock capabilities, samples their
+# path identities before and after this process, and gives this shell only a
+# non-lock pipe. The shell's receipt, pipe-writer, and contention samples are
+# cooperative point-in-time diagnostics; they neither authenticate the holder
+# nor prove lock lifetime.
+LOCK_STATUS_FILE="${LATTICE_BENCH_LOCK_STATUS:-$REPO/.cache/bench-locks-status.txt}"
 LOCK_SUMMARY=""
 verify_locks() {
   if [ ! -f "$LOCK_STATUS_FILE" ]; then
@@ -184,50 +172,31 @@ verify_locks() {
     echo "  Run scripts/bench-compare.sh, not this file directly." >&2
     exit 2
   fi
-  local sup
-  sup="$(sed -n 's/^supervisor_pid=//p' "$LOCK_STATUS_FILE" | head -1)"
-  case "$sup" in
-    ''|*[!0-9]*)
-      echo "bench-compare: lock status names no supervisor PID — refusing." >&2
-      exit 2
-      ;;
-  esac
-  local pid="$PPID"
-  local hops=0
-  local parent
-  local walked=1
-  while [ "$pid" -gt 1 ] && [ "$hops" -lt 64 ]; do
-    if [ "$pid" = "$sup" ]; then
-      LOCK_SUMMARY="$(sed -n 's/^lock=/  /p' "$LOCK_STATUS_FILE")"
-      return 0
-    fi
-    # A failing ps must reach the refusal below rather than abort the script.
-    # Under `set -o pipefail` the failure propagates out of the assignment and
-    # `set -e` exits with ps's own status, skipping the diagnostic entirely: the
-    # caller sees a bare 1 or 126 and no message. That is still fail-closed, but
-    # silently, and it fires on the ordinary case of an ancestor exiting during
-    # the walk, not only where process inspection is denied.
-    if ! parent="$(ps -o ppid= -p "$pid" 2>/dev/null)"; then
-      walked=0
-      break
-    fi
-    pid="$(printf '%s' "$parent" | tr -d ' ')"
-    case "$pid" in ''|*[!0-9]*) walked=0; break ;; esac
-    hops=$((hops + 1))
-  done
-  if [ "$walked" -eq 0 ]; then
-    echo "bench-compare: could not walk this process's ancestry to the end" \
-         "(ps failed or returned nothing) — refusing to measure." >&2
-    echo "  Supervisor $sup was not seen before the walk stopped, so whether it" \
-         "is an ancestor is unknown, and unknown is refused." >&2
-  else
-    echo "bench-compare: lock supervisor $sup is not an ancestor of this run" \
-         "(stale or copied $LOCK_STATUS_FILE) — refusing to measure." >&2
+  LOCK_SUMMARY="$(sed -n 's/^lock=/  /p' "$LOCK_STATUS_FILE")"
+
+  if [ -z "${LATTICE_BENCH_SUPERVISOR_FD:-}" ]; then
+    echo "bench-compare: no supervisor handoff pipe" \
+         "(LATTICE_BENCH_SUPERVISOR_FD is unset) — refusing to measure." >&2
+    echo "  Run scripts/bench-compare.sh, not this file directly." >&2
+    exit 2
   fi
-  echo "  Run scripts/bench-compare.sh, not this file directly." >&2
-  exit 2
+
+  if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
+    echo "bench-compare: cooperative supervisor handoff failed —" \
+         "refusing to measure." >&2
+    exit 2
+  fi
 }
 verify_locks
+
+set +e
+(
+set -e
+supervisor_fd="${LATTICE_BENCH_SUPERVISOR_FD:-}"
+if [[ "$supervisor_fd" =~ ^[0-9]+$ ]]; then
+  eval "exec ${supervisor_fd}<&-"
+fi
+unset LATTICE_BENCH_SUPERVISOR_FD
 
 # --- Machine-state and ambient-load gates ---
 # A lock excludes peers; it says nothing about ambient load, thermal pressure,
@@ -257,13 +226,14 @@ machine_state_probe() {
       python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
     )" || rc=$?
   fi
+  if [ "$rc" -ne 0 ] || [ -z "$record" ]; then
+    echo "bench-compare: machine-state checkpoint '$label' failed or returned" \
+         "no record — refusing to certify this A/B." >&2
+    exit 2
+  fi
   echo "[state] $label: $record"
   MACHINE_STATE_SAMPLES="${MACHINE_STATE_SAMPLES}${MACHINE_STATE_SAMPLES:+
 }$record"
-  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
-    echo "bench-compare: machine-state checkpoint '$label' failed — refusing to certify this A/B." >&2
-    exit 2
-  fi
 }
 
 quiet_gate() {
@@ -485,7 +455,7 @@ python3 "$GATE_SCRIPT" "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
 python3 "$GATE_SCRIPT" "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
   --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
 
-# --- Measurement-integrity helpers (only bite under --fail-on-regression) ---
+# --- Measurement-integrity helpers ---
 # `cargo bench ... | grep -E "time:" || true` discards cargo's status TWICE: a
 # pipeline reports its LAST command (grep), and `|| true` then resets
 # PIPESTATUS to 0. So a bench that failed to build or died mid-run looked
@@ -507,22 +477,31 @@ run_bench() {
   local filter="$1"; shift
   BENCH_RC=0
   BENCH_LINES=0
-  local matched
+  local output matched
+  output="$(mktemp)"
   matched="$(mktemp)"
-  { "$@" 2>&1 | grep -E "$filter" | tee "$matched"; BENCH_RC=${PIPESTATUS[0]}; } || true
+  if "$@" >"$output" 2>&1; then
+    BENCH_RC=0
+  else
+    BENCH_RC=$?
+  fi
+  grep -E "$filter" "$output" >"$matched" || true
   BENCH_LINES="$(wc -l < "$matched" | tr -d ' ')"
-  rm -f "$matched"
+  if [ "$BENCH_RC" -ne 0 ]; then
+    cat "$output" >&2
+  else
+    cat "$matched"
+  fi
+  rm -f "$output" "$matched"
 }
 
 # A partial A/B is not weaker evidence that nothing regressed, it is no
 # evidence: the target that failed is precisely the one nobody measured. Exit 2
 # (measurement broken) rather than 1 (confirmed regression) because the two ask
-# the reader for opposite responses. The reporter keeps its tolerant behavior.
+# the reader for opposite responses. Report-only changes regression handling,
+# not whether missing evidence is accepted as a measurement.
 require_measured() {
   local what="$1" rc="$2" lines="${3:-}"
-  if [ "$FAIL_ON_REGRESSION" != "1" ]; then
-    return 0
-  fi
   if [ "$rc" -ne 0 ]; then
     echo "bench-compare: $what failed (exit $rc) — refusing to certify a partial A/B." >&2
     exit 2
@@ -581,8 +560,8 @@ HEAD_CRITERION="$(criterion_version "$HEAD_DIR")"
 copy_base_artifacts() {
   local what="$1"; shift
   local rc=0
-  rsync "$@" 2>/dev/null || rc=$?
-  if [ "$rc" -ne 0 ] && [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  rsync "$@" || rc=$?
+  if [ "$rc" -ne 0 ]; then
     echo "bench-compare: $what failed (rsync exit $rc) — refusing to certify a partial A/B." >&2
     return 2
   fi
@@ -735,7 +714,7 @@ echo "  resolution: ${QUICK_FLAGS:---full}"
 echo "  targets: lattice-inference:$BENCHES_INFERENCE, lattice-embed:$BENCHES_EMBED"
 echo "  inference features: ${CARGO_FEATURES_INFERENCE:-<none>}"
 echo "  filters: inference='${BENCH_GROUPS_INFERENCE:-<all>}' embed='${BENCH_GROUPS_EMBED:-<all>}'"
-echo "  enforcement: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "--fail-on-regression (gate status propagated)" || echo "report-only (gate status printed, exit 0)")"
+echo "  enforcement: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "--fail-on-regression (regression status propagated)" || echo "report-only (regressions reported; measurement failures still refuse)")"
 echo "  arm order: ABBA (base₁ → head₁ → head₂ → base₂)"
 echo "  locks:"
 echo "$LOCK_SUMMARY"
@@ -825,9 +804,6 @@ run_target_gate \
   "$EMBED_CRITERION_ROOT" \
   "$BASE_CONTROL_EMBED_CRITERION_ROOT"
 
-echo ""
-echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
-
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;
   # exit 3 is a run whose ambient or order-bias evidence makes it unmeasurable.
@@ -842,3 +818,16 @@ if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   fi
   exit "$GATE_RC"
 fi
+
+echo ""
+echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
+)
+MEASUREMENT_RC=$?
+set -e
+
+if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
+  echo "bench-compare: final cooperative supervisor sample failed —" \
+       "refusing to certify it." >&2
+  exit 2
+fi
+exit "$MEASUREMENT_RC"

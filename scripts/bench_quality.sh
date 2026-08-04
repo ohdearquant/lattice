@@ -18,6 +18,9 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO/scripts/lib/bench-supervision.sh"
+
+bench_quality_measurement() {
 EVAL_BIN="$REPO/target/release/eval_perplexity"
 Q4_DIR="${Q4_DIR:-$HOME/.lattice/models/qwen3.5-0.8b-q4}"
 QUAROT_DIR="${QUAROT_DIR:-$HOME/.lattice/models/qwen3.5-0.8b-q4-quarot}"
@@ -30,6 +33,7 @@ WINDOW="${WINDOW:-512}"            # Buffer is window*vocab*4 = ~508MB at vocab=
 STRIDE="${STRIDE:-256}"            # 2x stride overlap → adequate context coverage
 SEED="${SEED:-0xC0FFEE}"           # QuaRot rotation seed (artifacts not interchangeable across seeds)
 SKIP_MLX="${SKIP_MLX:-0}"          # set 1 to skip the MLX cross-check (no mlx-lm / offline)
+MLX_LOG="${MLX_LOG:-/tmp/mlx_ppl.log}"
 
 mkdir -p "$OUT"
 
@@ -186,7 +190,7 @@ if [[ -z "$MLX_TMP" ]] || [[ ! -f "$MLX_TMP" ]]; then
   echo "  ERROR: failed to create the MLX output tempfile" >&2
   exit 1
 fi
-uv run --quiet --with mlx-lm python3 - "$TOK_DIR" "$CORPUS" "$WINDOW" "$STRIDE" "$MAX_TOKENS" > "$MLX_TMP" 2>/tmp/mlx_ppl.log <<'PY'
+uv run --quiet --with mlx-lm python3 - "$TOK_DIR" "$CORPUS" "$WINDOW" "$STRIDE" "$MAX_TOKENS" > "$MLX_TMP" 2>"$MLX_LOG" <<'PY'
 import sys, math
 mdir, corpus, window, stride, max_tokens = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
 import mlx.core as mx
@@ -229,7 +233,7 @@ ppl_at_bits(4, "q4")
 PY
 MLX_RC=$?
 if [[ "$MLX_RC" -ne 0 ]]; then
-  echo "  ERROR: MLX cross-check failed (exit $MLX_RC; see /tmp/mlx_ppl.log)" >&2
+  echo "  ERROR: MLX cross-check failed (exit $MLX_RC; see $MLX_LOG)" >&2
   exit 1
 fi
 for TIER in q8 q4; do
@@ -240,11 +244,11 @@ for TIER in q8 q4; do
       print row
     }
   ' "$MLX_TMP")"; then
-    echo "  ERROR: MLX cross-check did not produce exactly one $TIER row (see /tmp/mlx_ppl.log)" >&2
+    echo "  ERROR: MLX cross-check did not produce exactly one $TIER row (see $MLX_LOG)" >&2
     exit 1
   fi
   if [[ -z "$MLX_ROW" ]]; then
-    echo "  ERROR: MLX cross-check produced an empty $TIER row (see /tmp/mlx_ppl.log)" >&2
+    echo "  ERROR: MLX cross-check produced an empty $TIER row (see $MLX_LOG)" >&2
     exit 1
   fi
   append_lines "MLX/$TIER result" "$MLX_ROW"
@@ -292,3 +296,6 @@ DATA_TMP=""
 
 echo ""
 echo "Raw data: $DATA"
+}
+
+bench_supervise_entry "quality-perplexity" durable bench_quality_measurement "$@"
