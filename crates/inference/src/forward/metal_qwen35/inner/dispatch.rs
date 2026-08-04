@@ -1304,6 +1304,11 @@ impl MetalQwen35State {
              {candidate_capacity} — buffer-sizing invariant violated"
         );
 
+        #[cfg(test)]
+        if local_k == 50 {
+            LM_HEAD_BLOCK_K50_PATH_PROOF.fetch_add(1, Ordering::Relaxed);
+        }
+
         match self.engine.quant_format {
             QuantFormat::Q8_0 => {
                 enc.set_compute_pipeline_state(&self.engine.pipelines.lm_head_block_topk_f16[slot]);
@@ -1330,10 +1335,10 @@ impl MetalQwen35State {
 
     /// Stage 2: reduces the compact per-tile candidates Stage 1 already
     /// wrote into `topk_scratch_a` to the global result. Reuses the exact
-    /// same `argmax_merge` / `topk_merge_pass` kernels as the existing
-    /// `dispatch_topk_enc` seam below — the only difference is that the
-    /// input candidates come from Stage 1's fused GEMV instead of a
-    /// full-logits first pass over a materialized `[vocab_size]` buffer.
+    /// same `argmax_merge` / `topk_merge_pass` kernels that reduce compact
+    /// candidates elsewhere — the input here comes from Stage 1's fused
+    /// GEMV instead of a full-logits first pass over a materialized
+    /// `[vocab_size]` buffer.
     /// Appended to the same encoder; no second command-buffer round-trip.
     ///
     /// Returns 0 if the final `local_k` candidates are in
@@ -1382,97 +1387,6 @@ impl MetalQwen35State {
             current_groups = out_groups;
             which = 1 - which;
         }
-        which
-    }
-
-    // -----------------------------------------------------------------------
-    // GPU Top-K dispatch helpers
-    // -----------------------------------------------------------------------
-
-    /// Dispatch top-k kernels into `enc` (same command buffer as the logits GEMV).
-    ///
-    /// Runs first-pass + iterative merge passes.  All dispatches are in the
-    /// same encoder so the GPU executes them in order without extra synchronisation.
-    ///
-    /// Returns 0 if the final result is in `topk_scratch_a`, 1 for `topk_scratch_b`.
-    /// The caller reads from that buffer after `wait_until_completed()`.
-    pub(super) fn dispatch_topk_enc(
-        &self,
-        enc: &ComputeCommandEncoderRef,
-        vocab_size: u32,
-        k: u32,
-    ) -> u8 {
-        // compact_route must be set before dispatch; CpuFallback means compact_topk=0.
-        debug_assert!(
-            self.session.compact_route != GpuTopkRoute::CpuFallback,
-            "dispatch_topk_enc called with CpuFallback route"
-        );
-        if k == 1 {
-            // Dedicated argmax: two passes, no sorting.
-            let groups = vocab_size.div_ceil(1024);
-            enc.set_compute_pipeline_state(&self.engine.pipelines.argmax_first);
-            enc.set_buffer(0, Some(&self.session.activations.logits), 0);
-            enc.set_buffer(1, Some(&self.session.activations.topk_scratch_a), 0);
-            enc.set_bytes(2, 4, &vocab_size as *const u32 as *const _);
-            enc.dispatch_thread_groups(MTLSize::new(groups as u64, 1, 1), MTLSize::new(1024, 1, 1));
-
-            enc.set_compute_pipeline_state(&self.engine.pipelines.argmax_merge);
-            enc.set_buffer(0, Some(&self.session.activations.topk_scratch_a), 0);
-            enc.set_buffer(1, Some(&self.session.activations.topk_scratch_b), 0);
-            enc.set_bytes(2, 4, &groups as *const u32 as *const _);
-            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
-
-            return 1; // result in scratch_b[0]
-        }
-
-        // k > 1: hierarchical k=50 SIMD-group tournament (no bitonic sort).
-        debug_assert_eq!(k, 50, "only HierarchicalK50 route is supported for k>1");
-        debug_assert_eq!(self.session.compact_route, GpuTopkRoute::HierarchicalK50);
-
-        let tile = 1024u32;
-        let first_pass_groups = vocab_size.div_ceil(tile);
-
-        enc.set_compute_pipeline_state(&self.engine.pipelines.topk_select50_first);
-        enc.set_buffer(0, Some(&self.session.activations.logits), 0);
-        enc.set_buffer(1, Some(&self.session.activations.topk_scratch_a), 0);
-        enc.set_bytes(2, 4, &vocab_size as *const u32 as *const _);
-        enc.dispatch_thread_groups(
-            MTLSize::new(first_pass_groups as u64, 1, 1),
-            MTLSize::new(256, 1, 1),
-        );
-
-        let mut current_groups = first_pass_groups;
-        let mut which: u8 = 0;
-
-        while current_groups > 1 {
-            let fan_in: u32 = 16u32.min(current_groups);
-            let out_groups = current_groups.div_ceil(fan_in);
-
-            let (in_buf, out_buf) = if which == 0 {
-                (
-                    &self.session.activations.topk_scratch_a,
-                    &self.session.activations.topk_scratch_b,
-                )
-            } else {
-                (
-                    &self.session.activations.topk_scratch_b,
-                    &self.session.activations.topk_scratch_a,
-                )
-            };
-            enc.set_compute_pipeline_state(&self.engine.pipelines.topk_select50_merge);
-            enc.set_buffer(0, Some(in_buf), 0);
-            enc.set_buffer(1, Some(out_buf), 0);
-            enc.set_bytes(2, 4, &current_groups as *const u32 as *const _);
-            enc.set_bytes(3, 4, &fan_in as *const u32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(out_groups as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-
-            current_groups = out_groups;
-            which = 1 - which;
-        }
-
         which
     }
 }
