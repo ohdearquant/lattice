@@ -180,7 +180,14 @@ jobs:
               echo "::error::missing prebuilt binary: $binary"
               exit 1
             fi
-            (cd "npm/$suffix" && npm publish --dry-run)
+            # Registry-independent content check: a package version already
+            # published to npm makes `npm publish --dry-run` fail permanently
+            # (name@version tuples are immutable), which would turn this
+            # collector red forever after the first real release. `npm pack
+            # --dry-run` only inspects local tarball contents and never
+            # queries the registry; version-availability is checked later,
+            # in the actual release preflight (scripts/publish-npm.sh).
+            (cd "npm/$suffix" && npm pack --dry-run --json | node ../../scripts/assert-platform-packlist.mjs)
           done
 
       - name: Upload assembled platform packages
@@ -236,16 +243,11 @@ jobs:
         working-directory: npm/lattice-embed-native
         run: npm run test:prebuild
 
-      - name: Create platform packages
-        working-directory: npm/lattice-embed-native
-        run: npm run create-npm-dirs
-
-      - name: Download native bindings
+      - name: Download validated platform packages
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: native-*
-          path: npm/lattice-embed-native
-          merge-multiple: true
+          name: npm-native-prebuilds
+          path: npm/lattice-embed-native/npm
 
       - name: Cache native test models
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4

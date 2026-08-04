@@ -46,24 +46,34 @@ NATIVE_DIR="$ROOT/npm/lattice-embed-native"
 
 # Gather any locally built .node into npm/<platform>/ so the platform
 # subpackages have their binary. Cross-platform binaries come from the napi
-# build matrix in CI; a local run only produces the current platform.
+# build matrix in CI (npm-prebuild.yml's `publish` job downloads the
+# collector-validated `npm-native-prebuilds` artifact before this script
+# runs), so this is a no-op in that path and only fills in the current
+# platform for a local run.
 ( cd "$NATIVE_DIR" && npm run artifacts >/dev/null 2>&1 || true )
 
-# Discover the platform subpackages that actually carry a binary.
-PLATFORM_DIRS=""
-for pkgdir in "$NATIVE_DIR"/npm/*/; do
-    [ -d "$pkgdir" ] || continue
-    if ls "$pkgdir"*.node >/dev/null 2>&1; then
-        PLATFORM_DIRS="$PLATFORM_DIRS $pkgdir"
-    fi
-done
+# Require every platform advertised in the main package's
+# optionalDependencies to carry its native binary -- not any nonempty subset.
+# The real publish path only ever runs in CI against the full napi build
+# matrix; a partial local checkout must fail closed here rather than
+# silently release a package whose optionalDependencies point at platforms
+# nobody published this round.
+EXPECTED_PLATFORMS=$(node -p "Object.keys(require('$NATIVE_DIR/package.json').optionalDependencies).map(n => n.replace('@khive-ai/lattice-embed-', '')).join(' ')")
 
-if [ -z "$PLATFORM_DIRS" ]; then
-    echo "ERROR: no native platform binary found under $NATIVE_DIR/npm/*/." >&2
-    echo "Build the current platform first: (cd $NATIVE_DIR && npm run build)." >&2
-    echo "Cross-platform binaries are produced by the napi build matrix in CI." >&2
-    exit 1
-fi
+PLATFORM_DIRS=""
+for platform in $EXPECTED_PLATFORMS; do
+    pkgdir="$NATIVE_DIR/npm/$platform/"
+    if [ ! -d "$pkgdir" ] || ! ls "$pkgdir"*.node >/dev/null 2>&1; then
+        echo "ERROR: missing native binary for platform '$platform' under $pkgdir" >&2
+        echo "       the release must include every platform listed in" >&2
+        echo "       $NATIVE_DIR/package.json optionalDependencies, not a subset." >&2
+        echo "       Cross-platform binaries come from the napi build matrix in CI;" >&2
+        echo "       run this from npm-prebuild.yml's publish job, which downloads" >&2
+        echo "       the npm-native-prebuilds artifact first." >&2
+        exit 1
+    fi
+    PLATFORM_DIRS="$PLATFORM_DIRS $pkgdir"
+done
 
 # ---- Preflight: verify none of the packages we're about to publish already
 # exist on npm. name@version tuples are immutable, so a collision discovered
