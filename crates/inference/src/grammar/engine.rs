@@ -76,6 +76,11 @@ pub struct MaskProfile {
     /// Context-dependent token recheck loop (runs only on the precomputed-hit path).
     pub context_recheck_calls: u64,
     pub context_recheck_ns: u64,
+    /// Number of context-dependent candidates that actually reached
+    /// `simulate_token` inside the recheck loop (i.e. were not already
+    /// pre-blocked by the precomputed bitmask). Distinguishes "the recheck
+    /// loop ran" (`context_recheck_calls`) from "the recheck loop did work".
+    pub context_recheck_simulated: u64,
     /// `mask_by_simulation` fallback: `find_state_id` (miss) + full-vocab simulation.
     pub fallback_calls: u64,
     pub fallback_ns: u64,
@@ -92,6 +97,7 @@ impl MaskProfile {
             precomputed_ns: 0,
             context_recheck_calls: 0,
             context_recheck_ns: 0,
+            context_recheck_simulated: 0,
             fallback_calls: 0,
             fallback_ns: 0,
             advance_calls: 0,
@@ -423,6 +429,7 @@ impl GrammarEngine {
 
                 // Re-check context-dependent tokens at runtime.
                 let t1 = profiling.then(std::time::Instant::now);
+                let mut simulated = 0u64;
                 for &token_id in self.partition.context_dependent_ids() {
                     if token_id >= self.vocab_size {
                         continue;
@@ -438,6 +445,9 @@ impl GrammarEngine {
                         continue;
                     }
                     let (result, _) = simulate_token(state, &self.grammar, token_bytes);
+                    if profiling {
+                        simulated += 1;
+                    }
                     match result {
                         // Byte-level rejection, or partial consumption (the token
                         // straddles a grammar boundary and cannot be generated as a
@@ -455,6 +465,7 @@ impl GrammarEngine {
                         let mut p = p.borrow_mut();
                         p.context_recheck_calls += 1;
                         p.context_recheck_ns += ns;
+                        p.context_recheck_simulated += simulated;
                     });
                 }
             }

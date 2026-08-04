@@ -53,6 +53,16 @@ fn fixture() -> (GrammarEngine, GrammarState, usize) {
     assert_eq!(profile.precomputed_calls, 1);
     assert_eq!(profile.context_recheck_calls, 1);
     assert_eq!(profile.fallback_calls, 0);
+    // The context-dependent vocabulary is spread evenly across STATE_COUNT
+    // grammar states (each state's literal byte prefixes CONTEXT_TOKEN_COUNT
+    // / STATE_COUNT of the two-byte tokens), and only the group matching the
+    // queried state clears the precomputed bitmask to reach `simulate_token`.
+    // A precomputed-mask regression that pre-blocks (or never routes)
+    // candidates into the runtime recheck loop collapses this to 0 while
+    // `context_recheck_calls` above stays 1, since that counter only proves
+    // the loop *ran*, not that it did work.
+    let expected_simulated = (CONTEXT_TOKEN_COUNT / STATE_COUNT) as u64;
+    assert_eq!(profile.context_recheck_simulated, expected_simulated);
     assert_eq!(
         probe_logits
             .iter()
