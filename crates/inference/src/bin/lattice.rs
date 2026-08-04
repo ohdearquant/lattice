@@ -2933,8 +2933,14 @@ mod serve {
             // The explicit owner is not needed by this binary: every
             // production `MetalWorkerClient` retains an owner clone. The
             // clone held by `client` keeps the worker alive through the
-            // router's lifetime; dropping the last client closes the queue
-            // before the last owner performs its bounded join.
+            // router's lifetime; on a normal return, dropping the last
+            // client closes the queue before the last owner performs its
+            // bounded join. As with `lattice_serve.rs`, that guarantee does
+            // not reach this file's fatal `std::process::exit` calls (e.g.
+            // the server-error path a few lines below, after
+            // `serve_until_shutdown` returns `Err`): process exit never
+            // runs destructors, so any owner clone still alive at that
+            // point is dropped without performing the bounded join.
             drop(owner);
             Ok((
                 ModelBackend::Metal {
