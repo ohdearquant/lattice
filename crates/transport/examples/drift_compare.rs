@@ -21,18 +21,54 @@ fn load_dump(path: &str) -> HashMap<String, Vec<Vec<f32>>> {
 
 /// Cosine similarity between two equal-length f32 slices.
 ///
-/// Returns the dot product divided by the product of L2 norms.  Returns 1.0
-/// when both vectors are zero (identical degenerate case).
+/// Returns the dot product divided by the product of L2 norms. Returns 1.0
+/// only when BOTH vectors collapse (L2 norm below the noise floor or
+/// non-finite) — an identical degenerate case. Returns -1.0 (maximum "1 -
+/// cosine" drift) when exactly ONE side collapses, matching the fail-closed
+/// convention in `crates/embed/src/drift.rs`'s `cosine_f32`: a one-sided
+/// collapse (e.g. a broken forward pass zeroing out the current embedding
+/// while the baseline is non-degenerate) must read as maximal drift, not as
+/// an identity match.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "dimension mismatch in cosine");
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let denom = norm_a * norm_b;
-    if denom < 1e-12 {
-        1.0
-    } else {
-        (dot / denom).clamp(-1.0, 1.0)
+    let a_degenerate = !norm_a.is_finite() || norm_a < 1e-12;
+    let b_degenerate = !norm_b.is_finite() || norm_b < 1e-12;
+    match (a_degenerate, b_degenerate) {
+        (true, true) => 1.0,
+        (true, false) | (false, true) => -1.0,
+        (false, false) => (dot / (norm_a * norm_b)).clamp(-1.0, 1.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_zero_reads_as_identity() {
+        assert_eq!(cosine(&[0.0, 0.0], &[0.0, 0.0]), 1.0);
+    }
+
+    #[test]
+    fn one_sided_collapse_reads_as_maximal_drift_a_then_b() {
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), -1.0);
+    }
+
+    #[test]
+    fn one_sided_collapse_reads_as_maximal_drift_b_then_a() {
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 0.0]), -1.0);
+    }
+
+    #[test]
+    fn normal_pair_computes_true_cosine() {
+        let value = cosine(&[1.0, 0.0], &[1.0, 0.0]);
+        assert!((value - 1.0).abs() < 1e-6, "expected ~1.0, got {value}");
+
+        let value = cosine(&[1.0, 0.0], &[0.0, 1.0]);
+        assert!(value.abs() < 1e-6, "expected ~0.0, got {value}");
     }
 }
 
