@@ -194,6 +194,26 @@ Publish order follows the internal dependency DAG (deps before dependents): fann
 2. Update release notes file (rename if needed); add a "Note on v<broken>" section explaining the yank
 3. Tag + GH release + `make publish`
 4. `for c in lattice-inference lattice-fann lattice-transport lattice-embed lattice-tune; do cargo yank --version <broken> "$c"; done`
-5. Verify: `curl -s https://crates.io/api/v1/crates/<crate>` should show `latest_unyanked=<new>`, `yanked=[<broken>]`
+5. Verify against the registry. crates.io rejects API requests that do not identify the caller, returning HTTP 403 with a JSON error object rather than crate data, so the request needs a `User-Agent` and the check needs to distinguish an error object from an absent version — a bare `curl` fails in a way that reads like "this version was never published".
+
+   ```bash
+   UA="lattice-release-check (you@example.com)"   # any identifying string with contact info
+   for c in lattice-inference lattice-fann lattice-transport lattice-embed lattice-tune; do
+     curl -s -H "User-Agent: $UA" "https://crates.io/api/v1/crates/$c" | python3 -c "
+   import sys, json
+   d = json.load(sys.stdin)
+   if 'errors' in d:                      # 403 or other API refusal — NOT an answer
+       raise SystemExit('FAILED READ: ' + d['errors'][0].get('detail', ''))
+   yanked = [v['num'] for v in d['versions'] if v['yanked']]
+   print(d['crate']['name'], 'max_stable=' + d['crate']['max_stable_version'], 'yanked=' + str(yanked))
+   "
+   done
+   ```
+
+   Expect `max_stable=<new>` on every crate and `<broken>` present in `yanked`. The fields are
+   `max_stable_version` / `max_version` / `newest_version` on the crate object and a per-version
+   `yanked` boolean in the `versions` array; the crate object carries no `latest_unyanked`. Run the same
+   command against a crate you know is published (`serde`) whenever the result is empty or
+   uniform across all five, so a refused request cannot be mistaken for a missing release.
 
 Done in v0.2.3 (yanked broken 0.2.2 which shipped with the RoPE bug). New `cargo add` users get the fix; existing pinned users get a yank warning on next `cargo update`.
