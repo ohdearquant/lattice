@@ -79,10 +79,11 @@ name: perf post-merge detection (informational, PAUSED)
 # architecture and never pooled. aarch64 leans slower while x86_64 leans
 # faster, so a pooled figure is partly cancellation and overstates how
 # symmetric the distribution is. The conclusion survives either way; the
-# pooled version of it does not survive scrutiny. Separately, the CI-lower >
-# 7% FAIL population (220 rows, all positive by construction of the
-# one-sided rule) is the population the 5.6% FAIL rate above is stated over,
-# and is not the population this split is drawn from.
+# pooled version of it does not survive scrutiny. Separately, the 5.6% FAIL
+# rate is 220 CI-lower > 7% rows out of the 3948 x86_64-linux comparison
+# rows; that one-sided 220-row subset is the rate's numerator, not a
+# population, and is not the population the signed Delta-point split is
+# drawn from.
 #
 # Cost of leaving it on: roughly 88 minutes of wall clock per run, on each of two
 # runner jobs, for every qualifying merge, producing a verdict that cannot be
