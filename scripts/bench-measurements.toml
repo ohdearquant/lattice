@@ -42,6 +42,7 @@ paths = [
     "crates/inference/benches/elementwise_cpu_bench.rs",
     "crates/inference/benches/f16_convert_bench.rs",
     "crates/inference/benches/gated_attention_bench.rs",
+    "crates/inference/benches/grammar_mask_bench.rs",
     "crates/inference/benches/inference_bench.rs",
     "crates/inference/benches/inference_perf.rs",
     "crates/inference/benches/kv_cache_f16_bench.rs",

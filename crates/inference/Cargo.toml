@@ -325,6 +325,10 @@ name = "elementwise_cpu_bench"
 harness = false
 
 [[bench]]
+name = "grammar_mask_bench"
+harness = false
+
+[[bench]]
 name = "elementwise_bench"
 harness = false
 
