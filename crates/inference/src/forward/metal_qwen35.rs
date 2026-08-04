@@ -3641,43 +3641,22 @@ mod inner {
             module: &str,
         ) -> Result<(usize, usize), crate::error::InferenceError> {
             use crate::error::InferenceError;
-            let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
-            let is_full = cfg.is_full_attention(layer_idx);
 
-            match (module, is_full) {
-                // Full-attention projections
-                ("q_proj", true) => Ok((hidden, 2 * cfg.full_q_dim())),
-                ("k_proj", true) => Ok((hidden, cfg.full_kv_dim())),
-                ("v_proj", true) => Ok((hidden, cfg.full_kv_dim())),
-                ("o_proj", true) => Ok((cfg.full_q_dim(), hidden)),
-                // GDN projections
-                ("in_proj_qkv", false) => Ok((hidden, cfg.linear_qkv_dim())),
-                ("in_proj_z", false) => Ok((hidden, cfg.linear_output_dim())),
-                ("in_proj_b" | "in_proj_a", false) => Err(InferenceError::Inference(format!(
+            if matches!(module, "in_proj_b" | "in_proj_a") {
+                if cfg.is_full_attention(layer_idx) {
+                    return Err(InferenceError::Inference(format!(
+                        "unknown LoRA module '{module}'"
+                    )));
+                }
+                return Err(InferenceError::Inference(format!(
                     "module '{module}' is not yet supported in Metal forward (consumed inside \
                      fused GDN recurrence kernel); target other GDN modules instead"
-                ))),
-                ("out_proj", false) => Ok((cfg.linear_output_dim(), hidden)),
-                // MLP projections (shared across both layer types)
-                ("gate_proj", _) => Ok((hidden, inter)),
-                ("up_proj", _) => Ok((hidden, inter)),
-                ("down_proj", _) => Ok((inter, hidden)),
-                // Wrong layer-type combinations
-                ("q_proj" | "k_proj" | "v_proj" | "o_proj", false) => {
-                    Err(InferenceError::Inference(format!(
-                        "module '{module}' is a full-attention projection but layer {layer_idx} is GDN"
-                    )))
-                }
-                ("in_proj_qkv" | "in_proj_z" | "out_proj", true) => {
-                    Err(InferenceError::Inference(format!(
-                        "module '{module}' is a GDN projection but layer {layer_idx} is full-attention"
-                    )))
-                }
-                _ => Err(InferenceError::Inference(format!(
-                    "unknown LoRA module '{module}'"
-                ))),
+                )));
             }
+
+            let shape = crate::lora_hook::qwen35_projection_shape(cfg, layer_idx, module)
+                .map_err(InferenceError::Inference)?;
+            Ok((shape.d_in, shape.d_out))
         }
 
         /// Load a LoRA adapter onto the Metal GPU for inference.
@@ -21343,6 +21322,38 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 state.load_lora_adapter(layers, 1.0, None).is_err(),
                 "in_proj_b rejected via loader on full-attention layer too"
             );
+        }
+
+        #[test]
+        fn expected_lora_shape_preserves_metal_in_proj_capability_filter_without_device() {
+            use crate::model::qwen35_config::Qwen35Config;
+
+            let mut gdn_cfg = Qwen35Config::qwen35_0_8b();
+            gdn_cfg.num_hidden_layers = 1;
+            gdn_cfg.layer_types = vec![LayerType::LinearAttention];
+            gdn_cfg.layer_mask = vec![true];
+
+            for module in ["in_proj_b", "in_proj_a"] {
+                let err = MetalQwen35State::expected_lora_shape(&gdn_cfg, 0, module)
+                    .expect_err("Metal cannot apply alpha/beta LoRA inside the fused GDN kernel");
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "Inference error: module '{module}' is not yet supported in Metal forward \
+                         (consumed inside fused GDN recurrence kernel); target other GDN modules instead"
+                    )
+                );
+            }
+
+            let full_cfg = Qwen35Config::qwen35_0_8b();
+            for module in ["in_proj_b", "in_proj_a"] {
+                let err = MetalQwen35State::expected_lora_shape(&full_cfg, 3, module)
+                    .expect_err("alpha/beta modules remain invalid on full-attention layers");
+                assert_eq!(
+                    err.to_string(),
+                    format!("Inference error: unknown LoRA module '{module}'")
+                );
+            }
         }
 
         #[test]
