@@ -22,10 +22,19 @@
 # up measurement protection".
 set -euo pipefail
 
-DIR="${1:?usage: ensure-noindex-marker.sh <dir>}"
+if [ "$#" -lt 1 ] || [ -z "${1:-}" ]; then
+  echo "[noindex] FATAL: usage: ensure-noindex-marker.sh <dir>" >&2
+  exit 2
+fi
+DIR="$1"
 MARKER="$DIR/.metadata_never_index"
 
-mkdir -p "$DIR"
+if ! mkdir -p "$DIR" 2>/dev/null; then
+  echo "[noindex] FATAL: cannot create $DIR (unwritable parent, or a" >&2
+  echo "[noindex] non-directory already occupies that path). Refusing to" >&2
+  echo "[noindex] continue rather than measure unprotected." >&2
+  exit 2
+fi
 
 # A symlink (or any non-regular entry) here defeats the protection silently:
 # `test -e` is FALSE for a dangling link, so an existence check falls through to

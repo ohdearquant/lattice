@@ -210,6 +210,7 @@ jobs:
 
       - name: Classify the gate outcome
         if: always()
+        id: classify
         env:
           AB_RC: ${{ steps.ab.outputs.rc }}
           STATUS_DIR: ${{ runner.temp }}/perf-postmerge-status
@@ -244,10 +245,44 @@ jobs:
               f"verdict=not_measurable; {detail}"
           )
           PY
+            echo "effective_rc=3" >> "$GITHUB_OUTPUT"
             exit 3
           fi
-          if [ "$AB_RC" != "0" ]; then
-            exit "${AB_RC:-2}"
+          # AB_RC=1 alone is not sufficient evidence of a confirmed regression:
+          # it is bench-compare.sh's own contract-normalized status (see
+          # scripts/lib/ensure-noindex-marker.sh and bench-compare-impl.sh), but
+          # a caller running any of that chain under `set -e` propagates an
+          # UN-normalized exit 1 (e.g. a raw mkdir/coreutils failure) verbatim
+          # too. Require the gate's own machine-readable status artifact
+          # (perf-bench-gate.py --status-out) to say verdict=regression,
+          # exit_code=1 before trusting AB_RC=1 as a real regression verdict.
+          effective_rc="$AB_RC"
+          if [ "$AB_RC" = "1" ]; then
+            if python3 - "$STATUS_DIR" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          statuses = [
+              json.loads(path.read_text())
+              for path in pathlib.Path(sys.argv[1]).glob("*.json")
+          ]
+          confirmed = any(
+              item.get("verdict") == "regression" and item.get("exit_code") == 1
+              for item in statuses
+          )
+          sys.exit(0 if confirmed else 1)
+          PY
+            then
+              echo "::notice title=Confirmed regression::a gate status artifact records verdict=regression"
+            else
+              echo "::warning title=Unconfirmed exit 1::AB_RC=1 with no matching verdict=regression status artifact; treating as a generic pre-measurement failure (exit 2)"
+              effective_rc=2
+            fi
+          fi
+          echo "effective_rc=$effective_rc" >> "$GITHUB_OUTPUT"
+          if [ "$effective_rc" != "0" ]; then
+            exit "${effective_rc:-2}"
           fi
 
       - name: Record the outcome honestly
@@ -255,12 +290,13 @@ jobs:
         env:
           JOB_STATUS: ${{ job.status }}
           AB_RC: ${{ steps.ab.outputs.rc }}
+          EFFECTIVE_RC: ${{ steps.classify.outputs.effective_rc }}
           EVENT_NAME: ${{ github.event_name }}
           STATE_BRANCH: ${{ steps.refs.outputs.state_branch }}
           HEAD: ${{ steps.refs.outputs.head }}
         run: |
           {
-            if [ "$AB_RC" = "3" ]; then
+            if [ "$EFFECTIVE_RC" = "3" ]; then
               echo "GAP, exit 3 — verdict \`not_measurable\`. Measurement conditions"
               echo "invalidated this run, so it produced no performance data point"
               echo "and did not advance \`$STATE_BRANCH\`. See the warning and"
@@ -277,9 +313,16 @@ jobs:
               echo "The A/B passed, but its successful-head record was not published."
               echo "This run is not progression evidence; the next run will retry from"
               echo "the prior recorded base. Inspect the state-publication step."
+            elif [ "$EFFECTIVE_RC" = "1" ]; then
+              echo "FAILED, exit 1 — a confirmed regression: a gate status artifact"
+              echo "records \`verdict=regression\`. Check the flagged groups are"
+              echo "reachable from the merged diff, then revert or justify."
             elif [ "$AB_RC" = "1" ]; then
-              echo "FAILED, exit 1 — a confirmed regression. Check the flagged groups"
-              echo "are reachable from the merged diff, then revert or justify."
+              echo "FAILED, exit 2 — bench-compare.sh exited 1 but no gate status"
+              echo "artifact records \`verdict=regression\`, so this is NOT a"
+              echo "confirmed regression: treated as a generic pre-measurement"
+              echo "failure. Inspect the failing step above; do NOT revert on this"
+              echo "alone."
             elif [ "$AB_RC" = "2" ]; then
               echo "FAILED, exit 2 — the gate refused to certify this run: no"
               echo "comparison data, a partial A/B, or nothing gating among the"

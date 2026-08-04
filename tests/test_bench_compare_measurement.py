@@ -465,6 +465,34 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertIn("[noindex] FATAL", result.stderr)
         self.assertNotIn("gate reported a confirmed regression", result.stderr)
 
+    def test_cache_mkdir_failure_is_not_a_confirmed_regression(self):
+        """The entry point's own `mkdir -p "$REPO/.cache"` must not leak raw exit 1.
+
+        scripts/bench-compare.sh runs this mkdir under `set -e` before it ever
+        execs bench-locks.py -- before any lock is taken, any worktree exists,
+        or any benchmark runs. If it ever regresses to a bare `mkdir -p`, a
+        regular file occupying `.cache` makes mkdir fail with an unnormalized
+        exit 1, and perf-postmerge-gate.yml would report it as a confirmed
+        regression with revert advice for a run that never measured anything.
+
+        Mutation-sensitive: revert the guard's normalization (exit 2 -> the
+        bare `mkdir -p "$REPO/.cache"`) in scripts/bench-compare.sh and this
+        run's exit code flips from 2 to 1, exactly the collision this test
+        exists to catch.
+        """
+        def occupy_cache(root):
+            (root / ".cache").write_text("occupied")
+
+        result = _run(["--fail-on-regression"], setup=occupy_cache)
+        self.assertEqual(
+            result.returncode, 2,
+            "a pre-measurement instrumentation failure must exit 2 (input/"
+            "instrumentation error), never 1 (confirmed regression); got "
+            f"{result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+        self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
     def test_enforcing_mode_refuses_a_run_that_measured_nothing(self):
         """A bench that exits 0 having printed no measurement must not certify.
 

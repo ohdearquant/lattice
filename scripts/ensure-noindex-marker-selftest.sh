@@ -128,7 +128,27 @@ else
   chmod u+w "$D"
 fi
 
-# 9. CALL-SITE ASSERTIONS. Testing the helper in isolation would still pass if
+# 9. NO ARGUMENT. The required-positional-argument expansion must not leak a
+#    raw exit 1 (the same code the gate reserves for a confirmed regression).
+OUT="$(bash "$SRC" 2>&1)"; rc=$?
+check "no argument fails closed" 2 "$rc"
+case "$OUT" in
+  *FATAL*) echo "  PASS:   -> diagnostic names the failure"; pass=$((pass+1)) ;;
+  *) echo "  FAIL:   -> no FATAL diagnostic in output"; fail=$((fail+1)) ;;
+esac
+
+# 10. UNWRITABLE PARENT (mkdir -p failure). A regular file occupying the
+#     target path makes `mkdir -p` fail with its own raw exit 1; that must be
+#     normalized too, not just the marker-creation failures below it.
+F="$SB/occupied-by-file"; : > "$F"
+OUT="$(bash "$SRC" "$F/sub" 2>&1)"; rc=$?
+check "mkdir -p failure (path occupied by a file) fails closed" 2 "$rc"
+case "$OUT" in
+  *FATAL*) echo "  PASS:   -> diagnostic names the failure"; pass=$((pass+1)) ;;
+  *) echo "  FAIL:   -> no FATAL diagnostic in output"; fail=$((fail+1)) ;;
+esac
+
+# 11. CALL-SITE ASSERTIONS. Testing the helper in isolation would still pass if
 #    a measurement body stopped calling it, so pin the exact protected trees.
 cache_call="\"\$REPO/scripts/lib/ensure-noindex-marker.sh\" \"\$REPO/.cache\""
 target_call="\"\$REPO/scripts/lib/ensure-noindex-marker.sh\" \"\$REPO/target\""
@@ -151,7 +171,7 @@ else
   echo "  FAIL: slopefit no longer protects its in-place target"; fail=$((fail+1))
 fi
 
-# 10. Each marker must exist before the operation that creates or builds the
+# 12. Each marker must exist before the operation that creates or builds the
 #     protected resource. These ordering checks fail if a call drifts too late.
 cache_guard_ln=$(grep -nF "$cache_call" "$COMPARE_CALLER" | head -1 | cut -d: -f1)
 wt_ln=$(grep -n 'worktree add' "$COMPARE_CALLER" | head -1 | cut -d: -f1)

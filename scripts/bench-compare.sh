@@ -25,7 +25,12 @@
 # establish.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-mkdir -p "$REPO/.cache"
+if ! mkdir -p "$REPO/.cache" 2>/dev/null; then
+  echo "bench-compare: FATAL: cannot create $REPO/.cache (unwritable parent," >&2
+  echo "or a non-directory already occupies that path). Refusing to continue" >&2
+  echo "rather than run the A/B without its lock-status directory." >&2
+  exit 2
+fi
 exec python3 "$REPO/scripts/lib/bench-locks.py" \
   --label "bench-compare" \
   --status-file "$REPO/.cache/bench-locks-status.txt" \
