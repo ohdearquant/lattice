@@ -733,10 +733,24 @@ def _require_within_root(path: Path, root_resolved: Path, description: str) -> P
 
 
 def clear_selected_baseline_artifacts(root: Path, baseline_name: str) -> int:
-    """Validate, then remove exact baseline dirs before copying a fresh base set."""
+    """Validate, then remove exact baseline dirs before copying a fresh base set.
+
+    A pruned baseline dir drops its bench out of the selected set, so any
+    `new/`/`change/` siblings left behind become unreachable debris that the
+    head-side inventory later rglobs up as a phantom, unbaselined head
+    measurement. Remove those siblings here, atomically with the baseline dir,
+    since this is the only prune step that runs before the fresh base copy.
+    Siblings are validated like the baseline dir itself (real dir, no
+    symlinks, resolves under root) but excluded from the returned count, which
+    stays the exact-baseline-dir total callers already print. Only baseline
+    dirs found by find_selected_baseline_files enter the plan, so an unrelated
+    target's Criterion data sharing this root is never touched.
+    """
     root_resolved = _checked_criterion_root(root)
+    baseline_parts = _baseline_parts(baseline_name)
     baseline_files = find_selected_baseline_files(root, baseline_name)
     deletion_plan: set[Path] = set()
+    sibling_plan: set[Path] = set()
 
     for baseline_file in baseline_files:
         if baseline_file.is_symlink() or not baseline_file.is_file():
@@ -754,8 +768,23 @@ def clear_selected_baseline_artifacts(root: Path, baseline_name: str) -> int:
         )
         deletion_plan.add(baseline_dir)
 
-    for baseline_dir in sorted(deletion_plan):
-        shutil.rmtree(baseline_dir)
+        bench_dir = baseline_file.parents[len(baseline_parts)]
+        _require_within_root(bench_dir, root_resolved, "selected baseline benchmark")
+        for artifact_name in ("new", "change"):
+            artifact_dir = bench_dir / artifact_name
+            if artifact_dir.is_symlink():
+                raise ValueError(f"refusing to remove symlinked Criterion artifact: {artifact_dir}")
+            if not artifact_dir.exists():
+                continue
+            if not artifact_dir.is_dir():
+                raise ValueError(
+                    f"Criterion artifact is not a directory: {artifact_dir}"
+                )
+            _require_within_root(artifact_dir, root_resolved, "Criterion artifact")
+            sibling_plan.add(artifact_dir)
+
+    for path in sorted(deletion_plan | sibling_plan):
+        shutil.rmtree(path)
 
     return len(deletion_plan)
 
@@ -1831,10 +1860,10 @@ def run_selftest() -> int:
             failures.append(
                 "baseline-copy freshness: stale exact selected baseline survived"
             )
-        if not (stale_selected / "change" / "estimates.json").exists():
+        if (stale_selected / "new").exists() or (stale_selected / "change").exists():
             failures.append(
-                "baseline-copy freshness: comparison output was removed before "
-                "the fresh selected set existed"
+                "baseline-copy freshness: stale new/change siblings of a pruned "
+                "selected baseline survived to false-fail head coverage"
             )
         if not (preserved_other / "previous-run" / "estimates.json").exists():
             failures.append(

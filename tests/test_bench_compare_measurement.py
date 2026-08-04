@@ -14,6 +14,7 @@ disposable git repo, copies the shipping script and its lib/ into it, and puts a
 stub `cargo` on PATH that exits 0 and prints no measurement lines — exactly the
 shape that used to pass.
 """
+import importlib.util
 import os
 import re
 import shutil
@@ -27,6 +28,12 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
 LIB = REPO / "scripts" / "lib"
+
+_GATE_SPEC = importlib.util.spec_from_file_location("perf_bench_gate", GATE)
+assert _GATE_SPEC is not None and _GATE_SPEC.loader is not None
+gate = importlib.util.module_from_spec(_GATE_SPEC)
+sys.modules[_GATE_SPEC.name] = gate
+_GATE_SPEC.loader.exec_module(gate)
 
 # Exits 0 for every subcommand and prints nothing a measurement filter matches.
 STUB_CARGO = """#!/usr/bin/env bash
@@ -222,6 +229,7 @@ def _run(
     extra_env=None,
     emit_criterion_home=False,
     stub_machine_state=None,
+    post_run=None,
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -322,9 +330,54 @@ def _run(
             **(extra_env or {}),
             "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
-        return subprocess.run(
+        result = subprocess.run(
             ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, "HEAD~1", "HEAD"],
             capture_output=True, text=True, env=env, timeout=300)
+        if post_run is not None:
+            post_run(root)
+        return result
+
+
+class ClearSelectedBaselineArtifactsSiblingPrune(unittest.TestCase):
+    """Isolated repro for the round-4 fix: clear_selected_baseline_artifacts
+
+    must remove a pruned baseline dir's new/change siblings, and must not
+    touch a differently-named baseline tree sharing the same criterion root.
+    """
+
+    def _make_root(self, tmp):
+        root = Path(tmp) / "criterion"
+        pruned = root / "old_group" / "42"
+        (pruned / "compare-base").mkdir(parents=True)
+        (pruned / "new").mkdir()
+        (pruned / "change").mkdir()
+        (pruned / "compare-base" / "estimates.json").write_text(
+            '{"mean":{"point_estimate":90.0}}\n'
+        )
+        (pruned / "new" / "estimates.json").write_text(
+            '{"mean":{"point_estimate":100.0}}\n'
+        )
+        (pruned / "change" / "estimates.json").write_text(
+            '{"mean":{"point_estimate":0.01,'
+            '"confidence_interval":{"lower_bound":0.0,"upper_bound":0.02}}}\n'
+        )
+
+        unrelated = root / "other_group" / "7" / "manual-snapshot"
+        unrelated.mkdir(parents=True)
+        (unrelated / "estimates.json").write_text('{"mean":{"point_estimate":50.0}}\n')
+        return root, pruned, unrelated
+
+    def test_removes_pruned_siblings_and_spares_unrelated_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, pruned, unrelated = self._make_root(tmp)
+
+            removed = gate.clear_selected_baseline_artifacts(root, "compare-base")
+
+            self.assertEqual(removed, 1)
+            self.assertFalse((pruned / "compare-base").exists())
+            self.assertFalse((pruned / "new").exists())
+            self.assertFalse((pruned / "change").exists())
+            self.assertTrue((unrelated / "estimates.json").exists())
 
 
 class BenchCompareMeasurementGuard(unittest.TestCase):
@@ -548,12 +601,26 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         stale compare-base artifact remains selected. The later head cleanup
         removes its old comparison, so completeness false-fails old_group/42
         even though every benchmark in today's fresh base set ran on HEAD.
+
+        The pruned baseline dir's `new/`/`change/` siblings must go with it
+        (mutation-sensitive on their own: leaving them behind resurrects
+        old_group/42 as a phantom unbaselined head measurement via the
+        root-wide new/estimates.json inventory — see
+        ClearSelectedBaselineArtifactsSiblingPrune for the isolated repro).
+        A second, differently-named baseline snapshot sharing the same
+        Criterion root must survive untouched, proving the prune did not
+        widen past the exact selected baseline.
         """
+        old_group_dir = None
+        unrelated_dir = None
+
         def seed_unrelated_run(root):
+            nonlocal old_group_dir, unrelated_dir
             bench = (
                 root / ".cache" / "bench-compare-criterion" / "head" /
                 "inference" / "criterion" / "old_group" / "42"
             )
+            old_group_dir = bench
             (bench / "compare-base").mkdir(parents=True)
             (bench / "new").mkdir()
             (bench / "change").mkdir()
@@ -568,10 +635,35 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                 '"confidence_interval":{"lower_bound":0.0,"upper_bound":0.02}}}\n'
             )
 
+            # A different target's persistent, differently-named baseline
+            # snapshot in the same criterion root. It has no new/change, so
+            # it cannot trip the head-ids coverage check either way; it is
+            # here purely to prove clear_selected_baseline_artifacts does not
+            # widen its deletion past the exact selected baseline name.
+            other = (
+                root / ".cache" / "bench-compare-criterion" / "head" /
+                "inference" / "criterion" / "other_group" / "7"
+            )
+            unrelated_dir = other / "manual-snapshot"
+            unrelated_dir.mkdir(parents=True)
+            (unrelated_dir / "estimates.json").write_text(
+                '{"mean":{"point_estimate":50.0}}\n'
+            )
+
+        snapshot = {}
+
+        def capture(root):
+            snapshot["old_group_new_exists"] = old_group_dir and (old_group_dir / "new").exists()
+            snapshot["old_group_change_exists"] = old_group_dir and (old_group_dir / "change").exists()
+            snapshot["unrelated_exists"] = (
+                unrelated_dir and (unrelated_dir / "estimates.json").exists()
+            )
+
         result = _run(
             ["--fail-on-regression"],
             stub_cargo=STALE_CHANGE_CARGO,
             setup=seed_unrelated_run,
+            post_run=capture,
         )
         self.assertEqual(
             result.returncode, 0,
@@ -583,6 +675,18 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             result.stdout,
         )
         self.assertNotIn("old_group/42", result.stdout)
+        self.assertFalse(
+            snapshot["old_group_new_exists"],
+            "stale old_group/42/new must be pruned along with its baseline dir",
+        )
+        self.assertFalse(
+            snapshot["old_group_change_exists"],
+            "stale old_group/42/change must be pruned along with its baseline dir",
+        )
+        self.assertTrue(
+            snapshot["unrelated_exists"],
+            "an unrelated target's differently-named baseline snapshot must survive the prune",
+        )
 
     def test_enforcing_mode_refuses_a_partial_baseline_copy(self):
         """A failed partial copy must not shrink the selected set and certify.
