@@ -104,6 +104,7 @@ extension View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("OpaquePanel") {
     VStack(spacing: Theme.Space.md) {
         OpaquePanel {
@@ -133,3 +134,4 @@ extension View {
     .frame(width: 360)
     .padding(Theme.Space.lg)
 }
+#endif

@@ -77,9 +77,19 @@ cargo publish -p lattice-tune
 ```
 
 ```sh
-# 7. GitHub release
-gh release create v{VERSION} --title "v{VERSION}" --notes-file docs/releases/v{VERSION}.md
+# 7. Create the tagged GitHub release as a draft
+gh release create v{VERSION} --draft --title "v{VERSION}" --notes-file docs/releases/v{VERSION}.md
+
+# 8. Dispatch the asset workflow from main; it verifies, uploads, and publishes the draft
+gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f tag=v{VERSION}
 ```
+
+Do not publish the draft manually while the asset workflow is running. Its draft-state checks are
+separate API reads, not a lock against another actor publishing concurrently.
+Publication during upload can leave the remote asset set partly or fully replaced before the
+workflow notices and stops. The release can be published after the final state read and before the
+workflow's publish edit. After a state-change or asset-verification failure, inspect the release
+state and every remote asset before retrying.
 
 ## Post-release
 
@@ -103,14 +113,15 @@ working version to resolve to. The required order is: ship the fix, then yank th
 # 2. Update the release notes file (rename if needed); add a
 #    "Note on v<broken>" section explaining the bug and the yank.
 
-# 3. Run the normal release gates and publish the replacement:
+# 3. Run the normal release gates and publish the replacement under a new tag and version:
 git tag -a v{NEW_VERSION} -m "v{NEW_VERSION}"
 git push origin v{NEW_VERSION}
 make publish
-gh release create v{NEW_VERSION} --title "v{NEW_VERSION}" --notes-file docs/releases/v{NEW_VERSION}.md
+gh release create v{NEW_VERSION} --draft --title "v{NEW_VERSION}" --notes-file docs/releases/v{NEW_VERSION}.md
+gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f tag=v{NEW_VERSION}
 
-# 4. Only after the replacement is live on crates.io, yank the broken version
-#    from every published crate:
+# 4. Only after the replacement is live on crates.io and its GitHub asset workflow succeeds,
+#    yank the broken version from every published crate:
 for c in lattice-fann lattice-transport lattice-inference lattice-embed lattice-tune; do
   cargo yank --version {BROKEN_VERSION} "$c"
 done
@@ -119,6 +130,9 @@ done
 curl -s https://crates.io/api/v1/crates/{CRATE}
 # should show latest_unyanked={NEW_VERSION} and yanked versions including {BROKEN_VERSION}
 ```
+
+A published GitHub release is not repaired in place by this workflow. Corrections always use the
+new version, new tag, and new draft sequence above.
 
 This is the same sequence used for the v0.2.3 release, which yanked the broken v0.2.2 (shipped
 with a RoPE bug): new `cargo add` users got the fix directly, and existing users pinned to v0.2.2

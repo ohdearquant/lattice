@@ -26,6 +26,7 @@ fn main() {
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
+        let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
         if let Err(err) = run() {
             eprintln!("[bench_concurrent] ERROR: {err}");
             std::process::exit(1);
