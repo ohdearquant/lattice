@@ -19,7 +19,10 @@ Compare current lattice embeddings with frozen release baselines.
 
 options:
   --model <NAME>      Model to check. Repeat for multiple models.
-                      With no --model, checks every model with a baseline fixture.
+                      With no --model, checks the fixed production quartet
+                      (bge-small-en-v1.5, multilingual-e5-small, all-minilm-l6-v2,
+                      paraphrase-multilingual-minilm-l12-v2); a missing fixture
+                      for one of them is a NoBaseline failure, not silent skip.
   --json              Emit one @@lattice {\"ev\":\"drift_done\",...} line to stdout.
   --enforce           Fail when a requested model's weights are absent.
                       LATTICE_DRIFT_GATE_ENFORCE=1 has the same effect.
@@ -33,6 +36,20 @@ exit codes:
   2  enforced skip: at least one model's weights were absent while enforcing
   3  usage, fixture, model-loading, or IO error
 ";
+
+    /// The production embedding models this gate always covers when no
+    /// `--model` is given. This is the single source of truth for "the
+    /// quartet": every enforced workflow invocation omits `--model` and
+    /// relies on this list rather than on which fixture files happen to be
+    /// present on disk, so deleting a fixture can no longer silently shrink
+    /// coverage — it turns into a `NoBaseline` failure for the now-unmatched
+    /// model instead.
+    const REQUIRED_MODELS: [EmbeddingModel; 4] = [
+        EmbeddingModel::BgeSmallEnV15,
+        EmbeddingModel::MultilingualE5Small,
+        EmbeddingModel::AllMiniLmL6V2,
+        EmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+    ];
 
     struct Options {
         models: Vec<EmbeddingModel>,
@@ -106,6 +123,9 @@ exit codes:
     }
 
     fn baseline_dir() -> PathBuf {
+        if let Some(dir) = std::env::var_os("LATTICE_DRIFT_BASELINE_DIR") {
+            return PathBuf::from(dir);
+        }
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
@@ -144,19 +164,18 @@ exit codes:
         if !options.models.is_empty() {
             return Ok(options.models.clone());
         }
-        if fixtures.is_empty() {
-            return Err("baseline directory contains no JSON fixtures".to_string());
-        }
-
-        let mut models = Vec::with_capacity(fixtures.len());
+        // Validate fixture uniqueness eagerly so a duplicated fixture file
+        // still fails loudly even though the requested set no longer comes
+        // from directory discovery.
+        let mut seen = Vec::with_capacity(fixtures.len());
         for fixture in fixtures {
             let model = fixture_model(fixture)?;
-            if models.contains(&model) {
+            if seen.contains(&model) {
                 return Err(format!("multiple baseline fixtures select model {model}"));
             }
-            models.push(model);
+            seen.push(model);
         }
-        Ok(models)
+        Ok(REQUIRED_MODELS.to_vec())
     }
 
     async fn run_checks(
