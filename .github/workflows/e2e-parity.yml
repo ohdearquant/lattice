@@ -78,6 +78,7 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] || [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
@@ -86,7 +87,34 @@ jobs:
             echo "→ $GITHUB_EVENT_NAME trigger: full parity suite REQUIRED"
             exit 0
           fi
-          CHANGED=$(./scripts/ci-changed-files.sh)
+          if [[ ! "$CI_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base revision must be a nonempty 40-character hexadecimal commit ID" >&2
+            exit 2
+          fi
+          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "engine=true" >> "$GITHUB_OUTPUT"
+            echo "tune=true" >> "$GITHUB_OUTPUT"
+            echo "→ all-zero base revision: full parity suite REQUIRED"
+            exit 0
+          fi
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
           echo "Changed files:"
           echo "$CHANGED"
           # Markdown is stripped BEFORE classification, and the reason is that
@@ -133,14 +161,14 @@ jobs:
           # still triggers wasm-parity. Without them, engine stays false and the
           # required parity-gate could pass green without the wasm path ever
           # running, a fail-open on the gate itself.
-          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/inference/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/(inference|embed)/src/|^crates/(inference|embed)/Cargo\.toml$|^Cargo\.lock$|^scripts/(ci-changed-files\.sh|e2e_parity_check\.py)$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/|^\.github/actions/rust-setup/|^crates/inference/tests/fixtures/e2e_parity_reference_v1/|^tests/test_e2e_parity_reference\.py$|^crates/inference/tests/quarot_q4_composed_golden\.rs$|^crates/inference/tests/fixtures/quarot_q4_composed_v1/|^scripts/gen_quarot_q4_composed_golden\.py$|^scripts/wasm-parity\.sh$|^scripts/wasm-simd128-parity\.sh$|^crates/embed/tests/wasm/|^crates/embed/tests/fixtures/embed_parity_v1/|^crates/embed/examples/dump_parity_embeddings\.rs$|^scripts/ppl_gate_check\.py$|^scripts/ppl_gate_check_selftest\.sh$|^crates/inference/tests/fixtures/ppl_gate_v1/|^crates/inference/src/bin/eval_perplexity\.rs$|^crates/inference/src/bin/quantize_q4\.rs$|^docs/bench_results/wiki\.test\.raw$|^crates/inference/tests/vision_s3_vit_forward_test\.rs$|^crates/inference/tests/vision_s4_merger_test\.rs$|^crates/inference/tests/vision_s5b_e2e_gate_test\.rs$|^crates/inference/tests/vision_serve_e2e_test\.rs$|^tests/fixtures/vision/|^scripts/vision_goldens_qwen35\.py$|^crates/embed/tests/embed_drift_baseline\.rs$|^crates/embed/tests/fixtures/embed_drift_baseline_v1/' <<<"$CHANGED" >/dev/null; then
             echo "engine=true" >> "$GITHUB_OUTPUT"
             echo "→ engine surface changed: parity REQUIRED"
           else
             echo "engine=false" >> "$GITHUB_OUTPUT"
             echo "→ no engine change: parity not required"
           fi
-          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
+          if grep -E '^crates/tune/(src|tests)/|^crates/tune/Cargo\.toml$|^Cargo\.lock$|^scripts/ci-changed-files\.sh$|^\.github/workflows/e2e-parity\.yml$|^\.github/actions/provision-qwen35-0-8b/' <<<"$CHANGED" >/dev/null; then
             echo "tune=true" >> "$GITHUB_OUTPUT"
             echo "→ tune training surface changed: layer-23 golden REQUIRED"
           else
@@ -274,8 +302,9 @@ jobs:
       # produced the current passing parity baseline (extracted from a green
       # `e2e parity` run). An unpinned `pip install` lets a new transformers
       # release silently change greedy-generation behavior and flip the parity
-      # verdict on borderline prompts (issue #236). To bump: change a pin, let
-      # this gate re-run, and re-baseline the committed goldens if it moves.
+      # verdict on borderline prompts (issue #236). Dependency and model bumps
+      # follow docs/e2e-parity-frozen-reference.md, including reviewed fixture
+      # regeneration and matching workflow-pin updates.
       - name: Install Python deps
         run: pip install "torch==2.12.1" "transformers==5.12.1" "tokenizers==0.22.2" "huggingface_hub==1.20.1"
 
@@ -313,6 +342,9 @@ jobs:
       # Step 6: post results as PR comment
       - name: Post parity report
         if: github.event_name == 'pull_request' && always()
+        # The API call's failed outcome and log remain visible, but reporting
+        # does not vote on the verification command's job verdict.
+        continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         with:
           header: e2e-parity
@@ -430,6 +462,9 @@ jobs:
 
       - name: Post Metal parity report
         if: github.event_name == 'pull_request' && always()
+        # The API call's failed outcome and log remain visible, but reporting
+        # does not vote on the verification command's job verdict.
+        continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         with:
           header: e2e-metal-parity
@@ -495,6 +530,58 @@ jobs:
         run: |
           cargo test --release -p lattice-embed --test embed_drift_baseline \
             -- --nocapture
+
+  # x86_64 counterpart to embed-drift. This starts as an observation job rather
+  # than a required parity-gate dependency: the frozen threshold has live
+  # evidence on aarch64, but no measured x86_64 distribution yet. Keeping this
+  # job outside parity-gate and allowing it to fail makes that policy explicit:
+  # missing prerequisites and numerical regressions remain visible without
+  # turning an observation into a required gate.
+  embed-drift-x86:
+    name: embed drift gate (x86_64 observation)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assert x86_64 runner
+        run: test "$(uname -m)" = 'x86_64'
+
+      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: embed-drift-x86
+
+      - name: Cache BGE-small weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/bge-small-en-v1.5
+          key: bge-small-en-v1.5-v1
+
+      - name: Provision bge-small-en-v1.5 weights
+        run: |
+          cargo run --release -p lattice-embed --bin embed \
+            -- --model bge-small-en-v1.5 --download-only
+
+      - name: Run x86_64 embedding-drift observation (fail-closed)
+        env:
+          LATTICE_DRIFT_GATE_ENFORCE: '1'
+        run: |
+          if cargo test --release -p lattice-embed --test embed_drift_baseline \
+            -- --nocapture > embed-drift-x86.log 2>&1
+          then
+            cat embed-drift-x86.log
+          else
+            status=$?
+            cat embed-drift-x86.log
+            exit "$status"
+          fi
+          grep -Fq 'Loaded drift baseline:' embed-drift-x86.log
+          grep -Fq '[bge-small drift gate] max(1-cosine)=' embed-drift-x86.log
 
   # wasm embedding parity gate (PR #681). Proves the wasm32-compiled
   # `LatticeEmbedder` binding (crates/embed/src/wasm.rs) produces output that
@@ -997,15 +1084,18 @@ jobs:
       # job's `--lib q4` filter does not match their names). This step reuses
       # this job's already-downloaded checkpoint (no second ~2 min
       # checkout+download job) and its macos-latest runner, which exposes a
-      # PARAVIRTUAL Metal device — sufficient here because none of these four
+      # PARAVIRTUAL Metal device — sufficient here because none of these five
       # tests touch the Apple7-gated tiled-GEMM path (decode-only GEMV/element-wise
       # dispatch), the same reasoning the f16-KV-cache Metal gate in ci.yml
       # documents. LATTICE_METAL_TEST_ENFORCE=1 makes a missing device or
-      # checkpoint a hard failure instead of the default dev-run skip; the
-      # `--lib inject` filter also matches two unrelated pre-existing tests
-      # (a QuaRot seed round-trip test and the CPU f16 injection oracle), so
-      # the exact-count grep below is 7, not 5 -- update it in the same PR
-      # if the `inject`-matching test surface changes.
+      # checkpoint a hard failure instead of the default dev-run skip. The
+      # `--lib inject` filter also matches `inject_quarot_seed_roundtrips_in_config_json`
+      # (QuaRot seed round trip), `injection_replaces_lookup_and_is_mutation_sensitive`
+      # (CPU f16 injection oracle), and
+      # `shared_server_runner_drops_router_after_injected_shutdown` (serve-shutdown
+      # regression matching only incidentally on the `injected` substring), so
+      # the exact-count grep below is 8, not 5 -- update it in the same PR if the
+      # `inject`-matching test surface changes.
       - name: Run MP2 Metal injection gate (fail-closed)
         if: ${{ !cancelled() }}
         env:
@@ -1020,7 +1110,7 @@ jobs:
             cat vision-mp2-inject-gate.log
             exit "$status"
           fi
-          grep -Eq '^test result: ok\. 7 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
 
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
@@ -1067,6 +1157,9 @@ jobs:
 
       - name: Post PPL gate report
         if: github.event_name == 'pull_request' && always()
+        # The API call's failed outcome and log remain visible, but reporting
+        # does not vote on the verification command's job verdict.
+        continue-on-error: true
         uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
         with:
           header: q4-ppl-gate
@@ -1176,6 +1269,14 @@ jobs:
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
           fi
+          if [ "$ENGINE" != "true" ] && [ "$ENGINE" != "false" ]; then
+            echo "::error::engine selector output is missing or invalid (value=$ENGINE)."
+            exit 1
+          fi
+          if [ "$TUNE" != "true" ] && [ "$TUNE" != "false" ]; then
+            echo "::error::tune selector output is missing or invalid (value=$TUNE)."
+            exit 1
+          fi
           # Drafts skip the resource-intensive parity jobs to keep hosted runner
           # capacity available to PRs that are ready to merge. Those skips reach
           # the arm checks below as result=skipped, which is correctly not "success",
@@ -1190,7 +1291,7 @@ jobs:
             echo "::error::Tune training surface changed and the layer-23 golden bridge did not succeed (result=$LAYER23_RESULT)."
             exit 1
           fi
-          if [ "$ENGINE" != "true" ]; then
+          if [ "$ENGINE" = "false" ]; then
             echo "No engine change — parity not required. PASS."
             exit 0
           fi

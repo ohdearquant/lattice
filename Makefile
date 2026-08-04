@@ -1,4 +1,7 @@
-.PHONY: check clippy test test-timing fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
+.PHONY: setup check clippy test test-timing fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
+
+setup:
+	rustup component add rustfmt clippy
 
 check:
 	cargo check --workspace
@@ -51,32 +54,19 @@ publish-npm:
 
 # ADR-058: run the same CPU benches CI does, save as new baseline.
 bench-ci:
-	cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --save-baseline local --noplot
-	cargo bench -p lattice-embed --bench simd -- --save-baseline local --noplot
+	./scripts/bench-ci.sh
 
 # ADR-058: compare current CPU bench results against the perf-baselines branch
-# checked into ./.cache/perf-baselines. Auto-detects local arch label.
+# checked into ./.cache/perf-baselines. Its rc enforces measurement completeness
+# and regressions, but without run provenance the report is unsuitable as
+# benchmark evidence. Auto-detects local arch label.
 bench-gate:
-	@if [ ! -d .cache/perf-baselines ]; then \
-		git clone --depth=1 --branch=perf-baselines \
-			$$(git remote get-url origin) .cache/perf-baselines || \
-			{ echo "no perf-baselines branch yet — run bench-update.yml on main first"; exit 1; }; \
-	else \
-		git -C .cache/perf-baselines pull --ff-only; \
-	fi
-	@arch=$$(uname -m | sed 's/arm64/aarch64/')-$$(uname -s | tr A-Z a-z); \
-		echo "arch: $$arch"; \
-		mkdir -p target/criterion; \
-		cp -r .cache/perf-baselines/$$arch/. target/criterion/ 2>/dev/null || { echo "no baseline for $$arch"; exit 1; }; \
-		cargo bench -p lattice-inference --bench elementwise_cpu_bench -- --baseline base --noplot; \
-		cargo bench -p lattice-embed --bench simd -- --baseline base --noplot; \
-		python3 scripts/perf-bench-gate.py target/criterion "$$arch-local"
+	./scripts/bench-gate.sh
 
 # E2E parity: HF transformers (reference) vs lattice (greedy token agreement).
 # Requires: pip install torch transformers tokenizers
 e2e-parity:
-	cargo build --release --bin qwen35_generate -p lattice-inference --features f16
-	python3 scripts/e2e_parity_check.py
+	./scripts/e2e-parity-local.sh
 
 # ADR-064 Phase-0: decode slope/intercept fit (Theil-Sen + bootstrap CI).
 # Usage: make bench-decode-slopefit                     (smoke grid {64,256,512})

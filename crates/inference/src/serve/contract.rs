@@ -1188,7 +1188,6 @@ mod tests {
     fn vision_profile() -> ServeProfile<'static> {
         ServeProfile::lattice("model", 32).with_vision_support(true)
     }
-
     #[test]
     fn standard_generation_defaults_snapshot() {
         let defaults = GenerationDefaults::standard(123);

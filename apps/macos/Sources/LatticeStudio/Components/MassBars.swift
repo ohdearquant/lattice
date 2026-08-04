@@ -154,6 +154,7 @@ struct MassBars: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("MassBars") {
     VStack(spacing: Theme.Space.xl) {
         Text("MASS BARS — TRUE SCALE")
@@ -179,3 +180,4 @@ struct MassBars: View {
     .background(Theme.Palette.canvas)
     .frame(width: 440)
 }
+#endif

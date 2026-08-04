@@ -8,6 +8,64 @@
 
 use crate::model::qwen35_config::Qwen35Config;
 
+/// Input and output dimensions for one LoRA-targetable linear projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoraProjectionShape {
+    /// Width of the activation consumed by the projection.
+    pub d_in: usize,
+    /// Width of the projection output.
+    pub d_out: usize,
+}
+
+/// Return the LoRA projection shape for a Qwen3.5 layer and module.
+///
+/// Full-attention modules are valid only on full-attention layers, Gated
+/// DeltaNet modules are valid only on linear-attention layers, and MLP modules
+/// are valid on both. The returned geometry includes `in_proj_a` and
+/// `in_proj_b`; a backend that cannot apply those projections must enforce that
+/// capability restriction separately.
+pub fn qwen35_projection_shape(
+    config: &Qwen35Config,
+    layer_idx: usize,
+    module: &str,
+) -> Result<LoraProjectionShape, String> {
+    if layer_idx >= config.num_hidden_layers {
+        return Err(format!(
+            "layer {layer_idx} is out of range for Qwen3.5 model with {} layers",
+            config.num_hidden_layers
+        ));
+    }
+
+    let hidden = config.hidden_size;
+    let intermediate = config.intermediate_size;
+    let is_full = config.is_full_attention(layer_idx);
+    let (d_in, d_out) = match (module, is_full) {
+        ("q_proj", true) => (hidden, 2 * config.full_q_dim()),
+        ("k_proj", true) => (hidden, config.full_kv_dim()),
+        ("v_proj", true) => (hidden, config.full_kv_dim()),
+        ("o_proj", true) => (config.full_q_dim(), hidden),
+        ("in_proj_qkv", false) => (hidden, config.linear_qkv_dim()),
+        ("in_proj_z", false) => (hidden, config.linear_output_dim()),
+        ("in_proj_b" | "in_proj_a", false) => (hidden, config.linear_num_value_heads()),
+        ("out_proj", false) => (config.linear_output_dim(), hidden),
+        ("gate_proj", _) | ("up_proj", _) => (hidden, intermediate),
+        ("down_proj", _) => (intermediate, hidden),
+        ("q_proj" | "k_proj" | "v_proj" | "o_proj", false) => {
+            return Err(format!(
+                "module '{module}' is a full-attention projection but layer {layer_idx} is GDN"
+            ));
+        }
+        ("in_proj_qkv" | "in_proj_z" | "in_proj_b" | "in_proj_a" | "out_proj", true) => {
+            return Err(format!(
+                "module '{module}' is a GDN projection but layer {layer_idx} is full-attention"
+            ));
+        }
+        _ => return Err(format!("unknown LoRA module '{module}'")),
+    };
+
+    Ok(LoraProjectionShape { d_in, d_out })
+}
+
 /// **Unstable**: trait for LoRA adapter injection into linear projections.
 ///
 /// The inference forward pass calls `apply()` for each projected row after a
@@ -152,6 +210,188 @@ impl LoraHook for NoopLoraHook {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn qwen35_projection_shape_covers_full_attention_modules() {
+        let config = Qwen35Config::qwen35_0_8b();
+        let full_layer = 3;
+        let cases = [
+            (
+                "q_proj",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 4096,
+                },
+            ),
+            (
+                "k_proj",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 512,
+                },
+            ),
+            (
+                "v_proj",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 512,
+                },
+            ),
+            (
+                "o_proj",
+                LoraProjectionShape {
+                    d_in: 2048,
+                    d_out: 1024,
+                },
+            ),
+        ];
+
+        for (module, expected) in cases {
+            assert_eq!(
+                qwen35_projection_shape(&config, full_layer, module),
+                Ok(expected),
+                "unexpected shape for {module}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_projection_shape_covers_gdn_modules_including_alpha_and_beta() {
+        let config = Qwen35Config::qwen35_0_8b();
+        let gdn_layer = 0;
+        let cases = [
+            (
+                "in_proj_qkv",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 6144,
+                },
+            ),
+            (
+                "in_proj_z",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 2048,
+                },
+            ),
+            (
+                "in_proj_b",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 16,
+                },
+            ),
+            (
+                "in_proj_a",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 16,
+                },
+            ),
+            (
+                "out_proj",
+                LoraProjectionShape {
+                    d_in: 2048,
+                    d_out: 1024,
+                },
+            ),
+        ];
+
+        for (module, expected) in cases {
+            assert_eq!(
+                qwen35_projection_shape(&config, gdn_layer, module),
+                Ok(expected),
+                "unexpected shape for {module}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_projection_shape_uses_value_heads_for_gdn_alpha_and_beta() {
+        let config = Qwen35Config::qwen36_35b_a3b();
+        assert_eq!(config.linear_num_key_heads, 16);
+        assert_eq!(config.linear_num_value_heads(), 32);
+
+        for module in ["in_proj_b", "in_proj_a"] {
+            assert_eq!(
+                qwen35_projection_shape(&config, 0, module),
+                Ok(LoraProjectionShape {
+                    d_in: config.hidden_size,
+                    d_out: 32,
+                }),
+                "{module} must use the asymmetric value-head count"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_projection_shape_accepts_mlp_modules_on_both_layer_types() {
+        let config = Qwen35Config::qwen35_0_8b();
+        let cases = [
+            (
+                "gate_proj",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 3584,
+                },
+            ),
+            (
+                "up_proj",
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 3584,
+                },
+            ),
+            (
+                "down_proj",
+                LoraProjectionShape {
+                    d_in: 3584,
+                    d_out: 1024,
+                },
+            ),
+        ];
+
+        for layer_idx in [0, 3] {
+            for (module, expected) in cases {
+                assert_eq!(
+                    qwen35_projection_shape(&config, layer_idx, module),
+                    Ok(expected),
+                    "unexpected shape for {module} on layer {layer_idx}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35_projection_shape_rejects_wrong_layer_types() {
+        let config = Qwen35Config::qwen35_0_8b();
+
+        assert_eq!(
+            qwen35_projection_shape(&config, 0, "q_proj"),
+            Err("module 'q_proj' is a full-attention projection but layer 0 is GDN".to_string())
+        );
+        assert_eq!(
+            qwen35_projection_shape(&config, 3, "in_proj_qkv"),
+            Err(
+                "module 'in_proj_qkv' is a GDN projection but layer 3 is full-attention"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn qwen35_projection_shape_rejects_unknown_and_out_of_range_targets() {
+        let config = Qwen35Config::qwen35_0_8b();
+
+        assert_eq!(
+            qwen35_projection_shape(&config, 3, "q_porj"),
+            Err("unknown LoRA module 'q_porj'".to_string())
+        );
+        assert_eq!(
+            qwen35_projection_shape(&config, config.num_hidden_layers, "q_proj"),
+            Err("layer 24 is out of range for Qwen3.5 model with 24 layers".to_string())
+        );
+    }
 
     struct RowSensitiveHook {
         calls: AtomicUsize,

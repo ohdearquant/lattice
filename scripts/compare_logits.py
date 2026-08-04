@@ -24,6 +24,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from bench_supervision import ensure_python_entrypoint
+
+    ensure_python_entrypoint("logit-divergence")
+
 import numpy as np
 
 # ---------------------------------------------------------------------------

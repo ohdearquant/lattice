@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "purpose": "Candidate pool and measured selection outcome for replacing parity prompts with unstable greedy decisions.",
+  "provenance_limit": "The preserved measurement outputs did not record model revision, package versions, or measurement date.",
+  "measurement": {
+    "thread_counts": [
+      1,
+      4
+    ],
+    "token_counts": [
+      4,
+      15
+    ],
+    "minimum_logit_margin": 0.1,
+    "scope": "Every generated position through each token count is measured."
+  },
+  "selection_rule": {
+    "eligibility": "A candidate is eligible only when every measured logit margin is at least 0.1 at both thread counts and both token counts, and its generated token IDs agree across thread counts.",
+    "winner": "Within each replacement pool, select the eligible candidate with the greatest minimum margin across all measured positions, thread counts, and token counts.",
+    "tie_breaker": "If candidates have equal minimum margins, select the lexicographically smallest candidate id.",
+    "failure": "If a pool has no eligible candidate, do not replace that prompt and do not change the margin floor or match window."
+  },
+  "measurements": {
+    "short-01": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.25,
+          "15_tokens": 0.25
+        },
+        "4": {
+          "4_tokens": 0.25,
+          "15_tokens": 0.25
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "short-02": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.5,
+          "15_tokens": 0.25
+        },
+        "4": {
+          "4_tokens": 0.5,
+          "15_tokens": 0.25
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "short-03": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.1875,
+          "15_tokens": 0.1875
+        },
+        "4": {
+          "4_tokens": 0.1875,
+          "15_tokens": 0.1875
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "long-01": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 1.375,
+          "15_tokens": 1.0
+        },
+        "4": {
+          "4_tokens": 1.375,
+          "15_tokens": 1.0
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "long-02": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.25,
+          "15_tokens": 0.125
+        },
+        "4": {
+          "4_tokens": 0.25,
+          "15_tokens": 0.125
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    },
+    "long-03": {
+      "minimum_margin": {
+        "1": {
+          "4_tokens": 0.875,
+          "15_tokens": 0.875
+        },
+        "4": {
+          "4_tokens": 0.875,
+          "15_tokens": 0.875
+        }
+      },
+      "generated_ids_agree_across_threads": true
+    }
+  },
+  "pools": [
+    {
+      "id": "short-general-prose",
+      "selected_candidate": "short-01",
+      "replaces_prompt": "In the year 2024, artificial intelligence",
+      "required_property": "A short, non-code prose continuation with match_window 3.",
+      "candidates": [
+        {
+          "id": "short-01",
+          "prompt": "The largest planet in our solar system is",
+          "match_window": 3
+        },
+        {
+          "id": "short-02",
+          "prompt": "Water freezes at a temperature of",
+          "match_window": 3
+        },
+        {
+          "id": "short-03",
+          "prompt": "The author of Pride and Prejudice is",
+          "match_window": 3
+        }
+      ]
+    },
+    {
+      "id": "long-prefill-python",
+      "selected_candidate": "long-01",
+      "replaces_prompt_prefix": "def merge_sort(arr):",
+      "required_property": "The existing approximately 816-token Python corpus followed by a fixed new-function task, with match_window 2.",
+      "base_prompt_source": "LONG_PREFILL_BASE in scripts/e2e_parity_check.py",
+      "candidates": [
+        {
+          "id": "long-01",
+          "suffix": "# Implement heap sort using the helpers above.\ndef heap_sort(arr):\n    ",
+          "match_window": 2
+        },
+        {
+          "id": "long-02",
+          "suffix": "# Implement breadth-first search using the helpers above.\ndef breadth_first_search(graph, start):\n    ",
+          "match_window": 2
+        },
+        {
+          "id": "long-03",
+          "suffix": "# Implement insertion sort using the helpers above.\ndef insertion_sort(arr):\n    ",
+          "match_window": 2
+        }
+      ]
+    }
+  ]
+}

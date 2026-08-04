@@ -100,6 +100,8 @@ use lattice_inference::forward::neon::{
 };
 use lattice_inference::kv_cache::{EvictionPolicy, PagedKVCache, PagedKVCacheConfig};
 #[cfg(feature = "bench-internals")]
+use lattice_inference::kv_cache::{FlatKVCache, FlatKVCacheConfig};
+#[cfg(feature = "bench-internals")]
 use lattice_inference::rope::RopeTable;
 use lattice_inference::sampling::{Sampler, SamplingConfig};
 use lattice_inference::{BpeTokenizer, Tokenizer};
@@ -206,7 +208,7 @@ fn bench_simd_q8_neon_matvec(c: &mut Criterion) {
     for &(label, n, k) in cases {
         let x = rand_f32_vec(k, 0x1111_0000 ^ n as u32);
         let w_f32 = rand_f32_vec(n * k, 0x2222_0000 ^ n as u32 ^ (k as u32).wrapping_shl(8));
-        let packed = pack_weights_q8(&w_f32, n, k);
+        let packed = pack_weights_q8(&w_f32, n, k).expect("valid benchmark matrix");
 
         // Pre-quantize x once: used for the scalar path (no per-call alloc).
         let (x_q, x_scale) = quantize_vec_q8(&x);
@@ -950,9 +952,9 @@ fn bench_q8_neon_forward_allocations(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 // OPT-LOGIT: final logits projection benchmark (vocab=248320, hidden=2048)
 //
-// The generate.rs scalar loop (lines 400-407) does one dot product per vocab
-// row against the final hidden state. This benchmark compares:
-//   scalar             — exact loop from generate.rs
+// The former generic scalar loop did one dot product per vocabulary row
+// against the final hidden state. This benchmark compares:
+//   scalar             — direct per-output dot-product loop
 //   matmul_bt_existing — existing CPU dispatch (Accelerate on macOS, NEON tiled
 //                        on aarch64 non-macOS). Same as the Qwen3.5 qwen35.rs path.
 //
@@ -1001,7 +1003,7 @@ fn bench_logits_projection(c: &mut Criterion) {
 
     let mut out = vec![0.0f32; LOGITS_VOCAB];
 
-    // scalar: identical to the generate.rs:400-407 loop that we will optimize
+    // scalar: direct per-output dot-product reference
     group.bench_function("scalar", |b| {
         b.iter(|| {
             let h = black_box(&hidden[..]);
@@ -1046,8 +1048,8 @@ fn bench_logits_projection(c: &mut Criterion) {
 // OPT-FWD: forward_with_cache allocation gate (requires --features bench-internals)
 //
 // Measures allocations-per-token and latency for a single-token decode at
-// Qwen3.5-target dimensions. The "allocating_current" variant mirrors
-// generate.rs:forward_with_cache exactly: 11 top-level buffer allocs +
+// Qwen3.5-target dimensions. The "allocating_current" variant models the
+// retired flat-cache decode shape: 11 top-level buffer allocations plus
 // 1 logits alloc + 24 layers × 8 heads × 1 query = 192 score allocs
 // = 204 allocs/token total (before ForwardScratch).
 //
@@ -1115,8 +1117,9 @@ impl SyntheticLayerWeights {
 }
 
 // Allocating attention: one Vec<f32> per head per query position.
-// Matches the generate.rs:441 allocation pattern that ForwardScratch eliminates.
+// Matches the retired generic decode allocation pattern that ForwardScratch eliminates.
 #[cfg(feature = "bench-internals")]
+#[allow(clippy::too_many_arguments)]
 fn compute_attention_alloc(
     output: &mut [f32],
     q: &[f32],
@@ -1178,7 +1181,7 @@ fn compute_attention_alloc(
 }
 
 // Single-token decode with all per-call allocations intact (pre-optimization baseline).
-// Mirrors generate.rs:forward_with_cache for seq_len=1 using synthetic weights.
+// Models a single-token flat-cache decode using synthetic weights.
 // Returns the logits Vec (alloc #12).
 #[cfg(feature = "bench-internals")]
 #[allow(clippy::too_many_arguments)]
@@ -1193,11 +1196,9 @@ fn forward_allocating_decode(
 ) -> Vec<f32> {
     let tok = (token_id as usize) % FWD_VOCAB;
 
-    // Alloc #1
     let mut hidden = vec![0.0f32; FWD_HIDDEN];
     hidden.copy_from_slice(&embed_tokens[tok * FWD_HIDDEN..(tok + 1) * FWD_HIDDEN]);
 
-    // Allocs #2-11
     let mut residual = vec![0.0f32; FWD_HIDDEN];
     let mut qkv_buf = vec![0.0f32; FWD_QKV_DIM];
     let mut q_buf = vec![0.0f32; FWD_Q_DIM];
@@ -1266,22 +1267,26 @@ fn forward_allocating_decode(
             );
         }
 
-        // Write K/V to cache at start_pos (mutable borrow ends before shared borrows below)
-        {
-            let dst_off = start_pos * FWD_KV_DIM;
-            cache.k_buffer_mut(layer)[dst_off..dst_off + FWD_KV_DIM].copy_from_slice(&k_buf);
-            cache.v_buffer_mut(layer)[dst_off..dst_off + FWD_KV_DIM].copy_from_slice(&v_buf);
-        }
+        cache
+            .append_kv(layer, &k_buf, &v_buf)
+            .expect("benchmark cache has capacity");
 
         // Attention over full cached K/V (start_pos prior tokens + 1 current)
         let cached_seq_len = start_pos + 1;
         let k_end = cached_seq_len * FWD_KV_DIM;
-        // Allocs #13..+8 per layer (8 heads × 1 query): the 192 score allocs
+        let cache_k: Vec<f32> = cache.k_buffer(layer)[..k_end]
+            .iter()
+            .map(|value| value.to_f32())
+            .collect();
+        let cache_v: Vec<f32> = cache.v_buffer(layer)[..k_end]
+            .iter()
+            .map(|value| value.to_f32())
+            .collect();
         compute_attention_alloc(
             &mut attn_out,
             &q_buf,
-            &cache.k_buffer(layer)[..k_end],
-            &cache.v_buffer(layer)[..k_end],
+            &cache_k,
+            &cache_v,
             1,
             cached_seq_len,
             start_pos,
@@ -1338,7 +1343,6 @@ fn forward_allocating_decode(
     // Final RMS norm
     rms_norm(&mut hidden, norm_weight, FWD_HIDDEN, FWD_RMS_EPS);
 
-    // Alloc #12: logits
     let mut logits = vec![0.0f32; FWD_VOCAB];
     matmul_bt(&hidden, embed_tokens, &mut logits, 1, FWD_HIDDEN, FWD_VOCAB);
     logits
@@ -1363,6 +1367,8 @@ struct ForwardBenchScratch {
     up_buf: Vec<f32>,      // [FWD_INTER]
     ffn_out: Vec<f32>,     // [FWD_HIDDEN]
     scores: Vec<f32>,      // [FWD_N_HEADS * q_seq_len * kv_seq_len]
+    cache_k: Vec<f32>,     // [max_kv_seq_len * FWD_KV_DIM]
+    cache_v: Vec<f32>,     // [max_kv_seq_len * FWD_KV_DIM]
     logits: Vec<f32>,      // [FWD_VOCAB]
 }
 
@@ -1382,6 +1388,8 @@ impl ForwardBenchScratch {
             up_buf: vec![0.0; FWD_INTER],
             ffn_out: vec![0.0; FWD_HIDDEN],
             scores: vec![0.0; FWD_N_HEADS * max_kv_seq_len],
+            cache_k: vec![0.0; FWD_KV_DIM * max_kv_seq_len],
+            cache_v: vec![0.0; FWD_KV_DIM * max_kv_seq_len],
             logits: vec![0.0; FWD_VOCAB],
         }
     }
@@ -1390,6 +1398,7 @@ impl ForwardBenchScratch {
 // Opt 2: score-scratch attention — same math as compute_attention_alloc but
 // indexes into a pre-allocated scratch slice instead of allocating per head.
 #[cfg(feature = "bench-internals")]
+#[allow(clippy::too_many_arguments)]
 fn compute_attention_scratch(
     output: &mut [f32],
     q: &[f32],
@@ -1531,17 +1540,25 @@ fn forward_scratch_decode(
             );
         }
 
-        {
-            let dst_off = start_pos * FWD_KV_DIM;
-            cache.k_buffer_mut(layer)[dst_off..dst_off + FWD_KV_DIM]
-                .copy_from_slice(&scratch.k_buf);
-            cache.v_buffer_mut(layer)[dst_off..dst_off + FWD_KV_DIM]
-                .copy_from_slice(&scratch.v_buf);
-        }
+        cache
+            .append_kv(layer, &scratch.k_buf, &scratch.v_buf)
+            .expect("benchmark cache has capacity");
 
         let cached_seq_len = start_pos + 1;
         let k_end = cached_seq_len * FWD_KV_DIM;
         let score_len = FWD_N_HEADS * cached_seq_len;
+        for (dst, src) in scratch.cache_k[..k_end]
+            .iter_mut()
+            .zip(&cache.k_buffer(layer)[..k_end])
+        {
+            *dst = src.to_f32();
+        }
+        for (dst, src) in scratch.cache_v[..k_end]
+            .iter_mut()
+            .zip(&cache.v_buffer(layer)[..k_end])
+        {
+            *dst = src.to_f32();
+        }
 
         // Opt 2: pass score scratch slice — no Vec alloc per head
         // Need to split scratch borrows: attn_out + scores mut, q_buf imm
@@ -1554,8 +1571,8 @@ fn forward_scratch_decode(
         compute_attention_scratch(
             attn_slice,
             &scratch.q_buf,
-            &cache.k_buffer(layer)[..k_end],
-            &cache.v_buffer(layer)[..k_end],
+            &scratch.cache_k[..k_end],
+            &scratch.cache_v[..k_end],
             1,
             cached_seq_len,
             start_pos,
@@ -1631,15 +1648,12 @@ fn bench_forward_with_cache(c: &mut Criterion) {
     #[cfg(feature = "bench-internals")]
     {
         // Build fixture (done once outside timing)
-        let embed_tokens = match try_rand_f32_vec(FWD_VOCAB * FWD_HIDDEN, 0xFEED_0001) {
-            Some(v) => v,
-            None => {
-                eprintln!(
-                    "[bench_forward_with_cache] Cannot allocate {:.1} GiB embed_tokens — skip",
-                    (FWD_VOCAB * FWD_HIDDEN * 4) as f64 / (1u64 << 30) as f64
-                );
-                return;
-            }
+        let Some(embed_tokens) = try_rand_f32_vec(FWD_VOCAB * FWD_HIDDEN, 0xFEED_0001) else {
+            eprintln!(
+                "[bench_forward_with_cache] Cannot allocate {:.1} GiB embed_tokens — skip",
+                (FWD_VOCAB * FWD_HIDDEN * 4) as f64 / (1u64 << 30) as f64
+            );
+            return;
         };
         let lw = SyntheticLayerWeights::new(0xFEED_0002);
         let norm_weight = rand_f32_vec(FWD_HIDDEN, 0xFEED_0003);
@@ -1698,7 +1712,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
 
         group.bench_function("allocating_current", |b| {
             b.iter_batched(
-                || make_warmed_cache(),
+                &make_warmed_cache,
                 |mut cache| {
                     black_box(forward_allocating_decode(
                         42u32,
@@ -1727,7 +1741,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
                     let mut cache = make_warmed_cache();
                     let snap = AllocationSnapshot::capture();
                     for _ in 0..MEASURED {
-                        black_box(forward_scratch_decode(
+                        forward_scratch_decode(
                             42u32,
                             FWD_WARM_KV,
                             &mut cache,
@@ -1736,7 +1750,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
                             &norm_weight,
                             &rope,
                             &mut scratch,
-                        ));
+                        );
                     }
                     AllocationSnapshot::delta_since(&snap)
                 },
@@ -1746,9 +1760,9 @@ fn bench_forward_with_cache(c: &mut Criterion) {
         group.bench_function("scratch_dispatch", |b| {
             let mut scratch = ForwardBenchScratch::new(FWD_WARM_KV + 1);
             b.iter_batched(
-                || make_warmed_cache(),
+                &make_warmed_cache,
                 |mut cache| {
-                    black_box(forward_scratch_decode(
+                    forward_scratch_decode(
                         42u32,
                         FWD_WARM_KV,
                         &mut cache,
@@ -1757,7 +1771,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
                         &norm_weight,
                         &rope,
                         &mut scratch,
-                    ));
+                    );
                 },
                 BatchSize::LargeInput,
             );
@@ -1775,17 +1789,15 @@ fn bench_forward_with_cache(c: &mut Criterion) {
             &[("seq1024", 1024), ("seq4096", 4096), ("seq16384", 16384)];
 
         for &(label, warm_kv) in decode_contexts {
-            let warm_kv_seq_ctx =
-                match try_rand_f32_vec(warm_kv * FWD_KV_DIM, 0xDEAD_0000u32 ^ warm_kv as u32) {
-                    Some(v) => v,
-                    None => {
-                        eprintln!(
-                            "[decode_f32/{label}] Cannot allocate {:.1} MiB warm_kv_seq — skip",
-                            (warm_kv * FWD_KV_DIM * 4) as f64 / (1u64 << 20) as f64
-                        );
-                        continue;
-                    }
-                };
+            let Some(warm_kv_seq_ctx) =
+                try_rand_f32_vec(warm_kv * FWD_KV_DIM, 0xDEAD_0000u32 ^ warm_kv as u32)
+            else {
+                eprintln!(
+                    "[decode_f32/{label}] Cannot allocate {:.1} MiB warm_kv_seq — skip",
+                    (warm_kv * FWD_KV_DIM * 4) as f64 / (1u64 << 20) as f64
+                );
+                continue;
+            };
 
             let cache_cfg_ctx =
                 FlatKVCacheConfig::for_qwen3(FWD_LAYERS, FWD_N_KV_HEADS, FWD_HEAD_DIM, warm_kv + 2);
@@ -1807,7 +1819,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
                 b.iter_batched(
                     make_ctx_cache,
                     |mut cache| {
-                        black_box(forward_scratch_decode(
+                        forward_scratch_decode(
                             42u32,
                             warm_kv,
                             &mut cache,
@@ -1816,7 +1828,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
                             &norm_weight,
                             &rope_ctx,
                             &mut scratch,
-                        ));
+                        );
                     },
                     BatchSize::LargeInput,
                 );

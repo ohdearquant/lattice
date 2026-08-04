@@ -72,7 +72,7 @@ pub fn into_engine_chat_messages(
         .collect()
 }
 
-/// Render normalized contract messages with the engine's text chat skeleton.
+/// Render normalized contract messages with the engine's canonical chat template.
 ///
 /// For image-bearing messages this is the preliminary text-only rendering
 /// used by adapter-level context checks. The Metal worker later inserts the
@@ -141,7 +141,9 @@ const SERVER_ABORT_TIMEOUT: Duration = Duration::from_secs(3);
 /// seconds to release request-held state before this returns
 /// [`std::io::ErrorKind::TimedOut`]. Both binaries treat that error as a hard
 /// process-exit boundary because a non-cooperative task must not make shutdown
-/// unbounded.
+/// unbounded. That last resort can truncate in-flight responses, partially
+/// written files, and unflushed telemetry because process exit skips Rust
+/// destructors.
 pub async fn serve_until_shutdown(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -235,8 +237,11 @@ where
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 format!(
-                    "server connections did not drain within {} ms",
-                    drain_timeout.as_millis()
+                    "server connections did not drain within {} ms; remaining tasks were aborted \
+                     and given up to {} ms for cleanup; hard process exit may truncate in-flight \
+                     responses, partially written files, and unflushed telemetry",
+                    drain_timeout.as_millis(),
+                    SERVER_ABORT_TIMEOUT.as_millis()
                 ),
             ))
         }
@@ -1739,6 +1744,18 @@ mod tests {
             .expect("shared runner task must not panic")
             .expect_err("stuck connection drain must return a timeout error");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        for required_warning in [
+            "hard process exit",
+            "in-flight responses",
+            "partially written files",
+            "unflushed telemetry",
+        ] {
+            assert!(
+                message.contains(required_warning),
+                "timeout error must warn operators about {required_warning}: {message}"
+            );
+        }
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),
             "forced connection cancellation must drop router state before returning"
@@ -1865,7 +1882,6 @@ mod tests {
             }
         ));
     }
-
     #[test]
     fn finish_reason_stopped_true_is_stop() {
         assert_eq!(finish_reason(true), "stop");

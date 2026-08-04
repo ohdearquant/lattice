@@ -99,6 +99,17 @@ inference (~118K)                                 ← optional dep on fann (`mix
 embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
+Three of those four edges are feature-gated, and the gates do not all default the
+same way, so "depends on" in the diagram is not one relationship. `tune` depends on
+`fann` unconditionally. The other three are optional deps: `embed` to `inference` is
+enabled through `native`, which is in embed's default set, so it is present in an
+ordinary build; `inference` to `fann` is behind `mixture` and `tune` to `inference` is
+behind `inference-hook` or `train-backward`, and neither of those is in its crate's
+default set. A default `cargo build -p lattice-tune` therefore does not compile
+`lattice-inference` at all — six targets pull it in through `required-features` and
+that is the whole of its reach. Check the manifest before assuming an edge is live in
+the build you are looking at.
+
 ### lattice-inference — Transformer kernel
 
 | Module           | Purpose                      | Key Exports                                                                       |
@@ -109,7 +120,6 @@ embed (12K)   tune (20K)                          ← embed uses inference; tune
 | `attention/`     | Attention mechanisms         | `flash_attention`, `gqa_attention`, `GatedDeltaNetState`                          |
 | `forward/`       | Compute backends             | `cpu/`, `metal_qwen35.rs` (Metal MSL), NEON/AVX2 kernels                          |
 | `kv_cache/`      | KV cache for generation      | `FlatKVCache`, `PagedKVCache`                                                     |
-| `generate.rs`    | Autoregressive generation    | `GenerateConfig`                                                                  |
 | `speculative.rs` | Speculative decoding         | `NgramSpeculator`, `MtpVerifier`                                                  |
 | `lora_hook.rs`   | LoRA adapter injection trait | `LoraHook`, `NoopLoraHook`                                                        |
 | `rope.rs`        | Rotary positional encoding   | `RopeTable`                                                                       |
@@ -219,6 +229,20 @@ feature branch → PR → CI green → review → merge to main
 
 GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Runs on ubuntu + macos (x86 + ARM SIMD). Rust 1.94.1 pinned. No deno in remote CI.
 
+### Bench-Compare Disposition
+
+Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include a
+bench-compare disposition in its description. By default, run `make bench-compare` and paste its
+A/B table into the PR body. If the result shows no change, state that as the disposition.
+`crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
+and because it declares its own bench target (`router_online`).
+
+The waiver predicate is reachability, not compilation, and the canonical statement of the rule —
+including the all-declared-target search requirement, the FANN `router_online` example, and the
+residual-risk framing — lives in `CLAUDE.md` under "Measure First, Code Second". Read that section
+before claiming a waiver here; do not treat "compiled out of the default bench binaries" alone as
+sufficient.
+
 ### E2E Parity Gate
 
 PRs touching `crates/inference/src/` or `crates/embed/src/` trigger `e2e-parity.yml`. It runs HF transformers (reference) then lattice on the same macOS runner and compares greedy generation output. First 3 greedy tokens must match HF (2 for the long-prefill prompt; GDN recurrence diverges naturally after that). Speed is reported but not gated.
@@ -235,6 +259,7 @@ The `perf-baselines` branch is still updated by `bench-update.yml` on merge to m
 ## Commands
 
 ```bash
+make setup           # install rustfmt + clippy for the pinned toolchain
 make ci              # full local CI (fmt + clippy + deno lint + test + build)
 make fmt             # cargo fmt + deno fmt on markdown
 make lint-docs       # deno doc lint only
@@ -244,12 +269,12 @@ make publish         # publish (dependency order, sleeps for indexing)
 # E2E parity (HF reference vs lattice)
 make e2e-parity                          # run locally (needs torch + transformers)
 
-# Perf benchmarking (ADR-058, trend data)
-# bench-compare takes the machine-wide bench-window and GPU locks itself and
-# gates on ambient CPU idle — do NOT wrap it in an external bench-window helper.
-make bench-compare                       # A/B: origin/main vs HEAD (~2 min, --quick)
+# Perf benchmarking (ADR-087, trend data)
+# bench-compare takes the machine-wide bench-window and GPU locks itself, and
+# gates macOS power/thermal/AFK plus ambient CPU idle — do NOT wrap it.
+make bench-compare                       # A/B: origin/main vs HEAD (--quick, the default; not separately measured)
 make bench-compare BASE=main HEAD=pr/x   # A/B: explicit refs
-scripts/bench-compare.sh --full main     # A/B with tight CIs (~15 min)
+scripts/bench-compare.sh --full main     # A/B with tight CIs; see CLAUDE.md's measured slow-side bound (under "Measure First, Code Second") before booking a window
 make bench-ci                            # save local Criterion baseline
 make bench-gate                          # compare against perf-baselines branch
 ```

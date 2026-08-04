@@ -1592,7 +1592,7 @@ mod tests {
         assert_eq!(ids, vec![11, 16]);
         // Regression: decode must reverse the byte-level encoding (the "Ġ"
         // prefix maps back to a space), not return an empty string — the
-        // prior generate.rs detokenize block discarded the text entirely.
+        // retired generic detokenize block discarded the text entirely.
         assert_eq!(tokenizer.decode(&ids), Some("hello world".to_string()));
         assert_eq!(tokenizer.decode(&[]), Some(String::new()));
     }

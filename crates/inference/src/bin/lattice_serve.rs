@@ -2874,9 +2874,14 @@ mod imp {
             }
         };
         // Retain the explicit owner through the server lifetime. Every
-        // production client also retains an owner clone, so whichever
-        // reference is dropped last performs the same bounded join after
-        // the final job sender closes.
+        // production client also retains an owner clone, so on a normal
+        // return whichever reference is dropped last performs the same
+        // bounded join after the final job sender closes. That guarantee
+        // does not reach the `std::process::exit` call on the server-error
+        // path below (nor any other fatal exit in this file):
+        // `std::process::exit` never runs destructors, so on those paths
+        // this owner -- and any surviving client-held owner clone -- is
+        // dropped without ever performing the bounded join.
         let _owner = owner;
 
         let model_id: Arc<str> = model_dir
