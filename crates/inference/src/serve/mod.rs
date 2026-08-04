@@ -902,7 +902,7 @@ pub struct ExpectedObservation<'a> {
 /// `lattice.rs`'s and `lattice_serve.rs`'s
 /// `production_adapter_observation` test modules so neither binary can drift
 /// back to asserting only a hand-picked subset of `GenerateConfigSnapshot`'s
-/// thirteen fields.
+/// fields, instead of every field.
 pub fn assert_observation_matches(
     obs: &ProductionAdapterObservation,
     expected: &ExpectedObservation<'_>,

@@ -38,8 +38,9 @@ longer exists fails that check closed (#654).
 
 No `--lora`, `--reasoning-budget`, `--top-k`, or `--repetition-penalty` flags exist on any
 subcommand -- `chat` only ever runs with `GenerateConfig { max_new_tokens, temperature,
-..Default::default() }` (`lattice.rs:2301-2305`), so top_k/repetition_penalty/seed/grammar/MTP/
-reasoning-budget are all fixed at their `Default` values (`qwen35_config.rs:710-728`: `top_k: 50,
+..Default::default() }` (`lattice.rs:2463-2467`, in `run_chat`), so top_k/repetition_penalty/seed/grammar/MTP/
+reasoning-budget are all fixed at their `Default` values (`qwen35_config.rs`'s
+`impl Default for GenerateConfig`, `qwen35_config.rs:2433-2452`: `top_k: 50,
 top_p: 0.9, min_p: 0.0, top_n_sigma: 0.0, repetition_penalty: 1.1, enable_mtp: None,
 grammar: None, reasoning_budget: None`)
 for the whole interactive session -- there is no way to change them without editing source.
