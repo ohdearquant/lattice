@@ -59,11 +59,15 @@ EOF
     printf '%s\n' "$FN_BODY"
     printf 'check_version_available %q\n' "$PKGDIR"
   } > "$RUNNER"
-  OUT="$(PATH="$STUBDIR:$PATH" bash "$RUNNER" 2>&1)"
+  # /bin/sh with set -e: the production shell and options publish-npm.sh
+  # actually runs under (it has `#!/bin/sh` and `set -e` at its own top).
+  # Testing under bash without -e (as this harness used to) exercises a
+  # shell environment the release preflight never runs in.
+  OUT="$(PATH="$STUBDIR:$PATH" /bin/sh -c "set -e; . '$RUNNER'" 2>&1)"
   return $?
 }
 
-echo "=== publish-npm.sh preflight self-test (3 stubbed npm dispositions) ==="
+echo "=== publish-npm.sh preflight self-test (7 stubbed npm dispositions) ==="
 
 # (a) npm's real not-found response: E404 JSON on stdout, nonzero exit.
 run_case 'cat <<J
@@ -96,6 +100,45 @@ case "$OUT" in
   *"already published on npm"*) echo "  PASS:   -> already-published diagnostic printed"; pass=$((pass+1)) ;;
   *) echo "  FAIL:   -> missing already-published diagnostic"; fail=$((fail+1)) ;;
 esac
+
+# (d) empty body: nonzero exit, nothing on stdout at all.
+run_case 'exit 1'
+check "(d) empty body fails closed (nonzero)" 1 $?
+if printf '%s' "$OUT" | grep -qF "did not return npm"; then
+  echo "  PASS:   -> diagnostic distinguishes lookup failure from availability"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> no distinguishing diagnostic in output"; fail=$((fail+1))
+fi
+
+# (e) invalid JSON body: nonzero exit, unparseable stdout.
+run_case 'echo "not json at all {"
+exit 1'
+check "(e) invalid JSON fails closed (nonzero)" 1 $?
+if printf '%s' "$OUT" | grep -qF "did not return npm"; then
+  echo "  PASS:   -> diagnostic distinguishes lookup failure from availability"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> no distinguishing diagnostic in output"; fail=$((fail+1))
+fi
+
+# (f) valid JSON but no "error" key: nonzero exit, well-formed but unrelated body.
+run_case 'echo "{\"ok\":false}"
+exit 1'
+check "(f) missing error key fails closed (nonzero)" 1 $?
+if printf '%s' "$OUT" | grep -qF "did not return npm"; then
+  echo "  PASS:   -> diagnostic distinguishes lookup failure from availability"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> no distinguishing diagnostic in output"; fail=$((fail+1))
+fi
+
+# (g) "error" key present but no "error.code": nonzero exit, ambiguous error shape.
+run_case 'echo "{\"error\":{\"summary\":\"something broke\"}}"
+exit 1'
+check "(g) missing error.code fails closed (nonzero)" 1 $?
+if printf '%s' "$OUT" | grep -qF "did not return npm"; then
+  echo "  PASS:   -> diagnostic distinguishes lookup failure from availability"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> no distinguishing diagnostic in output"; fail=$((fail+1))
+fi
 
 echo "=== $pass passed, $fail failed ==="
 [ "$fail" -eq 0 ]

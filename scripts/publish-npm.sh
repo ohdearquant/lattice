@@ -84,9 +84,12 @@ check_version_available() {
     pkgdir="$1"
     name=$(node -p "require('$pkgdir/package.json').name")
     version=$(node -p "require('$pkgdir/package.json').version")
-    view_out=$(npm view "$name@$version" version --json 2>/dev/null)
-    view_status=$?
-    if [ "$view_status" -eq 0 ]; then
+    # The lookup's nonzero status must not trigger errexit -- it is not an
+    # error, it's the "not found" signal this function exists to interpret.
+    # A standalone `view_out=$(...)` assignment IS itself a failed command
+    # under set -e, so the failure has to land inside an `if` condition
+    # instead, where errexit does not apply.
+    if view_out=$(npm view "$name@$version" version --json 2>/dev/null); then
         echo "ERROR: $name@$version is already published on npm and cannot be republished." >&2
         echo "       npm name@version tuples are immutable. Bump the version in" >&2
         echo "       $pkgdir/package.json (and every sibling package that must move in" >&2
@@ -138,6 +141,14 @@ for pkgdir in $PLATFORM_DIRS; do
     ( cd "$pkgdir" && npm publish --dry-run )
 done
 ( cd "$NATIVE_DIR" && npm publish --dry-run )
+
+# `npm publish --dry-run` above packs the main package but never examines
+# its contents -- it only proves the tarball builds, not that the tarball's
+# contents are correct. `npm run packlist` (npm/lattice-embed-native's own
+# assert-packlist.mjs) is the purpose-built content guard for this package,
+# in the same shape the platform packages already get from
+# assert-platform-packlist.mjs in npm-prebuild.yml's package job.
+( cd "$NATIVE_DIR" && npm run packlist )
 echo "Preflight OK."
 
 if [ "$MODE" = "dry-run" ]; then
