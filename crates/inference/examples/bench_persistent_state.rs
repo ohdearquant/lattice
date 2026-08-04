@@ -11,6 +11,7 @@
 ///   LATTICE_MODEL_DIR=~/.lattice/models/qwen3.6-27b-q4 \
 ///   LATTICE_TOKENIZER_DIR=~/.lattice/models/qwen3.6-27b \
 ///   cargo run --release --example bench_persistent_state -p lattice-inference --features "f16,metal-gpu"
+#[allow(clippy::field_reassign_with_default)]
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
@@ -62,17 +63,15 @@ fn run() {
 
     let im_end_id = tokenizer.special_token_id("<|im_end|>").unwrap_or(151645);
     // Deterministic config from spec §6 — do not change for valid before/after comparison.
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 16,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![im_end_id],
-        enable_thinking: false,
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 16;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.top_p = 1.0;
+    gen_cfg.repetition_penalty = 1.0;
+    gen_cfg.seed = Some(1);
+    gen_cfg.stop_token_ids = vec![im_end_id];
+    gen_cfg.enable_thinking = false;
     let system_msg = ChatMessage::system("You are a helpful assistant. Be concise.");
 
     // Warmup: one full 3-turn conversation to prime Metal GPU kernels and cache.

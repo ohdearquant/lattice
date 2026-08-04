@@ -1,4 +1,5 @@
 //! Debug diagnostic for Qwen3.5-2B — checks each stage of the forward pass.
+#![allow(clippy::field_reassign_with_default)]
 
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_inference::tokenizer::common::Tokenizer;
@@ -36,12 +37,10 @@ fn main() {
     println!("Expected:  [760, 6511, 314, 9338, 369]");
 
     // Run generate with temperature 0 (greedy)
-    let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-        max_new_tokens: 16,
-        temperature: 0.0,
-        top_k: 1,
-        ..Default::default()
-    };
+    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    gen_cfg.max_new_tokens = 16;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
 
     println!("\nGenerating (greedy, 16 tokens)...");
     match model.generate(prompt, &gen_cfg) {

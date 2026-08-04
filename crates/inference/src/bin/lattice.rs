@@ -10,6 +10,7 @@
 //!   --calibration-corpus calibration.txt --validation-corpus validation.txt \
 //!   --prune-layers 4 --output lattice_pruning.json
 //! ```
+#![allow(clippy::field_reassign_with_default)]
 
 use clap::{Parser, Subcommand};
 
@@ -2460,11 +2461,9 @@ fn run_chat(model_path: &str, max_tokens: usize, temperature: f32, tokenizer_dir
     };
     eprintln!("Model loaded. Type 'exit' or 'quit' to stop.\n");
 
-    let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-        max_new_tokens: max_tokens,
-        temperature,
-        ..Default::default()
-    };
+    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_tokens;
+    gen_cfg.temperature = temperature;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -3628,15 +3627,13 @@ mod serve {
             || state.model.max_context(),
         )?;
 
-        let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-            max_new_tokens: max_tokens,
-            temperature,
-            top_p,
-            seed,
-            stop_strings,
-            logprobs,
-            ..Default::default()
-        };
+        let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+        gen_cfg.max_new_tokens = max_tokens;
+        gen_cfg.temperature = temperature;
+        gen_cfg.top_p = top_p;
+        gen_cfg.seed = seed;
+        gen_cfg.stop_strings = stop_strings;
+        gen_cfg.logprobs = logprobs;
 
         // Metal-only: reuse the exact messages normalized alongside the CPU
         // prompt, so role/content validation and allocation happen once.
@@ -6624,17 +6621,14 @@ mod serve {
             /// `GenerateConfig::default()` -- exactly like production's own
             /// `..Default::default()` tail.
             fn expected_gen_cfg() -> GenerateConfigSnapshot {
-                GenerateConfigSnapshot::from(
-                    &lattice_inference::model::qwen35_config::GenerateConfig {
-                        max_new_tokens: 9,
-                        temperature: 1.3,
-                        top_p: 0.55,
-                        seed: Some(7),
-                        stop_strings: vec![],
-                        logprobs: None,
-                        ..Default::default()
-                    },
-                )
+                let mut cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+                cfg.max_new_tokens = 9;
+                cfg.temperature = 1.3;
+                cfg.top_p = 0.55;
+                cfg.seed = Some(7);
+                cfg.stop_strings = vec![];
+                cfg.logprobs = None;
+                GenerateConfigSnapshot::from(&cfg)
             }
 
             #[tokio::test]
