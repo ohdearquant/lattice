@@ -113,7 +113,11 @@ set -euo pipefail
 # this script needs the caller's index state.
 unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
 
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+if ! REPO="$(cd "$(dirname "$0")/../.." && pwd)"; then
+  printf 'bench-compare-impl: FATAL: cannot resolve the repository root from %s (the ' "$0" >&2 || :
+  printf 'directory was removed or is unreachable). Refusing to continue.\n' >&2 || :
+  exit 2
+fi
 QUICK_FLAGS="--quick"  # adaptive two-point samples in each of four ABBA arms
 RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 if [ -n "${BENCH_HOST_ID:-}" ]; then
@@ -259,9 +263,16 @@ quiet_gate() {
 }
 
 if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
-  mkdir -p "$PERF_POSTMERGE_STATUS_DIR"
+  if ! mkdir -p "$PERF_POSTMERGE_STATUS_DIR"; then
+    printf 'bench-compare: FATAL: cannot create PERF_POSTMERGE_STATUS_DIR %s\n' \
+      "$PERF_POSTMERGE_STATUS_DIR" >&2 || :
+    exit 2
+  fi
   AMBIENT_SAMPLES_FILE="$PERF_POSTMERGE_STATUS_DIR/ambient-samples.jsonl"
-  : > "$AMBIENT_SAMPLES_FILE"
+  if ! { : > "$AMBIENT_SAMPLES_FILE"; } 2>/dev/null; then
+    printf 'bench-compare: FATAL: cannot create %s\n' "$AMBIENT_SAMPLES_FILE" >&2 || :
+    exit 2
+  fi
 fi
 BASE_REF="${1:-origin/main}"
 HEAD_REF="${2:-HEAD}"

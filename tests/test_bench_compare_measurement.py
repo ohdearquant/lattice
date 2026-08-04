@@ -737,6 +737,101 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stderr:\n{result.stderr}")
         self.assertIn("FATAL", result.stderr)
 
+    def test_inner_root_resolution_failure_is_not_a_confirmed_regression(self):
+        """The measurement body's own root resolution must not leak raw exit 1.
+
+        scripts/lib/bench-compare-impl.sh resolves its own repository root via
+        an unguarded `REPO="$(cd "$(dirname "$0")/../.." && pwd)"` before doing
+        anything else. This is the merged entry route's own inner boundary,
+        distinct from scripts/bench-compare.sh's outer resolution already
+        covered above -- the outer script's own guard does not protect this
+        body when it (or a caller bypassing the entry point) invokes it with a
+        $0 whose parent has disappeared.
+
+        Reproduced deterministically the same way as the outer case: bash gets
+        the body's own source on the command line with $0 set to a path whose
+        parent never existed.
+
+        Mutation-sensitive: revert the guard around the REPO= assignment in
+        bench-compare-impl.sh and this run's exit code flips from 2 to a raw 1
+        (or an unhandled `set -e` abort), never a controlled refusal.
+        """
+        impl_body = (LIB / "bench-compare-impl.sh").read_text()
+        fake_path = (
+            "/tmp/lattice-inner-root-resolution-never-existed/"
+            "scripts/lib/bench-compare-impl.sh"
+        )
+        result = subprocess.run(
+            ["bash", "-c", impl_body, fake_path],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            result.returncode, 2,
+            "inner repository-root resolution failure must exit 2 (input/"
+            "instrumentation error), never a raw 1 (confirmed regression); "
+            f"got {result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+
+    def test_perf_postmerge_status_dir_regular_file_refuses_with_exit_2(self):
+        """The postmerge status-directory setup must not leak raw exit 1.
+
+        bench-compare-impl.sh creates $PERF_POSTMERGE_STATUS_DIR and truncates
+        an ambient-samples file inside it before any worktree or benchmark
+        exists. A regular file occupying that path makes `mkdir -p` fail with
+        an unnormalized exit 1 under `set -e`.
+
+        Mutation-sensitive: revert the `if ! mkdir -p ...; then ... fi` guard
+        around $PERF_POSTMERGE_STATUS_DIR and this run's exit code flips from
+        2 to 1.
+        """
+        with tempfile.TemporaryDirectory() as status_tmp:
+            status_dir = Path(status_tmp) / "postmerge-status"
+            status_dir.write_text("occupied")
+            result = _run(
+                ["--fail-on-regression"],
+                extra_env={"PERF_POSTMERGE_STATUS_DIR": str(status_dir)},
+            )
+        self.assertEqual(
+            result.returncode, 2,
+            "a pre-measurement instrumentation failure must exit 2 (input/"
+            "instrumentation error), never 1 (confirmed regression); got "
+            f"{result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+        self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
+    def test_perf_postmerge_status_dir_nonwritable_refuses_with_exit_2(self):
+        """A non-writable (but existing) status directory must also exit 2.
+
+        `mkdir -p` on an existing directory succeeds regardless of write
+        permission, so the ambient-samples file truncation is the operation
+        that actually fails here -- a second, independent failure point in
+        the same setup block.
+
+        Mutation-sensitive: revert the guard around the
+        `: > "$AMBIENT_SAMPLES_FILE"` truncation and this run's exit code
+        flips from 2 to 1.
+        """
+        with tempfile.TemporaryDirectory() as status_tmp:
+            status_dir = Path(status_tmp) / "postmerge-status"
+            status_dir.mkdir()
+            status_dir.chmod(0o555)
+            try:
+                result = _run(
+                    ["--fail-on-regression"],
+                    extra_env={"PERF_POSTMERGE_STATUS_DIR": str(status_dir)},
+                )
+            finally:
+                status_dir.chmod(0o755)
+        self.assertEqual(
+            result.returncode, 2,
+            "a pre-measurement instrumentation failure must exit 2 (input/"
+            "instrumentation error), never 1 (confirmed regression); got "
+            f"{result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+        self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
     def test_enforcing_mode_refuses_a_run_that_measured_nothing(self):
         """A bench that exits 0 having printed no measurement must not certify.
 

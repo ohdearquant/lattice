@@ -241,24 +241,33 @@ def main() -> int:
     if not cmd:
         ap.error("no command given after --")
 
-    os.makedirs(PENDING_DIR, exist_ok=True)
     marker = os.path.join(PENDING_DIR, str(os.getpid()))
     dispositions: list[str] = []
     fds: list[int] = []
     try:
-        with open(marker, "w") as fh:
-            fh.write(args.label + "\n")
+        try:
+            os.makedirs(PENDING_DIR, exist_ok=True)
+            with open(marker, "w") as fh:
+                fh.write(args.label + "\n")
 
-        for path, name in ((BENCH_WINDOW, "bench-window"), (GPU_LOCK, "Metal GPU")):
-            fd, how = acquire(path, name)
-            fds.append(fd)
-            dispositions.append(f"{name} ({path}): {how}")
+            for path, name in (
+                (BENCH_WINDOW, "bench-window"),
+                (GPU_LOCK, "Metal GPU"),
+            ):
+                fd, how = acquire(path, name)
+                fds.append(fd)
+                dispositions.append(f"{name} ({path}): {how}")
 
-        os.makedirs(os.path.dirname(os.path.abspath(args.status_file)), exist_ok=True)
-        with open(args.status_file, "w") as fh:
-            fh.write(f"supervisor_pid={os.getpid()}\n")
-            for line in dispositions:
-                fh.write(f"lock={line}\n")
+            os.makedirs(
+                os.path.dirname(os.path.abspath(args.status_file)), exist_ok=True
+            )
+            with open(args.status_file, "w") as fh:
+                fh.write(f"supervisor_pid={os.getpid()}\n")
+                for line in dispositions:
+                    fh.write(f"lock={line}\n")
+        except OSError as exc:
+            _log(f"cannot prepare bench-lock setup: {exc}; refusing to measure")
+            return REFUSAL_EXIT
 
         if args.pass_lock_fds:
             child_env = os.environ.copy()

@@ -925,6 +925,117 @@ class AmbientLoadGate(unittest.TestCase):
             )
 
 
+class PreMeasurementSetupFailures(unittest.TestCase):
+    """A setup failure before any lock or measurement must exit 2, not 1.
+
+    scripts/lib/bench_supervision.py's status-directory mkdir and
+    scripts/lib/bench-locks.py's pending-marker mkdir both run before any
+    lock is held or any measurement command starts. An uncaught FileExistsError
+    there used to escape as Python's raw exit 1 -- the status this contract
+    reserves for a confirmed regression.
+    """
+
+    def test_supervision_status_dir_regular_file_refuses_with_exit_2(self):
+        """Mutation-sensitive: revert the try/except around ``status.parent.mkdir``
+        in bench_supervision.py's run_supervised and this run's exit code flips
+        from 2 to an uncaught-traceback 1."""
+        with _Sandbox() as sb:
+            cache_dir = sb.root / ".cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            (cache_dir / "bench-supervision").write_text("occupied")
+            helper = sb.root / "scripts" / "lib" / "bench_supervision.py"
+            r = subprocess.run(
+                [sys.executable, str(helper), "run", "--label", "bench-compare",
+                 "--", "/usr/bin/true"],
+                capture_output=True, text=True, cwd=str(sb.root), timeout=30)
+            self.assertEqual(
+                r.returncode, 2,
+                f"expected exit 2 (setup failure), got {r.returncode}\n"
+                f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
+            self.assertIn("cannot create", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_pending_marker_regular_file_refuses_with_exit_2(self):
+        """Mutation-sensitive: revert the try/except around the setup block
+        (PENDING_DIR mkdir through the status-file write) in bench-locks.py's
+        main() and this run's exit code flips from 2 to an uncaught-traceback 1.
+        """
+        with _Sandbox() as sb:
+            locks_path = sb.root / "scripts" / "lib" / "bench-locks.py"
+            match = re.search(r'^PENDING_DIR = "([^"]*)"$', locks_path.read_text(), re.M)
+            self.assertIsNotNone(match, "PENDING_DIR constant not found")
+            pending_dir = Path(match.group(1))
+            pending_dir.parent.mkdir(parents=True, exist_ok=True)
+            pending_dir.write_text("occupied")
+            status_file = sb.root.parent / "bench-locks-status-test.txt"
+            r = subprocess.run(
+                [sys.executable, str(locks_path), "--label", "test",
+                 "--status-file", str(status_file), "--", "/usr/bin/true"],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                r.returncode, 2,
+                f"expected exit 2 (setup failure), got {r.returncode}\n"
+                f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
+            self.assertIn("cannot prepare bench-lock setup", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+
+class SupervisionShellHelperFailures(unittest.TestCase):
+    """scripts/lib/bench-supervision.sh's helpers must not leak a raw exit 1.
+
+    Both bench_supervise_entry and bench_quiet_checkpoint resolve their own
+    repo root via an unguarded ``cd "$(dirname "${BASH_SOURCE[0]}")/../.."``
+    and, on refusal, write a FATAL diagnostic to fd 2 before their explicit
+    ``exit 2``. Under a caller's `set -e` (every real caller has one), a
+    failing root resolution or a closed-stderr diagnostic write is itself a
+    failing command and aborts with the shell's own exit 1 before the
+    explicit ``exit 2`` is ever reached.
+    """
+
+    def _call(self, function_call: str, *, argv0: str) -> subprocess.CompletedProcess:
+        helper_body = (LIB / "bench-supervision.sh").read_text()
+        script = f"set -e\n{helper_body}\n{function_call}\n"
+        return subprocess.run(
+            ["bash", "-c", script, argv0],
+            capture_output=True, text=True, timeout=30)
+
+    def test_root_resolution_failure_exits_2(self):
+        """Mutation-sensitive: revert the `if ! repo=... ; then ... fi` guard
+        around either `cd` in bench-supervision.sh and this run's exit code
+        flips from 2 to a raw 1 (or an unhandled `set -e` abort)."""
+        fake_source = (
+            "/tmp/lattice-bench-supervision-root-never-existed/"
+            "scripts/lib/bench-supervision.sh"
+        )
+        r = self._call('bench_quiet_checkpoint test-label', argv0=fake_source)
+        self.assertEqual(
+            r.returncode, 2,
+            f"expected exit 2, got {r.returncode}\nstdout:\n{r.stdout}\n"
+            f"stderr:\n{r.stderr}")
+        self.assertIn("FATAL", r.stderr)
+
+    def test_closed_stderr_diagnostic_still_exits_2(self):
+        """Mutation-sensitive: drop the `|| :` from the FATAL echo in
+        bench_quiet_checkpoint and this closed-stderr run flips from 2 to 1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            (root / "scripts" / "lib").mkdir(parents=True)
+            shutil.copy2(LIB / "bench-supervision.sh", root / "scripts" / "lib")
+            (root / "scripts" / "lib" / "quiet-probe.py").write_text(
+                "#!/usr/bin/env python3\nraise SystemExit(1)\n"
+            )
+            script = (
+                'set -e\n'
+                f'source "{root / "scripts" / "lib" / "bench-supervision.sh"}"\n'
+                'bench_quiet_checkpoint "closed-stderr-test" 2>&-\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            r.returncode, 2,
+            f"expected exit 2, got {r.returncode}\nstdout:\n{r.stdout}")
+
+
 def load_tests(
     loader: unittest.TestLoader,
     tests: unittest.TestSuite,

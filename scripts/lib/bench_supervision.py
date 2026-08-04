@@ -247,7 +247,15 @@ def run_supervised(
 
     if STATUS_ENV not in os.environ:
         status = _status_path(label)
-        status.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            status.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            print(
+                f"bench-supervision: cannot create {status.parent}: {exc}; "
+                "refusing to measure",
+                file=sys.stderr,
+            )
+            return REFUSAL_EXIT
         env = os.environ.copy()
         env[STATUS_ENV] = str(status)
         if quiet:
