@@ -249,48 +249,58 @@ class PerfBenchGateStatusTests(unittest.TestCase):
             self.assertEqual(payload["exit_code"], 2)
             self.assertIn("NO COVERAGE", payload["reason"])
 
-    def test_root_level_new_estimates_ignored_in_report_only_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            criterion = _criterion_root(root, "pass", 0.0)
-            # Root-level debris: a bare `cargo bench` (or stray output) can
-            # write new/estimates.json directly under the Criterion root,
-            # with no benchmark directory above it.
-            (criterion / "new").mkdir(parents=True)
-            (criterion / "new" / "estimates.json").write_text(
-                '{"mean":{"point_estimate":100.0}}\n'
-            )
+    def test_root_level_estimates_ignored_in_report_only_mode(self) -> None:
+        # Root-level debris: a bare `cargo bench` (or stray output) can write
+        # new/estimates.json OR change/estimates.json directly under the
+        # Criterion root, with no benchmark directory above it. Both the
+        # head-side (new/) and change-side (change/) artifact names must be
+        # excluded the same way.
+        for debris_name in ("new", "change"):
+            with self.subTest(debris_name=debris_name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    criterion = _criterion_root(root, "pass", 0.0)
+                    (criterion / debris_name).mkdir(parents=True)
+                    (criterion / debris_name / "estimates.json").write_text(
+                        '{"mean":{"point_estimate":100.0}}\n'
+                    )
 
-            result = subprocess.run(
-                ["python3", str(GATE), str(criterion), "fixture/report-only"],
-                text=True,
-                capture_output=True,
-            )
+                    result = subprocess.run(
+                        ["python3", str(GATE), str(criterion), "fixture/report-only"],
+                        text=True,
+                        capture_output=True,
+                    )
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn("Traceback", result.stderr)
-            self.assertNotIn("is not below a Criterion benchmark directory", result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn(
+                        "is not below a Criterion benchmark directory", result.stderr
+                    )
 
-    def test_root_level_new_estimates_ignored_with_status_out(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            criterion = _criterion_root(root, "pass", 0.0)
-            (criterion / "new").mkdir(parents=True)
-            (criterion / "new" / "estimates.json").write_text(
-                '{"mean":{"point_estimate":100.0}}\n'
-            )
+    def test_root_level_estimates_ignored_with_status_out(self) -> None:
+        for debris_name in ("new", "change"):
+            with self.subTest(debris_name=debris_name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    criterion = _criterion_root(root, "pass", 0.0)
+                    (criterion / debris_name).mkdir(parents=True)
+                    (criterion / debris_name / "estimates.json").write_text(
+                        '{"mean":{"point_estimate":100.0}}\n'
+                    )
 
-            samples = root / "ambient.jsonl"
-            _samples(samples, {phase: 95.0 for phase in PHASES})
-            status = root / "status.json"
-            result = _run(criterion, samples, status, "lattice-inference:fixture")
+                    samples = root / "ambient.jsonl"
+                    _samples(samples, {phase: 95.0 for phase in PHASES})
+                    status = root / "status.json"
+                    result = _run(criterion, samples, status, "lattice-inference:fixture")
 
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertNotIn("Traceback", result.stderr)
-            self.assertTrue(status.exists(), "status file must be written even with root debris")
-            payload = json.loads(status.read_text())
-            self.assertEqual(payload["verdict"], "pass")
-            self.assertEqual(payload["exit_code"], 0)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertTrue(
+                        status.exists(), "status file must be written even with root debris"
+                    )
+                    payload = json.loads(status.read_text())
+                    self.assertEqual(payload["verdict"], "pass")
+                    self.assertEqual(payload["exit_code"], 0)
 
     def test_non_voting_phase_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
