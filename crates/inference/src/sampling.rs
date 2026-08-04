@@ -111,9 +111,6 @@ pub struct SamplingConfig {
     pub top_k: usize,
     /// Top-p (nucleus): keep tokens whose cumulative probability <= p. 1.0 = disabled.
     pub top_p: f32,
-    /// Min-p: keep tokens with probability at least `min_p * max_probability`.
-    /// 0.0 or NaN = disabled; all other values clamp to `[0.0, 1.0]`.
-    pub min_p: f32,
     /// Repetition penalty multiplier. 1.0 = no penalty.
     pub repetition_penalty: f32,
 }
@@ -124,7 +121,6 @@ impl Default for SamplingConfig {
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
-            min_p: 0.0,
             repetition_penalty: 1.1,
         }
     }
@@ -137,7 +133,6 @@ impl SamplingConfig {
             temperature: 0.0,
             top_k: 1,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 1.0,
         }
     }
@@ -444,6 +439,12 @@ impl Rng {
 /// **Unstable**: stateful sampler; implementation and state fields may change.
 pub struct Sampler {
     config: SamplingConfig,
+    /// Min-p: keep tokens with probability at least `min_p * max_probability`.
+    /// 0.0 or NaN = disabled; all other values clamp to `[0.0, 1.0]`. Carried
+    /// out-of-band from `SamplingConfig` (which is exhaustively constructible
+    /// through the public API at published `0.7.1`, so it cannot gain a field
+    /// without a major break); set via [`with_min_p`](Self::with_min_p).
+    min_p: f32,
     rng: Rng,
     /// Token IDs seen since the last `reset`: prompt tokens (from `seed_history`)
     /// followed by all generated tokens.  Full history is retained for repetition penalty.
@@ -471,6 +472,7 @@ impl Sampler {
             .unwrap_or(0x853c_49e6_748f_ea9b);
         Self {
             config,
+            min_p: 0.0,
             rng: Rng::new(seed),
             recent_tokens: Vec::new(),
             penalty_seen: std::collections::HashSet::new(),
@@ -483,6 +485,12 @@ impl Sampler {
     /// **Unstable**: set PRNG seed for reproducible sampling.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.rng = Rng::new(seed);
+        self
+    }
+
+    /// **Unstable**: set min-p (relative-probability floor). 0.0 = disabled.
+    pub fn with_min_p(mut self, min_p: f32) -> Self {
+        self.min_p = min_p;
         self
     }
 
@@ -577,7 +585,7 @@ impl Sampler {
         };
         let r = self.rng.next_f32();
         let token = cs.sample_min_p_top_p_with_scratch(
-            self.config.min_p,
+            self.min_p,
             self.config.top_p,
             r,
             &mut self.prob_scratch,
@@ -665,6 +673,7 @@ pub(crate) fn sample_full_logits(
     cfg: &GenerateConfig,
     previous_ids: &[u32],
     rng_state: &mut u64,
+    min_p: f32,
 ) -> u32 {
     FULL_LOGIT_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();
@@ -737,7 +746,7 @@ pub(crate) fn sample_full_logits(
             candidates: std::mem::take(candidate_scratch),
         };
         let r = uniform_f32_from_u64(xorshift64_next(rng_state));
-        let token = cs.sample_min_p_top_p_with_scratch(cfg.min_p, cfg.top_p, r, prob_scratch);
+        let token = cs.sample_min_p_top_p_with_scratch(min_p, cfg.top_p, r, prob_scratch);
         *candidate_scratch = cs.candidates; // restore scratch capacity
         token
     })
@@ -1315,7 +1324,6 @@ mod tests {
                 temperature: bad,
                 top_k: 2,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1333,7 +1341,6 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(0x5eed_f00d_1234_5678);
@@ -1359,7 +1366,6 @@ mod tests {
                 temperature: tiny,
                 top_k: 2,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1419,7 +1425,6 @@ mod tests {
                 temperature: band,
                 top_k: 2,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
             };
             let mut sampler = Sampler::new(config).with_seed(7);
@@ -1493,7 +1498,6 @@ mod tests {
             temperature: 1.0,
             top_k: 2,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(123);
@@ -1518,7 +1522,6 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 0,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 100.0, // very strong penalty
         };
         let mut sampler = Sampler::new(config);
@@ -1543,7 +1546,6 @@ mod tests {
             temperature: 0.0, // greedy fast path
             top_k: 0,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 0.5, // < 1.0 boosts recent tokens
         };
         let mut sampler = Sampler::new(config);
@@ -1567,7 +1569,6 @@ mod tests {
             temperature: 0.0, // greedy fast path
             top_k: 0,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 0.5, // < 1.0 boosts recent tokens
         };
         let mut sampler = Sampler::new(config);
@@ -1586,7 +1587,6 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 0.5,
-            min_p: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(456);
@@ -1673,10 +1673,10 @@ mod tests {
                 temperature: 2.0,
                 top_k: 2,
                 top_p: 0.9,
-                min_p: 0.7,
                 repetition_penalty: 4.0,
             })
-            .with_seed(seed);
+            .with_seed(seed)
+            .with_min_p(0.7);
             sampler.seed_history(&[0]);
             let token = sampler.sample(&logits);
             assert_ne!(
@@ -1703,24 +1703,19 @@ mod tests {
     #[test]
     fn min_p_interacts_with_penalty_temperature_top_k_and_top_p() {
         let logits = [8.0, 3.0, 0.0];
-        let config_min_p_on = SamplingConfig {
+        let config = SamplingConfig {
             temperature: 2.0,
             top_k: 2,
             top_p: 0.9,
-            min_p: 0.7,
             repetition_penalty: 4.0,
-        };
-        let config_min_p_off = SamplingConfig {
-            min_p: 0.0,
-            ..config_min_p_on
         };
 
         for seed in [0x1234_5678_9abc_def0, 0x9e37_79b9_7f4a_7c15] {
-            let mut sampler_on = Sampler::new(config_min_p_on.clone()).with_seed(seed);
+            let mut sampler_on = Sampler::new(config.clone()).with_seed(seed).with_min_p(0.7);
             sampler_on.seed_history(&[0]);
             let token_on = sampler_on.sample(&logits);
 
-            let mut sampler_off = Sampler::new(config_min_p_off.clone()).with_seed(seed);
+            let mut sampler_off = Sampler::new(config.clone()).with_seed(seed).with_min_p(0.0);
             sampler_off.seed_history(&[0]);
             let token_off = sampler_off.sample(&logits);
 
@@ -2318,7 +2313,6 @@ mod tests {
             temperature: 1.0,
             top_k: 0,   // disabled
             top_p: 1.0, // disabled
-            min_p: 0.0, // disabled
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config).with_seed(42);
@@ -2449,7 +2443,6 @@ mod tests {
             temperature: 0.0,
             top_k: 1,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 2.0,
         })
         .with_seed(1);
@@ -2504,7 +2497,6 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2531,7 +2523,6 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2566,7 +2557,6 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 1,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 2.0,
         };
         let mut sampler = Sampler::new(config).with_seed(1);
@@ -2841,7 +2831,6 @@ mod tests {
             temperature: 0.7,
             top_k: 40,
             top_p: 0.9,
-            min_p: 0.0,
             repetition_penalty: 1.1,
         };
         let gen_cfg = GenerateConfig {
@@ -2875,6 +2864,7 @@ mod tests {
                 &gen_cfg,
                 &previous_ids,
                 &mut rng_after,
+                0.0,
             ));
         }
         let after_elapsed = after_start.elapsed();

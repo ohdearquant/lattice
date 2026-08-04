@@ -125,7 +125,6 @@ mod route_predicate_tests {
             temperature: 0.0,
             top_k: 1,
             top_p: 1.0,
-            min_p: 0.0,
             repetition_penalty: 1.0,
             seed: Some(42),
             stop_token_ids: vec![],
@@ -294,7 +293,7 @@ mod route_predicate_tests {
             ..greedy_gen_cfg(vec![])
         };
         let mut rng = 7u64;
-        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng);
+        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng, 0.0);
         assert_eq!(
             canonical, 1,
             "sample_token must penalize the previously-seen argmax enough to \
@@ -10707,6 +10706,21 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
+        // `GenerateConfig` cannot carry `min_p` (it is exhaustively
+        // constructible through the public API at published `0.7.1`; adding
+        // any field is a major break -- see
+        // `crate::sampling::Sampler::with_min_p`), and no production entry
+        // point sets it yet, so this path is always disabled.
+        sample_from_candidates_impl(candidates, cfg, previous_ids, rng_state, 0.0)
+    }
+
+    fn sample_from_candidates_impl(
+        candidates: &[crate::sampling::Candidate],
+        cfg: &GenerateConfig,
+        previous_ids: &[u32],
+        rng_state: &mut u64,
+        min_p: f32,
+    ) -> u32 {
         use crate::sampling::CandidateSet;
         let mut cs = CandidateSet::from_candidates(candidates.to_vec());
 
@@ -10726,12 +10740,12 @@ mod inner {
         // worst-probability token. Route through the canonical [0, 1) helper
         // (provably < 1.0), matching the CPU sampling path.
         let r = crate::sampling::uniform_f32_from_u64(raw);
-        cs.sample_min_p_top_p(cfg.min_p, cfg.top_p, r)
+        cs.sample_min_p_top_p(min_p, cfg.top_p, r)
     }
 
     #[cfg(test)]
     mod min_p_compact_sampling_tests {
-        use super::{GenerateConfig, sample_from_candidates};
+        use super::{GenerateConfig, sample_from_candidates_impl};
         use crate::sampling::Candidate;
 
         #[test]
@@ -10746,10 +10760,9 @@ mod inner {
                     logit: 0.49_f32.ln(),
                 },
             ];
-            let mut disabled = GenerateConfig {
+            let disabled = GenerateConfig {
                 temperature: 1.0,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 ..Default::default()
             };
@@ -10758,16 +10771,21 @@ mod inner {
             for seed in [0x1234_5678_9abc_def0, 0xabad_1dea_dead_beef] {
                 let mut control_rng = seed;
                 saw_tail_without_min_p |=
-                    sample_from_candidates(&candidates, &disabled, &[], &mut control_rng) == 8;
+                    sample_from_candidates_impl(&candidates, &disabled, &[], &mut control_rng, 0.0)
+                        == 8;
 
-                disabled.min_p = 0.5;
                 let mut filtered_rng = seed;
                 assert_eq!(
-                    sample_from_candidates(&candidates, &disabled, &[], &mut filtered_rng),
+                    sample_from_candidates_impl(
+                        &candidates,
+                        &disabled,
+                        &[],
+                        &mut filtered_rng,
+                        0.5,
+                    ),
                     7,
                     "compact Metal candidates below min_p * max_probability must be removed"
                 );
-                disabled.min_p = 0.0;
             }
 
             assert!(
@@ -10805,7 +10823,7 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
+        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0)
     }
 
     /// Signpost-traced sampling shared by every autoregressive decode loop's
@@ -17011,7 +17029,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -28139,7 +28156,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28179,7 +28195,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28211,7 +28226,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..32u32).collect(),
@@ -28257,7 +28271,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28300,7 +28313,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28355,7 +28367,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: (0..cfg.vocab_size as u32).collect(),
@@ -28407,7 +28418,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -28554,7 +28564,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -28631,7 +28640,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -28711,7 +28719,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(7),
                 stop_token_ids: vec![],
@@ -28790,7 +28797,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -28883,7 +28889,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -28977,7 +28982,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29080,7 +29084,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29370,7 +29373,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -29440,7 +29442,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 logprobs: None,
@@ -29523,7 +29524,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 logprobs: None,
@@ -29609,7 +29609,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -29681,7 +29680,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29729,7 +29727,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29777,7 +29774,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(42),
                 stop_token_ids: vec![],
@@ -29833,7 +29829,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -29890,7 +29885,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -29956,7 +29950,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -30057,7 +30050,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(7),
                 stop_token_ids: vec![],
@@ -32871,7 +32863,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(seed),
                 stop_token_ids: vec![],
@@ -34585,7 +34576,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -34643,7 +34633,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -34715,7 +34704,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -34787,7 +34775,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -35072,7 +35059,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -35860,7 +35846,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -35906,7 +35891,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -35963,7 +35947,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36028,7 +36011,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36322,7 +36304,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36377,7 +36358,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
@@ -36443,7 +36423,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
-                min_p: 0.0,
                 repetition_penalty: 1.0,
                 seed: Some(1),
                 stop_token_ids: vec![],
