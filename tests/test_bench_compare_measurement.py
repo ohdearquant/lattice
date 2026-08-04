@@ -902,6 +902,51 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertIn("FATAL", result.stderr)
         self.assertNotIn("gate reported a confirmed regression", result.stderr)
 
+    def test_perf_postmerge_status_filename_strips_colon_and_slash(self):
+        """The gate-status filename derived from a bench target must contain
+        neither ':' nor '/': actions/upload-artifact rejects both, and
+        uploading "lattice-embed:simd.json" fails the run with "Contains the
+        following character: Colon :".
+
+        A bracket expression bash never closes (`[:\\/]` -- `[:` opens a
+        POSIX character-class token with no matching `:]`) matches nothing,
+        so the substitution silently no-ops and the colon survives all the
+        way to the upload step. This asserts the OUTPUT the fix must
+        produce, not that the substitution merely ran: a no-op substitution
+        exits 0 and prints a string too, so only the produced characters
+        can tell the two apart.
+
+        Mutation-sensitive: revert the substitution to `[:\\/]` and this
+        fails because ':' (and, on the slash fixture, '/') survive in the
+        printed filename.
+        """
+        impl_source = (REPO / "scripts" / "lib" / "bench-compare-impl.sh").read_text()
+        sanitizer_line = next(
+            line.strip() for line in impl_source.splitlines()
+            if line.strip().startswith("local status_name=")
+        )
+        for target in ("lattice-embed:simd", "lattice-inference/elementwise"):
+            script = (
+                'set -euo pipefail\n'
+                f'target="{target}"\n'
+                f'f() {{ {sanitizer_line}; printf "%s" "$status_name"; }}\n'
+                'f\n'
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=10)
+            self.assertEqual(
+                result.returncode, 0,
+                f"sanitizer line failed for target {target!r}: {result.stderr}")
+            produced = result.stdout
+            self.assertNotIn(
+                ":", produced,
+                f"status filename retains a colon for target {target!r}: "
+                f"{produced!r} -- actions/upload-artifact rejects this path")
+            self.assertNotIn(
+                "/", produced,
+                f"status filename retains a slash for target {target!r}: "
+                f"{produced!r} -- this would be read as a subdirectory")
+
     def test_enforcing_mode_refuses_a_run_that_measured_nothing(self):
         """A bench that exits 0 having printed no measurement must not certify.
 

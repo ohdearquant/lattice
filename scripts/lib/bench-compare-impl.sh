@@ -937,7 +937,7 @@ run_target_gate() {
       --require-provenance
     )
     if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
-      local status_name="${target//[:\\/]/-}"
+      local status_name="${target//[:\/]/-}"
       gate_args+=(
         --ambient-samples "$AMBIENT_SAMPLES_FILE"
         --status-out "$PERF_POSTMERGE_STATUS_DIR/$status_name.json"
