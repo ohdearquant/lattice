@@ -52,21 +52,26 @@ pub mod weights;
 
 // Standalone modules
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
-/// and [`generate`].
+/// and [`model`].
 pub mod batch;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
-/// Generic text generation loop and cache-backed forward path. See [`sampling`],
-/// [`kv_cache`], and [`grammar`].
-pub mod generate;
-/// Grammar-constrained decoding and logit masking. See [`generate`] and [`sampling`].
+/// Grammar-constrained decoding and logit masking. See [`model`] and [`sampling`].
 pub mod grammar;
-/// Flat and paged key/value cache implementations. See [`generate`] and [`forward`].
+/// Flat and paged key/value cache implementations. See [`model`] and [`forward`].
 pub mod kv_cache;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
 pub mod lora_hook;
+/// Repository-internal guards shared by Metal tests and measurement targets.
+///
+/// This module is hidden from generated documentation and is not a supported
+/// production API. It is exported because Cargo builds repository integration
+/// tests, benches, examples, and binaries as separate crates.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[doc(hidden)]
+pub mod measurement;
 /// Inference metrics and entropy accumulation. See [`model`].
 pub mod metrics;
 /// Adapter routing and mixture support built on top of [`lora_hook`] and [`sampling`].
@@ -88,7 +93,7 @@ pub mod pruning;
 pub mod quant;
 /// Rotary position embedding tables and application helpers. See [`model`] and [`forward`].
 pub mod rope;
-/// Sampling configuration and token selection helpers. See [`generate`] and [`speculative`].
+/// Sampling configuration and token selection helpers. See [`model`] and [`speculative`].
 pub mod sampling;
 /// Shared HTTP serving contract (error envelope, `finish_reason`, `max_tokens`
 /// zero-rejection, `/v1/models` body) consumed by both the `lattice` unified
@@ -96,9 +101,9 @@ pub mod sampling;
 /// Requires the `serve` feature (axum/tokio/futures).
 #[cfg(feature = "serve")]
 pub mod serve;
-/// N-gram prompt lookup speculative decoding. See [`sampling`] and [`generate`].
+/// N-gram prompt lookup speculative decoding. See [`sampling`] and [`model`].
 pub mod speculative;
-/// Generation stop reason taxonomy; see [`StopReason`] and [`generate`].
+/// Generation stop reason taxonomy; see [`StopReason`] and [`model`].
 pub mod stop_reason;
 
 /// Cross-path sweep (#613): every CPU-family `generate*` entry point agrees on
@@ -150,7 +155,7 @@ pub use crate::model::QwenModel;
 /// BERT pooling strategy selector (mean or CLS). See [`pool`] and [`BertModel`].
 pub use crate::pool::BertPooling;
 /// Reason a generation request stopped (e.g. EOS, max tokens). See [`stop_reason`] and
-/// [`generate`].
+/// [`model`].
 pub use crate::stop_reason::StopReason;
 /// Byte-level BPE tokenizer used by Qwen-family models. See [`Tokenizer`] and [`TokenizedInput`].
 pub use crate::tokenizer::BpeTokenizer;

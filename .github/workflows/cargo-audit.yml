@@ -23,9 +23,9 @@ name: cargo audit
 # ships: `audit` for the root workspace's tracked `Cargo.lock`, and
 # `audit-native` for `npm/lattice-embed-native`, which declares its own
 # single-crate `[workspace]` (see that manifest's header comment) and is
-# gitignored at the repo root's `Cargo.lock` pattern, so it has no tracked
-# lockfile to scan directly. `audit-native` generates one at CI time with
-# `cargo generate-lockfile` and audits that. cargo-audit's config discovery
+# ignored by that directory's own `.gitignore`, so it has no tracked lockfile
+# to scan directly. `audit-native` generates one at CI time with `cargo
+# generate-lockfile` and audits that. cargo-audit's config discovery
 # walks up from the current directory the same way cargo's own config
 # discovery does, so running `cargo audit` from inside
 # npm/lattice-embed-native still picks up the root `.cargo/audit.toml`
@@ -71,30 +71,56 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] || [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
-            CHANGED=$(./scripts/ci-changed-files.sh)
-            echo "Changed files:"
-            echo "$CHANGED"
-            # Two single greps against a here-string, not a `grep | grep -q`
-            # pipe: a downstream `-q` can close its end of a pipe early and
-            # SIGPIPE the upstream producer, which under `pipefail` reports
-            # as the pipeline's exit code instead of the match result
-            # (fail-open on a large diff) — see the matching comment in
-            # ci.yml's `changes` job.
-            MATCH=$(grep -E '(^Cargo\.lock$|^Cargo\.toml$|^crates/.*/Cargo\.toml$|^npm/lattice-embed-native/Cargo\.toml$|^\.cargo/audit\.toml$|^scripts/ci-changed-files\.sh$|^\.github/workflows/cargo-audit\.yml$)' <<<"$CHANGED" || true)
-            if grep -q . <<<"$MATCH"; then
-              echo "deps=true" >> "$GITHUB_OUTPUT"
-              echo "→ dependency-relevant change: audit REQUIRED"
-            else
-              echo "deps=false" >> "$GITHUB_OUTPUT"
-              echo "→ no dependency-relevant change: audit work skipped"
-            fi
-          else
-            # schedule / workflow_dispatch: no event diff to gate on, always audit.
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] || [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "deps=true" >> "$GITHUB_OUTPUT"
-            echo "→ non-diff trigger (${{ github.event_name }}): audit REQUIRED"
+            echo "→ non-diff trigger ($GITHUB_EVENT_NAME): audit REQUIRED"
+            exit 0
+          fi
+          if [[ ! "$CI_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base revision must be a nonempty 40-character hexadecimal commit ID" >&2
+            exit 2
+          fi
+          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "deps=true" >> "$GITHUB_OUTPUT"
+            echo "→ all-zero base revision: audit REQUIRED"
+            exit 0
+          fi
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
+          echo "Changed files:"
+          echo "$CHANGED"
+          # Two single greps against a here-string, not a `grep | grep -q`
+          # pipe: a downstream `-q` can close its end of a pipe early and
+          # SIGPIPE the upstream producer, which under `pipefail` reports
+          # as the pipeline's exit code instead of the match result
+          # (fail-open on a large diff) — see the matching comment in
+          # ci.yml's `changes` job.
+          MATCH=$(grep -E '(^Cargo\.lock$|^Cargo\.toml$|^crates/.*/Cargo\.toml$|^npm/lattice-embed-native/Cargo\.toml$|^\.cargo/audit\.toml$|^scripts/ci-changed-files\.sh$|^\.github/workflows/cargo-audit\.yml$)' <<<"$CHANGED" || true)
+          if grep -q . <<<"$MATCH"; then
+            echo "deps=true" >> "$GITHUB_OUTPUT"
+            echo "→ dependency-relevant change: audit REQUIRED"
+          else
+            echo "deps=false" >> "$GITHUB_OUTPUT"
+            echo "→ no dependency-relevant change: audit work skipped"
           fi
 
   audit:
@@ -172,7 +198,11 @@ jobs:
             echo "::error::change-detection did not succeed, failing closed."
             exit 1
           fi
-          if [ "$DEPS" != "true" ]; then
+          if [ "$DEPS" != "true" ] && [ "$DEPS" != "false" ]; then
+            echo "::error::deps selector output is missing or invalid (value=$DEPS)."
+            exit 1
+          fi
+          if [ "$DEPS" = "false" ]; then
             echo "No dependency-relevant change, audit jobs not required. PASS."
             exit 0
           fi
