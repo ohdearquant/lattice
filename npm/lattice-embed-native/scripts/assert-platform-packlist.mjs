@@ -41,7 +41,12 @@ assert.equal(
 )
 
 const allowed = new Set(['package.json', nodeFiles[0]])
-const readmePattern = /^README(\.[A-Za-z0-9]+)?$/i
+// Mirrors npm-packlist's own root-README grammar (`!/readme{,.*[^~$]}`, case-insensitive
+// via ignore-walk's `nocase: true`): bare `README`, or `README.` followed by any run of
+// characters whose last character is not `~` or `$` (npm excludes those from the tarball
+// entirely, e.g. `README.md~`, so they never reach this check). Multi-dot suffixes like
+// `README.md.bak` are npm's own auto-include, not ours to reject.
+const readmePattern = /^README(\..*[^~$])?$/i
 const readmeFiles = files.filter(path => !allowed.has(path) && readmePattern.test(path))
 assert.ok(
   readmeFiles.length <= 1,

@@ -69,6 +69,35 @@ test('rejects an allowlisted readme-prefixed non-README file', () => {
   }
 })
 
+test('accepts a multi-dot root README (npm auto-includes README.md.bak)', () => {
+  const dir = makeFixture({
+    'package.json': basePackageJson(['test.node']),
+    'test.node': '',
+    'README.md.bak': 'multi-dot readme\n',
+  })
+  try {
+    assert.doesNotThrow(() => packAndAssert(dir))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a root README ending in ~ is excluded by npm itself, not by this guard', () => {
+  // Empirically verified via `npm pack --dry-run --json`: npm-packlist's own grammar
+  // (`!/readme{,.*[^~$]}`) excludes trailing-~/$ variants from the tarball entirely, so
+  // README.md~ never reaches the guard's file list -- the pack succeeds as if it were absent.
+  const dir = makeFixture({
+    'package.json': basePackageJson(['test.node']),
+    'test.node': '',
+    'README.md~': 'trailing tilde readme\n',
+  })
+  try {
+    assert.doesNotThrow(() => packAndAssert(dir))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('rejects an ordinary unexpected extra file', () => {
   const dir = makeFixture({
     'package.json': basePackageJson(['test.node', 'extra.txt']),
