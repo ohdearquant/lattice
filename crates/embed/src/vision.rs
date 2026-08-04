@@ -9,26 +9,78 @@
 //! here — only checkpoint loading (mirroring the directory-loading pattern
 //! `service::native` uses for the BERT/Qwen text models) and error mapping.
 //!
-//! [`VisionEmbeddingModel::from_directory`] supports only checkpoints that
-//! carry a `model.safetensors.index.json` (or `quantize_index.json`)
-//! manifest naming exactly one decoder shard (matches the Qwen3.5-0.8B
-//! checkpoint shape) — the vision-tensor loader requires that manifest and
-//! runs before decoder-shard resolution, so a directory with only a plain
-//! `model.safetensors` and no manifest is rejected. Callers with pre-loaded
-//! components, or a multi-shard checkpoint, can assemble their own weights
-//! and call [`VisionEmbeddingModel::new`] directly.
+//! [`VisionEmbeddingModel::from_directory`] accepts either a
+//! `model.safetensors.index.json` naming exactly one decoder shard (the
+//! Qwen3.5-0.8B layout), or an unindexed directory containing exactly one
+//! safetensors file named `model.safetensors`. The indexed path is
+//! authoritative when both are present. The unindexed path parses the
+//! safetensors header and validates the exact `model.visual.*` inventory
+//! before tensor payloads are materialized. Decoder and visual tensors are
+//! materialized from the same mmap-backed open file, so a path replacement
+//! during loading cannot mix two checkpoint versions. For an indexed
+//! one-shard layout, the authoritative `weight_map` must exactly match that
+//! opened shard's header inventory. `quantize_index.json` is rejected: this
+//! loader constructs an f16 decoder and cannot bind a quantized visual file
+//! set coherently. Callers with pre-loaded components, or a multi-shard
+//! decoder checkpoint, can assemble their own weights and call
+//! [`VisionEmbeddingModel::new`] directly.
 
 use crate::error::{EmbedError, Result};
 use lattice_inference::InferenceError;
 use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
-use lattice_inference::vision::checkpoint::{Qwen35VisionWeights, load_qwen35_vision_weights};
-use lattice_inference::vision::embed_image_from_bytes_f16;
-use lattice_inference::weights::SafetensorsFile;
+use lattice_inference::vision::checkpoint::{
+    Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
+    open_qwen35_single_decoder_safetensors,
+};
+use lattice_inference::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 use lattice_inference::weights::f16_weights::{F16ModelWeights, load_f16_weights};
 use std::path::Path;
 
 pub use lattice_inference::forward::cpu_f16::PoolingStrategy;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_VISUAL_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn run_after_visual_load_hook() {
+    let hook = AFTER_VISUAL_LOAD_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn with_after_visual_load_hook<T>(hook: impl FnOnce() + 'static, action: impl FnOnce() -> T) -> T {
+    struct ClearHookOnDrop;
+    impl Drop for ClearHookOnDrop {
+        fn drop(&mut self) {
+            AFTER_VISUAL_LOAD_HOOK.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    AFTER_VISUAL_LOAD_HOOK.with(|slot| {
+        let previous = slot.borrow_mut().replace(Box::new(hook));
+        assert!(
+            previous.is_none(),
+            "visual-load test hook already installed"
+        );
+    });
+    let _clear_on_drop = ClearHookOnDrop;
+    let result = action();
+    AFTER_VISUAL_LOAD_HOOK.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "VisionEmbeddingModel::from_directory did not traverse the visual-load test hook"
+        );
+    });
+    result
+}
 
 /// A loaded Qwen3.5 vision-language checkpoint, ready to pool image (and
 /// image+text) embeddings.
@@ -64,21 +116,41 @@ impl VisionEmbeddingModel {
 
     /// Load a Qwen3.5 vision-language checkpoint directory: `config.json`,
     /// `tokenizer.json`, the `model.visual.*` vision-encoder tensors, and a
-    /// single-shard decoder checkpoint. The directory must carry a
-    /// `model.safetensors.index.json` (or `quantize_index.json`) manifest
-    /// naming exactly one decoder shard file — the vision-tensor loader
-    /// requires one of those manifests and runs before decoder-shard
-    /// resolution, so a plain `model.safetensors` alone (with no manifest)
-    /// is not sufficient. The canonical Qwen3.5-0.8B HF layout (a one-shard
-    /// index) satisfies this.
+    /// single-shard f16 decoder checkpoint. An existing
+    /// `model.safetensors.index.json` is authoritative. Without an index, the
+    /// directory must contain exactly one `*.safetensors` file, named
+    /// `model.safetensors`; its header must carry the exact `model.visual.*`
+    /// inventory implied by `vision_config`. A `quantize_index.json` is
+    /// rejected because this constructor has no quantized decoder loader. The
+    /// chosen safetensors file is opened once and that same reader supplies
+    /// both visual and decoder tensors.
     ///
     /// # Errors
     ///
     /// Returns [`EmbedError::ModelInitialization`] if `config.json` is
-    /// missing or invalid, if the checkpoint has no `vision_config`, if
-    /// neither manifest is present, if the decoder weights are sharded
-    /// across more than one file, or if any component tensor fails to load.
+    /// missing or invalid, if the checkpoint has no `vision_config`, if a
+    /// quantized checkpoint is present, if the unindexed safetensors layout is
+    /// missing or ambiguous, if the decoder weights are sharded across more
+    /// than one file, or if any component tensor fails to load.
     pub fn from_directory(dir: &Path) -> Result<Self> {
+        let quantized_index = dir.join("quantize_index.json");
+        match std::fs::symlink_metadata(&quantized_index) {
+            Ok(_) => {
+                return Err(EmbedError::ModelInitialization(format!(
+                    "{} is present, but quantized checkpoints are not supported by \
+                     VisionEmbeddingModel::from_directory's f16 decoder loader",
+                    quantized_index.display()
+                )));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(EmbedError::ModelInitialization(format!(
+                    "failed to inspect {}: {err}",
+                    quantized_index.display()
+                )));
+            }
+        }
+
         let config = Qwen35Config::from_model_dir(dir)
             .map_err(|e| EmbedError::ModelInitialization(format!("config.json: {e}")))?;
         let vision_cfg = config.vision_config.clone().ok_or_else(|| {
@@ -88,20 +160,24 @@ impl VisionEmbeddingModel {
             ))
         })?;
 
-        let vision_weights = load_qwen35_vision_weights(dir, &vision_cfg)
-            .map_err(|e| EmbedError::ModelInitialization(format!("vision weights: {e}")))?;
-
-        let shard_path = resolve_single_shard(dir)?;
-        let sf = SafetensorsFile::open(&shard_path).map_err(|e| {
-            EmbedError::ModelInitialization(format!("opening {}: {e}", shard_path.display()))
-        })?;
-        let weights = load_f16_weights(&sf, &config)
-            .map_err(|e| EmbedError::ModelInitialization(format!("decoder weights: {e}")))?;
-
+        // Tokenizer parsing is independent of tensor payloads, so reject a
+        // missing or malformed tokenizer before materializing multi-GB model
+        // weights. The checkpoint itself is still opened only once below so
+        // visual and decoder tensors stay bound to one file descriptor.
         let tokenizer_path = dir.join("tokenizer.json");
         let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path).map_err(|e| {
             EmbedError::ModelInitialization(format!("{}: {e}", tokenizer_path.display()))
         })?;
+
+        let (mut sf, shard_path) = open_qwen35_single_decoder_safetensors(dir)
+            .map_err(|e| EmbedError::ModelInitialization(format!("decoder checkpoint: {e}")))?;
+        let vision_weights =
+            load_qwen35_vision_weights_from_safetensors(&mut sf, &shard_path, &vision_cfg)
+                .map_err(|e| EmbedError::ModelInitialization(format!("vision weights: {e}")))?;
+        #[cfg(test)]
+        run_after_visual_load_hook();
+        let weights = load_f16_weights(&sf, &config)
+            .map_err(|e| EmbedError::ModelInitialization(format!("decoder weights: {e}")))?;
 
         Ok(Self::new(weights, config, vision_weights, tokenizer))
     }
@@ -129,6 +205,38 @@ impl VisionEmbeddingModel {
         pooling: PoolingStrategy,
     ) -> Result<Vec<f32>> {
         embed_image_from_bytes_f16(
+            &self.weights,
+            &self.config,
+            &self.vision_weights,
+            &self.tokenizer,
+            image_bytes,
+            prompt,
+            pooling,
+        )
+        .map_err(map_inference_error)
+    }
+
+    /// Metal-dispatching sibling of [`Self::embed_image`]: runs the ViT
+    /// forward pass on the Metal GPU instead of the CPU (see
+    /// [`lattice_inference::vision::embed_image_from_bytes_f16_metal`]).
+    /// Same scaffold, pooling contract, and error semantics as
+    /// [`Self::embed_image`], with one addition: on a build/platform with no
+    /// Metal support, this returns [`EmbedError::InferenceFailed`] (Metal
+    /// unavailability is a runtime-backend failure, not caller-input
+    /// validation) rather than silently falling back to
+    /// [`Self::embed_image`]'s CPU path — callers that want a fallback must
+    /// call [`Self::embed_image`] themselves.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::embed_image`]'s docs.
+    pub fn embed_image_metal(
+        &self,
+        image_bytes: &[u8],
+        prompt: &str,
+        pooling: PoolingStrategy,
+    ) -> Result<Vec<f32>> {
+        embed_image_from_bytes_f16_metal(
             &self.weights,
             &self.config,
             &self.vision_weights,
@@ -177,51 +285,13 @@ fn map_inference_error(e: InferenceError) -> EmbedError {
     }
 }
 
-/// Resolve the single safetensors shard `load_f16_weights` needs. By the time
-/// this runs, [`load_qwen35_vision_weights`] has already required a
-/// `model.safetensors.index.json` or `quantize_index.json` manifest to exist
-/// in `model_dir` (see module docs) — so a convenience `model.safetensors`
-/// file (often a symlink some local checkouts add alongside the manifest) is
-/// checked first as a cheap shortcut when present, then falls back to
-/// resolving the shard named by the index. This mirrors
-/// `Qwen35Model::from_safetensors`'s plain-then-index precedence, but
-/// resolves the concrete shard path a single-`SafetensorsFile` loader needs
-/// (multi-shard checkpoints are out of scope here — see module docs).
-fn resolve_single_shard(model_dir: &Path) -> Result<std::path::PathBuf> {
-    let plain = model_dir.join("model.safetensors");
-    if plain.exists() {
-        return Ok(plain);
-    }
-    let index = lattice_inference::weights::parse_index(model_dir).map_err(|e| {
-        EmbedError::ModelInitialization(format!(
-            "no model.safetensors in {} and no valid model.safetensors.index.json: {e}",
-            model_dir.display()
-        ))
-    })?;
-    let mut shards: Vec<&str> = index.weight_map.values().map(String::as_str).collect();
-    shards.sort_unstable();
-    shards.dedup();
-    match shards.as_slice() {
-        [one] => Ok(model_dir.join(one)),
-        [] => Err(EmbedError::ModelInitialization(format!(
-            "empty weight_map in {}",
-            model_dir.join("model.safetensors.index.json").display()
-        ))),
-        _ => Err(EmbedError::ModelInitialization(format!(
-            "checkpoint at {} is sharded across {} files; VisionEmbeddingModel::from_directory \
-             only supports single-shard checkpoints -- use VisionEmbeddingModel::new with \
-             manually loaded components instead",
-            model_dir.display(),
-            shards.len()
-        ))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use lattice_inference::model::qwen35_config::{LayerType, RopeParams, VisionModelConfig};
-    use lattice_inference::vision::checkpoint::{VisualBlockWeights, VisualMergerWeights};
+    use lattice_inference::vision::checkpoint::{
+        VisualBlockWeights, VisualMergerWeights, resolve_qwen35_single_decoder_safetensors,
+    };
     use lattice_inference::weights::f16_weights::{
         F16AttentionWeights, F16CommonLayerWeights, F16FeedForwardWeights,
         F16FullAttentionLayerWeights, f32_to_f16_slice,
@@ -435,6 +505,228 @@ mod tests {
         BpeTokenizer::from_vocab_and_merges(vocab_map, vec![]).expect("tokenizer constructs")
     }
 
+    fn tiny_vlm_checkpoint_shapes() -> Vec<(String, Vec<usize>)> {
+        let hidden = 8usize;
+        let mut shapes = vec![
+            (
+                "model.language_model.embed_tokens.weight".to_string(),
+                vec![16, hidden],
+            ),
+            ("model.language_model.norm.weight".to_string(), vec![hidden]),
+            (
+                "model.language_model.layers.0.input_layernorm.weight".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.language_model.layers.0.post_attention_layernorm.weight".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.language_model.layers.0.mlp.gate_proj.weight".to_string(),
+                vec![4, hidden],
+            ),
+            (
+                "model.language_model.layers.0.mlp.up_proj.weight".to_string(),
+                vec![4, hidden],
+            ),
+            (
+                "model.language_model.layers.0.mlp.down_proj.weight".to_string(),
+                vec![hidden, 4],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.q_proj.weight".to_string(),
+                vec![16, hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.k_proj.weight".to_string(),
+                vec![hidden, hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.v_proj.weight".to_string(),
+                vec![hidden, hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.o_proj.weight".to_string(),
+                vec![hidden, hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.q_norm.weight".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.k_norm.weight".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.visual.patch_embed.proj.weight".to_string(),
+                vec![hidden, 3, 1, 2, 2],
+            ),
+            (
+                "model.visual.patch_embed.proj.bias".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.visual.pos_embed.weight".to_string(),
+                vec![16, hidden],
+            ),
+            (
+                "model.visual.merger.linear_fc1.weight".to_string(),
+                vec![32, 32],
+            ),
+            ("model.visual.merger.linear_fc1.bias".to_string(), vec![32]),
+            (
+                "model.visual.merger.linear_fc2.weight".to_string(),
+                vec![hidden, 32],
+            ),
+            (
+                "model.visual.merger.linear_fc2.bias".to_string(),
+                vec![hidden],
+            ),
+            ("model.visual.merger.norm.weight".to_string(), vec![hidden]),
+            ("model.visual.merger.norm.bias".to_string(), vec![hidden]),
+        ];
+        for (suffix, shape) in [
+            ("attn.qkv.weight", vec![24, hidden]),
+            ("attn.qkv.bias", vec![24]),
+            ("attn.proj.weight", vec![hidden, hidden]),
+            ("attn.proj.bias", vec![hidden]),
+            ("mlp.linear_fc1.weight", vec![32, hidden]),
+            ("mlp.linear_fc1.bias", vec![32]),
+            ("mlp.linear_fc2.weight", vec![hidden, 32]),
+            ("mlp.linear_fc2.bias", vec![hidden]),
+            ("norm1.weight", vec![hidden]),
+            ("norm1.bias", vec![hidden]),
+            ("norm2.weight", vec![hidden]),
+            ("norm2.bias", vec![hidden]),
+        ] {
+            shapes.push((format!("model.visual.blocks.0.{suffix}"), shape));
+        }
+        shapes
+    }
+
+    fn write_f32_safetensors(path: &Path, shapes: &[(String, Vec<usize>)]) {
+        write_f32_safetensors_with_offset(path, shapes, 0.0);
+    }
+
+    fn write_f32_safetensors_with_offset(
+        path: &Path,
+        shapes: &[(String, Vec<usize>)],
+        offset: f32,
+    ) {
+        let mut header_parts = Vec::with_capacity(shapes.len());
+        let mut data = Vec::new();
+        for (i, (name, shape)) in shapes.iter().enumerate() {
+            let start = data.len();
+            let numel: usize = shape.iter().product();
+            for _ in 0..numel {
+                data.extend_from_slice(&(offset + (i + 1) as f32 / 100.0).to_le_bytes());
+            }
+            let end = data.len();
+            let shape = shape
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            header_parts.push(format!(
+                r#""{name}":{{"dtype":"F32","shape":[{shape}],"data_offsets":[{start},{end}]}}"#
+            ));
+        }
+        let header = format!("{{{}}}", header_parts.join(","));
+        let mut bytes = Vec::with_capacity(8 + header.len() + data.len());
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(path, bytes).expect("write safetensors fixture");
+    }
+
+    fn write_tiny_tokenizer_json(dir: &Path) {
+        let tokenizer = r#"{
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "a": 0, "b": 1, "c": 2, "d": 3,
+                    "e": 4, "f": 5, "g": 6, "h": 7,
+                    "i": 8, "j": 9, "k": 10, "l": 11,
+                    "m": 12, "n": 13, "o": 14, "p": 15
+                },
+                "merges": []
+            }
+        }"#;
+        std::fs::write(dir.join("tokenizer.json"), tokenizer).expect("write tokenizer.json");
+    }
+
+    fn write_tiny_vlm_checkpoint(dir: &Path, indexed: bool) {
+        let config = r#"{
+            "text_config": {
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "vocab_size": 16,
+                "intermediate_size": 4,
+                "rms_norm_eps": 0.000001,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 8,
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 1.0,
+                "rope_parameters": {
+                    "rope_theta": 10000000.0,
+                    "partial_rotary_factor": 1.0,
+                    "mrope_section": [2, 1, 1],
+                    "mrope_interleaved": true
+                },
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 4,
+                "tie_word_embeddings": true,
+                "full_attention_interval": 1,
+                "layer_types": ["full_attention"],
+                "layer_mask": [true],
+                "eos_token_id": 15,
+                "max_position_embeddings": 512
+            },
+            "vision_config": {
+                "depth": 1,
+                "hidden_size": 8,
+                "num_heads": 2,
+                "patch_size": 2,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 8,
+                "temporal_patch_size": 1,
+                "num_position_embeddings": 16,
+                "in_channels": 3,
+                "deepstack_visual_indexes": []
+            },
+            "image_token_id": 9,
+            "vision_start_token_id": 10,
+            "vision_end_token_id": 11,
+            "tie_word_embeddings": true
+        }"#;
+        std::fs::write(dir.join("config.json"), config).expect("write config.json");
+        write_tiny_tokenizer_json(dir);
+
+        let shapes = tiny_vlm_checkpoint_shapes();
+        let shard_name = if indexed {
+            "model-00001-of-00001.safetensors"
+        } else {
+            "model.safetensors"
+        };
+        write_f32_safetensors(&dir.join(shard_name), &shapes);
+        if indexed {
+            let weight_map = shapes
+                .iter()
+                .map(|(name, _)| format!(r#""{name}":"{shard_name}""#))
+                .collect::<Vec<_>>()
+                .join(",");
+            std::fs::write(
+                dir.join("model.safetensors.index.json"),
+                format!(r#"{{"weight_map":{{{weight_map}}}}}"#),
+            )
+            .expect("write one-shard index");
+        }
+    }
+
     /// The embed-crate wrapper must return the exact same vector as calling
     /// the raw inference-crate primitive directly: wiring adds no numerical
     /// difference. This is the core claim of this module (a wire-through,
@@ -474,6 +766,72 @@ mod tests {
             via_wrapper, via_raw,
             "embed-crate wrapper must return the identical vector to the raw primitive"
         );
+    }
+
+    /// Same wire-through claim as
+    /// `embed_image_matches_raw_inference_primitive`, for the Metal entry
+    /// point: the crate wrapper must add no numerical difference relative to
+    /// calling `embed_image_from_bytes_f16_metal` directly.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn embed_image_metal_matches_raw_inference_primitive() {
+        use lattice_inference::vision::embed_image_from_bytes_f16_metal;
+
+        let (cfg, weights, vision_weights) = tiny_vlm_fixture();
+        let tokenizer = tiny_tokenizer();
+        let png = make_test_png(8, 8, 0);
+
+        let model = VisionEmbeddingModel::new(
+            weights.clone(),
+            cfg.clone(),
+            vision_weights.clone(),
+            tokenizer.clone(),
+        );
+        let via_wrapper = model
+            .embed_image_metal(
+                &png,
+                "describe this image",
+                PoolingStrategy::MeanVisualTokens,
+            )
+            .expect("wrapper embed_image_metal succeeds");
+
+        let via_raw = embed_image_from_bytes_f16_metal(
+            &weights,
+            &cfg,
+            &vision_weights,
+            &tokenizer,
+            &png,
+            "describe this image",
+            PoolingStrategy::MeanVisualTokens,
+        )
+        .expect("raw metal primitive succeeds");
+
+        assert_eq!(
+            via_wrapper, via_raw,
+            "embed-crate Metal wrapper must return the identical vector to the raw primitive"
+        );
+    }
+
+    /// Off this cfg gate, the wrapper must surface the CPU/Metal
+    /// distinction the inference crate makes (`InferenceError::
+    /// UnsupportedModel`) as `EmbedError::InferenceFailed`, never silently
+    /// substituting `embed_image`'s CPU output.
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    #[test]
+    fn embed_image_metal_fails_closed_without_metal_gpu() {
+        let (cfg, weights, vision_weights) = tiny_vlm_fixture();
+        let tokenizer = tiny_tokenizer();
+        let png = make_test_png(8, 8, 0);
+        let model = VisionEmbeddingModel::new(weights, cfg, vision_weights, tokenizer);
+
+        let err = model
+            .embed_image_metal(
+                &png,
+                "describe this image",
+                PoolingStrategy::MeanVisualTokens,
+            )
+            .expect_err("Metal wrapper must fail without the metal-gpu feature");
+        assert!(matches!(err, EmbedError::InferenceFailed(_)));
     }
 
     #[test]
@@ -610,42 +968,197 @@ mod tests {
         )
         .expect("write index");
 
-        let err = resolve_single_shard(tmp.path()).expect_err("multi-shard must be rejected");
+        let err = resolve_qwen35_single_decoder_safetensors(tmp.path())
+            .expect_err("multi-shard must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("sharded across 2 files"), "got: {msg}");
     }
 
     #[test]
-    fn resolve_single_shard_rejects_missing_manifest() {
+    fn resolve_single_shard_rejects_missing_checkpoint() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let err = resolve_single_shard(tmp.path()).expect_err("missing manifest must be rejected");
-        assert!(matches!(err, EmbedError::ModelInitialization(_)));
+        let err = resolve_qwen35_single_decoder_safetensors(tmp.path())
+            .expect_err("missing checkpoint must be rejected");
+        assert!(matches!(err, InferenceError::ModelNotFound(_)));
     }
 
-    /// `from_directory`'s documented contract requires an index/quantize
-    /// manifest (the vision-tensor loader runs before decoder-shard
-    /// resolution and has no plain-file fallback). A directory with a valid
-    /// config.json (including `vision_config`) but no manifest at all must
-    /// fail with an actionable, named error -- not merely `expect_err` on
-    /// some opaque error -- pinning the real (manifest-required) behavior
-    /// rather than the previously-documented (plain-file-sufficient) one.
     #[test]
-    fn from_directory_without_manifest_reports_actionable_error() {
+    fn from_directory_without_checkpoint_reports_actionable_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let config_json = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../inference/tests/fixtures/qwen35_0_8b_config.json"
         ));
         std::fs::write(tmp.path().join("config.json"), config_json).expect("write config.json");
+        write_tiny_tokenizer_json(tmp.path());
 
         let Err(err) = VisionEmbeddingModel::from_directory(tmp.path()) else {
-            panic!("a directory with no index/quantize manifest must be rejected")
+            panic!("a directory with no checkpoint must be rejected")
         };
         assert!(matches!(err, EmbedError::ModelInitialization(_)));
         let msg = err.to_string();
         assert!(
-            msg.contains("model.safetensors.index.json") && msg.contains("quantize_index.json"),
-            "error must name the missing manifest(s), got: {msg}"
+            msg.contains("model.safetensors") && msg.contains("model.safetensors.index.json"),
+            "error must name the supported checkpoint layouts, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_directory_rejects_missing_tokenizer_before_checkpoint_materialization() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_tiny_vlm_checkpoint(tmp.path(), false);
+        std::fs::remove_file(tmp.path().join("tokenizer.json")).expect("remove tokenizer fixture");
+        std::fs::write(tmp.path().join("model.safetensors"), u64::MAX.to_le_bytes())
+            .expect("replace checkpoint with a corrupt header");
+
+        let Err(err) = VisionEmbeddingModel::from_directory(tmp.path()) else {
+            panic!("a checkpoint without tokenizer.json must be rejected")
+        };
+        assert!(matches!(err, EmbedError::ModelInitialization(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("tokenizer.json"), "got: {msg}");
+        assert!(
+            !msg.contains("vision weights") && !msg.contains("decoder weights"),
+            "tokenizer admission must fail before tensor materialization, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_directory_rejects_quantized_checkpoint_before_tensor_loading() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("quantize_index.json"), b"not valid json")
+            .expect("write quantized checkpoint sentinel");
+
+        let Err(err) = VisionEmbeddingModel::from_directory(tmp.path()) else {
+            panic!("the f16 pooled decoder loader must reject quantized checkpoints")
+        };
+        assert!(matches!(err, EmbedError::ModelInitialization(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("quantize_index.json"), "got: {msg}");
+        assert!(msg.contains("not supported"), "got: {msg}");
+        assert!(
+            !msg.contains("config.json"),
+            "the unsupported file-set must fail before unrelated component loading, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_directory_loads_single_model_safetensors_without_index() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_tiny_vlm_checkpoint(tmp.path(), false);
+
+        let model = VisionEmbeddingModel::from_directory(tmp.path())
+            .expect("single-file VLM checkpoint must load without a synthetic index");
+        assert_eq!(model.dimensions(), 8);
+    }
+
+    #[test]
+    fn single_file_and_one_shard_index_produce_identical_image_embeddings() {
+        let single = tempfile::tempdir().expect("single tempdir");
+        let indexed = tempfile::tempdir().expect("indexed tempdir");
+        write_tiny_vlm_checkpoint(single.path(), false);
+        write_tiny_vlm_checkpoint(indexed.path(), true);
+
+        let single_model = VisionEmbeddingModel::from_directory(single.path())
+            .expect("single-file VLM checkpoint loads");
+        let indexed_model = VisionEmbeddingModel::from_directory(indexed.path())
+            .expect("equivalent one-shard indexed VLM checkpoint loads");
+        let image = make_test_png(4, 4, 17);
+        let from_single = single_model
+            .embed_image(&image, "a", PoolingStrategy::MeanVisualTokens)
+            .expect("single-file image embedding succeeds");
+        let from_index = indexed_model
+            .embed_image(&image, "a", PoolingStrategy::MeanVisualTokens)
+            .expect("indexed image embedding succeeds");
+
+        assert_eq!(
+            from_single, from_index,
+            "equivalent single-file and indexed layouts must produce parity embeddings"
+        );
+    }
+
+    #[test]
+    fn from_directory_rejects_index_map_that_contradicts_opened_shard_header() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_tiny_vlm_checkpoint(tmp.path(), true);
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"not.a.real.tensor":"model-00001-of-00001.safetensors"}}"#,
+        )
+        .expect("replace index with contradictory weight_map");
+
+        let Err(err) = VisionEmbeddingModel::from_directory(tmp.path()) else {
+            panic!("an authoritative index that omits the physical tensors must be rejected")
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("weight_map/header inventory mismatch"),
+            "got: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_directory_binds_visual_and_decoder_weights_across_path_replacement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_tiny_vlm_checkpoint(tmp.path(), false);
+        let checkpoint_path = tmp.path().join("model.safetensors");
+        let replacement = tmp.path().join("replacement-checkpoint");
+        write_f32_safetensors_with_offset(&replacement, &tiny_vlm_checkpoint_shapes(), 10.0);
+
+        let model = with_after_visual_load_hook(
+            move || {
+                std::fs::rename(&replacement, &checkpoint_path)
+                    .expect("atomically replace checkpoint pathname with checkpoint B");
+            },
+            || {
+                VisionEmbeddingModel::from_directory(tmp.path())
+                    .expect("constructor keeps both components on checkpoint A")
+            },
+        );
+
+        assert_eq!(
+            model.vision_weights.patch_embed_weight[0], 0.14,
+            "visual weights must remain bound to checkpoint A"
+        );
+        let mut expected_embed = [0u16];
+        f32_to_f16_slice(&[0.01], &mut expected_embed);
+        assert_eq!(
+            model.weights.embed_tokens[0], expected_embed[0],
+            "decoder weights must remain bound to checkpoint A"
+        );
+    }
+
+    #[test]
+    fn resolve_single_shard_prefers_existing_index_over_plain_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("model.safetensors"), b"plain")
+            .expect("write convenience file");
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"tensor":"indexed.safetensors"}}"#,
+        )
+        .expect("write index");
+
+        let resolved = resolve_qwen35_single_decoder_safetensors(tmp.path())
+            .expect("single-shard index resolves");
+        assert_eq!(resolved, tmp.path().join("indexed.safetensors"));
+    }
+
+    #[test]
+    fn resolve_single_shard_rejects_index_entry_escaping_model_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"tensor":"../outside.safetensors"}}"#,
+        )
+        .expect("write index");
+
+        let err = resolve_qwen35_single_decoder_safetensors(tmp.path())
+            .expect_err("an index entry must not escape the checkpoint directory");
+        assert!(
+            err.to_string().contains("escapes the model directory"),
+            "got: {err}"
         );
     }
 }

@@ -23,6 +23,7 @@ pub type AdapterId = String;
 
 /// Error type for routing operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RouterError {
     /// The fann network forward pass failed.
     #[error("gate network error: {0}")]

@@ -1,8 +1,9 @@
 # ADR-078: Multimodal / Vision Serving Priority (Deferral)
 
-**Status**: Proposed
+**Status**: Superseded
 **Date**: 2026-07-09
 **Crate**: lattice-inference
+**Superseded by**: ADR-069 Amendment 2 (2026-07-29)
 
 ## Context
 
@@ -102,3 +103,12 @@ model acquisition is required.
 When the vision lane is scheduled and multimodal serving lands, this deferral is superseded. Record
 the activation as a status update / new row on this ADR whichever way the lever ranking then falls —
 so the bundle's traceability chain shows idea → deferral → activation, not a silent flip.
+
+## Activation record (2026-07-29)
+
+The named re-entry trigger fired: the Qwen3.5 vision lane reached the served Metal path, and both
+HTTP binaries now admit one bounded inline PNG/JPEG content part through their shared request
+contract when the loaded checkpoint is vision-capable. Text-only checkpoints retain the original
+400 capability error. ADR-069 Amendment 2 records the active wire contract, resource bounds,
+worker routing, and remaining deferrals; this priority deferral is therefore superseded rather
+than silently rewritten.

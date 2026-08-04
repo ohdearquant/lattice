@@ -1,0 +1,60 @@
+[1m[32m    Building[0m lattice-embed v0.8.0 (current)
+       Built [  21.157s] (current)
+[1m[32m     Parsing[0m lattice-embed v0.8.0 (current)
+      Parsed [   0.021s] (current)
+[1m[32m    Building[0m lattice-embed v0.7.1 (baseline)
+       Built [   4.013s] (baseline)
+[1m[32m     Parsing[0m lattice-embed v0.7.1 (baseline)
+      Parsed [   0.010s] (baseline)
+[1m[32m    Checking[0m lattice-embed v0.7.1 -> v0.8.0 (major change)
+[1m[32m Checked[0m [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+[1m[32m   Finished[0m [  25.201s] lattice-embed
+[1m[32m    Building[0m lattice-fann v0.8.0 (current)
+       Built [  21.157s] (current)
+[1m[32m     Parsing[0m lattice-fann v0.8.0 (current)
+      Parsed [   0.021s] (current)
+[1m[32m    Building[0m lattice-fann v0.7.1 (baseline)
+       Built [   4.013s] (baseline)
+[1m[32m     Parsing[0m lattice-fann v0.7.1 (baseline)
+      Parsed [   0.010s] (baseline)
+[1m[32m    Checking[0m lattice-fann v0.7.1 -> v0.8.0 (major change)
+[1m[32m Checked[0m [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+[1m[32m   Finished[0m [  25.201s] lattice-fann
+[1m[32m    Building[0m lattice-inference v0.8.0 (current)
+       Built [  21.157s] (current)
+[1m[32m     Parsing[0m lattice-inference v0.8.0 (current)
+      Parsed [   0.021s] (current)
+[1m[32m    Building[0m lattice-inference v0.7.1 (baseline)
+       Built [   4.013s] (baseline)
+[1m[32m     Parsing[0m lattice-inference v0.7.1 (baseline)
+      Parsed [   0.010s] (baseline)
+[1m[32m    Checking[0m lattice-inference v0.7.1 -> v0.8.0 (major change)
+[1m[32m Checked[0m [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+[1m[32m   Finished[0m [  25.201s] lattice-inference
+[1m[32m    Building[0m lattice-transport v0.8.0 (current)
+       Built [  21.157s] (current)
+[1m[32m     Parsing[0m lattice-transport v0.8.0 (current)
+      Parsed [   0.021s] (current)
+[1m[32m    Building[0m lattice-transport v0.7.1 (baseline)
+       Built [   4.013s] (baseline)
+[1m[32m     Parsing[0m lattice-transport v0.7.1 (baseline)
+      Parsed [   0.010s] (baseline)
+[1m[32m    Checking[0m lattice-transport v0.7.1 -> v0.8.0 (major change)
+[1m[32m Checked[0m [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+[1m[32m   Finished[0m [  25.201s] lattice-transport
+[1m[32m    Building[0m lattice-tune v0.8.0 (current)
+       Built [  21.157s] (current)
+[1m[32m     Parsing[0m lattice-tune v0.8.0 (current)
+      Parsed [   0.021s] (current)
+[1m[32m    Building[0m lattice-tune v0.7.1 (baseline)
+       Built [   4.013s] (baseline)
+[1m[32m     Parsing[0m lattice-tune v0.7.1 (baseline)
+      Parsed [   0.010s] (baseline)
+[1m[32m    Checking[0m lattice-tune v0.7.1 -> v0.8.0 (major change)
+[1m[32m Checked[0m [   0.000s] 0 checks: 0 pass, 253 skip
+     Summary no semver update required
+[1m[32m   Finished[0m [  25.201s] lattice-tune

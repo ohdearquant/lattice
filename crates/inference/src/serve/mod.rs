@@ -21,37 +21,66 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use serde_json::Value;
+use std::future::Future;
+use std::time::Duration;
 use tokio::sync::watch;
+use tower::ServiceExt as _;
 
 use crate::model::qwen35_config::GenerateConfig;
 
 /// Shared chat-completions wire DTO and normalization policies.
 pub mod contract;
 
+/// Shared `/v1/embeddings` wire DTO, model loader, and pooled-embedding
+/// dispatch.
+pub mod embeddings;
+
 /// Convert normalized contract messages into the engine's chat representation.
 ///
 /// Both HTTP binaries cross the contract/backend boundary through this one
-/// adapter so role mapping cannot drift between them.
+/// adapter so role mapping cannot drift between them. A caller-constructed
+/// normalized value that attaches an image to a non-user role is rejected
+/// rather than allowed to reach the engine.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] when a caller-constructed normalized
+/// message attaches an image to a non-user role.
 pub fn into_engine_chat_messages(
     messages: Vec<contract::NormalizedChatMessage>,
-) -> Vec<crate::forward::metal_qwen35::ChatMessage> {
+) -> Result<Vec<crate::forward::metal_qwen35::ChatMessage>, ApiError> {
     messages
         .into_iter()
-        .map(|message| match message.role {
-            contract::NormalizedChatRole::System => {
-                crate::forward::metal_qwen35::ChatMessage::system(message.content)
+        .map(|message| match (message.role, message.image) {
+            (contract::NormalizedChatRole::System, None) => Ok(
+                crate::forward::metal_qwen35::ChatMessage::system(message.content),
+            ),
+            (contract::NormalizedChatRole::User, None) => Ok(
+                crate::forward::metal_qwen35::ChatMessage::user(message.content),
+            ),
+            (contract::NormalizedChatRole::Assistant, None) => Ok(
+                crate::forward::metal_qwen35::ChatMessage::assistant(message.content),
+            ),
+            (contract::NormalizedChatRole::User, Some(image)) => {
+                Ok(crate::forward::metal_qwen35::ChatMessage::user_with_image(
+                    message.content,
+                    image.bytes,
+                    image.text_offset,
+                ))
             }
-            contract::NormalizedChatRole::User => {
-                crate::forward::metal_qwen35::ChatMessage::user(message.content)
-            }
-            contract::NormalizedChatRole::Assistant => {
-                crate::forward::metal_qwen35::ChatMessage::assistant(message.content)
-            }
+            (_, Some(_)) => Err(ApiError::BadRequest {
+                message: "image content is supported only on user messages".to_string(),
+                code: "invalid_image_role",
+            }),
         })
         .collect()
 }
 
 /// Render normalized contract messages with the engine's canonical chat template.
+///
+/// For image-bearing messages this is the preliminary text-only rendering
+/// used by adapter-level context checks. The Metal worker later inserts the
+/// checkpoint's vision token IDs at the normalized image position.
 pub fn format_normalized_chat_template(messages: &[contract::NormalizedChatMessage]) -> String {
     crate::forward::metal_qwen35::format_chat_template_parts(
         messages
@@ -103,9 +132,149 @@ pub const OVERFLOW_PARITY_MAX_TOKENS_CAP: usize = 4096;
 /// The exact request body both binaries' overflow-parity tests send.
 pub const OVERFLOW_PARITY_REQUEST_BODY: &str = r#"{"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":1024,"stream":true}"#;
 
+const SERVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const SERVER_ABORT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Serve an axum router until SIGINT or, on Unix, SIGTERM, then give active
+/// connections a bounded interval to drain.
+///
+/// Both serving binaries use this entry point so router state is dropped
+/// normally on process-supervisor shutdown. That drop closes the shared
+/// Metal worker queue and runs its bounded join. If a connection does not
+/// drain within five seconds, its task is aborted and given up to three more
+/// seconds to release request-held state before this returns
+/// [`std::io::ErrorKind::TimedOut`]. Both binaries treat that error as a hard
+/// process-exit boundary because a non-cooperative task must not make shutdown
+/// unbounded. That last resort can truncate in-flight responses, partially
+/// written files, and unflushed telemetry because process exit skips Rust
+/// destructors.
+pub async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+) -> std::io::Result<()> {
+    serve_with_shutdown(
+        listener,
+        app,
+        async {
+            if let Err(error) = shutdown_signal().await {
+                eprintln!("Error waiting for shutdown signal: {error}");
+            }
+            eprintln!("Shutdown signal received, draining connections...");
+        },
+        SERVER_DRAIN_TIMEOUT,
+    )
+    .await
+}
+
+async fn serve_with_shutdown<F>(
+    mut listener: tokio::net::TcpListener,
+    app: axum::Router,
+    shutdown: F,
+    drain_timeout: Duration,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => break,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::error!(%error, "HTTP connection task failed");
+                }
+            }
+            accepted = axum::serve::Listener::accept(&mut listener) => {
+                let (stream, remote_address) = accepted;
+                let service = app.clone().map_request(
+                    |request: hyper::Request<hyper::body::Incoming>| {
+                        request.map(axum::body::Body::new)
+                    },
+                );
+                let hyper_service = hyper_util::service::TowerToHyperService::new(service);
+                let mut drain = drain_rx.clone();
+                connections.spawn(async move {
+                    let connection = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), hyper_service)
+                        .with_upgrades();
+                    tokio::pin!(connection);
+                    let result = tokio::select! {
+                        result = &mut connection => result,
+                        _ = drain.changed() => {
+                            connection.as_mut().graceful_shutdown();
+                            connection.await
+                        }
+                    };
+                    if let Err(error) = result {
+                        tracing::debug!(%remote_address, %error, "HTTP connection ended with an error");
+                    }
+                });
+            }
+        }
+    }
+
+    drop(listener);
+    drop(app);
+    drain_tx.send_replace(true);
+    drop(drain_rx);
+    drop(drain_tx);
+
+    let drained = tokio::time::timeout(drain_timeout, async {
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(%error, "HTTP connection task failed during shutdown");
+            }
+        }
+    })
+    .await;
+    match drained {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            connections.abort_all();
+            let _ = tokio::time::timeout(SERVER_ABORT_TIMEOUT, async {
+                while connections.join_next().await.is_some() {}
+            })
+            .await;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "server connections did not drain within {} ms; remaining tasks were aborted \
+                     and given up to {} ms for cleanup; hard process exit may truncate in-flight \
+                     responses, partially written files, and unflushed telemetry",
+                    drain_timeout.as_millis(),
+                    SERVER_ABORT_TIMEOUT.as_millis()
+                ),
+            ))
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        received = terminate.recv() => received.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "SIGTERM signal stream closed",
+            )
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
+}
+
 /// Structured HTTP error shared by both binaries, serializing to the OpenAI
 /// error envelope: `{"error": {"message", "type", "code", "param"}}`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ApiError {
     /// Caller mistake — HTTP 400.
     BadRequest { message: String, code: &'static str },
@@ -1452,24 +1621,222 @@ const ACCEPTED_MINIMAL_FIELDS: &[FieldExpectation] = &[FieldExpectation::Eq {
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
+    struct RouterDropProbe {
+        cohort: std::sync::Arc<()>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for RouterDropProbe {
+        fn drop(&mut self) {
+            if std::sync::Arc::strong_count(&self.cohort) == 1 {
+                self.dropped
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct StuckDrainState {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        finished: tokio::sync::mpsc::UnboundedSender<()>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    async fn stuck_drain_handler(
+        axum::extract::State(state): axum::extract::State<StuckDrainState>,
+    ) -> &'static str {
+        let _ = state.started.send(());
+        state.release.notified().await;
+        let _ = state.finished.send(());
+        "released"
+    }
+
+    #[tokio::test]
+    async fn shared_server_runner_drops_router_after_injected_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener must bind");
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = RouterDropProbe {
+            cohort: std::sync::Arc::new(()),
+            dropped: dropped.clone(),
+        };
+        let app = axum::Router::new().layer(axum::Extension(probe));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(serve_with_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+        shutdown_tx
+            .send(())
+            .expect("server must still own the shutdown receiver");
+        tokio::time::timeout(std::time::Duration::from_secs(1), server)
+            .await
+            .expect("shared runner must honor its shutdown future")
+            .expect("shared runner task must not panic")
+            .expect("shared runner must stop cleanly");
+
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "router state must be dropped before the shared runner returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_server_runner_bounds_a_stuck_connection_drain() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener must bind");
+        let address = listener
+            .local_addr()
+            .expect("bound listener must expose its local address");
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (finished_tx, mut finished_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe = RouterDropProbe {
+            cohort: std::sync::Arc::new(()),
+            dropped: dropped.clone(),
+        };
+        let app = axum::Router::new()
+            .route("/stuck", axum::routing::get(stuck_drain_handler))
+            .with_state(StuckDrainState {
+                started: started_tx,
+                finished: finished_tx,
+                release: release.clone(),
+            })
+            .layer(axum::Extension(probe));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = tokio::spawn(serve_with_shutdown(
+            listener,
+            app,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(20),
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("test client must connect");
+        client
+            .write_all(b"GET /stuck HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("test client must write its request");
+        tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("stuck handler must start before shutdown")
+            .expect("stuck handler start channel must remain open");
+        shutdown_tx
+            .send(())
+            .expect("server must still own the shutdown receiver");
+
+        let bounded = tokio::time::timeout(Duration::from_millis(500), &mut server).await;
+        if bounded.is_err() {
+            release.notify_waiters();
+            drop(client);
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+            panic!("stuck connection drain must not bypass the configured deadline");
+        }
+        let error = bounded
+            .expect("checked above")
+            .expect("shared runner task must not panic")
+            .expect_err("stuck connection drain must return a timeout error");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        let message = error.to_string();
+        for required_warning in [
+            "hard process exit",
+            "in-flight responses",
+            "partially written files",
+            "unflushed telemetry",
+        ] {
+            assert!(
+                message.contains(required_warning),
+                "timeout error must warn operators about {required_warning}: {message}"
+            );
+        }
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "forced connection cancellation must drop router state before returning"
+        );
+
+        release.notify_waiters();
+        drop(client);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), finished_rx.recv())
+                .await
+                .expect("aborted handler finish channel must close promptly")
+                .is_none(),
+            "timed-out handler must be cancelled rather than detached"
+        );
+    }
+
+    #[test]
+    fn both_server_binaries_use_shared_graceful_runner() {
+        // `lattice` is now a module tree (#834), not a single file; concatenate
+        // its split source files so the substring/window checks below still
+        // see the same source text as when it was one file.
+        let lattice = concat!(
+            include_str!("../bin/lattice/main.rs"),
+            include_str!("../bin/lattice/chat.rs"),
+            include_str!("../bin/lattice/doctor.rs"),
+            include_str!("../bin/lattice/serve.rs"),
+        );
+        let lattice_serve = include_str!("../bin/lattice_serve.rs");
+        for (name, source) in [("lattice", lattice), ("lattice_serve", lattice_serve)] {
+            assert!(
+                source.contains("serve::serve_until_shutdown(listener, app)"),
+                "{name} must route process signals through the shared graceful runner"
+            );
+            assert!(
+                !source.contains("axum::serve(listener, app)"),
+                "{name} must not bypass the shared graceful runner"
+            );
+            let call = source
+                .find("serve::serve_until_shutdown(listener, app)")
+                .expect("shared graceful runner call must exist");
+            let hard_exit_boundary = &source[call..source.len().min(call + 512)];
+            assert!(
+                hard_exit_boundary.contains("std::process::exit(1);"),
+                "{name} must hard-exit if bounded connection draining fails"
+            );
+        }
+        assert!(
+            lattice.contains("drop(app);"),
+            "lattice bind failure must drop router state before process::exit"
+        );
+    }
+
     #[test]
     fn contract_to_engine_message_adapter_preserves_roles_and_content() {
         let normalized = vec![
             contract::NormalizedChatMessage {
                 role: contract::NormalizedChatRole::System,
                 content: "system-content".to_string(),
+                image: None,
             },
             contract::NormalizedChatMessage {
                 role: contract::NormalizedChatRole::User,
                 content: "user-content".to_string(),
+                image: None,
             },
             contract::NormalizedChatMessage {
                 role: contract::NormalizedChatRole::Assistant,
                 content: "assistant-content".to_string(),
+                image: None,
             },
         ];
         let rendered = format_normalized_chat_template(&normalized);
-        let owned = into_engine_chat_messages(normalized);
+        let owned =
+            into_engine_chat_messages(normalized).expect("valid messages must reach the engine");
         assert_eq!(
             rendered,
             crate::forward::metal_qwen35::format_chat_template(&owned)
@@ -1492,6 +1859,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn contract_to_engine_message_adapter_preserves_image_and_position() {
+        let owned = into_engine_chat_messages(vec![contract::NormalizedChatMessage {
+            role: contract::NormalizedChatRole::User,
+            content: "beforeafter".to_string(),
+            image: Some(contract::NormalizedChatImage {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                text_offset: "before".len(),
+            }),
+        }])
+        .expect("valid user image must reach the engine");
+        let image = owned[0]
+            .image
+            .as_ref()
+            .expect("normalized image must reach the engine message");
+        assert_eq!(image.bytes, [0x89, b'P', b'N', b'G']);
+        assert_eq!(image.text_offset, "before".len());
+    }
+
+    #[test]
+    fn contract_to_engine_message_adapter_rejects_non_user_image_without_panicking() {
+        let error = into_engine_chat_messages(vec![contract::NormalizedChatMessage {
+            role: contract::NormalizedChatRole::System,
+            content: "policy".to_string(),
+            image: Some(contract::NormalizedChatImage {
+                bytes: vec![0x89, b'P', b'N', b'G'],
+                text_offset: 0,
+            }),
+        }])
+        .expect_err("caller-constructed invalid normalized state must fail closed");
+        assert!(matches!(
+            error,
+            ApiError::BadRequest {
+                code: "invalid_image_role",
+                ..
+            }
+        ));
+    }
     #[test]
     fn finish_reason_stopped_true_is_stop() {
         assert_eq!(finish_reason(true), "stop");

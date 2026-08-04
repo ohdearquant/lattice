@@ -74,6 +74,8 @@ fn bench_baseline(c: &mut Criterion) {
         use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
         use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
+        let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
         let Some(dir) = q4_model_dir() else {
             eprintln!("SKIP mtp_decode/baseline: Q4 model not found (need mtp_fc_weight.q4)");
             return;
@@ -169,6 +171,8 @@ fn bench_mtp(c: &mut Criterion) {
         use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
         use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
         use lattice_inference::tokenizer::bpe::BpeTokenizer;
+
+        let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
 
         let Some(dir) = q4_model_dir() else {
             eprintln!("SKIP mtp_decode/mtp: Q4 model not found (need mtp_fc_weight.q4)");

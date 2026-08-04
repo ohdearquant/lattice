@@ -14,6 +14,7 @@
 mod activation;
 mod error;
 mod layer;
+pub mod lora;
 mod network;
 pub mod training;
 
@@ -23,6 +24,7 @@ pub mod gpu;
 pub use activation::Activation;
 pub use error::{FannError, FannResult};
 pub use layer::Layer;
+pub use lora::LoraDescriptor;
 pub use network::{Network, NetworkBuilder};
 pub use training::{
     BackpropTrainer, GradientGuardStrategy, Trainer, TrainingConfig, TrainingResult,

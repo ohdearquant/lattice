@@ -1,30 +1,49 @@
 //! Structural regression: `LoraAdapter::apply` must not heap-allocate on the
 //! per-token-row hot path (`lattice_inference::lora_hook::apply_lora_rows`
 //! calls it once per row — 6 x layers x tokens times for a BERT forward
-//! pass), whether or not the layer/module has an adapter.
+//! pass), whether or not the layer/module has an adapter — for ranks within
+//! `apply::STACK_RANK_CAPACITY` (128), the only case this claim covers.
+//! `apply_lora`'s own doc comment states the contract as rank-conditional:
+//! above that cap it falls back to a heap `Vec` for the `A @ x` intermediate
+//! and stays correct, just not allocation-free. `LoraAdapter::validate_against_bert`
+//! deliberately permits `rank > min(d_in, d_out)` (redundant but valid; see
+//! `blend_lora_adapters`, which produces exactly this shape), so a rank above
+//! 128 is reachable through the public API, not just a hypothetical.
 //!
 //! Installs a counting global allocator for this test binary only (isolated
 //! from other integration tests, which run as separate processes) and
 //! asserts zero allocation-call deltas across both the missing-adapter fast
-//! path and the matched, rank-driven path.
+//! path and the matched, rank-driven path — plus a companion test below that
+//! records the heap branch honestly instead of leaving it unmeasured.
+//!
+//! Counters are thread-local (#1272): the test body runs on a harness-spawned
+//! thread while other harness threads (result reporting, output capture,
+//! timing) remain live and may allocate during the measured window. A
+//! process-wide counter attributes that unrelated activity to
+//! `LoraAdapter::apply`, producing an intermittent nonzero delta with no
+//! code change — the same commit both failed and passed in CI. Scoping the
+//! counters to the measuring thread removes that cross-thread noise instead
+//! of tolerating it with a fudge-factor threshold.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use lattice_tune::lora::{LoraAdapter, LoraConfig, LoraLayer};
 
 struct CountingAlloc;
 
-static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
-static DEALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static ALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
+    static DEALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
+}
 
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_CALLS.with(|c| c.set(c.get() + 1));
         // SAFETY: `System` imposes the same contract on `alloc` that this
         // impl's caller has already satisfied, and `layout` reaches it
         // unchanged. Counting is side-effect free with respect to that
@@ -34,7 +53,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        DEALLOC_CALLS.with(|c| c.set(c.get() + 1));
         // SAFETY: every pointer this allocator hands out comes from `System`,
         // so a `ptr`/`layout` pair the caller validly passes here is one
         // `System` allocated under that same layout. Both are forwarded
@@ -43,7 +62,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_CALLS.with(|c| c.set(c.get() + 1));
         // SAFETY: same forwarding invariant as `dealloc` for `ptr`/`layout`,
         // and `new_size` is passed through untouched for `System` to validate
         // against its own contract.
@@ -52,11 +71,11 @@ unsafe impl GlobalAlloc for CountingAlloc {
 }
 
 fn alloc_calls() -> u64 {
-    ALLOC_CALLS.load(Ordering::Relaxed)
+    ALLOC_CALLS.with(Cell::get)
 }
 
 fn dealloc_calls() -> u64 {
-    DEALLOC_CALLS.load(Ordering::Relaxed)
+    DEALLOC_CALLS.with(Cell::get)
 }
 
 fn make_adapter() -> LoraAdapter {
@@ -64,6 +83,7 @@ fn make_adapter() -> LoraAdapter {
         rank: 8,
         alpha: 16.0,
         target_modules: vec!["query".into(), "value".into()],
+        dtype: "f32".into(),
     };
 
     let mut layers = HashMap::new();
@@ -131,5 +151,53 @@ fn apply_matched_and_missing_hot_path_allocates_nothing() {
         "LoraAdapter::apply performed {} heap deallocations across 512 * 12 * 4 \
          hooked rows; the per-row hot path must be allocation-free",
         dealloc_after - dealloc_before
+    );
+}
+
+/// Companion to the test above: a rank above the stack-scratch cap (128, per
+/// `apply::STACK_RANK_CAPACITY`) takes the documented heap-fallback branch.
+/// This records that honestly (asserting the allocation actually happens)
+/// rather than silently leaving it unmeasured — a renamed or generalized
+/// "allocation-free" claim without this would still prove nothing about the
+/// over-cap path. `rank = 200` matches the value `apply.rs`'s own internal
+/// unit test uses for the same fallback.
+#[test]
+fn apply_rank_above_stack_capacity_falls_back_to_heap_allocation() {
+    let rank = 200;
+    let config = LoraConfig {
+        rank,
+        alpha: rank as f32,
+        target_modules: vec!["query".into()],
+        dtype: "f32".into(),
+    };
+    let mut layers = HashMap::new();
+    layers.insert(
+        (0, "query".to_string()),
+        LoraLayer {
+            a: vec![0.01; rank * 16],
+            b: vec![0.02; 16 * rank],
+            d_in: 16,
+            d_out: 16,
+            rank,
+        },
+    );
+    let adapter = LoraAdapter::new(config, layers).expect("valid adapter config");
+    let x = vec![0.1f32; 16];
+    let mut output = vec![0.0f32; 16];
+
+    // Warm up once, matching the pattern above, so only the measured calls
+    // below are attributed.
+    adapter.apply(0, "query", &x, &mut output);
+
+    let alloc_before = alloc_calls();
+    adapter.apply(0, "query", &x, &mut output);
+    let alloc_after = alloc_calls();
+
+    assert!(
+        alloc_after > alloc_before,
+        "rank {rank} (above STACK_RANK_CAPACITY=128) is documented to take the \
+         heap-fallback branch for its A @ x scratch buffer, but no allocation \
+         was observed — either the fallback stopped firing or this test no \
+         longer exercises it"
     );
 }

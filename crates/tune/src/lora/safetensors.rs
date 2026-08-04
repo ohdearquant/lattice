@@ -372,6 +372,7 @@ pub(crate) fn load_peft_safetensors_bytes(bytes: &[u8]) -> Result<LoraAdapter, T
         rank,
         alpha,
         target_modules: target_modules.into_iter().collect(),
+        dtype: "f32".into(),
     };
     LoraAdapter::new(config, layers)
 }
@@ -1057,6 +1058,7 @@ mod tests {
             rank,
             alpha: rank as f32,
             target_modules: vec!["q_proj".to_string(), "gate_proj".to_string()],
+            dtype: "f32".into(),
         };
 
         let a_data: Vec<f32> = (0..rank * d_in).map(|i| i as f32 * 0.01).collect();
@@ -1131,6 +1133,7 @@ mod tests {
             rank,
             alpha: rank as f32,
             target_modules: vec!["q_proj".to_string()],
+            dtype: "f32".into(),
         };
         let mut layers = HashMap::new();
         layers.insert(
@@ -1178,6 +1181,7 @@ mod tests {
             rank,
             alpha: rank as f32,
             target_modules: vec!["q_proj".to_string()],
+            dtype: "f32".into(),
         };
         let mut layers = HashMap::new();
         layers.insert(
@@ -1244,6 +1248,7 @@ mod tests {
             rank,
             alpha: 16.0,
             target_modules: vec!["q_proj".to_string()],
+            dtype: "f32".into(),
         };
 
         let mut layers = HashMap::new();
@@ -1379,6 +1384,7 @@ mod tests {
             rank,
             alpha: rank as f32,
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+            dtype: "f32".into(),
         };
 
         let mut layers = HashMap::new();

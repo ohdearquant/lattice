@@ -550,8 +550,8 @@ mod tests {
     /// token 1's delta must be the complete "好", not mojibake or U+FFFD.
     #[test]
     fn token_level_split_cjk_codepoint_decodes_without_mojibake() {
-        use crate::model::qwen35::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
         use crate::tokenizer::bpe::BpeTokenizer;
+        use crate::tokenizer::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
         use std::collections::HashMap;
 
         let byte_encoder = bytes_to_unicode();
@@ -581,8 +581,8 @@ mod tests {
     /// never emitting a dropped/garbled tail for the preceding ASCII text.
     #[test]
     fn stop_streamer_matches_split_cjk_stop_string_no_dropped_tail() {
-        use crate::model::qwen35::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
         use crate::tokenizer::bpe::BpeTokenizer;
+        use crate::tokenizer::detokenize::{IncrementalDetokenizer, bytes_to_unicode};
         use std::collections::HashMap;
 
         let byte_encoder = bytes_to_unicode();

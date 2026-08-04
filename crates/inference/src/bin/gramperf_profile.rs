@@ -77,6 +77,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(1024);
 
     eprintln!("[gramperf] loading {model_dir_str} (Q4) / tokenizer {tokenizer_dir_str}");
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let cfg = Qwen35Config::from_model_dir(dir).map_err(|e| format!("config.json load: {e}"))?;
     let mut metal =
         MetalQwen35State::from_q4_dir(dir, &tokenizer_dir.join("tokenizer.json"), &cfg, 4096)
