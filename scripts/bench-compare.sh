@@ -25,7 +25,9 @@
 # with only a fabricated status file is refused at the handoff sample.
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-exec python3 "$REPO/scripts/lib/bench_supervision.py" run \
+source "$REPO/scripts/lib/bench-python.sh"
+PYTHON_BIN="$(bench_require_python3 "bench-compare.sh")" || exit 1
+exec "$PYTHON_BIN" "$REPO/scripts/lib/bench_supervision.py" run \
   --label "bench-compare" \
   --entrypoint \
   -- "$REPO/scripts/lib/bench-compare-impl.sh" "$@"

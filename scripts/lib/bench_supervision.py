@@ -11,6 +11,27 @@ caller-supplied state and does not authenticate a deliberate same-user caller.
 
 from __future__ import annotations
 
+import sys
+
+# 3.10 covers this module's own zip(..., strict=True) (PEP 618), but the
+# measurement scripts this supervisor hands off to (scripts/perf-bench-gate.py,
+# scripts/lib/machine-state-probe.py) already require 3.11 (`datetime.UTC`,
+# PEP 604 checked at their own entry). Floor here at the graph's actual
+# requirement so a 3.10 interpreter fails fast at this entry point instead of
+# passing here and crashing two steps later inside the measurement body.
+_MIN_PYTHON = (3, 11)
+if sys.version_info < _MIN_PYTHON:
+    sys.stderr.write(
+        "bench-supervision: requires Python >= "
+        f"{'.'.join(str(part) for part in _MIN_PYTHON)} "
+        "(this harness and the measurement scripts it hands off to use "
+        "zip(..., strict=True) and datetime.UTC); found "
+        f"{sys.version.split()[0]} at {sys.executable}. "
+        "Install a newer interpreter (e.g. `brew install python@3.12`) and "
+        "point the caller at it explicitly rather than relying on PATH.\n"
+    )
+    sys.exit(1)
+
 import argparse
 import fcntl
 import os
@@ -19,7 +40,6 @@ import runpy
 import select
 import stat
 import subprocess
-import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]

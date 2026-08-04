@@ -994,8 +994,17 @@ class InventoryContract(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 source = (REPO / path).read_text()
+                # The interpreter may be a literal `python3` or a resolved
+                # interpreter variable (e.g. `"$python_bin"` from
+                # bench-python.sh's version-floor resolver) -- either way,
+                # the helper's `verify` subcommand must be re-invoked.
                 self.assertGreaterEqual(
-                    len(re.findall(r'python3 "[^"]+" verify', source)), 2
+                    len(
+                        re.findall(
+                            r'(?:python3|"\$[A-Za-z_]+") "[^"]+" verify', source
+                        )
+                    ),
+                    2,
                 )
                 self.assertNotIn("verify-retained", source)
 
@@ -1008,7 +1017,12 @@ class _SupervisorSandbox:
         self.root = Path(self.tmp.name) / "repo"
         lib = self.root / "scripts" / "lib"
         lib.mkdir(parents=True)
-        for name in ("bench_supervision.py", "bench-locks.py", "quiet-probe.py"):
+        for name in (
+            "bench_supervision.py",
+            "bench-locks.py",
+            "quiet-probe.py",
+            "bench-python.sh",
+        ):
             shutil.copy2(REPO / "scripts" / "lib" / name, lib / name)
         shutil.copy2(
             REPO / "scripts" / "lib" / "bench-supervision.sh",
@@ -2299,6 +2313,10 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
         shutil.copy2(
             REPO / "scripts" / "lib" / "bench_supervision.py",
             lib / "bench_supervision.py",
+        )
+        shutil.copy2(
+            REPO / "scripts" / "lib" / "bench-python.sh",
+            lib / "bench-python.sh",
         )
         self.bench_lock = Path(tmp) / "bench-window.lock"
         self.gpu_lock = Path(tmp) / "metal-gpu.lock"
