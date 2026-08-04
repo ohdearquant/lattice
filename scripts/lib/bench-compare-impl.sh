@@ -439,24 +439,80 @@ BENCH_HEAD_BASELINE_NAME="compare-head"
 # Keep Criterion evidence target-qualified without giving up Cargo's shared
 # compilation target. CRITERION_HOME controls only Criterion's report/baseline
 # tree; Cargo continues to use each worktree's normal target directory.
+#
+# Root paths are keyed by BENCH TARGET, not just by crate: BENCHES_INFERENCE
+# is caller-overridable (BENCHES_EMBED is a fixed "simd" today, keyed the same
+# way for consistency should that change), so two runs that pick different
+# targets must never share a directory — Criterion's own report tree keys by
+# group/function only, and two different bench targets can and do declare
+# same-named or different groups into what would otherwise be one shared
+# directory. A target name reaches the filesystem as a path component here,
+# so it is sanitized first: anything outside [A-Za-z0-9._-] becomes '_', and
+# a name that sanitizes to nothing refuses rather than silently keying every
+# such target into the same empty-string directory.
+sanitize_target_component() {
+  local raw="$1" clean
+  clean="$(printf '%s' "$raw" | tr -c 'A-Za-z0-9._-' '_')"
+  if [ -z "$clean" ]; then
+    echo "bench-compare: bench target name '$raw' sanitizes to an empty path" \
+         "component — refusing." >&2
+    exit 2
+  fi
+  printf '%s' "$clean"
+}
+
 BENCH_CRITERION_ROOT="$REPO/.cache/bench-compare-criterion"
-BASE_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/inference/criterion"
-BASE_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/embed/criterion"
-INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/inference/criterion"
-EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/embed/criterion"
-HEAD_CONTROL_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/head/inference/criterion"
-HEAD_CONTROL_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/head/embed/criterion"
-BASE_CONTROL_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/base/inference/criterion"
-BASE_CONTROL_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/base/embed/criterion"
-mkdir -p \
-  "$BASE_INFERENCE_CRITERION_ROOT" "$BASE_EMBED_CRITERION_ROOT" \
-  "$INFERENCE_CRITERION_ROOT" "$EMBED_CRITERION_ROOT" \
-  "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" "$HEAD_CONTROL_EMBED_CRITERION_ROOT" \
-  "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" "$BASE_CONTROL_EMBED_CRITERION_ROOT"
-python3 "$GATE_SCRIPT" "$BASE_INFERENCE_CRITERION_ROOT" \
-  --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
-python3 "$GATE_SCRIPT" "$BASE_EMBED_CRITERION_ROOT" \
-  --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+BENCHES_INFERENCE_KEY="$(sanitize_target_component "$BENCHES_INFERENCE")"
+BENCHES_EMBED_KEY="$(sanitize_target_component "$BENCHES_EMBED")"
+BASE_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/inference/$BENCHES_INFERENCE_KEY/criterion"
+BASE_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/base/embed/$BENCHES_EMBED_KEY/criterion"
+INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/inference/$BENCHES_INFERENCE_KEY/criterion"
+EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/head/embed/$BENCHES_EMBED_KEY/criterion"
+HEAD_CONTROL_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/head/inference/$BENCHES_INFERENCE_KEY/criterion"
+HEAD_CONTROL_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/head/embed/$BENCHES_EMBED_KEY/criterion"
+BASE_CONTROL_INFERENCE_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/base/inference/$BENCHES_INFERENCE_KEY/criterion"
+BASE_CONTROL_EMBED_CRITERION_ROOT="$BENCH_CRITERION_ROOT/order-control/base/embed/$BENCHES_EMBED_KEY/criterion"
+
+# Each arm's root is wiped immediately before the phase that populates it, not
+# just created if absent: keying stops two DIFFERENT targets from sharing a
+# directory, but says nothing about a group a PRIOR run under the same key
+# left behind (renamed, removed, or from before this fix shipped). An `rm -rf`
+# whose argument came back empty or unmoored is the exact failure this repo's
+# rules exist to prevent, so the path is asserted non-empty and confined under
+# $BENCH_CRITERION_ROOT before anything is removed; both are already
+# guaranteed by sanitize_target_component and the fixed prefix construction
+# above, this is the second, independent check at the point of deletion.
+clear_criterion_root() {
+  local root="$1"
+  if [ -z "$root" ]; then
+    echo "bench-compare: internal error — empty Criterion root path passed to" \
+         "clear_criterion_root; refusing to remove anything." >&2
+    exit 2
+  fi
+  case "$root" in
+    "$BENCH_CRITERION_ROOT"/*) ;;
+    *)
+      echo "bench-compare: internal error — '$root' is not under the expected" \
+           "Criterion cache root '$BENCH_CRITERION_ROOT'; refusing to remove it." >&2
+      exit 2
+      ;;
+  esac
+  rm -rf -- "$root"
+  mkdir -p -- "$root"
+}
+
+clear_criterion_root "$BASE_INFERENCE_CRITERION_ROOT"
+clear_criterion_root "$BASE_EMBED_CRITERION_ROOT"
+clear_criterion_root "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT"
+clear_criterion_root "$HEAD_CONTROL_EMBED_CRITERION_ROOT"
+clear_criterion_root "$BASE_CONTROL_INFERENCE_CRITERION_ROOT"
+clear_criterion_root "$BASE_CONTROL_EMBED_CRITERION_ROOT"
+if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+  python3 "$GATE_SCRIPT" "$BASE_INFERENCE_CRITERION_ROOT" \
+    --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+  python3 "$GATE_SCRIPT" "$BASE_EMBED_CRITERION_ROOT" \
+    --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
+fi
 python3 "$GATE_SCRIPT" "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
   --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
 python3 "$GATE_SCRIPT" "$HEAD_CONTROL_EMBED_CRITERION_ROOT" \
@@ -589,6 +645,12 @@ prepare_target_root() {
   python3 "$GATE_SCRIPT" "$head_root" \
     --baseline-name "$baseline_name" --prepare-head
 }
+
+# Wiped here, immediately before the head phase populates them (base-arm
+# baseline copy, then head's own run) — same rationale as the base-side clear
+# above, applied to the head-side roots at the point the head phase begins.
+clear_criterion_root "$INFERENCE_CRITERION_ROOT"
+clear_criterion_root "$EMBED_CRITERION_ROOT"
 
 prepare_target_root \
   "lattice-inference:$BENCHES_INFERENCE" \
@@ -734,12 +796,115 @@ echo "$QUIET_SAMPLES" | sed 's/^/    /'
 echo "  machine state:"
 echo "$MACHINE_STATE_SAMPLES" | sed 's/^/    /'
 
+# --- Reconcile reported groups against the bench target's declared groups ---
+# Path-keying and the clears above stop a stray group from surviving into a
+# target's root by construction. This is the independent check at the point
+# of reporting: it does not trust that construction, it verifies the outcome.
+# Before the gate reads a root, compare the Criterion groups actually present
+# in it (the first path component of every change/estimates.json — exactly
+# what perf-bench-gate.py's find_change_files/parse_bench walk to build the
+# report) against the groups the target's bench SOURCE declares. A group
+# present but undeclared refuses the run rather than being reported: this is
+# the third state the run can end in — not pass, not a confirmed regression,
+# but "the instrument's output does not match its subject."
+#
+# Declared groups are read by grepping the bench source for literal
+# `benchmark_group("...")` arguments — lexical, not semantic. This misses:
+#   - a group name built at runtime (format!, a variable, a match arm)
+#     instead of written as a string literal;
+#   - a benchmark registered directly via `c.bench_function(...)` with no
+#     enclosing group, which gets its own top-level directory named after the
+#     function rather than a declared group name.
+# Neither pattern occurs today in elementwise_cpu_bench.rs, f16_convert_bench
+# .rs, or embed's simd.rs: every group.bench_function/group.bench_with_input
+# call in those three files sits inside a benchmark_group(...) block, and a
+# bare `c.bench_function` (not `group.bench_function`) does not appear in any
+# of them (checked by grep over the three files during this fix). A future
+# bench target using either pattern needs this derivation extended — until
+# then, a group registered that way is invisible to this guard, so it is a
+# lower bound on what gets caught, not a proof that nothing can slip past it.
+bench_source_for_target() {
+  local head_dir="$1" crate_dir="$2" bench_name="$3"
+  local benches_dir candidate base_resolved resolved
+  benches_dir="$head_dir/crates/$crate_dir/benches"
+  candidate="$benches_dir/$bench_name.rs"
+  if [ ! -d "$benches_dir" ] || [ ! -f "$candidate" ]; then
+    echo "bench-compare: expected bench source '$candidate' does not exist —" \
+         "refusing to reconcile without a declared-group source." >&2
+    exit 2
+  fi
+  if ! base_resolved="$(cd "$benches_dir" && pwd -P)"; then
+    echo "bench-compare: cannot resolve '$benches_dir' — refusing." >&2
+    exit 2
+  fi
+  resolved="$base_resolved/$(basename "$candidate")"
+  case "$resolved" in
+    "$base_resolved"/*) ;;
+    *)
+      echo "bench-compare: bench source '$candidate' resolves outside" \
+           "'$base_resolved' — refusing." >&2
+      exit 2
+      ;;
+  esac
+  printf '%s' "$resolved"
+}
+
+declared_groups_from_source() {
+  local bench_source="$1"
+  command grep -oE 'benchmark_group\("[^"]+"\)' "$bench_source" \
+    | command sed -E 's/^benchmark_group\("(.*)"\)$/\1/' \
+    | LC_ALL=C sort -u
+}
+
+reconcile_criterion_groups() {
+  local target="$1" criterion_root="$2" bench_source="$3"
+  local declared actual stray
+
+  declared="$(declared_groups_from_source "$bench_source")"
+  if [ -z "$declared" ]; then
+    echo "bench-compare: $target: found zero declared Criterion groups in" \
+         "$bench_source — refusing. An empty declared set would let every" \
+         "reported group pass unreconciled, which is worse than not" \
+         "reconciling at all." >&2
+    exit 2
+  fi
+
+  if [ ! -d "$criterion_root" ]; then
+    return 0
+  fi
+
+  actual="$(
+    find "$criterion_root" -type f -path '*/change/estimates.json' -print 2>/dev/null \
+      | while IFS= read -r f; do
+          rel="${f#"$criterion_root"/}"
+          printf '%s\n' "${rel%%/*}"
+        done \
+      | LC_ALL=C sort -u
+  )"
+  if [ -z "$actual" ]; then
+    return 0
+  fi
+
+  stray="$(comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$declared"))"
+  if [ -n "$stray" ]; then
+    echo "bench-compare: $target: $criterion_root reports group(s) this" \
+         "target does not declare — refusing to certify this report." >&2
+    echo "  undeclared group(s) found:" >&2
+    printf '%s\n' "$stray" | sed 's/^/    - /' >&2
+    echo "  declared groups (from $bench_source):" >&2
+    printf '%s\n' "$declared" | sed 's/^/    - /' >&2
+    exit 2
+  fi
+}
+
 echo ""
 echo "=== Target-qualified gate reports ==="
 GATE_RC=0
 run_target_gate() {
-  local target="$1" criterion_root="$2" order_control_root="$3"
+  local target="$1" criterion_root="$2" order_control_root="$3" bench_source="$4"
   local gate_rc=0 policy_rc=0 policy_invalid=0
+
+  reconcile_criterion_groups "$target" "$criterion_root" "$bench_source"
   local gate_args=(
     --baseline-name compare-base
     --target "$target"
@@ -809,11 +974,13 @@ run_target_gate() {
 run_target_gate \
   "lattice-inference:$BENCHES_INFERENCE" \
   "$INFERENCE_CRITERION_ROOT" \
-  "$BASE_CONTROL_INFERENCE_CRITERION_ROOT"
+  "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
+  "$(bench_source_for_target "$HEAD_DIR" "inference" "$BENCHES_INFERENCE")"
 run_target_gate \
   "lattice-embed:$BENCHES_EMBED" \
   "$EMBED_CRITERION_ROOT" \
-  "$BASE_CONTROL_EMBED_CRITERION_ROOT"
+  "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
+  "$(bench_source_for_target "$HEAD_DIR" "embed" "$BENCHES_EMBED")"
 
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;

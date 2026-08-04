@@ -20,17 +20,17 @@
 //! ONE contract -- an explicit [`WorkerEvent::Cancelled`] terminal event --
 //! and both binaries now go through the exact same loop to get it.
 //!
-//! # Shutdown scope (explicitly out of scope here -- see the companion
-//! lifecycle issue in this cluster, #833)
+//! # Bounded shutdown
 //!
-//! [`MetalWorkerOwner`] retains the worker thread's `JoinHandle` so a future
-//! graceful-shutdown PR has an obvious place to add a join/shutdown method,
-//! but this module does not add one: neither `lattice.rs`'s prior
-//! `MetalHandle` nor `lattice_serve.rs`'s prior bare
-//! `mpsc::UnboundedSender<Job>` ever joined or explicitly shut down their
-//! worker thread either (the process exits and the OS reaps the detached
-//! thread), so today's behavior is preserved exactly rather than replaced
-//! with a new, ad hoc shutdown state machine.
+//! Every production [`MetalWorkerClient`] retains a clone of
+//! [`MetalWorkerOwner`]. The client's `Drop` implementation explicitly closes
+//! its job sender before automatic field destruction can drop the owner, so
+//! the sequence does not depend on field declaration order. The last owner
+//! then transfers the worker's join handle to a detached reaper. The owner
+//! waits up to two seconds for the reaper's result, so the deadline covers the
+//! full join, including thread-local destructors. A backend call or destructor
+//! that does not return therefore cannot hang process shutdown indefinitely;
+//! on timeout the reaper remains detached and the process remains free to exit.
 //!
 //! # Testability without a GPU
 //!
@@ -49,13 +49,29 @@
 //! on `metal_qwen35.rs`'s own exhaustive Device-gated tests for the
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
-use crate::forward::metal_qwen35::{ChatMessage, MetalQwen35State, format_chat_template};
+use crate::forward::metal_qwen35::{
+    ChatMessage, MetalQwen35State, format_chat_template, push_chat_turn_close, push_chat_turn_open,
+};
 use crate::kv_cache::CrossTurnSlotId;
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
+use crate::model::qwen35_config::{
+    GenerateConfig, GenerateOutput, Qwen35Config, VisionModelConfig,
+};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
-use std::sync::Arc;
+use crate::vision::checkpoint::{
+    Qwen35VisionWeights, load_qwen35_vision_weights_with_cancel,
+    validate_qwen35_vision_weight_inventory,
+};
+use crate::vision::multimodal::Qwen35VisionRequest;
+use crate::vision::qwen35_merger::qwen35_merger_forward_with_cancel;
+use crate::vision::qwen35_vit::preprocess_qwen35_image_for_serve;
+use crate::vision::qwen35_vit_metal::qwen35_vit_forward_metal_with_cancel;
+use std::io::Write as _;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 
 /// Default cap on outstanding (queued + in-flight) jobs a [`MetalWorkerClient`]
@@ -68,6 +84,18 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 /// sooner. Both binaries expose this as an overridable `--max-pending` flag;
 /// this constant is only the default when that flag is omitted.
 pub const DEFAULT_MAX_PENDING_JOBS: usize = 32;
+
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum WorkerShutdown {
+    Joined,
+    AlreadyStopped,
+    TimedOut,
+    Panicked,
+    ReaperUnavailable,
+}
 
 /// Selects the context-window formula enforced before Metal generation.
 /// Each serve adapter supplies the policy matching its pre-worker contract.
@@ -133,6 +161,7 @@ pub enum WorkerEvent {
 /// `Rejected` vs. `Failed` distinction (#656 vs. #611) at the type level
 /// instead of `lattice_serve.rs`'s prior string-prefix-sniffing convention
 /// (`PROMPT_EXCEEDS_WINDOW_PREFIX`).
+#[derive(Debug)]
 enum WorkerFailure {
     Rejected(ApiError),
     Failed(String),
@@ -220,13 +249,120 @@ pub struct WorkerJob {
     _admission_permit: OwnedSemaphorePermit,
 }
 
-/// Owns the dedicated worker thread's `JoinHandle`. See the module docs'
-/// "Shutdown scope" section: intentionally inert today beyond retaining the
-/// handle -- issue #833 is where a join/shutdown method belongs.
-#[derive(Debug)]
+/// Shared owner for the dedicated worker thread.
+///
+/// Production [`MetalWorkerClient`] values retain an owner clone. Each
+/// client's `Drop` explicitly releases its queue sender before automatic
+/// field destruction can release that owner clone. The last owner's `Drop`
+/// is the sole production shutdown trigger; there is no explicit method that
+/// can detach the join handle while a client still keeps the queue open.
+#[derive(Debug, Clone)]
 pub struct MetalWorkerOwner {
-    #[allow(dead_code)]
-    join_handle: Option<std::thread::JoinHandle<()>>,
+    _inner: Arc<MetalWorkerOwnerInner>,
+}
+
+#[derive(Debug)]
+struct MetalWorkerOwnerInner {
+    join_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    drop_timeout: Duration,
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+impl MetalWorkerOwnerInner {
+    fn wait_for_exit(&self, timeout: Duration) -> WorkerShutdown {
+        let handle = {
+            let mut join_handle = lock_unpoisoned(&self.join_handle);
+            let Some(handle) = join_handle.take() else {
+                return WorkerShutdown::AlreadyStopped;
+            };
+            handle
+        };
+
+        let started = Instant::now();
+        let (joined_tx, joined_rx) = std::sync::mpsc::sync_channel(1);
+        let reaper = std::thread::Builder::new()
+            .name("lattice-metal-worker-reaper".to_string())
+            .spawn(move || {
+                let _ = joined_tx.send(handle.join());
+            });
+        let Ok(reaper) = reaper else {
+            return WorkerShutdown::ReaperUnavailable;
+        };
+        // Joining this helper would recreate the TLS-destructor tail that the
+        // result channel exists to keep outside the owner's deadline.
+        drop(reaper);
+
+        let remaining = timeout.saturating_sub(started.elapsed());
+        match joined_rx.recv_timeout(remaining) {
+            Ok(Ok(())) => WorkerShutdown::Joined,
+            Ok(Err(_)) => WorkerShutdown::Panicked,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => WorkerShutdown::TimedOut,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                WorkerShutdown::ReaperUnavailable
+            }
+        }
+    }
+}
+
+impl Drop for MetalWorkerOwnerInner {
+    fn drop(&mut self) {
+        match self.wait_for_exit(self.drop_timeout) {
+            WorkerShutdown::Joined | WorkerShutdown::AlreadyStopped => {}
+            WorkerShutdown::TimedOut => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[metal-worker] shutdown timed out after {} ms; detaching worker join reaper",
+                    self.drop_timeout.as_millis()
+                );
+            }
+            WorkerShutdown::Panicked => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[metal-worker] worker thread panicked during shutdown"
+                );
+            }
+            WorkerShutdown::ReaperUnavailable => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "[metal-worker] worker join reaper unavailable; detaching worker thread"
+                );
+            }
+        }
+    }
+}
+
+impl MetalWorkerOwner {
+    fn from_handle(join_handle: std::thread::JoinHandle<()>) -> Self {
+        Self::from_handle_with_timeout(join_handle, WORKER_SHUTDOWN_TIMEOUT)
+    }
+
+    fn from_handle_with_timeout(
+        join_handle: std::thread::JoinHandle<()>,
+        drop_timeout: Duration,
+    ) -> Self {
+        Self {
+            _inner: Arc::new(MetalWorkerOwnerInner {
+                join_handle: Mutex::new(Some(join_handle)),
+                drop_timeout,
+            }),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn unattached_for_test() -> Self {
+        Self {
+            _inner: Arc::new(MetalWorkerOwnerInner {
+                join_handle: Mutex::new(None),
+                drop_timeout: WORKER_SHUTDOWN_TIMEOUT,
+            }),
+        }
+    }
 }
 
 /// Cheaply `Clone` (an `mpsc` sender) handle used to submit generation
@@ -236,15 +372,47 @@ pub struct MetalWorkerOwner {
 /// confined to that thread.
 #[derive(Debug, Clone)]
 pub struct MetalWorkerClient {
-    jobs: mpsc::UnboundedSender<WorkerJob>,
+    jobs: Option<mpsc::UnboundedSender<WorkerJob>>,
     /// Bounded-admission cap (issue #932): `Semaphore::new(max_pending)`, one
     /// permit per outstanding job (queued + in-flight, i.e. from `submit`
     /// until `run_worker_loop` is done with it). `Arc`-shared with every
     /// clone of this client so the cap is process-wide, not per-clone.
     admission: Arc<Semaphore>,
+    vision_supported: Arc<AtomicBool>,
+    /// Keeps the worker join owner alive for exactly as long as the queue
+    /// can accept jobs. Test-only clients without a worker carry an owner
+    /// whose join slot is already empty.
+    _owner: MetalWorkerOwner,
 }
 
 impl MetalWorkerClient {
+    fn with_owner(
+        jobs: mpsc::UnboundedSender<WorkerJob>,
+        admission: Arc<Semaphore>,
+        vision_supported: Arc<AtomicBool>,
+        owner: MetalWorkerOwner,
+    ) -> Self {
+        Self {
+            jobs: Some(jobs),
+            admission,
+            vision_supported,
+            _owner: owner,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn unattached_for_test(
+        jobs: mpsc::UnboundedSender<WorkerJob>,
+        admission: Arc<Semaphore>,
+    ) -> Self {
+        Self::with_owner(
+            jobs,
+            admission,
+            Arc::new(AtomicBool::new(false)),
+            MetalWorkerOwner::unattached_for_test(),
+        )
+    }
+
     /// Submit one generation request; the worker thread processes jobs
     /// strictly FIFO. Returns the event receiver on success -- if the
     /// worker thread is no longer running, the returned receiver closes
@@ -288,7 +456,9 @@ impl MetalWorkerClient {
         // On failure `job` (including `tx` and the admission permit) is
         // simply dropped here, closing `rx` with zero events and freeing
         // the slot immediately -- see the doc comment above.
-        let _ = self.jobs.send(job);
+        if let Some(jobs) = self.jobs.as_ref() {
+            let _ = jobs.send(job);
+        }
         Ok(rx)
     }
 
@@ -301,6 +471,21 @@ impl MetalWorkerClient {
     /// the actual admission state.
     pub fn available_permits(&self) -> usize {
         self.admission.available_permits()
+    }
+
+    /// Whether this worker currently accepts image content.
+    ///
+    /// Starts `true` only for a concrete vision-capable checkpoint and
+    /// flips to `false` if its first lazy vision-weight load fails
+    /// terminally.
+    pub fn supports_vision(&self) -> bool {
+        self.vision_supported.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for MetalWorkerClient {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
     }
 }
 
@@ -444,6 +629,364 @@ fn run_worker_loop(
     }
 }
 
+enum VisionState {
+    Unsupported,
+    Pending {
+        model_dir: PathBuf,
+        config: VisionModelConfig,
+    },
+    Loaded(Qwen35VisionWeights),
+    Failed(String),
+}
+
+#[derive(Debug)]
+enum VisionRuntimeLoad<'a> {
+    Ready(&'a Qwen35VisionWeights),
+    Unsupported,
+    Cancelled,
+}
+
+/// Worker-local vision capability and lazily loaded vision weights.
+///
+/// Loading stays on the same dedicated thread that owns the Metal decoder
+/// and happens only for the first admitted image request. Text-only servers
+/// and text-only traffic retain the pre-vision startup and memory profile.
+pub struct VisionRuntime {
+    state: VisionState,
+    vision_supported: Arc<AtomicBool>,
+}
+
+impl VisionRuntime {
+    /// Resolve a runtime from concrete checkpoint metadata.
+    pub fn from_model_config(model_dir: PathBuf, config: &Qwen35Config) -> Self {
+        let token_metadata_present = match (
+            config.image_token_id,
+            config.vision_start_token_id,
+            config.vision_end_token_id,
+        ) {
+            (Some(image), Some(start), Some(end)) => {
+                [image, start, end]
+                    .into_iter()
+                    .all(|token| (token as usize) < config.vocab_size)
+                    && image != start
+                    && image != end
+                    && start != end
+            }
+            _ => false,
+        };
+        let supported_weight_source = token_metadata_present
+            && config.vision_config.as_ref().is_some_and(|vision_config| {
+                validate_qwen35_vision_weight_inventory(&model_dir, vision_config).is_ok()
+            });
+        let state = match (
+            &config.vision_config,
+            token_metadata_present,
+            supported_weight_source,
+        ) {
+            (Some(vision_config), true, true) => VisionState::Pending {
+                model_dir,
+                config: vision_config.clone(),
+            },
+            _ => VisionState::Unsupported,
+        };
+        let vision_supported =
+            matches!(&state, VisionState::Pending { .. } | VisionState::Loaded(_));
+        Self {
+            state,
+            vision_supported: Arc::new(AtomicBool::new(vision_supported)),
+        }
+    }
+
+    /// Text-only runtime used by the compatibility [`MetalWorker::spawn`]
+    /// entry point and GPU-free worker tests.
+    pub fn unsupported() -> Self {
+        Self {
+            state: VisionState::Unsupported,
+            vision_supported: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Whether request normalization may admit image content parts.
+    pub fn is_supported(&self) -> bool {
+        self.vision_supported.load(Ordering::Acquire)
+    }
+
+    fn shared_capability(&self) -> Arc<AtomicBool> {
+        self.vision_supported.clone()
+    }
+
+    fn get_or_load(
+        &mut self,
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<VisionRuntimeLoad<'_>, String> {
+        if let VisionState::Pending { model_dir, config } = &self.state {
+            let model_dir = model_dir.clone();
+            let config = config.clone();
+            match load_qwen35_vision_weights_with_cancel(&model_dir, &config, should_cancel) {
+                Ok(Some(weights)) => self.state = VisionState::Loaded(weights),
+                Ok(None) => return Ok(VisionRuntimeLoad::Cancelled),
+                Err(err) => {
+                    let message = format!("vision weights failed to load: {err}");
+                    self.state = VisionState::Failed(message.clone());
+                    self.vision_supported.store(false, Ordering::Release);
+                    return Err(message);
+                }
+            }
+        }
+        match &self.state {
+            VisionState::Unsupported => Ok(VisionRuntimeLoad::Unsupported),
+            VisionState::Loaded(weights) => Ok(VisionRuntimeLoad::Ready(weights)),
+            VisionState::Failed(message) => Err(message.clone()),
+            VisionState::Pending { .. } => {
+                self.vision_supported.store(false, Ordering::Release);
+                Err("vision weights remained pending after a load attempt".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn tokenize_text(tokenizer: &BpeTokenizer, text: &str) -> Vec<u32> {
+    let encoded = tokenizer.tokenize(text);
+    encoded.input_ids[..encoded.real_length].to_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_vision_prompt_ids(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    tokenizer: &BpeTokenizer,
+    vision_start_token_id: u32,
+    vision_end_token_id: u32,
+    image_token_id: u32,
+    image_pad_count: usize,
+) -> Result<Vec<u32>, WorkerFailure> {
+    let image_message = &messages[image_message_index];
+    let image = image_message
+        .image
+        .as_ref()
+        .ok_or_else(|| WorkerFailure::Failed("vision dispatch lost its image payload".into()))?;
+    if image.text_offset > image_message.content.len()
+        || !image_message.content.is_char_boundary(image.text_offset)
+    {
+        return Err(WorkerFailure::Failed(
+            "normalized image text offset is not a UTF-8 boundary".into(),
+        ));
+    }
+
+    let mut before = String::new();
+    for message in &messages[..image_message_index] {
+        push_chat_turn_open(&mut before, message.role.as_str());
+        before.push_str(&message.content);
+        push_chat_turn_close(&mut before);
+    }
+    push_chat_turn_open(&mut before, image_message.role.as_str());
+    before.push_str(&image_message.content[..image.text_offset]);
+
+    let mut after = String::new();
+    after.push_str(&image_message.content[image.text_offset..]);
+    push_chat_turn_close(&mut after);
+    for message in &messages[image_message_index + 1..] {
+        push_chat_turn_open(&mut after, message.role.as_str());
+        after.push_str(&message.content);
+        push_chat_turn_close(&mut after);
+    }
+    after.push_str("<|im_start|>assistant\n");
+
+    let mut inserted_ids = Vec::with_capacity(image_pad_count.saturating_add(2));
+    inserted_ids.push(vision_start_token_id);
+    inserted_ids.extend(std::iter::repeat_n(image_token_id, image_pad_count));
+    inserted_ids.push(vision_end_token_id);
+    let ids = tokenizer.tokenize_fragments_with_inserted_ids(&before, &inserted_ids, &after);
+    if ids.iter().filter(|&&id| id == image_token_id).count() != image_pad_count {
+        return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "message text must not contain the checkpoint's reserved image token"
+                .to_string(),
+            code: "invalid_messages",
+        }));
+    }
+    Ok(ids)
+}
+
+enum VisionRequestBuild {
+    Ready {
+        request: Qwen35VisionRequest,
+        metal_dispatches: usize,
+        gemm_calls: usize,
+    },
+    Cancelled,
+}
+
+fn build_vision_request(
+    runtime: &mut VisionRuntime,
+    config: &Qwen35Config,
+    tokenizer: &BpeTokenizer,
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    should_cancel: &mut dyn FnMut() -> bool,
+    window_preflight: impl FnOnce(usize) -> Result<(), ApiError>,
+) -> Result<VisionRequestBuild, WorkerFailure> {
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+    let vision_config = config.vision_config.as_ref().ok_or_else(|| {
+        WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "image input requires a vision-capable model".to_string(),
+            code: "vision_unsupported",
+        })
+    })?;
+    let image_token_id = config.image_token_id.ok_or_else(|| {
+        WorkerFailure::Failed("vision checkpoint has no image_token_id".to_string())
+    })?;
+    let vision_start_token_id = config.vision_start_token_id.ok_or_else(|| {
+        WorkerFailure::Failed("vision checkpoint has no vision_start_token_id".to_string())
+    })?;
+    let vision_end_token_id = config.vision_end_token_id.ok_or_else(|| {
+        WorkerFailure::Failed("vision checkpoint has no vision_end_token_id".to_string())
+    })?;
+    let image = messages[image_message_index]
+        .image
+        .as_ref()
+        .ok_or_else(|| WorkerFailure::Failed("vision dispatch lost its image payload".into()))?;
+
+    let (pixel_values, grid) = preprocess_qwen35_image_for_serve(&image.bytes, vision_config)
+        .map_err(|err| {
+            WorkerFailure::Rejected(ApiError::BadRequest {
+                message: format!("image preprocessing failed: {err}"),
+                code: "invalid_image",
+            })
+        })?;
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+    let merge_area = vision_config
+        .spatial_merge_size
+        .checked_mul(vision_config.spatial_merge_size)
+        .filter(|&area| area > 0)
+        .ok_or_else(|| WorkerFailure::Failed("vision spatial_merge_size is invalid".to_string()))?;
+    if !grid.num_patches().is_multiple_of(merge_area) {
+        return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "image patch grid is incompatible with the checkpoint merge size".to_string(),
+            code: "invalid_image",
+        }));
+    }
+    let image_pad_count = grid.num_patches() / merge_area;
+    let input_ids = build_vision_prompt_ids(
+        messages,
+        image_message_index,
+        tokenizer,
+        vision_start_token_id,
+        vision_end_token_id,
+        image_token_id,
+        image_pad_count,
+    )?;
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+    window_preflight(input_ids.len()).map_err(WorkerFailure::Rejected)?;
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+
+    let weights = match runtime
+        .get_or_load(should_cancel)
+        .map_err(WorkerFailure::Failed)?
+    {
+        VisionRuntimeLoad::Ready(weights) => weights,
+        VisionRuntimeLoad::Unsupported => {
+            return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                message: "image input requires a vision-capable model".to_string(),
+                code: "vision_unsupported",
+            }));
+        }
+        VisionRuntimeLoad::Cancelled => return Ok(VisionRequestBuild::Cancelled),
+    };
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+    let Some(vit_output) = qwen35_vit_forward_metal_with_cancel(
+        weights,
+        vision_config,
+        &pixel_values,
+        grid,
+        should_cancel,
+    )
+    .map_err(|err| WorkerFailure::Failed(format!("vision forward failed: {err}")))?
+    else {
+        return Ok(VisionRequestBuild::Cancelled);
+    };
+    let Some(post_merger) = qwen35_merger_forward_with_cancel(
+        &weights.merger,
+        vision_config,
+        &vit_output.hidden_states,
+        should_cancel,
+    )
+    .map_err(|err| WorkerFailure::Failed(format!("vision merger failed: {err}")))?
+    else {
+        return Ok(VisionRequestBuild::Cancelled);
+    };
+    if should_cancel() {
+        return Ok(VisionRequestBuild::Cancelled);
+    }
+
+    Ok(VisionRequestBuild::Ready {
+        request: Qwen35VisionRequest {
+            input_ids,
+            image_grids: vec![grid],
+            post_merger_rows: post_merger,
+            image_token_id,
+            spatial_merge_size: vision_config.spatial_merge_size,
+            decoder_hidden_size: config.hidden_size,
+        },
+        metal_dispatches: vit_output.metal_dispatches,
+        gemm_calls: vit_output.gemm_calls,
+    })
+}
+
+fn cancelled_output() -> GenerateOutput {
+    GenerateOutput {
+        text: String::new(),
+        token_ids: Vec::new(),
+        prompt_tokens: 0,
+        generated_tokens: 0,
+        stopped: false,
+        stop_reason: Some(crate::StopReason::Interrupt),
+        token_logprobs: Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobRoute {
+    Text,
+    Vision { message_index: usize },
+}
+
+fn classify_job(messages: &[ChatMessage]) -> Result<JobRoute, WorkerFailure> {
+    let mut image_positions = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.image.is_some());
+    let first = image_positions.next();
+    if image_positions.next().is_some() {
+        return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "only one image is supported per request".to_string(),
+            code: "multiple_images_unsupported",
+        }));
+    }
+    Ok(match first {
+        Some((_message_index, message))
+            if message.role != crate::forward::metal_qwen35::ChatRole::User =>
+        {
+            return Err(WorkerFailure::Rejected(ApiError::BadRequest {
+                message: "image content is supported only on user messages".to_string(),
+                code: "invalid_image_role",
+            }));
+        }
+        Some((message_index, _)) => JobRoute::Vision { message_index },
+        None => JobRoute::Text,
+    })
+}
+
 /// Namespace for [`MetalWorker::spawn`] -- a zero-sized marker type (never
 /// constructed) so the shared worker's entry point reads as
 /// `MetalWorker::spawn(..)` at every call site, matching the association
@@ -478,6 +1021,22 @@ impl MetalWorker {
         + 'static,
         max_pending: usize,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
+        Self::spawn_with_vision(loader, VisionRuntime::unsupported(), max_pending)
+    }
+
+    /// Vision-capable sibling of [`Self::spawn`].
+    ///
+    /// `vision_runtime` is derived from the same concrete checkpoint config
+    /// as `loader`. It remains worker-local and loads vision tensors only
+    /// when the first image-bearing job is actually dispatched.
+    pub fn spawn_with_vision(
+        loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
+        + Send
+        + 'static,
+        mut vision_runtime: VisionRuntime,
+        max_pending: usize,
+    ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
+        let vision_supported = vision_runtime.shared_capability();
         // #939: validate BEFORE `Semaphore::new`, which panics outright for
         // `max_pending > Semaphore::MAX_PERMITS` and would otherwise let
         // `max_pending == 0` silently build a worker that admits nothing.
@@ -492,6 +1051,59 @@ impl MetalWorker {
             Ok((mut state, tokenizer, meta)) => {
                 let _ = ready_tx.send(Ok(meta.clone()));
                 run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
+                    if let JobRoute::Vision {
+                        message_index: image_message_index,
+                    } = classify_job(messages)?
+                    {
+                        if should_cancel() {
+                            return Ok(cancelled_output());
+                        }
+                        let config = state.engine.config.clone();
+                        let (request, metal_dispatches, gemm_calls) = match build_vision_request(
+                            &mut vision_runtime,
+                            &config,
+                            &tokenizer,
+                            messages,
+                            image_message_index,
+                            should_cancel,
+                            |prompt_len| {
+                                check_prompt_fits_window(
+                                    meta.context_window_policy,
+                                    meta.model_max_context,
+                                    prompt_len,
+                                    cfg,
+                                )
+                            },
+                        )? {
+                            VisionRequestBuild::Ready {
+                                request,
+                                metal_dispatches,
+                                gemm_calls,
+                            } => (request, metal_dispatches, gemm_calls),
+                            VisionRequestBuild::Cancelled => return Ok(cancelled_output()),
+                        };
+                        if should_cancel() {
+                            return Ok(cancelled_output());
+                        }
+                        eprintln!(
+                            "[metal-worker] route=vision dispatch=multimodal \
+                             metal_gemm_dispatches={metal_dispatches} \
+                             metal_gemm_calls={gemm_calls}"
+                        );
+                        let output = state
+                            .generate_multimodal_vision_with_cancel(
+                                &request,
+                                &tokenizer,
+                                cfg,
+                                should_cancel,
+                            )
+                            .map_err(WorkerFailure::from)?;
+                        if !output.text.is_empty() {
+                            let _ = on_token(&output.text, 0);
+                        }
+                        return Ok(output);
+                    }
+
                     // Render the ChatML prompt exactly once (#828/#832: the
                     // prior `lattice_serve.rs` path rendered it a second
                     // time inside its own window preflight); reused for
@@ -556,17 +1168,17 @@ impl MetalWorker {
             }
         });
 
+        let owner = MetalWorkerOwner::from_handle(join_handle);
         match ready_rx.recv() {
-            Ok(Ok(meta)) => Ok((
-                MetalWorkerOwner {
-                    join_handle: Some(join_handle),
-                },
-                MetalWorkerClient {
-                    jobs: job_tx,
+            Ok(Ok(meta)) => {
+                let client = MetalWorkerClient::with_owner(
+                    job_tx,
                     admission,
-                },
-                meta,
-            )),
+                    vision_supported,
+                    owner.clone(),
+                );
+                Ok((owner, client, meta))
+            }
             Ok(Err(e)) => Err(StartupError::Load(e)),
             Err(_) => Err(StartupError::ThreadExited),
         }
@@ -627,10 +1239,7 @@ pub fn test_client_and_jobs_with_cap(
 ) -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerJob>) {
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
     (
-        MetalWorkerClient {
-            jobs: job_tx,
-            admission: Arc::new(Semaphore::new(max_pending)),
-        },
+        MetalWorkerClient::unattached_for_test(job_tx, Arc::new(Semaphore::new(max_pending))),
         job_rx,
     )
 }
@@ -697,6 +1306,65 @@ pub fn spawn_fake_with_cap(
     context_window_policy: ContextWindowPolicy,
     model_max_context: usize,
     tokenizer: BpeTokenizer,
+    generate: impl FnMut(
+        &[ChatMessage],
+        &GenerateConfig,
+        usize,
+        &mut dyn FnMut(&str, u32) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, String>
+    + Send
+    + 'static,
+) -> MetalWorkerClient {
+    spawn_fake_with_capability(
+        max_pending,
+        context_window_policy,
+        model_max_context,
+        tokenizer,
+        false,
+        generate,
+    )
+}
+
+/// Vision-admitting sibling of [`spawn_fake`] for cross-binary HTTP tests.
+///
+/// The fake still substitutes only the terminal Metal call, but advertises
+/// vision capability so request normalization can prove that an admitted
+/// image survives both binary adapters and reaches their common worker job.
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::type_complexity)]
+pub fn spawn_fake_with_vision(
+    context_window_policy: ContextWindowPolicy,
+    model_max_context: usize,
+    tokenizer: BpeTokenizer,
+    generate: impl FnMut(
+        &[ChatMessage],
+        &GenerateConfig,
+        usize,
+        &mut dyn FnMut(&str, u32) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, String>
+    + Send
+    + 'static,
+) -> MetalWorkerClient {
+    spawn_fake_with_capability(
+        TEST_EFFECTIVELY_UNBOUNDED_CAP,
+        context_window_policy,
+        model_max_context,
+        tokenizer,
+        true,
+        generate,
+    )
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(clippy::type_complexity)]
+fn spawn_fake_with_capability(
+    max_pending: usize,
+    context_window_policy: ContextWindowPolicy,
+    model_max_context: usize,
+    tokenizer: BpeTokenizer,
+    vision_supported: bool,
     mut generate: impl FnMut(
         &[ChatMessage],
         &GenerateConfig,
@@ -708,7 +1376,7 @@ pub fn spawn_fake_with_cap(
     + 'static,
 ) -> MetalWorkerClient {
     let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
-    std::thread::spawn(move || {
+    let join_handle = std::thread::spawn(move || {
         run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
             let prompt = format_chat_template(messages);
             let prompt_tokens = tokenizer.tokenize(&prompt).real_length;
@@ -718,18 +1386,386 @@ pub fn spawn_fake_with_cap(
                 .map_err(WorkerFailure::Failed)
         });
     });
-    MetalWorkerClient {
-        jobs: job_tx,
-        admission: Arc::new(Semaphore::new(max_pending)),
-    }
+    let owner = MetalWorkerOwner::from_handle(join_handle);
+    MetalWorkerClient::with_owner(
+        job_tx,
+        Arc::new(Semaphore::new(max_pending)),
+        Arc::new(AtomicBool::new(vision_supported)),
+        owner,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    struct BlockingThreadLocalDrop {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        finished: std::sync::mpsc::SyncSender<()>,
+    }
+
+    impl Drop for BlockingThreadLocalDrop {
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.release.recv();
+            let _ = self.finished.send(());
+        }
+    }
+
+    thread_local! {
+        static BLOCKING_THREAD_LOCAL_DROP: RefCell<Option<BlockingThreadLocalDrop>> =
+            const { RefCell::new(None) };
+    }
+
+    fn test_owner(
+        join_handle: std::thread::JoinHandle<()>,
+        drop_timeout: Duration,
+    ) -> MetalWorkerOwner {
+        MetalWorkerOwner::from_handle_with_timeout(join_handle, drop_timeout)
+    }
+
+    fn tiny_tokenizer() -> BpeTokenizer {
+        BpeTokenizer::from_vocab_and_merges(
+            HashMap::from([
+                ("a".to_string(), 0),
+                ("b".to_string(), 1),
+                ("e".to_string(), 2),
+                ("f".to_string(), 3),
+                ("o".to_string(), 4),
+                ("r".to_string(), 5),
+            ]),
+            Vec::new(),
+        )
+        .expect("tiny tokenizer must construct")
+    }
+
+    fn tiny_vision_config(out_hidden_size: usize) -> VisionModelConfig {
+        VisionModelConfig {
+            depth: 1,
+            hidden_size: 8,
+            num_heads: 2,
+            patch_size: 2,
+            spatial_merge_size: 2,
+            out_hidden_size,
+            temporal_patch_size: 1,
+            num_position_embeddings: 16,
+            in_channels: 3,
+            deepstack_visual_indexes: Vec::new(),
+            intermediate_size: None,
+        }
+    }
+
+    fn make_test_png(width: u32, height: u32) -> Vec<u8> {
+        let mut image = image::RgbImage::new(width, height);
+        for y in 0..height {
+            for x in 0..width {
+                let value = ((x + y) % 256) as u8;
+                image.put_pixel(x, y, image::Rgb([value, value, value]));
+            }
+        }
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("test PNG encode");
+        bytes
+    }
+
+    #[test]
+    fn image_job_classification_enforces_role_and_multiplicity() {
+        assert_eq!(
+            classify_job(&[ChatMessage::user("hello")]).expect("text job"),
+            JobRoute::Text
+        );
+        let image = ChatMessage::user_with_image("beforeafter", vec![1, 2, 3], 6);
+        assert_eq!(
+            classify_job(&[ChatMessage::system("policy"), image.clone()]).expect("one image job"),
+            JobRoute::Vision { message_index: 1 }
+        );
+        let err = classify_job(&[image.clone(), image]).expect_err("two images must fail");
+        assert!(matches!(
+            err,
+            WorkerFailure::Rejected(ApiError::BadRequest {
+                code: "multiple_images_unsupported",
+                ..
+            })
+        ));
+        for role in [
+            crate::forward::metal_qwen35::ChatRole::System,
+            crate::forward::metal_qwen35::ChatRole::Assistant,
+        ] {
+            let mut non_user_image = ChatMessage::user_with_image("beforeafter", vec![1, 2, 3], 6);
+            non_user_image.role = role;
+            let err = classify_job(&[non_user_image]).expect_err("non-user image role must fail");
+            assert!(matches!(
+                err,
+                WorkerFailure::Rejected(ApiError::BadRequest {
+                    code: "invalid_image_role",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn vision_prompt_splices_tokens_at_original_content_part_position() {
+        let tokenizer = tiny_tokenizer();
+        let messages = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::user_with_image("beforeafter", vec![1], "before".len()),
+            ChatMessage::assistant("prior"),
+        ];
+        let actual = build_vision_prompt_ids(&messages, 1, &tokenizer, 90, 91, 92, 3)
+            .expect("vision prompt");
+
+        let before = "<|im_start|>system\npolicy<|im_end|>\n<|im_start|>user\nbefore";
+        let after =
+            "after<|im_end|>\n<|im_start|>assistant\nprior<|im_end|>\n<|im_start|>assistant\n";
+        let mut expected = tokenize_text(&tokenizer, before);
+        expected.extend([90, 92, 92, 92, 91]);
+        expected.extend(tokenize_text(&tokenizer, after));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn vision_prompt_tokenizes_the_complete_sequence_before_window_validation() {
+        let capped = tiny_tokenizer().with_max_seq_len(4);
+        let unbounded = capped.with_max_seq_len(usize::MAX);
+        let before = "before".repeat(64);
+        let messages = vec![ChatMessage::user_with_image(
+            format!("{before}after"),
+            vec![1],
+            before.len(),
+        )];
+        let actual = build_vision_prompt_ids(&messages, 0, &capped, 90, 91, 92, 3)
+            .expect("capped tokenizer must not truncate prompt fragments");
+        let expected = build_vision_prompt_ids(&messages, 0, &unbounded, 90, 91, 92, 3)
+            .expect("unbounded tokenizer");
+        assert_eq!(actual, expected);
+        assert!(actual.len() > 4);
+    }
+
+    fn vision_build_config() -> Qwen35Config {
+        let mut config = Qwen35Config::qwen35_0_8b();
+        config.vision_config = Some(tiny_vision_config(config.hidden_size));
+        config.image_token_id = Some(90);
+        config.vision_start_token_id = Some(91);
+        config.vision_end_token_id = Some(92);
+        config
+    }
+
+    #[test]
+    fn vision_request_build_cancels_before_image_preprocessing() {
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            b"not an image".to_vec(),
+            "before".len(),
+        )];
+        let mut polls = 0;
+        let result = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || {
+                polls += 1;
+                true
+            },
+            |_| panic!("window preflight must not run after cancellation"),
+        )
+        .expect("cancellation is not a worker failure");
+        assert!(matches!(result, VisionRequestBuild::Cancelled));
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn vision_request_build_cancels_after_preprocess_and_prompt_before_window_check() {
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            make_test_png(8, 8),
+            "before".len(),
+        )];
+        let mut polls = 0;
+        let mut window_checked = false;
+        let result = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || {
+                polls += 1;
+                polls == 3
+            },
+            |_| {
+                window_checked = true;
+                Ok(())
+            },
+        )
+        .expect("cancellation is not a worker failure");
+        assert!(matches!(result, VisionRequestBuild::Cancelled));
+        assert_eq!(polls, 3);
+        assert!(!window_checked);
+    }
+
+    #[test]
+    fn vision_request_build_cancels_after_window_check_before_lazy_load() {
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            make_test_png(8, 8),
+            "before".len(),
+        )];
+        let mut polls = 0;
+        let mut window_checked = false;
+        let result = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || {
+                polls += 1;
+                polls == 4
+            },
+            |_| {
+                window_checked = true;
+                Ok(())
+            },
+        )
+        .expect("cancellation is not a worker failure");
+        assert!(matches!(result, VisionRequestBuild::Cancelled));
+        assert_eq!(polls, 4);
+        assert!(window_checked);
+    }
+
+    #[test]
+    fn vision_runtime_capability_requires_config_token_metadata_and_weight_source() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("quantize_index.json"), "[]")
+            .expect("weight-source marker");
+        let mut config = Qwen35Config::qwen35_0_8b();
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &config).is_supported()
+        );
+        config.vision_config = Some(tiny_vision_config(config.hidden_size));
+        config.image_token_id = Some(10);
+        config.vision_start_token_id = Some(11);
+        config.vision_end_token_id = Some(12);
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &config).is_supported(),
+            "an empty manifest must not advertise vision capability"
+        );
+
+        let mut names = vec![
+            "model.visual.patch_embed.proj.weight".to_string(),
+            "model.visual.patch_embed.proj.bias".to_string(),
+            "model.visual.pos_embed.weight".to_string(),
+            "model.visual.merger.linear_fc1.weight".to_string(),
+            "model.visual.merger.linear_fc1.bias".to_string(),
+            "model.visual.merger.linear_fc2.weight".to_string(),
+            "model.visual.merger.linear_fc2.bias".to_string(),
+            "model.visual.merger.norm.weight".to_string(),
+            "model.visual.merger.norm.bias".to_string(),
+        ];
+        for suffix in [
+            "attn.qkv.weight",
+            "attn.qkv.bias",
+            "attn.proj.weight",
+            "attn.proj.bias",
+            "mlp.linear_fc1.weight",
+            "mlp.linear_fc1.bias",
+            "mlp.linear_fc2.weight",
+            "mlp.linear_fc2.bias",
+            "norm1.weight",
+            "norm1.bias",
+            "norm2.weight",
+            "norm2.bias",
+        ] {
+            names.push(format!("model.visual.blocks.0.{suffix}"));
+        }
+        std::fs::write(temp.path().join("visual.bin"), b"inventory preflight")
+            .expect("visual tensor marker");
+        let entries: Vec<_> = names
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "file": "visual.bin"}))
+            .collect();
+        std::fs::write(
+            temp.path().join("quantize_index.json"),
+            serde_json::to_vec(&entries).expect("manifest fixture"),
+        )
+        .expect("complete vision manifest");
+        let mut invalid_tokens = config.clone();
+        invalid_tokens.image_token_id = Some(config.vocab_size as u32);
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &invalid_tokens)
+                .is_supported(),
+            "out-of-vocabulary image metadata must not advertise capability"
+        );
+        invalid_tokens.image_token_id = invalid_tokens.vision_start_token_id;
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &invalid_tokens)
+                .is_supported(),
+            "aliased vision token metadata must not advertise capability"
+        );
+        let mut runtime = VisionRuntime::from_model_config(temp.path().to_path_buf(), &config);
+        assert!(runtime.is_supported());
+        let (job_tx, _job_rx) = mpsc::unbounded_channel();
+        let client = MetalWorkerClient::with_owner(
+            job_tx,
+            Arc::new(Semaphore::new(1)),
+            runtime.shared_capability(),
+            MetalWorkerOwner::unattached_for_test(),
+        );
+        assert!(client.supports_vision());
+        let cancelled = runtime
+            .get_or_load(&mut || true)
+            .expect("cancellation is not a lazy-load failure");
+        assert!(matches!(cancelled, VisionRuntimeLoad::Cancelled));
+        assert!(runtime.is_supported());
+        assert!(
+            client.supports_vision(),
+            "cancellation must preserve Pending capability for a later retry"
+        );
+        let mut never_cancel = || false;
+        let first_error = runtime
+            .get_or_load(&mut never_cancel)
+            .expect_err("junk tensor payload must fail its first lazy load");
+        assert!(first_error.contains("vision weights failed to load"));
+        assert!(!runtime.is_supported());
+        assert!(
+            !client.supports_vision(),
+            "terminal lazy-load failure must revoke the shared client capability"
+        );
+        std::fs::remove_file(temp.path().join("visual.bin"))
+            .expect("remove source after the first attempt");
+        let second_error = runtime
+            .get_or_load(&mut never_cancel)
+            .expect_err("terminal failure must be returned, not retried");
+        assert_eq!(second_error, first_error);
+        assert!(
+            !VisionRuntime::from_model_config(PathBuf::from("/unused"), &config).is_supported(),
+            "config metadata alone must not advertise vision without a supported weight source"
+        );
+        config.vision_end_token_id = None;
+        assert!(
+            !VisionRuntime::from_model_config(temp.path().to_path_buf(), &config).is_supported()
+        );
+    }
 
     // ── GPU-free fakes, ported from lattice_serve.rs's pre-existing
     //    `run_worker_loop` test suite (#832 migrates them here) ──────────
@@ -1211,28 +2247,201 @@ mod tests {
 
     #[test]
     fn owner_shutdown_joins_cleanly_once_the_queue_closes() {
-        // "Owner shutdown" without going through the real `MetalWorker::spawn`
-        // (which needs a real Metal device to reach `Ok`): builds a
-        // `MetalWorkerOwner` directly around a `run_worker_loop` thread, the
-        // same shape `MetalWorker::spawn` constructs internally.
         let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
         let started = Arc::new(AtomicUsize::new(0));
         let ran_tokens = Arc::new(AtomicUsize::new(0));
         let started2 = started.clone();
         let ran2 = ran_tokens.clone();
-        let join_handle =
-            std::thread::spawn(move || run_worker_loop(job_rx, fake_generate(1, started2, ran2)));
-        let mut owner = MetalWorkerOwner {
-            join_handle: Some(join_handle),
-        };
+        let join_handle = std::thread::spawn(move || {
+            run_worker_loop(job_rx, fake_generate(1, started2, ran2));
+        });
+        let owner = test_owner(join_handle, Duration::from_secs(1));
         drop(job_tx);
-        let handle = owner
-            .join_handle
-            .take()
-            .expect("owner must retain the join handle (issue #833's seam)");
-        handle
+        assert_eq!(
+            owner._inner.wait_for_exit(Duration::from_secs(1)),
+            WorkerShutdown::Joined
+        );
+        assert_eq!(
+            owner._inner.wait_for_exit(Duration::ZERO),
+            WorkerShutdown::AlreadyStopped,
+            "the join handle must be claimed exactly once"
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn owner_shutdown_deadline_covers_blocking_thread_local_destructor() {
+        let (destructor_entered_tx, destructor_entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_destructor_tx, release_destructor_rx) = std::sync::mpsc::sync_channel(1);
+        let (destructor_finished_tx, destructor_finished_rx) = std::sync::mpsc::sync_channel(1);
+        let join_handle = std::thread::spawn(move || {
+            BLOCKING_THREAD_LOCAL_DROP.with(|slot| {
+                *slot.borrow_mut() = Some(BlockingThreadLocalDrop {
+                    entered: destructor_entered_tx,
+                    release: release_destructor_rx,
+                    finished: destructor_finished_tx,
+                });
+            });
+        });
+        destructor_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the worker must enter its thread-local destructor");
+        let finished_deadline = Instant::now() + Duration::from_secs(1);
+        while !join_handle.is_finished() && Instant::now() < finished_deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            join_handle.is_finished(),
+            "the worker main function must finish while its thread-local destructor is blocked"
+        );
+
+        let owner = test_owner(join_handle, Duration::from_millis(20));
+        let (shutdown_done_tx, shutdown_done_rx) = std::sync::mpsc::sync_channel(1);
+        let shutdown_thread = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = owner._inner.wait_for_exit(Duration::from_millis(20));
+            let _ = shutdown_done_tx.send((result, started.elapsed()));
+        });
+        let before_watchdog = shutdown_done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .ok();
+
+        release_destructor_tx
+            .send(())
+            .expect("the blocked thread-local destructor must still accept its release");
+        destructor_finished_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the thread-local destructor must finish after release");
+        let observed = match before_watchdog {
+            Some(result) => result,
+            None => shutdown_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("shutdown must finish after the destructor is released"),
+        };
+        shutdown_thread
             .join()
-            .expect("owner's worker thread must join cleanly once the queue closes");
+            .expect("shutdown helper thread must not panic");
+
+        let Some((result, elapsed)) = before_watchdog else {
+            panic!(
+                "the configured deadline must include thread-local destructor cleanup; \
+                 observed {observed:?}"
+            );
+        };
+        assert_eq!(
+            result,
+            WorkerShutdown::TimedOut,
+            "blocked thread-local cleanup must exhaust the configured deadline"
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "shutdown exceeded the deadline watchdog: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn final_client_drop_closes_queue_before_owner_joins() {
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (queue_closed_tx, queue_closed_rx) = std::sync::mpsc::sync_channel(1);
+        let (allow_exit_tx, allow_exit_rx) = std::sync::mpsc::sync_channel(1);
+        let join_handle = std::thread::spawn(move || {
+            while job_rx.blocking_recv().is_some() {}
+            let _ = queue_closed_tx.send(());
+            let _ = allow_exit_rx.recv();
+        });
+        let owner = test_owner(join_handle, Duration::from_secs(2));
+        let client = MetalWorkerClient::with_owner(
+            job_tx,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            owner.clone(),
+        );
+        drop(owner);
+
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
+        let drop_thread = std::thread::spawn(move || {
+            drop(client);
+            let _ = drop_done_tx.send(());
+        });
+        queue_closed_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("dropping the last client must close the queue");
+        assert!(
+            matches!(
+                drop_done_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "last client drop must still be waiting while the worker is live"
+        );
+        allow_exit_tx
+            .send(())
+            .expect("the worker must still be waiting for the exit release");
+        drop_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("last client drop must finish after the worker exits");
+        drop_thread
+            .join()
+            .expect("client drop thread must not panic");
+    }
+
+    #[test]
+    fn final_client_drop_timeout_detaches_instead_of_blocking() {
+        let (worker_started_tx, worker_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_worker_tx, release_worker_rx) = std::sync::mpsc::sync_channel(1);
+        let (worker_done_tx, worker_done_rx) = std::sync::mpsc::sync_channel(1);
+        let join_handle = std::thread::spawn(move || {
+            let _ = worker_started_tx.send(());
+            let _ = release_worker_rx.recv();
+            let _ = worker_done_tx.send(());
+        });
+        worker_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the worker must reach its stuck-backend stand-in");
+        let owner = test_owner(join_handle, Duration::from_millis(20));
+        let (job_tx, _job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let client = MetalWorkerClient::with_owner(
+            job_tx,
+            Arc::new(Semaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            owner.clone(),
+        );
+        drop(owner);
+
+        let (drop_done_tx, drop_done_rx) = std::sync::mpsc::sync_channel(1);
+        let drop_thread = std::thread::spawn(move || {
+            drop(client);
+            let _ = drop_done_tx.send(());
+        });
+        let returned_before_watchdog = drop_done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .is_ok();
+
+        release_worker_tx
+            .send(())
+            .expect("detached worker must still accept the cleanup release");
+        worker_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached worker must exit after the cleanup release");
+        drop_thread
+            .join()
+            .expect("timed-out client drop thread must not panic");
+        assert!(
+            returned_before_watchdog,
+            "last client Drop must honor its configured deadline instead of joining a stuck worker"
+        );
+    }
+
+    #[test]
+    fn owner_shutdown_reports_worker_panic_after_join() {
+        let join_handle = std::thread::spawn(move || {
+            panic!("simulated worker panic");
+        });
+        let owner = test_owner(join_handle, Duration::from_secs(1));
+
+        assert_eq!(
+            owner._inner.wait_for_exit(Duration::from_secs(1)),
+            WorkerShutdown::Panicked
+        );
     }
 
     #[test]

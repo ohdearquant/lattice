@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bench-python.sh"
+
 bench_close_supervisor_witness() {
     local fd="${LATTICE_BENCH_SUPERVISOR_FD:-}"
 
@@ -15,26 +17,27 @@ bench_supervise_entry() {
     local measurement="$3"
     shift 3
 
-    local repo helper
+    local repo helper python_bin
     if ! repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; then
         printf 'bench-supervision: FATAL: cannot resolve the repository root from %s; ' "${BASH_SOURCE[0]}" >&2 || :
         printf 'refusing to continue.\n' >&2 || :
         exit 2
     fi
     helper="$repo/scripts/lib/bench_supervision.py"
+    python_bin="$(bench_require_python3 "${0##*/}")" || exit 1
 
     if [[ -z "${LATTICE_BENCH_LOCK_STATUS:-}" ]]; then
         if [[ "$mode" == "durable" ]]; then
-            exec python3 "$helper" run --label "$label" --quiet --entrypoint -- "$0" "$@"
+            exec "$python_bin" "$helper" run --label "$label" --quiet --entrypoint -- "$0" "$@"
         fi
-        exec python3 "$helper" run --label "$label" --entrypoint -- "$0" "$@"
+        exec "$python_bin" "$helper" run --label "$label" --entrypoint -- "$0" "$@"
     fi
     if [[ "$mode" == "durable" ]]; then
-        if ! python3 "$helper" verify --require-quiet; then
+        if ! "$python_bin" "$helper" verify --require-quiet; then
             exit 2
         fi
     else
-        if ! python3 "$helper" verify; then
+        if ! "$python_bin" "$helper" verify; then
             exit 2
         fi
     fi
@@ -58,7 +61,7 @@ bench_supervise_entry() {
     if [[ "$restore_errexit" -eq 1 ]]; then
         set -e
     fi
-    if ! python3 "$helper" verify; then
+    if ! "$python_bin" "$helper" verify; then
         return 2
     fi
     return "$measurement_rc"

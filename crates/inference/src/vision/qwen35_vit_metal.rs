@@ -35,6 +35,14 @@ use super::qwen35_vit::GridThw;
 #[allow(unused_imports)]
 use crate::model::qwen35_config::VisionModelConfig;
 
+pub(crate) struct Qwen35VitMetalOutput {
+    pub(crate) hidden_states: Vec<f32>,
+    #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+    pub(crate) metal_dispatches: usize,
+    #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "serve"))]
+    pub(crate) gemm_calls: usize,
+}
+
 // Real implementation lives behind the same `metal-gpu` feature gating as
 // the rest of the codebase's Metal code (`metal_gemm.rs`'s `mod gpu { .. }`
 // pattern, reused here). A stub below keeps the symbol callable — returning
@@ -47,6 +55,7 @@ mod gpu {
     use super::super::qwen35_vit::GridThw;
     use super::super::qwen35_vit::{apply_rope_inplace, build_pos_embed_and_rope_tables};
     use super::super::vit::{gelu, layer_norm, softmax_inplace};
+    use super::Qwen35VitMetalOutput;
     use crate::forward::metal_gemm::{metal_matmul, metal_matmul_bt};
     use crate::model::qwen35_config::VisionModelConfig;
     #[cfg(feature = "test-utils")]
@@ -67,6 +76,12 @@ mod gpu {
     /// see `tests/vision_s3b_vit_metal_gate_test.rs`.
     #[cfg(feature = "test-utils")]
     static METAL_DISPATCH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Default)]
+    struct ForwardDispatchStats {
+        metal_dispatches: usize,
+        gemm_calls: usize,
+    }
 
     /// Returns the number of Metal GEMM calls dispatched to the GPU (as
     /// opposed to the CPU fallback branch) since the last
@@ -91,9 +106,18 @@ mod gpu {
     /// availability. This is the exact math [`super::qwen35_vit::qwen35_vit`]'s
     /// `batch_matvec` performs (`A` = activations `[m, k]`, `B` = weight
     /// `[n, k]` row-major, i.e. PyTorch `nn.Linear` layout).
-    fn gemm_bt(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    fn gemm_bt(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        stats: &mut ForwardDispatchStats,
+    ) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
+        stats.gemm_calls += 1;
         if metal_matmul_bt(a, b, &mut c, m, k, n) {
+            stats.metal_dispatches += 1;
             #[cfg(feature = "test-utils")]
             METAL_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -114,9 +138,18 @@ mod gpu {
 
     /// `C[m, n] = A[m, k] @ B[k, n]`, dispatched to Metal via `metal_matmul`;
     /// same CPU-fallback contract and dispatch-counting as [`gemm_bt`].
-    fn gemm_nn(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
+    fn gemm_nn(
+        a: &[f32],
+        b: &[f32],
+        m: usize,
+        k: usize,
+        n: usize,
+        stats: &mut ForwardDispatchStats,
+    ) -> Vec<f32> {
         let mut c = vec![0.0f32; m * n];
+        stats.gemm_calls += 1;
         if metal_matmul(a, b, &mut c, m, k, n) {
+            stats.metal_dispatches += 1;
             #[cfg(feature = "test-utils")]
             METAL_DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -146,10 +179,15 @@ mod gpu {
         n_heads: usize,
         head_dim: usize,
         scale: f32,
-    ) -> Vec<f32> {
+        should_cancel: &mut dyn FnMut() -> bool,
+        stats: &mut ForwardDispatchStats,
+    ) -> Option<Vec<f32>> {
         let mut out = vec![0.0f32; n * hidden];
 
         for h in 0..n_heads {
+            if should_cancel() {
+                return None;
+            }
             let mut q_h = vec![0.0f32; n * head_dim];
             let mut k_h = vec![0.0f32; n * head_dim];
             let mut v_h = vec![0.0f32; n * head_dim];
@@ -167,40 +205,44 @@ mod gpu {
 
             // scores[n, n] = Q_h @ K_h^T, then scale (same order as the CPU
             // reference: dot product first, `* scale` applied to the raw dot).
-            let mut scores = gemm_bt(&q_h, &k_h, n, head_dim, n);
+            let mut scores = gemm_bt(&q_h, &k_h, n, head_dim, n, stats);
+            if should_cancel() {
+                return None;
+            }
             for s in scores.iter_mut() {
                 *s *= scale;
             }
             for i in 0..n {
                 softmax_inplace(&mut scores[i * n..(i + 1) * n]);
             }
+            if should_cancel() {
+                return None;
+            }
 
             // out_h[n, head_dim] = scores @ V_h
-            let out_h = gemm_nn(&scores, &v_h, n, n, head_dim);
+            let out_h = gemm_nn(&scores, &v_h, n, n, head_dim, stats);
+            if should_cancel() {
+                return None;
+            }
             for i in 0..n {
                 out[i * hidden + h * head_dim..i * hidden + (h + 1) * head_dim]
                     .copy_from_slice(&out_h[i * head_dim..(i + 1) * head_dim]);
             }
         }
 
-        out
+        Some(out)
     }
 
-    /// Metal port of [`super::qwen35_vit::qwen35_vit_forward`]. Same signature,
-    /// same output contract (`[num_patches, hidden_size]` pre-merger hidden
-    /// states, no post-block normalization). See module docs for the
-    /// GPU/CPU-reuse split.
-    ///
-    /// # Errors
-    ///
-    /// [`VisionError::ShapeMismatch`] if `pixel_values.len()` doesn't match
-    /// `grid.num_patches() * (in_channels * temporal_patch_size * patch_size^2)`.
-    pub fn qwen35_vit_forward_metal(
+    pub(crate) fn qwen35_vit_forward_metal_with_cancel(
         weights: &Qwen35VisionWeights,
         cfg: &VisionModelConfig,
         pixel_values: &[f32],
         grid: GridThw,
-    ) -> Result<Vec<f32>, VisionError> {
+        should_cancel: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Qwen35VitMetalOutput>, VisionError> {
+        if should_cancel() {
+            return Ok(None);
+        }
         let hidden = cfg.hidden_size;
         let n = grid.num_patches();
         let patch_len = cfg.in_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
@@ -212,15 +254,27 @@ mod gpu {
             });
         }
 
+        let mut dispatch_stats = ForwardDispatchStats::default();
+
         // ---- Patch embedding (Metal GEMM). ----
+        if should_cancel() {
+            return Ok(None);
+        }
         let mut hidden_states = gemm_bt(
             pixel_values,
             &weights.patch_embed_weight,
             n,
             patch_len,
             hidden,
+            &mut dispatch_stats,
         );
+        if should_cancel() {
+            return Ok(None);
+        }
         for i in 0..n {
+            if should_cancel() {
+                return Ok(None);
+            }
             for j in 0..hidden {
                 hidden_states[i * hidden + j] += weights.patch_embed_bias[j];
             }
@@ -228,20 +282,37 @@ mod gpu {
 
         // ---- Position embedding + RoPE tables: exact CPU-reference setup reuse. ----
         let head_dim = hidden / cfg.num_heads;
+        if should_cancel() {
+            return Ok(None);
+        }
         let (pos_embed_contrib, cos_table, sin_table) =
             build_pos_embed_and_rope_tables(weights, cfg, grid);
-        for i in 0..n * hidden {
-            hidden_states[i] += pos_embed_contrib[i];
+        if should_cancel() {
+            return Ok(None);
+        }
+        for i in 0..n {
+            if should_cancel() {
+                return Ok(None);
+            }
+            for j in 0..hidden {
+                hidden_states[i * hidden + j] += pos_embed_contrib[i * hidden + j];
+            }
         }
 
         let scale = 1.0_f32 / (head_dim as f32).sqrt();
         let n_heads = cfg.num_heads;
 
         for block in &weights.blocks {
+            if should_cancel() {
+                return Ok(None);
+            }
             // -- Attention sub-layer --
             let residual = hidden_states.clone();
             let mut normed = hidden_states.clone();
             for i in 0..n {
+                if should_cancel() {
+                    return Ok(None);
+                }
                 layer_norm(
                     &mut normed[i * hidden..(i + 1) * hidden],
                     &block.norm1_weight,
@@ -250,8 +321,24 @@ mod gpu {
                 );
             }
 
-            let mut qkv = gemm_bt(&normed, &block.qkv_weight, n, hidden, 3 * hidden);
+            if should_cancel() {
+                return Ok(None);
+            }
+            let mut qkv = gemm_bt(
+                &normed,
+                &block.qkv_weight,
+                n,
+                hidden,
+                3 * hidden,
+                &mut dispatch_stats,
+            );
+            if should_cancel() {
+                return Ok(None);
+            }
             for i in 0..n {
+                if should_cancel() {
+                    return Ok(None);
+                }
                 for j in 0..3 * hidden {
                     qkv[i * 3 * hidden + j] += block.qkv_bias[j];
                 }
@@ -260,6 +347,9 @@ mod gpu {
             // Apply RoPE to Q and K in place, per head — exact CPU-reference
             // rotate-half function, reused directly (not re-derived).
             for i in 0..n {
+                if should_cancel() {
+                    return Ok(None);
+                }
                 let base = i * 3 * hidden;
                 let cos_row = &cos_table[i * head_dim..(i + 1) * head_dim];
                 let sin_row = &sin_table[i * head_dim..(i + 1) * head_dim];
@@ -272,17 +362,49 @@ mod gpu {
                 }
             }
 
-            let attn_out =
-                multihead_attention_full_metal(&qkv, n, hidden, n_heads, head_dim, scale);
-            let proj_out = gemm_bt(&attn_out, &block.proj_weight, n, hidden, hidden);
-            for i in 0..n * hidden {
-                hidden_states[i] = residual[i] + proj_out[i] + block.proj_bias[i % hidden];
+            let Some(attn_out) = multihead_attention_full_metal(
+                &qkv,
+                n,
+                hidden,
+                n_heads,
+                head_dim,
+                scale,
+                should_cancel,
+                &mut dispatch_stats,
+            ) else {
+                return Ok(None);
+            };
+            if should_cancel() {
+                return Ok(None);
+            }
+            let proj_out = gemm_bt(
+                &attn_out,
+                &block.proj_weight,
+                n,
+                hidden,
+                hidden,
+                &mut dispatch_stats,
+            );
+            if should_cancel() {
+                return Ok(None);
+            }
+            for i in 0..n {
+                if should_cancel() {
+                    return Ok(None);
+                }
+                for j in 0..hidden {
+                    let index = i * hidden + j;
+                    hidden_states[index] = residual[index] + proj_out[index] + block.proj_bias[j];
+                }
             }
 
             // -- MLP sub-layer --
             let residual = hidden_states.clone();
             let mut normed = hidden_states.clone();
             for i in 0..n {
+                if should_cancel() {
+                    return Ok(None);
+                }
                 layer_norm(
                     &mut normed[i * hidden..(i + 1) * hidden],
                     &block.norm2_weight,
@@ -292,25 +414,69 @@ mod gpu {
             }
 
             let mlp_dim = block.fc1_bias.len();
-            let mut fc1_out = gemm_bt(&normed, &block.fc1_weight, n, hidden, mlp_dim);
+            if should_cancel() {
+                return Ok(None);
+            }
+            let mut fc1_out = gemm_bt(
+                &normed,
+                &block.fc1_weight,
+                n,
+                hidden,
+                mlp_dim,
+                &mut dispatch_stats,
+            );
+            if should_cancel() {
+                return Ok(None);
+            }
             for i in 0..n {
+                if should_cancel() {
+                    return Ok(None);
+                }
                 for j in 0..mlp_dim {
                     let idx = i * mlp_dim + j;
                     fc1_out[idx] = gelu(fc1_out[idx] + block.fc1_bias[j]);
                 }
             }
-            let fc2_out = gemm_bt(&fc1_out, &block.fc2_weight, n, mlp_dim, hidden);
-            for i in 0..n * hidden {
-                hidden_states[i] = residual[i] + fc2_out[i] + block.fc2_bias[i % hidden];
+            if should_cancel() {
+                return Ok(None);
+            }
+            let fc2_out = gemm_bt(
+                &fc1_out,
+                &block.fc2_weight,
+                n,
+                mlp_dim,
+                hidden,
+                &mut dispatch_stats,
+            );
+            if should_cancel() {
+                return Ok(None);
+            }
+            for i in 0..n {
+                if should_cancel() {
+                    return Ok(None);
+                }
+                for j in 0..hidden {
+                    let index = i * hidden + j;
+                    hidden_states[index] = residual[index] + fc2_out[index] + block.fc2_bias[j];
+                }
             }
         }
 
-        Ok(hidden_states)
+        if should_cancel() {
+            return Ok(None);
+        }
+        Ok(Some(Qwen35VitMetalOutput {
+            hidden_states,
+            #[cfg(feature = "serve")]
+            metal_dispatches: dispatch_stats.metal_dispatches,
+            #[cfg(feature = "serve")]
+            gemm_calls: dispatch_stats.gemm_calls,
+        }))
     }
 } // mod gpu
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub use gpu::qwen35_vit_forward_metal;
+pub(crate) use gpu::qwen35_vit_forward_metal_with_cancel;
 
 /// Test-only diagnostic re-exports — see [`gpu::metal_dispatch_count`] docs.
 /// Gated on `test-utils` in addition to `metal-gpu` so the normal production
@@ -318,24 +484,52 @@ pub use gpu::qwen35_vit_forward_metal;
 #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "test-utils"))]
 pub use gpu::{metal_dispatch_count, reset_metal_dispatch_count};
 
-/// Stub for builds without the `metal-gpu` feature (or off macOS): returns a
-/// clear error instead of silently running a CPU-only re-implementation, so
-/// callers can tell "Metal unavailable" apart from "Metal ran and matched".
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-pub fn qwen35_vit_forward_metal(
+pub(crate) fn qwen35_vit_forward_metal_with_cancel(
     _weights: &Qwen35VisionWeights,
     _cfg: &VisionModelConfig,
     _pixel_values: &[f32],
     _grid: GridThw,
-) -> Result<Vec<f32>, VisionError> {
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Result<Option<Qwen35VitMetalOutput>, VisionError> {
+    if should_cancel() {
+        return Ok(None);
+    }
     Err(VisionError::InvalidConfig(
         "qwen35_vit_forward_metal requires the `metal-gpu` feature on macOS".into(),
     ))
 }
 
+/// Metal port of [`super::qwen35_vit::qwen35_vit_forward`]. Same output
+/// contract (`[num_patches, hidden_size]` pre-merger hidden states, no
+/// post-block normalization). See module docs for the GPU/CPU-reuse split.
+///
+/// # Errors
+///
+/// [`VisionError::ShapeMismatch`] if `pixel_values.len()` doesn't match
+/// `grid.num_patches() * (in_channels * temporal_patch_size * patch_size^2)`,
+/// or [`VisionError::InvalidConfig`] when Metal support is unavailable.
+///
+/// Serving uses an internal cancellation-aware sibling; this compatibility
+/// entry point never requests cancellation.
+pub fn qwen35_vit_forward_metal(
+    weights: &Qwen35VisionWeights,
+    cfg: &VisionModelConfig,
+    pixel_values: &[f32],
+    grid: GridThw,
+) -> Result<Vec<f32>, VisionError> {
+    let mut never_cancel = || false;
+    match qwen35_vit_forward_metal_with_cancel(weights, cfg, pixel_values, grid, &mut never_cancel)?
+    {
+        Some(output) => Ok(output.hidden_states),
+        None => Err(VisionError::InvalidConfig(
+            "non-cancellable Metal vision forward was cancelled".into(),
+        )),
+    }
+}
+
 #[cfg(all(test, target_os = "macos", feature = "metal-gpu"))]
 mod tests {
-    use super::gpu::qwen35_vit_forward_metal;
     use super::*;
     use crate::vision::checkpoint::{VisualBlockWeights, VisualMergerWeights};
     use crate::vision::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
@@ -437,14 +631,47 @@ mod tests {
         let cpu_out = qwen35_vit_forward(&weights, &cfg, &pixel_values, grid).expect("cpu forward");
         let metal_out =
             qwen35_vit_forward_metal(&weights, &cfg, &pixel_values, grid).expect("metal forward");
+        let mut never_cancel = || false;
+        let observed = qwen35_vit_forward_metal_with_cancel(
+            &weights,
+            &cfg,
+            &pixel_values,
+            grid,
+            &mut never_cancel,
+        )
+        .expect("observed Metal forward")
+        .expect("no cancellation requested");
 
         assert_eq!(cpu_out.len(), metal_out.len());
+        assert_eq!(observed.hidden_states, metal_out);
+        assert_eq!(observed.gemm_calls, 9);
+        assert_eq!(
+            observed.metal_dispatches, 0,
+            "tiny shapes must exercise the documented CPU fallback"
+        );
         for (a, b) in cpu_out.iter().zip(metal_out.iter()) {
             assert!(
                 (a - b).abs() < 1e-4,
                 "cpu={a} metal={b} diverge beyond fallback-path tolerance"
             );
         }
+    }
+
+    #[test]
+    fn metal_forward_cancels_after_work_started() {
+        let cfg = tiny_cfg();
+        let weights = make_test_weights(&cfg);
+        let png = make_test_png(8, 8);
+        let (pixel_values, grid) = preprocess_qwen35_image(&png, &cfg).expect("preprocess");
+        let mut polls = 0;
+        let result =
+            qwen35_vit_forward_metal_with_cancel(&weights, &cfg, &pixel_values, grid, &mut || {
+                polls += 1;
+                polls == 90
+            })
+            .expect("cancellation is not a vision failure");
+        assert!(result.is_none());
+        assert_eq!(polls, 90);
     }
 
     #[test]

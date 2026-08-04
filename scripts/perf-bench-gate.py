@@ -34,10 +34,11 @@ Exit codes:
   2 — parse error / bad input, or (with --require-measurements) the gate
       refusing to certify a run it could not judge: no comparison data, or
       no gating comparison among the parsed results, or a benchmark in the
-      selected baseline set with no head comparison. Also covers invalid
-      ambient instrumentation for an automated lane: the before/between/after
-      sample stream is missing, malformed, or duplicated. An automated lane
-      must not read "nothing was measured" as "nothing regressed".
+      selected baseline set with no head comparison, or a head benchmark with
+      no selected baseline. Also covers invalid ambient instrumentation for an
+      automated lane: the before/between/after sample stream is missing,
+      malformed, or duplicated. An automated lane must not read "nothing was
+      measured" as "nothing regressed".
   3 — not measurable: the automated lane's before/between/after ambient sample
       stream parsed and was complete, but idle was below BENCH_IDLE_FLOOR in
       at least one phase; or the measured AB/BA order-bias envelope is itself
@@ -847,6 +848,20 @@ def artifact_bench_id(estimate_file: Path, root: Path, artifact_parts: int) -> s
     return Path(*relative_parts[:-trim]).as_posix()
 
 
+def _below_benchmark_dir(estimate_file: Path, root: Path, artifact_parts: int) -> bool:
+    """True if estimate_file sits below a Criterion benchmark directory.
+
+    Root-level debris (e.g. a bare `cargo bench` writing `new/estimates.json`
+    or `change/estimates.json` directly under the Criterion root) has no
+    benchmark directory to attribute to and must be excluded before calling
+    artifact_bench_id, mirroring the length guard find_selected_baseline_files
+    already applies to the selected-baseline inventory.
+    """
+    relative_parts = estimate_file.relative_to(root).parts
+    trim = artifact_parts + 1
+    return len(relative_parts) > trim
+
+
 def selected_baseline_bench_ids(root: Path, baseline_name: str) -> set[str]:
     """Return bench IDs measured by the exact named base arm."""
     artifact_parts = len(_baseline_parts(baseline_name))
@@ -876,10 +891,24 @@ def _require_within_root(path: Path, root_resolved: Path, description: str) -> P
 
 
 def clear_selected_baseline_artifacts(root: Path, baseline_name: str) -> int:
-    """Validate, then remove exact baseline dirs before copying a fresh base set."""
+    """Validate, then remove exact baseline dirs before copying a fresh base set.
+
+    A pruned baseline dir drops its bench out of the selected set, so any
+    `new/`/`change/` siblings left behind become unreachable debris that the
+    head-side inventory later rglobs up as a phantom, unbaselined head
+    measurement. Remove those siblings here, atomically with the baseline dir,
+    since this is the only prune step that runs before the fresh base copy.
+    Siblings are validated like the baseline dir itself (real dir, no
+    symlinks, resolves under root) but excluded from the returned count, which
+    stays the exact-baseline-dir total callers already print. Only baseline
+    dirs found by find_selected_baseline_files enter the plan, so an unrelated
+    target's Criterion data sharing this root is never touched.
+    """
     root_resolved = _checked_criterion_root(root)
+    baseline_parts = _baseline_parts(baseline_name)
     baseline_files = find_selected_baseline_files(root, baseline_name)
     deletion_plan: set[Path] = set()
+    sibling_plan: set[Path] = set()
 
     for baseline_file in baseline_files:
         if baseline_file.is_symlink() or not baseline_file.is_file():
@@ -897,8 +926,23 @@ def clear_selected_baseline_artifacts(root: Path, baseline_name: str) -> int:
         )
         deletion_plan.add(baseline_dir)
 
-    for baseline_dir in sorted(deletion_plan):
-        shutil.rmtree(baseline_dir)
+        bench_dir = baseline_file.parents[len(baseline_parts)]
+        _require_within_root(bench_dir, root_resolved, "selected baseline benchmark")
+        for artifact_name in ("new", "change"):
+            artifact_dir = bench_dir / artifact_name
+            if artifact_dir.is_symlink():
+                raise ValueError(f"refusing to remove symlinked Criterion artifact: {artifact_dir}")
+            if not artifact_dir.exists():
+                continue
+            if not artifact_dir.is_dir():
+                raise ValueError(
+                    f"Criterion artifact is not a directory: {artifact_dir}"
+                )
+            _require_within_root(artifact_dir, root_resolved, "Criterion artifact")
+            sibling_plan.add(artifact_dir)
+
+    for path in sorted(deletion_plan | sibling_plan):
+        shutil.rmtree(path)
 
     return len(deletion_plan)
 
@@ -2095,6 +2139,117 @@ def run_selftest() -> int:
                     "as an uncaught exception"
                 )
 
+        no_coverage_root = Path(td) / "no-baseline-coverage" / "criterion"
+        _fabricate_bench(
+            no_coverage_root / "existing_group" / "existing_bench",
+            "compare-base",
+        )
+        head_only = no_coverage_root / "new_group" / "new_bench" / "new"
+        head_only.mkdir(parents=True)
+        (head_only / "estimates.json").write_text(
+            json.dumps({"mean": {"point_estimate": 100.0}})
+        )
+        no_coverage_ambient = no_coverage_root.parent / "ambient.jsonl"
+        no_coverage_ambient.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "schema": AMBIENT_SAMPLE_SCHEMA,
+                        "phase": phase,
+                        "idle_pct": 95.0,
+                    }
+                )
+                + "\n"
+                for phase in REQUIRED_AMBIENT_PHASES
+            )
+        )
+        no_coverage_status = no_coverage_root.parent / "status.json"
+        no_coverage = _run(
+            no_coverage_root,
+            "--require-measurements",
+            "--target",
+            "lattice-inference:elementwise_cpu_bench",
+            "--ambient-samples",
+            str(no_coverage_ambient),
+            "--status-out",
+            str(no_coverage_status),
+        )
+        if no_coverage.returncode != 2:
+            failures.append(
+                "head-baseline-completeness: head benchmark without baseline exited "
+                f"{no_coverage.returncode} instead of 2"
+            )
+        if "NO COVERAGE" not in no_coverage.stderr:
+            failures.append(
+                "head-baseline-completeness: refusal did not label unbaselined "
+                "head benchmarks NO COVERAGE"
+            )
+        no_coverage_payload = json.loads(no_coverage_status.read_text())
+        if (
+            no_coverage_payload["verdict"] != "error"
+            or no_coverage_payload["exit_code"] != 2
+            or "NO COVERAGE" not in no_coverage_payload["reason"]
+        ):
+            failures.append(
+                "head-baseline-completeness: status surface rendered unbaselined "
+                "head benchmark as a pass"
+            )
+        if (
+            "  - lattice-inference:elementwise_cpu_bench: new_group/new_bench"
+            not in no_coverage.stderr
+        ):
+            failures.append(
+                "head-baseline-completeness: refusal did not name exact head-only "
+                "bench ID 'new_group/new_bench'"
+            )
+        if "produced no head comparison" in no_coverage.stderr:
+            failures.append(
+                "inventory-direction: head-without-baseline was collapsed into "
+                "the baseline-without-head refusal"
+            )
+
+        # A stale/non-selected change/ dir must not exempt an
+        # uncovered head artifact. existing_group/existing_bench compares
+        # cleanly against the selected baseline; stale_group/stale_bench has a
+        # head new/ artifact and a change/ comparison, but that change/ is
+        # against a non-selected "stale-baseline", not "compare-base".
+        # Mutation-sensitive: restore the `- all_change_ids` subtraction and
+        # this exits 0 instead of 2.
+        stale_change_root = Path(td) / "stale-change-coverage" / "criterion"
+        _fabricate_bench(
+            stale_change_root / "existing_group" / "existing_bench",
+            "compare-base",
+        )
+        _fabricate_bench(
+            stale_change_root / "stale_group" / "stale_bench",
+            "stale-baseline",
+        )
+        stale_change = _run(
+            stale_change_root,
+            "--require-measurements",
+            "--target",
+            "lattice-inference:elementwise_cpu_bench",
+        )
+        if stale_change.returncode != 2:
+            failures.append(
+                "stale-change-coverage: a head artifact whose only companion "
+                "is a stale non-selected change/ exited "
+                f"{stale_change.returncode} instead of 2"
+            )
+        if "NO COVERAGE" not in stale_change.stderr:
+            failures.append(
+                "stale-change-coverage: refusal did not label the "
+                "stale-change-only head artifact NO COVERAGE"
+            )
+        if (
+            "  - lattice-inference:elementwise_cpu_bench: stale_group/stale_bench"
+            not in stale_change.stderr
+        ):
+            failures.append(
+                "stale-change-coverage: refusal did not name exact bench ID "
+                "'stale_group/stale_bench'"
+            )
+
         # A target can be intentionally all-informational only when the exact
         # target key accompanies both the root and the demotion. This remains a
         # measured target and is valid in an enforcing multi-target run; another
@@ -2159,12 +2314,6 @@ def run_selftest() -> int:
         _fabricate_bench(
             coverage_root / "renamed_rms_norm" / "4096", "compare-base"
         )
-        _fabricate_bench(
-            coverage_root / "stale_default" / "bench", "base"
-        )
-        _fabricate_bench(
-            coverage_root / "stale_named" / "bench", "previous-run"
-        )
         # An estimates file directly under the selected baseline directory has
         # no benchmark ID and is unrelated Criterion-tree debris, not a bench.
         (coverage_root / "compare-base").mkdir(parents=True)
@@ -2191,17 +2340,16 @@ def run_selftest() -> int:
                     "baseline-completeness: refusal did not name exact missing "
                     f"bench ID {expected_id!r}"
                 )
-        for unrelated_id in ("stale_default/bench", "stale_named/bench"):
-            if unrelated_id in coverage.stderr:
-                failures.append(
-                    "baseline-completeness: unrelated baseline tree leaked into "
-                    f"selected set: {unrelated_id}"
-                )
-            if unrelated_id in coverage.stdout:
-                failures.append(
-                    "baseline-completeness: unrelated stale comparison was "
-                    f"judged by the enforcing run: {unrelated_id}"
-                )
+        if "produced no head comparison" not in coverage.stderr:
+            failures.append(
+                "inventory-direction: baseline-without-head refusal lost its "
+                "direction-specific description"
+            )
+        if "NO COVERAGE" in coverage.stderr:
+            failures.append(
+                "inventory-direction: baseline-without-head was collapsed into "
+                "the head-without-baseline NO COVERAGE disposition"
+            )
         if _run(
             coverage_root,
         ).returncode != 0:
@@ -2281,10 +2429,10 @@ def run_selftest() -> int:
             failures.append(
                 "baseline-copy freshness: stale exact selected baseline survived"
             )
-        if not (stale_selected / "change" / "estimates.json").exists():
+        if (stale_selected / "new").exists() or (stale_selected / "change").exists():
             failures.append(
-                "baseline-copy freshness: comparison output was removed before "
-                "the fresh selected set existed"
+                "baseline-copy freshness: stale new/change siblings of a pruned "
+                "selected baseline survived to false-fail head coverage"
             )
         if not (preserved_other / "previous-run" / "estimates.json").exists():
             failures.append(
@@ -2324,8 +2472,6 @@ def run_selftest() -> int:
         freshness_root = Path(td) / "freshness" / "criterion"
         removed_bench = freshness_root / "rms_norm" / "4096"
         _fabricate_bench(removed_bench, "compare-base")
-        unrelated_bench = freshness_root / "legacy_group" / "legacy_bench"
-        _fabricate_bench(unrelated_bench, "previous-run")
         sibling_root = Path(td) / "freshness-sibling" / "criterion"
         sibling_bench = sibling_root / "simd_dot_product" / "scalar" / "384"
         _fabricate_bench(sibling_bench, "compare-base")
@@ -2340,10 +2486,6 @@ def run_selftest() -> int:
             failures.append(
                 "head-freshness: stale selected-bench new/change artifacts survived"
             )
-        if not (unrelated_bench / "new" / "estimates.json").exists():
-            failures.append(
-                "head-freshness: unrelated named-baseline benchmark was cleaned"
-            )
         if not (sibling_bench / "change" / "estimates.json").exists():
             failures.append(
                 "head-freshness: preparing one target root touched its sibling"
@@ -2353,6 +2495,25 @@ def run_selftest() -> int:
             failures.append(
                 "head-freshness: deleted head benchmark was masked by stale "
                 "same-path output"
+            )
+
+        # Reconciling missing_baseline_ids against baseline_ids instead of any
+        # change/ presence means an unrelated named-baseline bench surviving
+        # cleanup now correctly reports its own NO COVERAGE gap. Test that
+        # survival-of-cleanup property in isolation so it does not also
+        # contaminate the single-direction check above.
+        freshness_unrelated_root = Path(td) / "freshness-unrelated" / "criterion"
+        unrelated_bench = freshness_unrelated_root / "legacy_group" / "legacy_bench"
+        _fabricate_bench(unrelated_bench, "previous-run")
+        prepared_unrelated = _prepare(freshness_unrelated_root, "--prepare-head")
+        if prepared_unrelated.returncode != 0:
+            failures.append(
+                "head-freshness: unrelated-baseline prepare step failed: "
+                f"{prepared_unrelated.stderr}"
+            )
+        if not (unrelated_bench / "new" / "estimates.json").exists():
+            failures.append(
+                "head-freshness: unrelated named-baseline benchmark was cleaned"
             )
 
         unsafe_root = Path(td) / "not-the-criterion-root"
@@ -2769,10 +2930,11 @@ def main() -> int:
                          "(default: full).")
     ap.add_argument("--require-measurements", action="store_true",
                     help="Fail (exit 2) instead of passing when the run produced no gating "
-                         "comparison to judge or a selected-base benchmark has no head "
-                         "comparison. Without this, an absent baseline exits 0, which is "
-                         "right for a first run but wrong for an automated lane: it cannot "
-                          "tell 'nothing regressed' from 'nothing was measured'.")
+                         "comparison to judge, a selected-base benchmark has no head "
+                         "comparison, or a head benchmark has no selected baseline. "
+                         "Without this, an absent baseline exits 0, which is right for a "
+                         "first run but wrong for an automated lane: it cannot tell "
+                         "'nothing regressed' from 'nothing was measured'.")
     ap.add_argument("--ambient-samples", type=Path,
                     help="JSONL before/between/after ambient samples. Requires "
                          "--status-out; a missing, malformed, or duplicated "
@@ -2999,6 +3161,59 @@ def main() -> int:
         print(f"error: invalid --baseline-name: {error}", file=sys.stderr)
         return finish("error", EXIT_ERROR, f"invalid baseline name: {error}")
 
+    all_change_files = [
+        change_file
+        for change_file in find_change_files(args.criterion_root)
+        if _below_benchmark_dir(change_file, args.criterion_root, artifact_parts=1)
+    ]
+    change_file_ids = {
+        change_file: artifact_bench_id(
+            change_file, args.criterion_root, artifact_parts=1
+        )
+        for change_file in all_change_files
+    }
+    # Root-level new/estimates.json (a bare `cargo bench` writing directly under
+    # the Criterion root, or stray debris) has no benchmark directory to
+    # attribute to; silently excluded here, the same disposition
+    # find_selected_baseline_files already gives the mirror-image root-level
+    # case in the selected-baseline inventory, rather than crashing the gate.
+    head_ids = {
+        artifact_bench_id(head_file, args.criterion_root, artifact_parts=1)
+        for head_file in args.criterion_root.rglob("new/estimates.json")
+        if _below_benchmark_dir(head_file, args.criterion_root, artifact_parts=1)
+    }
+    # A stale/non-selected change/estimates.json is not evidence of coverage: the
+    # enforcing filter below only trusts a change file whose id is in baseline_ids,
+    # so exempting on any change/ presence here would fail open on exactly the
+    # artifact that filter later excludes. Reconcile against baseline_ids directly,
+    # the same selected-baseline inventory the enforcing path trusts.
+    missing_baseline_ids = sorted(head_ids - baseline_ids)
+
+    def refuse_missing_baseline() -> int:
+        print(
+            f"error: NO COVERAGE: --require-measurements set but "
+            f"{len(missing_baseline_ids)} benchmark(s) ran in the head with no "
+            f"estimate in selected baseline {args.baseline_name!r}:",
+            file=sys.stderr,
+        )
+        for bench_id in missing_baseline_ids:
+            print(
+                f"  - {args.target + ': ' if args.target else ''}{bench_id}",
+                file=sys.stderr,
+            )
+        print(
+            "Record a baseline for these benchmarks before enforcing the A/B gate.",
+            file=sys.stderr,
+        )
+        return finish(
+            "error",
+            EXIT_ERROR,
+            f"NO COVERAGE: {len(missing_baseline_ids)} head benchmarks have no selected baseline",
+        )
+
+    # An entirely empty selected baseline gets its own clearer message: check
+    # it first, since a fully empty baseline_ids would otherwise put every
+    # head id into missing_baseline_ids and mask the more specific diagnosis.
     if require_measurements and not baseline_ids:
         print(
             f"error: --require-measurements set but selected baseline "
@@ -3010,13 +3225,9 @@ def main() -> int:
         )
         return finish("error", EXIT_ERROR, "the selected baseline set is empty")
 
-    all_change_files = find_change_files(args.criterion_root)
-    change_file_ids = {
-        change_file: artifact_bench_id(
-            change_file, args.criterion_root, artifact_parts=1
-        )
-        for change_file in all_change_files
-    }
+    if require_measurements and missing_baseline_ids:
+        return refuse_missing_baseline()
+
     # Enforcing A/B runs judge only the exact selected base set. A persistent
     # Criterion root can contain change output from other named baselines or
     # bench targets; letting those rows into this run can create either a stale

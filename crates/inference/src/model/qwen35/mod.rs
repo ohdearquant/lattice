@@ -12,6 +12,7 @@
 mod cache;
 mod debug;
 pub(crate) mod detokenize;
+mod embed;
 mod eval;
 mod forward;
 mod generation;
@@ -25,6 +26,7 @@ mod sampling;
 pub(crate) mod stop_strings;
 mod weights;
 
+pub use embed::HiddenPooling;
 pub use eval::{PerplexityConfig, PerplexityReport};
 /// Re-exported for the Metal Q4 perplexity harness in
 /// [`crate::forward::metal_qwen35`]; the CPU forward path consumes them

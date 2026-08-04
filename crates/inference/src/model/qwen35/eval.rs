@@ -145,17 +145,38 @@ impl Qwen35Model {
     /// are fixed inputs and can be cached across optimizer steps.
     #[cfg(feature = "train-backward")]
     pub fn forward_final_hidden(&self, tokens: &[u32]) -> Result<Vec<Vec<f32>>, InferenceError> {
-        let cfg = &self.config;
         if tokens.len() < 2 {
             return Err(InferenceError::Inference(format!(
                 "forward_final_hidden: need at least 2 tokens, got {}",
                 tokens.len()
             )));
         }
+        self.final_hidden_states(tokens)
+    }
+
+    /// Per-position final hidden states: one `[hidden_size]` vector per input
+    /// token, the residual stream after the final RMSNorm, which is the exact
+    /// vector `lm_head` is applied to at that position.
+    ///
+    /// This carries no feature gate. It is the shared core beneath both the
+    /// training capture path ([`Qwen35Model::forward_final_hidden`], which adds
+    /// its own two-token minimum) and the stable pooled-embedding API
+    /// ([`Qwen35Model::embed_tokens`]), so that a consumer building for
+    /// inference only can reach hidden states without enabling `train-backward`.
+    pub(crate) fn final_hidden_states(
+        &self,
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>, InferenceError> {
+        let cfg = &self.config;
+        if tokens.is_empty() {
+            return Err(InferenceError::Inference(
+                "final_hidden_states: need at least 1 token, got 0".to_string(),
+            ));
+        }
         let max_context = self.max_context();
         if tokens.len() > max_context {
             return Err(InferenceError::Inference(format!(
-                "forward_final_hidden: tokens.len() ({}) exceeds RoPE capacity ({max_context})",
+                "final_hidden_states: tokens.len() ({}) exceeds RoPE capacity ({max_context})",
                 tokens.len(),
             )));
         }
@@ -165,7 +186,7 @@ impl Qwen35Model {
             .find(|&(_, &t)| (t as usize) >= cfg.vocab_size)
         {
             return Err(InferenceError::Inference(format!(
-                "forward_final_hidden: tokens[{bad_idx}]={bad} >= vocab_size {}",
+                "final_hidden_states: tokens[{bad_idx}]={bad} >= vocab_size {}",
                 cfg.vocab_size
             )));
         }

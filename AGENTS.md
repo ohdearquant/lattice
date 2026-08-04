@@ -99,6 +99,17 @@ inference (~118K)                                 ← optional dep on fann (`mix
 embed (12K)   tune (20K)                          ← embed uses inference; tune uses fann + inference
 ```
 
+Three of those four edges are feature-gated, and the gates do not all default the
+same way, so "depends on" in the diagram is not one relationship. `tune` depends on
+`fann` unconditionally. The other three are optional deps: `embed` to `inference` is
+enabled through `native`, which is in embed's default set, so it is present in an
+ordinary build; `inference` to `fann` is behind `mixture` and `tune` to `inference` is
+behind `inference-hook` or `train-backward`, and neither of those is in its crate's
+default set. A default `cargo build -p lattice-tune` therefore does not compile
+`lattice-inference` at all — six targets pull it in through `required-features` and
+that is the whole of its reach. Check the manifest before assuming an edge is live in
+the build you are looking at.
+
 ### lattice-inference — Transformer kernel
 
 | Module           | Purpose                      | Key Exports                                                                       |
@@ -223,15 +234,14 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include a
 bench-compare disposition in its description. By default, run `make bench-compare` and paste its
 A/B table into the PR body. If the result shows no change, state that as the disposition.
-`crates/fann/` is covered because it feeds inference through the optional `mixture` feature; a
-fann-only diff that the bench build compiles out qualifies for the structural waiver below, on
-the same terms as any other diff.
+`crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
+and because it declares its own bench target (`router_online`).
 
-The only structural waiver is a diff compiled out of the bench binaries by a `cfg` gate. A waiver
-must name the gate, name the bench build's feature set, and state that the base and head bench
-binaries have identical effective source. "Cold path", "not benchmark-relevant", "additive only",
-and a bare `cfg(test)` that names no bench feature set are not valid waivers. If any changed line is
-compiled into the bench binaries, run the A/B.
+The waiver predicate is reachability, not compilation, and the canonical statement of the rule —
+including the all-declared-target search requirement, the FANN `router_online` example, and the
+residual-risk framing — lives in `CLAUDE.md` under "Measure First, Code Second". Read that section
+before claiming a waiver here; do not treat "compiled out of the default bench binaries" alone as
+sufficient.
 
 ### E2E Parity Gate
 
@@ -262,9 +272,9 @@ make e2e-parity                          # run locally (needs torch + transforme
 # Perf benchmarking (ADR-087, trend data)
 # bench-compare takes the machine-wide bench-window and GPU locks itself, and
 # gates macOS power/thermal/AFK plus ambient CPU idle — do NOT wrap it.
-make bench-compare                       # A/B: origin/main vs HEAD (~2 min CI, ~3-4 min macOS)
+make bench-compare                       # A/B: origin/main vs HEAD (--quick, the default; not separately measured)
 make bench-compare BASE=main HEAD=pr/x   # A/B: explicit refs
-scripts/bench-compare.sh --full main     # A/B with tight CIs (~15 min)
+scripts/bench-compare.sh --full main     # A/B with tight CIs; see CLAUDE.md's measured slow-side bound (under "Measure First, Code Second") before booking a window
 make bench-ci                            # save local Criterion baseline
 make bench-gate                          # compare against perf-baselines branch
 ```

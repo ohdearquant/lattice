@@ -53,7 +53,7 @@ tracing = "0.1"
 # its own ureq/download stack to non-wasm targets, so a plain `--features wasm`
 # build stays download-free; edge/cross builds drop it with
 # `--no-default-features --features native`. See issue #1095.
-lattice-inference = { version = "0.7.1", path = "../inference", optional = true, default-features = false, features = [
+lattice-inference = { version = "0.8.0", path = "../inference", optional = true, default-features = false, features = [
     "std",
     "f16",
 ] }

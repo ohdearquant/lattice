@@ -3,7 +3,7 @@
 //! [`convert_quarot_qwen35`] reads `config.json` + SafeTensors from
 //! `input_dir`, runs the full pipeline
 //! (`materialize_lm_head` → `fuse_rmsnorms` → `absorb_rotations` →
-//! [`assert_forward_equivalence_qwen35`]) entirely in f64, and on success
+//! forward equivalence) entirely in f64, and on success
 //! writes the converted model to `output_dir`:
 //!
 //! - Planned (rotated) tensors → `<sanitized>.q4` via
@@ -32,7 +32,12 @@ use crate::error::InferenceError;
 use crate::model::qwen35::qwen_required_tensor_names;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::forward_equivalence::{
-    ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_forward_equivalence_qwen35,
+    ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_prepared_forward_equivalence_qwen35,
+    prepare_forward_equivalence_qwen35_after_admission, validate_forward_equivalence_admission,
+};
+#[cfg(test)]
+use crate::quant::quarot::forward_equivalence::{
+    pre_admission_allocation_tracking, prepare_forward_equivalence_qwen35,
 };
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader};
@@ -497,6 +502,17 @@ pub fn convert_quarot_qwen35(
         ));
     }
 
+    let forward_cfg = ForwardEquivalenceConfig {
+        num_probe_tokens: opts.num_probe_tokens,
+        tolerance: opts.tolerance,
+        seed: opts.rotation_seed,
+    };
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_converter_boundary();
+    let forward_admission = validate_forward_equivalence_admission(&cfg, &forward_cfg)?;
+
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_reader_boundary();
     let reader = QuarotTensorReader::open(input_dir)?;
     let input_source = input_dir.display().to_string();
     let required_names = qwen_required_tensor_names(&cfg);
@@ -553,30 +569,37 @@ pub fn convert_quarot_qwen35(
 
     let was_tied = cfg.tie_word_embeddings;
     if was_tied {
+        working_set.reserve(1);
+    }
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_materialized_working_set_boundary();
+    if was_tied {
         materialize_lm_head_for_qwen35(&mut working_set, &cfg)?;
     }
 
-    let original_snapshot = working_set.clone();
+    let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
+    // The historical `working_set.clone()` regression sat exactly here, between
+    // materialization and this prepare call (see git history at this path). Keep
+    // the `MaterializedWorkingSetBoundary` phase open through the call below so
+    // `converter_does_not_clone_materialized_working_set` observes allocations
+    // at the former clone site instead of stopping at materialization.
+    let equivalence_snapshot = prepare_forward_equivalence_qwen35_after_admission(
+        &working_set,
+        &rotation,
+        forward_admission,
+    )?;
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_materialized_working_set_boundary_completed();
 
     let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg)?;
     fusion_plan.push(qwen35_final_norm_fusion_target());
     let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
-    let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
 
     fuse_rmsnorms(&mut working_set, &fusion_plan)?;
     absorb_rotations(&mut working_set, &rotation_plan, &rotation)?;
 
-    let forward_equivalence = assert_forward_equivalence_qwen35(
-        &original_snapshot,
-        &working_set,
-        &cfg,
-        &rotation,
-        &ForwardEquivalenceConfig {
-            num_probe_tokens: opts.num_probe_tokens,
-            tolerance: opts.tolerance,
-            seed: opts.rotation_seed,
-        },
-    )?;
+    let forward_equivalence =
+        assert_prepared_forward_equivalence_qwen35(equivalence_snapshot, &reader, &working_set)?;
 
     if !opts.dry_run {
         fs::create_dir_all(output_dir).map_err(|e| {
@@ -863,6 +886,9 @@ fn write_f16_file(
 mod tests {
     use super::*;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
+    use crate::quant::quarot::lm_head::{
+        QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
+    };
     use crate::weights::q4_weights::q4_f32_to_f16;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -1050,8 +1076,16 @@ mod tests {
             .collect()
     }
 
+    const TIED_LM_HEAD_PERTURBED_INDEX: usize = 0;
+    const TIED_LM_HEAD_PERTURBATION: f64 = 1.0 / 32_768.0;
+
     /// Write every required tensor for `cfg` to a single safetensors file.
-    fn write_required_tensors_for(cfg: &Qwen35Config, path: &Path, seed: u64) {
+    fn write_required_tensors_for(
+        cfg: &Qwen35Config,
+        path: &Path,
+        seed: u64,
+        include_tied_lm_head: bool,
+    ) {
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let intermediate = cfg.intermediate_size;
@@ -1071,17 +1105,30 @@ mod tests {
             synth_data(n, s)
         };
 
+        let mut embed_tokens = next(vocab * hidden);
+        let mut final_norm = next(hidden);
+        let tied_lm_head = if cfg.tie_word_embeddings && include_tied_lm_head {
+            embed_tokens[TIED_LM_HEAD_PERTURBED_INDEX] = 0.25;
+            final_norm[TIED_LM_HEAD_PERTURBED_INDEX] = 0.0;
+            let mut lm_head = embed_tokens.clone();
+            lm_head[TIED_LM_HEAD_PERTURBED_INDEX] += TIED_LM_HEAD_PERTURBATION;
+            Some(lm_head)
+        } else {
+            None
+        };
         entries.push((
             "model.language_model.embed_tokens.weight".to_string(),
             vec![vocab, hidden],
-            next(vocab * hidden),
+            embed_tokens,
         ));
         entries.push((
             "model.language_model.norm.weight".to_string(),
             vec![hidden],
-            next(hidden),
+            final_norm,
         ));
-        if !cfg.tie_word_embeddings {
+        if let Some(lm_head) = tied_lm_head {
+            entries.push(("lm_head.weight".to_string(), vec![vocab, hidden], lm_head));
+        } else if !cfg.tie_word_embeddings {
             entries.push((
                 "lm_head.weight".to_string(),
                 vec![vocab, hidden],
@@ -1208,7 +1255,7 @@ mod tests {
     fn write_input_dir(cfg: &Qwen35Config, dir: &Path, seed: u64) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("config.json"), tiny_config_json(cfg)).unwrap();
-        write_required_tensors_for(cfg, &dir.join("model.safetensors"), seed);
+        write_required_tensors_for(cfg, &dir.join("model.safetensors"), seed, false);
     }
 
     // ------------------------------------------------------------------
@@ -1302,6 +1349,250 @@ mod tests {
         let out_cfg_str = fs::read_to_string(output.join("config.json")).unwrap();
         let out_cfg = Qwen35Config::from_config_json_str(&out_cfg_str).unwrap();
         assert!(!out_cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn converter_rejects_probe_budget_before_tensor_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
+
+        let tracking = pre_admission_allocation_tracking::start_at_converter_boundary();
+        let result = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                num_probe_tokens: 2_000_000,
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        let observation = tracking.finish();
+
+        assert!(
+            observation.rejection_seen,
+            "the converter call must reach budget rejection"
+        );
+        assert_eq!(
+            observation.before_rejection_allocation_calls, 0,
+            "the converter allocated between config preflight and budget rejection"
+        );
+        assert!(
+            observation.after_rejection_allocation_calls > 0,
+            "the diagnostic allocation after budget rejection must be observed"
+        );
+        let error = result
+            .expect_err("the over-budget conversion must fail admission")
+            .to_string();
+        assert!(
+            error.contains("retained chain-logit budget"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn assert_config_rejected_before_tensor_materialization(
+        opts: ConversionOptions,
+        expected_error: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 0x0A11_CE55);
+
+        let tracking = pre_admission_allocation_tracking::start_at_converter_boundary();
+        let result = convert_quarot_qwen35(&input, &output, &opts);
+        let observation = tracking.finish();
+
+        assert!(
+            observation.rejection_seen,
+            "the converter call must reach config admission rejection"
+        );
+        assert_eq!(
+            observation.before_rejection_allocation_calls, 0,
+            "config admission allocated before rejection"
+        );
+        assert!(
+            observation.after_rejection_allocation_calls > 0,
+            "the diagnostic allocation after config rejection must be observed"
+        );
+        assert!(
+            !observation.reader_boundary_seen,
+            "config admission rejection must precede reader access"
+        );
+        assert!(
+            !observation.materialized_working_set_boundary_seen,
+            "config admission rejection must precede tensor materialization"
+        );
+        let error = result
+            .expect_err("invalid forward-equivalence config must fail admission")
+            .to_string();
+        assert!(error.contains(expected_error), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn converter_rejects_zero_probe_count_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                num_probe_tokens: 0,
+                dry_run: true,
+                ..Default::default()
+            },
+            "num_probe_tokens must be > 0",
+        );
+    }
+
+    #[test]
+    fn converter_rejects_zero_tolerance_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                tolerance: 0.0,
+                dry_run: true,
+                ..Default::default()
+            },
+            "tolerance must be a positive finite value",
+        );
+    }
+
+    #[test]
+    fn converter_rejects_nan_tolerance_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                tolerance: f64::NAN,
+                dry_run: true,
+                ..Default::default()
+            },
+            "tolerance must be a positive finite value",
+        );
+    }
+
+    #[test]
+    fn converter_does_not_clone_materialized_working_set() {
+        // Spans tied-head materialization through
+        // `prepare_forward_equivalence_qwen35_after_admission` — the step that
+        // replaced the historical full-working-set clone — so a reintroduced
+        // clone at that former site is observed, not skipped.
+        const REQUIRED_MATERIALIZATION_AND_PREPARE_ALLOCATION_CALLS: usize = 152;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 0xA110_CA7E);
+
+        let tracking =
+            pre_admission_allocation_tracking::start_at_materialized_working_set_boundary();
+        convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                num_probe_tokens: 2,
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let observation = tracking.finish();
+
+        assert!(
+            observation.materialized_working_set_boundary_seen,
+            "the converter must reach the materialized working-set boundary"
+        );
+        assert!(
+            observation.materialized_working_set_boundary_completed,
+            "the converter must close the materialized working-set boundary"
+        );
+        assert_eq!(
+            observation.materialized_working_set_allocation_calls,
+            REQUIRED_MATERIALIZATION_AND_PREPARE_ALLOCATION_CALLS,
+            "tied-head materialization and forward-equivalence preparation performed \
+             unexpected owned allocations (a reintroduced working-set clone would show up here)"
+        );
+    }
+
+    #[test]
+    fn prepared_equivalence_streams_original_tensors_and_refuses_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let cfg = tiny_cfg(true);
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 0x1074, true);
+
+        let reader = QuarotTensorReader::open(&input).unwrap();
+        assert!(
+            reader.has_tensor(QWEN35_LM_HEAD_NAME),
+            "the tied fixture must contain a competing on-disk lm_head"
+        );
+        let (disk_embed, _) = reader.read_tensor_f64(QWEN35_EMBED_TOKENS_NAME).unwrap();
+        let (disk_lm_head, _) = reader.read_tensor_f64(QWEN35_LM_HEAD_NAME).unwrap();
+        let (disk_final_norm, _) = reader.read_tensor_f64(QWEN35_FINAL_NORM_NAME).unwrap();
+        let differing_indices = disk_lm_head
+            .iter()
+            .zip(&disk_embed)
+            .enumerate()
+            .filter_map(|(index, (lm_head, embed))| (lm_head != embed).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            differing_indices,
+            vec![TIED_LM_HEAD_PERTURBED_INDEX],
+            "the competing lm_head must differ at exactly one element"
+        );
+        let source_delta = (disk_lm_head[TIED_LM_HEAD_PERTURBED_INDEX]
+            - disk_embed[TIED_LM_HEAD_PERTURBED_INDEX])
+            .abs();
+        assert_eq!(source_delta, TIED_LM_HEAD_PERTURBATION);
+        let tolerance = 1e-5;
+        let transformed_delta = source_delta
+            * (1.0 + disk_final_norm[TIED_LM_HEAD_PERTURBED_INDEX]).abs()
+            / (cfg.hidden_size as f64).sqrt();
+        assert!(
+            transformed_delta > tolerance && transformed_delta < 1.1 * tolerance,
+            "controlled post-fusion/rotation delta {transformed_delta} must sit just above \
+             tolerance {tolerance}"
+        );
+        let required_names = qwen_required_tensor_names(&cfg);
+        let mut working_set = load_tensors_f64(&reader, &required_names).unwrap();
+        materialize_lm_head_for_qwen35(&mut working_set, &cfg).unwrap();
+
+        let rotation = RandomizedHadamard::new(0xA11C_E5E5, cfg.hidden_size).unwrap();
+        let forward_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: 2,
+            tolerance,
+            ..Default::default()
+        };
+        let passing_snapshot =
+            prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)
+                .unwrap();
+        let refusing_snapshot =
+            prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)
+                .unwrap();
+
+        let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg).unwrap();
+        fusion_plan.push(qwen35_final_norm_fusion_target());
+        let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        fuse_rmsnorms(&mut working_set, &fusion_plan).unwrap();
+        absorb_rotations(&mut working_set, &rotation_plan, &rotation).unwrap();
+
+        let report =
+            assert_prepared_forward_equivalence_qwen35(passing_snapshot, &reader, &working_set)
+                .unwrap();
+        assert!(report.max_abs_error <= forward_cfg.tolerance);
+
+        let chain_skipped = "model.language_model.layers.1.self_attn.k_proj.weight";
+        working_set
+            .get_mut(chain_skipped)
+            .expect("full-attention k_proj must exist")
+            .data[0] += 0.25;
+
+        let err =
+            assert_prepared_forward_equivalence_qwen35(refusing_snapshot, &reader, &working_set)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("per-tensor"), "unexpected error: {msg}");
     }
 
     // ------------------------------------------------------------------
@@ -2391,7 +2682,7 @@ mod tests {
         fs::create_dir_all(&input).unwrap();
         fs::write(input.join("config.json"), tiny_config_json_with_mtp(&cfg)).unwrap();
         // Write only the main model tensors — no MTP tensors in the file.
-        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 71);
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 71, false);
 
         let report = convert_quarot_qwen35(
             &input,
@@ -2441,7 +2732,7 @@ mod tests {
         // defaults to 0 on deserialize) alongside the main safetensors.
         fs::create_dir_all(&input).unwrap();
         fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
-        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 72);
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 72, false);
 
         let report = convert_quarot_qwen35(
             &input,

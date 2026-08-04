@@ -110,6 +110,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "benches/elementwise_cpu_bench.rs",
     "benches/f16_convert_bench.rs",
     "benches/gated_attention_bench.rs",
+    "benches/grammar_mask_bench.rs",
     "benches/inference_bench.rs",
     "benches/inference_perf.rs",
     "benches/kv_cache_f16_bench.rs",
@@ -139,6 +140,7 @@ const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
     "src/forward/metal_qwen35.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
     "src/forward/metal_qwen35.rs::lora_gemv_kernel_matches_cpu_reference",
     "src/forward/metal_qwen35.rs::load_adapter_and_dispatch_lora_if_active",
+    "src/forward/metal_qwen35.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
     "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
 ];
 const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
@@ -263,7 +265,7 @@ const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
         "MetalChatBackend::load belongs to a long-running interactive process outside the bounded measurement-harness contract",
     ),
     (
-        "bin:lattice:src/bin/lattice.rs=>src/bin/lattice.rs:2897:85",
+        "bin:lattice:src/bin/lattice.rs=>src/bin/lattice.rs:2927:85",
         "MetalHandle::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
     ),
     (
@@ -963,6 +965,9 @@ fn path_label(path: &syn::Path) -> String {
 fn classify_test_meta(meta: &Meta) -> TestRegistration {
     let path = meta.path();
     if path.is_ident("test") {
+        return TestRegistration::Yes;
+    }
+    if path_label(path) == "tokio::test" {
         return TestRegistration::Yes;
     }
     if path.is_ident("cfg_attr") {
@@ -2994,18 +2999,23 @@ path = "tools/explicit_example.rs"
 }
 
 #[test]
-fn cfg_attr_test_function_is_included_in_raw_dispatch_inventory() {
+fn cfg_attr_and_tokio_test_functions_are_included_in_raw_dispatch_inventory() {
     let source = r#"
 #[cfg_attr(test, test)]
 fn cfg_attr_registered_test() {
     let command_buffer = queue.new_command_buffer();
 }
+
+#[tokio::test]
+async fn tokio_registered_test() {
+    let command_buffer = queue.new_command_buffer();
+}
 "#;
-    let parsed = StructuredSource::parse("fixtures/cfg_attr_test.rs", source, true)
-        .expect("parse cfg_attr test fixture");
+    let parsed = StructuredSource::parse("fixtures/registered_tests.rs", source, true)
+        .expect("parse registered test fixture");
     let discovered = parsed
         .test_functions()
-        .expect("classify cfg_attr test functions")
+        .expect("classify registered test functions")
         .into_iter()
         .filter(|function| {
             !parsed
@@ -3016,7 +3026,10 @@ fn cfg_attr_registered_test() {
         .map(|function| function.name.as_str())
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(discovered, BTreeSet::from(["cfg_attr_registered_test"]));
+    assert_eq!(
+        discovered,
+        BTreeSet::from(["cfg_attr_registered_test", "tokio_registered_test"])
+    );
 }
 
 #[test]
@@ -3093,7 +3106,7 @@ fn raw_dispatch() {
 #[test]
 fn unknown_test_registration_attribute_fails_closed() {
     let source = r#"
-#[tokio::test]
+#[custom_runtime::test]
 async fn raw_dispatch() {
     let queue = Queue;
     let _command_buffer = queue.new_command_buffer();
@@ -3101,8 +3114,8 @@ async fn raw_dispatch() {
 "#;
     assert_command_buffer_fixture_rejected_with(
         source,
-        "tests/tokio_dispatch.rs",
-        "unclassifiable test function attribute `tokio::test`",
+        "tests/custom_runtime_dispatch.rs",
+        "unclassifiable test function attribute `custom_runtime::test`",
     );
 }
 

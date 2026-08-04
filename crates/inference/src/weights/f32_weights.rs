@@ -254,6 +254,12 @@ impl SafetensorsFile {
                 .try_into()
                 .map_err(|_| InferenceError::InvalidSafetensors("invalid header length".into()))?,
         ) as usize;
+        if header_len > MAX_SAFETENSORS_HEADER_BYTES {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "header length {header_len} exceeds limit of {MAX_SAFETENSORS_HEADER_BYTES} bytes"
+            )));
+        }
+
         let data_offset = 8usize
             .checked_add(header_len)
             .ok_or_else(|| InferenceError::InvalidSafetensors("header length overflow".into()))?;
@@ -956,6 +962,48 @@ pub(crate) const MAX_SAFETENSORS_INDEX_BYTES: u64 = 67_108_864;
 /// 1,000,000 leaves well over an order of magnitude of headroom while rejecting an
 /// unbounded entry count.
 pub(crate) const MAX_WEIGHT_MAP_ENTRIES: usize = 1_000_000;
+
+/// Upper bound, in bytes, on the safetensors header (`header_len` at the start of a
+/// `.safetensors` file, checked in [`SafetensorsFile::from_backing`] before the header
+/// is parsed as JSON).
+///
+/// An unsharded checkpoint puts metadata for every tensor in this one header, so it can
+/// run larger than a single shard's slice of `model.safetensors.index.json`. Real dense
+/// and MoE checkpoints, including the largest single-file presets this crate loads,
+/// produce headers on the order of a few hundred KiB to low single-digit MiB, so
+/// compatibility alone would tolerate a much larger cap.
+///
+/// This value is set by a second, tighter bound: what the parser retains after
+/// `open()` returns, not what a real header looks like. Every tensor's `shape` is
+/// stored as a `Vec<usize>` (8 bytes/element on this crate's supported targets), and
+/// [`validate_safetensors_layout`]'s element-count product accepts a zero-length
+/// dimension (`checked_mul` by 0 is always in range), so a tensor entry needs no
+/// corresponding tensor-data bytes once any one of its `shape` entries is `0`. A
+/// header can therefore spend nearly its whole byte budget on a single tensor's
+/// `shape` array of 8-byte elements written as one-digit decimals (`"0,"` is 2 input
+/// bytes per retained element). Measured `Vec<usize>` growth under repeated `push`
+/// (this crate's `parse_usize_array` never calls `with_capacity`) lands on the next
+/// power of two at or above the element count, so at a power-of-two byte cap this
+/// construction retains almost exactly 4x the cap: 4 MiB of header bounds worst-case
+/// retained shape-array bytes to 16 MiB. (Tensor names, `TensorMeta`'s fixed fields,
+/// and the `HashMap` bucket overhead were checked too: at 120 bytes/entry plus a
+/// short name, spreading the same byte budget across many small tensor entries
+/// instead retains less per input byte than the single-oversized-shape
+/// construction, so they do not set the bound.)
+///
+/// This sizing assumes the ordinary Rust allocator contract: growing a `Vec` past
+/// available memory via plain `push` is not a `Result` calling code can recover
+/// from, so the input-side byte cap is what keeps retained parser state bounded,
+/// not error handling downstream of the allocation.
+const MAX_SAFETENSORS_HEADER_BYTES: usize = 4_194_304;
+
+/// Upper bound on JSON container nesting depth (`{` / `[`) while parsing a safetensors
+/// header, tracked by [`JsonParser::depth`] and enforced in [`JsonParser::skip_value`].
+///
+/// A real header is shallow: the top-level object holds per-tensor objects, each holding
+/// at most a `shape`/`data_offsets` array — three levels deep, four counting `__metadata__`
+/// values written by common tooling. 32 leaves an order of magnitude of headroom over that.
+const MAX_SAFETENSORS_HEADER_DEPTH: usize = 32;
 
 /// Parsed `model.safetensors.index.json` from a HuggingFace sharded checkpoint.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1702,6 +1750,9 @@ fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, I
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Current container nesting depth, checked against [`MAX_SAFETENSORS_HEADER_DEPTH`]
+    /// on entry to each `{`/`[` container in [`Self::skip_value`].
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -1709,6 +1760,7 @@ impl<'a> JsonParser<'a> {
         Self {
             bytes: s.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -1875,10 +1927,17 @@ impl<'a> JsonParser<'a> {
                 Ok(())
             }
             Some(b'{') => {
+                self.depth += 1;
+                if self.depth > MAX_SAFETENSORS_HEADER_DEPTH {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "header nesting exceeds depth limit of {MAX_SAFETENSORS_HEADER_DEPTH}"
+                    )));
+                }
                 self.bump();
                 self.skip_ws();
                 if matches!(self.peek(), Some(b'}')) {
                     self.bump();
+                    self.depth -= 1;
                     return Ok(());
                 }
                 loop {
@@ -1909,13 +1968,21 @@ impl<'a> JsonParser<'a> {
                         }
                     }
                 }
+                self.depth -= 1;
                 Ok(())
             }
             Some(b'[') => {
+                self.depth += 1;
+                if self.depth > MAX_SAFETENSORS_HEADER_DEPTH {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "header nesting exceeds depth limit of {MAX_SAFETENSORS_HEADER_DEPTH}"
+                    )));
+                }
                 self.bump();
                 self.skip_ws();
                 if matches!(self.peek(), Some(b']')) {
                     self.bump();
+                    self.depth -= 1;
                     return Ok(());
                 }
                 loop {
@@ -1942,6 +2009,7 @@ impl<'a> JsonParser<'a> {
                         }
                     }
                 }
+                self.depth -= 1;
                 Ok(())
             }
             Some(b't') => self.skip_literal(b"true"),
@@ -2302,6 +2370,85 @@ mod tests {
         );
 
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_rejects_header_exceeding_depth_limit() {
+        // Nested well past MAX_SAFETENSORS_HEADER_DEPTH, but the whole header is a
+        // couple hundred bytes -- far under MAX_SAFETENSORS_HEADER_BYTES, so only
+        // the depth bound can be what rejects this fixture.
+        let depth = MAX_SAFETENSORS_HEADER_DEPTH + 8;
+        let mut header = String::from(r#"{"__metadata__":"#);
+        header.push_str(&"[".repeat(depth));
+        header.push_str(&"]".repeat(depth));
+        header.push('}');
+        assert!(header.len() < MAX_SAFETENSORS_HEADER_BYTES);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+
+        let err = SafetensorsFile::from_bytes(bytes)
+            .expect_err("header nesting past the depth limit must be rejected");
+        assert!(
+            err.to_string().contains("depth limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_header_exceeding_size_limit() {
+        // A single valid JSON string value padded past MAX_SAFETENSORS_HEADER_BYTES,
+        // with the full declared header actually present in the buffer (so the
+        // separate "header extends past end of file" check can't be what rejects
+        // this instead). A bare string value never recurses through skip_value, so
+        // this fixture stays at depth 0 -- only the size bound can reject it.
+        let prefix = r#"{"__metadata__":""#;
+        let suffix = r#""}"#;
+        let pad_len = MAX_SAFETENSORS_HEADER_BYTES + 1024 - prefix.len() - suffix.len();
+        let header_len = prefix.len() + pad_len + suffix.len();
+        assert!(header_len > MAX_SAFETENSORS_HEADER_BYTES);
+
+        let mut bytes = Vec::with_capacity(8 + header_len);
+        bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
+        bytes.extend_from_slice(prefix.as_bytes());
+        bytes.extend_from_slice(&vec![b'a'; pad_len]);
+        bytes.extend_from_slice(suffix.as_bytes());
+
+        let err = SafetensorsFile::from_bytes(bytes)
+            .expect_err("a header past the size limit must be rejected");
+        assert!(
+            err.to_string().contains("exceeds limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parses_header_within_depth_and_size_bounds() {
+        // A legitimate small header: under both the depth limit and the size
+        // limit. Must still parse, so neither bound above can be read as
+        // "reject everything" and still pass the suite.
+        let header = r#"{
+            "__metadata__": {"format": "pt"},
+            "t": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}
+        }"#
+        .replace(['\n', ' '], "");
+        assert!(header.len() < MAX_SAFETENSORS_HEADER_BYTES);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        for value in [1.0f32, 2.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let sf = SafetensorsFile::from_bytes(bytes)
+            .expect("a header within both bounds must still parse");
+        let (data, shape) = sf
+            .get_f32_tensor("t")
+            .expect("tensor within a bounded header must still load");
+        assert_eq!(shape, &[2]);
+        assert_eq!(data, &[1.0, 2.0]);
     }
 
     fn write_raw_safetensors(path: &std::path::Path, header: &str, raw: &[u8]) {
