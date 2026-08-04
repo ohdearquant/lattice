@@ -20,7 +20,7 @@ This process caught a 15% decode throughput regression (157 → 130 tok/s) that 
 
 ### Keep the Machine Quiet During A/B Runs — Quiet Means Zero Disk Activity, Not Just Zero Builds
 
-`scripts/bench-compare.sh` now enforces the machine side of this itself, so do not wrap it in an external bench-window helper. It takes both machine-wide advisory locks (the bench window and the Metal GPU lock) unconditionally for the whole run, samples ambient CPU idle before the base phase, between phases, and after the head phase, and refuses to certify a run that fell below the idle floor at any of them. The floor is settable with `BENCH_IDLE_FLOOR`; if you move it, say so wherever the numbers are quoted. Every run prints a `Run conditions` block recording the refs, the effective bench targets and features, the resolution, the lock dispositions, and the measured idle samples — quote that block along with the numbers, because a figure that does not record what produced it is indistinguishable from one produced on a quiet machine.
+`scripts/bench-compare.sh` now enforces the machine side of this itself, so do not wrap it in an external bench-window helper. It takes both machine-wide advisory locks (the bench window and the Metal GPU lock) unconditionally for the whole run. At each of the three boundaries — before base, between phases, and after head — macOS runs hold a mandatory 30-second cooldown, then require AC power, nominal thermal state, at least 30 seconds of HID idle, and the portable ambient-CPU idle floor. Linux CI records that the macOS-only probes are unavailable and still applies the CPU-idle gate. The CPU floor is settable with `BENCH_IDLE_FLOOR`; if you move it, say so wherever the numbers are quoted. Every run prints a `Run conditions` block recording the refs, effective bench targets and features, resolution, lock dispositions, machine-state checkpoints, and measured idle samples — quote that block along with the numbers, because a figure that does not record what produced it is indistinguishable from one produced on a quiet machine.
 
 Both locks are taken regardless of what the run benches. That is deliberate: deciding whether a target is GPU-driving would mean maintaining an enumeration of bench names, feature combinations, and transitive dependencies that pull Metal in without saying so, and every miss would pass the check while the GPU spins. Serializing a CPU-only bench against GPU work is correct rather than merely tolerable, since GPU work during a CPU bench is exactly the ambient load the idle floor exists to exclude.
 
@@ -39,9 +39,9 @@ A reachability verdict costs minutes of reading and decides whether a bench wind
 Never run the full Criterion suite; see the measured slow-side bound above. Filter to the groups your PR touches:
 
 ```bash
-cargo bench -p lattice-embed --bench simd -- "simd_dot_product"     # one group
-cargo bench -p lattice-embed --bench simd -- "int8_raw|normalize"   # multiple groups
-cargo bench -p lattice-inference --bench elementwise_cpu_bench      # inference CPU ops
+scripts/bench-command.sh --label embed-simd -- cargo bench -p lattice-embed --bench simd -- "simd_dot_product"
+scripts/bench-command.sh --label embed-simd -- cargo bench -p lattice-embed --bench simd -- "int8_raw|normalize"
+scripts/bench-command.sh --label inference-cpu -- cargo bench -p lattice-inference --bench elementwise_cpu_bench
 ```
 
 For the A/B workflow, pass the same Criterion filter through `make bench-compare`:
@@ -52,6 +52,19 @@ make bench-compare BENCH_GROUPS_EMBED="simd_dot_product|int8_raw"
 ```
 
 Leaving these variables unset keeps the default `elementwise_cpu_bench` and `simd` bench targets.
+
+The local script paths classified in `scripts/bench-measurements.toml` enter a
+cooperative wrapper on ordinary direct invocation. This prevents accidental
+unlocked runs but is not a same-user authentication boundary. Add new local
+measurement entry points to that inventory; the CI contract rejects an
+unclassified `scripts/bench*` entry. Source-pattern discovery is advisory: a
+lexical no-match does not prove that a script never measures. The Rust
+inventory in the same manifest covers only its declared path grammar; other
+Rust examples, binaries, and tests require manual classification. Use
+`scripts/bench-command.sh --label <name> -- <command>` for an ad-hoc raw CPU
+Criterion command. `make bench-ci` and `make bench-gate` also refuse below the
+ambient-idle floor because their baseline or result outlives the process that
+produced it.
 
 Quick mode (`--quick`) is sufficient for direction + magnitude. Full mode only when you need tight CIs for a PR description or ADR evidence.
 

@@ -43,6 +43,18 @@ fi
 exit 0
 """
 
+FAILING_CARGO = """#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+  exit 0
+fi
+if [[ " $* " == *" --no-run "* ]]; then
+  exit 0
+fi
+printf '%s\n' 'fixture cargo failed before producing a measurement' >&2
+exit 7
+"""
+
 STUB_GOVERNOR = """#!/usr/bin/env python3
 import json
 import sys
@@ -73,6 +85,11 @@ print(json.dumps({
         "kill_switch": "clear",
     },
 }, separators=(",", ":"), sort_keys=True))
+"""
+
+FAILING_STATE_PROBE = """#!/usr/bin/env python3
+print("malformed machine-state fixture")
+raise SystemExit(127)
 """
 
 STUB_MACHINE_PROBE = """#!/usr/bin/env python3
@@ -193,6 +210,9 @@ else
   fi
 fi
 
+if [[ "${STUB_EMIT_CRITERION_HOME:-0}" == "1" ]]; then
+  echo "time: criterion-home=${CRITERION_HOME:-<unset>}"
+fi
 printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
 printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
 """
@@ -483,19 +503,46 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
         self.assertIn("produced no measurements", result.stderr)
 
-    def test_reporter_mode_is_unchanged_by_the_guard(self):
-        """Without the flag the script stays tolerant: the guard must not bite.
-
-        The default caller is a human reading an A/B against an arbitrary ref,
-        where a missing bench target is ordinary. Pinning this stops a later
-        tightening from silently becoming the default.
-        """
+    def test_default_mode_refuses_a_run_that_measured_nothing(self):
+        """Report-only controls regression enforcement, not measurement validity."""
         result = _run([])
-        self.assertNotEqual(
+        self.assertEqual(
             result.returncode, 2,
-            f"reporter mode must not exit 2\nstdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}")
-        self.assertNotIn("produced no measurements", result.stderr)
+            f"expected exit 2 (not measurable), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("produced no measurements", result.stderr)
+
+    def test_default_mode_surfaces_a_failed_benchmark_command(self):
+        result = _run([], stub_cargo=FAILING_CARGO)
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (not measurable), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("failed (exit 7)", result.stderr)
+        self.assertIn(
+            "fixture cargo failed before producing a measurement", result.stderr
+        )
+
+    def test_default_mode_refuses_a_failed_machine_state_probe_before_base(self):
+        result = _run([], stub_machine_state=FAILING_STATE_PROBE)
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (not measurable), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("machine-state checkpoint 'before base' failed", result.stderr)
+        self.assertNotIn("--- Building + benching BASE", result.stdout)
+
+    def test_default_mode_completes_a_healthy_measurement_fixture(self):
+        result = _run([], stub_cargo=STALE_CHANGE_CARGO)
+        self.assertEqual(
+            result.returncode, 0,
+            f"healthy report-only fixture failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        self.assertIn("Done.", result.stdout)
 
     def test_stale_change_cannot_mask_a_benchmark_removed_on_head(self):
         """A stale same-path comparison must not satisfy head completeness.
@@ -618,7 +665,9 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         #1090. The stub emits only its inherited CRITERION_HOME; no benchmark
         implementation is duplicated here.
         """
-        result = _run([], emit_criterion_home=True)
+        result = _run(
+            [], stub_cargo=STALE_CHANGE_CARGO, emit_criterion_home=True
+        )
         self.assertEqual(
             result.returncode, 0,
             f"reporter-mode probe failed\nstdout:\n{result.stdout}\n"
@@ -633,5 +682,12 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertTrue(any("/embed/criterion" in path for path in roots), roots)
 
 
+class _FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        if self.test.countTestCases() == 0:
+            raise SystemExit("no tests collected")
+        super().runTests()
+
+
 if __name__ == "__main__":
-    unittest.main()
+    _FailOnEmptyTestProgram()

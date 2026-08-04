@@ -90,6 +90,20 @@ except ImportError:
 if sys.version_info[:2] < (3, 11):
     raise SystemExit(_PYTHON_REQUIREMENT_ERROR)
 
+if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from bench_supervision import ensure_python_entrypoint
+
+    requested_run_kind = "baseline"
+    for index, arg in enumerate(sys.argv[1:], start=1):
+        if arg == "--run-kind" and index + 1 < len(sys.argv):
+            requested_run_kind = sys.argv[index + 1]
+        elif arg.startswith("--run-kind="):
+            requested_run_kind = arg.split("=", 1)[1]
+    ensure_python_entrypoint(
+        "cpu-flagship", quiet=requested_run_kind != "demonstration"
+    )
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = Path(__file__).resolve().parent
 

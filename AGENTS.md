@@ -259,8 +259,8 @@ make publish         # publish (dependency order, sleeps for indexing)
 make e2e-parity                          # run locally (needs torch + transformers)
 
 # Perf benchmarking (ADR-087, trend data)
-# bench-compare takes the machine-wide bench-window and GPU locks itself and
-# gates on ambient CPU idle — do NOT wrap it in an external bench-window helper.
+# bench-compare takes the machine-wide bench-window and GPU locks itself, and
+# gates macOS power/thermal/AFK plus ambient CPU idle — do NOT wrap it.
 make bench-compare                       # A/B: origin/main vs HEAD (--quick, the default; not separately measured)
 make bench-compare BASE=main HEAD=pr/x   # A/B: explicit refs
 scripts/bench-compare.sh --full main     # A/B with tight CIs; see CLAUDE.md's measured slow-side bound (under "Measure First, Code Second") before booking a window

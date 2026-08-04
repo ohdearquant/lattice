@@ -43,6 +43,12 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+if __name__ == "__main__" and not {"-h", "--help"}.intersection(sys.argv[1:]):
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+    from bench_supervision import ensure_python_entrypoint
+
+    ensure_python_entrypoint("decode-apples-precise", quiet=True)
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_decode_harness as harness  # noqa: E402
 
