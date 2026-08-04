@@ -223,15 +223,14 @@ GitHub Actions on every push/PR to `main`: fmt → clippy → test → build. Ru
 Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include a
 bench-compare disposition in its description. By default, run `make bench-compare` and paste its
 A/B table into the PR body. If the result shows no change, state that as the disposition.
-`crates/fann/` is covered because it feeds inference through the optional `mixture` feature; a
-fann-only diff that the bench build compiles out qualifies for the structural waiver below, on
-the same terms as any other diff.
+`crates/fann/` is covered both because it feeds inference through the optional `mixture` feature
+and because it declares its own bench target (`router_online`).
 
-The only structural waiver is a diff compiled out of the bench binaries by a `cfg` gate. A waiver
-must name the gate, name the bench build's feature set, and state that the base and head bench
-binaries have identical effective source. "Cold path", "not benchmark-relevant", "additive only",
-and a bare `cfg(test)` that names no bench feature set are not valid waivers. If any changed line is
-compiled into the bench binaries, run the A/B.
+The waiver predicate is reachability, not compilation, and the canonical statement of the rule —
+including the all-declared-target search requirement, the FANN `router_online` example, and the
+residual-risk framing — lives in `CLAUDE.md` under "Measure First, Code Second". Read that section
+before claiming a waiver here; do not treat "compiled out of the default bench binaries" alone as
+sufficient.
 
 ### E2E Parity Gate
 

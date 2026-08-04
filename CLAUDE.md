@@ -6,7 +6,7 @@ Read `AGENTS.md` first for coding conventions, crate structure, and design princ
 
 ### Measure First, Code Second
 
-Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like. One honesty note on `crates/fann/`: the default bench build does not enable the optional `mixture` feature, so a fann-only diff is usually compiled out of the bench binaries and its disposition will correctly be the structural waiver below — the gate still requires stating that explicitly. A fann change whose effects reach the default bench binaries (or any future mixture-enabled bench target) runs the A/B like everyone else.
+Every PR that touches `crates/inference/`, `crates/embed/`, or `crates/fann/` must include `make bench-compare` output. No exceptions. A PR without before/after numbers is incomplete regardless of what the code looks like. One honesty note on `crates/fann/`: the default bench build does not enable the optional `mixture` feature, so a fann-only diff is usually compiled out of the two default bench targets — but default-target compilation status alone is not sufficient to claim the waiver. `crates/fann/` also declares its own feature-gated `router_online` bench target (requires the `online-router` feature; `crates/fann/Cargo.toml:45-48`), which directly exercises FANN training and network APIs. A fann diff takes the same all-declared-target reachability search as any other crate: search every declared target, including `router_online`, and if a reachable one exists, run it instead of claiming the waiver.
 
 ```bash
 make bench-compare                         # origin/main vs HEAD (~2 min, default)
@@ -36,7 +36,7 @@ A reachability verdict costs minutes of reading and decides whether a bench wind
 
 ### Bench by Group, Not All at Once
 
-The full Criterion suite takes 15-30 min. Never run it all. Filter to the groups your PR touches:
+Never run the full Criterion suite; see the measured slow-side bound above. Filter to the groups your PR touches:
 
 ```bash
 cargo bench -p lattice-embed --bench simd -- "simd_dot_product"     # one group
