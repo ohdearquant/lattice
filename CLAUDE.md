@@ -198,7 +198,11 @@ Publish order follows the internal dependency DAG (deps before dependents): fann
 
    ```bash
    UA="lattice-release-check (you@example.com)"   # any identifying string with contact info
-   for c in lattice-inference lattice-fann lattice-transport lattice-embed lattice-tune; do
+   # serde is the control and is first on purpose: it is always published, so reaching a lattice
+   # line at all proves the registry accepted the request shape. The subshell keeps the abort
+   # from closing an interactive terminal.
+   (
+   for c in serde lattice-inference lattice-fann lattice-transport lattice-embed lattice-tune; do
      curl -s -H "User-Agent: $UA" "https://crates.io/api/v1/crates/$c" | python3 -c "
    import sys, json
    d = json.load(sys.stdin)
@@ -206,14 +210,20 @@ Publish order follows the internal dependency DAG (deps before dependents): fann
        raise SystemExit('FAILED READ: ' + d['errors'][0].get('detail', ''))
    yanked = [v['num'] for v in d['versions'] if v['yanked']]
    print(d['crate']['name'], 'max_stable=' + d['crate']['max_stable_version'], 'yanked=' + str(yanked))
-   "
+   " || exit 1
    done
+   )
    ```
 
-   Expect `max_stable=<new>` on every crate and `<broken>` present in `yanked`. The fields are
-   `max_stable_version` / `max_version` / `newest_version` on the crate object and a per-version
-   `yanked` boolean in the `versions` array; the crate object carries no `latest_unyanked`. Run the same
-   command against a crate you know is published (`serde`) whenever the result is empty or
-   uniform across all five, so a refused request cannot be mistaken for a missing release.
+   Expect a `serde` line first, then `max_stable=<new>` on every lattice crate with `<broken>`
+   present in `yanked`. The fields are `max_stable_version` / `max_version` / `newest_version` on
+   the crate object and a per-version `yanked` boolean in the `versions` array; the crate object
+   carries no `latest_unyanked`.
+
+   The control runs inside the loop rather than being described beside it, because the failure it
+   guards against does not look like a failure. A refused request returns an error object, and code
+   scanning that object for a version finds none, so a refusal is rendered as an absence and reads
+   as "this release was never published" — wrong in the reassuring direction. A control that the
+   reader is told to run when something looks wrong never runs, because nothing looks wrong.
 
 Done in v0.2.3 (yanked broken 0.2.2 which shipped with the RoPE bug). New `cargo add` users get the fix; existing pinned users get a yank warning on next `cargo update`.
