@@ -62,6 +62,7 @@ thread_local! {
     static MASK_PROFILING_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MASK_PROFILE: std::cell::RefCell<MaskProfile> =
         const { std::cell::RefCell::new(MaskProfile::new()) };
+    static CONTEXT_RECHECK_SIMULATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BUILD_PROFILE: std::cell::RefCell<BuildProfile> =
         const { std::cell::RefCell::new(BuildProfile::new()) };
 }
@@ -76,11 +77,6 @@ pub struct MaskProfile {
     /// Context-dependent token recheck loop (runs only on the precomputed-hit path).
     pub context_recheck_calls: u64,
     pub context_recheck_ns: u64,
-    /// Number of context-dependent candidates that actually reached
-    /// `simulate_token` inside the recheck loop (i.e. were not already
-    /// pre-blocked by the precomputed bitmask). Distinguishes "the recheck
-    /// loop ran" (`context_recheck_calls`) from "the recheck loop did work".
-    pub context_recheck_simulated: u64,
     /// `mask_by_simulation` fallback: `find_state_id` (miss) + full-vocab simulation.
     pub fallback_calls: u64,
     pub fallback_ns: u64,
@@ -97,7 +93,6 @@ impl MaskProfile {
             precomputed_ns: 0,
             context_recheck_calls: 0,
             context_recheck_ns: 0,
-            context_recheck_simulated: 0,
             fallback_calls: 0,
             fallback_ns: 0,
             advance_calls: 0,
@@ -137,12 +132,26 @@ impl BuildProfile {
 pub fn enable_mask_profiling() {
     MASK_PROFILING_ENABLED.with(|e| e.set(true));
     MASK_PROFILE.with(|p| *p.borrow_mut() = MaskProfile::new());
+    CONTEXT_RECHECK_SIMULATED.with(|c| c.set(0));
 }
 
 /// Disable mask profiling and return the accumulated [`MaskProfile`].
 pub fn take_mask_profile() -> MaskProfile {
     MASK_PROFILING_ENABLED.with(|e| e.set(false));
     MASK_PROFILE.with(|p| *p.borrow())
+}
+
+/// Number of context-dependent candidates that actually reached
+/// `simulate_token` inside the recheck loop since the last
+/// [`enable_mask_profiling`] call (i.e. were not already pre-blocked by the
+/// precomputed bitmask). Distinguishes "the recheck loop ran"
+/// ([`MaskProfile::context_recheck_calls`]) from "the recheck loop did work".
+/// Tracked separately from [`MaskProfile`] so that surfacing it does not
+/// require adding a field to that exhaustively public, struct-literal-
+/// constructible type (a semver-major break). Unlike [`take_mask_profile`],
+/// this does not disable profiling, so it can be read mid-run.
+pub fn context_recheck_simulated() -> u64 {
+    CONTEXT_RECHECK_SIMULATED.with(std::cell::Cell::get)
 }
 
 fn mask_profiling_enabled() -> bool {
@@ -465,8 +474,8 @@ impl GrammarEngine {
                         let mut p = p.borrow_mut();
                         p.context_recheck_calls += 1;
                         p.context_recheck_ns += ns;
-                        p.context_recheck_simulated += simulated;
                     });
+                    CONTEXT_RECHECK_SIMULATED.with(|c| c.set(c.get() + simulated));
                 }
             }
             None => {
