@@ -110,6 +110,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "benches/elementwise_cpu_bench.rs",
     "benches/f16_convert_bench.rs",
     "benches/gated_attention_bench.rs",
+    "benches/grammar_mask_bench.rs",
     "benches/inference_bench.rs",
     "benches/inference_perf.rs",
     "benches/kv_cache_f16_bench.rs",
