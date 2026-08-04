@@ -1002,8 +1002,10 @@ class SupervisionShellHelperFailures(unittest.TestCase):
 
     def test_root_resolution_failure_exits_2(self):
         """Mutation-sensitive: revert the `if ! repo=... ; then ... fi` guard
-        around either `cd` in bench-supervision.sh and this run's exit code
-        flips from 2 to a raw 1 (or an unhandled `set -e` abort).
+        around `bench_quiet_checkpoint`'s own `cd` in bench-supervision.sh
+        and this run's exit code flips from 2 to a raw 1 (or an unhandled
+        `set -e` abort). See test_supervise_entry_root_resolution_failure_exits_2
+        for the same guard on `bench_supervise_entry`'s separate `cd`.
 
         `BASH_SOURCE[0]` for a function *defined inline inside a `bash -c`
         string* is not reliably the argv0 passed alongside that string --
