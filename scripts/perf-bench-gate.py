@@ -1596,6 +1596,48 @@ def run_selftest() -> int:
                 "the baseline-without-head refusal"
             )
 
+        # lattice#1298 F1: a stale/non-selected change/ dir must not exempt an
+        # uncovered head artifact. existing_group/existing_bench compares
+        # cleanly against the selected baseline; stale_group/stale_bench has a
+        # head new/ artifact and a change/ comparison, but that change/ is
+        # against a non-selected "stale-baseline", not "compare-base".
+        # Mutation-sensitive: restore the `- all_change_ids` subtraction and
+        # this exits 0 instead of 2.
+        stale_change_root = Path(td) / "stale-change-coverage" / "criterion"
+        _fabricate_bench(
+            stale_change_root / "existing_group" / "existing_bench",
+            "compare-base",
+        )
+        _fabricate_bench(
+            stale_change_root / "stale_group" / "stale_bench",
+            "stale-baseline",
+        )
+        stale_change = _run(
+            stale_change_root,
+            "--require-measurements",
+            "--target",
+            "lattice-inference:elementwise_cpu_bench",
+        )
+        if stale_change.returncode != 2:
+            failures.append(
+                "stale-change-coverage: a head artifact whose only companion "
+                "is a stale non-selected change/ exited "
+                f"{stale_change.returncode} instead of 2"
+            )
+        if "NO COVERAGE" not in stale_change.stderr:
+            failures.append(
+                "stale-change-coverage: refusal did not label the "
+                "stale-change-only head artifact NO COVERAGE"
+            )
+        if (
+            "  - lattice-inference:elementwise_cpu_bench: stale_group/stale_bench"
+            not in stale_change.stderr
+        ):
+            failures.append(
+                "stale-change-coverage: refusal did not name exact bench ID "
+                "'stale_group/stale_bench'"
+            )
+
         # A target can be intentionally all-informational only when the exact
         # target key accompanies both the root and the demotion. This remains a
         # measured target and is valid in an enforcing multi-target run; another
@@ -1660,12 +1702,6 @@ def run_selftest() -> int:
         _fabricate_bench(
             coverage_root / "renamed_rms_norm" / "4096", "compare-base"
         )
-        _fabricate_bench(
-            coverage_root / "stale_default" / "bench", "base"
-        )
-        _fabricate_bench(
-            coverage_root / "stale_named" / "bench", "previous-run"
-        )
         # An estimates file directly under the selected baseline directory has
         # no benchmark ID and is unrelated Criterion-tree debris, not a bench.
         (coverage_root / "compare-base").mkdir(parents=True)
@@ -1702,17 +1738,6 @@ def run_selftest() -> int:
                 "inventory-direction: baseline-without-head was collapsed into "
                 "the head-without-baseline NO COVERAGE disposition"
             )
-        for unrelated_id in ("stale_default/bench", "stale_named/bench"):
-            if unrelated_id in coverage.stderr:
-                failures.append(
-                    "baseline-completeness: unrelated baseline tree leaked into "
-                    f"selected set: {unrelated_id}"
-                )
-            if unrelated_id in coverage.stdout:
-                failures.append(
-                    "baseline-completeness: unrelated stale comparison was "
-                    f"judged by the enforcing run: {unrelated_id}"
-                )
         if _run(
             coverage_root,
         ).returncode != 0:
@@ -1835,8 +1860,6 @@ def run_selftest() -> int:
         freshness_root = Path(td) / "freshness" / "criterion"
         removed_bench = freshness_root / "rms_norm" / "4096"
         _fabricate_bench(removed_bench, "compare-base")
-        unrelated_bench = freshness_root / "legacy_group" / "legacy_bench"
-        _fabricate_bench(unrelated_bench, "previous-run")
         sibling_root = Path(td) / "freshness-sibling" / "criterion"
         sibling_bench = sibling_root / "simd_dot_product" / "scalar" / "384"
         _fabricate_bench(sibling_bench, "compare-base")
@@ -1851,10 +1874,6 @@ def run_selftest() -> int:
             failures.append(
                 "head-freshness: stale selected-bench new/change artifacts survived"
             )
-        if not (unrelated_bench / "new" / "estimates.json").exists():
-            failures.append(
-                "head-freshness: unrelated named-baseline benchmark was cleaned"
-            )
         if not (sibling_bench / "change" / "estimates.json").exists():
             failures.append(
                 "head-freshness: preparing one target root touched its sibling"
@@ -1864,6 +1883,25 @@ def run_selftest() -> int:
             failures.append(
                 "head-freshness: deleted head benchmark was masked by stale "
                 "same-path output"
+            )
+
+        # lattice#1298 F1's fix (reconciling missing_baseline_ids against
+        # baseline_ids instead of any change/ presence) means an unrelated
+        # named-baseline bench surviving cleanup now correctly reports its own
+        # NO COVERAGE gap. Test that survival-of-cleanup property in isolation
+        # so it does not also contaminate the single-direction check above.
+        freshness_unrelated_root = Path(td) / "freshness-unrelated" / "criterion"
+        unrelated_bench = freshness_unrelated_root / "legacy_group" / "legacy_bench"
+        _fabricate_bench(unrelated_bench, "previous-run")
+        prepared_unrelated = _prepare(freshness_unrelated_root, "--prepare-head")
+        if prepared_unrelated.returncode != 0:
+            failures.append(
+                "head-freshness: unrelated-baseline prepare step failed: "
+                f"{prepared_unrelated.stderr}"
+            )
+        if not (unrelated_bench / "new" / "estimates.json").exists():
+            failures.append(
+                "head-freshness: unrelated named-baseline benchmark was cleaned"
             )
 
         unsafe_root = Path(td) / "not-the-criterion-root"
@@ -2502,10 +2540,12 @@ def main() -> int:
         artifact_bench_id(head_file, args.criterion_root, artifact_parts=1)
         for head_file in args.criterion_root.rglob("new/estimates.json")
     }
-    # Existing comparison artifacts can belong to preserved, unrelated baseline trees;
-    # only a head artifact with no comparison at all proves the first-run coverage gap.
-    all_change_ids = set(change_file_ids.values())
-    missing_baseline_ids = sorted(head_ids - baseline_ids - all_change_ids)
+    # A stale/non-selected change/estimates.json is not evidence of coverage: the
+    # enforcing filter below only trusts a change file whose id is in baseline_ids,
+    # so exempting on any change/ presence here would fail open on exactly the
+    # artifact that filter later excludes. Reconcile against baseline_ids directly,
+    # the same selected-baseline inventory the enforcing path trusts.
+    missing_baseline_ids = sorted(head_ids - baseline_ids)
 
     def refuse_missing_baseline() -> int:
         print(
@@ -2529,9 +2569,9 @@ def main() -> int:
             f"NO COVERAGE: {len(missing_baseline_ids)} head benchmarks have no selected baseline",
         )
 
-    if require_measurements and missing_baseline_ids:
-        return refuse_missing_baseline()
-
+    # An entirely empty selected baseline gets its own clearer message: check
+    # it first, since a fully empty baseline_ids would otherwise put every
+    # head id into missing_baseline_ids and mask the more specific diagnosis.
     if require_measurements and not baseline_ids:
         print(
             f"error: --require-measurements set but selected baseline "
@@ -2542,6 +2582,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return finish("error", EXIT_ERROR, "the selected baseline set is empty")
+
+    if require_measurements and missing_baseline_ids:
+        return refuse_missing_baseline()
 
     # Enforcing A/B runs judge only the exact selected base set. A persistent
     # Criterion root can contain change output from other named baselines or
