@@ -63,6 +63,7 @@ thread_local! {
     static MASK_PROFILE: std::cell::RefCell<MaskProfile> =
         const { std::cell::RefCell::new(MaskProfile::new()) };
     static CONTEXT_RECHECK_SIMULATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CONTEXT_RECHECK_CANDIDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BUILD_PROFILE: std::cell::RefCell<BuildProfile> =
         const { std::cell::RefCell::new(BuildProfile::new()) };
 }
@@ -149,6 +150,7 @@ pub fn enable_mask_profiling() {
     MASK_PROFILING_ENABLED.with(|e| e.set(true));
     MASK_PROFILE.with(|p| *p.borrow_mut() = MaskProfile::new());
     CONTEXT_RECHECK_SIMULATED.with(|c| c.set(0));
+    CONTEXT_RECHECK_CANDIDATES.with(|c| c.set(0));
 }
 
 /// Disable mask profiling and return the accumulated [`MaskProfile`].
@@ -168,6 +170,22 @@ pub fn take_mask_profile() -> MaskProfile {
 /// this does not disable profiling, so it can be read mid-run.
 pub fn context_recheck_simulated() -> u64 {
     CONTEXT_RECHECK_SIMULATED.with(std::cell::Cell::get)
+}
+
+/// Number of times the context-dependent recheck loop body was entered
+/// (i.e. the size of the candidate set the loop iterated over) since the
+/// last [`enable_mask_profiling`] call. Counted at loop entry, before the
+/// precomputed-bitmask short-circuit (`logits[token_id] ==
+/// f32::NEG_INFINITY`) skips a candidate. Distinguishes *which candidate
+/// set* the loop iterated (state-local vs. the conservative global union)
+/// from [`context_recheck_simulated`], which only counts candidates that
+/// survived that short-circuit to reach `simulate_token` — a metric that
+/// reads identically for either candidate set whenever the bitmask already
+/// rejects every out-of-group candidate. Tracked separately from
+/// [`MaskProfile`] for the same semver reason as
+/// [`context_recheck_simulated`].
+pub fn context_recheck_candidates() -> u64 {
+    CONTEXT_RECHECK_CANDIDATES.with(std::cell::Cell::get)
 }
 
 fn mask_profiling_enabled() -> bool {
@@ -456,9 +474,13 @@ impl GrammarEngine {
                 // Re-check context-dependent tokens at runtime.
                 let t1 = profiling.then(std::time::Instant::now);
                 let mut simulated = 0u64;
+                let mut visited = 0u64;
                 for &token_id in self.partition.context_dependent_ids_for_state(state_id) {
                     #[cfg(test)]
                     CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(|count| count.set(count.get() + 1));
+                    if profiling {
+                        visited += 1;
+                    }
                     if token_id >= self.vocab_size {
                         continue;
                     }
@@ -495,6 +517,7 @@ impl GrammarEngine {
                         p.context_recheck_ns += ns;
                     });
                     CONTEXT_RECHECK_SIMULATED.with(|c| c.set(c.get() + simulated));
+                    CONTEXT_RECHECK_CANDIDATES.with(|c| c.set(c.get() + visited));
                 }
             }
             None => {
