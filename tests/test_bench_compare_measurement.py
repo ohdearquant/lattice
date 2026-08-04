@@ -287,7 +287,24 @@ def _run(
             'name = "criterion"\n'
             'version = "0.5.1"\n'
         )
-        subprocess.run([*GIT, "-C", str(root), "add", "-f", "Cargo.lock"], check=True)
+        # The default bench targets' declared-group derivation reads
+        # crates/<crate>/benches/<target>.rs from the checked-out worktree, so
+        # the fixture needs stub sources declaring the same groups the stub
+        # cargo fixtures above write results for (rms_norm, simd_dot_product).
+        # Every test defaults to BENCHES_INFERENCE=elementwise_cpu_bench and
+        # BENCHES_EMBED=simd (none override them), so one fixed pair covers
+        # the whole file.
+        inference_benches = root / "crates" / "inference" / "benches"
+        inference_benches.mkdir(parents=True)
+        (inference_benches / "elementwise_cpu_bench.rs").write_text(
+            'let mut group = c.benchmark_group("rms_norm");\n'
+        )
+        embed_benches = root / "crates" / "embed" / "benches"
+        embed_benches.mkdir(parents=True)
+        (embed_benches / "simd.rs").write_text(
+            'let mut group = c.benchmark_group("simd_dot_product");\n'
+        )
+        subprocess.run([*GIT, "-C", str(root), "add", "-f", "Cargo.lock", "crates"], check=True)
         for i in range(2):
             (root / f"f{i}.txt").write_text(str(i))
             subprocess.run([*GIT, "-C", str(root), "add", "-A"], check=True)
@@ -609,9 +626,13 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         enforcing run exits 0 instead of 2.
         """
         def seed_stale_change(root):
+            # Path is target-keyed (lattice#bench-criterion-root-per-target):
+            # BENCHES_INFERENCE defaults to elementwise_cpu_bench, so that is
+            # the segment between the crate and "criterion" here.
             bench = (
                 root / ".cache" / "bench-compare-criterion" / "head" /
-                "inference" / "criterion" / "rms_norm" / "4096"
+                "inference" / "elementwise_cpu_bench" / "criterion" /
+                "rms_norm" / "4096"
             )
             (bench / "new").mkdir(parents=True)
             (bench / "change").mkdir()
@@ -639,34 +660,47 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             "  - lattice-inference:elementwise_cpu_bench: rms_norm/4096",
             result.stdout,
         )
-        self.assertIn("removed 2 stale head artifact directories", result.stdout)
+        # The per-target root is now wiped wholesale before the head phase
+        # (lattice#bench-criterion-root-per-target), so the selective
+        # clear_selected_head_artifacts prune this message reports on always
+        # finds the root already empty here — the seeded stale artifact
+        # never survives to be found. The invariant this test guards (a stale
+        # same-path comparison cannot satisfy head completeness) is proven by
+        # the exit-2 assertion above, which fires because the real head stub
+        # genuinely never measured rms_norm/4096 in this run, independent of
+        # whichever mechanism cleared any prior data.
+        self.assertIn("removed 0 stale head artifact directories", result.stdout)
 
     def test_stale_unrelated_selected_baseline_is_pruned_before_copy(self):
         """A prior alternate-target baseline must not join today's base set.
 
-        Mutation-sensitive: remove the --prepare-baseline-copy call and the
-        stale compare-base artifact remains selected. The later head cleanup
-        removes its old comparison, so completeness false-fails old_group/42
-        even though every benchmark in today's fresh base set ran on HEAD.
-
-        The pruned baseline dir's `new/`/`change/` siblings must go with it
-        (mutation-sensitive on their own: leaving them behind resurrects
-        old_group/42 as a phantom unbaselined head measurement via the
-        root-wide new/estimates.json inventory — see
-        ClearSelectedBaselineArtifactsSiblingPrune for the isolated repro).
-        A second, differently-named baseline snapshot sharing the same
-        Criterion root must survive untouched, proving the prune did not
-        widen past the exact selected baseline.
+        Pre-lattice#bench-criterion-root-per-target, this asserted that
+        clear_selected_baseline_artifacts selectively pruned only the exact
+        selected-baseline dir, leaving an unrelated differently-named
+        baseline snapshot in the same root untouched. That fix now wipes the
+        whole arm-and-target root before either phase writes into it
+        (bench-compare-impl.sh's clear_criterion_root), which is a stronger
+        guarantee: a bench-compare-owned per-target root holds nothing but
+        this run's own artifacts, so nothing sharing that root — selected
+        baseline or not — should outlive one invocation. Both stale seeds
+        below (old_group/42 and the differently-named manual-snapshot) are
+        gone by construction; this test now asserts that directly rather than
+        asserting the old selective-prune's "removed N" message, which always
+        reads 0 now that the wipe runs first.
         """
         old_group_dir = None
         unrelated_dir = None
 
         def seed_unrelated_run(root):
             nonlocal old_group_dir, unrelated_dir
-            bench = (
+            # Path is target-keyed: BENCHES_INFERENCE defaults to
+            # elementwise_cpu_bench, the segment between crate and
+            # "criterion".
+            target_root = (
                 root / ".cache" / "bench-compare-criterion" / "head" /
-                "inference" / "criterion" / "old_group" / "42"
+                "inference" / "elementwise_cpu_bench" / "criterion"
             )
+            bench = target_root / "old_group" / "42"
             old_group_dir = bench
             (bench / "compare-base").mkdir(parents=True)
             (bench / "new").mkdir()
@@ -683,14 +717,11 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             )
 
             # A different target's persistent, differently-named baseline
-            # snapshot in the same criterion root. It has no new/change, so
-            # it cannot trip the head-ids coverage check either way; it is
-            # here purely to prove clear_selected_baseline_artifacts does not
-            # widen its deletion past the exact selected baseline name.
-            other = (
-                root / ".cache" / "bench-compare-criterion" / "head" /
-                "inference" / "criterion" / "other_group" / "7"
-            )
+            # snapshot sharing the same criterion root before this run wipes
+            # it. It has no new/change, so it cannot trip the head-ids
+            # coverage check either way; it is here to prove the wipe is
+            # total rather than scoped to the selected baseline name.
+            other = target_root / "other_group" / "7"
             unrelated_dir = other / "manual-snapshot"
             unrelated_dir.mkdir(parents=True)
             (unrelated_dir / "estimates.json").write_text(
@@ -718,21 +749,22 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn(
-            "removed 1 stale selected-baseline artifact directory before fresh base copy",
+            "removed 0 stale selected-baseline artifact directories before fresh base copy",
             result.stdout,
         )
         self.assertNotIn("old_group/42", result.stdout)
         self.assertFalse(
             snapshot["old_group_new_exists"],
-            "stale old_group/42/new must be pruned along with its baseline dir",
+            "stale old_group/42/new must not survive the arm-and-target root wipe",
         )
         self.assertFalse(
             snapshot["old_group_change_exists"],
-            "stale old_group/42/change must be pruned along with its baseline dir",
+            "stale old_group/42/change must not survive the arm-and-target root wipe",
         )
-        self.assertTrue(
+        self.assertFalse(
             snapshot["unrelated_exists"],
-            "an unrelated target's differently-named baseline snapshot must survive the prune",
+            "a differently-named baseline snapshot must not survive the arm-and-target "
+            "root wipe either — the wipe is total, not scoped to the selected baseline",
         )
 
     def test_enforcing_mode_refuses_a_partial_baseline_copy(self):
@@ -768,6 +800,11 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         member or includes `<unset>`, reproducing the shared namespace behind
         #1090. The stub emits only its inherited CRITERION_HOME; no benchmark
         implementation is duplicated here.
+
+        Roots are keyed by bench TARGET as well as by crate (lattice#bench-
+        criterion-root-per-target): every root's path includes the exact
+        target name as its own path component, not just the crate name, so
+        two different targets under the same crate can never collide.
         """
         result = _run(
             [], stub_cargo=STALE_CHANGE_CARGO, emit_criterion_home=True
@@ -782,8 +819,67 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"expected isolated base/head roots per target, saw {roots}\n"
             f"stdout:\n{result.stdout}")
         self.assertNotIn("<unset>", roots)
-        self.assertTrue(any("/inference/criterion" in path for path in roots), roots)
-        self.assertTrue(any("/embed/criterion" in path for path in roots), roots)
+        self.assertTrue(
+            any("/inference/elementwise_cpu_bench/criterion" in path for path in roots),
+            roots,
+        )
+        self.assertTrue(
+            any("/embed/simd/criterion" in path for path in roots), roots
+        )
+
+    def test_different_bench_targets_get_different_criterion_roots(self):
+        """The actual defect: two runs choosing different BENCHES_INFERENCE
+        values must never write into the same Criterion root.
+
+        Mutation-sensitive: drop the target-name path segment (key the root by
+        crate alone, as the pre-fix script did) and both invocations report
+        the same criterion-home path.
+        """
+        def add_f16_convert_bench_source(root):
+            # STALE_CHANGE_CARGO picks its fabricated group name (rms_norm)
+            # from the CRATE in argv, not the --bench target, so the fixture
+            # source declares the same group name regardless of target — this
+            # test asserts path distinctness, not group-content reconciliation
+            # (that is covered separately by the reconciliation tests below).
+            # The file must be committed, not just written: bench-compare
+            # reads it from a `git worktree add --detach` checkout of HEAD,
+            # which only contains tracked, committed content.
+            path = root / "crates" / "inference" / "benches" / "f16_convert_bench.rs"
+            path.write_text('let mut group = c.benchmark_group("rms_norm");\n')
+            subprocess.run([*GIT, "-C", str(root), "add", "-f", str(path)], check=True)
+            subprocess.run(
+                [*GIT, "-C", str(root), "commit", "-qm", "add f16_convert_bench fixture"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                },
+            )
+
+        first = _run(
+            [], stub_cargo=STALE_CHANGE_CARGO, emit_criterion_home=True
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            emit_criterion_home=True,
+            extra_env={"BENCHES_INFERENCE": "f16_convert_bench"},
+            setup=add_f16_convert_bench_source,
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        first_roots = set(re.findall(r"criterion-home=(\S+)", first.stdout))
+        second_roots = set(re.findall(r"criterion-home=(\S+)", second.stdout))
+        inference_first = {p for p in first_roots if "/inference/" in p}
+        inference_second = {p for p in second_roots if "/inference/" in p}
+        self.assertTrue(inference_first, first.stdout)
+        self.assertTrue(inference_second, second.stdout)
+        self.assertFalse(
+            inference_first & inference_second,
+            f"different BENCHES_INFERENCE values shared a root: "
+            f"{inference_first} vs {inference_second}",
+        )
 
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):
