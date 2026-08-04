@@ -539,7 +539,7 @@ impl BpeTokenizer {
         self.tokenize_to_ids_into(text, &mut scratch)
     }
 
-    #[cfg(feature = "metal-gpu")]
+    #[cfg(all(feature = "metal-gpu", feature = "serve"))]
     pub(crate) fn tokenize_fragments_with_inserted_ids(
         &self,
         before: &str,
