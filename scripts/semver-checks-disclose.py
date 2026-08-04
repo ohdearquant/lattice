@@ -134,7 +134,32 @@ def could_not_read_summary(detail: str) -> str:
     )
 
 
-def compose_summary(result: ParseResult) -> str | None:
+def _observed_scope_clause(observed_package: str | None) -> str:
+    """The scope-tripwire sentence: name what was actually checked.
+
+    The capture re-run checks one crate, not the workspace's full set.
+    That is sound only because every workspace crate shares one
+    `[workspace.package] version` — a bump voids the gate for all of them
+    at once through that single shared value, so one crate's real
+    `Checked N checks` line answers the question for the rest. If the
+    workspace ever splits into per-crate versions, that inference goes
+    silently false, and this sentence is the only thing in the disclosure
+    that says the instrument's basis has expired — it must stay in the
+    disclosure text itself, not a code comment nobody reading the alert
+    will see.
+    """
+    if not observed_package:
+        return ""
+    return (
+        f" Observed `{observed_package}` directly; the other workspace "
+        "crates are inferred to be in the same state because they share "
+        "one `[workspace.package] version`."
+    )
+
+
+def compose_summary(
+    result: ParseResult, observed_package: str | None = None
+) -> str | None:
     """Return the $GITHUB_STEP_SUMMARY text, or None to stay silent.
 
     Silence is the healthy-case default: when checks actually executed,
@@ -156,7 +181,7 @@ def compose_summary(result: ParseResult) -> str | None:
         f"so cargo-semver-checks skipped all {result.total_skip} checks). "
         "A green result here is NOT coverage. It becomes coverage again "
         "once the bumped version is published and becomes the crates.io "
-        "baseline.\n"
+        f"baseline.{_observed_scope_clause(observed_package)}\n"
     )
 
 
@@ -232,6 +257,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run the three built-in fixtures and exit",
     )
+    parser.add_argument(
+        "--observed-package",
+        default=None,
+        help=(
+            "Name of the single crate the capture re-run actually checked "
+            "(e.g. lattice-transport). Included in the zero-checks "
+            "disclosure so it names its own scope instead of implying "
+            "workspace-wide coverage."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.selftest:
@@ -254,7 +289,7 @@ def main(argv: list[str] | None = None) -> int:
         parse_ok = False
     else:
         result = parse_semver_checks_output(text)
-        summary = compose_summary(result)
+        summary = compose_summary(result, observed_package=args.observed_package)
         parse_ok = result.parse_ok
 
     if summary is None:

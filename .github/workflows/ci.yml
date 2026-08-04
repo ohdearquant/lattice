@@ -829,13 +829,28 @@ jobs:
       # 0.7.1 -> 0.8.0) reads to cargo-semver-checks as an assumed-major
       # change, so every check is skipped and the action above still reports
       # success — a green run that verified nothing. This block re-runs the
-      # exact command the gate ran and discloses, on the step summary and as
-      # a workflow annotation, when the executed-check count is zero. Every
+      # check for one crate and discloses, on the step summary and as a
+      # workflow annotation, when the executed-check count is zero. Every
       # step here is continue-on-error: an observer must never be able to
-      # fail the job it only reports on. The re-run is a real second
-      # invocation of the same command, not a free read of cached state —
-      # measured on a real run: the gate action itself took 72s, this re-run
-      # took 154s.
+      # fail the job it only reports on.
+      #
+      # Scoped to lattice-transport alone rather than repeating the gate's
+      # five-package check. The condition this observer detects is
+      # workspace-global by construction: every crate shares one
+      # `[workspace.package] version`, so a version bump voids the gate for
+      # all five simultaneously through that single shared value, and one
+      # crate's real `Checked N checks` line answers the question for the
+      # rest. lattice-transport and lattice-fann are the workspace's leaf
+      # crates (no internal path deps to build first); measured locally with
+      # a warm target dir (the state this step actually runs in, since the
+      # gate step above already built rustdoc JSON for all five crates in
+      # this same job) via
+      # `cargo semver-checks check-release -p <crate> --default-features`,
+      # lattice-transport finished in ~0.75-0.79s across two runs versus
+      # lattice-fann's ~1.0-1.2s, so lattice-transport is the cheaper pick.
+      # The disclosure step below is told which crate this is via
+      # --observed-package so its own text states the scope it actually
+      # checked, rather than implying workspace-wide coverage.
       - name: Confirm cargo-semver-checks is on PATH
         continue-on-error: true
         run: |
@@ -853,7 +868,7 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
         run: |
-          cargo semver-checks check-release -p lattice-fann -p lattice-transport -p lattice-inference -p lattice-embed -p lattice-tune --default-features \
+          cargo semver-checks check-release -p lattice-transport --default-features \
             > "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" 2>&1 || true
       # Every other Python step in this workflow uses bare python3 (see
       # decode-harness-unit-tests below); match that convention rather than
@@ -862,7 +877,7 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          python3 scripts/semver-checks-disclose.py "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" --summary-out "$GITHUB_STEP_SUMMARY"
+          python3 scripts/semver-checks-disclose.py "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" --summary-out "$GITHUB_STEP_SUMMARY" --observed-package lattice-transport
           status=$?
           # 0 = ran to completion silently or with its own disclosure+warning;
           # 1 = ran to completion and emitted its own could-not-read

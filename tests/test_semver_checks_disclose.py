@@ -51,19 +51,22 @@ def _unparseable_fixture() -> str:
     return "error: could not locate baseline rustdoc JSON for lattice-fann\n"
 
 
-def _run(text: str, root: Path) -> tuple[subprocess.CompletedProcess, Path]:
+def _run(
+    text: str, root: Path, *, observed_package: str | None = None
+) -> tuple[subprocess.CompletedProcess, Path]:
     captured = root / "captured.txt"
     captured.write_text(text)
-    return _run_path(captured, root)
+    return _run_path(captured, root, observed_package=observed_package)
 
 
-def _run_path(captured: Path, root: Path) -> tuple[subprocess.CompletedProcess, Path]:
+def _run_path(
+    captured: Path, root: Path, *, observed_package: str | None = None
+) -> tuple[subprocess.CompletedProcess, Path]:
     summary = root / "summary.md"
-    result = subprocess.run(
-        ["python3", str(SCRIPT), str(captured), "--summary-out", str(summary)],
-        text=True,
-        capture_output=True,
-    )
+    argv = ["python3", str(SCRIPT), str(captured), "--summary-out", str(summary)]
+    if observed_package:
+        argv += ["--observed-package", observed_package]
+    result = subprocess.run(argv, text=True, capture_output=True)
     return result, summary
 
 
@@ -157,6 +160,27 @@ class SemverChecksDiscloseTests(unittest.TestCase):
             self.assertIn("0.7.1 -> 0.8.0", text)
             self.assertNotIn("version transition unavailable", text)
 
+    def test_zero_disclosure_names_its_own_observed_scope(self) -> None:
+        # ci.yml's capture re-run now checks one crate (lattice-transport),
+        # not all five, because every workspace crate shares one
+        # `[workspace.package] version` — a bump voids the gate for all of
+        # them at once through that shared value. The disclosure text is the
+        # only place that inference is written down, so it must name both
+        # the crate actually observed and the inference itself in its own
+        # words; a future edit that drops this clause would make the
+        # disclosure imply workspace-wide coverage it never measured.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result, summary = _run(
+                _zero_fixture(), root, observed_package="lattice-transport"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(summary.exists())
+            text = summary.read_text()
+            self.assertIn("lattice-transport", text)
+            self.assertIn("inferred", text)
+            self.assertIn("[workspace.package] version", text)
+
     def test_missing_capture_file_is_could_not_read_not_silent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -248,6 +272,37 @@ class SemverChecksDiscloseTests(unittest.TestCase):
             result, _summary = _run(_healthy_fixture(), root)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("::warning::", result.stdout)
+
+    def test_capture_step_is_scoped_to_one_crate(self) -> None:
+        # The gate step above (untouched by this scoping change) still checks
+        # all five packages; only the observer's own re-run narrows to one.
+        # A version bump voids the gate for every crate at once through the
+        # single shared `[workspace.package] version`, so one crate's real
+        # `Checked N checks` line answers the workspace-wide question.
+        with open(CI_WORKFLOW) as fh:
+            workflow = yaml.safe_load(fh)
+        steps = workflow["jobs"]["semver-checks"]["steps"]
+        capture_steps = [
+            step
+            for step in steps
+            if step.get("name") == "Re-run semver-checks to capture executed-check counts"
+        ]
+        self.assertEqual(len(capture_steps), 1)
+        run = capture_steps[0]["run"]
+        self.assertEqual(run.count("-p lattice-"), 1, run)
+        self.assertIn("-p lattice-transport", run)
+
+    def test_disclosure_step_passes_the_observed_package_it_checked(self) -> None:
+        with open(CI_WORKFLOW) as fh:
+            workflow = yaml.safe_load(fh)
+        steps = workflow["jobs"]["semver-checks"]["steps"]
+        disclose_steps = [
+            step for step in steps if step.get("name") == "Disclose zero-check semver-checks runs"
+        ]
+        self.assertEqual(len(disclose_steps), 1)
+        self.assertIn(
+            "--observed-package lattice-transport", disclose_steps[0]["run"]
+        )
 
     def test_capture_step_disables_ansi_color(self) -> None:
         # Prevention, not the guarantee (the parser's own ANSI strip is the
