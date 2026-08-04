@@ -824,6 +824,31 @@ jobs:
         with:
           package: lattice-fann,lattice-transport,lattice-inference,lattice-embed,lattice-tune
           feature-group: default-features
+      # Pure observer, added after the gate above and byte-for-byte unable to
+      # change its verdict. Under 0.x semver a workspace minor bump (e.g.
+      # 0.7.1 -> 0.8.0) reads to cargo-semver-checks as an assumed-major
+      # change, so every check is skipped and the action above still reports
+      # success — a green run that verified nothing. This block re-runs the
+      # exact command the gate ran (the target dir and rustdoc JSON are warm
+      # from the action step, so the rerun is cheap), and discloses on
+      # $GITHUB_STEP_SUMMARY when the executed-check count is zero. Every
+      # step here is continue-on-error: an observer must never be able to
+      # fail the job it only reports on.
+      - name: Confirm cargo-semver-checks is on PATH
+        continue-on-error: true
+        run: |
+          if ! command -v cargo-semver-checks >/dev/null 2>&1; then
+            echo "::warning::cargo-semver-checks not found on PATH after the action step; installing it directly via 'cargo install --locked' so the disclosure re-run below can proceed"
+            cargo install cargo-semver-checks --locked
+          fi
+      - name: Re-run semver-checks to capture executed-check counts
+        continue-on-error: true
+        run: |
+          cargo semver-checks check-release -p lattice-fann -p lattice-transport -p lattice-inference -p lattice-embed -p lattice-tune --default-features \
+            > "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" 2>&1 || true
+      - name: Disclose zero-check semver-checks runs
+        continue-on-error: true
+        run: uv run python3 scripts/semver-checks-disclose.py "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" --summary-out "$GITHUB_STEP_SUMMARY"
 
   # REQUIRED status check (see the rollout note at the top of this file).
   # Always runs, always reports. `ci`, `feature-matrix`, and `msrv` are matrix
