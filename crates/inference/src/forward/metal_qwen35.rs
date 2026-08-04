@@ -26,6 +26,7 @@
 //! q/k/v/o_proj) and embed_tokens. Buffers kept as f32: norm weights, bias/log scalars,
 //! conv1d weights (small, read by CPU), RoPE tables, activation scratch buffers.
 
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 mod mtp_weights;
 
 // -----------------------------------------------------------------------------
@@ -455,7 +456,7 @@ mod inner {
     mod layers;
 
     use super::GdnStateTrafficScope;
-    use gdn_state::{MetalGdnState, MetalGdnStatePrecision};
+    use gdn_state::{MetalGdnState, MetalGdnStatePrecision, active_gdn_layer_indices};
     // Chat message types + the shared ChatML renderer (#668) live at the file
     // top level (module-scope, above `mod inner`) so CPU-only builds can
     // render through the same `format_chat_template` this Metal path uses,
@@ -11530,7 +11531,7 @@ mod inner {
             // ----------------------------------------------------------------
             // GDN recurrent states (same as new())
             // ----------------------------------------------------------------
-            let num_linear = cfg.num_active_linear_attention_layers();
+            let num_linear = active_gdn_layer_indices(cfg).len();
             let num_full = cfg.num_active_full_attention_layers();
             let gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
                 .map(|_| GatedDeltaNetState::new(cfg))
@@ -13559,29 +13560,34 @@ mod inner {
             );
         }
 
+        /// Behavioral guard for the allocation policy `from_q4_dir` uses to size
+        /// typed Metal GDN state (`active_gdn_layer_indices`, called at the
+        /// `num_linear` assignment above the `MetalGdnState::new` call in
+        /// `from_q4_dir`). Exercises the same pure decision the constructor makes
+        /// — which layer indices are GatedDeltaNet AND unpruned — without a GPU
+        /// or a model fixture download.
         #[test]
         fn q4_constructor_allocates_typed_gdn_state_for_active_layers() {
-            let src = include_str!("metal_qwen35.rs");
-            let production_end = src
-                .find("    mod tests {")
-                .expect("mod tests must exist in this file");
-            let production_src = &src[..production_end];
-            let q4_start = production_src
-                .find("pub fn from_q4_dir(")
-                .expect("Q4-directory Metal constructor must exist");
-            let q4_end = q4_start
-                + production_src[q4_start..]
-                    .find("\n        pub fn chat_completion_streaming<")
-                    .expect("chat completion must follow the Q4-directory constructor");
-            let q4_body = &production_src[q4_start..q4_end];
-
-            assert!(
-                q4_body.contains("let num_linear = cfg.num_active_linear_attention_layers();"),
-                "the prunable Q4 constructor must size GDN state from active linear layers"
+            let (cfg, _weights) = tiny_hybrid_fixture();
+            // tiny_hybrid_fixture: layer_types = [Linear, Linear, Linear, Full],
+            // layer_mask all active — every linear-attention layer is selected,
+            // the full-attention layer (index 3) is excluded.
+            assert_eq!(super::active_gdn_layer_indices(&cfg), vec![0, 1, 2]);
+            assert_eq!(
+                super::active_gdn_layer_indices(&cfg).len(),
+                cfg.num_active_linear_attention_layers()
             );
-            assert!(
-                q4_body.contains("MetalGdnState::new(&device, cfg, num_linear)"),
-                "the Q4 constructor must pass its active-layer count to the typed GDN owner"
+
+            let mut pruned = cfg.clone();
+            pruned.layer_mask[1] = false;
+            assert_eq!(
+                super::active_gdn_layer_indices(&pruned),
+                vec![0, 2],
+                "a pruned linear-attention layer must not receive typed GDN state"
+            );
+            assert_eq!(
+                super::active_gdn_layer_indices(&pruned).len(),
+                pruned.num_active_linear_attention_layers()
             );
         }
 

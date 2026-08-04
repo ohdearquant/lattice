@@ -1,5 +1,15 @@
 use super::*;
 
+/// Layer indices (architectural order) that receive typed Metal GDN state
+/// under the active-layer allocation policy: GatedDeltaNet (linear-attention)
+/// layers that survive `layer_mask` pruning. Full-attention layers and
+/// pruned layers are excluded — they never own conv/S-matrix buffers.
+pub(crate) fn active_gdn_layer_indices(cfg: &Qwen35Config) -> Vec<usize> {
+    (0..cfg.num_hidden_layers)
+        .filter(|&i| cfg.is_layer_active(i) && !cfg.is_full_attention(i))
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MetalGdnStatePrecision {
     F32,
