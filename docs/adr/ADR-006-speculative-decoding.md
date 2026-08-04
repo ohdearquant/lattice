@@ -12,6 +12,37 @@ RoPE-convention fix. The function now uses **split-half `(i, half+i)`**, matchin
 the main-model convention. See ADR-007 Amendment for full context. The inline
 correction is marked with `[CORRECTED]` in the Risks section below.
 
+## Amendment (2026-07-29): Metal owns its n-gram generation lifecycle
+
+The public free function `speculative::generate_with_speculation` remains the
+model-agnostic closure API. Its callback protocol is retained for compatibility:
+the first callback receives the final prompt token at
+`position = prompt_tokens.len()`. That protocol must not drive a live
+`MetalQwen35State` after prefill because it would write the final prompt token
+into the next position.
+
+Metal n-gram generation instead uses the additive inherent method
+`MetalQwen35State::generate_with_speculation`. The state owns this lifecycle:
+
+1. Reject an empty prompt or out-of-vocabulary token ids before state mutation
+   or GPU work. For a valid prompt, a zero-token budget is then a successful
+   no-op.
+2. For a non-zero budget, reject a `prompt_len + max_new_tokens` request beyond
+   `max_context()`, then reset the session and prefill the prompt exactly once.
+3. Seed verification from the prefill logits rather than re-feeding the final
+   prompt token.
+4. Forward every emitted non-EOS token exactly once at its absolute position,
+   including the final token admitted by the generation budget.
+
+After a successful non-zero-budget call, the live KV/GDN state represents
+`prompt_tokens.len() + generated.len()` tokens. EOS is neither returned nor
+forwarded. The method inherits the existing Metal prefill boundary used by
+`generate` and `generate_streaming`: multi-token MoE prompts are unsupported by
+the batched prefill path; no speculative-only sequential MoE path is introduced.
+
+This amendment does not replace the free closure API and does not change the
+native Metal MTP or GDN self-speculative routes.
+
 ---
 
 ## Context
@@ -92,12 +123,17 @@ Implement **two-tier speculative decoding**: `NgramSpeculator` (zero training, p
 - `MtpVerifier` draft acceptance rate is significantly higher than n-gram for general text.
 - Cache rollback is O(1) regardless of how many tokens are rejected.
 - `generate_with_speculation()` API is model-agnostic (takes a verification closure).
+- Metal callers can use a state-owned n-gram entry point without reconstructing
+  prefill, context admission, or token-position bookkeeping.
 
 **Negative**:
 
 - Greedy acceptance is not statistically correct at temperature > 0. If the crate is extended for probabilistic generation, this must be revisited.
 - `MtpVerifier` requires a separate checkpoint (MTP layer weights). The MTP model is not included in the base Qwen3-Embedding checkpoint.
 - `find_ngram()` linear scan degrades linearly with prompt length. For prompts > 4096 tokens, a hash-based index would be faster.
+- The generic closure API and the Metal state-owned API have intentionally
+  different callback ownership contracts; callers must choose the entry point
+  matching their state model.
 
 **Risks**:
 
@@ -112,6 +148,7 @@ Implement **two-tier speculative decoding**: `NgramSpeculator` (zero training, p
 ## References
 
 - `src/speculative.rs` — `NgramSpeculator`, `MtpVerifier`, `MtpConfig`, `mtp_verify_draft()`, `generate_with_speculation()`
+- `src/forward/metal_qwen35.rs` — state-owned Metal n-gram generation lifecycle
 - `src/kv_cache/flat.rs` — `truncate_to()` used for cache rollback
 - Leviathan et al. 2023 — "Fast Inference from Transformers via Speculative Decoding" — https://arxiv.org/abs/2211.17192
 - Deepseek-MTP architecture — partial RoPE factor, MoE configuration
