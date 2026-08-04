@@ -299,7 +299,9 @@ rather than only the number it produced.
 
 ### The result is unchanged, and now reproduces under both surfaces
 
-Measured on 2026-08-04 across the 34 open pull requests: 26 trigger the rule. Under the surface
+Measured on 2026-08-04 across the 34 pull requests open at the time of measurement, which
+excludes the one carrying this amendment because it did not yet exist and is in any case
+documentation only: 26 trigger the rule. Under the surface
 as originally written, zero are reached. Under the corrected surface, one is reached, PR #1289,
 and it is reached through `crates/embed/src/lib.rs` alone.
 
