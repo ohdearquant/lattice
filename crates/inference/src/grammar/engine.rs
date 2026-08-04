@@ -62,6 +62,7 @@ thread_local! {
     static MASK_PROFILING_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MASK_PROFILE: std::cell::RefCell<MaskProfile> =
         const { std::cell::RefCell::new(MaskProfile::new()) };
+    static CONTEXT_RECHECK_SIMULATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BUILD_PROFILE: std::cell::RefCell<BuildProfile> =
         const { std::cell::RefCell::new(BuildProfile::new()) };
 }
@@ -147,12 +148,26 @@ impl BuildProfile {
 pub fn enable_mask_profiling() {
     MASK_PROFILING_ENABLED.with(|e| e.set(true));
     MASK_PROFILE.with(|p| *p.borrow_mut() = MaskProfile::new());
+    CONTEXT_RECHECK_SIMULATED.with(|c| c.set(0));
 }
 
 /// Disable mask profiling and return the accumulated [`MaskProfile`].
 pub fn take_mask_profile() -> MaskProfile {
     MASK_PROFILING_ENABLED.with(|e| e.set(false));
     MASK_PROFILE.with(|p| *p.borrow())
+}
+
+/// Number of context-dependent candidates that actually reached
+/// `simulate_token` inside the recheck loop since the last
+/// [`enable_mask_profiling`] call (i.e. were not already pre-blocked by the
+/// precomputed bitmask). Distinguishes "the recheck loop ran"
+/// ([`MaskProfile::context_recheck_calls`]) from "the recheck loop did work".
+/// Tracked separately from [`MaskProfile`] so that surfacing it does not
+/// require adding a field to that exhaustively public, struct-literal-
+/// constructible type (a semver-major break). Unlike [`take_mask_profile`],
+/// this does not disable profiling, so it can be read mid-run.
+pub fn context_recheck_simulated() -> u64 {
+    CONTEXT_RECHECK_SIMULATED.with(std::cell::Cell::get)
 }
 
 fn mask_profiling_enabled() -> bool {
@@ -440,6 +455,7 @@ impl GrammarEngine {
 
                 // Re-check context-dependent tokens at runtime.
                 let t1 = profiling.then(std::time::Instant::now);
+                let mut simulated = 0u64;
                 for &token_id in self.partition.context_dependent_ids_for_state(state_id) {
                     #[cfg(test)]
                     CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(|count| count.set(count.get() + 1));
@@ -457,6 +473,9 @@ impl GrammarEngine {
                         continue;
                     }
                     let (result, _) = simulate_token(state, &self.grammar, token_bytes);
+                    if profiling {
+                        simulated += 1;
+                    }
                     match result {
                         // Byte-level rejection, or partial consumption (the token
                         // straddles a grammar boundary and cannot be generated as a
@@ -475,6 +494,7 @@ impl GrammarEngine {
                         p.context_recheck_calls += 1;
                         p.context_recheck_ns += ns;
                     });
+                    CONTEXT_RECHECK_SIMULATED.with(|c| c.set(c.get() + simulated));
                 }
             }
             None => {
