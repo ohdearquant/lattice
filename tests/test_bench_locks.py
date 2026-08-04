@@ -990,6 +990,14 @@ class SupervisionShellHelperFailures(unittest.TestCase):
     failing root resolution or a closed-stderr diagnostic write is itself a
     failing command and aborts with the shell's own exit 1 before the
     explicit ``exit 2`` is ever reached.
+
+    Each helper's root-resolution guard is a separate copy in a separate
+    function, so each gets its own mutation-sensitive test:
+    test_root_resolution_failure_exits_2 (bench_quiet_checkpoint) and
+    test_supervise_entry_root_resolution_failure_exits_2
+    (bench_supervise_entry). The closed-stderr diagnostic-write guard is
+    tested once, against the branch it can actually reach; see
+    test_closed_stderr_quiet_probe_diagnostic_still_exits_2's docstring.
     """
 
     def test_root_resolution_failure_exits_2(self):
@@ -1043,9 +1051,63 @@ class SupervisionShellHelperFailures(unittest.TestCase):
             "refusal) also exits 2 with a different message, so the "
             f"guard-specific text must be present.\nstderr:\n{r.stderr}")
 
-    def test_closed_stderr_diagnostic_still_exits_2(self):
-        """Mutation-sensitive: drop the `|| :` from the FATAL echo in
-        bench_quiet_checkpoint and this closed-stderr run flips from 2 to 1."""
+    def test_supervise_entry_root_resolution_failure_exits_2(self):
+        """Mutation-sensitive: revert the `if ! repo=... ; then ... fi` guard
+        around bench_supervise_entry's own `cd` in bench-supervision.sh and
+        this run's exit code flips from 2 to a raw 1 (or an unhandled
+        `set -e` abort).
+
+        bench_supervise_entry resolves the repo root with the same unguarded
+        `cd "$(dirname "${BASH_SOURCE[0]}")/../.."` pattern as
+        bench_quiet_checkpoint, but as a separate copy in a separate
+        function -- reverting one function's guard leaves the other's
+        intact, so a test that only ever calls bench_quiet_checkpoint proves
+        nothing about this guard. Root resolution runs before
+        bench_supervise_entry inspects LATTICE_BENCH_LOCK_STATUS or any of
+        its other arguments, so a bare label/mode/measurement triple is
+        enough to reach it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            vanished_root = Path(tmp) / "vanished-repo-root"
+            (vanished_root / "scripts" / "lib").mkdir(parents=True)
+            shutil.copy2(
+                LIB / "bench-supervision.sh",
+                vanished_root / "scripts" / "lib" / "bench-supervision.sh")
+            helper_path = vanished_root / "scripts" / "lib" / "bench-supervision.sh"
+            script = (
+                'set -e\n'
+                f'source "{helper_path}"\n'
+                f'rm -rf "{vanished_root}"\n'
+                'bench_supervise_entry test-label direct dummy_measurement\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            r.returncode, 2,
+            f"expected exit 2, got {r.returncode}\nstdout:\n{r.stdout}\n"
+            f"stderr:\n{r.stderr}")
+        self.assertIn(
+            "FATAL: cannot resolve the repository root", r.stderr,
+            "exit 2 alone does not pin this to the root-resolution guard.\n"
+            f"stderr:\n{r.stderr}")
+
+    def test_closed_stderr_quiet_probe_diagnostic_still_exits_2(self):
+        """Mutation-sensitive: drop the `|| :` from the quiet-probe-refusal
+        echo in bench_quiet_checkpoint and this closed-stderr run flips from
+        2 to 1.
+
+        The fixture below builds a valid, on-disk repo root, so
+        bench_quiet_checkpoint's root-resolution `cd` succeeds and this test
+        never reaches the FATAL root-resolution branch or its diagnostic
+        printfs -- only quiet-probe.py's forced failure and the "machine was
+        not quiet" echo that follows it. A scratch mutant confirms both
+        halves: dropping `|| :` from the FATAL printfs (the unreached
+        branch) leaves this run at exit 2 unchanged, while dropping it from
+        this quiet-probe echo (the reached branch) flips the run to exit 1
+        under `set -e`. test_root_resolution_failure_exits_2 above is the
+        one that pins the FATAL branch, via a fixture that deletes the repo
+        root instead of building one.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "repo"
             (root / "scripts" / "lib").mkdir(parents=True)
