@@ -15,6 +15,7 @@ mkdir -p "$SB/scripts/lib" "$SB/docs/bench_results" "$SB/target/release" \
 cp "$SRC" "$SB/scripts/bench_quality.sh"
 if ! cp \
   "$SRC_ROOT/scripts/lib/bench-supervision.sh" \
+  "$SRC_ROOT/scripts/lib/bench-python.sh" \
   "$SRC_ROOT/scripts/lib/bench_supervision.py" \
   "$SRC_ROOT/scripts/lib/bench-locks.py" \
   "$SB/scripts/lib/"; then
