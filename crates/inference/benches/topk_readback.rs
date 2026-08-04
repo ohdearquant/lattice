@@ -25,6 +25,18 @@ use criterion::{
 };
 use lattice_inference::sampling::{Candidate, CandidateSet, Sampler, SamplingConfig};
 
+fn bench_locked_metal_groups(c: &mut Criterion) {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
+    bench_full_logit_readback_metal(c);
+    bench_compact_readback_metal(c);
+    bench_noop_command_buffer(c);
+    bench_metal_topk_dispatch_only(c);
+    bench_metal_topk_plus_readback(c);
+    bench_topk_parity(c);
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -2136,12 +2148,7 @@ criterion_group!(
         bench_compact_readback,
         bench_sampling_pipeline,
         bench_topk_selection,
-        bench_full_logit_readback_metal,
-        bench_compact_readback_metal,
-        bench_noop_command_buffer,
-        bench_metal_topk_dispatch_only,
-        bench_metal_topk_plus_readback,
+        bench_locked_metal_groups,
         bench_candidate_sampler,
-        bench_topk_parity,
 );
 criterion_main!(topk_readback_benches);

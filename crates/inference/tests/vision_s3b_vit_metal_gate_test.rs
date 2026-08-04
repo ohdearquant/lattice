@@ -21,12 +21,9 @@
 //! (`64*64*64`) at this geometry, so a genuine GPU dispatch happens per op
 //! when Metal is available — this is not exercising the CPU-fallback branch.
 //!
-//! Acquires the machine-wide `gpu_test_lock()` (own copy — external
-//! integration tests can't reach the `metal_qwen35.rs`/`metal.rs`-private
-//! copies; duplicating this exact lock is the codebase's established
-//! sibling-invocation-path pattern for GPU-touching test binaries, see
-//! `bin/bench_gdn_prefill_ab.rs`) before any Metal work, and runs
-//! `--test-threads=1`-safe (each test acquires its own lock instance).
+//! Acquires the shared machine-wide
+//! [`gpu_test_lock()`](lattice_inference::measurement::gpu_test_lock)
+//! before any Metal work, and runs `--test-threads=1`-safe.
 //!
 //! The dispatch-count proof (see `expected_dispatch_count`/
 //! `assert_dispatch_count` below) is only compiled in under the non-default
@@ -51,6 +48,7 @@
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod gated {
+    use lattice_inference::measurement::gpu_test_lock;
     use lattice_inference::model::qwen35_config::VisionModelConfig;
     use lattice_inference::vision::checkpoint::{
         Qwen35VisionWeights, VisualBlockWeights, VisualMergerWeights,
@@ -98,59 +96,6 @@ mod gated {
             in_channels: 3,
             deepstack_visual_indexes: vec![],
             intermediate_size: None,
-        }
-    }
-
-    /// Serializes GPU-heavy tests onto the single shared Metal device, both
-    /// in-process and machine-wide. Own copy of `metal_qwen35.rs`'s
-    /// `gpu_test_lock()` — see module docs for why external integration
-    /// tests can't import the original (private, nested in that file's own
-    /// `#[cfg(test)] mod tests`).
-    struct GpuTestGuard {
-        _process: std::sync::MutexGuard<'static, ()>,
-        _machine: std::fs::File,
-    }
-
-    const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-    const GPU_MACHINE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-    fn gpu_test_lock() -> GpuTestGuard {
-        use std::sync::Mutex;
-        static GPU_LOCK: Mutex<()> = Mutex::new(());
-        let process = GPU_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(GPU_MACHINE_LOCK_PATH)
-            .unwrap_or_else(|e| panic!("gpu_test_lock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}"));
-        let deadline = std::time::Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
-                        panic!(
-                            "gpu_test_lock: another process has held {GPU_MACHINE_LOCK_PATH} for \
-                             over {}s — a Metal test run elsewhere on this machine is wedged or \
-                             genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
-                            GPU_MACHINE_LOCK_TIMEOUT.as_secs()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                Err(std::fs::TryLockError::Error(e)) => {
-                    panic!("gpu_test_lock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
-                }
-            }
-        }
-
-        GpuTestGuard {
-            _process: process,
-            _machine: file,
         }
     }
 
