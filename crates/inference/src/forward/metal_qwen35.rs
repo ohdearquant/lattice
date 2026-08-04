@@ -473,7 +473,10 @@ mod inner {
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
     use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::stop_strings::StopStringMatcher;
-    use crate::model::qwen35::{AttentionWeights, ModelWeights};
+    use crate::model::qwen35::{
+        AttentionWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
+        ModelWeights, prepare_generation,
+    };
     use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob};
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
@@ -1894,11 +1897,6 @@ mod inner {
         /// otherwise); read via `path_proof_snapshot` and zeroed via
         /// `reset_path_proof_counters`.
         pub(crate) path_proof: PathProofCounters,
-    }
-
-    enum GenerateAdmission {
-        Zero(GenerateOutput),
-        Ready(Vec<u32>),
     }
 
     // ---------------------------------------------------------------------------
@@ -3954,9 +3952,9 @@ mod inner {
                 ));
             }
 
-            match self.preflight_generate(prompt, tokenizer, gen_cfg)? {
-                GenerateAdmission::Zero(output) => return Ok(output),
-                GenerateAdmission::Ready(_) => {}
+            match self.prepare_direct_generation(prompt, tokenizer, gen_cfg)? {
+                GenerationPreparation::Complete(output) => return Ok(output),
+                GenerationPreparation::Ready(_) => {}
             }
 
             // Unload any previously loaded adapter so the slot is free.
@@ -8178,38 +8176,20 @@ mod inner {
             }
         }
 
-        fn preflight_generate(
+        fn prepare_direct_generation(
             &self,
             prompt: &str,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
-        ) -> Result<GenerateAdmission, crate::error::InferenceError> {
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids = input.input_ids[..input.real_length].to_vec();
-            let prompt_len = prompt_ids.len();
-
-            crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
-            if gen_cfg.max_new_tokens == 0 {
-                return Ok(GenerateAdmission::Zero(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: false,
-                    stop_reason: Some(StopReason::Length),
-                    token_logprobs: vec![],
-                }));
-            }
-            crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
-            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-            crate::model::qwen35::check_context_budget(
-                prompt_len,
-                gen_cfg.reasoning_budget,
-                gen_cfg.max_new_tokens,
+        ) -> Result<GenerationPreparation, crate::error::InferenceError> {
+            prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
                 self.max_context(),
-            )?;
-
-            Ok(GenerateAdmission::Ready(prompt_ids))
+                GenerationEntryContract::MetalDirect,
+            )
         }
 
         fn configure_sampling_route(
@@ -8249,32 +8229,18 @@ mod inner {
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
 
-            let prompt_ids = match self.preflight_generate(prompt, tokenizer, gen_cfg)? {
-                GenerateAdmission::Zero(output) => return Ok(output),
-                GenerateAdmission::Ready(prompt_ids) => prompt_ids,
+            let plan = match self.prepare_direct_generation(prompt, tokenizer, gen_cfg)? {
+                GenerationPreparation::Complete(output) => return Ok(output),
+                GenerationPreparation::Ready(plan) => plan,
             };
-            let prompt_len = prompt_ids.len();
+            let GenerationPlan {
+                mut rng_state,
+                prompt_ids,
+                prompt_len,
+                ..
+            } = plan;
 
             let cfg = self.engine.config.clone();
-
-            // Initialize RNG
-            let mut rng_state = match gen_cfg.seed {
-                Some(s) => {
-                    if s == 0 {
-                        1
-                    } else {
-                        s
-                    }
-                }
-                None => {
-                    use std::time::SystemTime;
-                    let t = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x12345678_9abcdef0);
-                    if t == 0 { 1 } else { t }
-                }
-            };
 
             // Reset state for new generation
             self.reset_state();
@@ -9898,64 +9864,25 @@ mod inner {
         {
             use crate::error::InferenceError;
 
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-            let prompt_len = prompt_ids.len();
-
-            // Empty prompt is rejected with a typed Err on every generation
-            // entry point as of #856 (this covers both `generate_streaming`
-            // and `generate_streaming_with_cancel`, since the former is a
-            // thin `should_cancel = || false` wrapper over this function).
-            // This used to return an empty
-            // Ok(GenerateOutput { stopped: false, stop_reason: None, .. }),
-            // diverging from the CPU streaming guard and the `generate()`
-            // guard above, which both reject via this exact same shared
-            // guard. See docs/generation-entrypoint-matrix.md row 2. Runs
-            // before `reset_state()` below, so a rejected request never
-            // mutates session/cache state.
-            crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
-
-            // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
-            // so we never emit a token the caller did not ask for, and on_token is never
-            // invoked. Mirrors the CPU generate_streaming() guard (model::qwen35::generation)
-            // and the generate() guard above.
-            if gen_cfg.max_new_tokens == 0 {
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: false,
-                    stop_reason: Some(StopReason::Length),
-                    token_logprobs: vec![],
-                });
-            }
-
-            crate::model::qwen35::check_context_budget(
-                prompt_len,
-                gen_cfg.reasoning_budget,
-                gen_cfg.max_new_tokens,
+            let plan = match prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
                 self.max_context(),
-            )?;
+                GenerationEntryContract::MetalStreaming,
+            )? {
+                GenerationPreparation::Complete(output) => return Ok(output),
+                GenerationPreparation::Ready(plan) => plan,
+            };
+            let GenerationPlan {
+                mut rng_state,
+                prompt_ids,
+                prompt_len,
+                ..
+            } = plan;
 
             let cfg = self.engine.config.clone();
-            let mut rng_state = match gen_cfg.seed {
-                Some(s) => {
-                    if s == 0 {
-                        1
-                    } else {
-                        s
-                    }
-                }
-                None => {
-                    use std::time::SystemTime;
-                    let t = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x12345678_9abcdef0);
-                    if t == 0 { 1 } else { t }
-                }
-            };
 
             self.reset_state();
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
@@ -15709,21 +15636,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         /// Direct generation's `logprobs: Some(_)` admission is rejected by
-        /// `preflight_generate`'s `check_logprobs_not_set` call, strictly
-        /// before either of the two paths that mutate
+        /// `prepare_direct_generation`'s shared `GenerationEntryContract::MetalDirect`
+        /// capability check, strictly before either of the two paths that mutate
         /// `InferenceSession::compact_route` / `compact_topk` /
         /// `compact_result` can run: `reset_state()` and
         /// `configure_sampling_route`. `generate()` propagates that `Err` via
-        /// `?` immediately after the `preflight_generate` call, so a rejected
+        /// `?` immediately after the `prepare_direct_generation` call, so a rejected
         /// request must leave route state untouched.
         ///
         /// This replaces a prior test that only proved the ordering held in
-        /// the *source text* (`preflight_generate` found lexically before
+        /// the *source text* (`prepare_direct_generation` found lexically before
         /// `configure_sampling_route`, with an unbounded "rest of the file"
         /// slice as the search space). A source-text match cannot tell
         /// whether the matched `configure_sampling_route` call even belongs
         /// to `generate()`, and it cannot catch a caller that stores
-        /// `preflight_generate`'s `Result` in a local, calls
+        /// `prepare_direct_generation`'s `Result` in a local, calls
         /// `configure_sampling_route` unconditionally, and only applies `?`
         /// afterward: textual order is preserved, the guard's `Err` is still
         /// returned, yet route state has already been mutated. This test
@@ -15733,16 +15660,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// seeded state survives untouched.
         ///
         /// Note the boundary this test does *not* cover: a `max_new_tokens:
-        /// 0` request short-circuits to `GenerateAdmission::Zero` inside
-        /// `preflight_generate` *before* `check_logprobs_not_set` ever runs,
-        /// so a zero-budget request with `logprobs: Some(_)` is never
+        /// 0` request short-circuits to `GenerationPreparation::Complete` inside
+        /// `prepare_direct_generation` *before* the logprobs capability check ever
+        /// runs, so a zero-budget request with `logprobs: Some(_)` is never
         /// rejected at all -- it returns `Ok` and never touches sampling
         /// routing either way. That path is untested here and must not be
         /// read as if this test covered it.
         ///
         /// Mutation sensitivity: reordering `generate()` to call
-        /// `configure_sampling_route` before applying `preflight_generate`'s
-        /// `?` -- even while keeping the *textual* preflight-before-configure
+        /// `configure_sampling_route` before applying `prepare_direct_generation`'s
+        /// `?` -- even while keeping the *textual* prepare-before-configure
         /// ordering -- lets this rejected request mutate `compact_route` /
         /// `compact_topk` / `compact_result` before the error is returned, so
         /// the "state unchanged" assertions below fail.
@@ -25795,12 +25722,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// token is ever pushed into the output, matching the CPU `generate()`
         /// contract (model::qwen35::generation): zero tokens, `StopReason::Length`.
         ///
-        /// Mutation sensitivity: without the guard, `generate` samples the prefill
-        /// token from `prefill_logits` and pushes it into `generated_ids` before the
-        /// (empty, since `1..0` has no elements) decode loop runs, so
-        /// `generated_tokens` would be 1 instead of 0. `eos_token_id` is pushed out
-        /// of the reachable vocab range so this holds regardless of which token
-        /// greedy sampling picks at prefill.
+        /// Mutation sensitivity: treating the shared preparation's
+        /// `GenerationPreparation::Complete` as ready would let `generate` sample
+        /// the prefill token and push it into `generated_ids` before the empty
+        /// decode loop runs, so `generated_tokens` would be 1 instead of 0.
+        /// `eos_token_id` is pushed out of the reachable vocab range so this holds
+        /// regardless of which token greedy sampling picks at prefill.
         #[test]
         fn metal_generate_zero_budget_reports_length() {
             let _gpu_guard = gpu_test_lock();
@@ -25855,16 +25782,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// stop_reason: None, .. })` it used to return. See
         /// docs/generation-entrypoint-matrix.md row 2.
         ///
-        /// This is the production-seam test for the guard added to `generate`
-        /// itself; `check_prompt_not_empty_rejects_zero` /
-        /// `_allows_nonzero` (model::qwen35::generation) already cover the
-        /// pure guard logic without a GPU device.
+        /// This is the production-seam test for `generate`'s shared preparation
+        /// call; the generation-setup tests cover the pure contract without a GPU.
         ///
-        /// Mutation sensitivity: reverting the `check_prompt_not_empty` call
-        /// in `generate` lets this request proceed through prefill and
-        /// sampling instead of erroring, so `result.is_err()` fails (and the
-        /// old `Ok` shape would additionally have `stop_reason: None`, the
-        /// invariant-violating result #856 fixes).
+        /// Mutation sensitivity: bypassing `prepare_direct_generation` in
+        /// `generate` lets this request proceed through prefill and sampling
+        /// instead of erroring, so `result.is_err()` fails.
         ///
         /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
@@ -25915,14 +25838,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `InvalidInput` error, rather than silently ignoring the budget and
         /// generating unbudgeted output (ADR-080 C3, #783).
         ///
-        /// This is the production-seam test for the guard added to `generate`
-        /// itself, proving the call site is real — `route_predicate_tests`
-        /// and `multimodal_preflight_tests` already cover the pure guard
-        /// logic without a GPU device.
+        /// This is the production-seam test for `generate`'s
+        /// `GenerationEntryContract::MetalDirect`, proving the caller selects
+        /// the fail-closed contract.
         ///
-        /// Mutation sensitivity: removing the `check_reasoning_budget_not_set`
-        /// call from `generate` lets this request proceed through prefill and
-        /// sampling instead of erroring, so `result.is_err()` fails.
+        /// Mutation sensitivity: selecting `MetalStreaming` instead lets this
+        /// request proceed through prefill and sampling instead of erroring, so
+        /// `result.is_err()` fails.
         #[test]
         fn metal_generate_plain_rejects_reasoning_budget_config() {
             let Some(_) = metal::Device::system_default() else {
@@ -25967,9 +25889,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// request around the MTP/self-spec predicates alone would not have
         /// closed this, since the plain fallback path is exactly as silent.
         ///
-        /// Mutation sensitivity: removing the `check_logprobs_not_set` call
-        /// from `generate` lets this request proceed through prefill and
-        /// sampling instead of erroring, so `result.is_err()` fails.
+        /// Mutation sensitivity: selecting `MetalStreaming` instead lets this
+        /// request proceed through prefill and sampling instead of erroring, so
+        /// `result.is_err()` fails.
         #[test]
         fn metal_generate_plain_rejects_logprobs_config() {
             let Some(_) = metal::Device::system_default() else {
@@ -26014,10 +25936,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// call site fixed by #856), so this one test covers both. See
         /// docs/generation-entrypoint-matrix.md row 2.
         ///
-        /// Mutation sensitivity: reverting the `check_prompt_not_empty` call
-        /// in `generate_streaming_with_cancel` lets this request proceed
-        /// through prefill and sampling instead of erroring, so
-        /// `result.is_err()` fails.
+        /// Mutation sensitivity: bypassing the shared `prepare_generation`
+        /// call in `generate_streaming_with_cancel` lets this request proceed
+        /// through prefill and sampling instead of erroring.
         ///
         /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
@@ -26079,11 +26000,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `generate_streaming()` contract (model::qwen35::generation): zero tokens,
         /// `StopReason::Length`, and `on_token` never invoked.
         ///
-        /// Mutation sensitivity: without the guard, `generate_streaming` samples the
-        /// prefill token, pushes it into `generated_ids`, and feeds its delta to
-        /// `on_token` before the (empty, since `decode_cap(None, 0) == 0` makes
-        /// `1..0` have no elements) decode loop runs, so `generated_tokens` would be
-        /// 1 and the callback would fire at least once instead of staying silent.
+        /// Mutation sensitivity: treating the shared preparation's
+        /// `GenerationPreparation::Complete` as ready would make streaming sample
+        /// and emit the prefill token before the empty decode loop runs, so
+        /// `generated_tokens` would be 1 and the callback would fire.
         #[test]
         fn metal_generate_streaming_zero_budget_reports_length() {
             let _gpu_guard = gpu_test_lock();
