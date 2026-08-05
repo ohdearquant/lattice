@@ -331,17 +331,24 @@ jobs:
       - name: inference — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
-      # The worker module is macOS/metal-gpu-gated, but this lifecycle test
-      # uses only a blocking thread-local destructor and never acquires a
-      # Metal device. Run it explicitly so compiling the test is not mistaken
-      # for exercising the deadline, and fail if the exact selector goes stale.
-      - name: inference — Metal worker shutdown deadline (macOS only)
+      # The worker module is macOS/metal-gpu-gated, but no test in it ever
+      # constructs a MetalQwen35State: the loaders under test either return
+      # Err or panic!() if invoked, so the type appears only in closure
+      # signatures. The whole module is therefore GPU-free and safe to run
+      # on a CI runner, so run it in full instead of a single named
+      # selector. A filter matching nothing still exits 0, so assert the
+      # passed count is nonzero in the same invocation rather than trusting
+      # a green exit status alone. The count assertion alone would not
+      # notice a rename silently dropping a specific guard, so also assert
+      # by name on the two bounded-shutdown tests this module exists to
+      # cover: the owner-side deadline and the client-drop-timeout guard.
+      - name: inference — Metal worker module (macOS only)
         if: runner.os == 'macOS'
         run: |
-          log="${RUNNER_TEMP:-/tmp}/metal-worker-shutdown-deadline-test.log"
+          log="${RUNNER_TEMP:-/tmp}/metal-worker-tests.log"
           if cargo test -p lattice-inference --features f16,metal-gpu \
-            --lib serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor \
-            -- --exact >"$log" 2>&1
+            --lib serve::metal_worker::tests:: \
+            >"$log" 2>&1
           then
             cat "$log"
           else
@@ -350,7 +357,12 @@ jobs:
             exit "$status"
           fi
           grep -q 'test serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor ... ok' "$log"
-          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -q 'test serve::metal_worker::tests::final_client_drop_timeout_detaches_instead_of_blocking ... ok' "$log"
+          passed="$(grep -Eo '^test result: ok\. [0-9]+ passed' "$log" | grep -Eo '[0-9]+')"
+          if [ -z "$passed" ] || [ "$passed" -eq 0 ]; then
+            echo "::error::expected at least one passed test in serve::metal_worker::tests, got '${passed:-<none>}'"
+            exit 1
+          fi
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings
