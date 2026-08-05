@@ -36,6 +36,23 @@ inputs:
 runs:
   using: 'composite'
   steps:
+    # #1275: ARM Linux (and macOS ARM) rustup component installs intermittently
+    # fail with a `bin/cargo-clippy` conflict when a preinstalled or partially
+    # installed toolchain already occupies a component path on the runner
+    # image. dtolnay/rust-toolchain has no --force/retry for this, and
+    # retrying the same install against the same dirty state just repeats the
+    # failure. Point RUSTUP_HOME at a fresh, job-scoped directory before
+    # installing so every run starts from a clean Rustup state instead of
+    # whatever the runner image happened to preinstall. CARGO_HOME is left
+    # untouched so Swatinem/rust-cache's existing cache behavior is unaffected.
+    - name: Isolate Rustup state
+      shell: bash
+      run: |
+        rustup_home="${RUNNER_TEMP}/lattice-rustup"
+        rm -rf -- "$rustup_home"
+        mkdir -p "$rustup_home"
+        printf 'RUSTUP_HOME=%s\n' "$rustup_home" >> "$GITHUB_ENV"
+
     - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
       with:
         components: ${{ inputs.components }}
@@ -45,6 +62,12 @@ runs:
       if: inputs.pin-cargo-path == 'true'
       shell: bash
       run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+    - name: Verify Rust setup
+      shell: bash
+      run: |
+        rustc --version | grep -F '1.94.1'
+        echo 'LATTICE_RUST_SETUP_OK rustc 1.94.1'
 
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       with:
