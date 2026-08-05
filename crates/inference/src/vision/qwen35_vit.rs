@@ -42,6 +42,20 @@ const QWEN35_IMAGE_STD: f32 = 0.5;
 const MAX_IMAGE_DIMENSION_PIXELS: u32 = 2048;
 const MAX_SERVE_VISION_PATCHES: usize = 256;
 const MAX_SERVE_PREPROCESSED_BYTES: usize = 16 * 1024 * 1024;
+const SERVE_VISION_MAX_PATCHES_ENV: &str = "LATTICE_VISION_MAX_PATCHES";
+
+/// Resolve the serving pre-merge patch budget from an optional raw override
+/// string (the `LATTICE_VISION_MAX_PATCHES` environment value), falling back
+/// to the compiled [`MAX_SERVE_VISION_PATCHES`] default for anything that
+/// isn't a positive integer — unset, empty, malformed, zero, or negative.
+/// Takes the raw value rather than reading the environment itself so tests
+/// can exercise every fallback case without mutating real process state.
+fn resolve_serve_max_patches(raw_override: Option<&str>) -> usize {
+    raw_override
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_SERVE_VISION_PATCHES)
+}
 
 /// The temporal/height/width patch-grid shape for one image (`grid_thw` in
 /// the HF reference). `t` is always 1 for a still image (video is out of
@@ -95,7 +109,9 @@ pub fn preprocess_qwen35_image_for_serve(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
 ) -> Result<(Vec<f32>, GridThw), VisionError> {
-    preprocess_qwen35_image_inner(image_bytes, cfg, Some(MAX_SERVE_VISION_PATCHES))
+    let max_patches =
+        resolve_serve_max_patches(std::env::var(SERVE_VISION_MAX_PATCHES_ENV).ok().as_deref());
+    preprocess_qwen35_image_inner(image_bytes, cfg, Some(max_patches))
 }
 
 fn preprocess_qwen35_image_inner(
@@ -654,6 +670,44 @@ mod tests {
         assert!(
             preprocess_qwen35_image(&over, &cfg).is_ok(),
             "the serving-only latency budget must not narrow the embedding API"
+        );
+    }
+
+    #[test]
+    fn resolve_serve_max_patches_falls_back_to_default_for_every_invalid_shape() {
+        assert_eq!(resolve_serve_max_patches(None), MAX_SERVE_VISION_PATCHES);
+        assert_eq!(
+            resolve_serve_max_patches(Some("")),
+            MAX_SERVE_VISION_PATCHES
+        );
+        assert_eq!(
+            resolve_serve_max_patches(Some("not-a-number")),
+            MAX_SERVE_VISION_PATCHES
+        );
+        assert_eq!(
+            resolve_serve_max_patches(Some("0")),
+            MAX_SERVE_VISION_PATCHES
+        );
+        assert_eq!(
+            resolve_serve_max_patches(Some("-4")),
+            MAX_SERVE_VISION_PATCHES
+        );
+    }
+
+    #[test]
+    fn resolve_serve_max_patches_honors_a_positive_override() {
+        assert_eq!(resolve_serve_max_patches(Some("64")), 64);
+        assert_eq!(resolve_serve_max_patches(Some(" 64 ")), 64);
+    }
+
+    #[test]
+    fn serving_preprocess_inner_honors_a_lower_override_below_the_default_boundary() {
+        let cfg = tiny_cfg();
+        let boundary = make_test_png(32, 32); // 16 * 16 = 256 patches, accepted at the default
+        assert!(preprocess_qwen35_image_inner(&boundary, &cfg, Some(256)).is_ok());
+        let err = preprocess_qwen35_image_inner(&boundary, &cfg, Some(200)).unwrap_err();
+        assert!(
+            matches!(err, VisionError::InvalidConfig(message) if message.contains("serving maximum is 200"))
         );
     }
 

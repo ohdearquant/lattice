@@ -203,7 +203,9 @@ use `{"type": "text", "text": "..."}`. A vision-capable Metal checkpoint also ac
 `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` part on a user
 message; JPEG uses `data:image/jpeg;base64,...`. The image may appear between text parts and keeps
 that position in the rendered multimodal prompt. The decoded payload is capped at 48,000 bytes,
-and each serving image is capped at 256 pre-merge patches and 16 MiB of preprocessed patch data.
+and each serving image is capped at 256 pre-merge patches (overridable via the
+`LATTICE_VISION_MAX_PATCHES` environment variable, which falls back to 256 for any unset, empty,
+malformed, zero, or negative value) and 16 MiB of preprocessed patch data.
 Image requests must use `stream: false` (or omit `stream`) until the multimodal decoder supports
 incremental deltas. Remote URLs are never fetched, multi-image requests are rejected, and a
 text-only/CPU model returns 400 `vision_unsupported`. Audio/file parts remain unsupported rather
