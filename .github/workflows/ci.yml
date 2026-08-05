@@ -193,23 +193,14 @@ jobs:
         os: ${{ fromJSON(needs.changes.outputs.oslist) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: ./.github/actions/rust-setup
         with:
           components: rustfmt, clippy
+          pin-cargo-path: true
+          cache-on-failure: true
       - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.x
-      - name: Pin the real toolchain bin on PATH
-        # Some macos-latest runner images ship ~/.cargo/bin/cargo as a copy of
-        # rustup-init rather than the rustup proxy, so `cargo fmt` fails with
-        # "error: unexpected argument 'fmt'". rustup itself is unaffected — resolve
-        # the real toolchain bin dir through it and put it first on PATH so every
-        # later step (cache, clean, ci.sh) gets a working cargo. No-op on healthy
-        # images and on Linux.
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-on-failure: true
       - name: Clean lattice crates (force rebuild, keep dep cache)
         run: |
           cargo clean -p lattice-inference 2>/dev/null || true
@@ -249,13 +240,10 @@ jobs:
         os: ${{ fromJSON(needs.changes.outputs.featureoslist) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: ./.github/actions/rust-setup
         with:
           components: clippy
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
+          pin-cargo-path: true
           shared-key: feature-matrix
           cache-on-failure: true
       - name: tune — safetensors + inference-hook + serde (compile tests)
@@ -635,11 +623,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
+          pin-cargo-path: true
           shared-key: rustdoc-lint
           cache-on-failure: true
       - name: cargo doc — broken-intra-doc-links and doc warnings (informational)
@@ -663,13 +649,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: ./.github/actions/rust-setup
         with:
           components: clippy
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
+          pin-cargo-path: true
           shared-key: unwrap-in-lib-lint
           cache-on-failure: true
       - name: clippy — unwrap/expect in library targets (informational)
