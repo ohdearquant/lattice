@@ -301,6 +301,17 @@ jobs:
       # which is why the guard runs on the isolated resolve instead. See #1095.
       - name: embed — f16 native dependency load guard (standalone, no workspace unification)
         run: cargo test -p lattice-embed --test f16_feature_load_guard
+      # `-p lattice-inference` in isolation, default features only, no `--features`
+      # flag. Neither the pre-commit hook's `--workspace --all-targets` nor this
+      # job's own `f16,metal-gpu` clippy step below can see what this catches:
+      # `--workspace` lets another member's feature unification pull `f16` into
+      # lattice-inference for free, and the metal-gpu step enables it explicitly.
+      # Both masked four real dead-code items (two unused test imports, an unused
+      # test helper, an unused test-only method) that only this isolated,
+      # default-feature, per-crate scope reports (#1276). Run it so that scope
+      # divergence — locally-green, CI-green, and still rotting — cannot recur.
+      - name: inference — default-feature clippy, isolated (no workspace unification)
+        run: cargo clippy -p lattice-inference --all-targets -- -D warnings
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'
