@@ -4667,17 +4667,77 @@ mod imp {
             );
         }
 
+        // #831: `lattice_serve` now accepts and applies `stop`, aligned with
+        // `lattice serve` (was previously rejected outright with "stop is
+        // not supported by this server"). This drives the real worker
+        // thread (`spawn_fake`, issue #832's cross-binary test seam) end to
+        // end through `router()`, so the generate closure captures the
+        // `stop_strings` this binary's real `build_cfg` actually produced --
+        // not a value reconstructed independently in the test. Replaces the
+        // old `chat_completions_stop_400` (`test_app_state()`'s dropped-
+        // receiver job queue can't reach this far, since the request no
+        // longer short-circuits with a 400 before submission).
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
-        async fn chat_completions_stop_400() {
+        async fn chat_completions_stop_is_accepted_and_reaches_generate_config() {
+            use tower::ServiceExt as _;
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            let observed_stop: Arc<std::sync::Mutex<Option<Vec<String>>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let observed_for_closure = Arc::clone(&observed_stop);
+            let jobs = spawn_fake(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                4096,
+                tokenizer,
+                move |_messages, cfg, prompt_tokens, _on_token, _should_cancel| {
+                    *observed_for_closure
+                        .lock()
+                        .expect("observation mutex poisoned") = Some(cfg.stop_strings.clone());
+                    Ok(GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens,
+                        generated_tokens: 0,
+                        stopped: true,
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    })
+                },
+            );
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: GenerationDefaults::standard(100),
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: Arc::new(vec![]),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stop":"\n"}"#.to_string(),
             );
-            let response =
-                chat_completions(State(test_app_state()), test_json_headers(), body).await;
-            let (status, message) = error_message_of(response).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(message, "stop is not supported by this server");
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(body)
+                .expect("fixture request must build");
+            let response = router(state)
+                .oneshot(request)
+                .await
+                .expect("router must produce a response, not a transport error");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                observed_stop
+                    .lock()
+                    .expect("observation mutex poisoned")
+                    .clone(),
+                Some(vec!["\n".to_string()]),
+                "stop must reach the real GenerateConfig the worker's generate closure receives"
+            );
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

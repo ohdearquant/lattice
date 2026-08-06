@@ -2544,8 +2544,8 @@ mod serve {
     use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
-        ValidatedChatRequest as ContractValidatedChatRequest, normalize_request_with_context,
-        validate_context_window,
+        ValidatedChatRequest as ContractValidatedChatRequest,
+        normalize_request_with_context_and_budget, validate_context_window_with_budget,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
@@ -3436,6 +3436,7 @@ mod serve {
         logprobs: Option<usize>,
         prompt: String,
         stop_strings: Vec<String>,
+        reasoning_budget: Option<usize>,
         seed: Option<u64>,
         stream: bool,
     }
@@ -3443,7 +3444,7 @@ mod serve {
     /// Production entry point for the shared context-aware normalization
     /// cascade: supplies the prompt-aware context-window check (rendering the
     /// chat template, tokenizing it, then calling the shared
-    /// `validate_context_window`) as the context check, in the
+    /// `validate_context_window_with_budget`) as the context check, in the
     /// exact order the original inline `chat_completions` cascade used:
     /// `stop` is validated *last*, after both the served-model hard
     /// requirements and the context-window check that guards against a
@@ -3468,14 +3469,19 @@ mod serve {
         tokenize_len: impl FnOnce(&str) -> usize,
         max_context: impl FnOnce() -> usize,
     ) -> Result<PreparedChatRequest, ApiError> {
-        let (validated, prompt) = normalize_request_with_context(
+        let (validated, prompt) = normalize_request_with_context_and_budget(
             req,
             GenerationDefaults::standard(default_max_tokens),
             ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),
-            |messages, max_tokens| {
+            |messages, max_tokens, reasoning_budget| {
                 let prompt = format_normalized_chat_template(messages);
                 let prompt_token_count = tokenize_len(&prompt);
-                validate_context_window(prompt_token_count, max_tokens, max_context())?;
+                validate_context_window_with_budget(
+                    prompt_token_count,
+                    max_tokens,
+                    reasoning_budget,
+                    max_context(),
+                )?;
                 Ok(prompt)
             },
         )?;
@@ -3486,6 +3492,7 @@ mod serve {
             top_p,
             logprobs,
             stop_strings,
+            reasoning_budget,
             seed,
             stream,
             ..
@@ -3500,6 +3507,7 @@ mod serve {
             logprobs,
             prompt,
             stop_strings,
+            reasoning_budget,
             seed,
             stream,
         })
@@ -3646,6 +3654,7 @@ mod serve {
             logprobs,
             prompt,
             stop_strings,
+            reasoning_budget,
             seed,
             stream,
         } = prepare_chat_request(
@@ -3664,6 +3673,7 @@ mod serve {
             top_p,
             seed,
             stop_strings,
+            reasoning_budget,
             logprobs,
             ..Default::default()
         };
@@ -6695,7 +6705,9 @@ mod serve {
             /// `GenerateOutput`, so a caller of this helper can vary it and prove
             /// the observation genuinely mirrors what the seam returned rather
             /// than an independent hardcoded literal.
-            async fn run_observed(stopped: bool) -> ProductionAdapterObservation {
+            const OBSERVATION_GOLDEN_REQUEST_BODY: &str = r#"{"model":"test-model","messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#;
+
+            async fn run_observed(stopped: bool, body: &str) -> ProductionAdapterObservation {
                 let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
                 let tokenizer = model.tokenizer().clone();
                 let observed: Arc<Mutex<Option<ProductionAdapterObservation>>> =
@@ -6748,7 +6760,6 @@ mod serve {
                     model_id: "test-model".to_string(),
                     request_counter: Arc::new(AtomicU64::new(0)),
                 };
-                let body = r#"{"model":"test-model","messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#;
                 let request = axum::http::Request::builder()
                     .method("POST")
                     .uri("/v1/chat/completions")
@@ -6791,7 +6802,7 @@ mod serve {
 
             #[tokio::test]
             async fn chat_completions_non_streaming_observation_captures_real_config_and_prompt() {
-                let obs = run_observed(true).await;
+                let obs = run_observed(true, OBSERVATION_GOLDEN_REQUEST_BODY).await;
                 let expected_prompt_tokens = {
                     let tokenizer =
                         lattice_inference::model::qwen35::test_support::tiny_zero_model()
@@ -6821,10 +6832,29 @@ mod serve {
             /// `run_observed(false)` must observe `stopped == false`.
             #[tokio::test]
             async fn chat_completions_non_streaming_observation_captures_real_stopped_false() {
-                let obs = run_observed(false).await;
+                let obs = run_observed(false, OBSERVATION_GOLDEN_REQUEST_BODY).await;
                 assert!(
                     !obs.stopped,
                     "observation must report the seam's actual stopped=false, not a hardcoded true"
+                );
+            }
+
+            /// #831 config-capture regression guard: a request that sets
+            /// `reasoning_budget` must reach the real `GenerateConfig` this
+            /// binary hands its generation adapter, not get silently dropped
+            /// between `prepare_chat_request` and `gen_cfg` construction.
+            /// Mutation-sensitive: dropping the `reasoning_budget` field
+            /// assignment in `chat_completions_with_request`'s `gen_cfg`
+            /// literal, or zeroing the parsed value, turns this `Some(5)`
+            /// into `None`.
+            #[tokio::test]
+            async fn chat_completions_non_streaming_observation_captures_real_reasoning_budget() {
+                let body = r#"{"model":"test-model","messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9,"reasoning_budget":5}"#;
+                let obs = run_observed(true, body).await;
+                assert_eq!(
+                    obs.gen_cfg.reasoning_budget,
+                    Some(5),
+                    "reasoning_budget from the request must reach the real GenerateConfig"
                 );
             }
         }

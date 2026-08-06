@@ -367,7 +367,7 @@ impl<'a> ServeProfile<'a> {
             require_last_user: true,
             stop_supported: true,
             sampling_extensions_supported: false,
-            reasoning_budget_supported: false,
+            reasoning_budget_supported: true,
             structured_output_supported: false,
             logprobs_supported: true,
             vision_supported: false,
@@ -383,7 +383,7 @@ impl<'a> ServeProfile<'a> {
                 context: model_max_context,
             },
             require_last_user: false,
-            stop_supported: false,
+            stop_supported: true,
             sampling_extensions_supported: true,
             reasoning_budget_supported: true,
             structured_output_supported: true,
@@ -436,30 +436,56 @@ pub fn normalize_request(
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
 ) -> Result<ValidatedChatRequest, ApiError> {
-    normalize_request_inner(req, defaults, profile, |_, _| Ok(())).map(|(validated, ())| validated)
+    normalize_request_inner(req, defaults, profile, |_, _, _| Ok(()))
+        .map(|(validated, ())| validated)
 }
 
 /// Normalize a request while preserving the unified server's context-check precedence.
 ///
-/// `check_context` runs after message and sampling validation but before stop
-/// parsing. Its returned prompt is paired with the normalized request so the
-/// unified server renders and tokenizes exactly once. The standalone daemon
-/// uses [`normalize_request`] because its worker performs the prompt-aware
+/// `check_context` runs after message and sampling validation (including the
+/// resolved `reasoning_budget`, #831) but before stop parsing. It receives
+/// the effective `reasoning_budget` so it can apply the shared full-window
+/// formula (see [`validate_context_window_with_budget`]). Its returned
+/// prompt is paired with the normalized request so the unified server
+/// renders and tokenizes exactly once. The standalone daemon uses
+/// [`normalize_request`] because its worker performs the prompt-aware
 /// context check after tokenization.
+pub fn normalize_request_with_context_and_budget(
+    req: &ChatRequest,
+    defaults: GenerationDefaults,
+    profile: ServeProfile<'_>,
+    check_context: impl FnOnce(
+        &[NormalizedChatMessage],
+        usize,
+        Option<usize>,
+    ) -> Result<String, ApiError>,
+) -> Result<(ValidatedChatRequest, String), ApiError> {
+    normalize_request_inner(req, defaults, profile, check_context)
+}
+
+/// No-reasoning-budget form of [`normalize_request_with_context_and_budget`].
+///
+/// Delegates with the reasoning-budget argument dropped from the callback,
+/// preserving the published 2-arg-callback signature.
 pub fn normalize_request_with_context(
     req: &ChatRequest,
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
     check_context: impl FnOnce(&[NormalizedChatMessage], usize) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String), ApiError> {
-    normalize_request_inner(req, defaults, profile, check_context)
+    normalize_request_with_context_and_budget(
+        req,
+        defaults,
+        profile,
+        |messages, max_tokens, _reasoning_budget| check_context(messages, max_tokens),
+    )
 }
 
 fn normalize_request_inner<C>(
     req: &ChatRequest,
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
-    check_context: impl FnOnce(&[NormalizedChatMessage], usize) -> Result<C, ApiError>,
+    check_context: impl FnOnce(&[NormalizedChatMessage], usize, Option<usize>) -> Result<C, ApiError>,
 ) -> Result<(ValidatedChatRequest, C), ApiError> {
     reject_unsupported(req, profile)?;
     validate_model_name(req.model.as_deref(), profile.model_name)?;
@@ -505,7 +531,29 @@ fn normalize_request_inner<C>(
     {
         unsupported("json_schema response format is not supported for image requests")?;
     }
-    let context = check_context(&messages, max_tokens)?;
+    // Resolved ahead of `check_context` (rather than in its pre-refactor spot
+    // after `check_context`/`stop`) so the shared full-window formula
+    // (`prompt + max_new_tokens + reasoning_budget + 1 <= max_context`, #831)
+    // has the effective reasoning budget in hand when it runs -- the window
+    // cannot be validated against a value that has not been parsed yet.
+    let mut reasoning_budget = if profile.reasoning_budget_supported {
+        parse_ignorable_field::<usize>(&req.reasoning_budget, "reasoning_budget")?
+            .filter(|&value| value > 0)
+            .or(defaults.reasoning_budget)
+    } else {
+        None
+    };
+    if let MaxTokensPolicy::ClampToContext { context } = profile.max_tokens {
+        let reasoning_room = context.saturating_sub(max_tokens).saturating_sub(1);
+        reasoning_budget = reasoning_budget
+            .map(|value| value.min(reasoning_room))
+            .filter(|&value| value > 0);
+    }
+    if has_image && reasoning_budget.is_some() {
+        unsupported("reasoning_budget is not supported for image requests")?;
+    }
+
+    let context = check_context(&messages, max_tokens, reasoning_budget)?;
     let stop_strings = if profile.stop_supported {
         parse_stop_strings(&req.stop)?
     } else {
@@ -523,22 +571,6 @@ fn normalize_request_inner<C>(
     } else {
         defaults.repetition_penalty
     };
-    let mut reasoning_budget = if profile.reasoning_budget_supported {
-        parse_ignorable_field::<usize>(&req.reasoning_budget, "reasoning_budget")?
-            .filter(|&value| value > 0)
-            .or(defaults.reasoning_budget)
-    } else {
-        None
-    };
-    if let MaxTokensPolicy::ClampToContext { context } = profile.max_tokens {
-        let reasoning_room = context.saturating_sub(max_tokens).saturating_sub(1);
-        reasoning_budget = reasoning_budget
-            .map(|value| value.min(reasoning_room))
-            .filter(|&value| value > 0);
-    }
-    if has_image && reasoning_budget.is_some() {
-        unsupported("reasoning_budget is not supported for image requests")?;
-    }
 
     Ok((
         ValidatedChatRequest {
@@ -597,9 +629,11 @@ fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<()
     if profile.max_tokens_conflict_checked_early {
         reject_conflicting_max_tokens(req)?;
     }
-    // top_k, repetition_penalty, and reasoning_budget are accepted-and-ignored
-    // (not rejected) on profiles that don't support them, matching each
-    // server's pre-shared-contract tolerance for these fields.
+    // top_k and repetition_penalty are accepted-and-ignored (not rejected) on
+    // profiles that don't support them, matching each server's
+    // pre-shared-contract tolerance for these fields. reasoning_budget is
+    // supported (applied, and strictly validated) on both profiles as of
+    // #831 -- it no longer belongs in this ignore list.
     if let Some(format) = &req.response_format
         && format.r#type != "text"
         && !(profile.structured_output_supported && format.r#type == "json_schema")
@@ -1132,20 +1166,46 @@ pub fn parse_stop_strings(stop: &Option<Value>) -> Result<Vec<String>, ApiError>
 }
 
 /// Reject prompt plus decode budgets that exceed a model context window.
-pub fn validate_context_window(
+///
+/// Shared saturating full-window formula (#831):
+/// `prompt + max_new_tokens + reasoning_budget + 1 <= max_context`. The `+1`
+/// reserves the generation-turn delimiter token, matching
+/// `check_prompt_fits_window`'s `PromptAndDecodeWithDelimiter` policy in
+/// `crates/inference/src/serve/metal_worker.rs` -- this is the one shared
+/// formula both `lattice serve`'s HTTP preflight (below) and that worker-side
+/// invariant compute, so neither binary can drift back to its own
+/// pre-#831 accounting independently.
+pub fn validate_context_window_with_budget(
     prompt_tokens: usize,
     max_tokens: usize,
+    reasoning_budget: Option<usize>,
     max_context: usize,
 ) -> Result<(), ApiError> {
-    if prompt_tokens == 0 || prompt_tokens.saturating_add(max_tokens) > max_context {
+    let reasoning_budget = reasoning_budget.unwrap_or(0);
+    let decode_budget = max_tokens.saturating_add(reasoning_budget);
+    let required = prompt_tokens
+        .saturating_add(decode_budget)
+        .saturating_add(1);
+    if prompt_tokens == 0 || required > max_context {
         return Err(ApiError::BadRequest {
             message: format!(
-                "prompt ({prompt_tokens} tokens) plus max_tokens ({max_tokens}) exceeds model context window ({max_context})"
+                "prompt ({prompt_tokens} tokens) plus max_tokens ({max_tokens}) plus reasoning_budget ({reasoning_budget}) exceeds model context window ({max_context}): {required} tokens required"
             ),
             code: "context_length_exceeded",
         });
     }
     Ok(())
+}
+
+/// No-reasoning-budget form of [`validate_context_window_with_budget`].
+///
+/// Delegates with `reasoning_budget = None`.
+pub fn validate_context_window(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    max_context: usize,
+) -> Result<(), ApiError> {
+    validate_context_window_with_budget(prompt_tokens, max_tokens, None, max_context)
 }
 
 #[cfg(test)]
@@ -1413,12 +1473,13 @@ mod tests {
             normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
         assert_eq!(lattice.max_tokens, 31);
         assert_eq!(lattice.stop_strings, ["done"]);
-        assert_eq!(
-            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 16),)
-                .unwrap_err()
-                .code(),
-            "unsupported_feature"
-        );
+
+        // #831: lattice_serve now also accepts and propagates `stop`,
+        // aligned with the `lattice` profile (was previously rejected
+        // outright with unsupported_feature).
+        let daemon_with_stop =
+            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 100)).unwrap();
+        assert_eq!(daemon_with_stop.stop_strings, ["done"]);
 
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_tokens":31}"#,
@@ -1449,20 +1510,23 @@ mod tests {
     }
 
     #[test]
-    fn lattice_profile_accepts_and_ignores_reasoning_budget() {
-        // Mirrors profiles_preserve_sampling_extension_policy for
-        // reasoning_budget: lattice serve must accept the field without a
-        // 400 and must not let it influence the effective budget.
+    fn both_profiles_apply_reasoning_budget() {
+        // #831 (maintainer-binding decision): `lattice serve` must actually
+        // apply `reasoning_budget`, matching `lattice_serve`'s pre-existing
+        // behavior, instead of accepting-and-ignoring it. Mutation-sensitive:
+        // dropping the reasoning_budget field assignment or zeroing it turns
+        // either assertion `None`.
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"reasoning_budget":40}"#,
         );
-        let lattice =
-            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
-        assert_eq!(lattice.reasoning_budget, None);
 
         // Context must leave enough decode room (>= reasoning_budget) so the
         // context-window clamp in normalize_request doesn't also shrink the
         // value under test; that clamp is exercised separately.
+        let lattice =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 100)).unwrap();
+        assert_eq!(lattice.reasoning_budget, Some(40));
+
         let daemon =
             normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 100)).unwrap();
         assert_eq!(daemon.reasoning_budget, Some(40));
@@ -1471,33 +1535,31 @@ mod tests {
     #[test]
     fn lattice_profile_tolerates_malformed_ignored_sampling_fields() {
         // Regression: pre-refactor, lattice serve's DTO didn't model
-        // top_k/repetition_penalty/reasoning_budget at all, so a
-        // type-mismatched value (e.g. a string where a number is expected)
-        // was silently ignored along with everything else serde didn't
-        // recognize. The shared typed DTO must preserve that tolerance
-        // rather than hard-failing the whole request with
-        // invalid_request_body before profile normalization runs.
+        // top_k/repetition_penalty at all, so a type-mismatched value (e.g. a
+        // string where a number is expected) was silently ignored along with
+        // everything else serde didn't recognize. The shared typed DTO must
+        // preserve that tolerance rather than hard-failing the whole request
+        // with invalid_request_body before profile normalization runs.
+        // `reasoning_budget` is excluded here (unlike pre-#831): the lattice
+        // profile now honors it, so a malformed value is strictly rejected —
+        // see `honoring_profile_still_rejects_malformed_sampling_fields`.
         let req = request(
-            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":"ignored","repetition_penalty":"x","reasoning_budget":"y"}"#,
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":"ignored","repetition_penalty":"x"}"#,
         );
         let lattice =
             normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
         assert_eq!(lattice.top_k, defaults().top_k);
         assert_eq!(lattice.repetition_penalty, defaults().repetition_penalty);
-        assert_eq!(lattice.reasoning_budget, None);
     }
 
     #[test]
     fn honoring_profile_still_rejects_malformed_sampling_fields() {
-        // Control: a profile that actually USES top_k /
-        // repetition_penalty / reasoning_budget must keep strict
-        // validation — tolerance is scoped to profiles that ignore the
-        // field, not a blanket type-laxness relaxation.
-        for (field, bad_value) in [
-            ("top_k", r#""ignored""#),
-            ("repetition_penalty", r#""x""#),
-            ("reasoning_budget", r#""y""#),
-        ] {
+        // Control: a profile that actually USES top_k / repetition_penalty
+        // must keep strict validation — tolerance is scoped to profiles that
+        // ignore the field, not a blanket type-laxness relaxation. Neither
+        // profile ignores `reasoning_budget` as of #831, so both reject a
+        // malformed value.
+        for (field, bad_value) in [("top_k", r#""ignored""#), ("repetition_penalty", r#""x""#)] {
             let body = format!(
                 r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"{field}":{bad_value}}}"#
             );
@@ -1508,6 +1570,22 @@ mod tests {
                     .code(),
                 "invalid_request_body",
                 "field {field} should have been rejected on the honoring profile"
+            );
+        }
+
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"reasoning_budget":"y"}"#,
+        );
+        for profile in [
+            ServeProfile::lattice("model", 32),
+            ServeProfile::lattice_serve("model", 32),
+        ] {
+            assert_eq!(
+                normalize_request(&req, defaults(), profile)
+                    .unwrap_err()
+                    .code(),
+                "invalid_request_body",
+                "malformed reasoning_budget should have been rejected on both profiles"
             );
         }
     }
@@ -1784,10 +1862,50 @@ mod tests {
 
     #[test]
     fn context_window_accepts_boundary_and_rejects_overflow() {
-        validate_context_window(8, 8, 16).unwrap();
+        // #831: the shared formula reserves one delimiter slot
+        // (`prompt + max_tokens + reasoning_budget + 1 <= max_context`), so
+        // the exact boundary now needs one fewer prompt/decode token than
+        // `max_context` to leave room for that reserved slot.
+        validate_context_window(7, 8, 16).unwrap();
         assert_eq!(
-            validate_context_window(8, 9, 16).unwrap_err().code(),
+            validate_context_window(8, 8, 16).unwrap_err().code(),
             "context_length_exceeded"
+        );
+    }
+
+    #[test]
+    fn context_window_accounts_for_reasoning_budget() {
+        // Mutation-sensitive: dropping the `+ reasoning_budget` term from
+        // `validate_context_window_with_budget`'s formula would accept this
+        // request (7 + 8 + 1 == 16), rather than rejecting it for the 4
+        // extra reasoning tokens (7 + 8 + 4 + 1 == 20 > 16).
+        validate_context_window_with_budget(7, 8, Some(0), 16).unwrap();
+        assert_eq!(
+            validate_context_window_with_budget(7, 8, Some(4), 16)
+                .unwrap_err()
+                .code(),
+            "context_length_exceeded"
+        );
+        validate_context_window_with_budget(3, 8, Some(4), 16).unwrap();
+    }
+
+    #[test]
+    fn context_window_error_message_names_reasoning_budget_on_reasoning_only_overflow() {
+        // prompt + max_tokens alone fit (3 + 4 + 1 == 8 <= 16), so this
+        // request is only rejected because of the reasoning budget -- the
+        // error text must say so, not just blame prompt/max_tokens (#1324
+        // review finding 4).
+        validate_context_window_with_budget(3, 4, None, 16).unwrap();
+        let err = validate_context_window_with_budget(3, 4, Some(10), 16).unwrap_err();
+        assert_eq!(err.code(), "context_length_exceeded");
+        let message = err.message();
+        assert!(
+            message.contains("reasoning_budget (10)"),
+            "error message must name the reasoning budget: {message}"
+        );
+        assert!(
+            message.contains("18 tokens required"),
+            "error message must name the total required tokens: {message}"
         );
     }
 
