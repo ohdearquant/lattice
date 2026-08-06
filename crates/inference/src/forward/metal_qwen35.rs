@@ -514,7 +514,6 @@ mod inner {
     };
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
-    use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{
         AttentionWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
@@ -524,6 +523,7 @@ mod inner {
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
+    use crate::tokenizer::detokenize::IncrementalDetokenizer;
     use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
     use metal::*;
@@ -9915,7 +9915,7 @@ mod inner {
     }
 
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
-        crate::model::qwen35::detokenize::decode_tokens(tokenizer, ids)
+        crate::tokenizer::detokenize::decode_tokens(tokenizer, ids)
     }
 
     // -----------------------------------------------------------------------
@@ -25737,7 +25737,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `好` (`0xE5 0xA5 0xBD`), exactly as a real byte-level BPE vocab
         /// would encode it, so ids 30/31 decode to genuine CJK bytes if sampled.
         fn multibyte_vocab_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
-            use crate::model::qwen35::detokenize::bytes_to_unicode;
+            use crate::tokenizer::detokenize::bytes_to_unicode;
             use std::collections::HashMap;
             let byte_encoder = bytes_to_unicode();
             let byte_level_token = |bytes: &[u8]| -> String {

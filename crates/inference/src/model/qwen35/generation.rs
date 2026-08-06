@@ -1,6 +1,5 @@
 //! Qwen3.5 generation, streaming generation, prefill/decode loops, stop-streamer utilities, and stop-token helpers.
 use super::cache::{ForwardScratch, KvCache};
-use super::detokenize::{IncrementalDetokenizer, decode_tokens};
 use super::model::Qwen35Model;
 use super::sampling::sample_token;
 use super::stop_strings::{
@@ -15,6 +14,7 @@ use crate::model::qwen35_config::{
 use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::common::Tokenizer;
+use crate::tokenizer::detokenize::{IncrementalDetokenizer, decode_tokens};
 
 /// Test-only toggle forcing the pre-delegation serial prefill path
 /// (`prefill_tokens`) instead of `prefill_tokens_batched_for_generate`.
