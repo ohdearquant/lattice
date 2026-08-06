@@ -1,5 +1,6 @@
 //! Metal GPU benchmark — proper throughput measurement with multiple prompts.
 //! Usage: cargo run --release -p lattice-inference --bin profile_metal --features "f16,metal-gpu"
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     let home = std::env::var("HOME").unwrap();
@@ -38,13 +39,11 @@ fn main() {
             .collect()
     };
 
-    let gen_cfg_greedy = GenerateConfig {
-        max_new_tokens: 20,
-        temperature: 0.0,
-        top_k: 1,
-        seed: Some(630),
-        ..Default::default()
-    };
+    let mut gen_cfg_greedy = GenerateConfig::default();
+    gen_cfg_greedy.max_new_tokens = 20;
+    gen_cfg_greedy.temperature = 0.0;
+    gen_cfg_greedy.top_k = 1;
+    gen_cfg_greedy.seed = Some(630);
 
     // Warmup
     eprintln!("\n[bench] Warmup...");
@@ -71,13 +70,11 @@ fn main() {
 
     for (label, prompt) in &prompts {
         for max_tok in [20, 50] {
-            let gen_cfg = GenerateConfig {
-                max_new_tokens: max_tok,
-                temperature: 0.0,
-                top_k: 1,
-                seed: Some(630),
-                ..Default::default()
-            };
+            let mut gen_cfg = GenerateConfig::default();
+            gen_cfg.max_new_tokens = max_tok;
+            gen_cfg.temperature = 0.0;
+            gen_cfg.top_k = 1;
+            gen_cfg.seed = Some(630);
 
             // Run 3 times, take best
             let mut best_tps = 0.0f64;
@@ -126,13 +123,11 @@ fn main() {
     unsafe {
         std::env::set_var("LATTICE_PROFILE", "1");
     }
-    let gen_cfg_50 = GenerateConfig {
-        max_new_tokens: 50,
-        temperature: 0.0,
-        top_k: 1,
-        seed: Some(630),
-        ..Default::default()
-    };
+    let mut gen_cfg_50 = GenerateConfig::default();
+    gen_cfg_50.max_new_tokens = 50;
+    gen_cfg_50.temperature = 0.0;
+    gen_cfg_50.top_k = 1;
+    gen_cfg_50.seed = Some(630);
     let t = std::time::Instant::now();
     let result = metal
         .generate("The capital of France is", &tokenizer, &gen_cfg_50)

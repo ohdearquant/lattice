@@ -13,6 +13,7 @@
 //! (`scripts/bench_cpu_flagship_supervisor.py`) parses to compute the five
 //! mandated metrics. See that script's module docstring for the sampler and
 //! run-record side of the contract.
+#![allow(clippy::field_reassign_with_default)]
 
 use lattice_inference::tokenizer::common::Tokenizer as _;
 use std::io::Write as _;
@@ -81,11 +82,9 @@ fn main() {
     let load_ms = t0.elapsed().as_millis();
     println!("Model loaded in {load_ms}ms\n");
 
-    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-        max_new_tokens: max_tokens,
-        seed,
-        ..Default::default()
-    };
+    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_tokens;
+    gen_cfg.seed = seed;
     if let Some(t) = temperature {
         gen_cfg.temperature = t;
     }
@@ -307,27 +306,23 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
     // profile"): greedy, EOS disabled (forced fixed-length decode),
     // temperature 0 / top-k 1 / top-p 1 / repetition_penalty 1, thinking and
     // MTP off, no grammar, no string-level stops, no reasoning budget.
-    let base_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-        max_new_tokens: max_tokens,
-        seed: Some(seed),
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        ..Default::default()
-    };
+    let mut base_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    base_cfg.max_new_tokens = max_tokens;
+    base_cfg.seed = Some(seed);
+    base_cfg.temperature = 0.0;
+    base_cfg.top_k = 1;
+    base_cfg.top_p = 1.0;
+    base_cfg.repetition_penalty = 1.0;
+    base_cfg.stop_token_ids = vec![];
+    base_cfg.enable_thinking = false;
+    base_cfg.enable_mtp = Some(false);
 
     // One untimed warmup pass after load (DESIGN.md section 2), same prompt
     // and config, `warmup_tokens` generated tokens, discarded, no phase
     // events emitted for it -- distinct from the measured trial below.
     if warmup_tokens > 0 {
-        let warmup_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-            max_new_tokens: warmup_tokens,
-            ..base_cfg.clone()
-        };
+        let mut warmup_cfg = base_cfg.clone();
+        warmup_cfg.max_new_tokens = warmup_tokens;
         if let Err(e) =
             model.generate_streaming_with_cancel(&prompt, &warmup_cfg, |_delta| true, || false)
         {

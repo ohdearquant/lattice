@@ -15,6 +15,7 @@
 ///   LATTICE_STABILITY_TOKENS=4096    max tokens to generate (default: 2048)
 ///   LATTICE_STABILITY_WINDOW=256     monitoring window size (default: 256)
 ///   LATTICE_PROFILE=1                enable per-step GPU profiling
+#[allow(clippy::field_reassign_with_default)]
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
@@ -93,15 +94,13 @@ fn run() {
         cache_len
     );
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: max_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        enable_thinking: false,
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_tokens;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.top_p = 1.0;
+    gen_cfg.repetition_penalty = 1.0;
+    gen_cfg.enable_thinking = false;
 
     eprintln!(
         "[bench_stability] Generating {max_tokens} tokens per prompt (greedy), window={window_size}"

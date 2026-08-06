@@ -104,6 +104,7 @@ mod argmax_f32_first_wins_tests {
 /// **Unstable**: sampling configuration for decoder-only generation; fields
 /// and defaults may change as the generation API evolves.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SamplingConfig {
     /// Temperature for logit scaling. 0.0 = greedy, 1.0 = unscaled.
     pub temperature: f32,
