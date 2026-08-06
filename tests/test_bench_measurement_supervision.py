@@ -512,6 +512,21 @@ class InventoryContract(unittest.TestCase):
             excluded | non_measurement_paths, discovered_declared_rust_inventory_paths()
         )
 
+    def test_phase_event_binary_is_classified_as_measurement(self):
+        """qwen35_generate.rs's --emit-phase-events mode is a real timing
+        surface (the CPU flagship lane driven by
+        bench_cpu_flagship_supervisor.py), so classifying it as
+        non_measurement_surface is wrong regardless of how the manifest
+        entry is worded. Tied to source content, not just the manifest, so
+        reverting the classification without also removing the marker
+        still fails here."""
+
+        path = "crates/inference/src/bin/qwen35_generate.rs"
+        source = (REPO / path).read_text()
+        self.assertIn("--emit-phase-events", source)
+        self.assertIn(path, excluded_measurement_surfaces())
+        self.assertNotIn(path, non_measurement_surfaces())
+
     def test_every_benchmark_named_script_is_classified(self):
         """A new bench script cannot appear without an explicit classification."""
 

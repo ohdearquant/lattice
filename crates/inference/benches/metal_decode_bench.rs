@@ -174,9 +174,17 @@ fn bench_metal_decode_q4(c: &mut Criterion) {
                 );
                 return;
             }
-            Err(error) => {
-                eprintln!("SKIP: Q4 setup failed: {error}");
+            // HomeUnset and TokenizerMissing indicate the environment or model
+            // is simply absent (same class as ModelDirectoryMissing above), so
+            // they skip too. Config and State mean a model IS present and
+            // rejected the load -- that is a real regression, not an absent
+            // fixture, so it must fail the bench loudly rather than exit 0.
+            Err(error @ (Q4SetupError::HomeUnset | Q4SetupError::TokenizerMissing(_))) => {
+                eprintln!("SKIP: {error}");
                 return;
+            }
+            Err(error @ (Q4SetupError::Config(_) | Q4SetupError::State(_))) => {
+                panic!("Q4 setup failed on a present model: {error}");
             }
         };
 

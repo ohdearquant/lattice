@@ -112,10 +112,10 @@ paths = [
 ]
 
 [[excluded_surface]]
-family = "inference-additional-binary"
+family = "inference-supervised-phase-event-binary"
 tracking_issue = "#1273"
-reason = "Constructs MetalQwen35State and reports timing without matching the bench_* binary grammar; previously invisible to this inventory."
-paths = ["crates/inference/src/bin/backfill_qwen3.rs"]
+reason = "Product CLI whose --emit-phase-events mode emits machine-readable prefill/decode timing events; it is a real measurement surface, invoked as the CPU flagship measurement lane by scripts/bench_cpu_flagship_supervisor.py (entry: role=measurement, supervision=both-locks+quiet-baseline)."
+paths = ["crates/inference/src/bin/qwen35_generate.rs"]
 
 [[excluded_surface]]
 family = "documented-direct-cargo-commands"
@@ -164,12 +164,12 @@ path = "crates/inference/src/bin/quantize_quarot.rs"
 reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/qwen35_debug.rs"
-reason = "Interactive debug command, not a measurement harness."
+path = "crates/inference/src/bin/backfill_qwen3.rs"
+reason = "One-time DB re-embedding migration utility; constructs QwenModel (not MetalQwen35State) and its rate/ETA printout is progress reporting for a human watching the migration run, not a timed measurement harness (same class as quantize_q4.rs/quantize_quarot.rs)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/qwen35_generate.rs"
-reason = "Product CLI; its supervised phase-event measurement mode is invoked only through scripts/bench_cpu_flagship_supervisor.py, which is already classified below as measurement with both-locks+quiet-baseline supervision."
+path = "crates/inference/src/bin/qwen35_debug.rs"
+reason = "Interactive debug command, not a measurement harness."
 
 # Hosted workflow measurements are intentionally outside this local-machine
 # convention. Issue #1121 expressly excludes bench-update.yml.
