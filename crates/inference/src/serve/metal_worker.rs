@@ -50,7 +50,8 @@
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
 use crate::forward::metal_qwen35::{
-    ChatMessage, MetalQwen35State, format_chat_template, push_chat_turn_close, push_chat_turn_open,
+    ChatMessage, MetalQwen35State, format_chat_template, push_chat_generation_open,
+    push_chat_turn_close, push_chat_turn_open,
 };
 use crate::kv_cache::CrossTurnSlotId;
 use crate::model::qwen35_config::{
@@ -751,16 +752,17 @@ fn tokenize_text(tokenizer: &BpeTokenizer, text: &str) -> Vec<u32> {
     encoded.input_ids[..encoded.real_length].to_vec()
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_vision_prompt_ids(
+/// Build the vision prompt's text fragments around the image splice: `before`
+/// ends immediately after the image message's leading text (image tokens are
+/// inserted after this point) and `after` carries the trailing text plus every
+/// later turn and the generation opener. Kept separate from token insertion
+/// so it shares the same turn-sequencing primitives as the canonical
+/// text-only renderer (`format_chat_template`) and so `before + after` is
+/// directly comparable to that renderer's output around the splice point.
+fn build_vision_prompt_text(
     messages: &[ChatMessage],
     image_message_index: usize,
-    tokenizer: &BpeTokenizer,
-    vision_start_token_id: u32,
-    vision_end_token_id: u32,
-    image_token_id: u32,
-    image_pad_count: usize,
-) -> Result<Vec<u32>, WorkerFailure> {
+) -> Result<(String, String), WorkerFailure> {
     let image_message = &messages[image_message_index];
     let image = image_message
         .image
@@ -791,7 +793,22 @@ fn build_vision_prompt_ids(
         after.push_str(&message.content);
         push_chat_turn_close(&mut after);
     }
-    after.push_str("<|im_start|>assistant\n");
+    push_chat_generation_open(&mut after);
+
+    Ok((before, after))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_vision_prompt_ids(
+    messages: &[ChatMessage],
+    image_message_index: usize,
+    tokenizer: &BpeTokenizer,
+    vision_start_token_id: u32,
+    vision_end_token_id: u32,
+    image_token_id: u32,
+    image_pad_count: usize,
+) -> Result<Vec<u32>, WorkerFailure> {
+    let (before, after) = build_vision_prompt_text(messages, image_message_index)?;
 
     let mut inserted_ids = Vec::with_capacity(image_pad_count.saturating_add(2));
     inserted_ids.push(vision_start_token_id);
@@ -1533,6 +1550,22 @@ mod tests {
         expected.extend([90, 92, 92, 92, 91]);
         expected.extend(tokenize_text(&tokenizer, after));
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn vision_prompt_text_matches_plain_template_around_image_splice() {
+        let messages = vec![
+            ChatMessage::system("policy"),
+            ChatMessage::user_with_image("beforeafter", vec![1], "before".len()),
+            ChatMessage::assistant("prior"),
+        ];
+        let (before, after) = build_vision_prompt_text(&messages, 1).expect("vision text");
+        let plain = format_chat_template(&messages);
+        assert_eq!(
+            before.clone() + &after,
+            plain,
+            "vision splice fragments must reconstruct exactly the canonical text-only template"
+        );
     }
 
     #[test]

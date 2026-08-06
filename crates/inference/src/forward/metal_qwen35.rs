@@ -476,8 +476,7 @@ pub(crate) fn format_chat_template_parts<'a>(
         prompt.push_str(content);
         push_chat_turn_close(&mut prompt);
     }
-    // Open assistant turn for generation
-    prompt.push_str("<|im_start|>assistant\n");
+    push_chat_generation_open(&mut prompt);
     prompt
 }
 
@@ -489,6 +488,13 @@ pub(crate) fn push_chat_turn_open(prompt: &mut String, role: &str) {
 
 pub(crate) fn push_chat_turn_close(prompt: &mut String) {
     prompt.push_str("<|im_end|>\n");
+}
+
+/// Open the trailing assistant turn left unclosed for generation — shared by
+/// the canonical text-only renderer and the vision prompt builder so both
+/// paths emit the identical generation-turn opener.
+pub(crate) fn push_chat_generation_open(prompt: &mut String) {
+    push_chat_turn_open(prompt, ChatRole::Assistant.as_str());
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
