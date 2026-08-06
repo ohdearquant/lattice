@@ -44,6 +44,7 @@ struct TensorManifest {
 struct Manifest {
     #[allow(dead_code)] // only read by the f16-gated gate functions
     image_grid_thw: Vec<[u64; 3]>,
+    #[allow(dead_code)] // only read by the f16-gated gate functions
     vit_pre_merger: TensorManifest,
     vit_post_merger: TensorManifest,
 }
