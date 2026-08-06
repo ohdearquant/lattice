@@ -85,6 +85,11 @@ name = "layer23_golden_bridge"
 path = "tests/layer23_golden_bridge.rs"
 required-features = ["train-backward"]
 
+[[test]]
+name = "gdn_lora_wiring"
+path = "tests/gdn_lora_wiring.rs"
+required-features = ["train-backward"]
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
