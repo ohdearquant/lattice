@@ -131,20 +131,31 @@ def excluded_measurement_surfaces() -> set[str]:
     }
 
 
+def non_measurement_surfaces() -> set[str]:
+    data = tomllib.loads(MANIFEST.read_text())
+    return {surface["path"] for surface in data["non_measurement_surface"]}
+
+
 def discovered_declared_rust_inventory_paths() -> set[str]:
+    """Every Rust path the manifest's grammar must classify.
+
+    Broadened from a bench*-prefix filename match (issue #1273): every
+    example and every binary under the inference crate is discovered, not
+    just ones whose basename happens to start with `bench`. A path that
+    matches this glob and is not in excluded_surface or
+    non_measurement_surface fails the fail-closed test below.
+    """
     paths = {
         str(path.relative_to(REPO))
         for path in (REPO / "crates").glob("*/benches/*.rs")
     }
     paths.update(
         str(path.relative_to(REPO))
-        for path in (REPO / "crates/inference/examples").glob("bench*.rs")
+        for path in (REPO / "crates/inference/examples").glob("*.rs")
     )
     paths.update(
         str(path.relative_to(REPO))
         for path in (REPO / "crates/inference/src/bin").glob("*.rs")
-        if path.stem.startswith("bench_")
-        or path.stem in {"eval_perplexity", "gramperf_profile", "ppl_metal"}
     )
     paths.add("README.md")
     return paths
@@ -461,21 +472,14 @@ class InventoryContract(unittest.TestCase):
         )
         self.assertEqual(
             contract["rust_inventory_grammar"],
-            "crates/*/benches/*.rs; crates/inference/examples/bench*.rs; "
-            "crates/inference/src/bin/bench_*.rs plus eval_perplexity.rs, "
-            "gramperf_profile.rs, and ppl_metal.rs; README.md",
+            "crates/*/benches/*.rs; crates/inference/examples/*.rs; "
+            "crates/inference/src/bin/*.rs; README.md",
         )
         self.assertEqual(
             contract["rust_inventory_limitation"],
-            "does not discover other Rust examples, binaries, or tests",
+            "does not discover Rust tests, except the one tracked entry point below",
         )
-        confirmed_outside = {
-            "crates/inference/examples/profile_metal_decode.rs",
-            "crates/inference/examples/profile_metal.rs",
-            "crates/inference/examples/decode_profile.rs",
-            "crates/inference/examples/layer_sweep.rs",
-            "crates/tune/tests/bench_backward_737.rs",
-        }
+        confirmed_outside = {"crates/tune/tests/bench_backward_737.rs"}
         self.assertEqual(
             set(contract["confirmed_outside_rust_inventory"]), confirmed_outside
         )
@@ -493,9 +497,35 @@ class InventoryContract(unittest.TestCase):
                 self.assertTrue(surface["paths"])
                 for path in surface["paths"]:
                     self.assertTrue((REPO / path).is_file(), path)
+        non_measurement = data["non_measurement_surface"]
+        self.assertTrue(non_measurement)
+        for surface in non_measurement:
+            with self.subTest(path=surface["path"]):
+                self.assertTrue(surface["reason"])
+                self.assertTrue((REPO / surface["path"]).is_file(), surface["path"])
         excluded = excluded_measurement_surfaces()
+        non_measurement_paths = non_measurement_surfaces()
         self.assertEqual(len(excluded), sum(len(s["paths"]) for s in surfaces))
-        self.assertEqual(excluded, discovered_declared_rust_inventory_paths())
+        self.assertEqual(len(non_measurement_paths), len(non_measurement))
+        self.assertTrue(excluded.isdisjoint(non_measurement_paths))
+        self.assertEqual(
+            excluded | non_measurement_paths, discovered_declared_rust_inventory_paths()
+        )
+
+    def test_phase_event_binary_is_classified_as_measurement(self):
+        """qwen35_generate.rs's --emit-phase-events mode is a real timing
+        surface (the CPU flagship lane driven by
+        bench_cpu_flagship_supervisor.py), so classifying it as
+        non_measurement_surface is wrong regardless of how the manifest
+        entry is worded. Tied to source content, not just the manifest, so
+        reverting the classification without also removing the marker
+        still fails here."""
+
+        path = "crates/inference/src/bin/qwen35_generate.rs"
+        source = (REPO / path).read_text()
+        self.assertIn("--emit-phase-events", source)
+        self.assertIn(path, excluded_measurement_surfaces())
+        self.assertNotIn(path, non_measurement_surfaces())
 
     def test_every_benchmark_named_script_is_classified(self):
         """A new bench script cannot appear without an explicit classification."""

@@ -161,11 +161,11 @@ const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
         "setup_lm_head_fixture Q4 initialization is an exact deferred Criterion construction tracked in #1274",
     ),
     (
-        "bench:metal_decode_bench:benches/metal_decode_bench.rs=>benches/metal_decode_bench.rs:53:35",
+        "bench:metal_decode_bench:benches/metal_decode_bench.rs=>benches/metal_decode_bench.rs:88:27",
         "load_q4_state is an exact deferred Criterion construction tracked in #1274",
     ),
     (
-        "bench:metal_decode_bench:benches/metal_decode_bench.rs=>benches/metal_decode_bench.rs:63:35",
+        "bench:metal_decode_bench:benches/metal_decode_bench.rs=>benches/metal_decode_bench.rs:98:35",
         "load_q8_state is an exact deferred Criterion construction tracked in #1274",
     ),
     (
