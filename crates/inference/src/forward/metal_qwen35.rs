@@ -520,7 +520,6 @@ mod inner {
     };
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
-    use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{
         AttentionWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
@@ -530,6 +529,7 @@ mod inner {
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
+    use crate::tokenizer::detokenize::IncrementalDetokenizer;
     use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
     use metal::*;
@@ -4223,12 +4223,12 @@ mod inner {
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<MetalVerifyOutput, crate::error::InferenceError> {
+            self.check_forward_range_capacity(start_pos, tokens.len(), true)?;
             if self.session.gdn_checkpoints.is_none() {
                 return Err(crate::error::InferenceError::Inference(
                     "GDN checkpoint pool required for verify_tokens_batched".into(),
                 ));
             }
-            self.check_forward_range_capacity(start_pos, tokens.len(), true)?;
             if let Some(ref mut p) = self.session.gdn_checkpoints {
                 p.active_base_seq_len = Some(start_pos);
                 p.mtp_base_seq_len = self.session.mtp.as_ref().map(|m| m.cache.seq_len);
@@ -4283,12 +4283,12 @@ mod inner {
                     "verify_batch: bad token count {n} (max {MTP_VERIFY_MAX_TOKENS})"
                 )));
             }
+            self.check_forward_range_capacity(start_pos, n, false)?;
             if self.session.gdn_checkpoints.is_none() {
                 return Err(crate::error::InferenceError::Inference(
                     "GDN checkpoint pool required for verify_tokens_batch_gemm".into(),
                 ));
             }
-            self.check_forward_range_capacity(start_pos, n, false)?;
 
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
@@ -9921,7 +9921,7 @@ mod inner {
     }
 
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
-        crate::model::qwen35::detokenize::decode_tokens(tokenizer, ids)
+        crate::tokenizer::detokenize::decode_tokens(tokenizer, ids)
     }
 
     // -----------------------------------------------------------------------
@@ -25743,7 +25743,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `好` (`0xE5 0xA5 0xBD`), exactly as a real byte-level BPE vocab
         /// would encode it, so ids 30/31 decode to genuine CJK bytes if sampled.
         fn multibyte_vocab_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
-            use crate::model::qwen35::detokenize::bytes_to_unicode;
+            use crate::tokenizer::detokenize::bytes_to_unicode;
             use std::collections::HashMap;
             let byte_encoder = bytes_to_unicode();
             let byte_level_token = |bytes: &[u8]| -> String {
