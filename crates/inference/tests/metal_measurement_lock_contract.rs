@@ -97,7 +97,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "src/bin/dump_quarot_q4_golden.rs",
     "src/bin/eval_perplexity.rs",
     "src/bin/gramperf_profile.rs",
-    "src/bin/lattice.rs",
+    "src/bin/lattice/main.rs",
     "src/bin/lattice_serve.rs",
     "src/bin/ppl_metal.rs",
 ];
@@ -261,11 +261,11 @@ const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
         "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     ),
     (
-        "bin:lattice:src/bin/lattice.rs=>src/bin/lattice.rs:2388:81",
+        "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/chat.rs:53:81",
         "MetalChatBackend::load belongs to a long-running interactive process outside the bounded measurement-harness contract",
     ),
     (
-        "bin:lattice:src/bin/lattice.rs=>src/bin/lattice.rs:2927:85",
+        "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs:400:81",
         "MetalHandle::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
     ),
     (

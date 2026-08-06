@@ -16,7 +16,13 @@ set -eu
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 
-lattice_rs="$repo_root/crates/inference/src/bin/lattice.rs"
+# `lattice` is a module tree (#834), not a single file: main.rs (CLI dispatch),
+# chat.rs (REPL), doctor.rs (preflight), serve.rs (HTTP API) each carry their
+# own fixtures now.
+lattice_bin_main_rs="$repo_root/crates/inference/src/bin/lattice/main.rs"
+lattice_bin_chat_rs="$repo_root/crates/inference/src/bin/lattice/chat.rs"
+lattice_bin_doctor_rs="$repo_root/crates/inference/src/bin/lattice/doctor.rs"
+lattice_bin_serve_rs="$repo_root/crates/inference/src/bin/lattice/serve.rs"
 lattice_serve_rs="$repo_root/crates/inference/src/bin/lattice_serve.rs"
 chat_metal_rs="$repo_root/crates/inference/src/bin/chat_metal.rs"
 # Shared Metal worker owner (#832): the cancellation/window-check fixtures
@@ -49,7 +55,10 @@ extract_test_fn_names() {
 
 all_test_fns="$(
     {
-        extract_test_fn_names "$lattice_rs"
+        extract_test_fn_names "$lattice_bin_main_rs"
+        extract_test_fn_names "$lattice_bin_chat_rs"
+        extract_test_fn_names "$lattice_bin_doctor_rs"
+        extract_test_fn_names "$lattice_bin_serve_rs"
         extract_test_fn_names "$lattice_serve_rs"
         extract_test_fn_names "$chat_metal_rs"
         extract_test_fn_names "$metal_worker_rs"
@@ -171,7 +180,7 @@ fi
 # families added before #654's Fixture manifest section don't need every
 # single test enumerated by name on day one. Reuses $tokens, set by the
 # check_doc call above.
-for f in "$lattice_rs" "$lattice_serve_rs" "$chat_metal_rs" "$metal_worker_rs"; do
+for f in "$lattice_bin_main_rs" "$lattice_bin_chat_rs" "$lattice_bin_doctor_rs" "$lattice_bin_serve_rs" "$lattice_serve_rs" "$chat_metal_rs" "$metal_worker_rs"; do
     extract_test_fn_names "$f" | while read -r name; do
         matched_prefix=0
         for p in $prefixes; do

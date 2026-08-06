@@ -111,7 +111,7 @@ libc = "0.2"
 
 [[bin]]
 name = "lattice"
-path = "src/bin/lattice.rs"
+path = "src/bin/lattice/main.rs"
 required-features = ["serve"]
 
 [[bin]]
