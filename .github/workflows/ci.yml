@@ -301,6 +301,17 @@ jobs:
       # which is why the guard runs on the isolated resolve instead. See #1095.
       - name: embed — f16 native dependency load guard (standalone, no workspace unification)
         run: cargo test -p lattice-embed --test f16_feature_load_guard
+      # `cargo test --workspace`'s default target set is lib, bins, tests,
+      # benches, and doctests — it does NOT include `[[example]]` targets
+      # (that needs an explicit `--example`/`--examples`/`--all-targets`).
+      # drift_compare's `cosine()` degenerate-case regressions (both_zero_
+      # reads_as_identity, one_sided_collapse_reads_as_maximal_drift_*,
+      # normal_pair_computes_true_cosine) live in a `#[cfg(test)]` module
+      # inside `crates/transport/examples/drift_compare.rs`, so the required
+      # `ci` job's `cargo test --workspace` never builds or runs them. Run
+      # the example target explicitly so they cannot silently rot.
+      - name: transport — drift_compare example regressions (unreached by cargo test --workspace)
+        run: cargo test -p lattice-transport --example drift_compare
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'

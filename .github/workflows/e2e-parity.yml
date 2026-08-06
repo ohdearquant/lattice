@@ -470,29 +470,18 @@ jobs:
           header: e2e-metal-parity
           path: metal-parity-report.md
 
-  # Embedding-drift gate: re-embeds the 5 frozen BGE-small corpus texts and
-  # asserts max per-vector (1 - cosine) < 1e-3 vs the committed baseline.
+  # Embedding-drift gate: re-embeds every frozen model corpus and checks each
+  # vector against the committed release baseline.
   #
   # Runs on ubuntu-24.04-arm (aarch64) to exercise the NEON normalise path that
-  # crates/embed/src/simd/ dispatches on aarch64, the same ISA path that
-  # production lattice deployments use. Relocated from macos-latest (also
-  # aarch64) to cut the shared macOS-runner queue tax; NEON coverage is
-  # identical on aarch64 Linux.
+  # the native BERT pooling in crates/inference/src/pool.rs (via
+  # crates/inference/src/model/bert.rs) dispatches on aarch64, the same ISA
+  # path that production lattice deployments use. Relocated from
+  # macos-latest (also aarch64) to cut the shared macOS-runner queue tax;
+  # NEON coverage is identical on aarch64 Linux.
   #
-  # Model provisioning: the bge-small-en-v1.5 weights (~130 MB) are downloaded
-  # via `cargo run ... --bin embed -- --download-only`, then cached per-run by
-  # key "bge-small-en-v1.5-v1".  The key never changes because the weights are
-  # immutable; if the model revision is bumped the cache key must be bumped too.
-  #
-  # Re-baseline procedure: when an intentional forward-path change lands, run
-  #   cargo run --release -p lattice-embed --example dump_parity_embeddings
-  # to regenerate, commit the new fixture, and rename _v1 → _v2 in both the
-  # fixture directory and the test file.
-  #
-  # NOTE: once this job has gone green on CI once, add "embed-drift" to the
-  # repository's required status checks (Settings → Branches → main protection
-  # rule).  That governance step is done by the maintainers; it is intentionally
-  # not automated here.
+  # Model checkpoints are immutable. A checkpoint revision change must also
+  # change its cache key so the gate cannot reuse weights from the old revision.
   embed-drift:
     name: embed drift gate
     needs: changes
@@ -514,22 +503,38 @@ jobs:
           path: ~/.lattice/models/bge-small-en-v1.5
           key: bge-small-en-v1.5-v1
 
-      # Download weights into ~/.lattice/models/bge-small-en-v1.5 if not cached.
-      - name: Provision bge-small-en-v1.5 weights
+      - name: Cache multilingual-e5-small weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/multilingual-e5-small
+          key: multilingual-e5-small-v1
+
+      - name: Cache all-minilm-l6-v2 weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/all-minilm-l6-v2
+          key: all-minilm-l6-v2-v1
+
+      - name: Cache paraphrase-multilingual-minilm-l12-v2 weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/paraphrase-multilingual-minilm-l12-v2
+          key: paraphrase-multilingual-minilm-l12-v2-v1
+
+      - name: Provision embedding model weights
         run: |
-          cargo run --release -p lattice-embed --bin embed \
-            -- --model bge-small-en-v1.5 --download-only
+          set -euo pipefail
+          for model in \
+            bge-small-en-v1.5 \
+            multilingual-e5-small \
+            all-minilm-l6-v2 \
+            paraphrase-multilingual-minilm-l12-v2; do
+            cargo run --release -p lattice-embed --bin embed \
+              -- --model "$model" --download-only
+          done
 
       - name: Run embedding-drift gate
-        # LATTICE_DRIFT_GATE_ENFORCE=1 makes the test fail-closed if the weights
-        # are missing here (provisioning regression). The workspace-wide `cargo
-        # test` CI job does NOT set this, so it cleanly skips when weights are
-        # absent instead of panicking.
-        env:
-          LATTICE_DRIFT_GATE_ENFORCE: '1'
-        run: |
-          cargo test --release -p lattice-embed --test embed_drift_baseline \
-            -- --nocapture
+        run: cargo run --release -p lattice-embed --bin embed-drift -- --enforce --json
 
   # x86_64 counterpart to embed-drift. This starts as an observation job rather
   # than a required parity-gate dependency: the frozen threshold has live
@@ -562,26 +567,38 @@ jobs:
           path: ~/.lattice/models/bge-small-en-v1.5
           key: bge-small-en-v1.5-v1
 
-      - name: Provision bge-small-en-v1.5 weights
+      - name: Cache multilingual-e5-small weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/multilingual-e5-small
+          key: multilingual-e5-small-v1
+
+      - name: Cache all-minilm-l6-v2 weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/all-minilm-l6-v2
+          key: all-minilm-l6-v2-v1
+
+      - name: Cache paraphrase-multilingual-minilm-l12-v2 weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.lattice/models/paraphrase-multilingual-minilm-l12-v2
+          key: paraphrase-multilingual-minilm-l12-v2-v1
+
+      - name: Provision embedding model weights
         run: |
-          cargo run --release -p lattice-embed --bin embed \
-            -- --model bge-small-en-v1.5 --download-only
+          set -euo pipefail
+          for model in \
+            bge-small-en-v1.5 \
+            multilingual-e5-small \
+            all-minilm-l6-v2 \
+            paraphrase-multilingual-minilm-l12-v2; do
+            cargo run --release -p lattice-embed --bin embed \
+              -- --model "$model" --download-only
+          done
 
       - name: Run x86_64 embedding-drift observation (fail-closed)
-        env:
-          LATTICE_DRIFT_GATE_ENFORCE: '1'
-        run: |
-          if cargo test --release -p lattice-embed --test embed_drift_baseline \
-            -- --nocapture > embed-drift-x86.log 2>&1
-          then
-            cat embed-drift-x86.log
-          else
-            status=$?
-            cat embed-drift-x86.log
-            exit "$status"
-          fi
-          grep -Fq 'Loaded drift baseline:' embed-drift-x86.log
-          grep -Fq '[bge-small drift gate] max(1-cosine)=' embed-drift-x86.log
+        run: cargo run --release -p lattice-embed --bin embed-drift -- --enforce --json
 
   # wasm embedding parity gate (PR #681). Proves the wasm32-compiled
   # `LatticeEmbedder` binding (crates/embed/src/wasm.rs) produces output that
