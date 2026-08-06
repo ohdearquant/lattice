@@ -2517,6 +2517,90 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
         self.assertNotIn("=== bench-compare:", result.stdout)
 
 
+class ImplBodyInheritsResolvedPythonInterpreter(unittest.TestCase):
+    """bench-compare.sh resolves an interpreter meeting the harness's 3.11
+    floor and exports it as PYTHON_BIN; bench-compare-impl.sh must consume
+    that inherited variable rather than a bare `python3` lookup, or a stock
+    macOS PATH (old /usr/bin/python3 ahead of a newer interpreter) makes the
+    body die on the floor check instead of using the interpreter its own
+    entry point already found (lattice#1333).
+
+    This drives the real scripts/lib/bench-compare-impl.sh, not a rewritten
+    copy: only scripts/lib/bench-host-id.py is needed alongside it, since the
+    very first thing the body does (before touching git, locks, or cargo) is
+    resolve a run host id through a Python interpreter.
+    """
+
+    def _build_fixture(self, tmp: str) -> Path:
+        root = Path(tmp) / "repo"
+        lib = root / "scripts" / "lib"
+        lib.mkdir(parents=True)
+        shutil.copy2(
+            REPO / "scripts" / "lib" / "bench-compare-impl.sh",
+            lib / "bench-compare-impl.sh",
+        )
+        (lib / "bench-compare-impl.sh").chmod(0o755)
+        shutil.copy2(
+            REPO / "scripts" / "lib" / "bench-host-id.py",
+            lib / "bench-host-id.py",
+        )
+        return root
+
+    def _run(self, tmp: str, root: Path) -> subprocess.CompletedProcess[str]:
+        bindir = Path(tmp) / "bin"
+        bindir.mkdir()
+        stub_python3 = bindir / "python3"
+        stub_python3.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo 'STUB_PYTHON3_INVOKED: Python 3.9.6 (fixture, pre-floor)' >&2\n"
+            "exit 17\n"
+        )
+        stub_python3.chmod(0o755)
+
+        self.assertGreaterEqual(
+            sys.version_info[:2],
+            (3, 11),
+            "the interpreter running this test must itself satisfy the "
+            "harness's floor to stand in as the resolved PYTHON_BIN",
+        )
+        env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "PYTHON_BIN": sys.executable,
+            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+        }
+        for name in (
+            "LATTICE_BENCH_LOCK_STATUS",
+            "LATTICE_BENCH_LOCK_FDS",
+            "LATTICE_BENCH_SUPERVISOR_FD",
+        ):
+            env.pop(name, None)
+        return subprocess.run(
+            ["bash", str(root / "scripts" / "lib" / "bench-compare-impl.sh")],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_impl_body_proceeds_past_host_id_handoff_instead_of_dying_on_stub(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build_fixture(tmp)
+            result = self._run(tmp, root)
+
+        # The stub is never reached: the body used the inherited PYTHON_BIN
+        # for the host-id resolution, so it proceeds to the next real
+        # checkpoint (the supervisor lock-status refusal) instead of dying
+        # inside the stub at exit 17.
+        self.assertNotIn("STUB_PYTHON3_INVOKED", result.stderr, result.stderr)
+        self.assertNotEqual(17, result.returncode, result.stderr)
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertIn("no lock status at", result.stderr)
+        self.assertIn(
+            "Run scripts/bench-compare.sh, not this file directly", result.stderr
+        )
+
+
 class _FailOnEmptyTestProgram(unittest.TestProgram):
     def runTests(self) -> None:
         if self.test.countTestCases() == 0:

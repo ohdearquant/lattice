@@ -17,27 +17,28 @@ bench_supervise_entry() {
     local measurement="$3"
     shift 3
 
-    local repo helper python_bin
+    local repo helper
     if ! repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"; then
         printf 'bench-supervision: FATAL: cannot resolve the repository root from %s; ' "${BASH_SOURCE[0]}" >&2 || :
         printf 'refusing to continue.\n' >&2 || :
         exit 2
     fi
     helper="$repo/scripts/lib/bench_supervision.py"
-    python_bin="$(bench_require_python3 "${0##*/}")" || exit 1
+    PYTHON_BIN="$(bench_require_python3 "${0##*/}")" || exit 1
+    export PYTHON_BIN
 
     if [[ -z "${LATTICE_BENCH_LOCK_STATUS:-}" ]]; then
         if [[ "$mode" == "durable" ]]; then
-            exec "$python_bin" "$helper" run --label "$label" --quiet --entrypoint -- "$0" "$@"
+            exec "$PYTHON_BIN" "$helper" run --label "$label" --quiet --entrypoint -- "$0" "$@"
         fi
-        exec "$python_bin" "$helper" run --label "$label" --entrypoint -- "$0" "$@"
+        exec "$PYTHON_BIN" "$helper" run --label "$label" --entrypoint -- "$0" "$@"
     fi
     if [[ "$mode" == "durable" ]]; then
-        if ! "$python_bin" "$helper" verify --require-quiet; then
+        if ! "$PYTHON_BIN" "$helper" verify --require-quiet; then
             exit 2
         fi
     else
-        if ! "$python_bin" "$helper" verify; then
+        if ! "$PYTHON_BIN" "$helper" verify; then
             exit 2
         fi
     fi
@@ -61,7 +62,7 @@ bench_supervise_entry() {
     if [[ "$restore_errexit" -eq 1 ]]; then
         set -e
     fi
-    if ! "$python_bin" "$helper" verify; then
+    if ! "$PYTHON_BIN" "$helper" verify; then
         return 2
     fi
     return "$measurement_rc"
@@ -75,7 +76,7 @@ bench_quiet_checkpoint() {
         printf 'refusing to continue.\n' >&2 || :
         exit 2
     fi
-    if ! python3 "$repo/scripts/lib/quiet-probe.py" --label "$label"; then
+    if ! "${PYTHON_BIN:?PYTHON_BIN not set - bench_quiet_checkpoint requires bench_supervise_entry to have run first}" "$repo/scripts/lib/quiet-probe.py" --label "$label"; then
         echo "bench-supervision: machine was not quiet at $label; refusing to continue" >&2 || :
         exit 2
     fi

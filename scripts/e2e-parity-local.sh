@@ -15,4 +15,4 @@ bench_supervise_entry "e2e-parity-local" handoff - "$@"
     cargo build --release --bin qwen35_generate -p lattice-inference --features f16
 )
 cd "$REPO"
-exec python3 scripts/e2e_parity_check.py
+exec "${PYTHON_BIN:?PYTHON_BIN not set - bench_supervise_entry should have exported it}" scripts/e2e_parity_check.py
