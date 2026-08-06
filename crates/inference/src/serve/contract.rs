@@ -1156,7 +1156,7 @@ pub fn parse_stop_strings(stop: &Option<Value>) -> Result<Vec<String>, ApiError>
 /// formula both `lattice serve`'s HTTP preflight (below) and that worker-side
 /// invariant compute, so neither binary can drift back to its own
 /// pre-#831 accounting independently.
-pub fn validate_context_window(
+pub fn validate_context_window_with_budget(
     prompt_tokens: usize,
     max_tokens: usize,
     reasoning_budget: Option<usize>,
@@ -1175,6 +1175,17 @@ pub fn validate_context_window(
         });
     }
     Ok(())
+}
+
+/// No-reasoning-budget form of [`validate_context_window_with_budget`].
+///
+/// Delegates with `reasoning_budget = None`.
+pub fn validate_context_window(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    max_context: usize,
+) -> Result<(), ApiError> {
+    validate_context_window_with_budget(prompt_tokens, max_tokens, None, max_context)
 }
 
 #[cfg(test)]
@@ -1835,9 +1846,9 @@ mod tests {
         // (`prompt + max_tokens + reasoning_budget + 1 <= max_context`), so
         // the exact boundary now needs one fewer prompt/decode token than
         // `max_context` to leave room for that reserved slot.
-        validate_context_window(7, 8, None, 16).unwrap();
+        validate_context_window(7, 8, 16).unwrap();
         assert_eq!(
-            validate_context_window(8, 8, None, 16).unwrap_err().code(),
+            validate_context_window(8, 8, 16).unwrap_err().code(),
             "context_length_exceeded"
         );
     }
@@ -1845,17 +1856,17 @@ mod tests {
     #[test]
     fn context_window_accounts_for_reasoning_budget() {
         // Mutation-sensitive: dropping the `+ reasoning_budget` term from
-        // `validate_context_window`'s formula would accept this request
-        // (7 + 8 + 1 == 16), rather than rejecting it for the 4 extra
-        // reasoning tokens (7 + 8 + 4 + 1 == 20 > 16).
-        validate_context_window(7, 8, Some(0), 16).unwrap();
+        // `validate_context_window_with_budget`'s formula would accept this
+        // request (7 + 8 + 1 == 16), rather than rejecting it for the 4
+        // extra reasoning tokens (7 + 8 + 4 + 1 == 20 > 16).
+        validate_context_window_with_budget(7, 8, Some(0), 16).unwrap();
         assert_eq!(
-            validate_context_window(7, 8, Some(4), 16)
+            validate_context_window_with_budget(7, 8, Some(4), 16)
                 .unwrap_err()
                 .code(),
             "context_length_exceeded"
         );
-        validate_context_window(3, 8, Some(4), 16).unwrap();
+        validate_context_window_with_budget(3, 8, Some(4), 16).unwrap();
     }
 
     #[test]

@@ -2545,7 +2545,7 @@ mod serve {
     use lattice_inference::serve::contract::{
         ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
         ValidatedChatRequest as ContractValidatedChatRequest, normalize_request_with_context,
-        validate_context_window,
+        validate_context_window_with_budget,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
@@ -3444,7 +3444,7 @@ mod serve {
     /// Production entry point for the shared context-aware normalization
     /// cascade: supplies the prompt-aware context-window check (rendering the
     /// chat template, tokenizing it, then calling the shared
-    /// `validate_context_window`) as the context check, in the
+    /// `validate_context_window_with_budget`) as the context check, in the
     /// exact order the original inline `chat_completions` cascade used:
     /// `stop` is validated *last*, after both the served-model hard
     /// requirements and the context-window check that guards against a
@@ -3476,7 +3476,7 @@ mod serve {
             |messages, max_tokens, reasoning_budget| {
                 let prompt = format_normalized_chat_template(messages);
                 let prompt_token_count = tokenize_len(&prompt);
-                validate_context_window(
+                validate_context_window_with_budget(
                     prompt_token_count,
                     max_tokens,
                     reasoning_budget,
