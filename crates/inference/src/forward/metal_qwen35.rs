@@ -6296,7 +6296,7 @@ mod inner {
             entry_point: &str,
         ) -> Result<(), crate::error::InferenceError> {
             let seq_len = self.session.kv_cache.seq_len;
-            let gdn_state_is_initial = self.gdn_state_is_initial();
+            let gdn_state_is_initial = seq_len == 0 && self.gdn_state_is_initial();
             Self::validate_hidden_prefill_fresh_session(seq_len, gdn_state_is_initial).map_err(
                 |_| {
                     crate::error::InferenceError::InvalidInput(format!(
@@ -6801,19 +6801,10 @@ mod inner {
                     "forward_prefill_with_hidden: token_ids must not be empty".into(),
                 ));
             }
-            for (index, &token_id) in token_ids.iter().enumerate() {
-                if token_id as usize >= self.engine.config.vocab_size {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "forward_prefill_with_hidden: token_ids[{index}]={token_id} out of range: \
-                         vocab_size is {}",
-                        self.engine.config.vocab_size
-                    )));
-                }
-            }
-            Self::validate_hidden_prefill_fresh_session(
-                self.session.kv_cache.seq_len,
-                self.gdn_state_is_initial(),
-            )?;
+            self.check_forward_token_ids("forward_prefill_with_hidden", token_ids)?;
+            let seq_len = self.session.kv_cache.seq_len;
+            let gdn_state_is_initial = seq_len == 0 && self.gdn_state_is_initial();
+            Self::validate_hidden_prefill_fresh_session(seq_len, gdn_state_is_initial)?;
             self.check_forward_range_capacity(0, token_ids.len(), false)?;
             self.cross_turn_prefix_cache.clear();
 
