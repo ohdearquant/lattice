@@ -238,8 +238,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/lattice-models"
           ln -sf "${{ steps.provision.outputs.model-dir }}" "$RUNNER_TEMP/lattice-models/qwen3.5-0.8b"
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           shared-key: layer23-golden
 
@@ -320,8 +319,7 @@ jobs:
           ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
       # Step 4: build lattice
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           shared-key: e2e-parity
 
@@ -434,9 +432,7 @@ jobs:
           mkdir -p ~/.lattice/models
           ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           shared-key: e2e-metal-parity
 
@@ -502,9 +498,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           shared-key: embed-drift
 
@@ -550,9 +544,7 @@ jobs:
       - name: Assert x86_64 runner
         run: test "$(uname -m)" = 'x86_64'
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           shared-key: embed-drift-x86
 
@@ -601,12 +593,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: ./.github/actions/rust-setup
         with:
           targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
           shared-key: wasm-parity
 
       - name: Cache wasm-bindgen-cli
@@ -680,12 +669,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: ./.github/actions/rust-setup
         with:
           targets: wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
           shared-key: wasm-simd128-parity
 
       - name: Cache wasm-bindgen-cli
@@ -808,8 +794,7 @@ jobs:
           mkdir -p ~/.lattice/models
           ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           shared-key: vision-cpu-gates
 
@@ -884,8 +869,7 @@ jobs:
           mkdir -p ~/.lattice/models
           ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           shared-key: quarot-artifact
 
@@ -1017,8 +1001,7 @@ jobs:
           mkdir -p ~/.lattice/models
           ln -sf "${{ steps.provision.outputs.model-dir }}" ~/.lattice/models/qwen3.5-0.8b
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           shared-key: q4-vision-gates
 
