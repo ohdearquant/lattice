@@ -43,12 +43,21 @@ runs:
     # retrying the same install against the same dirty state just repeats the
     # failure. Point RUSTUP_HOME at a fresh, job-scoped directory before
     # installing so every run starts from a clean Rustup state instead of
-    # whatever the runner image happened to preinstall. CARGO_HOME is left
-    # untouched so Swatinem/rust-cache's existing cache behavior is unaffected.
+    # whatever the runner image happened to preinstall. The directory is
+    # deleted and recreated every run (isolation), but its path is a fixed
+    # location under $HOME rather than $RUNNER_TEMP: Swatinem/rust-cache
+    # hashes every non-empty RUST*-prefixed env var into its cache key
+    # (src/config.ts:107-117), and RUNNER_TEMP is a runner-provided absolute
+    # temp path that can differ across runners/runs, which fragmented the
+    # cache key and produced "No cache found" on an otherwise-unchanged repo.
+    # $HOME is stable across jobs on all runner images this action targets
+    # (ubuntu-latest, ubuntu-24.04-arm, macos-latest — no Windows runner uses
+    # this action), so the RUSTUP_HOME value stays constant and CARGO_HOME is
+    # left untouched so Swatinem/rust-cache's cache behavior is unaffected.
     - name: Isolate Rustup state
       shell: bash
       run: |
-        rustup_home="${RUNNER_TEMP}/lattice-rustup"
+        rustup_home="${HOME}/.lattice-rustup"
         rm -rf -- "$rustup_home"
         mkdir -p "$rustup_home"
         printf 'RUSTUP_HOME=%s\n' "$rustup_home" >> "$GITHUB_ENV"
