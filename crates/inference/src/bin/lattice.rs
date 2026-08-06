@@ -2544,8 +2544,8 @@ mod serve {
     use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
-        ValidatedChatRequest as ContractValidatedChatRequest, normalize_request_with_context,
-        validate_context_window_with_budget,
+        ValidatedChatRequest as ContractValidatedChatRequest,
+        normalize_request_with_context_and_budget, validate_context_window_with_budget,
     };
     #[cfg(test)]
     use lattice_inference::serve::contract::{
@@ -3469,7 +3469,7 @@ mod serve {
         tokenize_len: impl FnOnce(&str) -> usize,
         max_context: impl FnOnce() -> usize,
     ) -> Result<PreparedChatRequest, ApiError> {
-        let (validated, prompt) = normalize_request_with_context(
+        let (validated, prompt) = normalize_request_with_context_and_budget(
             req,
             GenerationDefaults::standard(default_max_tokens),
             ServeProfile::lattice(model_id, max_tokens_cap).with_vision_support(vision_supported),

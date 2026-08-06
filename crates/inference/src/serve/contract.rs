@@ -445,11 +445,12 @@ pub fn normalize_request(
 /// `check_context` runs after message and sampling validation (including the
 /// resolved `reasoning_budget`, #831) but before stop parsing. It receives
 /// the effective `reasoning_budget` so it can apply the shared full-window
-/// formula (see [`validate_context_window`]). Its returned prompt is paired
-/// with the normalized request so the unified server renders and tokenizes
-/// exactly once. The standalone daemon uses [`normalize_request`] because its
-/// worker performs the prompt-aware context check after tokenization.
-pub fn normalize_request_with_context(
+/// formula (see [`validate_context_window_with_budget`]). Its returned
+/// prompt is paired with the normalized request so the unified server
+/// renders and tokenizes exactly once. The standalone daemon uses
+/// [`normalize_request`] because its worker performs the prompt-aware
+/// context check after tokenization.
+pub fn normalize_request_with_context_and_budget(
     req: &ChatRequest,
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
@@ -460,6 +461,24 @@ pub fn normalize_request_with_context(
     ) -> Result<String, ApiError>,
 ) -> Result<(ValidatedChatRequest, String), ApiError> {
     normalize_request_inner(req, defaults, profile, check_context)
+}
+
+/// No-reasoning-budget form of [`normalize_request_with_context_and_budget`].
+///
+/// Delegates with the reasoning-budget argument dropped from the callback,
+/// preserving the published 2-arg-callback signature.
+pub fn normalize_request_with_context(
+    req: &ChatRequest,
+    defaults: GenerationDefaults,
+    profile: ServeProfile<'_>,
+    check_context: impl FnOnce(&[NormalizedChatMessage], usize) -> Result<String, ApiError>,
+) -> Result<(ValidatedChatRequest, String), ApiError> {
+    normalize_request_with_context_and_budget(
+        req,
+        defaults,
+        profile,
+        |messages, max_tokens, _reasoning_budget| check_context(messages, max_tokens),
+    )
 }
 
 fn normalize_request_inner<C>(
@@ -1162,14 +1181,15 @@ pub fn validate_context_window_with_budget(
     reasoning_budget: Option<usize>,
     max_context: usize,
 ) -> Result<(), ApiError> {
-    let decode_budget = max_tokens.saturating_add(reasoning_budget.unwrap_or(0));
+    let reasoning_budget = reasoning_budget.unwrap_or(0);
+    let decode_budget = max_tokens.saturating_add(reasoning_budget);
     let required = prompt_tokens
         .saturating_add(decode_budget)
         .saturating_add(1);
     if prompt_tokens == 0 || required > max_context {
         return Err(ApiError::BadRequest {
             message: format!(
-                "prompt ({prompt_tokens} tokens) plus max_tokens ({max_tokens}) exceeds model context window ({max_context})"
+                "prompt ({prompt_tokens} tokens) plus max_tokens ({max_tokens}) plus reasoning_budget ({reasoning_budget}) exceeds model context window ({max_context}): {required} tokens required"
             ),
             code: "context_length_exceeded",
         });
@@ -1867,6 +1887,26 @@ mod tests {
             "context_length_exceeded"
         );
         validate_context_window_with_budget(3, 8, Some(4), 16).unwrap();
+    }
+
+    #[test]
+    fn context_window_error_message_names_reasoning_budget_on_reasoning_only_overflow() {
+        // prompt + max_tokens alone fit (3 + 4 + 1 == 8 <= 16), so this
+        // request is only rejected because of the reasoning budget -- the
+        // error text must say so, not just blame prompt/max_tokens (#1324
+        // review finding 4).
+        validate_context_window_with_budget(3, 4, None, 16).unwrap();
+        let err = validate_context_window_with_budget(3, 4, Some(10), 16).unwrap_err();
+        assert_eq!(err.code(), "context_length_exceeded");
+        let message = err.message();
+        assert!(
+            message.contains("reasoning_budget (10)"),
+            "error message must name the reasoning budget: {message}"
+        );
+        assert!(
+            message.contains("18 tokens required"),
+            "error message must name the total required tokens: {message}"
+        );
     }
 
     #[test]

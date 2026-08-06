@@ -658,12 +658,22 @@ mod tests {
 
     #[test]
     fn serving_preprocess_enforces_patch_budget_without_narrowing_embedding_path() {
+        // Exercises the default budget via `preprocess_qwen35_image_inner`
+        // with an explicit `Some(MAX_SERVE_VISION_PATCHES)` rather than
+        // through the public `preprocess_qwen35_image_for_serve` wrapper,
+        // which reads `LATTICE_VISION_MAX_PATCHES` from the real process
+        // environment: a locally set override above 288 would silently
+        // widen the budget this test asserts against and make the "over"
+        // case below spuriously pass.
         let cfg = tiny_cfg();
         let boundary = make_test_png(32, 32); // 16 * 16 = 256 patches
-        assert!(preprocess_qwen35_image_for_serve(&boundary, &cfg).is_ok());
+        assert!(
+            preprocess_qwen35_image_inner(&boundary, &cfg, Some(MAX_SERVE_VISION_PATCHES)).is_ok()
+        );
 
         let over = make_test_png(36, 32); // 18 * 16 = 288 patches
-        let err = preprocess_qwen35_image_for_serve(&over, &cfg).unwrap_err();
+        let err =
+            preprocess_qwen35_image_inner(&over, &cfg, Some(MAX_SERVE_VISION_PATCHES)).unwrap_err();
         assert!(
             matches!(err, VisionError::InvalidConfig(message) if message.contains("serving maximum is 256"))
         );
