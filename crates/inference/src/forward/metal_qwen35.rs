@@ -6254,14 +6254,15 @@ mod inner {
             entry_point: &str,
         ) -> Result<(), crate::error::InferenceError> {
             let (seq_len, fresh) = self.prefill_session_freshness();
-            Self::validate_hidden_prefill_fresh_session(seq_len, fresh).map_err(|_| {
-                crate::error::InferenceError::InvalidInput(format!(
+            if !fresh {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
                     "{entry_point}: requires a fresh session (kv_cache.seq_len == 0 and GDN \
                      recurrent state at its initial condition), found \
                      kv_cache.seq_len={seq_len}; this call always dispatches from position \
                      0. Call reset_state() first to start a new prompt."
-                ))
-            })
+                )));
+            }
+            Ok(())
         }
 
         /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
@@ -6403,14 +6404,16 @@ mod inner {
         /// # Errors
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU dispatch
-        /// when `position` does not equal `kv_cache.seq_len`, or when `position`
-        /// or the next KV-cache row is outside the session capacity. On rejection,
-        /// session state is left unchanged.
+        /// when `token_id >= vocab_size`, when `position` does not equal
+        /// `kv_cache.seq_len`, or when `position` or the next KV-cache row is
+        /// outside the session capacity. On rejection, session state is left
+        /// unchanged.
         pub fn try_forward_step(
             &mut self,
             token_id: u32,
             position: usize,
         ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            self.check_forward_token_id("try_forward_step", token_id)?;
             self.check_forward_step_capacity(position)?;
             self.check_live_cursor("try_forward_step", position)?;
             self.cross_turn_prefix_cache.clear();
@@ -17182,6 +17185,45 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(state.session.kv_cache.seq_len, 2);
             assert_eq!(state.session.position, 2);
             assert!(hidden_b.iter().any(|&value| value != 0.0));
+        }
+
+        #[test]
+        fn try_forward_step_rejects_out_of_vocab_token_id() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            // forward_step's doc promises try_forward_step returns a typed
+            // input error instead of panicking on an out-of-vocab token_id;
+            // this must be rejected before any dispatch, same as the sibling
+            // forward_step_with_hidden guard above.
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let err = state
+                .try_forward_step(cfg.vocab_size as u32, 0)
+                .expect_err("out-of-vocab token_id must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, seq_len_before,
+                "rejection must not advance the KV cache cursor"
+            );
+            assert_eq!(
+                snapshot_kv_bytes(&state),
+                kv_before,
+                "rejection must not write any KV row"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                gdn_before,
+                "rejection must not mutate GDN recurrent state"
+            );
         }
 
         #[test]
