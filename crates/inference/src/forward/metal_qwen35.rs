@@ -6291,22 +6291,33 @@ mod inner {
             Ok(())
         }
 
+        /// The fresh-session predicate: `kv_cache.seq_len == 0 && gdn_state_is_initial()`.
+        /// The ONLY place this predicate is computed — every caller that needs it goes
+        /// through here (or through [`Self::check_hidden_prefill_fresh_session`], which
+        /// wraps it) so a caller can never check `seq_len` without also checking GDN state.
+        fn prefill_session_freshness(&self) -> (usize, bool) {
+            let seq_len = self.session.kv_cache.seq_len;
+            (seq_len, seq_len == 0 && self.gdn_state_is_initial())
+        }
+
+        fn check_hidden_prefill_fresh_session(&self) -> Result<(), crate::error::InferenceError> {
+            let (seq_len, fresh) = self.prefill_session_freshness();
+            Self::validate_hidden_prefill_fresh_session(seq_len, fresh)
+        }
+
         fn check_raw_prefill_fresh_session(
             &self,
             entry_point: &str,
         ) -> Result<(), crate::error::InferenceError> {
-            let seq_len = self.session.kv_cache.seq_len;
-            let gdn_state_is_initial = seq_len == 0 && self.gdn_state_is_initial();
-            Self::validate_hidden_prefill_fresh_session(seq_len, gdn_state_is_initial).map_err(
-                |_| {
-                    crate::error::InferenceError::InvalidInput(format!(
-                        "{entry_point}: requires a fresh session (kv_cache.seq_len == 0 and GDN \
-                         recurrent state at its initial condition), found \
-                         kv_cache.seq_len={seq_len}; this call always dispatches from position \
-                         0. Call reset_state() first to start a new prompt."
-                    ))
-                },
-            )
+            let (seq_len, fresh) = self.prefill_session_freshness();
+            Self::validate_hidden_prefill_fresh_session(seq_len, fresh).map_err(|_| {
+                crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: requires a fresh session (kv_cache.seq_len == 0 and GDN \
+                     recurrent state at its initial condition), found \
+                     kv_cache.seq_len={seq_len}; this call always dispatches from position \
+                     0. Call reset_state() first to start a new prompt."
+                ))
+            })
         }
 
         /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
@@ -6802,9 +6813,7 @@ mod inner {
                 ));
             }
             self.check_forward_token_ids("forward_prefill_with_hidden", token_ids)?;
-            let seq_len = self.session.kv_cache.seq_len;
-            let gdn_state_is_initial = seq_len == 0 && self.gdn_state_is_initial();
-            Self::validate_hidden_prefill_fresh_session(seq_len, gdn_state_is_initial)?;
+            self.check_hidden_prefill_fresh_session()?;
             self.check_forward_range_capacity(0, token_ids.len(), false)?;
             self.cross_turn_prefix_cache.clear();
 
