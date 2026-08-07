@@ -91,11 +91,11 @@ bench_quiet_checkpoint "bench-gate: after measurements"
 echo "UNSUITABLE AS BENCHMARK EVIDENCE: local bench-gate has no run provenance"
 rc=0
 gate_rc=0
-python3 scripts/perf-bench-gate.py \
+"${PYTHON_BIN:?PYTHON_BIN not set - bench_supervise_entry should have exported it}" scripts/perf-bench-gate.py \
     "$inference_root" "$arch-local/lattice-inference:elementwise_cpu_bench" \
     --target lattice-inference:elementwise_cpu_bench \
     --require-measurements || rc=$?
-python3 scripts/perf-bench-gate.py \
+"${PYTHON_BIN:?PYTHON_BIN not set - bench_supervise_entry should have exported it}" scripts/perf-bench-gate.py \
     "$embed_root" "$arch-local/lattice-embed:simd" \
     --target lattice-embed:simd \
     --require-measurements || gate_rc=$?
