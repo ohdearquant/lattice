@@ -2254,11 +2254,19 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
         self.assertIn("-xf quarot-q4.tar", q4_metal_code)
         self.assertIn("LATTICE_QUAROT_ARTIFACT_CONSUMED", q4_metal_code)
         self.assertNotIn("--bin quantize_quarot", q4_metal_code)
+        # The injection gate's filter list is pinned in full, and after the
+        # `--` separator. `cargo test` accepts one positional TESTNAME, so a
+        # multi-term filter written as `--lib a b c` exits 1 at argument
+        # parsing before any test binary is built; only libtest, on the far
+        # side of `--`, ORs multiple filters. Pinning the separator and every
+        # term is what distinguishes the working invocation from that
+        # look-alike, and it makes a change to the selected surface land in
+        # the same commit as the exact-count grep the gate asserts.
         for metal_gate_anchor in (
             "--test quarot_q4_composed_golden",
             '--features "f16,metal-gpu"',
             "LATTICE_METAL_TEST_ENFORCE: '1'",
-            "--lib inject",
+            "-- inject emit_head vision_runtime_preload",
             "--test vision_s5b_e2e_gate_test",
             "LATTICE_VISION_S5B_GREEDY_TOKENS",
             "--bin eval_perplexity --bin quantize_q4",

@@ -1095,17 +1095,21 @@ jobs:
       # the exact-count grep below is 12 (8 `inject`-filter matches + 2
       # `emit_head`-filter matches + 2 `vision_runtime_preload`-filter
       # matches), not 5 -- update it in the same PR if the matched test
-      # surface changes. `cargo test`'s libtest harness ORs multiple filter
-      # arguments together (verified locally with `--list inject emit_head
-      # vision_runtime_preload`), so one step covers all three groups.
+      # surface changes. libtest ORs multiple filter arguments together, so
+      # one step covers all three groups, but the filters MUST be passed to
+      # libtest after `--`: `cargo test` itself accepts a single positional
+      # TESTNAME (`cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]`) and exits
+      # 1 with `error: unexpected argument` on the second one, before any
+      # test binary is built or run.
       - name: Run MP2 Metal injection gate (fail-closed)
         if: ${{ !cancelled() }}
         env:
           LATTICE_METAL_TEST_ENFORCE: '1'
         run: |
           if cargo test --release -p lattice-inference --features f16,metal-gpu \
-            --lib inject emit_head vision_runtime_preload \
-            -- --nocapture --test-threads=1 > vision-mp2-inject-gate.log 2>&1
+            --lib \
+            -- inject emit_head vision_runtime_preload \
+            --nocapture --test-threads=1 > vision-mp2-inject-gate.log 2>&1
           then
             cat vision-mp2-inject-gate.log
           else
