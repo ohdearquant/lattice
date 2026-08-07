@@ -2,7 +2,7 @@
 //!
 //! Measures the real final-head kernels the decode path dispatches:
 //! - quant path: Q8 tied-f16 wide GEMV vs Q4 GEMV
-//! - route: full logits, block-argmax, block-top-k for K in {8, 16, 40, 64}
+//! - route: full logits, block-argmax, block-top-k for K in {8, 16, 40, 50, 64}
 //!
 //! Real measurement only compiles/runs with `--features metal-gpu,f16,bench-internals`
 //! on macOS. Default features compile a clean skip so the default CI jobs (no
@@ -62,7 +62,7 @@ mod real {
         route: LmHeadBenchRoute,
     }
 
-    const ROUTES: [RouteCase; 6] = [
+    const ROUTES: [RouteCase; 7] = [
         RouteCase {
             id: "full",
             route: LmHeadBenchRoute::Full,
@@ -82,6 +82,10 @@ mod real {
         RouteCase {
             id: "block_topk_k40",
             route: LmHeadBenchRoute::BlockTopK { local_k: 40 },
+        },
+        RouteCase {
+            id: "block_topk_k50",
+            route: LmHeadBenchRoute::BlockTopK { local_k: 50 },
         },
         RouteCase {
             id: "block_topk_k64",

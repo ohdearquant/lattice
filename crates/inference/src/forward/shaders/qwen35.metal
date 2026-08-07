@@ -1978,7 +1978,10 @@ kernel void lm_head_block_topk_q4(
     }
 }
 
-// ===== Hierarchical k=50 SIMD-Group Tournament =====
+// ===== Legacy Hierarchical k=50 SIMD-Group Tournament =====
+// Retained as source for the standalone topk_readback experiment; production
+// no longer precompiles or routes these kernels after the Stage-1 LOCAL_K=50
+// variant replaced the full-logit path in issue #546.
 // Two-stage exact selection without bitonic sort or threadgroup barriers in the
 // selection loop.  Only one threadgroup barrier is used (between stage 1 and 2).
 //

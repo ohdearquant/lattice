@@ -1238,11 +1238,7 @@ mod inner {
         gemm_q8: ComputePipelineState,
         gemm_q8_tiled: Option<ComputePipelineState>,
         topk_merge_pass: ComputePipelineState,
-        argmax_first: ComputePipelineState,
         argmax_merge: ComputePipelineState,
-        // Hierarchical k=50 SIMD-group tournament kernels (R2)
-        topk_select50_first: ComputePipelineState,
-        topk_select50_merge: ComputePipelineState,
         // Flash decode partitioned kernels (H3)
         decode_attn_partial: ComputePipelineState,
         decode_attn_reduce: ComputePipelineState,
@@ -1275,8 +1271,8 @@ mod inner {
         prefill_attention_batched_f16: ComputePipelineState,
         // lm_head two-stage block top-k (issue #171): Stage 1 fused GEMV +
         // block-local argmax/top-k. Indexed by LM_HEAD_LOCAL_KS position.
-        lm_head_block_topk_f16: [ComputePipelineState; 5],
-        lm_head_block_topk_q4: [ComputePipelineState; 5],
+        lm_head_block_topk_f16: [ComputePipelineState; LM_HEAD_LOCAL_KS.len()],
+        lm_head_block_topk_q4: [ComputePipelineState; LM_HEAD_LOCAL_KS.len()],
     }
 
     /// Vocab rows owned by one Stage-1 lm_head block-top-k threadgroup.
@@ -1285,7 +1281,10 @@ mod inner {
     pub(crate) const LM_HEAD_ROWS_PER_TG: u32 = 256;
     /// LOCAL_K values with precompiled Stage-1 pipeline variants. Index 0 is
     /// the greedy (argmax) variant; the rest back `GpuTopkRoute::BlockTopK`.
-    pub(crate) const LM_HEAD_LOCAL_KS: [u32; 5] = [1, 8, 16, 40, 64];
+    pub(crate) const LM_HEAD_LOCAL_KS: [u32; 6] = [1, 8, 16, 40, 50, 64];
+
+    #[cfg(test)]
+    static LM_HEAD_BLOCK_K50_PATH_PROOF: AtomicU64 = AtomicU64::new(0);
 
     fn lm_head_local_k_slot(k: u32) -> Option<usize> {
         LM_HEAD_LOCAL_KS
@@ -1299,26 +1298,13 @@ mod inner {
 
     /// Which GPU kernel path handles top-k for the current generate call.
     ///
-    /// Computed once by `choose_gpu_topk_route`; stored in `compact_route` so
-    /// the dispatch path doesn't re-evaluate env vars per token.
+    /// Computed once by `choose_gpu_block_topk_route`; stored in
+    /// `compact_route` so the dispatch path doesn't re-evaluate env vars per
+    /// token.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum GpuTopkRoute {
         /// CPU fallback — no GPU top-k dispatch; `compact_topk` stays 0.
         CpuFallback,
-        /// k=1 two-stage simdgroup argmax — reserved for a future faster kernel.
-        /// R1 bench (2026-04-26, M2 Max): CPU NEON 89 µs vs GPU 240 µs (2.70×); dead path.
-        #[allow(dead_code)]
-        Argmax,
-        /// k=2..=64 simdgroup selection — reserved for a future non-bitonic kernel.
-        /// Bench prototype failed gate by 2.4-2.8×; not reachable from production.
-        #[allow(dead_code)]
-        Select64,
-        /// k=65..=256 experimental — reserved for a future non-bitonic kernel.
-        #[allow(dead_code)]
-        Select256Experimental,
-        /// k=50 hierarchical SIMD-group tournament (two-stage, no bitonic sort).
-        /// Requires LATTICE_COMPACT_TOPK and LATTICE_COMPACT_TOPK_SELECT env vars.
-        HierarchicalK50,
         /// Issue #171: Stage-1 fused GEMV + block-local argmax, Stage-2 global
         /// reduce via the existing `argmax_merge` kernel. Greedy (k<=1) only.
         BlockArgmax,
@@ -1328,50 +1314,35 @@ mod inner {
         BlockTopK { local_k: u32 },
     }
 
-    /// Decide which GPU top-k route to take for a given `top_k` and env flags.
-    ///
-    /// `compact_env`: `LATTICE_COMPACT_TOPK` is set.
-    /// `selection_env`: `LATTICE_COMPACT_TOPK_SELECT` is set (unlocks k>1 routes).
-    fn choose_gpu_topk_route(top_k: usize, compact_env: bool, selection_env: bool) -> GpuTopkRoute {
-        // R1 benchmark (2026-04-26, M2 Max, vocab=248,320):
-        //   CPU NEON argmax k=1 = 89 µs; GPU argmax k=1 = 240 µs (2.70×, t=137, p<<0.0001).
-        //   GPU k>1 (bitonic/select64) = 811–940 µs (2.5-3.0× vs CPU 314–366 µs).
-        //   Hierarchical k=50 tournament under evaluation (R2, gated by both env flags).
-        if compact_env && selection_env && top_k == 50 {
-            return GpuTopkRoute::HierarchicalK50;
-        }
-        GpuTopkRoute::CpuFallback
-    }
-
     /// Decide whether the issue #171 lm_head two-stage block-top-k path
-    /// applies. Tried before `choose_gpu_topk_route`; falls back to
-    /// `GpuTopkRoute::CpuFallback` (which the caller then re-resolves via the
-    /// older function) when this round's compiled LOCAL_K set or top-p exactness
-    /// requirement rule it out.
+    /// applies. Falls back to `GpuTopkRoute::CpuFallback` when the compiled
+    /// LOCAL_K set or the route's opt-in gates rule it out.
     ///
     /// `top_p < 1.0` requires `approx_topp_env` (`LATTICE_COMPACT_TOPP_APPROX`):
     /// nucleus sampling over the compact top-k candidates is NOT equivalent to
     /// full-vocab nucleus sampling once the tail is truncated, so exact mode is
     /// the default and the approximation is opt-in only.
     ///
-    /// `top_k == 50` intentionally stays out of
-    /// `LM_HEAD_LOCAL_KS` and therefore falls through to `CpuFallback` here, so
-    /// the caller re-resolves it via `choose_gpu_topk_route`'s `HierarchicalK50`
-    /// path, which still does a full-logit GEMV before its compact dispatch.
-    /// This round's threadgroup-reduction claim (<=1,500 greedy / <=2,000
-    /// top-k<=64) is scoped to the precompiled `LM_HEAD_LOCAL_KS` set
-    /// `{1, 8, 16, 40, 64}`; adding a `local_k=50` Stage-1 pipeline variant
-    /// (new MSL function constant, precompile, agreement/bench coverage) is
-    /// out of scope for this PR and tracked as follow-up work rather than
-    /// silently claimed here.
+    /// `top_k == 50` preserves the older route's two opt-in gates:
+    /// `LATTICE_COMPACT_TOPK` and `LATTICE_COMPACT_TOPK_SELECT`. Its exact
+    /// Stage-1 local top-50 contains every candidate the sampler would retain
+    /// before applying top-p, so it does not need the approximate-top-p gate.
     fn choose_gpu_block_topk_route(
         top_k: usize,
         top_p: f32,
         compact_env: bool,
+        selection_env: bool,
         approx_topp_env: bool,
     ) -> GpuTopkRoute {
         if !compact_env {
             return GpuTopkRoute::CpuFallback;
+        }
+        if top_k == 50 {
+            return if selection_env {
+                GpuTopkRoute::BlockTopK { local_k: 50 }
+            } else {
+                GpuTopkRoute::CpuFallback
+            };
         }
         if top_p < 1.0 && !approx_topp_env {
             return GpuTopkRoute::CpuFallback;
@@ -1419,17 +1390,13 @@ mod inner {
         history_is_empty: bool,
         environment: SamplingRouteEnvironment,
     ) -> SamplingRoutePlan {
-        let block_route = choose_gpu_block_topk_route(
+        let route = choose_gpu_block_topk_route(
             gen_cfg.top_k,
             gen_cfg.top_p,
             environment.compact,
+            environment.selection,
             environment.approximate_top_p,
         );
-        let route = if block_route != GpuTopkRoute::CpuFallback {
-            block_route
-        } else {
-            choose_gpu_topk_route(gen_cfg.top_k, environment.compact, environment.selection)
-        };
         // This uniform `is_none()` check is not one policy for all three
         // callers: direct and prefix-cache generation already rejected
         // `logprobs: Some(_)` in their own `check_logprobs_not_set` preflight
@@ -1481,8 +1448,8 @@ mod inner {
 
     /// Resolves a `compact_route` to `(local_k, precompiled Stage-1 pipeline
     /// slot)`, or `None` if the route isn't a block-top-k route at all
-    /// (`Argmax`/`Select64`/`HierarchicalK50`/`CpuFallback`) **or** if
-    /// `local_k` has no precompiled Stage-1 pipeline variant.
+    /// (`CpuFallback`) **or** if `local_k` has no precompiled Stage-1
+    /// pipeline variant.
     ///
     /// `choose_gpu_block_topk_route` only ever constructs `BlockArgmax` /
     /// `BlockTopK { local_k }` with `local_k` in `LM_HEAD_LOCAL_KS`, so the
@@ -2652,13 +2619,13 @@ mod inner {
             .map_err(|e| format!("pipeline for '{name}' LOCAL_K={local_k} failed: {e}"))
     }
 
-    /// Compile all five LOCAL_K variants of a Stage-1 lm_head block-top-k kernel.
+    /// Compile every LOCAL_K variant of a Stage-1 lm_head block-top-k kernel.
     fn make_lm_head_block_pipelines(
         device: &Device,
         library: &Library,
         name: &str,
         hidden: u32,
-    ) -> Result<[ComputePipelineState; 5], String> {
+    ) -> Result<[ComputePipelineState; LM_HEAD_LOCAL_KS.len()], String> {
         let mut out: Vec<ComputePipelineState> = Vec::with_capacity(LM_HEAD_LOCAL_KS.len());
         for &local_k in LM_HEAD_LOCAL_KS.iter() {
             out.push(make_lm_head_block_pipeline(
@@ -2795,10 +2762,7 @@ mod inner {
             gemm_q8: make_pipeline("gemm_q8")?,
             gemm_q8_tiled: make_optional_gemm_q8_tiled(),
             topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
-            argmax_first: make_pipeline("logits_argmax_first")?,
             argmax_merge: make_pipeline("logits_argmax_merge")?,
-            topk_select50_first: make_pipeline("logits_topk_select50_first")?,
-            topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
             decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
             decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
             lora_gemv_a: make_pipeline("lora_gemv_a")?,
@@ -7701,13 +7665,7 @@ mod inner {
                     );
                 }
 
-                // Append top-k in the same encoder when compact mode is active (last-token only).
-                if !all_positions && self.session.compact_topk > 0 {
-                    let k = self.session.compact_topk as u32;
-                    Some(self.dispatch_topk_enc(enc, cfg.vocab_size as u32, k))
-                } else {
-                    None
-                }
+                None
             };
 
             enc.end_encoding();
@@ -9937,14 +9895,7 @@ mod inner {
                 prof.final_us += t0.elapsed().as_micros();
             }
 
-            // If compact mode, append top-k kernels to the same encoder before commit.
-            // This avoids a second command-buffer round-trip (~18 µs overhead).
-            if self.session.compact_topk > 0 {
-                let k = self.session.compact_topk as u32;
-                Some(self.dispatch_topk_enc(enc, cfg.vocab_size as u32, k))
-            } else {
-                None
-            }
+            None
         }
 
         // -----------------------------------------------------------------------
@@ -16099,106 +16050,46 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // ── Route-logic unit tests (pure Rust, no Metal device needed) ────────
 
         #[test]
-        fn sampling_route_legacy_helper_all_cases() {
-            // k=0 → always CPU
-            assert_eq!(
-                choose_gpu_topk_route(0, true, true),
-                GpuTopkRoute::CpuFallback,
-                "k=0"
-            );
-            // compact_env=false → always CPU
-            assert_eq!(
-                choose_gpu_topk_route(1, false, false),
-                GpuTopkRoute::CpuFallback,
-                "k=1, compact_env=false"
-            );
-            assert_eq!(
-                choose_gpu_topk_route(50, false, true),
-                GpuTopkRoute::CpuFallback,
-                "k=50, compact_env=false"
-            );
-            // k=1, compact_env=true → CpuFallback (GPU 2.70× slower than CPU NEON after R1)
-            assert_eq!(
-                choose_gpu_topk_route(1, true, false),
-                GpuTopkRoute::CpuFallback,
-                "k=1, compact_env=true, no select"
-            );
-            assert_eq!(
-                choose_gpu_topk_route(1, true, true),
-                GpuTopkRoute::CpuFallback,
-                "k=1, compact_env=true, select"
-            );
-            // k=2..=64, compact_env=true, no selection_env → CpuFallback
-            for k in [2usize, 10, 50, 64] {
-                assert_eq!(
-                    choose_gpu_topk_route(k, true, false),
-                    GpuTopkRoute::CpuFallback,
-                    "k={k}, no LATTICE_COMPACT_TOPK_SELECT"
-                );
-            }
-            // k=50 with both env flags → HierarchicalK50 (R2 experimental).
-            assert_eq!(
-                choose_gpu_topk_route(50, true, true),
-                GpuTopkRoute::HierarchicalK50,
-                "k=50 with both env flags must use HierarchicalK50"
-            );
-            // Other k>1 values must not enter any GPU route.
-            for k in [2usize, 10, 49, 51, 64, 65, 128, 256] {
-                assert_eq!(
-                    choose_gpu_topk_route(k, true, true),
-                    GpuTopkRoute::CpuFallback,
-                    "k={k} must not enter any GPU top-k route"
-                );
-            }
-            // k>256 → always CpuFallback
-            assert_eq!(
-                choose_gpu_topk_route(257, true, true),
-                GpuTopkRoute::CpuFallback,
-                "k=257"
-            );
-            assert_eq!(
-                choose_gpu_topk_route(1000, true, true),
-                GpuTopkRoute::CpuFallback,
-                "k=1000"
-            );
-        }
-
-        #[test]
         fn sampling_route_block_helper_gate() {
             assert_eq!(
-                choose_gpu_block_topk_route(8, 0.9, true, false),
+                choose_gpu_block_topk_route(8, 0.9, true, false, false),
                 GpuTopkRoute::CpuFallback,
                 "top_p<1.0 without the approx gate must stay exact"
             );
             assert_eq!(
-                choose_gpu_block_topk_route(8, 0.9, true, true),
+                choose_gpu_block_topk_route(8, 0.9, true, false, true),
                 GpuTopkRoute::BlockTopK { local_k: 8 },
                 "top_p<1.0 WITH the explicit approx gate may take the block route"
             );
             assert_eq!(
-                choose_gpu_block_topk_route(0, 1.0, true, false),
+                choose_gpu_block_topk_route(0, 1.0, true, false, false),
                 GpuTopkRoute::CpuFallback,
                 "top_k=0 means top-k DISABLED (full-distribution sampling), \
                  not greedy; BlockArgmax here would collapse sampling to top-1"
             );
             assert_eq!(
-                choose_gpu_block_topk_route(1, 1.0, true, false),
+                choose_gpu_block_topk_route(1, 1.0, true, false, false),
                 GpuTopkRoute::BlockArgmax
             );
             for &k in &[8u32, 16, 40, 64] {
                 assert_eq!(
-                    choose_gpu_block_topk_route(k as usize, 1.0, true, false),
+                    choose_gpu_block_topk_route(k as usize, 1.0, true, false, false),
                     GpuTopkRoute::BlockTopK { local_k: k },
                     "k={k} must map to BlockTopK"
                 );
             }
             assert_eq!(
-                choose_gpu_block_topk_route(50, 1.0, true, false),
-                GpuTopkRoute::CpuFallback,
-                "k=50 has no precompiled Stage-1 variant; must fall back exact"
+                choose_gpu_block_topk_route(50, 0.9, true, true, false),
+                GpuTopkRoute::BlockTopK { local_k: 50 },
+                "k=50 with both legacy opt-in gates must use Stage-1 BlockTopK"
             );
             assert_eq!(
-                choose_gpu_block_topk_route(8, 1.0, false, false),
+                choose_gpu_block_topk_route(50, 1.0, true, false, true),
+                GpuTopkRoute::CpuFallback,
+                "k=50 without LATTICE_COMPACT_TOPK_SELECT must stay exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 1.0, false, false, false),
                 GpuTopkRoute::CpuFallback,
                 "LATTICE_COMPACT_TOPK unset must stay exact regardless of k"
             );
@@ -16222,12 +16113,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
-        fn sampling_route_plan_composes_block_first_then_legacy_fallback() {
+        fn sampling_route_plan_composes_every_block_topk_variant() {
             for (top_k, expected_route, expected_topk) in [
                 (1, GpuTopkRoute::BlockArgmax, 1),
                 (8, GpuTopkRoute::BlockTopK { local_k: 8 }, 8),
                 (16, GpuTopkRoute::BlockTopK { local_k: 16 }, 16),
                 (40, GpuTopkRoute::BlockTopK { local_k: 40 }, 40),
+                (50, GpuTopkRoute::BlockTopK { local_k: 50 }, 50),
                 (64, GpuTopkRoute::BlockTopK { local_k: 64 }, 64),
             ] {
                 let plan = plan_sampling_route(
@@ -16245,20 +16137,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     "top_k={top_k}"
                 );
             }
-
-            let legacy_plan = plan_sampling_route(
-                &compact_sampling_config(50),
-                false,
-                compact_sampling_environment(),
-            );
-            assert_eq!(
-                legacy_plan,
-                SamplingRoutePlan {
-                    use_compact: true,
-                    compact_route: GpuTopkRoute::HierarchicalK50,
-                    compact_topk: 50,
-                }
-            );
         }
 
         /// `plan_sampling_route` no longer takes a caller-distinguishing logprobs
@@ -23204,6 +23082,55 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
+        #[test]
+        fn lm_head_block_topk50_executes_and_reports_path() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!("[METAL_LM_HEAD_K50_PATH] supported=false reason=no_metal_device");
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let route = choose_gpu_block_topk_route(50, 0.9, true, true, false);
+            assert_eq!(
+                route,
+                GpuTopkRoute::BlockTopK { local_k: 50 },
+                "the default sampler's top_k=50/top_p=0.9 must take the Stage-1 route \
+                 when both existing compact-selection gates are enabled"
+            );
+
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            LM_HEAD_BLOCK_K50_PATH_PROOF.store(0, Ordering::Relaxed);
+            let mut state = MetalQwen35State::new(&weights, &cfg, 8)
+                .expect("K=50 Stage-1 pipeline variant must compile");
+            state.session.compact_route = route;
+            state.session.compact_topk = 50;
+            let logits = state.forward_step(3, 0);
+            assert!(
+                logits.is_empty(),
+                "K=50 block route must return compact candidates, not full logits"
+            );
+            assert_eq!(
+                state.session.compact_result.len(),
+                50,
+                "K=50 block route must return exactly 50 candidates"
+            );
+            let dispatches = LM_HEAD_BLOCK_K50_PATH_PROOF.load(Ordering::Relaxed);
+            assert_eq!(
+                dispatches, 1,
+                "K=50 test must execute exactly one Stage-1 dispatch"
+            );
+            eprintln!(
+                "[METAL_LM_HEAD_K50_PATH] supported=true route=block_topk local_k=50 \
+                 stage1_dispatches={dispatches} candidates={}",
+                state.session.compact_result.len()
+            );
+        }
+
         // ===================================================================
         // Mutation-sensitive correctness tests for
         // the lm_head two-stage block-top-k path (issue #171).
@@ -23296,6 +23223,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             idx
         }
 
+        fn requested_lm_head_topk_ks() -> Vec<usize> {
+            const ALL: [usize; 5] = [8, 16, 40, 50, 64];
+            match std::env::var("LATTICE_TEST_TOPK_K") {
+                Ok(raw) => {
+                    let k: usize = raw.parse().expect("LATTICE_TEST_TOPK_K must be an integer");
+                    assert!(
+                        ALL.contains(&k),
+                        "LATTICE_TEST_TOPK_K={k} is unsupported; expected one of {ALL:?}"
+                    );
+                    vec![k]
+                }
+                Err(_) => ALL.to_vec(),
+            }
+        }
+
         /// Adversarial distribution: every
         /// global top-K token clusters inside ONE Stage-1 tile. Proves Stage 1
         /// emits a true per-tile top-`local_k`, not merely a per-tile argmax
@@ -23342,7 +23284,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let full_logits = baseline.forward_step(0, 0);
             assert_eq!(full_logits.len(), vocab);
 
-            for &k in &[8usize, 16, 40, 64] {
+            for &k in &[8usize, 16, 40, 50, 64] {
                 let expected: std::collections::HashSet<u32> =
                     cpu_topk_token_ids(&full_logits, k).into_iter().collect();
                 // Sanity: the adversarial construction must actually cluster
@@ -25093,11 +25035,14 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
-        /// Acceptance test: top-k SET agreement 100% for K in {8,16,40,64} vs. the
-        /// full-logit CPU oracle, on real checkpoint positions (the
+        /// Acceptance test: top-k SET agreement 100% for K in
+        /// {8,16,40,50,64} vs. the full-logit CPU oracle, on real checkpoint
+        /// positions (the
         /// clustered-tile adversarial case is covered separately by
         /// `lm_head_block_topk_clustered_single_tile_set_agreement`).
-        /// Overridable via `LATTICE_TEST_TOPK_POSITIONS`.
+        /// Position count is overridable via `LATTICE_TEST_TOPK_POSITIONS`;
+        /// `LATTICE_TEST_TOPK_K` can select one supported K for a targeted
+        /// local run while the default continues to cover every variant.
         #[test]
         fn lm_head_real_checkpoint_topk_set_agreement() {
             let Some(_) = Device::system_default() else {
@@ -25114,7 +25059,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .unwrap_or(500);
             let reset_every = 64usize;
             let vocab = model.config().vocab_size;
-            let ks = [8usize, 16, 40, 64];
+            let ks = requested_lm_head_topk_ks();
 
             let mut baseline = MetalQwen35State::new(model.weights(), model.config(), 128)
                 .expect("baseline real-checkpoint state");
@@ -25132,7 +25077,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
 
             let mut rng: u64 = 0xFEED_FACE_C0FF_EE00;
-            let mut accepted_ties = [0usize; 4];
+            let mut accepted_ties = vec![0usize; ks.len()];
             let mut pos_in_window = 0usize;
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
@@ -25526,9 +25471,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         /// Q4 counterpart of `lm_head_real_checkpoint_topk_set_agreement`
         /// (issue #171 Task 3). Reduced default position count (100 vs. 500)
-        /// to bound the cost of the five separate `from_q4_dir` loads
-        /// (baseline + one blocked state per K); override via
-        /// `LATTICE_TEST_Q4_TOPK_POSITIONS`.
+        /// to bound the cost of the six separate `from_q4_dir` loads
+        /// (baseline + one blocked state per K); override position count via
+        /// `LATTICE_TEST_Q4_TOPK_POSITIONS`. `LATTICE_TEST_TOPK_K` can select
+        /// one supported K for a targeted local run.
         #[test]
         fn lm_head_q4_real_checkpoint_topk_set_agreement() {
             let Some(_) = Device::system_default() else {
@@ -25547,7 +25493,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let vocab = cfg.vocab_size;
             let max_cache_len = 128usize;
             let tokenizer_path = std::path::Path::new("/dev/null");
-            let ks = [8usize, 16, 40, 64];
+            let ks = requested_lm_head_topk_ks();
 
             let mut baseline =
                 MetalQwen35State::from_q4_dir(&q4_dir, tokenizer_path, &cfg, max_cache_len)
@@ -25566,7 +25512,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
 
             let mut rng: u64 = 0xFEED_FACE_C0FF_EE00;
-            let mut accepted_ties = [0usize; 4];
+            let mut accepted_ties = vec![0usize; ks.len()];
             let mut pos_in_window = 0usize;
             for step in 0..num_positions {
                 if pos_in_window >= reset_every {
