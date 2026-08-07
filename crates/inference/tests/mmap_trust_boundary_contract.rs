@@ -1,10 +1,15 @@
 //! Contract test for #1368: every site in this crate that constructs a
 //! memory map from a checkpoint file (`memmap2::Mmap::map(&file)` or
-//! `memmap2::MmapOptions::new().map(&file)`) must first call one of this
-//! crate's two mmap trust-boundary chokepoints --
-//! [`lattice_inference`]'s `weights::mmap_trust::open_trusted_mmap_file` or
-//! `reject_if_open_mmap_file_untrusted` -- in the same enclosing function, or
-//! carry an explicit, reviewed [`MmapConstructionExemption`] naming why not.
+//! `memmap2::MmapOptions::new().map(&file)`) must call one of this crate's
+//! two mmap trust-boundary chokepoints -- [`lattice_inference`]'s
+//! `weights::mmap_trust::open_trusted_mmap_file` or
+//! `reject_if_open_mmap_file_untrusted` -- **earlier in the same enclosing
+//! function, on a path that necessarily executes before the construction
+//! call** (see [`walk_expr`]'s doc comment for exactly what that does and
+//! does not cover), or carry an explicit, reviewed
+//! [`MmapConstructionExemption`] naming why not. A guard call that runs
+//! after the construction call, or only on a sibling branch that does not
+//! run before it, does not satisfy this.
 //!
 //! Modeled on `metal_measurement_lock_contract.rs`'s construction-site
 //! inventory: a site is named by the program structure enclosing it
@@ -19,8 +24,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use syn::visit::{self, Visit};
-use syn::{Expr, ExprCall, ExprMethodCall, ImplItem, Item};
+use syn::{Block, Expr, ExprCall, ExprMethodCall, ImplItem, Item, Stmt};
 
 /// Free functions this crate's mmap trust boundary exposes. A call to either
 /// one, anywhere in the function enclosing a construction site, counts as
@@ -141,57 +145,245 @@ fn collect_functions<'a>(
     }
 }
 
-/// Finds every `Mmap::map(..)` / `MmapOptions::new().map(..)` construction
-/// call in a function body, in visitation order, labeled by which of the two
-/// idioms matched.
-#[derive(Default)]
-struct MmapConstructionFinder {
-    sites: Vec<&'static str>,
+/// Whether an `Expr::Call` node calls one of [`GUARD_FUNCTION_NAMES`].
+fn is_guard_call(call: &ExprCall) -> bool {
+    matches!(&*call.func, Expr::Path(callee)
+    if callee.path.segments.last().is_some_and(|segment| {
+        GUARD_FUNCTION_NAMES.contains(&segment.ident.to_string().as_str())
+    }))
 }
 
-impl<'ast> Visit<'ast> for MmapConstructionFinder {
-    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
-        if let Expr::Path(callee) = &*node.func
-            && path_ends_with(&callee.path, &["Mmap", "map"])
-        {
-            self.sites.push("Mmap::map()");
-        }
-        visit::visit_expr_call(self, node);
-    }
+/// Whether an `Expr::Call` node is the free-function `Mmap::map(..)` mmap
+/// construction idiom.
+fn is_mmap_map_call(call: &ExprCall) -> bool {
+    matches!(&*call.func, Expr::Path(callee) if path_ends_with(&callee.path, &["Mmap", "map"]))
+}
 
-    fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
-        if node.method == "map"
-            && let Expr::Call(receiver_call) = &*node.receiver
-            && receiver_call.args.is_empty()
-            && let Expr::Path(receiver_callee) = &*receiver_call.func
-            && path_ends_with(&receiver_callee.path, &["MmapOptions", "new"])
-        {
-            self.sites.push("MmapOptions::new().map()");
+/// Whether an `Expr::MethodCall` node is the `MmapOptions::new().map(..)`
+/// mmap construction idiom.
+fn is_mmap_options_map_call(method_call: &ExprMethodCall) -> bool {
+    method_call.method == "map"
+        && matches!(&*method_call.receiver, Expr::Call(receiver_call)
+            if receiver_call.args.is_empty()
+                && matches!(&*receiver_call.func, Expr::Path(receiver_callee)
+                    if path_ends_with(&receiver_callee.path, &["MmapOptions", "new"])))
+}
+
+/// A discovered mmap construction call, in the order [`walk_expr`] visits
+/// it, paired with whether a guard call was seen on a path that necessarily
+/// executes before it.
+struct SiteObservation {
+    selector: &'static str,
+    dominated_by_guard: bool,
+}
+
+/// Walks an expression in source order, threading a `guarded` flag that
+/// becomes (and stays) `true` once a guard call has been seen on a path that
+/// *necessarily* executes before the current point -- the "first" the module
+/// doc comment requires. This is a textual/structural approximation of
+/// control-flow dominance, not a real control-flow-graph analysis; it is
+/// sufficient for this crate's loaders, which are straight-line
+/// open-then-map functions, but the following cases are explicitly NOT
+/// treated as dominance:
+///
+/// - **`if`/`else` branches and `match` arms.** A guard call inside one arm
+///   is scoped to that arm alone: it is never credited to a sibling arm, nor
+///   to the statements that follow the conditional, because the *other* arm
+///   might have run instead. This is what catches "one branch guards,
+///   another maps unguarded". A conditional that guards on *every* arm is
+///   (conservatively) still not credited outside the conditional -- doing
+///   that soundly needs real control-flow reachability, which this AST walk
+///   does not build.
+/// - **Loop bodies** (`loop`/`while`/`for`). A loop may run zero times, so a
+///   guard call inside one is never credited to code after the loop, and a
+///   site inside the loop only sees guard calls from strictly before the
+///   loop, never from an earlier iteration of the same loop.
+/// - **Closures and `async`/`const` blocks.** Their bodies run later (or not
+///   at all) relative to the enclosing function, so each starts its own,
+///   independently threaded `guarded = false` and never reads or writes the
+///   surrounding flow's flag in either direction.
+/// - **Early `return`/`break`.** This walk has no notion of unreachable code
+///   after a diverging expression: it keeps threading `guarded` through the
+///   statements that textually follow one in the same block. A guard call
+///   placed after an unconditional `return` would (incorrectly) still be
+///   credited to sites after it, even though that guard call can never
+///   actually run. None of this crate's loaders do that; it is recorded here
+///   as a known gap rather than silently assumed away.
+///
+/// What DOES count as "necessarily executes before" and so threads the flag
+/// straight through: sequential statements in the same block, `unsafe { .. }`
+/// and bare `{ .. }` blocks, `?`, casts, references, field/index access, and
+/// method-call/call receivers and arguments (in left-to-right evaluation
+/// order), and binary/assignment operands.
+fn walk_expr(expr: &Expr, guarded_in: bool, sites: &mut Vec<SiteObservation>) -> bool {
+    match expr {
+        Expr::Block(block) => walk_block(&block.block, guarded_in, sites),
+        Expr::Unsafe(block) => walk_block(&block.block, guarded_in, sites),
+        Expr::Call(call) => {
+            let mut guarded = walk_expr(&call.func, guarded_in, sites);
+            for arg in &call.args {
+                guarded = walk_expr(arg, guarded, sites);
+            }
+            if is_mmap_map_call(call) {
+                sites.push(SiteObservation {
+                    selector: "Mmap::map()",
+                    dominated_by_guard: guarded,
+                });
+            }
+            if is_guard_call(call) {
+                guarded = true;
+            }
+            guarded
         }
-        visit::visit_expr_method_call(self, node);
+        Expr::MethodCall(method_call) => {
+            let mut guarded = walk_expr(&method_call.receiver, guarded_in, sites);
+            for arg in &method_call.args {
+                guarded = walk_expr(arg, guarded, sites);
+            }
+            if is_mmap_options_map_call(method_call) {
+                sites.push(SiteObservation {
+                    selector: "MmapOptions::new().map()",
+                    dominated_by_guard: guarded,
+                });
+            }
+            guarded
+        }
+        Expr::If(if_expr) => {
+            let guarded = walk_expr(&if_expr.cond, guarded_in, sites);
+            walk_block(&if_expr.then_branch, guarded, sites);
+            if let Some((_, else_expr)) = &if_expr.else_branch {
+                walk_expr(else_expr, guarded, sites);
+            }
+            guarded
+        }
+        Expr::Match(match_expr) => {
+            let guarded = walk_expr(&match_expr.expr, guarded_in, sites);
+            for arm in &match_expr.arms {
+                if let Some((_, guard_cond)) = &arm.guard {
+                    walk_expr(guard_cond, guarded, sites);
+                }
+                walk_expr(&arm.body, guarded, sites);
+            }
+            guarded
+        }
+        Expr::Loop(loop_expr) => {
+            walk_block(&loop_expr.body, guarded_in, sites);
+            guarded_in
+        }
+        Expr::While(while_expr) => {
+            let guarded = walk_expr(&while_expr.cond, guarded_in, sites);
+            walk_block(&while_expr.body, guarded, sites);
+            guarded_in
+        }
+        Expr::ForLoop(for_loop) => {
+            let guarded = walk_expr(&for_loop.expr, guarded_in, sites);
+            walk_block(&for_loop.body, guarded, sites);
+            guarded_in
+        }
+        Expr::Closure(closure) => {
+            walk_expr(&closure.body, false, sites);
+            guarded_in
+        }
+        Expr::Try(try_expr) => walk_expr(&try_expr.expr, guarded_in, sites),
+        Expr::Paren(paren) => walk_expr(&paren.expr, guarded_in, sites),
+        Expr::Group(group) => walk_expr(&group.expr, guarded_in, sites),
+        Expr::Reference(reference) => walk_expr(&reference.expr, guarded_in, sites),
+        Expr::Unary(unary) => walk_expr(&unary.expr, guarded_in, sites),
+        Expr::Cast(cast) => walk_expr(&cast.expr, guarded_in, sites),
+        Expr::Field(field) => walk_expr(&field.base, guarded_in, sites),
+        Expr::Await(await_expr) => walk_expr(&await_expr.base, guarded_in, sites),
+        Expr::Let(let_expr) => walk_expr(&let_expr.expr, guarded_in, sites),
+        Expr::Return(return_expr) => match &return_expr.expr {
+            Some(inner) => walk_expr(inner, guarded_in, sites),
+            None => guarded_in,
+        },
+        Expr::Break(break_expr) => match &break_expr.expr {
+            Some(inner) => walk_expr(inner, guarded_in, sites),
+            None => guarded_in,
+        },
+        Expr::Index(index) => {
+            let guarded = walk_expr(&index.expr, guarded_in, sites);
+            walk_expr(&index.index, guarded, sites)
+        }
+        Expr::Binary(binary) => {
+            let guarded = walk_expr(&binary.left, guarded_in, sites);
+            walk_expr(&binary.right, guarded, sites)
+        }
+        Expr::Assign(assign) => {
+            let guarded = walk_expr(&assign.left, guarded_in, sites);
+            walk_expr(&assign.right, guarded, sites)
+        }
+        Expr::Repeat(repeat) => {
+            let guarded = walk_expr(&repeat.expr, guarded_in, sites);
+            walk_expr(&repeat.len, guarded, sites)
+        }
+        Expr::Range(range) => {
+            let mut guarded = guarded_in;
+            if let Some(start) = &range.start {
+                guarded = walk_expr(start, guarded, sites);
+            }
+            if let Some(end) = &range.end {
+                guarded = walk_expr(end, guarded, sites);
+            }
+            guarded
+        }
+        Expr::Tuple(tuple) => {
+            let mut guarded = guarded_in;
+            for elem in &tuple.elems {
+                guarded = walk_expr(elem, guarded, sites);
+            }
+            guarded
+        }
+        Expr::Array(array) => {
+            let mut guarded = guarded_in;
+            for elem in &array.elems {
+                guarded = walk_expr(elem, guarded, sites);
+            }
+            guarded
+        }
+        Expr::Struct(struct_expr) => {
+            let mut guarded = guarded_in;
+            for field in &struct_expr.fields {
+                guarded = walk_expr(&field.expr, guarded, sites);
+            }
+            if let Some(rest) = &struct_expr.rest {
+                guarded = walk_expr(rest, guarded, sites);
+            }
+            guarded
+        }
+        // Every other expression kind (literals, paths, macros, `async`/
+        // `const` blocks, ...) is either a leaf with nothing to recurse into,
+        // or -- for `async`/`const` blocks -- runs later/independently like a
+        // closure and is out of scope for the loaders this test discovers.
+        _ => guarded_in,
     }
 }
 
-/// Whether a function body calls one of `GUARD_FUNCTION_NAMES`, anywhere in
-/// its body (including nested blocks/closures) -- these loaders are
-/// straight-line open-then-mmap functions, so "called somewhere in this
-/// function" is the property the mutation-arm test in #1368's PR actually
-/// exercises, not a stricter before/after ordering.
-#[derive(Default)]
-struct GuardCallFinder {
-    found: bool,
-}
-
-impl<'ast> Visit<'ast> for GuardCallFinder {
-    fn visit_expr_call(&mut self, node: &'ast ExprCall) {
-        if let Expr::Path(callee) = &*node.func
-            && let Some(last) = callee.path.segments.last()
-            && GUARD_FUNCTION_NAMES.contains(&last.ident.to_string().as_str())
-        {
-            self.found = true;
-        }
-        visit::visit_expr_call(self, node);
+/// Walks a block's statements in source order, threading `guarded` the same
+/// way [`walk_expr`] does.
+fn walk_block(block: &Block, guarded_in: bool, sites: &mut Vec<SiteObservation>) -> bool {
+    let mut guarded = guarded_in;
+    for stmt in &block.stmts {
+        guarded = match stmt {
+            Stmt::Local(local) => {
+                let mut guarded_after = guarded;
+                if let Some(init) = &local.init {
+                    guarded_after = walk_expr(&init.expr, guarded_after, sites);
+                    if let Some((_, diverge)) = &init.diverge {
+                        // `let ... else { diverge }`: the diverge block only
+                        // runs when the pattern does NOT match, so -- like an
+                        // `if`/`match` arm -- it is internal-only and never
+                        // propagated to the statements that follow.
+                        walk_expr(diverge, guarded_after, sites);
+                    }
+                }
+                guarded_after
+            }
+            Stmt::Expr(expr, _) => walk_expr(expr, guarded, sites),
+            Stmt::Macro(_) | Stmt::Item(_) => guarded,
+        };
     }
+    guarded
 }
 
 #[test]
@@ -219,23 +411,21 @@ fn every_mmap_construction_site_is_guarded_or_explicitly_exempted() {
         collect_functions(&syntax.items, &mut path_stack, &mut functions);
 
         for (function_path, body) in functions {
-            let mut construction = MmapConstructionFinder::default();
-            construction.visit_block(body);
-            if construction.sites.is_empty() {
+            let mut sites = Vec::new();
+            walk_block(body, false, &mut sites);
+            if sites.is_empty() {
                 continue;
             }
 
-            let mut guard = GuardCallFinder::default();
-            guard.visit_block(body);
-
             let mut ordinals: BTreeMap<&str, usize> = BTreeMap::new();
-            for selector in &construction.sites {
-                let ordinal = ordinals.entry(selector).or_insert(0);
+            for site in &sites {
+                let ordinal = ordinals.entry(site.selector).or_insert(0);
                 *ordinal += 1;
+                let selector = site.selector;
                 let key = format!("{relative}::{function_path}::{selector}#{ordinal}");
                 discovered.insert(key.clone());
 
-                if !guard.found
+                if !site.dominated_by_guard
                     && !MMAP_CONSTRUCTION_EXEMPTIONS
                         .iter()
                         .any(|exemption| exemption.site == key)
@@ -248,8 +438,9 @@ fn every_mmap_construction_site_is_guarded_or_explicitly_exempted() {
 
     assert!(
         violations.is_empty(),
-        "mmap construction site(s) with neither a trust-boundary guard call in the same \
-         function nor a reviewed MmapConstructionExemption:\n{}",
+        "mmap construction site(s) with neither a trust-boundary guard call earlier in the \
+         same function on a path that necessarily reaches the site, nor a reviewed \
+         MmapConstructionExemption:\n{}",
         violations.join("\n")
     );
 
