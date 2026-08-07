@@ -3959,16 +3959,27 @@ mod inner {
         /// scale and declared target modules, instead of a bare `scale: f32`
         /// the caller must have derived correctly on its own.
         ///
-        /// Validates `descriptor.alpha`/effective scale (finite) and
-        /// `descriptor.target_modules` (recognized names) before delegating
-        /// to [`Self::load_lora_adapter`] with `descriptor.scale()`. Every
+        /// Validates `descriptor.alpha`/effective scale (finite),
+        /// `descriptor.target_modules` (recognized names), that every
+        /// nonempty `layers` entry's rank matches `descriptor.rank`, and that
+        /// the set of modules present in `layers` matches
+        /// `descriptor.target_modules` exactly — before delegating to
+        /// [`Self::load_lora_adapter`] with `descriptor.scale()`. Every
         /// per-layer, per-architecture shape check `load_lora_adapter` already
         /// performs still applies on top of this.
+        ///
+        /// `descriptor.rank` and `descriptor.target_modules` are the inputs
+        /// `descriptor.scale()` is computed from; without this check a caller
+        /// could pass `layers` built at one rank alongside a `descriptor` built
+        /// at another (or covering a different module set) and silently get
+        /// the wrong scale applied to correctly-shaped buffers.
         ///
         /// # Errors
         ///
         /// Returns an error if the descriptor's alpha/scale is not finite, if
-        /// `target_modules` contains an unrecognized name, or for any reason
+        /// `target_modules` contains an unrecognized name, if any layer's
+        /// rank disagrees with `descriptor.rank`, if the loaded module set
+        /// disagrees with `descriptor.target_modules`, or for any reason
         /// [`Self::load_lora_adapter`] itself would reject the call.
         pub fn load_lora_adapter_with_descriptor(
             &mut self,
@@ -3986,6 +3997,33 @@ mod inner {
                 lattice_fann::lora::KNOWN_LORA_TARGET_MODULES,
             )
             .map_err(InferenceError::InvalidInput)?;
+
+            for layer in &layers {
+                if layer.rank != descriptor.rank {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "load_lora_adapter_with_descriptor: layer {} module '{}' has \
+                         rank={} but descriptor declares rank={}",
+                        layer.layer_idx, layer.module, layer.rank, descriptor.rank
+                    )));
+                }
+            }
+
+            let mut layer_modules: Vec<&str> = layers.iter().map(|l| l.module.as_str()).collect();
+            layer_modules.sort_unstable();
+            layer_modules.dedup();
+            let mut declared_modules: Vec<&str> = descriptor
+                .target_modules
+                .iter()
+                .map(String::as_str)
+                .collect();
+            declared_modules.sort_unstable();
+            declared_modules.dedup();
+            if layer_modules != declared_modules {
+                return Err(InferenceError::InvalidInput(format!(
+                    "load_lora_adapter_with_descriptor: loaded layer modules {layer_modules:?} \
+                     do not match descriptor.target_modules {declared_modules:?}"
+                )));
+            }
 
             self.load_lora_adapter(layers, descriptor.scale(), quarot_seed)
         }

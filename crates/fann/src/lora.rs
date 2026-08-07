@@ -384,6 +384,35 @@ mod tests {
     }
 
     #[test]
+    fn checked_group_elements_rejects_dims_add_overflow() {
+        let err = checked_group_elements("ctx", 0, "q_proj", 1, usize::MAX, 1).unwrap_err();
+        assert!(
+            err.contains("d_in+d_out overflowed"),
+            "expected d_in+d_out overflow message; got: {err}"
+        );
+    }
+
+    #[test]
+    fn checked_group_elements_rejects_rank_dims_mul_overflow() {
+        // dims = d_in + d_out = 2 (no overflow); rank_total * dims = usize::MAX * 2
+        // overflows the multiplication.
+        let err = checked_group_elements("ctx", 0, "q_proj", usize::MAX, 1, 1).unwrap_err();
+        assert!(
+            err.contains("rank_total*(d_in+d_out) overflowed"),
+            "expected rank_total*(d_in+d_out) overflow message; got: {err}"
+        );
+    }
+
+    #[test]
+    fn accumulate_planned_elements_rejects_overflow() {
+        let err = accumulate_planned_elements(usize::MAX, 1, "ctx").unwrap_err();
+        assert!(
+            err.contains("aggregate blend element count overflowed"),
+            "expected aggregate overflow message; got: {err}"
+        );
+    }
+
+    #[test]
     fn validate_target_modules_accepts_known_names() {
         let modules = vec!["q_proj".to_string(), "up_proj".to_string()];
         assert!(validate_target_modules(&modules, KNOWN_LORA_TARGET_MODULES).is_ok());

@@ -63,12 +63,16 @@ pub struct LoraConfig {
 impl LoraConfig {
     /// Compute the LoRA scaling factor: `alpha / rank`.
     ///
-    /// Delegates to [`lattice_fann::lora::effective_scale`] via
-    /// [`Self::to_descriptor`], the single source of truth this crate shares
-    /// with `lattice-inference`'s Metal LoRA path so the zero-rank and
-    /// non-finite fallbacks cannot drift between the two.
+    /// Delegates directly to [`lattice_fann::lora::effective_scale`], the
+    /// single source of truth this crate shares with `lattice-inference`'s
+    /// Metal LoRA path so the zero-rank and non-finite fallbacks cannot
+    /// drift between the two. Deliberately bypasses [`Self::to_descriptor`]:
+    /// that helper clones `target_modules` and `dtype` to build a full
+    /// descriptor, and `scale()` is called once per matched row by
+    /// [`LoraAdapter::apply`] — an allocation-free hot path that has no use
+    /// for either field.
     pub fn scale(&self) -> f32 {
-        self.to_descriptor().scale()
+        lattice_fann::lora::effective_scale(self.rank, self.alpha)
     }
 
     /// Validate that the LoRA alpha and effective scale are finite, and that
