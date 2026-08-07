@@ -43,7 +43,11 @@ assert.equal(
 const allowed = new Set(['package.json', nodeFiles[0]])
 // Mirrors npm-packlist's own root-README grammar (`!/readme{,.*[^~$]}`, case-insensitive
 // via ignore-walk's `nocase: true`, compiled by minimatch to
-// `/^(?:\/readme|\/readme\.[^/]*?[^~$])$/i` -- lib/index.js:290 in npm-packlist@11.8.0):
+// `/^(?:\/readme|\/readme\.[^/]*?[^~$])$/i`) as observed against npm-packlist@11.8.0's
+// published behavior. npm-packlist is a transitive dependency of npm itself, not a
+// direct or lockfile-pinned dependency here, so there is no in-tree source location to
+// cite -- re-derive this pattern from the installed npm's own npm-packlist if this
+// behavior ever needs re-confirming (`npm pack --dry-run --json` calls it directly):
 // bare `README`, or `README.` followed by a run of non-slash characters whose last
 // character is not `~` or `$` (npm excludes those from the tarball entirely, e.g.
 // `README.md~`, so they never reach this check). The suffix is scoped to a single path

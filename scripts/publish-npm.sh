@@ -233,11 +233,13 @@ check_version_available() {
         exit 1
     fi
 }
+# selftest-extraction-marker: VERSION_CHECK_CALLSITES_BEGIN
 check_version_available "$WASM_DIR"
 for pkgdir in $PLATFORM_DIRS; do
     check_version_available "$pkgdir"
 done
 check_version_available "$NATIVE_DIR"
+# selftest-extraction-marker: VERSION_CHECK_CALLSITES_END
 echo "Preflight OK: no version collisions."
 
 # ---- Preflight: dry-run the ENTIRE release before any real publish. This
