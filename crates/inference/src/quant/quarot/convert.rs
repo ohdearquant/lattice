@@ -142,6 +142,7 @@ struct IndexEntry {
 /// [`PromotionState::Promoted`] or [`PromotionState::Rejected`].
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum PromotionState {
     /// The PPL acceptance gate has not been recorded against this
     /// artifact. Default state for every artifact `convert_quarot_qwen35`

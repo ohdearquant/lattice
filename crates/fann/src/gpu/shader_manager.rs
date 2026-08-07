@@ -12,6 +12,7 @@ use wgpu::ComputePipeline;
 
 /// Types of shader operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ShaderType {
     /// Matrix-vector multiplication (y = Wx + b)
     MatrixVectorMultiply,

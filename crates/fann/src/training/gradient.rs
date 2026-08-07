@@ -54,6 +54,7 @@ pub fn sanitize_gradients(grads: &mut [f32]) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum GradientGuardStrategy {
     /// Return an error immediately when NaN/Inf detected
     #[default]

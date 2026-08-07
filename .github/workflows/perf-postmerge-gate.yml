@@ -242,9 +242,7 @@ jobs:
           # no parent and the resolve step below would fail closed.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           cache-on-failure: true
           shared-key: perf-postmerge-${{ matrix.arch }}

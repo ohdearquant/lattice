@@ -38,6 +38,7 @@ if ! mkdir -p "$REPO/.cache" 2>/dev/null; then
 fi
 source "$REPO/scripts/lib/bench-python.sh"
 PYTHON_BIN="$(bench_require_python3 "bench-compare.sh")" || exit 1
+export PYTHON_BIN
 exec "$PYTHON_BIN" "$REPO/scripts/lib/bench_supervision.py" run \
   --label "bench-compare" \
   --entrypoint \

@@ -150,6 +150,7 @@ pub struct Message {
 
 /// Validated role carried by a normalized serving-contract message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NormalizedChatRole {
     /// System instruction.
     System,
@@ -194,6 +195,7 @@ pub struct NormalizedChatImage {
 /// Message content represented as a string or a list of typed parts.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum MessageContent {
     /// Plain text content.
     Text(String),
@@ -203,6 +205,7 @@ pub enum MessageContent {
 
 /// One typed OpenAI message-content part.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentPart {
     /// A text content part.
     Text { text: String },

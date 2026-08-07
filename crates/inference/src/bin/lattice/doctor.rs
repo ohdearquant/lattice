@@ -820,6 +820,12 @@ pub fn build_report(
         crate::backend::ModelFormat::Unknown => {
             return Err(crate::backend::unrecognized_format_message(model_dir));
         }
+        // Any format this binary doesn't yet know how to inspect is handled
+        // the same way as `Unknown`: report it as an error rather than
+        // silently guessing an inventory shape.
+        _ => {
+            return Err(crate::backend::unrecognized_format_message(model_dir));
+        }
     };
 
     let tokenizer_path = tokenizer_dir.unwrap_or(model_dir).join("tokenizer.json");

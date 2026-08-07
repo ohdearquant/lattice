@@ -102,6 +102,7 @@ enum WorkerShutdown {
 /// Selects the context-window formula enforced before Metal generation.
 /// Each serve adapter supplies the policy matching its pre-worker contract.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum ContextWindowPolicy {
     /// Enforce `prompt_tokens + max_new_tokens <= model_max_context`.
     PromptAndMaxTokens,
@@ -124,6 +125,7 @@ pub struct WorkerMetadata {
 /// Replaces `lattice.rs`'s oneshot-reply `MetalJob` contract and
 /// `lattice_serve.rs`'s private `Ev` enum with a single shared shape.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum WorkerEvent {
     /// One streamed token delta.
     Delta(String),
@@ -195,6 +197,7 @@ impl From<crate::error::InferenceError> for WorkerFailure {
 /// before ever sending a readiness signal, or the requested admission cap
 /// (issue #939) was outside `Semaphore::new`'s valid range.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum StartupError {
     Load(String),
     ThreadExited,

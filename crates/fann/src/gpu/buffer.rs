@@ -16,6 +16,7 @@ use wgpu::BufferUsages;
 
 /// Buffer size categories
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum BufferCategory {
     /// < 1MB - biases, small activations
     Small,
