@@ -16,6 +16,77 @@ set -uo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$REPO/scripts/publish-npm.sh"
 
+# Shared by every selftest-extraction-marker-bounded extraction below (the
+# check_version_available() extraction above uses a different,
+# brace-delimited mechanism and is out of scope here). awk's `/begin/,/end/`
+# range pattern fails OPEN in two ways an empty-body check cannot see: (1) a
+# missing END never closes the range, so it silently overruns to EOF and
+# captures every guard and real `npm publish` call after it; (2) a duplicate
+# BEGIN or END makes it ambiguous which occurrence bounds the intended
+# block, so the wrong span (or the right span for the wrong reason) can be
+# captured without any visible failure. Measured directly: deleting
+# FULL_DRYRUN_GUARD_END produced a 49-line fragment containing
+# MAIN_PACKLIST_GUARD_BEGIN and the real `npm publish $PROV` calls at
+# publish-npm.sh:284,291,294 -- an overrun that a plain `-z "$BODY"` check
+# does not catch, because the body is non-empty. Guard against both: require
+# exactly one BEGIN and one END for the requested pair before extracting,
+# then refuse a captured body that still contains another pair's marker
+# (proof the range ran past its own boundary) or a non-dry-run `npm publish`
+# invocation (the one thing an overrun here must never be able to reach).
+# `--dry-run` calls are excluded from that last check because
+# FULL_DRYRUN_GUARD's own legitimate body contains three of them.
+#
+# One pair is deliberately nested inside another in publish-npm.sh:
+# PLATFORM_PKGJSON_GUARD sits inside PLATFORM_MATRIX_GUARD's own span
+# (:97-107 within :79-187) by design, not by overrun, so extracting
+# PLATFORM_MATRIX_GUARD legitimately captures PLATFORM_PKGJSON_GUARD's
+# markers too. Callers that expect a nested pair list it in $3+; any marker
+# not on that list is still treated as foreign and rejected.
+extract_marker_block() {  # $1=NAME (e.g. PLATFORM_MATRIX_GUARD) $2=src-file $3+=allowed-nested-NAMEs
+  name="$1"; src="$2"; shift 2
+  begin="# selftest-extraction-marker: ${name}_BEGIN"
+  end="# selftest-extraction-marker: ${name}_END"
+
+  begin_n=$(/usr/bin/grep -cF -- "$begin" "$src")
+  end_n=$(/usr/bin/grep -cF -- "$end" "$src")
+  if [ "$begin_n" -ne 1 ] || [ "$end_n" -ne 1 ]; then
+    echo "FATAL: $name marker pair is not exactly one BEGIN and one END in $src" >&2
+    echo "  (found $begin_n BEGIN, $end_n END) -- refusing to extract an ambiguous range." >&2
+    return 1
+  fi
+
+  # index(), not ==: PLATFORM_PKGJSON_GUARD's marker pair (publish-npm.sh:97,107)
+  # is indented (nested inside the platform loop), so an exact-line match would
+  # silently miss it the same way a renamed marker would.
+  body="$(awk -v b="$begin" -v e="$end" 'index($0,b){f=1;next} index($0,e){f=0} f' "$src")"
+
+  if [ -z "$body" ]; then
+    echo "FATAL: $name extraction produced an empty body from $src -- has it been" >&2
+    echo "  renamed or reshaped? The extraction below would otherwise silently test nothing." >&2
+    return 1
+  fi
+
+  foreign="$body"
+  for nested in "$@"; do
+    foreign="$(printf '%s\n' "$foreign" | /usr/bin/grep -vF -- "# selftest-extraction-marker: ${nested}_BEGIN" | /usr/bin/grep -vF -- "# selftest-extraction-marker: ${nested}_END")"
+  done
+  if printf '%s\n' "$foreign" | /usr/bin/grep -qF -- 'selftest-extraction-marker:'; then
+    echo "FATAL: $name extraction contains a foreign selftest-extraction-marker --" >&2
+    echo "  the range overran past its own END into another pair's territory:" >&2
+    printf '%s\n' "$foreign" | /usr/bin/grep -F -- 'selftest-extraction-marker:' >&2
+    return 1
+  fi
+
+  if printf '%s\n' "$body" | /usr/bin/grep -E 'npm publish' | /usr/bin/grep -qv -- '--dry-run'; then
+    echo "FATAL: $name extraction contains a non-dry-run npm publish invocation --" >&2
+    echo "  the range overran into the real publish path:" >&2
+    printf '%s\n' "$body" | /usr/bin/grep -E 'npm publish' | /usr/bin/grep -v -- '--dry-run' >&2
+    return 1
+  fi
+
+  printf '%s\n' "$body"
+}
+
 FN_BODY="$(awk '/^check_version_available\(\) \{/,/^\}$/' "$SRC")"
 if [ -z "$FN_BODY" ]; then
   echo "FATAL: could not extract check_version_available() from $SRC -- has it been renamed" >&2
@@ -165,13 +236,7 @@ echo "=== publish-npm.sh platform matrix guard self-test ==="
 # Every command the extracted text runs (`node -p`, `npm pack --dry-run
 # --json`) is local/offline -- no registry access, so no stubbing is needed
 # here the way check_version_available's `npm` had to be stubbed.
-MATRIX_BODY="$(awk '/^# selftest-extraction-marker: PLATFORM_MATRIX_GUARD_BEGIN$/,/^# selftest-extraction-marker: PLATFORM_MATRIX_GUARD_END$/' "$SRC")"
-if [ -z "$MATRIX_BODY" ]; then
-  echo "FATAL: could not extract the platform matrix guard from $SRC -- have its" >&2
-  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
-  echo "  extraction below would otherwise silently test nothing." >&2
-  exit 1
-fi
+MATRIX_BODY="$(extract_marker_block PLATFORM_MATRIX_GUARD "$SRC" PLATFORM_PKGJSON_GUARD)" || exit 1
 
 REAL_PACKLIST_ASSERT="$REPO/npm/lattice-embed-native/scripts/assert-platform-packlist.mjs"
 if [ ! -f "$REAL_PACKLIST_ASSERT" ]; then
@@ -288,10 +353,10 @@ fi
 #     closed. optionalDependencies is pinned at the CORRECT version (1.2.3,
 #     matching NATIVE_VERSION) so only the platform package's own version
 #     (9.9.9) is wrong -- otherwise this fixture also trips the
-#     optionalDependencies-value guard at :155 (same wrong value, same
+#     optionalDependencies-value guard at :166 (same wrong value, same
 #     NATIVE_VERSION comparison), and the two guards stop isolating: measured
-#     by disabling the :125 branch alone, which left the exit-code assertion
-#     GREEN (rc still 1, from :155) while only the message assertion caught
+#     by disabling the :133 branch alone, which left the exit-code assertion
+#     GREEN (rc still 1, from :166) while only the message assertion caught
 #     it. An arm whose exit assertion survives its own guard being deleted is
 #     not isolating that guard.
 NATIVE="$MSB/k-version"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3"
@@ -422,13 +487,7 @@ echo "=== publish-npm.sh main-package packlist guard self-test ==="
 # it needs its own extraction and its own fixture: a minimal npm project
 # satisfying assert-packlist.mjs's required-files list, with an optional
 # extra path appended to "files" to trip a forbidden pattern.
-MAIN_PACKLIST_BODY="$(awk '/^# selftest-extraction-marker: MAIN_PACKLIST_GUARD_BEGIN$/,/^# selftest-extraction-marker: MAIN_PACKLIST_GUARD_END$/' "$SRC")"
-if [ -z "$MAIN_PACKLIST_BODY" ]; then
-  echo "FATAL: could not extract the main-package packlist guard from $SRC -- have its" >&2
-  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
-  echo "  extraction below would otherwise silently test nothing." >&2
-  exit 1
-fi
+MAIN_PACKLIST_BODY="$(extract_marker_block MAIN_PACKLIST_GUARD "$SRC")" || exit 1
 
 REAL_MAIN_PACKLIST_ASSERT="$REPO/npm/lattice-embed-native/scripts/assert-packlist.mjs"
 if [ ! -f "$REAL_MAIN_PACKLIST_ASSERT" ]; then
@@ -498,7 +557,7 @@ fi
 
 echo
 echo "=== publish-npm.sh missing-platform-package.json guard self-test ==="
-# publish-npm.sh:95-102 (G3) rejects an advertised platform whose
+# publish-npm.sh:98-106 (G3) rejects an advertised platform whose
 # npm/<platform>/package.json is absent entirely -- distinct from the
 # exact-.node-path guard a few lines later (G4, arm (j) above), which always
 # writes a package.json and omits only the .node file. G3's own check sits
@@ -508,20 +567,15 @@ echo "=== publish-npm.sh missing-platform-package.json guard self-test ==="
 # defeated G3 still crashes on that require() with Node's own
 # MODULE_NOT_FOUND (rc 1), which happens to match G3's own expected rc and
 # so leaves the exit-code assertion falsely green -- measured: mutating
-# :95's condition to `if false` gave 53 passed, 1 failed, with only the
-# diagnostic-message assertion catching it, not the exit code. Bounding the
+# :98's condition to `if false` left only arm (x) red (both its exit-code
+# and diagnostic-message assertions), every other arm still green. Bounding
+# the
 # extraction to JUST the pkgjson-existence check (its own
 # PLATFORM_PKGJSON_GUARD marker pair in publish-npm.sh, ending before the
 # require() call) keeps that crash out of the tested block entirely, so a
 # defeated G3 now falls straight through to the PASSED marker with rc 0 --
 # an unambiguous isolation instead of a coincidentally-matching rc.
-PLATFORM_PKGJSON_BODY="$(awk '/selftest-extraction-marker: PLATFORM_PKGJSON_GUARD_BEGIN/,/selftest-extraction-marker: PLATFORM_PKGJSON_GUARD_END/' "$SRC")"
-if [ -z "$PLATFORM_PKGJSON_BODY" ]; then
-  echo "FATAL: could not extract the platform package.json guard from $SRC -- have its" >&2
-  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
-  echo "  extraction below would otherwise silently test nothing." >&2
-  exit 1
-fi
+PLATFORM_PKGJSON_BODY="$(extract_marker_block PLATFORM_PKGJSON_GUARD "$SRC")" || exit 1
 
 run_pkgjson_case() {  # $1=NATIVE_DIR $2=platform
   RUNNER="$MSB/pkgjson-runner.sh"
@@ -548,10 +602,10 @@ fi
 
 echo
 echo "=== publish-npm.sh npm-pack-command-failure guard self-test ==="
-# publish-npm.sh:168-170 fails closed when `npm pack --dry-run --json`
+# publish-npm.sh:172-175 fails closed when `npm pack --dry-run --json`
 # itself returns nonzero -- distinct from the packlist CONTENT guard at
-# :172-178 (arm (l) above), which requires a pack that succeeds but whose
-# contents are wrong. Measured before this arm existed: replacing :170's
+# :176-183 (arm (l) above), which requires a pack that succeeds but whose
+# contents are wrong. Measured before this arm existed: replacing :174's
 # `exit 1` with `:` left the suite fully green, because every fixture up to
 # that point had its `npm pack` call succeed, so nothing exercised this
 # branch. That baseline is what motivated adding the arm below, which
@@ -565,15 +619,15 @@ echo "=== publish-npm.sh npm-pack-command-failure guard self-test ==="
 # accidentally mask a different guard.
 #
 # The stub ALSO prints a well-formed pack manifest on stdout before exiting
-# nonzero. This matters: :168's diagnostic echo and :170's `exit 1` are two
+# nonzero. This matters: :173's diagnostic echo and :174's `exit 1` are two
 # separate statements in the same `if` block, so a mutation that only guts
-# :170 (leaving the echo) would still print :170's own message on the way
-# through to :172-178's packlist-content guard, which would then fail
+# :174 (leaving the echo) would still print :173's own message on the way
+# through to :176-183's packlist-content guard, which would then fail
 # closed on its own over the malformed/empty capture and produce the SAME
-# overall rc=1 -- an arm asserting only "message contains :170's text" would
-# stay green under that mutation without :170 itself doing any rejecting.
+# overall rc=1 -- an arm asserting only "message contains :173's text" would
+# stay green under that mutation without :174 itself doing any rejecting.
 # Handing the downstream check a manifest it accepts closes that gap: if
-# :170 is defeated, :172-178 is satisfied too and the whole block reaches
+# :174 is defeated, :176-183 is satisfied too and the whole block reaches
 # MATRIX_GUARD_PASSED with rc=0, so this arm's rc assertion alone -- not
 # just its message assertion -- is what catches the defeat.
 YSB="$MSB/y-packfail"
@@ -613,8 +667,8 @@ echo "=== publish-npm.sh check_version_available call-site coverage self-test ==
 # already-published) is exercised above by arms (a)-(g) against one
 # synthetic fixture, but nothing above proves the real script actually
 # CALLS it on the WASM package, every platform package, AND the native main
-# package -- publish-npm.sh:236,238,240. Measured before this arm existed:
-# replacing :240's `check_version_available "$NATIVE_DIR"` with `:` left the
+# package -- publish-npm.sh:241,243,245. Measured before this arm existed:
+# replacing :245's `check_version_available "$NATIVE_DIR"` with `:` left the
 # suite fully green; a native name@version collision would reach the real
 # publish loop undetected. That baseline motivated the arm below, which now
 # holds the same mutation (verified by re-running it with this arm in
@@ -632,13 +686,7 @@ echo "=== publish-npm.sh check_version_available call-site coverage self-test ==
 # to end-of-file, capturing unrelated later script content instead of
 # reporting a clean miss. Measured directly: doing exactly that produced a
 # nonsense capture that tried to `cd` into a fixture marker string.
-CALL_SITES_BODY="$(awk '/^# selftest-extraction-marker: VERSION_CHECK_CALLSITES_BEGIN$/,/^# selftest-extraction-marker: VERSION_CHECK_CALLSITES_END$/' "$SRC" | grep -v 'selftest-extraction-marker')"
-if [ -z "$CALL_SITES_BODY" ]; then
-  echo "FATAL: could not extract the check_version_available call sites from $SRC -- have" >&2
-  echo "  its selftest-extraction-marker comments been removed or reshaped? The" >&2
-  echo "  extraction below would otherwise silently test nothing." >&2
-  exit 1
-fi
+CALL_SITES_BODY="$(extract_marker_block VERSION_CHECK_CALLSITES "$SRC")" || exit 1
 
 ZSB="$SB/z-callsites"
 mkdir -p "$ZSB"
@@ -669,7 +717,7 @@ fi
 
 echo
 echo "=== publish-npm.sh full-release dry-run guard self-test ==="
-# publish-npm.sh:245-254 packs and gates the WHOLE release (wasm, every
+# publish-npm.sh:254-260 packs and gates the WHOLE release (wasm, every
 # platform, native main) via three `npm publish --dry-run` calls before any
 # real publish -- the immutability contract this script exists to protect
 # (npm name@version tuples cannot be republished, so a real publish that
@@ -677,16 +725,10 @@ echo "=== publish-npm.sh full-release dry-run guard self-test ==="
 # relies entirely on the script's own top-level `set -e` to abort on the
 # first nonzero `npm publish --dry-run`, so `grep -nE 'exit[[:space:]]+[0-9]+'`
 # does not find it at all and it was covered by zero arms. Measured:
-# replacing the first dry-run call (:250) with `:` left the suite fully
+# replacing the first dry-run call (:255) with `:` left the suite fully
 # green -- a dry-run failure on any package would previously reach the real
 # publish loop undetected.
-FULL_DRYRUN_BODY="$(awk '/selftest-extraction-marker: FULL_DRYRUN_GUARD_BEGIN/,/selftest-extraction-marker: FULL_DRYRUN_GUARD_END/' "$SRC")"
-if [ -z "$FULL_DRYRUN_BODY" ]; then
-  echo "FATAL: could not extract the full-release dry-run guard from $SRC -- have its" >&2
-  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
-  echo "  extraction below would otherwise silently test nothing." >&2
-  exit 1
-fi
+FULL_DRYRUN_BODY="$(extract_marker_block FULL_DRYRUN_GUARD "$SRC")" || exit 1
 
 DSB="$SB/dryrun"
 mkdir -p "$DSB/wasm" "$DSB/native" "$DSB/stub-bin"
@@ -753,14 +795,14 @@ fi
 
 echo
 echo "=== publish-npm.sh argv usage guard self-test ==="
-# publish-npm.sh:25-36's case statement (G1) rejects any argv other than ""
-# or "--dry-run" with `usage: ... ; exit 2` at :34 -- found during
+# publish-npm.sh:26-37's case statement (G1) rejects any argv other than ""
+# or "--dry-run" with `usage: ... ; exit 2` at :35 -- found during
 # enumeration (grep -n 'exit [0-9]' scripts/publish-npm.sh), covered by zero
 # arms before this one. Invoking the real script directly is not isolated
-# from the rest of the script, though: if :34's `exit 2` is defeated, the
+# from the rest of the script, though: if :35's `exit 2` is defeated, the
 # case's `*)` branch falls through with $MODE unset and execution continues
 # into the platform-matrix guard against whatever repo state the test
-# happens to run in -- measured: replacing :34's `exit 2` with `:` gave
+# happens to run in -- measured: replacing :35's `exit 2` with `:` gave
 # rc 1 (from the current checkout's own matrix guard) instead of rc 2, which
 # this arm's exit-code assertion does catch as a mismatch, but only because
 # a coincidentally-different rc came out of unrelated, environment-dependent
@@ -772,13 +814,7 @@ echo "=== publish-npm.sh argv usage guard self-test ==="
 # `sh -c CMD name arg` so the extracted `$0`/`${1:-}` references still see
 # the real script path and the bogus flag -- bounds the test so it cannot
 # reach the matrix guard or anything else, regardless of checkout state.
-ARGV_BODY="$(awk '/selftest-extraction-marker: ARGV_GUARD_BEGIN/,/selftest-extraction-marker: ARGV_GUARD_END/' "$SRC")"
-if [ -z "$ARGV_BODY" ]; then
-  echo "FATAL: could not extract the argv usage guard from $SRC -- have its" >&2
-  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
-  echo "  extraction below would otherwise silently test nothing." >&2
-  exit 1
-fi
+ARGV_BODY="$(extract_marker_block ARGV_GUARD "$SRC")" || exit 1
 
 RUNNER="$MSB/argv-runner.sh"
 {
@@ -791,6 +827,85 @@ if printf '%s' "$OUT" | grep -qF "usage: $SRC [--dry-run]"; then
   echo "  PASS:   -> usage diagnostic printed"; pass=$((pass+1))
 else
   echo "  FAIL:   -> missing usage diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+echo
+echo "=== publish-npm-preflight-selftest.sh marker-extraction self-defense self-test ==="
+# extract_marker_block (defined at the top of this file) is itself part of
+# the test harness, not scripts/publish-npm.sh -- it has to refuse a
+# malformed marker pair in the SOURCE it reads, not merely process one
+# correctly. Exercise both directions (a missing END, a duplicated BEGIN)
+# against a throwaway copy of publish-npm.sh; the live $SRC is never
+# mutated. Each arm captures a pre-mutation copy, asserts the mutation
+# landed (non-empty diff), asserts the extractor's own refusal (rc + the
+# pair-name-and-count diagnostic -- never a downstream effect, since the
+# whole point is that a downstream effect is what an overrun would produce
+# undetected), then restores by copying from $SRC again and proves
+# byte-exactness with cmp -s so no mutated copy leaks into anything below.
+# Inspecting the refusal is sufficient here -- this never evals the
+# fragment a defeated extractor would have produced, which is exactly the
+# risk item 1 exists to close off.
+MUTSB="$SB/marker-defense"
+mkdir -p "$MUTSB"
+MUT_SRC="$MUTSB/publish-npm.sh"
+
+# (dd) missing END: delete FULL_DRYRUN_GUARD_END from the copy. Predicted
+# red: extract_marker_block's own exactly-one-END check must refuse (rc 1),
+# not silently hand back an overrun fragment the way the pre-fix awk did
+# (measured: a 49-line fragment reaching MAIN_PACKLIST_GUARD_BEGIN and the
+# real `npm publish $PROV` calls at publish-npm.sh:284,291,294).
+cp "$SRC" "$MUT_SRC"
+cp "$MUT_SRC" "$MUTSB/pre-dd.sh"
+awk '!/# selftest-extraction-marker: FULL_DRYRUN_GUARD_END/' "$MUT_SRC" > "$MUTSB/dd.tmp" && mv "$MUTSB/dd.tmp" "$MUT_SRC"
+if cmp -s "$MUTSB/pre-dd.sh" "$MUT_SRC"; then
+  echo "FATAL: (dd) mutation did not land -- pre/post copies are byte-identical" >&2
+  exit 1
+fi
+if [ -z "$(diff "$MUTSB/pre-dd.sh" "$MUT_SRC" 2>/dev/null)" ]; then
+  echo "FATAL: (dd) mutation landed but the diff against the pre-mutation copy is empty" >&2
+  exit 1
+fi
+DD_ERR="$(extract_marker_block FULL_DRYRUN_GUARD "$MUT_SRC" 2>&1 1>/dev/null)"; DD_RC=$?
+check "(dd) missing END marker is refused by the extractor" 1 $DD_RC
+case "$DD_ERR" in
+  *"FULL_DRYRUN_GUARD marker pair is not exactly one BEGIN and one END"*)
+    echo "  PASS:   -> diagnostic names the pair and the ambiguous-count reason"; pass=$((pass+1)) ;;
+  *)
+    echo "  FAIL:   -> missing/incorrect diagnostic (got: $(printf '%s' "$DD_ERR" | tr '\n' '|'))"; fail=$((fail+1)) ;;
+esac
+cp "$SRC" "$MUT_SRC"
+if ! cmp -s "$SRC" "$MUT_SRC"; then
+  echo "FATAL: (dd) restore-by-inverse-edit did not reach byte-exactness against \$SRC" >&2
+  exit 1
+fi
+
+# (ee) duplicate marker: duplicate ARGV_GUARD_BEGIN in the copy (a second
+# BEGIN before the real one, e.g. from a copy-paste). Predicted red:
+# extract_marker_block's own exactly-one-BEGIN check must refuse (rc 1) --
+# a duplicate leaves awk's range pattern free to open on the wrong
+# occurrence without any visible failure otherwise.
+cp "$MUT_SRC" "$MUTSB/pre-ee.sh"
+awk '{print} /# selftest-extraction-marker: ARGV_GUARD_BEGIN/{print}' "$MUT_SRC" > "$MUTSB/ee.tmp" && mv "$MUTSB/ee.tmp" "$MUT_SRC"
+if cmp -s "$MUTSB/pre-ee.sh" "$MUT_SRC"; then
+  echo "FATAL: (ee) mutation did not land -- pre/post copies are byte-identical" >&2
+  exit 1
+fi
+if [ -z "$(diff "$MUTSB/pre-ee.sh" "$MUT_SRC" 2>/dev/null)" ]; then
+  echo "FATAL: (ee) mutation landed but the diff against the pre-mutation copy is empty" >&2
+  exit 1
+fi
+EE_ERR="$(extract_marker_block ARGV_GUARD "$MUT_SRC" 2>&1 1>/dev/null)"; EE_RC=$?
+check "(ee) duplicated BEGIN marker is refused by the extractor" 1 $EE_RC
+case "$EE_ERR" in
+  *"ARGV_GUARD marker pair is not exactly one BEGIN and one END"*)
+    echo "  PASS:   -> diagnostic names the pair and the ambiguous-count reason"; pass=$((pass+1)) ;;
+  *)
+    echo "  FAIL:   -> missing/incorrect diagnostic (got: $(printf '%s' "$EE_ERR" | tr '\n' '|'))"; fail=$((fail+1)) ;;
+esac
+cp "$SRC" "$MUT_SRC"
+if ! cmp -s "$SRC" "$MUT_SRC"; then
+  echo "FATAL: (ee) restore-by-inverse-edit did not reach byte-exactness against \$SRC" >&2
+  exit 1
 fi
 
 echo "=== $pass passed, $fail failed ==="
