@@ -76,7 +76,11 @@ bench_quiet_checkpoint() {
         printf 'refusing to continue.\n' >&2 || :
         exit 2
     fi
-    if ! "${PYTHON_BIN:?PYTHON_BIN not set - bench_quiet_checkpoint requires bench_supervise_entry to have run first}" "$repo/scripts/lib/quiet-probe.py" --label "$label"; then
+    if [[ -z "${PYTHON_BIN:-}" ]]; then
+        PYTHON_BIN="$(bench_require_python3 "${0##*/}")" || exit 1
+        export PYTHON_BIN
+    fi
+    if ! "$PYTHON_BIN" "$repo/scripts/lib/quiet-probe.py" --label "$label"; then
         echo "bench-supervision: machine was not quiet at $label; refusing to continue" >&2 || :
         exit 2
     fi

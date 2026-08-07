@@ -2600,6 +2600,50 @@ class ImplBodyInheritsResolvedPythonInterpreter(unittest.TestCase):
             "Run scripts/bench-compare.sh, not this file directly", result.stderr
         )
 
+    def test_impl_body_direct_invocation_resolves_its_own_interpreter_when_unset(
+        self,
+    ):
+        """A direct invocation (no entry point, so PYTHON_BIN never arrived)
+        must still end up with a qualifying interpreter, resolved by the
+        body itself via scripts/lib/bench-python.sh -- not with bash's own
+        "unbound variable" error (lattice#1333's original failure mode) and
+        not with a silent fall back to an unqualified `python3`.
+
+        PATH here is deliberately narrowed to /bin:/usr/bin, where macOS
+        ships only a pre-3.11 /usr/bin/python3, so bench_require_python3 has
+        no qualifying candidate and must refuse with its own diagnostic.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build_fixture(tmp)
+            shutil.copy2(
+                REPO / "scripts" / "lib" / "bench-python.sh",
+                root / "scripts" / "lib" / "bench-python.sh",
+            )
+            env = {
+                "PATH": "/bin:/usr/bin",
+                "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+            }
+            for name in (
+                "LATTICE_BENCH_LOCK_STATUS",
+                "LATTICE_BENCH_LOCK_FDS",
+                "LATTICE_BENCH_SUPERVISOR_FD",
+                "PYTHON_BIN",
+            ):
+                env.pop(name, None)
+            result = subprocess.run(
+                ["bash", str(root / "scripts" / "lib" / "bench-compare-impl.sh")],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertNotIn("unbound variable", result.stderr, result.stderr)
+        self.assertIn(
+            "no Python >= 3.11 found on PATH", result.stderr, result.stderr
+        )
+
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):
     def runTests(self) -> None:

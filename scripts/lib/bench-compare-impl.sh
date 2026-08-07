@@ -118,6 +118,22 @@ if ! REPO="$(cd "$(dirname "$0")/../.." && pwd)"; then
   printf 'directory was removed or is unreachable). Refusing to continue.\n' >&2 || :
   exit 2
 fi
+
+# scripts/bench-compare.sh (the entry point) resolves and exports PYTHON_BIN
+# before it hands off to this body, so the normal path just inherits it. This
+# file is also directly invocable (deliberately refused a few lines below,
+# once verify_locks runs) or unit-testable standalone, and neither of those
+# callers exports PYTHON_BIN — so resolve it here too, but only when it
+# didn't already arrive from an entry point, so the entry point's resolution
+# still governs the normal path.
+if [ -z "${PYTHON_BIN:-}" ]; then
+  source "$REPO/scripts/lib/bench-python.sh"
+  if ! PYTHON_BIN="$(bench_require_python3 "$0")"; then
+    exit 2
+  fi
+  export PYTHON_BIN
+fi
+
 QUICK_FLAGS="--quick"  # adaptive two-point samples in each of four ABBA arms
 RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 if [ -n "${BENCH_HOST_ID:-}" ]; then
