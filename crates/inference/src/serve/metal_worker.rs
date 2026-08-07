@@ -60,6 +60,7 @@ use crate::model::qwen35_config::{
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;
+use crate::vision::VisionError;
 use crate::vision::checkpoint::{
     Qwen35VisionWeights, load_qwen35_vision_weights_with_cancel,
     validate_qwen35_vision_weight_inventory,
@@ -640,7 +641,6 @@ enum VisionState {
         config: VisionModelConfig,
     },
     Loaded(Qwen35VisionWeights),
-    Failed(String),
 }
 
 #[derive(Debug)]
@@ -724,9 +724,9 @@ impl VisionRuntime {
     /// loaded, or the checkpoint never advertised vision capability).
     ///
     /// On failure, deliberately leaves `state` at `Pending` rather than
-    /// `Failed` — unlike [`Self::get_or_load`]'s terminal-failure contract,
-    /// a startup preload attempt is a best-effort optimization: the caller
-    /// is expected to warn and continue, and the FIRST image request still
+    /// `Failed`, matching [`Self::get_or_load`]'s retry policy: a startup
+    /// preload attempt is a best-effort optimization, so the caller is
+    /// expected to warn and continue, and the FIRST image request still
     /// gets its own (possibly successful) lazy-load attempt via
     /// `get_or_load`, exactly as if `--preload-vision` had never been
     /// passed. This is what "falls back to lazy loading" means for this
@@ -734,7 +734,7 @@ impl VisionRuntime {
     pub fn preload(&mut self) -> Result<(), String> {
         let (model_dir, config) = match &self.state {
             VisionState::Pending { model_dir, config } => (model_dir.clone(), config.clone()),
-            VisionState::Unsupported | VisionState::Loaded(_) | VisionState::Failed(_) => {
+            VisionState::Unsupported | VisionState::Loaded(_) => {
                 return Ok(());
             }
         };
@@ -751,6 +751,14 @@ impl VisionRuntime {
         }
     }
 
+    /// Attempt the lazy vision-weight load, retrying on every call while it
+    /// keeps failing: a failed attempt leaves `self.state` at `Pending`
+    /// rather than caching a permanent failure, and leaves
+    /// `vision_supported` untouched (still advertised), so the next
+    /// admitted image request tries the load again instead of being
+    /// rejected forever from one transient failure. There is no
+    /// permanent-failure policy elsewhere in the runtime for this codebase
+    /// to honor instead.
     fn get_or_load(
         &mut self,
         should_cancel: &mut dyn FnMut() -> bool,
@@ -761,18 +769,12 @@ impl VisionRuntime {
             match load_qwen35_vision_weights_with_cancel(&model_dir, &config, should_cancel) {
                 Ok(Some(weights)) => self.state = VisionState::Loaded(weights),
                 Ok(None) => return Ok(VisionRuntimeLoad::Cancelled),
-                Err(err) => {
-                    let message = format!("vision weights failed to load: {err}");
-                    self.state = VisionState::Failed(message.clone());
-                    self.vision_supported.store(false, Ordering::Release);
-                    return Err(message);
-                }
+                Err(err) => return Err(format!("vision weights failed to load: {err}")),
             }
         }
         match &self.state {
             VisionState::Unsupported => Ok(VisionRuntimeLoad::Unsupported),
             VisionState::Loaded(weights) => Ok(VisionRuntimeLoad::Ready(weights)),
-            VisionState::Failed(message) => Err(message.clone()),
             VisionState::Pending { .. } => {
                 self.vision_supported.store(false, Ordering::Release);
                 Err("vision weights remained pending after a load attempt".to_string())
@@ -860,6 +862,7 @@ fn build_vision_prompt_ids(
     Ok(ids)
 }
 
+#[derive(Debug)]
 enum VisionRequestBuild {
     Ready {
         request: Qwen35VisionRequest,
@@ -903,9 +906,18 @@ fn build_vision_request(
 
     let (pixel_values, grid) = preprocess_qwen35_image_for_serve(&image.bytes, vision_config)
         .map_err(|err| {
+            // `DimensionsExceeded` is a well-formed image that is simply
+            // larger than this server will process (a client can resize and
+            // retry); every other `VisionError` here means the bytes
+            // themselves are not a decodable image, which stays on the
+            // generic `invalid_image` code.
+            let code = match &err {
+                VisionError::DimensionsExceeded(_) => "image_dimensions_exceeded",
+                _ => "invalid_image",
+            };
             WorkerFailure::Rejected(ApiError::BadRequest {
                 message: format!("image preprocessing failed: {err}"),
-                code: "invalid_image",
+                code,
             })
         })?;
     if should_cancel() {
@@ -940,10 +952,19 @@ fn build_vision_request(
         return Ok(VisionRequestBuild::Cancelled);
     }
 
-    let weights = match runtime
-        .get_or_load(should_cancel)
-        .map_err(WorkerFailure::Failed)?
-    {
+    let weights = match runtime.get_or_load(should_cancel).map_err(|detail| {
+        // `detail` (from `load_qwen35_vision_weights_with_cancel`) routinely
+        // names the checkpoint directory (e.g. a missing-manifest message
+        // naming `model_dir`); log the full detail server-side only and
+        // send the client a fixed, path-free message. The load is
+        // retryable (see `VisionRuntime::get_or_load`), so this is a client
+        // rejection (400), not a permanent server failure (500).
+        eprintln!("[metal-worker] {detail}");
+        WorkerFailure::Rejected(ApiError::BadRequest {
+            message: "vision weights failed to load; the request can be retried".to_string(),
+            code: "vision_load_failed",
+        })
+    })? {
         VisionRuntimeLoad::Ready(weights) => weights,
         VisionRuntimeLoad::Unsupported => {
             return Err(WorkerFailure::Rejected(ApiError::BadRequest {
@@ -1721,6 +1742,180 @@ mod tests {
         assert!(window_checked);
     }
 
+    /// The 21 `model.visual.*` tensor names `tiny_vision_config` (depth 1)
+    /// expects, matching `checkpoint.rs`'s `tensor_names` for the same
+    /// config shape.
+    fn tiny_vision_manifest_names() -> Vec<String> {
+        let mut names = vec![
+            "model.visual.patch_embed.proj.weight".to_string(),
+            "model.visual.patch_embed.proj.bias".to_string(),
+            "model.visual.pos_embed.weight".to_string(),
+            "model.visual.merger.linear_fc1.weight".to_string(),
+            "model.visual.merger.linear_fc1.bias".to_string(),
+            "model.visual.merger.linear_fc2.weight".to_string(),
+            "model.visual.merger.linear_fc2.bias".to_string(),
+            "model.visual.merger.norm.weight".to_string(),
+            "model.visual.merger.norm.bias".to_string(),
+        ];
+        for suffix in [
+            "attn.qkv.weight",
+            "attn.qkv.bias",
+            "attn.proj.weight",
+            "attn.proj.bias",
+            "mlp.linear_fc1.weight",
+            "mlp.linear_fc1.bias",
+            "mlp.linear_fc2.weight",
+            "mlp.linear_fc2.bias",
+            "norm1.weight",
+            "norm1.bias",
+            "norm2.weight",
+            "norm2.bias",
+        ] {
+            names.push(format!("model.visual.blocks.0.{suffix}"));
+        }
+        names
+    }
+
+    #[test]
+    fn vision_request_build_rejects_oversized_image_with_dimensions_exceeded_code() {
+        use axum::response::IntoResponse as _;
+
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        // A thin (1px tall) image keeps the fixture tiny while still
+        // tripping the serving-side hard pixel-dimension cap on width
+        // alone -- deterministic regardless of any `LATTICE_VISION_MAX_PATCHES`
+        // override in the test process's environment, unlike the
+        // patch-count budget.
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            make_test_png(2049, 1),
+            "before".len(),
+        )];
+        let err = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || false,
+            |_| Ok(()),
+        )
+        .expect_err("an oversized image must be rejected before any worker dispatch");
+        match err {
+            WorkerFailure::Rejected(api_err) => {
+                assert_eq!(api_err.code(), "image_dimensions_exceeded");
+                assert_eq!(
+                    api_err.into_response().status(),
+                    axum::http::StatusCode::BAD_REQUEST
+                );
+            }
+            other => panic!("expected Rejected(image_dimensions_exceeded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_request_build_rejects_malformed_image_bytes_with_invalid_image_code() {
+        // Control: genuinely undecodable bytes must stay on the generic
+        // `invalid_image` code, not the new `image_dimensions_exceeded`
+        // code -- the split is scoped to well-formed-but-too-large images.
+        use axum::response::IntoResponse as _;
+
+        let mut runtime = VisionRuntime::unsupported();
+        let config = vision_build_config();
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            b"not an image".to_vec(),
+            "before".len(),
+        )];
+        let err = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || false,
+            |_| Ok(()),
+        )
+        .expect_err("malformed image bytes must be rejected");
+        match err {
+            WorkerFailure::Rejected(api_err) => {
+                assert_eq!(api_err.code(), "invalid_image");
+                assert_eq!(
+                    api_err.into_response().status(),
+                    axum::http::StatusCode::BAD_REQUEST
+                );
+            }
+            other => panic!("expected Rejected(invalid_image), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vision_request_build_maps_a_lazy_load_failure_to_a_retryable_client_rejection() {
+        use axum::response::IntoResponse as _;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Every manifest entry points at the same file, and that file is
+        // not a valid tensor payload -- the capability preflight
+        // (`validate_qwen35_vision_weight_inventory`) only checks that
+        // every expected name occurs once and its file opens, so this
+        // still advertises vision support; the actual lazy load fails
+        // once a real image request triggers it.
+        std::fs::write(temp.path().join("visual.bin"), b"not a valid tensor file")
+            .expect("weight-source marker");
+        let config = vision_build_config();
+        let entries: Vec<_> = tiny_vision_manifest_names()
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "file": "visual.bin"}))
+            .collect();
+        std::fs::write(
+            temp.path().join("quantize_index.json"),
+            serde_json::to_vec(&entries).expect("manifest fixture"),
+        )
+        .expect("test setup: write manifest");
+        let mut runtime = VisionRuntime::from_model_config(temp.path().to_path_buf(), &config);
+        assert!(
+            runtime.is_supported(),
+            "test setup: capability preflight must pass so the request reaches the lazy load"
+        );
+
+        let messages = vec![ChatMessage::user_with_image(
+            "beforeafter",
+            make_test_png(8, 8),
+            "before".len(),
+        )];
+        let err = build_vision_request(
+            &mut runtime,
+            &config,
+            &tiny_tokenizer(),
+            &messages,
+            0,
+            &mut || false,
+            |_| Ok(()),
+        )
+        .expect_err("a corrupt checkpoint must fail the lazy load");
+        match err {
+            WorkerFailure::Rejected(api_err) => {
+                assert_eq!(api_err.code(), "vision_load_failed");
+                let temp_path = temp.path().to_string_lossy().into_owned();
+                assert!(
+                    !api_err.message().contains(&temp_path),
+                    "client-visible message must not leak the checkpoint path: {}",
+                    api_err.message()
+                );
+                assert_eq!(
+                    api_err.into_response().status(),
+                    axum::http::StatusCode::BAD_REQUEST
+                );
+            }
+            other => panic!("expected Rejected(vision_load_failed), got {other:?}"),
+        }
+        assert!(
+            runtime.is_supported(),
+            "a lazy-load failure must stay retryable, not revoke capability permanently"
+        );
+    }
+
     #[test]
     fn vision_runtime_capability_requires_config_token_metadata_and_weight_source() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1814,17 +2009,98 @@ mod tests {
             .get_or_load(&mut never_cancel)
             .expect_err("junk tensor payload must fail its first lazy load");
         assert!(first_error.contains("vision weights failed to load"));
-        assert!(!runtime.is_supported());
         assert!(
-            !client.supports_vision(),
-            "terminal lazy-load failure must revoke the shared client capability"
+            runtime.is_supported(),
+            "a lazy-load failure must stay retryable, not revoke capability permanently"
         );
-        std::fs::remove_file(temp.path().join("visual.bin"))
-            .expect("remove source after the first attempt");
-        let second_error = runtime
-            .get_or_load(&mut never_cancel)
-            .expect_err("terminal failure must be returned, not retried");
-        assert_eq!(second_error, first_error);
+        assert!(
+            client.supports_vision(),
+            "a lazy-load failure must not revoke the shared client capability -- the \
+             caller can retry"
+        );
+
+        // Fix the checkpoint in place: write a genuinely valid q4 tensor for
+        // every `model.visual.*` name `config`'s tiny vision config expects,
+        // then retry. Reaching `VisionRuntimeLoad::Ready` (not another
+        // error) is the proof the second call actually attempted the load
+        // again rather than replaying a cached failure.
+        let hidden = 8usize;
+        let qkv_out = 3 * hidden;
+        let mlp_intermediate = 4 * hidden;
+        let merge_in = 2 * 2 * hidden;
+        let out_hidden = config.hidden_size;
+        let mut valid_shapes: Vec<(String, Vec<usize>)> = vec![
+            (
+                "model.visual.patch_embed.proj.weight".to_string(),
+                vec![hidden, 3, 1, 2, 2],
+            ),
+            (
+                "model.visual.patch_embed.proj.bias".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.visual.pos_embed.weight".to_string(),
+                vec![16, hidden],
+            ),
+            (
+                "model.visual.merger.linear_fc1.weight".to_string(),
+                vec![merge_in, merge_in],
+            ),
+            (
+                "model.visual.merger.linear_fc1.bias".to_string(),
+                vec![merge_in],
+            ),
+            (
+                "model.visual.merger.linear_fc2.weight".to_string(),
+                vec![out_hidden, merge_in],
+            ),
+            (
+                "model.visual.merger.linear_fc2.bias".to_string(),
+                vec![out_hidden],
+            ),
+            ("model.visual.merger.norm.weight".to_string(), vec![hidden]),
+            ("model.visual.merger.norm.bias".to_string(), vec![hidden]),
+        ];
+        for (suffix, shape) in [
+            ("attn.qkv.weight", vec![qkv_out, hidden]),
+            ("attn.qkv.bias", vec![qkv_out]),
+            ("attn.proj.weight", vec![hidden, hidden]),
+            ("attn.proj.bias", vec![hidden]),
+            ("mlp.linear_fc1.weight", vec![mlp_intermediate, hidden]),
+            ("mlp.linear_fc1.bias", vec![mlp_intermediate]),
+            ("mlp.linear_fc2.weight", vec![hidden, mlp_intermediate]),
+            ("mlp.linear_fc2.bias", vec![hidden]),
+            ("norm1.weight", vec![hidden]),
+            ("norm1.bias", vec![hidden]),
+            ("norm2.weight", vec![hidden]),
+            ("norm2.bias", vec![hidden]),
+        ] {
+            valid_shapes.push((format!("model.visual.blocks.0.{suffix}"), shape));
+        }
+        let mut manifest_entries = Vec::new();
+        for (i, (name, shape)) in valid_shapes.iter().enumerate() {
+            let numel: usize = shape.iter().product();
+            let q4 = crate::weights::q4_weights::quantize_f64_to_q4(&vec![0.25_f64; numel], shape)
+                .expect("quantize succeeds");
+            let file_name = format!("retry{i}.q4");
+            crate::weights::q4_weights::save_q4_file(&temp.path().join(&file_name), &q4)
+                .expect("test setup: write valid q4 file");
+            manifest_entries.push(format!(
+                r#"{{"name":"{name}","file":"{file_name}","quantized":true}}"#
+            ));
+        }
+        std::fs::write(
+            temp.path().join("quantize_index.json"),
+            format!("[{}]", manifest_entries.join(",")),
+        )
+        .expect("test setup: overwrite manifest with a valid checkpoint");
+
+        let retried = runtime.get_or_load(&mut never_cancel).expect(
+            "a fixed checkpoint must load successfully on retry, not replay the cached failure",
+        );
+        assert!(matches!(retried, VisionRuntimeLoad::Ready(_)));
+        assert!(runtime.is_supported());
+        assert!(client.supports_vision());
         assert!(
             !VisionRuntime::from_model_config(PathBuf::from("/unused"), &config).is_supported(),
             "config metadata alone must not advertise vision without a supported weight source"
@@ -1917,13 +2193,12 @@ mod tests {
     /// request gets its own normal lazy-load attempt rather than an
     /// immediately-terminal one.
     ///
-    /// Mutation-sensitivity: this is the test that reddens if `preload()` is
-    /// wired to `get_or_load()` directly (or otherwise poisons state to
-    /// `Failed` on error) instead of leaving `Pending` on failure — the
-    /// terminal-failure contract is correct for `get_or_load` (proven by
-    /// `vision_runtime_capability_requires_config_token_metadata_and_weight_source`
-    /// above) but wrong for `preload`, whose whole point is that failing must
-    /// not be terminal.
+    /// Mutation-sensitivity: this is the test that reddens if `preload()`
+    /// propagates its error in a way that revokes vision capability instead
+    /// of leaving `Pending` on failure. Both `preload` and `get_or_load` now
+    /// leave a failed load retryable, so the second half of this test pins
+    /// that shared policy: one unloadable fixture must not disable vision for
+    /// the rest of the session through either entry point.
     #[test]
     fn vision_runtime_preload_failure_falls_back_to_lazy_pending_state() {
         let (_temp, mut runtime) = pending_vision_runtime_with_unloadable_weights();
@@ -1939,17 +2214,18 @@ mod tests {
         );
 
         // The first real image request's lazy load must still be attempted
-        // fresh (not short-circuited by a stale `Failed` state left behind
-        // by preload) — same junk payload, so it fails too, but critically
-        // via `get_or_load`'s own (terminal) contract, not preload's.
+        // fresh, not short-circuited by state left behind by preload — same
+        // junk payload, so it fails too, and it fails through `get_or_load`'s
+        // own error path rather than preload's.
         let mut never_cancel = || false;
         let lazy_err = runtime
             .get_or_load(&mut never_cancel)
             .expect_err("lazy load retries the same unloadable fixture and fails the same way");
         assert!(lazy_err.contains("vision weights failed to load"));
         assert!(
-            !runtime.is_supported(),
-            "get_or_load's own terminal-failure contract still applies once it actually runs"
+            runtime.is_supported(),
+            "a failed lazy load leaves state at `Pending` and `vision_supported` untouched, so a \
+             later request retries rather than being rejected forever from one transient failure"
         );
     }
 

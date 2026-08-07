@@ -532,7 +532,9 @@ fn normalize_request_inner<C>(
             .as_ref()
             .is_some_and(|format| format.r#type == "json_schema")
     {
-        unsupported("json_schema response format is not supported for image requests")?;
+        image_unsupported_combination(
+            "json_schema response format is not supported for image requests",
+        )?;
     }
     // Resolved ahead of `check_context` (rather than in its pre-refactor spot
     // after `check_context`/`stop`) so the shared full-window formula
@@ -553,7 +555,7 @@ fn normalize_request_inner<C>(
             .filter(|&value| value > 0);
     }
     if has_image && reasoning_budget.is_some() {
-        unsupported("reasoning_budget is not supported for image requests")?;
+        image_unsupported_combination("reasoning_budget is not supported for image requests")?;
     }
 
     let context = check_context(&messages, max_tokens, reasoning_budget)?;
@@ -825,6 +827,20 @@ fn unsupported(message: impl Into<String>) -> Result<(), ApiError> {
     Err(ApiError::BadRequest {
         message: message.into(),
         code: "unsupported_feature",
+    })
+}
+
+/// Rejects an image combined with a specific incompatible request feature
+/// (`response_format.json_schema`, a nonzero `reasoning_budget`) with a
+/// stable, distinct code from the generic [`unsupported`] path, so a client
+/// can branch on "this combination is unsupported" without string-matching
+/// the message. Runs from [`normalize_request_inner`], ahead of worker
+/// dispatch on both server binaries -- a request that cannot be served never
+/// reaches the shared Metal worker.
+fn image_unsupported_combination(message: impl Into<String>) -> Result<(), ApiError> {
+    Err(ApiError::BadRequest {
+        message: message.into(),
+        code: "image_unsupported_combination",
     })
 }
 
@@ -1379,35 +1395,44 @@ mod tests {
             "unsupported_feature"
         );
 
+        // Pinned to the exact `BadRequest` variant (not just `.code()`), since
+        // that variant is what `ApiError`'s `IntoResponse` impl maps to HTTP
+        // 400 (`serve/mod.rs`, exercised there and in each binary's own
+        // envelope tests) -- this is the proof that `image_unsupported_combination`
+        // is a 400, not merely that some error carries that code string.
         let mut req = inline_image_request("user", &uri);
         req.reasoning_budget =
             Some(serde_json::value::RawValue::from_string("4".to_string()).unwrap());
-        assert_eq!(
+        assert!(matches!(
             normalize_request(
                 &req,
                 defaults(),
                 ServeProfile::lattice_serve("model", 32).with_vision_support(true),
             )
-            .unwrap_err()
-            .code(),
-            "unsupported_feature"
-        );
+            .unwrap_err(),
+            ApiError::BadRequest {
+                code: "image_unsupported_combination",
+                ..
+            }
+        ));
 
         let mut req = inline_image_request("user", &uri);
         req.response_format = Some(ResponseFormat {
             r#type: "json_schema".to_string(),
             json_schema: None,
         });
-        assert_eq!(
+        assert!(matches!(
             normalize_request(
                 &req,
                 defaults(),
                 ServeProfile::lattice_serve("model", 32).with_vision_support(true),
             )
-            .unwrap_err()
-            .code(),
-            "unsupported_feature"
-        );
+            .unwrap_err(),
+            ApiError::BadRequest {
+                code: "image_unsupported_combination",
+                ..
+            }
+        ));
     }
 
     #[test]
