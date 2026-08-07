@@ -31,8 +31,11 @@ use crate::model::qwen35_config::GenerateConfig;
 /// Shared chat-completions wire DTO and normalization policies.
 pub mod contract;
 
-/// Shared `/v1/embeddings` wire DTO, model loader, and pooled-embedding
-/// dispatch.
+/// `/v1/embeddings` wire DTOs, model loader, and pooled-embedding dispatch
+/// for the vision-language route, plus a separate, GPU-independent
+/// `/v1/embeddings` wire DTO, input normalization, and response building for
+/// `lattice_serve`'s text-only route (issue #584). See the module's own doc
+/// comment for how the two relate.
 pub mod embeddings;
 
 /// Convert normalized contract messages into the engine's chat representation.
