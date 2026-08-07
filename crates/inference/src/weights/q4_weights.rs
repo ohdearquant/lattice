@@ -966,11 +966,11 @@ pub(crate) fn open_and_mmap_q4_file(
     expected_shape: Option<&[usize]>,
     check: Q4BlockCheck<'_>,
 ) -> Result<(Q4FileHeader, memmap2::Mmap, Option<Q4BlocksChecked>), String> {
-    let (mut file, metadata) = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
-    let header = validate_q4_file(&mut file, path, expected_shape)
+    let mut handle = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
+    let header = validate_q4_file(handle.file_mut(), path, expected_shape)
         .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
 
-    let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&file, &metadata, path)?;
+    let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&handle)?;
 
     let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
         format!(

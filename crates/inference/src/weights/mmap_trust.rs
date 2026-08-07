@@ -139,7 +139,7 @@
 //! regardless of what the path later resolves to.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
 
@@ -463,10 +463,62 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
-/// Open `path` for a trusted, no-copy mmap and return the still-open
-/// `(File, Metadata)` pair every one of this crate's five mmap loaders needs
-/// -- callers never re-open or re-stat `path` afterward (see this module's
-/// fd-binding invariant).
+/// An already-open checkpoint `File`, together with the pre-map `Metadata`
+/// [`open_trusted_mmap_file`] captured and the resolved `Path` it came from,
+/// bundled behind private fields so the only way to obtain one is
+/// [`open_trusted_mmap_file`] itself.
+///
+/// This exists to close a defeat the previous `(File, Metadata)` tuple
+/// return shape permitted: [`map_and_verify_trusted`] took `file`, `prior`,
+/// and `path` as three independent parameters with no type-level
+/// relationship between them, so nothing stopped a caller from invoking it
+/// directly with a `file` that was never opened through
+/// [`open_trusted_mmap_file`] at all, paired with that same file's own
+/// metadata as `prior` -- [`verify_mmap_target_unchanged`] then saw no
+/// drift (the file had not changed since a stat taken from itself) and
+/// accepted an ungated, group/other-writable file. Bundling the three
+/// into one type whose fields only this module can set makes that
+/// construction unreachable: every `TrustedMmapFile` that exists has
+/// necessarily been through [`open_trusted_mmap_file`]'s mode/uid/ACL and
+/// parent-directory checks, because there is no other way to build one.
+///
+/// [`file_mut`](Self::file_mut) hands out a mutable borrow of the guarded
+/// file so a caller can read a header (Q4/Q3 preflight) between the
+/// trust-gated open and the mapping -- reading bytes off an already-open,
+/// already-guarded fd has no bearing on the mmap trust boundary this module
+/// enforces, only *mapping* does, and mapping stays reachable solely through
+/// [`map_and_verify_trusted`], which this type provides no way around: it is
+/// the only function that can see `prior` or construct a `Mmap` from
+/// `file`. This is not a wider exposure than the type it replaces already
+/// had -- the previous `(File, Metadata)` tuple handed the same `File` to
+/// callers just as directly, governed by the same lexical
+/// `only_the_mmap_trust_boundary_names_a_construction_api` contract test
+/// that still catches a caller writing `Mmap::map`/`MmapOptions` literally
+/// against that borrowed file outside this module; nothing about exposing
+/// `file_mut` changes that contract's coverage.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+pub(crate) struct TrustedMmapFile {
+    file: File,
+    prior: std::fs::Metadata,
+    path: PathBuf,
+}
+
+impl TrustedMmapFile {
+    /// Mutable access to the guarded file for a header read (Q4/Q3
+    /// preflight) that must happen between the trust-gated open and the
+    /// mapping. See the type doc comment for why this does not reopen the
+    /// hole [`TrustedMmapFile`] exists to close.
+    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+    pub(crate) fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+
+/// Open `path` for a trusted, no-copy mmap and return the still-open,
+/// trust-gated [`TrustedMmapFile`] every one of this crate's five mmap
+/// loaders needs -- callers never re-open or re-stat `path` afterward (see
+/// this module's fd-binding invariant).
 ///
 /// # FIFO / device DoS
 ///
@@ -517,7 +569,7 @@ unsafe extern "C" {
 /// ACL FFI calls at all.
 #[cfg(unix)]
 #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<(File, std::fs::Metadata), String> {
+pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -586,17 +638,25 @@ pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<(File, std::fs::Meta
     reject_if_mmap_parent_directory_chain_weak(path)?;
     reject_if_mmap_file_trust_boundary_weak(&file, path)?;
 
-    Ok((file, meta))
+    Ok(TrustedMmapFile {
+        file,
+        prior: meta,
+        path: path.to_path_buf(),
+    })
 }
 
 #[cfg(not(unix))]
 #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<(File, std::fs::Metadata), String> {
+pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
     let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let meta = file
         .metadata()
         .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
-    Ok((file, meta))
+    Ok(TrustedMmapFile {
+        file,
+        prior: meta,
+        path: path.to_path_buf(),
+    })
 }
 
 /// Post-map integrity recheck, replacing a previous
@@ -670,38 +730,48 @@ pub(crate) fn verify_mmap_target_unchanged(
     Ok(())
 }
 
-/// Map a `File` [`open_trusted_mmap_file`] already opened and trust-gated,
-/// then run [`verify_mmap_target_unchanged`] against the `Metadata` that call
-/// captured before mapping. `prior` must be the `Metadata` from that same
-/// `open_trusted_mmap_file` call on `file`.
+/// Map the `File` inside a [`TrustedMmapFile`] -- already opened and
+/// trust-gated by the only function that can construct one,
+/// [`open_trusted_mmap_file`] -- then run [`verify_mmap_target_unchanged`]
+/// against the `Metadata` that call captured before mapping.
 ///
 /// This -- not a bare `Mmap::map`/`MmapOptions::new().map` call written out
 /// at each loader -- is one of the two places in this crate a checkpoint
 /// mapping is constructed (see [`map_after_untrusted_open`] for the other).
-/// Folding the map and the post-map recheck into this module makes "guarded
-/// before mapped, rechecked after mapped" a property of *which function a
-/// caller calls*, not a convention each loader has to reproduce correctly on
-/// its own -- the property this module exists to enforce no longer depends
-/// on an external scan finding every call site that got it right.
+/// Taking `&TrustedMmapFile` rather than separate `file`/`prior`/`path`
+/// parameters (the previous shape) makes "guarded before mapped, rechecked
+/// after mapped" a property the type system enforces, not one this
+/// function's own body merely happens to implement correctly: there is no
+/// `TrustedMmapFile` value that has not been through
+/// [`open_trusted_mmap_file`]'s mode/uid/ACL and parent-directory checks, so
+/// there is no call to this function that can skip them -- previously
+/// nothing stopped a caller from invoking this with an ungated `file`
+/// paired with that same file's own metadata as `prior`, which
+/// [`verify_mmap_target_unchanged`] cannot distinguish from a genuinely
+/// guarded-then-unchanged file. See [`TrustedMmapFile`]'s doc comment for
+/// that defeat in full.
 ///
-/// A caller that needs to read `file`'s contents (a Q4/Q3 header, for
+/// A caller that needs to read the file's contents (a Q4/Q3 header, for
 /// instance) before the mapping is created does so between its
-/// `open_trusted_mmap_file` call and this one; nothing about that ordering
-/// is checked here, since a plain `std::fs::File` read has no bearing on the
-/// mmap trust boundary this module defends.
+/// `open_trusted_mmap_file` call and this one, via
+/// [`TrustedMmapFile::file_mut`]; nothing about that ordering is checked
+/// here, since a plain `std::fs::File` read has no bearing on the mmap
+/// trust boundary this module defends.
 #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn map_and_verify_trusted(
-    file: &File,
-    prior: &std::fs::Metadata,
-    path: &Path,
-) -> Result<Mmap, String> {
-    // SAFETY: `file` was opened and trust-gated by `open_trusted_mmap_file`
-    // (the caller's obligation, documented on this function); the model file
-    // must not be mutated while this process runs, the same invariant every
-    // mmap site in this crate relies on.
-    let mmap = unsafe { Mmap::map(file) }
-        .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
-    verify_mmap_target_unchanged(file, prior, path)?;
+pub(crate) fn map_and_verify_trusted(handle: &TrustedMmapFile) -> Result<Mmap, String> {
+    // SAFETY: `handle` is a `TrustedMmapFile`, and `open_trusted_mmap_file`
+    // is the only function that can construct one -- its fields are private
+    // to this module, so nothing outside it can assemble a `TrustedMmapFile`
+    // from a `file` that has not been through `open_trusted_mmap_file`'s
+    // mode/uid/ACL and parent-directory trust checks. This SAFETY argument
+    // rests on that type invariant, not on a caller's documented obligation
+    // to call the right function first. The model file must not be mutated
+    // while this process runs, the same residual invariant every mmap site
+    // in this crate relies on (see the module doc comment's
+    // "Trust-boundary scope" section).
+    let mmap = unsafe { Mmap::map(&handle.file) }
+        .map_err(|e| format!("failed to mmap {}: {e}", handle.path.display()))?;
+    verify_mmap_target_unchanged(&handle.file, &handle.prior, &handle.path)?;
     Ok(mmap)
 }
 
@@ -1610,12 +1680,12 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("chmod 0o600");
 
-        let (file, meta) =
+        let handle =
             open_trusted_mmap_file(&path).expect("a regular owner-only file must be accepted");
-        assert!(meta.is_file());
+        assert!(handle.prior.is_file());
         assert_eq!(
-            file.metadata().expect("stat returned file").len(),
-            meta.len()
+            handle.file.metadata().expect("stat returned file").len(),
+            handle.prior.len()
         );
     }
 
@@ -1667,10 +1737,9 @@ mod tests {
         let path = tmp.path().join("truncate_race.q4");
         std::fs::write(&path, vec![0xABu8; 4096]).expect("write fixture");
 
-        let (file, prior_meta) =
-            open_trusted_mmap_file(&path).expect("open + trust-gate the fixture");
+        let handle = open_trusted_mmap_file(&path).expect("open + trust-gate the fixture");
         // SAFETY: read-only mmap of a tempfile this test alone controls.
-        let _mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.expect("mmap fixture");
+        let _mmap = unsafe { memmap2::MmapOptions::new().map(&handle.file) }.expect("mmap fixture");
 
         // Simulate a writer truncating the file in the window between the
         // pre-map stat captured above and this recheck -- the exact race
@@ -1682,7 +1751,7 @@ mod tests {
             .set_len(4096 - 8)
             .expect("truncate fixture in place");
 
-        let result = verify_mmap_target_unchanged(&file, &prior_meta, &path);
+        let result = verify_mmap_target_unchanged(&handle.file, &handle.prior, &handle.path);
         assert!(
             result.is_err(),
             "a size change between the pre-map stat and this recheck must be rejected"
@@ -1704,12 +1773,11 @@ mod tests {
         let path = tmp.path().join("unchanged.q4");
         std::fs::write(&path, vec![0xCDu8; 4096]).expect("write fixture");
 
-        let (file, prior_meta) =
-            open_trusted_mmap_file(&path).expect("open + trust-gate the fixture");
-        let _mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.expect("mmap fixture");
+        let handle = open_trusted_mmap_file(&path).expect("open + trust-gate the fixture");
+        let _mmap = unsafe { memmap2::MmapOptions::new().map(&handle.file) }.expect("mmap fixture");
 
         assert!(
-            verify_mmap_target_unchanged(&file, &prior_meta, &path).is_ok(),
+            verify_mmap_target_unchanged(&handle.file, &handle.prior, &handle.path).is_ok(),
             "a file untouched between the pre-map stat and the post-map recheck must be accepted"
         );
     }

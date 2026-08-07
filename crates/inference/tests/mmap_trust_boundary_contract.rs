@@ -72,16 +72,27 @@
 //!   announces itself. Not defended against here; recorded as a residual
 //!   for the same reason as the macro case above.
 //! - **Ordering of the guard relative to the map** is no longer something
-//!   this *test* checks at all -- it is enforced by `mmap_trust.rs`'s own
-//!   function bodies (`map_and_verify_trusted`, `map_after_untrusted_open`
-//!   each call the guard, unconditionally, as the first statement, before
-//!   the `unsafe { Mmap::map(..) }` that follows). That is a stronger
-//!   guarantee than the walker's dominance analysis ever gave -- a single
-//!   straight-line function has no branches for a guard-only-on-one-arm bug
-//!   to hide in -- but it now lives as an invariant of that module's source,
-//!   not as something an external instrument re-derives on every run. A
-//!   regression there would have to be caught by `mmap_trust.rs`'s own unit
-//!   tests or code review, not by this file.
+//!   this *test* checks at all -- it is enforced two different ways inside
+//!   `mmap_trust.rs`, one per construction function. `map_after_untrusted_open`
+//!   still calls its guard (`reject_if_open_mmap_file_untrusted`),
+//!   unconditionally, as its first statement, before the
+//!   `unsafe { Mmap::map(..) }` that follows -- a single straight-line
+//!   function with no branches for a guard-only-on-one-arm bug to hide in.
+//!   `map_and_verify_trusted` (#1369 round 6) enforces the same property a
+//!   level up instead: it no longer takes a bare `&File` at all, only a
+//!   `&TrustedMmapFile`, whose fields are private to `mmap_trust.rs` and
+//!   whose only constructor, `open_trusted_mmap_file`, runs the mode/uid/ACL
+//!   and parent-directory checks before it can produce one. There is
+//!   therefore no `TrustedMmapFile` value, and so no call to
+//!   `map_and_verify_trusted`, that has not been through that gate -- the
+//!   ordering is a property of the type graph, not of statement order
+//!   inside one function body. Either shape is a stronger guarantee than the
+//!   walker's dominance analysis ever gave, but it now lives as an invariant
+//!   of that module's source, not as something an external instrument
+//!   re-derives on every run. A regression there would have to be caught by
+//!   `mmap_trust.rs`'s own unit tests (`open_trusted_mmap_file_rejects_a_writable_parent_directory`
+//!   and its siblings all fail if the guard calls inside
+//!   `open_trusted_mmap_file` are removed) or code review, not by this file.
 //!
 //! # What is intentionally NOT preserved from the walker
 //!

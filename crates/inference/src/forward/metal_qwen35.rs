@@ -776,16 +776,17 @@ mod inner {
 
         validate_q3_mlp_role(tensor_name).map_err(|e| e.to_string())?;
 
-        let (mut file, metadata) = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
-        let header = crate::weights::q3_weights::read_q3_header(&mut file)
+        let mut handle = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
+        let header = crate::weights::q3_weights::read_q3_header(handle.file_mut())
             .map_err(|e| format!("failed to parse Q3 header {}: {e}", path.display()))?;
-        let file_len = file
+        let file_len = handle
+            .file_mut()
             .metadata()
             .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
             .len();
         crate::weights::q3_weights::validate_q3_header_payload_bounds(&header, file_len, path)
             .map_err(|e| format!("failed to validate Q3 payload {}: {e}", path.display()))?;
-        let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&file, &metadata, path)?;
+        let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&handle)?;
 
         let buf = device.new_buffer_with_bytes_no_copy(
             mmap.as_ptr().cast(),
