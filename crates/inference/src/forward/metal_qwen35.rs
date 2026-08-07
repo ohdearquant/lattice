@@ -24341,7 +24341,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `self.encode_final_head(...)` in `forward_step_inner_impl` back to
         /// an unconditional call reddens the `emit_head=false` assertion
         /// below (the sentinel gets overwritten by the real lm_head GEMV
-        /// every time, regardless of the flag). Verified in REPORT.md.
+        /// every time, regardless of the flag).
         #[test]
         fn forward_step_mrope_emit_head_false_skips_terminal_head_dispatch() {
             let Some(model) = require_metal_and_real_checkpoint_or_skip(
