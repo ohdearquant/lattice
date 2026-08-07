@@ -167,9 +167,9 @@ impl CrossEncoderWeights {
 ///
 /// The owned variant exists for targets without real file-descriptor/mmap
 /// support (`wasm32-unknown-unknown`: `memmap2`'s wasm fallback compiles but
-/// every `Mmap::map` call returns `io::ErrorKind::Unsupported` at runtime) and
-/// for hosts that receive model weights as an in-memory buffer rather than a
-/// filesystem path (e.g. bytes handed in from JavaScript).
+/// every mmap construction call returns `io::ErrorKind::Unsupported` at
+/// runtime) and for hosts that receive model weights as an in-memory buffer
+/// rather than a filesystem path (e.g. bytes handed in from JavaScript).
 enum SafetensorsBacking {
     Mapped(Mmap),
     Owned(Vec<u8>),
@@ -218,21 +218,22 @@ impl SafetensorsFile {
         let file = File::open(path).map_err(|e| {
             InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
         })?;
-        Self::from_open_file(file, path.display().to_string())
+        Self::from_open_file(file, path)
     }
 
     /// Parse a safetensors file from an already-open [`File`].
     ///
     /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
-    /// validates the manifest string and opens the file exactly once. Mapping the fd the
-    /// caller already holds is what keeps that single open meaningful; reopening by path
-    /// here would reintroduce the window between the open and the read.
-    pub(crate) fn from_open_file(file: File, display_path: String) -> Result<Self, InferenceError> {
-        // SAFETY: The file descriptor remains alive until the mmap is created,
-        // and the returned Mmap owns the mapping independently of the File.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {display_path}: {e}"))
-        })?;
+    /// opens the file exactly once. Mapping the fd the caller already holds is what keeps
+    /// that single open meaningful; reopening by path here would reintroduce the window
+    /// between the open and the read. `path` is used both to run the mmap trust-boundary
+    /// guard (via [`crate::weights::mmap_trust::map_after_untrusted_open`]) and to name the
+    /// file in error messages -- it should be the resolved real path when the caller has
+    /// one, matching that guard's own `path` requirement.
+    pub(crate) fn from_open_file(file: File, path: &Path) -> Result<Self, InferenceError> {
+        let display_path = path.display().to_string();
+        let mmap = crate::weights::mmap_trust::map_after_untrusted_open(&file, path)
+            .map_err(InferenceError::InvalidSafetensors)?;
 
         Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
     }
@@ -1314,6 +1315,12 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
 /// [`contained_shard_path`] before the join: absolute paths and parent-directory components
 /// are rejected, lexically, without consulting any filesystem state.
 ///
+/// The returned file has already passed
+/// [`crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted`] against its resolved
+/// real path -- every caller mmaps this file read-only no-copy, so the same write-boundary
+/// gate every other checkpoint mmap goes through applies here too, without `open_trusted_mmap_file`'s
+/// `O_NOFOLLOW` (see that function's doc comment for why a hub-cache symlink must still resolve).
+///
 /// # Why this opens the file instead of returning a path to reopen
 ///
 /// Resolving a path and handing it back leaves the caller to `open()` it separately, and a
@@ -1341,6 +1348,8 @@ pub(crate) fn open_manifest_entry_once(
         InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", candidate.display()))
     })?;
     let real_path = real_path_of_open_file(&file, &candidate)?;
+    crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted(&file, &real_path)
+        .map_err(InferenceError::InvalidSafetensors)?;
     Ok((file, real_path))
 }
 
@@ -1405,7 +1414,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
         let (file, real_path) = open_manifest_entry_once(model_dir, &shard_file)?;
-        let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
+        let shard = SafetensorsFile::from_open_file(file, &real_path)?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
             tensors.insert(
@@ -1463,7 +1472,7 @@ impl ShardedSafetensors {
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
             let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
-            let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
+            let shard = SafetensorsFile::from_open_file(file, &real_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
         self.shards.get(shard_file).ok_or_else(|| {
@@ -2463,6 +2472,41 @@ mod tests {
         assert_eq!(mat_shape, &[2, 2]);
         assert_eq!(vec_data, &[1.0, 2.0]);
         assert_eq!(mat_data, &[3.0, 4.0, 5.0, 6.0]);
+    }
+
+    // #1368: `SafetensorsFile::open` is a raw-open entry point (used directly
+    // by the runtime model loaders, not just via `open_manifest_entry_once`)
+    // that must route through the mmap trust boundary the same as every
+    // other checkpoint mmap site in this crate. This proves the wiring, not
+    // just the underlying `reject_if_open_mmap_file_untrusted` predicate
+    // (already covered directly in `mmap_trust`'s own tests).
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_a_group_or_other_writable_checkpoint_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("lattice_weights_writable_checkpoint");
+        let header = r#"{"vec":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let mut file = File::create(&path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+        drop(file);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod 0o666");
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("a group/other-writable checkpoint file must be refused");
+        assert!(
+            matches!(&err, InferenceError::InvalidSafetensors(msg) if msg.contains("refusing to load")),
+            "expected a trust-boundary refusal, got: {err:?}"
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod 0o600");
+        SafetensorsFile::open(&path).expect("an owner-only checkpoint file must still be accepted");
     }
 
     #[test]
