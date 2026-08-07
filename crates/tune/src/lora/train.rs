@@ -582,6 +582,7 @@ fn train_micro_lora_impl(
         rank,
         alpha,
         target_modules,
+        dtype: "f32".into(),
     };
     LoraAdapter::new(lora_config, adapter_layers)
 }

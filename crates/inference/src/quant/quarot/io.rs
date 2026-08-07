@@ -134,12 +134,14 @@ impl Shard {
         let file = File::open(path).map_err(|e| {
             InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
         })?;
-        // SAFETY: the file is opened read-only; the returned Mmap owns the
-        // mapping. The File handle can be dropped immediately after — the OS
-        // keeps the fd alive through the map. Standard memmap2 usage.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {}: {e}", path.display()))
-        })?;
+        // This reader loads the same HuggingFace hub-cache checkpoints the
+        // runtime baseline forward pass does (see `QuarotTensorReader::open`'s
+        // doc comment), so `path` may resolve through a final-component
+        // symlink -- `open_trusted_mmap_file`'s `O_NOFOLLOW` would reject
+        // that. `map_after_untrusted_open` applies the same
+        // mode/uid/ACL/parent-directory checks without it, then maps.
+        let mmap = crate::weights::mmap_trust::map_after_untrusted_open(&file, path)
+            .map_err(InferenceError::InvalidSafetensors)?;
 
         if mmap.len() < 8 {
             return Err(InferenceError::InvalidSafetensors(format!(
@@ -1209,6 +1211,36 @@ mod tests {
         for (g, &v) in got.iter().zip(values.iter()) {
             assert_eq!(*g, v as f64);
         }
+    }
+
+    // #1368: `Shard::open` (reached via `QuarotTensorReader::open`) is a
+    // raw-open mmap site that must route through the mmap trust boundary the
+    // same as every other checkpoint mmap site in this crate. This proves
+    // the wiring at the public entry point, not just the underlying
+    // `reject_if_open_mmap_file_untrusted` predicate (already covered
+    // directly in `mmap_trust`'s own tests).
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_a_group_or_other_writable_checkpoint_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        write_safetensors(&path, &[("w", FixtureDType::F32, vec![1], &[1.0])]);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("chmod 0o666");
+
+        let err = QuarotTensorReader::open(dir.path())
+            .expect_err("a group/other-writable checkpoint file must be refused");
+        assert!(
+            matches!(&err, InferenceError::InvalidSafetensors(msg) if msg.contains("refusing to load")),
+            "expected a trust-boundary refusal, got: {err:?}"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0o600");
+        QuarotTensorReader::open(dir.path())
+            .expect("an owner-only checkpoint file must still be accepted");
     }
 
     #[test]

@@ -33,7 +33,10 @@ serve = [
 ]
 std = []
 f16 = []
-metal-gpu = ["dep:metal", "dep:objc"]
+# lattice-fann supplies the shared LoRA descriptor/blend-validation module
+# (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
+# be present whenever this feature is — not just under `mixture`.
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = []
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
@@ -41,8 +44,10 @@ backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq"]
 train-backward = []
 # AdapterRouter gate: enables the lattice-fann backed routing module.
-# blend_lora_layer_data and generate_with_lora_mixture do NOT require this
-# feature — they are always available.
+# generate_with_lora_mixture does NOT require this feature — it is always
+# available under `metal-gpu`. blend_lora_layer_data now depends on
+# lattice-fann too (issue #615), but that dep is already pulled in by
+# `metal-gpu` itself, so this feature only adds the routing module.
 mixture = ["dep:lattice-fann"]
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.

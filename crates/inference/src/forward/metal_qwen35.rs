@@ -755,7 +755,12 @@ mod inner {
     ///
     /// # Safety invariant
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
-    /// modified while the process is running.
+    /// modified while the process is running. [`crate::weights::mmap_trust::open_trusted_mmap_file`]
+    /// enforces the write-boundary half of that invariant (group/other-writable,
+    /// foreign ownership, a writable ancestor directory, or a permission-granting
+    /// extended ACL) the same way [`mmap_q4_weight`] does; same-uid mutation
+    /// through a second fd remains the documented residual, as for every mmap
+    /// site in this crate.
     ///
     /// Not yet called from live checkpoint loading (proven end-to-end by this
     /// module's `mmap_q3_weight_*` tests instead).
@@ -771,23 +776,15 @@ mod inner {
 
         validate_q3_mlp_role(tensor_name).map_err(|e| e.to_string())?;
 
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-        let header = crate::weights::q3_weights::read_q3_header(&mut file)
+        let mut handle = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
+        let header = crate::weights::q3_weights::read_q3_header(&mut handle)
             .map_err(|e| format!("failed to parse Q3 header {}: {e}", path.display()))?;
-        let file_len = file
-            .metadata()
-            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
-            .len();
+        let file_len = handle
+            .len()
+            .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
         crate::weights::q3_weights::validate_q3_header_payload_bounds(&header, file_len, path)
             .map_err(|e| format!("failed to validate Q3 payload {}: {e}", path.display()))?;
-        // SAFETY: `mmap`'s read-only-mmap invariant is documented above
-        // (`# Safety invariant`): the file is opened read-only and mapped
-        // `MAP_PRIVATE`, and the caller must not mutate the on-disk file
-        // while this process runs — the same invariant `mmap_q4_weight`
-        // relies on for its no-copy Metal buffer.
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-            .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+        let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&handle)?;
 
         let buf = device.new_buffer_with_bytes_no_copy(
             mmap.as_ptr().cast(),
@@ -1722,17 +1719,36 @@ mod inner {
     /// The Metal GEMV kernels assume a modest rank budget (≤ ~64 per adapter in a
     /// typical mixture).  This cap bounds allocations and rejects adversarially large
     /// adapter pools before `Vec::with_capacity`.
-    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
+    ///
+    /// Re-exported from [`lattice_fann::lora::MAX_BLEND_RANK_TOTAL`], the shared
+    /// cap this crate and `lattice-tune`'s CPU LoRA blend both enforce. Only
+    /// referenced by tests below — non-test code calls `lattice_fann::lora::*`
+    /// directly so the cap itself lives in exactly one place.
+    #[cfg(test)]
+    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = lattice_fann::lora::MAX_BLEND_RANK_TOTAL;
 
-    /// Aggregate cap on a blended adapter's total element count, summed across
-    /// every (layer_idx, module) projection: Σ rank_total·(d_in + d_out). At f32
-    /// this bounds the blended-adapter allocation to ~4 GiB. MAX_BLEND_RANK_TOTAL
-    /// bounds one projection; this bounds the whole blend, so a full-model adapter
-    /// that keeps every projection near the per-group cap cannot drive a multi-GiB
-    /// aggregate allocation. A realistic micro-LoRA mixture is far below this; a
-    /// large-model mixture at modest summed rank stays within budget, while a
-    /// rank-4096-everywhere adapter (tens of GiB) is rejected before any allocation.
-    pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
+    /// Reject any element of `inputs` whose inner layer slice is empty.
+    ///
+    /// An empty inner slice passes an outer `inputs.is_empty()` check (the
+    /// outer slice itself is non-empty) but contributes nothing to a
+    /// group-by-`(layer_idx, module)` pass, silently producing an empty
+    /// result instead of an admission error. Split out from
+    /// [`blend_lora_layer_data`] so callers that mutate state before
+    /// blending (e.g. [`MetalQwen35State::generate_with_lora_mixture`], which
+    /// unloads the currently loaded adapter first) can run this check first
+    /// and reject the request before that mutation, not after.
+    fn reject_empty_inner_layers(
+        inputs: &[(&[LoraLayerData], f32)],
+    ) -> Result<(), crate::error::InferenceError> {
+        for (idx, (layers, _)) in inputs.iter().enumerate() {
+            if layers.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: inputs[{idx}] has an empty layer slice"
+                )));
+            }
+        }
+        Ok(())
+    }
 
     /// Blend multiple sets of [`LoraLayerData`] into one rank-Σr set for use with
     /// the single-slot [`MetalQwen35State::load_lora_adapter`] API.
@@ -1755,6 +1771,7 @@ mod inner {
     ///
     /// Returns an error if:
     /// - `inputs` is empty
+    /// - Any element of `inputs` has an empty inner layer slice
     /// - Any weight is not finite
     /// - Two adapters have conflicting `d_in` / `d_out` for the same `(layer_idx, module)`
     /// - The summed rank for a single projection exceeds `MAX_BLEND_RANK_TOTAL`
@@ -1773,12 +1790,18 @@ mod inner {
             ));
         }
 
+        // An empty inner layer slice passes the outer `inputs.is_empty()`
+        // guard above (the outer slice itself is non-empty) but contributes
+        // nothing to `grouped` below, silently producing `Ok(Vec::new())`
+        // instead of an admission error. Callers that unload the currently
+        // loaded adapter before blending (e.g. `generate_with_lora_mixture`)
+        // must reject this before that mutation, not after — see
+        // `reject_empty_inner_layers` and its call site there.
+        reject_empty_inner_layers(inputs)?;
+
         for (idx, (_, w)) in inputs.iter().enumerate() {
-            if !w.is_finite() {
-                return Err(InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: weight at index {idx} is not finite ({w})"
-                )));
-            }
+            lattice_fann::lora::check_finite_weight("blend_lora_layer_data", idx, *w)
+                .map_err(InferenceError::InvalidInput)?;
         }
 
         // Group by (layer_idx, module): collect refs to layer data and effective weights.
@@ -1800,38 +1823,33 @@ mod inner {
         let mut planned_elems: usize = 0;
         for ((layer_idx, module), entries) in &grouped {
             let (first, _) = entries[0]; // each key was inserted with >=1 entry
-            let dims = first.d_in.checked_add(first.d_out).ok_or_else(|| {
-                InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: layer {layer_idx} module '{module}' d_in+d_out overflowed usize"
-                ))
-            })?;
             let mut group_rank: usize = 0;
             for (entry, _) in entries {
-                group_rank = group_rank.checked_add(entry.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank_total overflowed usize".into(),
-                    )
-                })?;
+                group_rank = lattice_fann::lora::accumulate_rank(
+                    group_rank,
+                    entry.rank,
+                    "blend_lora_layer_data",
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
-            let group_elems = group_rank.checked_mul(dims).ok_or_else(|| {
-                InferenceError::InvalidInput(
-                    "blend_lora_layer_data: rank_total*(d_in+d_out) overflowed usize".into(),
-                )
-            })?;
-            planned_elems = planned_elems.checked_add(group_elems).ok_or_else(|| {
-                InferenceError::InvalidInput(
-                    "blend_lora_layer_data: aggregate blend element count overflowed usize".into(),
-                )
-            })?;
+            let group_elems = lattice_fann::lora::checked_group_elements(
+                "blend_lora_layer_data",
+                *layer_idx,
+                module,
+                group_rank,
+                first.d_in,
+                first.d_out,
+            )
+            .map_err(InferenceError::InvalidInput)?;
+            planned_elems = lattice_fann::lora::accumulate_planned_elements(
+                planned_elems,
+                group_elems,
+                "blend_lora_layer_data",
+            )
+            .map_err(InferenceError::InvalidInput)?;
         }
-        if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
-            return Err(InferenceError::InvalidInput(format!(
-                "blend_lora_layer_data: aggregate blend size {planned_elems} elements exceeds \
-                 MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{} GiB f32); reduce the \
-                 number of adapters, their rank, or the number of target projections",
-                (MAX_BLEND_TOTAL_ELEMENTS * 4) / (1024 * 1024 * 1024)
-            )));
-        }
+        lattice_fann::lora::check_aggregate_elements_cap(planned_elems, "blend_lora_layer_data")
+            .map_err(InferenceError::InvalidInput)?;
 
         let mut result: Vec<LoraLayerData> = Vec::with_capacity(grouped.len());
         for ((layer_idx, module), entries) in grouped {
@@ -1841,64 +1859,46 @@ mod inner {
 
             // Validate dimension consistency across adapters for this projection.
             for (idx, (entry, _)) in entries.iter().enumerate() {
-                if entry.d_in != d_in || entry.d_out != d_out {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: layer {layer_idx} module '{module}' has \
-                         mismatched dimensions (entry 0: d_in={d_in}, d_out={d_out}; \
-                         entry {idx}: d_in={}, d_out={})",
-                        entry.d_in, entry.d_out
-                    )));
-                }
+                lattice_fann::lora::check_dims_match(
+                    "blend_lora_layer_data",
+                    layer_idx,
+                    &module,
+                    d_in,
+                    d_out,
+                    idx,
+                    entry.d_in,
+                    entry.d_out,
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
 
             // Accumulate rank_total with overflow protection and a hard cap
             // (MAX_BLEND_RANK_TOTAL is defined at module scope above this function).
             let mut rank_total: usize = 0;
             for (layer, _) in &entries {
-                rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank_total overflowed usize".into(),
-                    )
-                })?;
+                rank_total = lattice_fann::lora::accumulate_rank(
+                    rank_total,
+                    layer.rank,
+                    "blend_lora_layer_data",
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
-            if rank_total > MAX_BLEND_RANK_TOTAL {
-                return Err(InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: summed rank {rank_total} exceeds \
-                     MAX_BLEND_RANK_TOTAL={MAX_BLEND_RANK_TOTAL}"
-                )));
-            }
+            lattice_fann::lora::check_rank_total_cap(rank_total, "blend_lora_layer_data")
+                .map_err(InferenceError::InvalidInput)?;
 
             // Validate source slice lengths before any allocation: a malformed adapter
             // whose A or B buffer is the wrong size would cause out-of-bounds copies.
             for (idx, (entry, _)) in entries.iter().enumerate() {
-                let expected_a = entry.rank.checked_mul(d_in).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank*d_in overflowed usize".into(),
-                    )
-                })?;
-                let expected_b = d_out.checked_mul(entry.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: d_out*rank overflowed usize".into(),
-                    )
-                })?;
-                if entry.a.len() != expected_a {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: entry {idx} A slice length {} \
-                         does not match rank*d_in={}*{}={expected_a}",
-                        entry.a.len(),
-                        entry.rank,
-                        d_in,
-                    )));
-                }
-                if entry.b.len() != expected_b {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: entry {idx} B slice length {} \
-                         does not match d_out*rank={}*{}={expected_b}",
-                        entry.b.len(),
-                        d_out,
-                        entry.rank,
-                    )));
-                }
+                lattice_fann::lora::check_buffer_lengths(
+                    "blend_lora_layer_data",
+                    idx,
+                    entry.rank,
+                    d_in,
+                    d_out,
+                    entry.a.len(),
+                    entry.b.len(),
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
 
             let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
@@ -2135,7 +2135,7 @@ mod inner {
         }
     }
 
-    /// Dispatch-site counters for the Metal attention/KV-cache path-proof probe.
+    /// Dispatch/readback-site counters for the Metal path-proof probe.
     ///
     /// `&self`-compatible (interior mutability) because the dispatch helpers that
     /// increment these run inside `&self` methods sharing one command encoder.
@@ -2143,20 +2143,24 @@ mod inner {
     pub struct PathProofCounters {
         pub prefill_kv_batch: AtomicU64,
         pub prefill_attn_batched: AtomicU64,
+        pub prefill_hidden_readback: AtomicU64,
         pub decode_kv_copy: AtomicU64,
         pub decode_attn_direct: AtomicU64,
         pub decode_attn_split_partial: AtomicU64,
         pub decode_attn_split_reduce: AtomicU64,
+        pub decode_hidden_readback: AtomicU64,
     }
 
     impl PathProofCounters {
         fn reset(&self) {
             self.prefill_kv_batch.store(0, Ordering::Relaxed);
             self.prefill_attn_batched.store(0, Ordering::Relaxed);
+            self.prefill_hidden_readback.store(0, Ordering::Relaxed);
             self.decode_kv_copy.store(0, Ordering::Relaxed);
             self.decode_attn_direct.store(0, Ordering::Relaxed);
             self.decode_attn_split_partial.store(0, Ordering::Relaxed);
             self.decode_attn_split_reduce.store(0, Ordering::Relaxed);
+            self.decode_hidden_readback.store(0, Ordering::Relaxed);
         }
     }
 
@@ -2171,6 +2175,13 @@ mod inner {
         pub decode_attn_split_partial: u64,
         pub decode_attn_split_reduce: u64,
         pub kv_f16: bool,
+    }
+
+    /// Explicit hidden-readback counts recorded by the Metal path-proof probe.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct HiddenReadbackPathProofSnapshot {
+        pub decode: u64,
+        pub prefill: u64,
     }
 
     // ---------------------------------------------------------------------------
@@ -3647,10 +3658,12 @@ mod inner {
             self.session.mtp.is_some()
         }
 
-        /// Zeroes the Metal attention/KV-cache path-proof counters (issue #239).
+        /// Zeroes the Metal path-proof counters.
         ///
         /// Call before a one-shot `generate`/`generate_streaming` run so
-        /// [`Self::path_proof_snapshot`] afterward reflects only that run's dispatches.
+        /// [`Self::path_proof_snapshot`] and
+        /// [`Self::hidden_readback_path_proof_snapshot`] afterward reflect only
+        /// that run's dispatches and explicit hidden readbacks.
         pub fn reset_path_proof_counters(&self) {
             self.path_proof.reset();
         }
@@ -3672,6 +3685,20 @@ mod inner {
                     .decode_attn_split_reduce
                     .load(Ordering::Relaxed),
                 kv_f16: self.use_kv_f16,
+            }
+        }
+
+        /// Snapshots explicit hidden-readback path-proof counters without resetting them.
+        pub fn hidden_readback_path_proof_snapshot(&self) -> HiddenReadbackPathProofSnapshot {
+            HiddenReadbackPathProofSnapshot {
+                decode: self
+                    .path_proof
+                    .decode_hidden_readback
+                    .load(Ordering::Relaxed),
+                prefill: self
+                    .path_proof
+                    .prefill_hidden_readback
+                    .load(Ordering::Relaxed),
             }
         }
 
@@ -3767,6 +3794,17 @@ mod inner {
         /// GDN modules: `in_proj_qkv`, `in_proj_z`, `out_proj`.
         /// (`in_proj_a`, `in_proj_b` not yet supported — consumed inside fused kernels).
         /// MLP modules (both layer types): `gate_proj`, `up_proj`, `down_proj`.
+        ///
+        /// This is the deliberate low-level entry point: `scale` is applied
+        /// exactly as given, with no cross-check against any adapter
+        /// identity (no descriptor, no per-layer rank comparison, nothing
+        /// derived from `layers` itself). The caller owns the invariant that
+        /// `scale` is the correct `alpha / rank` for the adapter these
+        /// `layers` actually represent — this function has no way to verify
+        /// that on its own. Prefer [`Self::load_lora_adapter_with_descriptor`]
+        /// when `scale` should instead be derived from, and checked against,
+        /// a [`lattice_fann::lora::LoraDescriptor`]'s declared rank and
+        /// target modules.
         ///
         /// # Errors
         ///
@@ -3963,6 +4001,80 @@ mod inner {
             Ok(())
         }
 
+        /// Load a LoRA adapter using the shared cross-crate
+        /// [`lattice_fann::lora::LoraDescriptor`] as the source of the adapter's
+        /// scale and declared target modules, instead of a bare `scale: f32`
+        /// the caller must have derived correctly on its own.
+        ///
+        /// Validates `descriptor.alpha`/effective scale (finite),
+        /// `descriptor.target_modules` (recognized names), that every
+        /// nonempty `layers` entry's rank matches `descriptor.rank`, and that
+        /// the set of modules present in `layers` matches
+        /// `descriptor.target_modules` exactly — before delegating to
+        /// [`Self::load_lora_adapter`] with `descriptor.scale()`. Every
+        /// per-layer, per-architecture shape check `load_lora_adapter` already
+        /// performs still applies on top of this.
+        ///
+        /// `descriptor.rank` and `descriptor.target_modules` are the inputs
+        /// `descriptor.scale()` is computed from; without this check a caller
+        /// could pass `layers` built at one rank alongside a `descriptor` built
+        /// at another (or covering a different module set) and silently get
+        /// the wrong scale applied to correctly-shaped buffers.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the descriptor's alpha/scale is not finite, if
+        /// `target_modules` contains an unrecognized name, if any layer's
+        /// rank disagrees with `descriptor.rank`, if the loaded module set
+        /// disagrees with `descriptor.target_modules`, or for any reason
+        /// [`Self::load_lora_adapter`] itself would reject the call.
+        pub fn load_lora_adapter_with_descriptor(
+            &mut self,
+            layers: Vec<LoraLayerData>,
+            descriptor: &lattice_fann::lora::LoraDescriptor,
+            quarot_seed: Option<u64>,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            descriptor
+                .validate()
+                .map_err(InferenceError::InvalidInput)?;
+            lattice_fann::lora::validate_target_modules(
+                &descriptor.target_modules,
+                lattice_fann::lora::KNOWN_LORA_TARGET_MODULES,
+            )
+            .map_err(InferenceError::InvalidInput)?;
+
+            for layer in &layers {
+                if layer.rank != descriptor.rank {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "load_lora_adapter_with_descriptor: layer {} module '{}' has \
+                         rank={} but descriptor declares rank={}",
+                        layer.layer_idx, layer.module, layer.rank, descriptor.rank
+                    )));
+                }
+            }
+
+            let mut layer_modules: Vec<&str> = layers.iter().map(|l| l.module.as_str()).collect();
+            layer_modules.sort_unstable();
+            layer_modules.dedup();
+            let mut declared_modules: Vec<&str> = descriptor
+                .target_modules
+                .iter()
+                .map(String::as_str)
+                .collect();
+            declared_modules.sort_unstable();
+            declared_modules.dedup();
+            if layer_modules != declared_modules {
+                return Err(InferenceError::InvalidInput(format!(
+                    "load_lora_adapter_with_descriptor: loaded layer modules {layer_modules:?} \
+                     do not match descriptor.target_modules {declared_modules:?}"
+                )));
+            }
+
+            self.load_lora_adapter(layers, descriptor.scale(), quarot_seed)
+        }
+
         /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
         pub fn unload_lora_adapter(&mut self) {
             self.lora = None;
@@ -4034,6 +4146,13 @@ mod inner {
                 GenerationPreparation::Complete(output) => return Ok(output),
                 GenerationPreparation::Ready(_) => {}
             }
+
+            // Reject an empty inner layer slice here, before the adapter unload
+            // below — `blend_lora_layer_data` also runs this check, but only
+            // after the unload has already destroyed the previously loaded
+            // adapter. Admission errors must be returned before any existing
+            // adapter or prefix cache is changed (see this method's doc comment).
+            reject_empty_inner_layers(adapter_weights)?;
 
             // Unload any previously loaded adapter so the slot is free.
             self.unload_lora_adapter();
@@ -4246,6 +4365,7 @@ mod inner {
             start_pos: usize,
         ) -> Result<MetalVerifyOutput, crate::error::InferenceError> {
             self.check_forward_range_capacity(start_pos, tokens.len(), true)?;
+            self.check_live_cursor("verify_tokens_batched", start_pos)?;
             if self.session.gdn_checkpoints.is_none() {
                 return Err(crate::error::InferenceError::Inference(
                     "GDN checkpoint pool required for verify_tokens_batched".into(),
@@ -4299,6 +4419,7 @@ mod inner {
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<MetalVerifyOutput, crate::error::InferenceError> {
+            self.check_live_cursor("verify_tokens_batch_gemm", start_pos)?;
             let n = tokens.len();
             if n == 0 || n > MTP_VERIFY_MAX_TOKENS {
                 return Err(crate::error::InferenceError::Inference(format!(
@@ -6234,6 +6355,11 @@ mod inner {
 
                 // SAFETY: GPU completed (wait_until_completed called above for head_cmd).
                 let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                    if capture_hidden && self.path_proof_enabled {
+                        self.path_proof
+                            .decode_hidden_readback
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let _signpost_host_read = crate::forward::signpost::interval_in(
                         signpost_scope,
                         crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6405,6 +6531,11 @@ mod inner {
             // Read back pre-final hidden when requested (for MTP input).
             // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
             let pre_final_hidden = if capture_hidden || self.session.mtp.is_some() {
+                if capture_hidden && self.path_proof_enabled {
+                    self.path_proof
+                        .decode_hidden_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let _signpost_host_read = crate::forward::signpost::interval_in(
                     signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6464,6 +6595,115 @@ mod inner {
                 return Err(InferenceError::InvalidInput(format!(
                     "forward_step: KV cache is full at {} tokens (max_cache_len {max_cache_len})",
                     self.session.kv_cache.seq_len
+                )));
+            }
+            Ok(())
+        }
+
+        fn check_forward_token_id(
+            &self,
+            entry_point: &str,
+            token_id: u32,
+        ) -> Result<(), crate::error::InferenceError> {
+            if token_id as usize >= self.engine.config.vocab_size {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: token_id {token_id} out of range: vocab_size is {}",
+                    self.engine.config.vocab_size
+                )));
+            }
+            Ok(())
+        }
+
+        fn check_forward_token_ids(
+            &self,
+            entry_point: &str,
+            token_ids: &[u32],
+        ) -> Result<(), crate::error::InferenceError> {
+            for (index, &token_id) in token_ids.iter().enumerate() {
+                if token_id as usize >= self.engine.config.vocab_size {
+                    return Err(crate::error::InferenceError::InvalidInput(format!(
+                        "{entry_point}: token_ids[{index}]={token_id} out of range: vocab_size \
+                         is {}",
+                        self.engine.config.vocab_size
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        fn validate_live_cursor(
+            entry_point: &str,
+            supplied_position: usize,
+            live_cursor: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            if supplied_position != live_cursor {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: supplied position {supplied_position} does not match the \
+                     live cache cursor {live_cursor}; KV placement and attention length derive \
+                     from kv_cache.seq_len while RoPE uses the supplied position"
+                )));
+            }
+            Ok(())
+        }
+
+        fn check_live_cursor(
+            &self,
+            entry_point: &str,
+            supplied_position: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            Self::validate_live_cursor(
+                entry_point,
+                supplied_position,
+                self.session.kv_cache.seq_len,
+            )
+        }
+
+        fn validate_hidden_prefill_fresh_session(
+            seq_len: usize,
+            gdn_state_is_initial: bool,
+        ) -> Result<(), crate::error::InferenceError> {
+            if seq_len != 0 || !gdn_state_is_initial {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "forward_prefill_with_hidden: requires a fresh session (kv_cache.seq_len \
+                     == 0 and GDN recurrent state at its initial condition), found \
+                     kv_cache.seq_len={seq_len}; this call always dispatches from position 0, so \
+                     calling it against a session with live state would overwrite the \
+                     existing KV prefix while leaving GDN state conditioned on the tokens it \
+                     overwrote. Call reset_state() first to start a new prompt."
+                )));
+            }
+            Ok(())
+        }
+
+        /// The fresh-session predicate: `kv_cache.seq_len == 0 && gdn_state_is_initial()`,
+        /// with `gdn_state_is_initial()` treated as vacuously satisfied when the session
+        /// has no GDN layers at all — there is no recurrent state for such a session to
+        /// hold live, so `seq_len == 0` is already the complete freshness criterion.
+        /// The ONLY place this predicate is computed — every caller that needs it goes
+        /// through here (or through [`Self::check_hidden_prefill_fresh_session`], which
+        /// wraps it) so a caller can never check `seq_len` without also checking GDN state.
+        fn prefill_session_freshness(&self) -> (usize, bool) {
+            let seq_len = self.session.kv_cache.seq_len;
+            let gdn_fresh = !self.has_gdn_layers() || self.gdn_state_is_initial();
+            (seq_len, seq_len == 0 && gdn_fresh)
+        }
+
+        fn check_hidden_prefill_fresh_session(&self) -> Result<(), crate::error::InferenceError> {
+            let (seq_len, fresh) = self.prefill_session_freshness();
+            Self::validate_hidden_prefill_fresh_session(seq_len, fresh)
+        }
+
+        fn check_raw_prefill_fresh_session(
+            &self,
+            entry_point: &str,
+        ) -> Result<(), crate::error::InferenceError> {
+            let (seq_len, fresh) = self.prefill_session_freshness();
+            if !fresh {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: requires a fresh session (kv_cache.seq_len == 0 and GDN \
+                     recurrent state at its initial condition), found \
+                     kv_cache.seq_len={seq_len}; this call always dispatches from position \
+                     0. Call reset_state() first to start a new prompt."
                 )));
             }
             Ok(())
@@ -6554,20 +6794,98 @@ mod inner {
             )
         }
 
+        /// True when the session has at least one GatedDeltaNet linear-attention
+        /// layer, i.e. `gdn_state_is_initial()` has a population to answer about.
+        /// A session with zero GDN layers holds no recurrent state at all — that
+        /// is a distinct fact from "the recurrent state is clean" and callers must
+        /// check this before asking [`Self::gdn_state_is_initial`], never conflate
+        /// the two by treating an empty population as if it were a clean one.
+        fn has_gdn_layers(&self) -> bool {
+            !self.session.gdn_gpu_conv_bufs.is_empty()
+        }
+
+        /// True when every GDN recurrent-state buffer (S matrices and conv1d
+        /// rolling buffers, for every linear-attention layer) holds its
+        /// post-`reset_state()` zero value. Reads the live GPU buffers directly
+        /// (same buffers and safety invariant as `snapshot_gdn_states`), so this
+        /// reflects the state Metal dispatch will actually see, not the CPU
+        /// `gdn_states` mirror.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the session has no GDN layers (`has_gdn_layers()` is
+        /// false). A vacuous "true" there would silently conflate "no buffers to
+        /// check" with "buffers checked and clean" — two different facts a caller
+        /// may need to tell apart. Callers that consider both cases equally fresh
+        /// (there is nothing to protect when there is no GDN state) must say so
+        /// explicitly at the call site, e.g. `!self.has_gdn_layers() ||
+        /// self.gdn_state_is_initial()`, as [`Self::prefill_session_freshness`]
+        /// does.
+        fn gdn_state_is_initial(&self) -> bool {
+            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            assert!(
+                num_layers > 0,
+                "gdn_state_is_initial: session has no GDN layers; check has_gdn_layers() \
+                 first — an empty population and a clean population are not the same fact"
+            );
+            for i in 0..num_layers {
+                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
+                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let conv_floats = (conv_buf.length() / 4) as usize;
+                let s_floats = (s_buf.length() / 4) as usize;
+                // SAFETY: GPU buffers are StorageModeShared (allocated with
+                // MTLResourceOptions::StorageModeShared in `new`/`from_q4_dir`), so
+                // `contents()` points to host-readable memory. `length()` is the
+                // exact allocated byte length and is divisible by 4 (we always
+                // allocate f32 buffers). Callers invoke this before their own GPU
+                // dispatch, with no command buffer in flight, so no GPU write can
+                // race with this read — same invariant as `snapshot_gdn_states`.
+                let conv_nonzero = unsafe {
+                    let ptr = conv_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, conv_floats)
+                        .iter()
+                        .any(|&v| v != 0.0)
+                };
+                if conv_nonzero {
+                    return false;
+                }
+                let s_nonzero = unsafe {
+                    let ptr = s_buf.contents() as *const f32;
+                    std::slice::from_raw_parts(ptr, s_floats)
+                        .iter()
+                        .any(|&v| v != 0.0)
+                };
+                if s_nonzero {
+                    return false;
+                }
+            }
+            true
+        }
+
         /// **Unstable**: fallible single-token forward step; kernel dispatch strategy evolving.
         ///
         /// Run a single token through the full model. Returns logits [vocab_size].
         ///
+        /// `position` must equal the live cache cursor (`kv_cache.seq_len`). KV
+        /// placement and attention length derive from the live cursor while RoPE
+        /// uses the supplied `position`; sparse or out-of-order positions are not
+        /// supported.
+        ///
         /// # Errors
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU dispatch
-        /// when `position` or the next KV-cache row is outside the session capacity.
+        /// when `token_id >= vocab_size`, when `position` does not equal
+        /// `kv_cache.seq_len`, or when `position` or the next KV-cache row is
+        /// outside the session capacity. On rejection, session state is left
+        /// unchanged.
         pub fn try_forward_step(
             &mut self,
             token_id: u32,
             position: usize,
         ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            self.check_forward_token_id("try_forward_step", token_id)?;
             self.check_forward_step_capacity(position)?;
+            self.check_live_cursor("try_forward_step", position)?;
             self.cross_turn_prefix_cache.clear();
             Ok(self
                 .forward_step_inner(
@@ -6579,15 +6897,56 @@ mod inner {
                 .logits)
         }
 
+        /// **Unstable**: fallible single-token forward with explicit hidden readback.
+        ///
+        /// Returns `(logits, pre_final_hidden)`. The hidden row is captured before
+        /// the final RMSNorm overwrites the activation buffer. Existing
+        /// [`Self::try_forward_step`] and generation paths retain their current
+        /// readback behavior.
+        ///
+        /// `position` must equal the live cache cursor (`kv_cache.seq_len`): KV
+        /// placement and attention length derive from `kv_cache.seq_len` while
+        /// RoPE rotates by the supplied `position`, so a mismatched `position`
+        /// would rotate the token for a position other than the KV row it is
+        /// actually written to. Callers driving an out-of-order or sparse
+        /// position sequence are not supported by this entry point.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
+        /// dispatch when `token_id`, `position`, or the next KV-cache row is
+        /// outside the session capacity, or when `position` does not match
+        /// `kv_cache.seq_len`. On rejection, session state (KV cache, GDN
+        /// state, hidden-readback counters) is left unchanged.
+        pub fn forward_step_with_hidden(
+            &mut self,
+            token_id: u32,
+            position: usize,
+        ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
+            self.check_forward_token_id("forward_step_with_hidden", token_id)?;
+            self.check_forward_step_capacity(position)?;
+            self.check_live_cursor("forward_step_with_hidden", position)?;
+            self.cross_turn_prefix_cache.clear();
+            let output = self.forward_step_inner(
+                token_id,
+                position,
+                true,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            self.session.position = self.session.kv_cache.seq_len;
+            Ok((output.logits, output.pre_final_hidden))
+        }
+
         /// **Unstable**: single-token forward step; kernel dispatch strategy evolving.
         ///
         /// Run a single token through the full model. Returns logits [vocab_size].
         ///
         /// # Panics
         ///
-        /// Panics if `token_id >= vocab_size`, or if `position` or the next
+        /// Panics if `token_id >= vocab_size`, if `position` does not equal the
+        /// live cache cursor (`kv_cache.seq_len`), or if `position` or the next
         /// KV-cache row exceeds the session capacity. Use [`Self::try_forward_step`]
-        /// to receive a typed capacity error. These checks run before GPU dispatch.
+        /// to receive a typed input error. These checks run before GPU dispatch.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -6758,6 +7117,38 @@ mod inner {
             unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
         }
 
+        /// **Unstable**: fallible batch prompt prefill; kernel strategy may change.
+        ///
+        /// Returns logits for the last token while advancing KV and GDN state. This
+        /// is the non-panicking raw-prefill route; existing callers of
+        /// [`Self::forward_prefill`] can migrate by handling the returned
+        /// [`Result`]. Empty input retains `forward_prefill`'s existing zero-logit
+        /// result.
+        ///
+        /// # Fresh-prompt semantics
+        ///
+        /// This call always dispatches from position 0. It requires a fresh
+        /// session (`kv_cache.seq_len == 0` and GDN recurrent state at its initial
+        /// condition) and does not reset on the caller's behalf. Call
+        /// [`Self::reset_state`] before starting a new prompt on a reused session.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
+        /// dispatch for a non-fresh session, an out-of-vocabulary token, or a token
+        /// range beyond the session capacity. Rejection leaves session state
+        /// unchanged.
+        pub fn try_forward_prefill(
+            &mut self,
+            token_ids: &[u32],
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            self.check_raw_prefill_fresh_session("try_forward_prefill")?;
+            self.check_forward_token_ids("try_forward_prefill", token_ids)?;
+            self.check_forward_range_capacity(0, token_ids.len(), false)?;
+            self.cross_turn_prefix_cache.clear();
+            Ok(self.forward_prefill_impl(token_ids, false))
+        }
+
         /// **Unstable**: batch prompt prefill; prefill kernel and fallback threshold may change.
         ///
         /// Batch prefill: process all prompt tokens at once using GEMM.
@@ -6770,12 +7161,22 @@ mod inner {
         /// max_prefill-sized batched chunks; LoRA-active prompts remain on the
         /// per-token forward_step fallback.
         ///
+        /// # Fresh-prompt semantics
+        ///
+        /// This call always dispatches from position 0. It requires a fresh
+        /// session (`kv_cache.seq_len == 0` and GDN recurrent state at its
+        /// initial condition), does not reset state on the caller's behalf,
+        /// and does not append to an existing prefix. Call [`Self::reset_state`]
+        /// before reusing a session for a new prompt.
+        ///
         /// # Panics
         ///
-        /// Panics if any `token_ids[i] >= vocab_size`. The check is O(seq_len) and
-        /// runs once at the entry point before any GPU work. The tokenizer-bounded
-        /// generate path never triggers this; it can only be reached by a library
-        /// consumer passing raw ids with an out-of-vocabulary value.
+        /// Panics when [`Self::try_forward_prefill`] returns an error: the session
+        /// is not fresh, a token is outside the vocabulary, or the token range
+        /// exceeds capacity. New code should use the fallible route and handle its
+        /// typed input error. This compatibility wrapper preserves the existing
+        /// return type for callers that treat those conditions as contract
+        /// violations.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -6786,8 +7187,80 @@ mod inner {
         /// no-op on those paths; it only matters for a consumer calling this
         /// entry point directly against a state with a live retained entry.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
+            match self.try_forward_prefill(token_ids) {
+                Ok(logits) => logits,
+                Err(error) => panic!("{error}"),
+            }
+        }
+
+        /// **Unstable**: fallible prompt prefill with explicit hidden readback.
+        ///
+        /// Returns `(last_token_logits, pre_final_hidden)`. The hidden row is
+        /// captured for the prompt's last token before final RMSNorm. Batched,
+        /// chunked, one-token, and LoRA fallback paths advance KV/GDN state by
+        /// exactly the same token range as [`Self::forward_prefill`].
+        ///
+        /// # Fresh-prompt semantics
+        ///
+        /// This call always dispatches from position 0. It requires a fresh
+        /// session (`kv_cache.seq_len == 0` and GDN recurrent state at its
+        /// initial condition) and rejects otherwise — it does not reset the
+        /// session on the caller's behalf, and it does not implement append
+        /// semantics against an existing prefix. Calling it against a session
+        /// with live state would overwrite the existing KV prefix rows while
+        /// leaving GDN recurrent state conditioned on the tokens it overwrote,
+        /// an unreconstructible mix. Call [`Self::reset_state`] first to start a
+        /// new prompt on a session that has already generated.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
+        /// dispatch for an empty prompt, an out-of-vocabulary token, a prompt
+        /// whose token range exceeds the session capacity, or a session that is
+        /// not fresh (see above). On rejection, session state (KV cache, GDN
+        /// state, hidden-readback counters) is left unchanged.
+        pub fn forward_prefill_with_hidden(
+            &mut self,
+            token_ids: &[u32],
+        ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            if token_ids.is_empty() {
+                return Err(InferenceError::InvalidInput(
+                    "forward_prefill_with_hidden: token_ids must not be empty".into(),
+                ));
+            }
+            self.check_forward_token_ids("forward_prefill_with_hidden", token_ids)?;
+            self.check_hidden_prefill_fresh_session()?;
+            self.check_forward_range_capacity(0, token_ids.len(), false)?;
             self.cross_turn_prefix_cache.clear();
-            self.forward_prefill_impl(token_ids, false)
+
+            if token_ids.len() == 1 {
+                return self.forward_step_with_hidden(token_ids[0], 0);
+            }
+            if self.lora.is_some() {
+                let last_index = token_ids.len() - 1;
+                for (position, &token_id) in token_ids[..last_index].iter().enumerate() {
+                    self.try_forward_step(token_id, position)?;
+                }
+                return self.forward_step_with_hidden(token_ids[last_index], last_index);
+            }
+
+            let max_prefill = self.session.max_prefill;
+            if token_ids.len() <= max_prefill {
+                let logits = self.forward_prefill_batched_chunk(token_ids, 0, false, true, true);
+                return Ok((logits, self.session.last_pre_final_hidden.clone()));
+            }
+
+            let mut start_pos = 0usize;
+            let mut last_logits = Vec::new();
+            for chunk in token_ids.chunks(max_prefill) {
+                let is_last = start_pos + chunk.len() == token_ids.len();
+                last_logits =
+                    self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last, is_last);
+                start_pos += chunk.len();
+            }
+            Ok((last_logits, self.session.last_pre_final_hidden.clone()))
         }
 
         /// **Unstable**: prefill that returns logits for ALL `n` positions, not
@@ -6798,15 +7271,24 @@ mod inner {
         /// `n * vocab_size * 4` bytes — for `vocab_size=248K` and `n=128` that's
         /// ~127MB. Callers should cap `n` accordingly (typical PPL window: 128).
         ///
+        /// # Fresh-prompt semantics
+        ///
+        /// This call always dispatches from position 0. It requires a fresh
+        /// session (`kv_cache.seq_len == 0` and GDN recurrent state at its
+        /// initial condition), does not reset state on the caller's behalf,
+        /// and does not append to an existing prefix. Call [`Self::reset_state`]
+        /// before reusing a session for a new prompt.
+        ///
         /// # Panics
         ///
         /// Panics if any `token_ids[i] >= vocab_size`. See [`forward_prefill`] for details.
         ///
         /// # Errors
         ///
-        /// Returns an error when more than one position is requested while a
-        /// LoRA adapter is active, because the batched all-position path does
-        /// not apply LoRA projections.
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
+        /// dispatch when the session is not fresh (see above). Returns an error
+        /// when more than one position is requested while a LoRA adapter is active,
+        /// because the batched all-position path does not apply LoRA projections.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -6816,6 +7298,7 @@ mod inner {
             &mut self,
             token_ids: &[u32],
         ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            self.check_raw_prefill_fresh_session("forward_prefill_all_logits")?;
             if token_ids.len() > 1 && self.lora.is_some() {
                 return Err(crate::error::InferenceError::Inference(
                     "forward_prefill_all_logits: all-position prefill does not apply LoRA \
@@ -6870,7 +7353,13 @@ mod inner {
             let max_prefill = self.session.max_prefill;
             if n <= max_prefill {
                 // Only/last chunk — its logits are always the caller's answer.
-                return self.forward_prefill_batched_chunk(token_ids, 0, all_positions, true);
+                return self.forward_prefill_batched_chunk(
+                    token_ids,
+                    0,
+                    all_positions,
+                    true,
+                    false,
+                );
             }
             // Chunked batched prefill: each chunk is one command buffer (preserving the
             // n≤512 fast path within each chunk). GDN recurrent state threads across
@@ -6881,8 +7370,9 @@ mod inner {
                 let mut start_pos = 0usize;
                 for chunk in token_ids.chunks(max_prefill) {
                     // Perplexity needs every chunk's per-position logits.
-                    all_logits
-                        .extend(self.forward_prefill_batched_chunk(chunk, start_pos, true, true));
+                    all_logits.extend(
+                        self.forward_prefill_batched_chunk(chunk, start_pos, true, true, false),
+                    );
                     start_pos += chunk.len();
                 }
                 all_logits
@@ -6895,7 +7385,7 @@ mod inner {
                     // set_position, they just skip the terminal tail (Experiment B).
                     let is_last = start_pos + chunk.len() == n;
                     last_logits =
-                        self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last);
+                        self.forward_prefill_batched_chunk(chunk, start_pos, false, is_last, false);
                     start_pos += chunk.len();
                 }
                 last_logits
@@ -7385,7 +7875,7 @@ mod inner {
         /// once per chunk; for `n ≤ max_prefill` it IS the entire prefill (one command
         /// buffer, all 24 layers, final logits).
         ///
-        /// `emit_logits` gates ONLY the terminal RMSNorm, lm_head, MTP-capture/readback,
+        /// `emit_logits` gates ONLY the terminal RMSNorm, lm_head, hidden capture/readback,
         /// and top-k tail, which is purely terminal (it does not feed the residual
         /// stream, KV cache, or GDN recurrent state — those are fully advanced by the
         /// per-layer loop above it). When `false`, the layer command buffer for this
@@ -7399,6 +7889,7 @@ mod inner {
             start_pos: usize,
             all_positions: bool,
             emit_logits: bool,
+            capture_hidden: bool,
         ) -> Vec<f32> {
             let n = token_ids.len();
             debug_assert!(
@@ -7546,8 +8037,8 @@ mod inner {
                 None
             };
 
-            // MTP pre-final-hidden capture (last-token only; not needed for ppl).
-            if !all_positions && self.session.mtp.is_some() {
+            // Pre-final-hidden capture (last-token only; not needed for ppl).
+            if !all_positions && (capture_hidden || self.session.mtp.is_some()) {
                 enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
                 enc.set_buffer(0, Some(&self.session.activations.hidden), last_off);
                 enc.set_buffer(1, Some(&self.session.activations.pre_final_hidden), 0);
@@ -7679,7 +8170,12 @@ mod inner {
             cmd.commit();
             cmd.wait_until_completed();
 
-            if !all_positions && self.session.mtp.is_some() {
+            if !all_positions && (capture_hidden || self.session.mtp.is_some()) {
+                if capture_hidden && self.path_proof_enabled {
+                    self.path_proof
+                        .prefill_hidden_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 // SAFETY: GPU completed, pre_final_hidden is StorageModeShared.
                 self.session.last_pre_final_hidden =
                     unsafe { read_buffer(&self.session.activations.pre_final_hidden, hidden) };
@@ -9047,7 +9543,7 @@ mod inner {
 
             crate::model::qwen35::check_context_budget(
                 total_len,
-                gen_cfg.reasoning_budget,
+                gen_cfg.effective_reasoning_budget(),
                 gen_cfg.max_new_tokens,
                 self.max_context(),
             )?;
@@ -9478,7 +9974,7 @@ mod inner {
 
             crate::model::qwen35::check_context_budget(
                 prompt_len,
-                gen_cfg.reasoning_budget,
+                gen_cfg.effective_reasoning_budget(),
                 gen_cfg.max_new_tokens,
                 self.max_context(),
             )?;
@@ -10466,11 +10962,12 @@ mod inner {
 
             // Budget forcing: resolve the </think> token id once before the loops.
             // Only paid when reasoning_budget is Some; None path is a single branch.
-            let think_close_id = if gen_cfg.reasoning_budget.is_some() {
-                tokenizer.special_token_id("</think>")
-            } else {
-                None
-            };
+            let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
+                tokenizer,
+                gen_cfg.reasoning_budget,
+                gen_cfg.enable_thinking,
+                cfg.vocab_size,
+            )?;
 
             // Checked independently of `on_token`: a client that disconnected
             // between dequeue and here must not pay for the (potentially large,
@@ -10689,7 +11186,8 @@ mod inner {
             }
 
             // Autoregressive decode with streaming.
-            // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
+            // cap = rb + max_new_tokens + 1 when budgeting (the +1 is the forced
+            // </think> delimiter); max_new_tokens otherwise (parity-safe).
             let cap = policy.cap();
             for _ in 1..cap {
                 // Initial-token grammar completion (recorded above) terminates
@@ -12578,6 +13076,7 @@ mod inner {
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<Vec<Vec<f32>>, crate::error::InferenceError> {
+            self.check_live_cursor("MtpTargetVerifier::verify_tokens", start_pos)?;
             self.cross_turn_prefix_cache.clear();
             let out = self.verify_tokens_batched(tokens, start_pos)?;
             Ok(out.logits)
@@ -12723,7 +13222,26 @@ mod inner {
             tokenizer
                 .special_token_id("<|im_end|>")
                 .hash(&mut tok_hasher);
-            tokenizer.special_token_id("</think>").hash(&mut tok_hasher);
+            // Tokenizer identity only -- resolved unconditionally regardless
+            // of whether *this* request has an active reasoning budget.
+            // reasoning_budget is a generation-time policy choice, not a
+            // prefix-defining input: two requests with identical prompts and
+            // tokenizer state must hash to the same fingerprint whether or
+            // not either one sets a budget, so a turn that happens to omit
+            // (or vary) reasoning_budget can still reuse the other's cached
+            // prefix instead of forcing FullRefill. The close-marker
+            // VALIDATION that a budget is actually enforceable still runs
+            // separately, per-request, in `resolve_reasoning_close_token`.
+            // Hash EVERY id rendering the marker, not just the first tier hit.
+            // Two tokenizers that agree on the winning id but differ in their
+            // remaining aliases are not the same tokenizer, and folding only
+            // one id in would hash them identically. Sorted because the added
+            // -token walk is over a HashMap, and a cache key should not depend
+            // on iteration order.
+            let mut close_marker_ids =
+                tokenizer.token_ids_for_content(crate::model::qwen35::REASONING_CLOSE_MARKER);
+            close_marker_ids.sort_unstable();
+            close_marker_ids.hash(&mut tok_hasher);
             let tokenizer_fingerprint = tok_hasher.finish();
 
             let adapter_id = match &self.lora {
@@ -12959,6 +13477,7 @@ mod inner {
                     start_pos,
                     all_positions,
                     true,
+                    false,
                 ));
             }
             if all_positions {
@@ -12966,7 +13485,8 @@ mod inner {
                 let mut pos = start_pos;
                 for chunk in token_ids.chunks(max_prefill) {
                     // Perplexity needs every chunk's per-position logits.
-                    all_logits.extend(self.forward_prefill_batched_chunk(chunk, pos, true, true));
+                    all_logits
+                        .extend(self.forward_prefill_batched_chunk(chunk, pos, true, true, false));
                     pos += chunk.len();
                 }
                 Ok(all_logits)
@@ -12978,7 +13498,8 @@ mod inner {
                     // Only the LAST chunk's tail is ever kept — see
                     // forward_prefill_batched_chunk's doc comment (Experiment B).
                     let is_last = pos + chunk.len() == start_pos + total;
-                    last_logits = self.forward_prefill_batched_chunk(chunk, pos, false, is_last);
+                    last_logits =
+                        self.forward_prefill_batched_chunk(chunk, pos, false, is_last, false);
                     pos += chunk.len();
                 }
                 Ok(last_logits)
@@ -13252,6 +13773,38 @@ mod inner {
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
             self.plan_prefix_request(&prompt_ids, &plan)?;
 
+            // Budget forcing: validate the </think> token id here too,
+            // before `_inner` is even called -- same reasoning as the
+            // suffix-plan preflight immediately above (#835) and the
+            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
+            // above that (PR #787). `_inner` resolves this again (defense
+            // in depth, mirroring the suffix-plan double-check), but only
+            // THIS early return -- before the destructive `match` below
+            // runs `restore_cross_turn_prefix` or `reset_state()` --
+            // guarantees a missing/out-of-range </think> token never
+            // destroys a valid pre-existing cross-turn entry the request
+            // never touched.
+            //
+            // Gated on `max_new_tokens > 0`, same as the suffix-plan
+            // preflight above: `_inner`'s own zero-budget guard (before its
+            // `resolve_reasoning_close_token` call) is
+            // unreachable-before-return for a zero-token request, so an
+            // unconditional resolve here would disagree with every other
+            // generation path (plain CPU `generate()`, non-cached-prefix
+            // Metal `generate_streaming()`) -- both short-circuit
+            // `max_new_tokens == 0` to a zero-token `StopReason::Length`
+            // BEFORE resolving the close marker, so a `reasoning_budget`
+            // set alongside `max_new_tokens == 0` succeeds there even with
+            // a missing/invalid `</think>` marker.
+            if gen_cfg.max_new_tokens > 0 {
+                crate::model::qwen35::resolve_reasoning_close_token(
+                    tokenizer,
+                    gen_cfg.reasoning_budget,
+                    gen_cfg.enable_thinking,
+                    self.engine.config.vocab_size,
+                )?;
+            }
+
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
                 prompt_ids,
@@ -13347,6 +13900,24 @@ mod inner {
             // caller getting the wrapper's guard conditions right.
             self.plan_prefix_request(&prompt_ids, &plan)?;
 
+            // Budget forcing: resolve the </think> token id BEFORE the match
+            // below runs `restore_cross_turn_prefix` (which `take()`s the
+            // cache slot's entry) or `reset_state()` -- same reasoning as
+            // the suffix validation immediately above (#835), extended to
+            // this check: a missing or out-of-range </think> token must be
+            // rejected before any live state or cache entry is touched, or
+            // a rejected request would destroy a valid pre-existing prefix
+            // cache it never used. This also keeps the property that its `?`
+            // propagates before the should_cancel check below, so a
+            // cancelled-but-invalid-budget request is rejected instead of
+            // returning Ok(Interrupt).
+            let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
+                tokenizer,
+                gen_cfg.reasoning_budget,
+                gen_cfg.enable_thinking,
+                cfg.vocab_size,
+            )?;
+
             // The consumed entry (ExactAppend / ReplayFromCheckpoint) is
             // carried to the end-of-generation save so its checkpoint ring
             // and boundary snapshot survive across turns (#590).
@@ -13395,12 +13966,6 @@ mod inner {
             let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
-
-            let think_close_id = if gen_cfg.reasoning_budget.is_some() {
-                tokenizer.special_token_id("</think>")
-            } else {
-                None
-            };
 
             // The one line that differs structurally from `generate_streaming`:
             // prefill only the divergent suffix, at its true absolute position.
@@ -17107,6 +17672,1069 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            let logits = state.forward_step(42, 0);
+            assert_eq!(logits.len(), cfg.vocab_size);
+            let actual = &logits[..10];
+            // Math: token 42's embedding is one-hot: x[0]=1.0, x[1..]=0.0.
+            // All attention and FFN weights are zero → residual stream equals the
+            // raw embedding at every stage. final_norm then applies the shifted
+            // RMSNorm (qwen35_rms_norm convention: output = x * (1 + gamma) / rms(x)).
+            // With final_norm=[1.0] the scale is (1+1.0)=2; identity is gamma=0.
+            //   rms(x) = sqrt(1/512),  output[0] = 1.0 * (1+1.0) * sqrt(512) = 2*sqrt(512) ≈ 45.254.
+            // Tied lm_head col-0 pattern is [-1,0,1,-1,0,1,...], so logits ≈ ±45.25 / 0.
+            // (Issue #31: the original golden ±22.62 assumed plain-gamma; ±45.24 is correct.)
+            let expected = [
+                -45.243256_f32,
+                0.0,
+                45.243256,
+                -45.243256,
+                0.0,
+                45.243256,
+                -45.243256,
+                0.0,
+                45.243256,
+                -45.243256,
+            ];
+            let max_abs_diff = actual
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, e)| (a - e).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                max_abs_diff < 1e-4,
+                "golden first-10 logits changed: actual={actual:?} expected={expected:?} max_abs_diff={max_abs_diff}"
+            );
+        }
+
+        fn assert_forward_rows_close(label: &str, left: &[f32], right: &[f32]) {
+            assert_eq!(left.len(), right.len(), "{label}: row lengths must match");
+            let max_abs_diff = left
+                .iter()
+                .zip(right)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(max_abs_diff < 1e-4, "{label}: max_abs_diff={max_abs_diff}");
+        }
+
+        #[test]
+        fn forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut ordinary = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("ordinary tiny MetalQwen35State fixture constructs");
+            let mut with_hidden = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("hidden tiny MetalQwen35State fixture constructs");
+            ordinary.path_proof_enabled = true;
+            with_hidden.path_proof_enabled = true;
+            ordinary.reset_path_proof_counters();
+            with_hidden.reset_path_proof_counters();
+
+            let error = with_hidden
+                .forward_step_with_hidden(cfg.vocab_size as u32, 0)
+                .expect_err("out-of-vocabulary token must fail before dispatch");
+            assert!(matches!(
+                error,
+                crate::error::InferenceError::InvalidInput(_)
+            ));
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 0);
+            assert_eq!(
+                with_hidden.hidden_readback_path_proof_snapshot().decode,
+                0,
+                "invalid input must not read hidden state"
+            );
+
+            let ordinary_logits = ordinary.forward_step(42, 0);
+            let (hidden_logits, hidden) = with_hidden
+                .forward_step_with_hidden(42, 0)
+                .expect("hidden-returning step succeeds");
+            assert_forward_rows_close("step logits", &ordinary_logits, &hidden_logits);
+            assert_eq!(ordinary.session.kv_cache.seq_len, 1);
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 1);
+            assert_eq!(hidden.len(), cfg.hidden_size);
+            assert!(hidden.iter().all(|value| value.is_finite()));
+            assert!(hidden.iter().any(|&value| value != 0.0));
+            assert_forward_rows_close(
+                "returned and session hidden",
+                &hidden,
+                &with_hidden.session.last_pre_final_hidden,
+            );
+            assert!(
+                ordinary
+                    .session
+                    .last_pre_final_hidden
+                    .iter()
+                    .all(|&value| value == 0.0),
+                "ordinary step must not add an unconditional hidden readback"
+            );
+
+            let ordinary_hidden_proof = ordinary.hidden_readback_path_proof_snapshot();
+            let explicit_hidden_proof = with_hidden.hidden_readback_path_proof_snapshot();
+            assert_eq!(ordinary_hidden_proof.decode, 0);
+            assert_eq!(explicit_hidden_proof.decode, 1);
+
+            let ordinary_path = ordinary.path_proof_snapshot();
+            let explicit_path = with_hidden.path_proof_snapshot();
+            assert_eq!(ordinary_path.decode_kv_copy, explicit_path.decode_kv_copy);
+            assert!(explicit_path.decode_kv_copy > 0);
+            assert_eq!(
+                ordinary_path.decode_attn_direct,
+                explicit_path.decode_attn_direct
+            );
+            assert!(explicit_path.decode_attn_direct > 0);
+
+            let ordinary_followup = ordinary.forward_step(5, 1);
+            let hidden_followup = with_hidden.forward_step(5, 1);
+            assert_forward_rows_close(
+                "step follow-up logits",
+                &ordinary_followup,
+                &hidden_followup,
+            );
+            assert_eq!(ordinary.session.kv_cache.seq_len, 2);
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 2);
+        }
+
+        #[test]
+        fn forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut ordinary = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("ordinary tiny MetalQwen35State fixture constructs");
+            let mut with_hidden = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("hidden tiny MetalQwen35State fixture constructs");
+            ordinary.path_proof_enabled = true;
+            with_hidden.path_proof_enabled = true;
+            ordinary.reset_path_proof_counters();
+            with_hidden.reset_path_proof_counters();
+
+            let empty_error = with_hidden
+                .forward_prefill_with_hidden(&[])
+                .expect_err("empty prompt must fail before dispatch");
+            assert!(matches!(
+                empty_error,
+                crate::error::InferenceError::InvalidInput(_)
+            ));
+            let oov_error = with_hidden
+                .forward_prefill_with_hidden(&[cfg.vocab_size as u32])
+                .expect_err("out-of-vocabulary token must fail before dispatch");
+            assert!(matches!(
+                oov_error,
+                crate::error::InferenceError::InvalidInput(_)
+            ));
+            let oversized = vec![1_u32; 17];
+            let capacity_error = with_hidden
+                .forward_prefill_with_hidden(&oversized)
+                .expect_err("prompt beyond session capacity must fail before dispatch");
+            assert!(matches!(
+                capacity_error,
+                crate::error::InferenceError::InvalidInput(_)
+            ));
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 0);
+            assert_eq!(
+                with_hidden.hidden_readback_path_proof_snapshot().prefill,
+                0,
+                "invalid inputs must not read hidden state"
+            );
+
+            let tokens = [42_u32, 2, 5];
+            let ordinary_logits = ordinary.forward_prefill(&tokens);
+            let (hidden_logits, hidden) = with_hidden
+                .forward_prefill_with_hidden(&tokens)
+                .expect("hidden-returning prefill succeeds");
+            assert_forward_rows_close("prefill logits", &ordinary_logits, &hidden_logits);
+            assert_eq!(ordinary.session.kv_cache.seq_len, tokens.len());
+            assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len());
+            assert_eq!(ordinary.session.position, tokens.len());
+            assert_eq!(with_hidden.session.position, tokens.len());
+            assert_eq!(hidden.len(), cfg.hidden_size);
+            assert!(hidden.iter().all(|value| value.is_finite()));
+            assert!(hidden.iter().any(|&value| value != 0.0));
+            assert_forward_rows_close(
+                "returned and session hidden",
+                &hidden,
+                &with_hidden.session.last_pre_final_hidden,
+            );
+            assert!(
+                ordinary
+                    .session
+                    .last_pre_final_hidden
+                    .iter()
+                    .all(|&value| value == 0.0),
+                "ordinary prefill must not add an unconditional hidden readback"
+            );
+
+            let ordinary_hidden_proof = ordinary.hidden_readback_path_proof_snapshot();
+            let explicit_hidden_proof = with_hidden.hidden_readback_path_proof_snapshot();
+            assert_eq!(ordinary_hidden_proof.prefill, 0);
+            assert_eq!(explicit_hidden_proof.prefill, 1);
+
+            let ordinary_path = ordinary.path_proof_snapshot();
+            let explicit_path = with_hidden.path_proof_snapshot();
+            assert_eq!(
+                ordinary_path.prefill_kv_batch,
+                explicit_path.prefill_kv_batch
+            );
+            assert!(explicit_path.prefill_kv_batch > 0);
+            assert_eq!(
+                ordinary_path.prefill_attn_batched,
+                explicit_path.prefill_attn_batched
+            );
+            assert!(explicit_path.prefill_attn_batched > 0);
+
+            let ordinary_followup = ordinary.forward_step(7, tokens.len());
+            let hidden_followup = with_hidden.forward_step(7, tokens.len());
+            assert_forward_rows_close(
+                "prefill follow-up logits",
+                &ordinary_followup,
+                &hidden_followup,
+            );
+            assert_eq!(ordinary.session.kv_cache.seq_len, tokens.len() + 1);
+            assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len() + 1);
+        }
+
+        /// `tiny_metal_qwen35_fixture` (used by the two tests above) has zero
+        /// GDN/linear-attention layers — `has_gdn_layers()` is false for it — so
+        /// neither proves explicit hidden readback works on a hybrid GDN+full
+        /// session. This test mirrors their structure on `tiny_hybrid_fixture`
+        /// (3 GDN layers + 1 full-attention layer) to close that gap.
+        #[test]
+        fn forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback()
+         {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut ordinary = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("ordinary tiny hybrid MetalQwen35State fixture constructs");
+            let mut with_hidden = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("hidden tiny hybrid MetalQwen35State fixture constructs");
+            assert!(
+                with_hidden.has_gdn_layers(),
+                "forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback's \
+                 tiny_hybrid_fixture must retain its GDN layers for this test to exercise the \
+                 GDN path"
+            );
+            ordinary.path_proof_enabled = true;
+            with_hidden.path_proof_enabled = true;
+            ordinary.reset_path_proof_counters();
+            with_hidden.reset_path_proof_counters();
+
+            let ordinary_logits = ordinary.forward_step(3, 0);
+            let (hidden_logits, hidden) = with_hidden
+                .forward_step_with_hidden(3, 0)
+                .expect("hidden-returning step on a fresh hybrid/GDN session succeeds");
+            assert_forward_rows_close("hybrid step logits", &ordinary_logits, &hidden_logits);
+            assert_eq!(ordinary.session.kv_cache.seq_len, 1);
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 1);
+            assert_eq!(hidden.len(), cfg.hidden_size);
+            assert!(hidden.iter().all(|value| value.is_finite()));
+            assert!(hidden.iter().any(|&value| value != 0.0));
+            assert_forward_rows_close(
+                "hybrid returned and session hidden",
+                &hidden,
+                &with_hidden.session.last_pre_final_hidden,
+            );
+            assert!(
+                ordinary
+                    .session
+                    .last_pre_final_hidden
+                    .iter()
+                    .all(|&value| value == 0.0),
+                "ordinary hybrid step must not add an unconditional hidden readback"
+            );
+
+            let ordinary_hidden_proof = ordinary.hidden_readback_path_proof_snapshot();
+            let explicit_hidden_proof = with_hidden.hidden_readback_path_proof_snapshot();
+            assert_eq!(ordinary_hidden_proof.decode, 0);
+            assert_eq!(explicit_hidden_proof.decode, 1);
+
+            let ordinary_path = ordinary.path_proof_snapshot();
+            let explicit_path = with_hidden.path_proof_snapshot();
+            assert_eq!(ordinary_path.decode_kv_copy, explicit_path.decode_kv_copy);
+            assert!(explicit_path.decode_kv_copy > 0);
+            assert_eq!(
+                ordinary_path.decode_attn_direct,
+                explicit_path.decode_attn_direct
+            );
+            assert!(explicit_path.decode_attn_direct > 0);
+        }
+
+        /// Byte-for-byte snapshot of every KV buffer (K and V, every layer),
+        /// including unwritten rows beyond `seq_len`. Used to prove a rejected
+        /// call performed no GPU write anywhere in the cache, not just that
+        /// `seq_len` held still.
+        fn snapshot_kv_bytes(state: &MetalQwen35State) -> Vec<Vec<u8>> {
+            state
+                .session
+                .kv_cache
+                .k_bufs
+                .iter()
+                .chain(state.session.kv_cache.v_bufs.iter())
+                .map(|buf| {
+                    // SAFETY: StorageModeShared, no command buffer in flight
+                    // between test calls (each forward_*_with_hidden call
+                    // `wait_until_completed`s before returning).
+                    unsafe {
+                        let ptr = buf.contents() as *const u8;
+                        std::slice::from_raw_parts(ptr, buf.length() as usize).to_vec()
+                    }
+                })
+                .collect()
+        }
+
+        /// Byte-for-byte snapshot of every live GDN recurrent-state buffer.
+        fn snapshot_gdn_bytes(state: &MetalQwen35State) -> Vec<Vec<u8>> {
+            state
+                .session
+                .gdn_gpu_s_matrices
+                .iter()
+                .chain(state.session.gdn_gpu_conv_bufs.iter())
+                .map(|buf| {
+                    // SAFETY: StorageModeShared, and the verifier preflight runs
+                    // before creating a command buffer, so no GPU write is in flight.
+                    unsafe {
+                        let ptr = buf.contents() as *const u8;
+                        std::slice::from_raw_parts(ptr, buf.length() as usize).to_vec()
+                    }
+                })
+                .collect()
+        }
+
+        type CrossTurnCacheSnapshot = (
+            crate::kv_cache::CrossTurnPrefixEntry,
+            crate::attention::gdn::GdnSnapshot,
+            Vec<(usize, crate::attention::gdn::GdnSnapshot)>,
+        );
+
+        fn snapshot_cross_turn_cache(state: &MetalQwen35State) -> Option<CrossTurnCacheSnapshot> {
+            state.cross_turn_prefix_cache.entry.as_ref().map(|entry| {
+                (
+                    entry.generic.clone(),
+                    entry.gdn_snapshot.clone(),
+                    entry
+                        .checkpoints
+                        .iter()
+                        .map(|checkpoint| (checkpoint.len, checkpoint.snapshot.clone()))
+                        .collect(),
+                )
+            })
+        }
+
+        fn mtp_loaded_live_hybrid_state_for_guard_test() -> MetalQwen35State {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let (mut cfg, weights) = tiny_hybrid_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_synthetic_mtp_for_test(&weights, &cfg, None);
+            assert!(state.has_mtp(), "fixture must load MTP state");
+            state.path_proof_enabled = true;
+
+            let mut seeded_gdn = state.snapshot_gdn_states();
+            assert_eq!(seeded_gdn.len(), 3, "fixture must contain three GDN layers");
+            seeded_gdn[0].0[0] = 1.0;
+            seeded_gdn[0].1[0] = -1.0;
+            state.restore_gdn_states(&seeded_gdn);
+
+            state
+                .try_forward_step(1, 0)
+                .expect("first raw step at the live cursor must succeed");
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+            assert!(
+                state.has_gdn_layers(),
+                "mtp_loaded_live_hybrid_state_for_guard_test's tiny_hybrid_fixture \
+                 must retain its GDN layers for gdn_state_is_initial() to be meaningful"
+            );
+            assert!(!state.gdn_state_is_initial());
+            assert!(
+                !state.session.last_pre_final_hidden.is_empty(),
+                "MTP-loaded raw step must populate hidden readback state"
+            );
+            state.reset_path_proof_counters();
+            state
+        }
+
+        #[test]
+        fn raw_step_with_mtp_rejects_stale_live_cursor_without_mutation() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=raw_step_with_mtp_rejects_stale_live_cursor_without_mutation \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (raw_step_with_mtp_rejects_stale_live_cursor_without_mutation)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32)
+                .expect("tiny hybrid MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+            state
+                .generate_streaming_with_prefix_cache(
+                    crate::kv_cache::CrossTurnSlotId::DEFAULT,
+                    "ab",
+                    &tokenizer,
+                    &cross_turn_test_gen_cfg(9, 2),
+                    |_, _| true,
+                )
+                .expect("cache-aware warm-up must establish live state");
+            assert!(state.session.kv_cache.seq_len > 0);
+            assert!(state.cross_turn_prefix_cache.entry.is_some());
+            // tiny_hybrid_fixture's in_proj_qkv and conv1d_weight are both zero, so the
+            // conv1d output (crates/inference/src/attention/gdn.rs: apply_causal_conv1d,
+            // `sum += conv_buffer[..] * conv_weight[..]` / `sum += new_input[ch] *
+            // conv_weight[..]`) is a product of a zero factor at every step — either
+            // factor alone zeroing it, both would have to go nonzero together to move it
+            // off zero — so q/k/v are provably zero at every step regardless of the other
+            // fixture values. With v == kv_mem == 0 (kv_mem = 0 because the recurrent
+            // state S starts at zero and only ever receives outer(k, delta) with
+            // delta == 0), `gated_delta_net_step`'s update (gdn.rs: decay `s *= g` at
+            // ~L291-294, then `S += outer(k, delta)` at ~L313-318) is homogeneous: g
+            // scales an already-zero S, and the injection term is zero too, so S cannot
+            // leave zero however many tokens are generated. This fixture does set
+            // a_log = -1.0, dt_bias = 0.0, and norm_weight = 1.0 (nonzero,
+            // zero-in-this-fixture, and nonzero respectively) — all three sit on the path
+            // (compute_decay_gate uses a_log and dt_bias for g; norm_weight scales the
+            // final gated-RMSNorm output) but the zero-state argument above never
+            // depends on their values, only on v and kv_mem being zero. The Metal shader
+            // (forward/shaders/qwen35.metal: gdn_recurrence_fused, ~L1099-1121) computes
+            // the same recurrence in reordered form (`kv_mem` from pre-decay S, then
+            // `delta = (v - g * kv_mem) * beta`, then `sr[i] = fma(k, delta, g * sr[i])`)
+            // and agrees algebraically with the CPU path above. Falsifier: this reasoning
+            // breaks the moment `make_gdn` sets *both* in_proj_qkv and conv1d_weight
+            // nonzero at once — that is the only way ordinary decoding can move q/k/v
+            // (and hence the recurrent state) off zero. Until then, seed live GDN state
+            // directly instead, the same way `mtp_loaded_live_hybrid_state_for_guard_test`
+            // does, so the immutability assertions below exercise genuinely non-initial
+            // state rather than a vacuously-true reading of `gdn_state_is_initial()`.
+            assert!(
+                state.has_gdn_layers(),
+                "fixture must contain GDN layers for this predicate to be meaningful"
+            );
+            let mut seeded_gdn = state.snapshot_gdn_states();
+            seeded_gdn[0].0[0] = 1.0;
+            state.restore_gdn_states(&seeded_gdn);
+            assert!(!state.gdn_state_is_initial());
+            state.reset_path_proof_counters();
+
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let position_before = state.session.position;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = snapshot_gdn_bytes(&state);
+            let hidden_before = state.session.last_pre_final_hidden.clone();
+            let hidden_proof_before = state.hidden_readback_path_proof_snapshot();
+            let cross_turn_before = snapshot_cross_turn_cache(&state);
+
+            let error = state
+                .try_forward_step(2, 0)
+                .expect_err("an in-range stale raw step must be rejected");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for a stale raw step, got {error}");
+            };
+            assert!(message.contains("try_forward_step"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(snapshot_cross_turn_cache(&state), cross_turn_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+
+            let panic =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.forward_step(2, 0)));
+            assert!(
+                panic.is_err(),
+                "infallible raw step wrapper must reject the same stale cursor"
+            );
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+        }
+
+        #[test]
+        fn raw_prefills_with_mtp_reject_live_session_without_mutation() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=raw_prefills_with_mtp_reject_live_session_without_mutation \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (raw_prefills_with_mtp_reject_live_session_without_mutation)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
+
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let position_before = state.session.position;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = snapshot_gdn_bytes(&state);
+            let hidden_before = state.session.last_pre_final_hidden.clone();
+            let hidden_proof_before = state.hidden_readback_path_proof_snapshot();
+
+            let error = state
+                .try_forward_prefill(&[2, 3])
+                .expect_err("fallible raw prefill must reject a live session");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for a live-session raw prefill, got {error}");
+            };
+            assert!(message.contains("try_forward_prefill"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.forward_prefill(&[2, 3])
+            }));
+            assert!(panic.is_err(), "raw prefill must reject a live session");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+
+            let error = state
+                .forward_prefill_all_logits(&[2, 3])
+                .expect_err("all-logits raw prefill must reject a live session");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for a live-session raw prefill, got {error}");
+            };
+            assert!(message.contains("forward_prefill_all_logits"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+        }
+
+        #[cfg(feature = "bench-internals")]
+        #[test]
+        fn bench_prefill_helpers_reject_stale_cursor_without_mutation() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=bench_prefill_helpers_reject_stale_cursor_without_mutation \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (bench_prefill_helpers_reject_stale_cursor_without_mutation)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let mut state = mtp_loaded_live_hybrid_state_for_guard_test();
+
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let position_before = state.session.position;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = snapshot_gdn_bytes(&state);
+            let hidden_before = state.session.last_pre_final_hidden.clone();
+            let hidden_proof_before = state.hidden_readback_path_proof_snapshot();
+
+            let isolated_error =
+                bench_support::forward_prefill_gdn_isolated_chunk(&mut state, &[2, 3], 0)
+                    .expect_err("isolated bench prefill must reject a stale cursor");
+            assert!(isolated_error.to_string().contains("isolated"));
+
+            let capture_error = bench_support::forward_prefill_gdn_isolated_chunk_capture(
+                &mut state,
+                &[2, 3],
+                0,
+                &[],
+            )
+            .expect_err("capture bench prefill must reject a stale cursor");
+            assert!(capture_error.to_string().contains("capture"));
+
+            let production_error =
+                bench_support::forward_prefill_production_chunk(&mut state, &[2, 3], 0)
+                    .expect_err("production bench prefill must reject a stale cursor");
+            assert!(production_error.to_string().contains("production"));
+
+            assert_eq!(state.session.kv_cache.seq_len, seq_len_before);
+            assert_eq!(state.session.position, position_before);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(state.session.last_pre_final_hidden, hidden_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                hidden_proof_before
+            );
+        }
+
+        #[test]
+        fn forward_step_with_hidden_rejects_position_mismatched_with_cache_cursor() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+            state.reset_path_proof_counters();
+
+            // Defect-1 repro: on a fresh state (cursor at 0), a caller asks for
+            // position 5. The old guard only checked `position < max_cache_len`
+            // and would have RoPE-rotated token_a for position 5 while writing
+            // its KV row at row 0 (derived from kv_cache.seq_len). It must now
+            // be rejected before any dispatch.
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let err = state
+                .forward_step_with_hidden(42, 5)
+                .expect_err("position ahead of the live cache cursor must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "rejection must not advance the KV cache cursor"
+            );
+            assert_eq!(
+                state.session.position, 0,
+                "rejection must not advance the decode cursor"
+            );
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot().decode,
+                0,
+                "rejection must not read hidden state"
+            );
+            assert_eq!(
+                snapshot_kv_bytes(&state),
+                kv_before,
+                "rejection must not write any KV row"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                gdn_before,
+                "rejection must not mutate GDN recurrent state"
+            );
+
+            // The correctly-ordered sequence (position == cursor each call)
+            // still succeeds and advances both cursors together.
+            let (_, hidden_a) = state
+                .forward_step_with_hidden(42, 0)
+                .expect("position matching the live cache cursor succeeds");
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+            assert_eq!(state.session.position, 1);
+            assert!(hidden_a.iter().any(|&value| value != 0.0));
+
+            // Defect-1 repro, second call: token_b at position 1 is the correct
+            // next position now, but a stale/out-of-order position must still
+            // be rejected rather than silently accepted.
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let err = state
+                .forward_step_with_hidden(2, 0)
+                .expect_err("a stale position behind the live cache cursor must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+            assert_eq!(state.session.position, 1);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(state.snapshot_gdn_states(), gdn_before);
+
+            let (_, hidden_b) = state
+                .forward_step_with_hidden(2, 1)
+                .expect("position matching the live cache cursor succeeds");
+            assert_eq!(state.session.kv_cache.seq_len, 2);
+            assert_eq!(state.session.position, 2);
+            assert!(hidden_b.iter().any(|&value| value != 0.0));
+        }
+
+        #[test]
+        fn try_forward_step_rejects_out_of_vocab_token_id() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+
+            // forward_step's doc promises try_forward_step returns a typed
+            // input error instead of panicking on an out-of-vocab token_id;
+            // this must be rejected before any dispatch, same as the sibling
+            // forward_step_with_hidden guard above.
+            let seq_len_before = state.session.kv_cache.seq_len;
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let err = state
+                .try_forward_step(cfg.vocab_size as u32, 0)
+                .expect_err("out-of-vocab token_id must be rejected");
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, seq_len_before,
+                "rejection must not advance the KV cache cursor"
+            );
+            assert_eq!(
+                snapshot_kv_bytes(&state),
+                kv_before,
+                "rejection must not write any KV row"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                gdn_before,
+                "rejection must not mutate GDN recurrent state"
+            );
+        }
+
+        #[test]
+        fn mtp_verifier_boundaries_reject_mismatched_live_cursor() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=mtp_verifier_boundaries_reject_mismatched_live_cursor \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (mtp_verifier_boundaries_reject_mismatched_live_cursor)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny hybrid MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+            state.reset_path_proof_counters();
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = snapshot_gdn_bytes(&state);
+
+            let error = state
+                .verify_tokens(&[1], 1)
+                .expect_err("public verifier must reject start_pos beyond the live cursor");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for mismatched public verifier cursor, got {error}");
+            };
+            assert!(
+                message.contains("MtpTargetVerifier::verify_tokens"),
+                "{message}"
+            );
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+
+            let error = state
+                .verify_tokens_batched(&[1], 1)
+                .err()
+                .expect("sequential verifier must independently reject a cursor mismatch");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!(
+                    "expected InvalidInput for mismatched sequential verifier cursor, got {error}"
+                );
+            };
+            assert!(message.contains("verify_tokens_batched"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+
+            let error = state
+                .verify_tokens_batch_gemm(&[1], 1)
+                .err()
+                .expect("batch-GEMM verifier must independently reject a cursor mismatch");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!(
+                    "expected InvalidInput for mismatched batch-GEMM verifier cursor, got {error}"
+                );
+            };
+            assert!(message.contains("verify_tokens_batch_gemm"), "{message}");
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(snapshot_kv_bytes(&state), kv_before);
+            assert_eq!(snapshot_gdn_bytes(&state), gdn_before);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot(),
+                HiddenReadbackPathProofSnapshot::default(),
+                "cursor rejection must occur before any hidden readback"
+            );
+        }
+
+        #[test]
+        fn forward_prefill_with_hidden_rejects_live_session_without_reset() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+
+            // Establish live state: one token advances the KV cache cursor off
+            // zero. (`tiny_metal_qwen35_fixture` has no linear-attention layers, so
+            // `has_gdn_layers()` is false and the fresh-session gate's GDN conjunct
+            // is vacuously satisfied regardless of activity here; this test
+            // exercises the `kv_cache.seq_len` half of the gate, which alone is
+            // already sufficient to reject this repro.)
+            state
+                .forward_step_with_hidden(42, 0)
+                .expect("first token at position 0 succeeds");
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+
+            state.reset_path_proof_counters();
+
+            // Defect-2 repro: forward_prefill_with_hidden always dispatches from
+            // position 0. Without a reset, the old code would overwrite KV row
+            // 0 (and row 1) while leaving GDN recurrent state still conditioned
+            // on the token it just overwrote — an unreconstructible mix. It
+            // must now be rejected before any dispatch.
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let err = state.forward_prefill_with_hidden(&[2, 5]).expect_err(
+                "prefill against a live session must be rejected without reset_state()",
+            );
+            assert!(matches!(err, crate::error::InferenceError::InvalidInput(_)));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 1,
+                "rejection must not overwrite the live KV prefix"
+            );
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot().prefill,
+                0,
+                "rejection must not read hidden state"
+            );
+            assert_eq!(
+                snapshot_kv_bytes(&state),
+                kv_before,
+                "rejection must not write any KV row"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                gdn_before,
+                "rejection must not mutate GDN recurrent state"
+            );
+
+            // reset_state() clears both gates; the same call now succeeds.
+            state.reset_state();
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            // tiny_metal_qwen35_fixture has no linear-attention layers, so
+            // gdn_state_is_initial() has no population to check and panics if
+            // called (see its doc comment) — assert the population fact this test
+            // actually relies on instead of the vacuous predicate.
+            assert!(!state.has_gdn_layers());
+            let (_, hidden) = state
+                .forward_prefill_with_hidden(&[2, 5])
+                .expect("prefill against a freshly reset session succeeds");
+            assert_eq!(state.session.kv_cache.seq_len, 2);
+            assert!(hidden.iter().any(|&value| value != 0.0));
+        }
+
+        #[test]
+        fn forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny hybrid MetalQwen35State fixture constructs");
+            state.path_proof_enabled = true;
+
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert!(
+                state.has_gdn_layers(),
+                "forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv's \
+                 tiny_hybrid_fixture must retain its GDN layers for gdn_state_is_initial() \
+                 to be meaningful"
+            );
+            assert!(state.gdn_state_is_initial());
+            let mut seeded_gdn = state.snapshot_gdn_states();
+            assert_eq!(seeded_gdn.len(), 3, "fixture must contain three GDN layers");
+            seeded_gdn[0].0[0] = 1.0;
+            state.restore_gdn_states(&seeded_gdn);
+            let _ = state.forward_step_gdn_only(1, 0);
+            assert_eq!(
+                state.session.kv_cache.seq_len, 0,
+                "GDN-only forward must leave the first fresh-session disjunct false"
+            );
+            assert!(
+                state.has_gdn_layers(),
+                "forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv's \
+                 tiny_hybrid_fixture must retain its GDN layers for gdn_state_is_initial() \
+                 to be meaningful"
+            );
+            assert!(
+                !state.gdn_state_is_initial(),
+                "GDN-only forward must leave live recurrent state non-initial"
+            );
+
+            state.reset_path_proof_counters();
+            let kv_before = snapshot_kv_bytes(&state);
+            let gdn_before = state.snapshot_gdn_states();
+            let error = state
+                .forward_prefill_with_hidden(&[2])
+                .expect_err("non-initial GDN state with empty KV cache must be rejected");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for non-initial GDN state, got {error}");
+            };
+            assert!(
+                message.contains("GDN recurrent state at its initial condition"),
+                "error must name the rejected GDN condition: {message}"
+            );
+            assert!(
+                message.contains("kv_cache.seq_len=0"),
+                "error must prove the KV half of the guard was false: {message}"
+            );
+            assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert_eq!(state.session.position, 0);
+            assert_eq!(
+                state.hidden_readback_path_proof_snapshot().prefill,
+                0,
+                "rejection must not read hidden state"
+            );
+            assert_eq!(
+                snapshot_kv_bytes(&state),
+                kv_before,
+                "rejection must not write any KV row"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                gdn_before,
+                "rejection must not mutate GDN recurrent state"
+            );
+        }
+
+        /// Mutation control for the `has_gdn_layers()` / `gdn_state_is_initial()` split:
+        /// calling `gdn_state_is_initial()` on a session with zero GDN layers must panic
+        /// rather than silently returning `true` (the pre-fix behavior, which conflated
+        /// "no buffers to check" with "buffers checked and clean"). See REPORT.md for the
+        /// paired before/after run that mutates this assertion away and observes the
+        /// control go blind.
+        #[test]
+        fn gdn_state_is_initial_panics_on_empty_population() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=gdn_state_is_initial_panics_on_empty_population \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (gdn_state_is_initial_panics_on_empty_population)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            assert!(
+                !state.has_gdn_layers(),
+                "fixture must have zero GDN layers for this control"
+            );
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.gdn_state_is_initial()
+            }))
+            .is_err();
+            assert!(
+                panicked,
+                "gdn_state_is_initial() must panic on an empty GDN population instead of \
+                 silently returning true"
+            );
+        }
+
+        #[test]
         fn forward_step_rejects_position_and_cache_capacity_before_dispatch() {
             let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
@@ -17202,6 +18830,32 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 MetalQwen35State::validate_dispatch_capacity(0, 6, 100, None).is_ok(),
                 "a caller that never checkpoints per-token must not be pool-bounded"
+            );
+        }
+
+        #[test]
+        fn validate_live_cursor_rejects_mismatched_position() {
+            assert!(MetalQwen35State::validate_live_cursor("test", 3, 3).is_ok());
+            let error = MetalQwen35State::validate_live_cursor("test", 4, 3)
+                .expect_err("position beyond the live cursor must be rejected");
+            let crate::error::InferenceError::InvalidInput(message) = error else {
+                panic!("expected InvalidInput for mismatched cursor, got {error}");
+            };
+            assert!(message.contains("test"), "{message}");
+            assert!(message.contains("supplied position 4"), "{message}");
+            assert!(message.contains("live cache cursor 3"), "{message}");
+        }
+
+        #[test]
+        fn validate_hidden_prefill_fresh_session_checks_kv_and_gdn_state() {
+            assert!(MetalQwen35State::validate_hidden_prefill_fresh_session(0, true).is_ok());
+            assert!(
+                MetalQwen35State::validate_hidden_prefill_fresh_session(1, true).is_err(),
+                "a live KV cursor must be rejected"
+            );
+            assert!(
+                MetalQwen35State::validate_hidden_prefill_fresh_session(0, false).is_err(),
+                "non-initial GDN state must be rejected even when the KV cursor is zero"
             );
         }
 
@@ -17750,6 +19404,66 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 result.is_ok(),
                 "mmap_q3_weight must accept a well-formed MLP-role payload: {:?}",
+                result.err()
+            );
+        }
+
+        // #1368: `mmap_q3_weight` must route through the same mmap trust
+        // boundary `mmap_q4_weight` already does -- proves the wiring, not
+        // just the underlying `open_trusted_mmap_file` predicate (already
+        // covered directly in `mmap_trust`'s own tests).
+        #[cfg(unix)]
+        #[test]
+        fn mmap_q3_weight_rejects_a_group_or_other_writable_file() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("writable.q3");
+            let tensor = crate::weights::q3_weights::Q3Tensor {
+                blocks: vec![
+                    crate::weights::q3_weights::Q3Block {
+                        scale: 0,
+                        bias: 0,
+                        packed: [0u8; 12]
+                    };
+                    2
+                ],
+                shape: vec![64],
+                original_len: 64,
+            };
+            crate::weights::q3_weights::save_q3_file(&path, &tensor)
+                .expect("save well-formed q3 file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                .expect("chmod 0o666");
+
+            let result = mmap_q3_weight(
+                &device,
+                &path,
+                "model.layers.0.mlp.down_proj.weight",
+                "writable-file-rejected",
+            );
+            let Err(err) = result else {
+                panic!("a group/other-writable Q3 file must be refused")
+            };
+            assert!(
+                err.contains("refusing to load"),
+                "expected a trust-boundary refusal, got: {err}"
+            );
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 0o600");
+            let result = mmap_q3_weight(
+                &device,
+                &path,
+                "model.layers.0.mlp.down_proj.weight",
+                "owner-only-accepted",
+            );
+            assert!(
+                result.is_ok(),
+                "an owner-only Q3 file must still be accepted: {:?}",
                 result.err()
             );
         }
@@ -22035,6 +23749,66 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(result.is_err(), "zero d_in must return Err");
         }
 
+        // -----------------------------------------------------------------
+        // `generate_with_lora_mixture` must reject an empty inner layer
+        // slice before it unloads the currently loaded adapter — otherwise
+        // the request errors out *after* destroying a previously loaded
+        // adapter, contradicting this method's own admission-error promise
+        // ("Admission errors are returned before the existing adapter or
+        // prefix cache is changed"). Loads a real adapter first so the
+        // destructive path (`unload_lora_adapter`) has something to destroy,
+        // then asserts it is untouched after the rejected call.
+        // -----------------------------------------------------------------
+        #[test]
+        fn generate_with_lora_mixture_rejects_empty_inner_slice_without_unloading() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+
+            state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 1)], 1.0, None)
+                .expect("valid LoRA adapter loads");
+            assert!(
+                state.has_lora_adapter(),
+                "precondition: an adapter must be loaded before the rejected call"
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let empty: &[LoraLayerData] = &[];
+            let result =
+                state.generate_with_lora_mixture(&[(empty, 1.0)], "a", &tokenizer, &gen_cfg);
+            assert!(
+                result.is_err(),
+                "an empty inner layer slice must be rejected"
+            );
+            assert!(
+                state.has_lora_adapter(),
+                "the previously loaded adapter must survive a rejected request, \
+                 not be destroyed by the unconditional unload before blending"
+            );
+        }
+
         #[test]
         fn load_lora_adapter_rejects_out_of_range_layer_idx() {
             let _gpu_guard = gpu_test_lock();
@@ -22713,7 +24487,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             for attempt in 0..2 {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    state.forward_prefill_batched_chunk(&tokens, 0, true, true)
+                    state.forward_prefill_batched_chunk(&tokens, 0, true, true, false)
                 }));
                 assert!(
                     result.is_err(),
@@ -28226,6 +30000,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             });
 
             state.reset_state();
+            let real_prefill = state.forward_prefill(&[0u32]);
 
             // Plant a recognizable non-zero pattern into the live GDN GPU buffers so the
             // pre-draft / post-draft slot contents are observably distinct. The exact
@@ -28252,16 +30027,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 }
             }
 
-            let snap_before = state.snapshot_gdn_states();
+            let snap_pre_round = state.snapshot_gdn_states();
             assert!(
-                !snap_before.is_empty(),
+                !snap_pre_round.is_empty(),
                 "tiny hybrid fixture must have GDN layers"
             );
-
-            let real_prefill = state.forward_prefill(&[0u32]);
-            // Refresh the baseline AFTER prefill (which mutates GDN); this matches the
-            // exact state the self-spec round will see at `pos = kv.seq_len`.
-            let snap_pre_round = state.snapshot_gdn_states();
 
             // Precondition for the regression: GDN-only draft forwards must actually
             // mutate the live GDN buffers so we are checking that slot 0 is restored
@@ -29004,7 +30774,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut production =
                 MetalQwen35State::new(weights, cfg, 16).expect("production scheduler fixture");
             production.use_gdn_chunked = chunked;
-            let _ = production.forward_prefill_batched_chunk(tokens, 0, true, false);
+            let _ = production.forward_prefill_batched_chunk(tokens, 0, true, false, false);
             let production_artifacts = prefill_scheduler_artifacts(&mut production, tokens, 9);
 
             let mut isolated =
@@ -29094,7 +30864,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut production =
                 MetalQwen35State::new(&weights, &cfg, 8).expect("production fallback fixture");
             production.use_gdn_chunked = true;
-            let _ = production.forward_prefill_batched_chunk(&[1, 2], 0, true, false);
+            let _ = production.forward_prefill_batched_chunk(&[1, 2], 0, true, false, false);
             assert_eq!(production.session.position, 2);
             assert_eq!(production.session.kv_cache.seq_len, 2);
 
@@ -29706,7 +31476,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 &tokens,
                 0,
                 &capture_requests,
-            );
+            )
+            .expect("fresh benchmark state and in-range capture request");
             assert_eq!(
                 captures.len(),
                 capture_requests.len(),
@@ -31954,7 +33725,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // stream. This is the exact stale path: `forward_step`
             // advances `self.session.kv_cache` / GDN state directly, bypassing
             // both `reset_state()` (D3's guard) and the cache-aware save path.
-            let _ = state.forward_step(0, 0);
+            let live_cursor = state.session.kv_cache.seq_len;
+            let _ = state.forward_step(0, live_cursor);
 
             // The raw call must have invalidated the retained entry outright
             // (not just left it stale) — this is what D7 adds.
@@ -34794,6 +36566,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // -----------------------------------------------------------------
+        // An empty inner layer slice passes the outer `inputs.is_empty()`
+        // guard (the outer slice has one entry) but must still be rejected,
+        // not silently produce an empty `Ok(Vec::new())` blend.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_lora_layer_data_rejects_empty_inner_layer_slice() {
+            let empty: &[LoraLayerData] = &[];
+            let result = blend_lora_layer_data(&[(empty, 1.0)]);
+            assert!(
+                result.is_err(),
+                "an empty inner layer slice must return an error, not Ok(Vec::new())"
+            );
+        }
+
+        // -----------------------------------------------------------------
         // Contract: a malformed huge dimension returns Err, never panics.
         //
         // rank=2, d_in=usize::MAX/2+1, d_out=1 with empty a and b=[0.0;2].
@@ -34837,7 +36624,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // -----------------------------------------------------------------
         #[test]
         fn blend_aggregate_budget_exceeded_returns_err() {
-            // MAX_BLEND_TOTAL_ELEMENTS is in scope via `use super::*` above.
             let rank = MAX_BLEND_RANK_TOTAL; // 4096 — exactly at per-group cap
             let d_in = 2048usize;
             let d_out = 2048usize;
@@ -35001,19 +36787,32 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// let mp = max_prefill(&state);
         /// let mut start = 0usize;
         /// for chunk in token_ids.chunks(mp) {
-        ///     total.accumulate(&forward_prefill_gdn_isolated_chunk(&mut state, chunk, start));
+        ///     let timing = forward_prefill_gdn_isolated_chunk(&mut state, chunk, start)?;
+        ///     total.accumulate(&timing);
         ///     start += chunk.len();
         /// }
         /// ```
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::InvalidInput`] before cache
+        /// invalidation or GPU dispatch when `start_pos` is not the live cursor,
+        /// a token is out of range, the chunk is empty or too large, or its range
+        /// exceeds session capacity.
         pub fn forward_prefill_gdn_isolated_chunk(
             state: &mut MetalQwen35State,
             token_ids: &[u32],
             start_pos: usize,
-        ) -> GdnIsolatedChunkTiming {
-            assert_token_ids_in_vocab(state, token_ids);
-            state
+        ) -> Result<GdnIsolatedChunkTiming, crate::error::InferenceError> {
+            preflight_bench_prefill(
+                state,
+                "bench_support::forward_prefill_gdn_isolated_chunk",
+                token_ids,
+                start_pos,
+            )?;
+            Ok(state
                 .forward_prefill_chunk_gdn_isolated(token_ids, start_pos, &[])
-                .0
+                .0)
         }
 
         /// One (GDN layer, value head) target for a [`GdnLayerCapture`] read —
@@ -35056,20 +36855,31 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// recurrence inputs for each requested (layer, head) target. Capture
         /// cannot perturb the measured/production dispatch — see
         /// `MetalQwen35State::capture_gdn_chunk_scratch`'s doc comment.
+        ///
+        /// # Errors
+        ///
+        /// Returns the same pre-dispatch input errors as
+        /// [`forward_prefill_gdn_isolated_chunk`].
         pub fn forward_prefill_gdn_isolated_chunk_capture(
             state: &mut MetalQwen35State,
             token_ids: &[u32],
             start_pos: usize,
             capture: &[GdnCaptureRequest],
-        ) -> (GdnIsolatedChunkTiming, Vec<GdnLayerCapture>) {
-            assert_token_ids_in_vocab(state, token_ids);
-            state.forward_prefill_chunk_gdn_isolated(token_ids, start_pos, capture)
+        ) -> Result<(GdnIsolatedChunkTiming, Vec<GdnLayerCapture>), crate::error::InferenceError>
+        {
+            preflight_bench_prefill(
+                state,
+                "bench_support::forward_prefill_gdn_isolated_chunk_capture",
+                token_ids,
+                start_pos,
+            )?;
+            Ok(state.forward_prefill_chunk_gdn_isolated(token_ids, start_pos, capture))
         }
 
         /// The model's vocab size, exposed so harness bins can validate token ids
-        /// BEFORE the first forward call: the entry points in this module bypass
-        /// the public `forward_prefill_impl` path and its token-id validation, and
-        /// the embedding copy is an unsafe read indexed by token id.
+        /// before entering a measured region. Each forward helper also validates
+        /// token ids in its preflight because the embedding copy is an unsafe read
+        /// indexed by token id.
         pub fn vocab_size(state: &MetalQwen35State) -> usize {
             state.engine.config.vocab_size
         }
@@ -35084,19 +36894,29 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .map(|(i, &id)| (i, id))
         }
 
-        /// Both bench entry points bypass the public path's token-id validation,
-        /// so they re-validate here: the first forward would otherwise read
-        /// outside `embed_tokens` in the unsafe embedding copy instead of failing
-        /// loudly before measurement.
-        fn assert_token_ids_in_vocab(state: &MetalQwen35State, token_ids: &[u32]) {
-            let vocab = state.engine.config.vocab_size;
-            if let Some((i, id)) = first_out_of_vocab(token_ids, vocab) {
-                panic!(
-                    "token id {id} at index {i} is out of vocab range ({vocab}) — refusing \
-                     to run the unsafe embedding copy on unvalidated ids (tokenizer/model \
-                     mismatch?)"
-                );
+        fn preflight_bench_prefill(
+            state: &mut MetalQwen35State,
+            entry_point: &str,
+            token_ids: &[u32],
+            start_pos: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            if token_ids.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: token_ids must not be empty"
+                )));
             }
+            if token_ids.len() > state.session.max_prefill {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "{entry_point}: chunk length {} exceeds max_prefill {}",
+                    token_ids.len(),
+                    state.session.max_prefill
+                )));
+            }
+            state.check_forward_token_ids(entry_point, token_ids)?;
+            state.check_forward_range_capacity(start_pos, token_ids.len(), false)?;
+            state.check_live_cursor(entry_point, start_pos)?;
+            state.cross_turn_prefix_cache.clear();
+            Ok(())
         }
 
         /// True iff this state's config supports the chunked GDN prefill path.
@@ -35138,13 +36958,185 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// already inside `forward_prefill_batched_chunk`), so the caller times the
         /// call from outside with a plain CPU `Instant` — no internal
         /// instrumentation is needed or added.
+        ///
+        /// # Errors
+        ///
+        /// Returns the same pre-dispatch input errors as
+        /// [`forward_prefill_gdn_isolated_chunk`].
         pub fn forward_prefill_production_chunk(
             state: &mut MetalQwen35State,
             token_ids: &[u32],
             start_pos: usize,
-        ) {
-            assert_token_ids_in_vocab(state, token_ids);
-            let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false);
+        ) -> Result<(), crate::error::InferenceError> {
+            preflight_bench_prefill(
+                state,
+                "bench_support::forward_prefill_production_chunk",
+                token_ids,
+                start_pos,
+            )?;
+            let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false, false);
+            Ok(())
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::first_out_of_vocab;
+
+            #[test]
+            fn first_out_of_vocab_accepts_in_range() {
+                assert_eq!(first_out_of_vocab(&[0, 1, 99], 100), None);
+                assert_eq!(first_out_of_vocab(&[], 100), None);
+            }
+
+            #[test]
+            fn first_out_of_vocab_finds_first_offender() {
+                // Two offenders; the FIRST (index 1) must be reported.
+                assert_eq!(first_out_of_vocab(&[5, 200, 300], 100), Some((1, 200)));
+            }
+
+            #[test]
+            fn first_out_of_vocab_rejects_id_equal_to_vocab() {
+                // vocab_size itself is out of range (valid ids are 0..vocab_size).
+                assert_eq!(first_out_of_vocab(&[100], 100), Some((0, 100)));
+            }
+        }
+    }
+}
+
+// Target-independent numerical support follows the macOS + Metal implementation.
+#[cfg(test)]
+mod public_scheduling_entry_point_tests {
+    use std::collections::BTreeSet;
+
+    fn item<'a>(source: &'a str, declaration: &str) -> &'a str {
+        let start = source
+            .find(declaration)
+            .unwrap_or_else(|| panic!("missing declaration {declaration}"));
+        let open = start
+            + source[start..]
+                .find('{')
+                .unwrap_or_else(|| panic!("missing body for {declaration}"));
+        let mut depth = 0usize;
+        for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[start..=open + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated body for {declaration}");
+    }
+
+    fn public_functions(source: &str) -> Vec<(&str, &str)> {
+        let mut functions = Vec::new();
+        let mut rest = source;
+        while let Some(offset) = rest.find("pub fn ") {
+            rest = &rest[offset..];
+            let name_start = "pub fn ".len();
+            let name_end = rest[name_start..]
+                .find('(')
+                .map(|end| name_start + end)
+                .expect("public function has an argument list");
+            let declaration = &rest[..name_end + 1];
+            let body = item(rest, declaration);
+            functions.push((&rest[name_start..name_end], body));
+            rest = &rest[body.len()..];
+        }
+        functions
+    }
+
+    #[test]
+    fn every_public_stateful_scheduling_entry_point_has_preflight() {
+        let source = include_str!("metal_qwen35.rs");
+        let real = source
+            .split_once("mod inner {")
+            .expect("real Metal implementation exists")
+            .1
+            .split_once("// Target-independent numerical support follows")
+            .expect("real Metal implementation has a stable end marker")
+            .0;
+        let sinks = [
+            "forward_step_inner(",
+            "forward_prefill_impl(",
+            "forward_prefill_batched_chunk(",
+            "forward_prefill_chunk_gdn_isolated(",
+            "verify_tokens_batched(",
+        ];
+        let mut discovered: BTreeSet<&str> = public_functions(real)
+            .into_iter()
+            .filter(|(name, body)| {
+                name.starts_with("forward_prefill")
+                    || body.split_once('{').is_some_and(|(signature, _)| {
+                        signature.contains("position: usize")
+                            || signature.contains("start_pos: usize")
+                    })
+                    || sinks.iter().any(|sink| body.contains(sink))
+            })
+            .map(|(name, _)| name)
+            .collect();
+        discovered.extend(["rollback_cache_to", "verify_tokens"]);
+
+        let expected: BTreeSet<&str> = [
+            "forward_prefill",
+            "forward_prefill_all_logits",
+            "forward_prefill_gdn_isolated_chunk",
+            "forward_prefill_gdn_isolated_chunk_capture",
+            "forward_prefill_production_chunk",
+            "forward_prefill_with_hidden",
+            "forward_step",
+            "forward_step_with_hidden",
+            "prepare_hidden_for_bench",
+            "rollback_cache_to",
+            "try_forward_prefill",
+            "try_forward_step",
+            "verify_tokens",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(discovered, expected, "public scheduling population changed");
+
+        for (declaration, preflight) in [
+            ("pub fn try_forward_step(", "check_live_cursor"),
+            ("pub fn forward_step_with_hidden(", "check_live_cursor"),
+            ("pub fn forward_step(", "try_forward_step"),
+            (
+                "pub fn try_forward_prefill(",
+                "check_raw_prefill_fresh_session",
+            ),
+            ("pub fn forward_prefill(", "try_forward_prefill"),
+            (
+                "pub fn forward_prefill_with_hidden(",
+                "check_hidden_prefill_fresh_session",
+            ),
+            (
+                "pub fn forward_prefill_all_logits(",
+                "check_raw_prefill_fresh_session",
+            ),
+            ("fn verify_tokens(", "check_live_cursor"),
+            ("fn rollback_cache_to(", "rollback_speculative_state_to"),
+            ("pub fn prepare_hidden_for_bench(", "forward_step"),
+            (
+                "pub fn forward_prefill_gdn_isolated_chunk(",
+                "preflight_bench_prefill",
+            ),
+            (
+                "pub fn forward_prefill_gdn_isolated_chunk_capture(",
+                "preflight_bench_prefill",
+            ),
+            (
+                "pub fn forward_prefill_production_chunk(",
+                "preflight_bench_prefill",
+            ),
+        ] {
+            assert!(
+                item(real, declaration).contains(preflight),
+                "{declaration} must route through {preflight}"
+            );
         }
 
         /// Issue #1336 harness support (`bin/bench_vision_prefill_ab.rs`): a
@@ -36307,9 +38299,10 @@ mod gdn_state_traffic_tests {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
-    ChatCompletionOutput, LayerImportanceScore, LayerPruningPlan, LoraLayerData, MetalQwen35State,
-    MoeRoutingTraceRecord, PathProofSnapshot, arm_moe_routing_trace, blend_lora_layer_data,
-    dump_moe_routing_trace_jsonl, take_moe_routing_trace,
+    ChatCompletionOutput, HiddenReadbackPathProofSnapshot, LayerImportanceScore, LayerPruningPlan,
+    LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord, PathProofSnapshot,
+    arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
+    take_moe_routing_trace,
 };
 
 #[cfg(all(
@@ -36389,6 +38382,52 @@ impl MetalQwen35State {
         _token_id: u32,
         _position: usize,
     ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
+    /// **Unstable**: fallible Metal hidden-returning step stub.
+    pub fn forward_step_with_hidden(
+        &mut self,
+        _token_id: u32,
+        _position: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
+    /// **Unstable**: Metal prefill stub; panics without macOS + metal-gpu.
+    ///
+    /// Use [`Self::try_forward_prefill`] for a typed capability error.
+    pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
+        match self.try_forward_prefill(token_ids) {
+            Ok(logits) => logits,
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// **Unstable**: fallible Metal prefill stub.
+    ///
+    /// # Errors
+    ///
+    /// Always returns [`crate::error::InferenceError::Inference`] without
+    /// macOS + `metal-gpu` support.
+    pub fn try_forward_prefill(
+        &mut self,
+        _token_ids: &[u32],
+    ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
+    /// **Unstable**: fallible Metal hidden-returning prefill stub.
+    pub fn forward_prefill_with_hidden(
+        &mut self,
+        _token_ids: &[u32],
+    ) -> Result<(Vec<f32>, Vec<f32>), crate::error::InferenceError> {
         Err(crate::error::InferenceError::Inference(
             "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
         ))
@@ -36535,6 +38574,18 @@ mod non_metal_stub_tests {
             ("he".to_string(), "l".to_string()),
         ];
         BpeTokenizer::from_vocab_and_merges(vocab, merges).unwrap()
+    }
+
+    #[test]
+    fn non_metal_stub_try_forward_prefill_returns_capability_error() {
+        let mut state = MetalQwen35State;
+        let result = state.try_forward_prefill(&[1, 2]);
+        match result {
+            Err(InferenceError::Inference(message)) => {
+                assert!(message.contains("metal-gpu"), "{message}");
+            }
+            other => panic!("expected Metal capability error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1,35 +1,60 @@
 //! Metal GPU benchmark — proper throughput measurement with multiple prompts.
-//! Usage: cargo run --release -p lattice-inference --bin profile_metal --features "f16,metal-gpu"
+//!
+//! Usage:
+//! `cargo run --release -p lattice-inference --example profile_metal --features "f16,metal-gpu"`
+//!
+//! Set `LATTICE_MODEL_DIR` to a safetensors or native Q4 model directory.
+//! For a Q4 checkpoint whose tokenizer lives elsewhere, set
+//! `LATTICE_TOKENIZER_DIR` to that tokenizer directory.
 
 fn main() {
     let home = std::env::var("HOME").unwrap();
-    let model_dir = format!("{home}/.lattice/models/qwen3.5-2b");
+    let model_dir = std::env::var("LATTICE_MODEL_DIR")
+        .unwrap_or_else(|_| format!("{home}/.lattice/models/qwen3.5-2b"));
+    let tokenizer_dir =
+        std::env::var("LATTICE_TOKENIZER_DIR").unwrap_or_else(|_| model_dir.clone());
     let dir = std::path::Path::new(&model_dir);
-
-    if !dir.join("model.safetensors").exists() {
-        eprintln!("Model not found at {model_dir}");
-        std::process::exit(1);
-    }
+    let tokenizer_path = std::path::Path::new(&tokenizer_dir).join("tokenizer.json");
 
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::GenerateConfig;
+    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model_format::{ModelFormat, detect_format};
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
     let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
 
     eprintln!("[bench] Loading model...");
     let t0 = std::time::Instant::now();
-    let model = Qwen35Model::from_safetensors(dir).expect("load model");
-    let cfg = model.config().clone();
+    let (mut metal, quant_label) = match detect_format(dir) {
+        ModelFormat::Q4 => {
+            let cfg = Qwen35Config::from_model_dir(dir).expect("load Q4 model config");
+            let state = MetalQwen35State::from_q4_dir(dir, &tokenizer_path, &cfg, 4096)
+                .expect("initialize Q4 Metal state");
+            (state, "Q4_0")
+        }
+        ModelFormat::Safetensors => {
+            let model = Qwen35Model::from_safetensors(dir).expect("load safetensors model");
+            let state = MetalQwen35State::new(model.weights(), model.config(), 4096)
+                .expect("initialize Q8 Metal state");
+            (state, "Q8_0")
+        }
+        ModelFormat::Unknown => {
+            eprintln!("Unrecognized model directory at {model_dir}");
+            std::process::exit(1);
+        }
+        other => {
+            eprintln!("Model format {other:?} at {model_dir} is not supported by this example");
+            std::process::exit(1);
+        }
+    };
     let tokenizer =
-        BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json")).expect("load tokenizer");
+        BpeTokenizer::from_tokenizer_json(&tokenizer_path).expect("load tokenizer.json");
     eprintln!("[bench] Model loaded in {:.1}s", t0.elapsed().as_secs_f64());
-
-    eprintln!("[bench] Initializing Metal GPU state...");
-    let t1 = std::time::Instant::now();
-    let mut metal = MetalQwen35State::new(model.weights(), &cfg, 4096).expect("init metal");
-    eprintln!("[bench] Metal init in {:.1}s", t1.elapsed().as_secs_f64());
+    eprintln!(
+        "[bench] Metal format={quant_label}; MTP weights loaded={}",
+        metal.has_mtp()
+    );
 
     // Build reverse vocab using tokenizer's internal mapping
     let decode = |ids: &[u32]| -> String {
@@ -68,7 +93,7 @@ fn main() {
     ];
 
     eprintln!("\n============================================================");
-    eprintln!("  BENCHMARK: Qwen3.5-2B Q8_0 Metal GPU (single-cmd pipeline)");
+    eprintln!("  BENCHMARK: Qwen3.5 {quant_label} Metal GPU (single-cmd pipeline)");
     eprintln!("============================================================\n");
 
     for (label, prompt) in &prompts {
@@ -146,43 +171,77 @@ fn main() {
         result.generated_tokens, total_ms, avg_tps
     );
 
+    // Keep the explicit readback measurements off the verbose per-step profile path.
+    // SAFETY: single-threaded example; no other thread reads the environment.
+    unsafe {
+        std::env::remove_var("LATTICE_PROFILE");
+    }
+
     // ── Hidden-readback overhead measurement ─────────────────────────────────
-    // TODO(#1186): When MetalQwen35State::forward_step_with_hidden and
-    //   forward_prefill_with_hidden are implemented, replace this section with:
-    //
-    //   let n_measure = 5;
-    //   let prompt_ids: Vec<u32> = (0..8).collect(); // fixed short prompt
-    //
-    //   // Measure forward_prefill overhead
-    //   metal.reset_state();
-    //   let t0 = std::time::Instant::now();
-    //   for _ in 0..n_measure { metal.reset_state(); let _ = metal.forward_prefill(&prompt_ids); }
-    //   let t_prefill_us = t0.elapsed().as_secs_f64() * 1e6 / n_measure as f64;
-    //
-    //   metal.reset_state();
-    //   let t1 = std::time::Instant::now();
-    //   for _ in 0..n_measure { metal.reset_state(); let _ = metal.forward_prefill_with_hidden(&prompt_ids); }
-    //   let t_prefill_hidden_us = t1.elapsed().as_secs_f64() * 1e6 / n_measure as f64;
-    //
-    //   // Measure forward_step overhead
-    //   let t2 = std::time::Instant::now();
-    //   for _ in 0..n_measure { let _ = metal.forward_step(42, 1); }
-    //   let t_step_us = t2.elapsed().as_secs_f64() * 1e6 / n_measure as f64;
-    //
-    //   let t3 = std::time::Instant::now();
-    //   for _ in 0..n_measure { let _ = metal.forward_step_with_hidden(42, 1); }
-    //   let t_step_hidden_us = t3.elapsed().as_secs_f64() * 1e6 / n_measure as f64;
-    //
-    //   eprintln!("\npath,tok_s,hidden_readback_us,accepted_tokens_per_forward,acceptance_rate");
-    //   eprintln!("greedy,{:.1},0.0,1.00,1.00", avg_tps);
-    //   eprintln!("prefill_overhead,n/a,{:.1},n/a,n/a", t_prefill_hidden_us - t_prefill_us);
-    //   eprintln!("step_overhead,n/a,{:.1},n/a,n/a", t_step_hidden_us - t_step_us);
-    //   for dl in [2u32, 4, 8] {
-    //       eprintln!("mtp_draft_{dl},todo,{:.1},todo,todo", t_step_hidden_us - t_step_us);
-    //   }
+    let n_measure = 5usize;
+    let prompt_ids: Vec<u32> = (0..8).collect();
+
+    let measure_prefill = |state: &mut MetalQwen35State, capture_hidden: bool| -> f64 {
+        let start = std::time::Instant::now();
+        for _ in 0..n_measure {
+            state.reset_state();
+            if capture_hidden {
+                let output = state
+                    .forward_prefill_with_hidden(&prompt_ids)
+                    .expect("hidden-returning prefill");
+                std::hint::black_box(output);
+            } else {
+                std::hint::black_box(state.forward_prefill(&prompt_ids));
+            }
+        }
+        start.elapsed().as_secs_f64() * 1e6 / n_measure as f64
+    };
+
+    let measure_steps = |state: &mut MetalQwen35State, capture_hidden: bool, steps: usize| -> f64 {
+        let mut elapsed = std::time::Duration::ZERO;
+        for _ in 0..n_measure {
+            state.reset_state();
+            std::hint::black_box(state.forward_prefill(&[1]));
+            let start = std::time::Instant::now();
+            for offset in 0..steps {
+                if capture_hidden {
+                    let output = state
+                        .forward_step_with_hidden(42, 1 + offset)
+                        .expect("hidden-returning step");
+                    std::hint::black_box(output);
+                } else {
+                    std::hint::black_box(state.forward_step(42, 1 + offset));
+                }
+            }
+            elapsed += start.elapsed();
+        }
+        elapsed.as_secs_f64() * 1e6 / n_measure as f64
+    };
+
+    let prefill_us = measure_prefill(&mut metal, false);
+    let prefill_hidden_us = measure_prefill(&mut metal, true);
+    let step_us = measure_steps(&mut metal, false, 1);
+    let step_hidden_us = measure_steps(&mut metal, true, 1);
+
+    eprintln!("\npath,tok_s,hidden_readback_us,accepted_tokens_per_forward,acceptance_rate");
+    eprintln!("greedy,{avg_tps:.1},0.0,1.00,1.00");
     eprintln!(
-        "\nMTP real-model benchmark skipped: \
-         model has no loaded MTP weights or Metal MTP path is disabled"
+        "prefill_overhead,n/a,{:.1},n/a,n/a",
+        prefill_hidden_us - prefill_us
     );
-    eprintln!("  (Wire forward_step_with_hidden + forward_prefill_with_hidden in i2 to enable)");
+    eprintln!("step_overhead,n/a,{:.1},n/a,n/a", step_hidden_us - step_us);
+    for draft_len in [2usize, 4, 8] {
+        let baseline_us = measure_steps(&mut metal, false, draft_len);
+        let with_hidden_us = measure_steps(&mut metal, true, draft_len);
+        let tok_s = draft_len as f64 * 1e6 / with_hidden_us;
+        eprintln!(
+            "mtp_draft_{draft_len},{tok_s:.1},{:.1},n/a,n/a",
+            with_hidden_us - baseline_us
+        );
+    }
+    eprintln!(
+        "# MTP weights loaded={}; mtp_draft_* isolates explicit target-hidden readback \
+         for each requested draft span without changing the live MTP policy",
+        metal.has_mtp()
+    );
 }

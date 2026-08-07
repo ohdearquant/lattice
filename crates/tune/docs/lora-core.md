@@ -58,6 +58,26 @@ adapted projection's input and output width. This is the point to reject a
 model/adapter shape mismatch before generation, rather than discovering it in
 a projection call.
 
+### Target-module name checking
+
+`LoraAdapter::new` — the chokepoint `from_safetensors`, `blend_lora_adapters`,
+and training all route through — accepts any non-empty target-module name.
+This keeps construction itself model-neutral and preserves loading for an
+externally produced adapter that targets a projection this crate does not yet
+recognize by name; an unrecognized name only becomes a problem once something
+tries to install the adapter against a specific model, and
+`validate_against`/`validate_against_bert` already reject that at the point
+where the architecture is known.
+
+`LoraAdapter::new_with_descriptor` is stricter: it checks every declared
+`target_modules` entry against
+[`lattice_fann::lora::KNOWN_LORA_TARGET_MODULES`], the flat name list
+`lattice-tune` and `lattice-inference` share, before accepting a descriptor —
+the same check the Metal `load_lora_adapter_with_descriptor` loader performs
+at its own entry point. Prefer this constructor over the bare one when a
+typo'd target module name should fail construction rather than surface later
+as a mismatched-projection error.
+
 ## Exact micro-LoRA training
 
 The `train-backward` feature exposes `train_micro_lora`, a compact CPU trainer

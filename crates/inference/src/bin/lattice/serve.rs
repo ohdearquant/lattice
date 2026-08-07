@@ -822,18 +822,22 @@ pub(super) fn finish_reason_for(
 /// Decode-side token allowance for the post-generation length invariant
 /// (#1334).
 ///
-/// Mirrors the decode term of admission's shared full-window formula
-/// (`crates/inference/src/serve/contract.rs::validate_context_window_with_budget`):
-/// `prompt + max_tokens + reasoning_budget + 1 <= max_context`. Admission's
-/// `+1` reserves the prompt/generation delimiter and has no counterpart
-/// here -- this only bounds tokens the engine actually generated, so the
-/// invariant is `generated_tokens > max_tokens + reasoning_budget`, not
-/// `> max_tokens + reasoning_budget + 1`. Using the same
-/// `max_tokens.saturating_add(reasoning_budget)` term as admission's
-/// `decode_budget` keeps the two checks from drifting apart the way the
-/// post-generation check drifted from admission before #1334.
+/// Mirrors `decode_cap` (`crates/inference/src/model/qwen35_config.rs`),
+/// which this must stay in agreement with: when a positive
+/// `reasoning_budget` is active and the model does not close its own
+/// thinking block, the engine force-emits a `</think>` delimiter as an
+/// extra generated token (`force_close_think` / `DecodePolicy::
+/// apply_override`), so a completion that legitimately used the full
+/// reasoning and answer allowance is `reasoning_budget + max_tokens + 1`
+/// tokens long, not `reasoning_budget + max_tokens`. The invariant is
+/// `generated_tokens > reasoning_budget + max_tokens + 1` for a positive
+/// budget, and unchanged at `generated_tokens > max_tokens` when the
+/// budget is absent or zero (no forced delimiter can occur).
 fn decode_token_budget(max_tokens: usize, reasoning_budget: Option<usize>) -> usize {
-    max_tokens.saturating_add(reasoning_budget.unwrap_or(0))
+    match reasoning_budget {
+        Some(rb) if rb > 0 => rb.saturating_add(max_tokens).saturating_add(1),
+        _ => max_tokens,
+    }
 }
 
 /// Resolve a token id back to its OpenAI `logprobs` text/bytes representation (#585).
@@ -4475,9 +4479,12 @@ mod tests {
 
         #[tokio::test]
         async fn non_streaming_exact_acceptance_positive_budget() {
+            // The +1 is the forced </think> delimiter (#1372): a positive
+            // reasoning_budget allows rb + max_tokens + 1 generated tokens,
+            // not rb + max_tokens.
             assert_non_streaming(
                 Some(REASONING_BUDGET),
-                MAX_TOKENS + REASONING_BUDGET,
+                MAX_TOKENS + REASONING_BUDGET + 1,
                 true,
                 "non-streaming, positive reasoning_budget, exact budget",
             )
@@ -4488,7 +4495,7 @@ mod tests {
         async fn non_streaming_one_past_rejection_positive_budget() {
             assert_non_streaming(
                 Some(REASONING_BUDGET),
-                MAX_TOKENS + REASONING_BUDGET + 1,
+                MAX_TOKENS + REASONING_BUDGET + 2,
                 false,
                 "non-streaming, positive reasoning_budget, one past budget",
             )
@@ -4577,9 +4584,12 @@ mod tests {
 
         #[tokio::test]
         async fn streaming_exact_acceptance_positive_budget() {
+            // The +1 is the forced </think> delimiter (#1372): a positive
+            // reasoning_budget allows rb + max_tokens + 1 generated tokens,
+            // not rb + max_tokens.
             assert_streaming(
                 Some(REASONING_BUDGET),
-                MAX_TOKENS + REASONING_BUDGET,
+                MAX_TOKENS + REASONING_BUDGET + 1,
                 true,
                 "streaming, positive reasoning_budget, exact budget",
             )
@@ -4590,7 +4600,7 @@ mod tests {
         async fn streaming_one_past_rejection_positive_budget() {
             assert_streaming(
                 Some(REASONING_BUDGET),
-                MAX_TOKENS + REASONING_BUDGET + 1,
+                MAX_TOKENS + REASONING_BUDGET + 2,
                 false,
                 "streaming, positive reasoning_budget, one past budget",
             )

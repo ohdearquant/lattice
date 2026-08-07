@@ -112,11 +112,14 @@ impl GenerationEntryContract {
             Self::MetalDirect | Self::MetalStreaming | Self::MetalPrefixCacheStreaming => {
                 check_context_budget(
                     prompt_len,
-                    gen_cfg.reasoning_budget,
+                    gen_cfg.effective_reasoning_budget(),
                     gen_cfg.max_new_tokens,
                     max_context,
                 )?;
-                Ok(decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens))
+                Ok(decode_cap(
+                    gen_cfg.effective_reasoning_budget(),
+                    gen_cfg.max_new_tokens,
+                ))
             }
         }
     }
