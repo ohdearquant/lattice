@@ -6,6 +6,7 @@
 
 /// Controls what metrics are collected during inference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum MetricsMode {
     /// Zero overhead — no metrics collected.
     #[default]

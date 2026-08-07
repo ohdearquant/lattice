@@ -7,6 +7,7 @@ use thiserror::Error;
 
 /// GPU operation errors
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum GpuError {
     /// GPU device not available
     #[error("GPU not available: {0}")]
