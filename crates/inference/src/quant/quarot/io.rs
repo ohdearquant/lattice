@@ -138,16 +138,10 @@ impl Shard {
         // runtime baseline forward pass does (see `QuarotTensorReader::open`'s
         // doc comment), so `path` may resolve through a final-component
         // symlink -- `open_trusted_mmap_file`'s `O_NOFOLLOW` would reject
-        // that. `reject_if_open_mmap_file_untrusted` applies the same
-        // mode/uid/ACL/parent-directory checks without it.
-        crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted(&file, path)
+        // that. `map_after_untrusted_open` applies the same
+        // mode/uid/ACL/parent-directory checks without it, then maps.
+        let mmap = crate::weights::mmap_trust::map_after_untrusted_open(&file, path)
             .map_err(InferenceError::InvalidSafetensors)?;
-        // SAFETY: the file is opened read-only; the returned Mmap owns the
-        // mapping. The File handle can be dropped immediately after — the OS
-        // keeps the fd alive through the map. Standard memmap2 usage.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {}: {e}", path.display()))
-        })?;
 
         if mmap.len() < 8 {
             return Err(InferenceError::InvalidSafetensors(format!(

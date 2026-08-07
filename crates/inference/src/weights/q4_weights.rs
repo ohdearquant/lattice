@@ -970,12 +970,7 @@ pub(crate) fn open_and_mmap_q4_file(
     let header = validate_q4_file(&mut file, path, expected_shape)
         .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
 
-    // SAFETY: read-only mapping of a file this process does not mutate while
-    // running; the caller upholds the "model files are immutable for the
-    // process lifetime" invariant documented above.
-    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-        .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
-    crate::weights::mmap_trust::verify_mmap_target_unchanged(&file, &metadata, path)?;
+    let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&file, &metadata, path)?;
 
     let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
         format!(

@@ -141,6 +141,8 @@
 use std::fs::File;
 use std::path::Path;
 
+use memmap2::Mmap;
+
 /// Pure predicate: does this `(mode, file_uid, process_uid)` triple fall
 /// outside lattice's mode/uid trust boundary for a mmap'd model file? Split
 /// out from the metadata-reading wrapper so it is unit-testable without
@@ -666,6 +668,61 @@ pub(crate) fn verify_mmap_target_unchanged(
     _path: &Path,
 ) -> Result<(), String> {
     Ok(())
+}
+
+/// Map a `File` [`open_trusted_mmap_file`] already opened and trust-gated,
+/// then run [`verify_mmap_target_unchanged`] against the `Metadata` that call
+/// captured before mapping. `prior` must be the `Metadata` from that same
+/// `open_trusted_mmap_file` call on `file`.
+///
+/// This -- not a bare `Mmap::map`/`MmapOptions::new().map` call written out
+/// at each loader -- is one of the two places in this crate a checkpoint
+/// mapping is constructed (see [`map_after_untrusted_open`] for the other).
+/// Folding the map and the post-map recheck into this module makes "guarded
+/// before mapped, rechecked after mapped" a property of *which function a
+/// caller calls*, not a convention each loader has to reproduce correctly on
+/// its own -- the property this module exists to enforce no longer depends
+/// on an external scan finding every call site that got it right.
+///
+/// A caller that needs to read `file`'s contents (a Q4/Q3 header, for
+/// instance) before the mapping is created does so between its
+/// `open_trusted_mmap_file` call and this one; nothing about that ordering
+/// is checked here, since a plain `std::fs::File` read has no bearing on the
+/// mmap trust boundary this module defends.
+#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+pub(crate) fn map_and_verify_trusted(
+    file: &File,
+    prior: &std::fs::Metadata,
+    path: &Path,
+) -> Result<Mmap, String> {
+    // SAFETY: `file` was opened and trust-gated by `open_trusted_mmap_file`
+    // (the caller's obligation, documented on this function); the model file
+    // must not be mutated while this process runs, the same invariant every
+    // mmap site in this crate relies on.
+    let mmap = unsafe { Mmap::map(file) }
+        .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+    verify_mmap_target_unchanged(file, prior, path)?;
+    Ok(mmap)
+}
+
+/// Guard and map a `File` the caller opened itself through a plain,
+/// symlink-following `File::open` -- the flavor [`reject_if_open_mmap_file_untrusted`]'s
+/// doc comment describes for loaders that must follow a final-component
+/// symlink (a HuggingFace hub-cache checkpoint), which `open_trusted_mmap_file`'s
+/// `O_NOFOLLOW` would reject outright.
+///
+/// This is the second (and last) place in this crate a checkpoint mapping is
+/// constructed -- see [`map_and_verify_trusted`] for the `open_trusted_mmap_file`
+/// flavor. Folding the guard call and the map into one function here keeps
+/// the same structural guarantee: a caller cannot reach a mapping of `file`
+/// without this function having run the guard against it first.
+pub(crate) fn map_after_untrusted_open(file: &File, path: &Path) -> Result<Mmap, String> {
+    reject_if_open_mmap_file_untrusted(file, path)?;
+    // SAFETY: `file` was just trust-gated by `reject_if_open_mmap_file_untrusted`
+    // above, on the same descriptor; the model file must not be mutated while
+    // this process runs, the same invariant every mmap site in this crate
+    // relies on.
+    unsafe { Mmap::map(file) }.map_err(|e| format!("failed to mmap {}: {e}", path.display()))
 }
 
 /// macOS extended-ACL inspection, isolated in its own submodule so the FFI

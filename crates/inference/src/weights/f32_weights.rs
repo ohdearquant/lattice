@@ -167,9 +167,9 @@ impl CrossEncoderWeights {
 ///
 /// The owned variant exists for targets without real file-descriptor/mmap
 /// support (`wasm32-unknown-unknown`: `memmap2`'s wasm fallback compiles but
-/// every `Mmap::map` call returns `io::ErrorKind::Unsupported` at runtime) and
-/// for hosts that receive model weights as an in-memory buffer rather than a
-/// filesystem path (e.g. bytes handed in from JavaScript).
+/// every mmap construction call returns `io::ErrorKind::Unsupported` at
+/// runtime) and for hosts that receive model weights as an in-memory buffer
+/// rather than a filesystem path (e.g. bytes handed in from JavaScript).
 enum SafetensorsBacking {
     Mapped(Mmap),
     Owned(Vec<u8>),
@@ -218,23 +218,22 @@ impl SafetensorsFile {
         let file = File::open(path).map_err(|e| {
             InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
         })?;
-        crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted(&file, path)
-            .map_err(InferenceError::InvalidSafetensors)?;
-        Self::from_open_file(file, path.display().to_string())
+        Self::from_open_file(file, path)
     }
 
     /// Parse a safetensors file from an already-open [`File`].
     ///
     /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
-    /// validates the manifest string and opens the file exactly once. Mapping the fd the
-    /// caller already holds is what keeps that single open meaningful; reopening by path
-    /// here would reintroduce the window between the open and the read.
-    pub(crate) fn from_open_file(file: File, display_path: String) -> Result<Self, InferenceError> {
-        // SAFETY: The file descriptor remains alive until the mmap is created,
-        // and the returned Mmap owns the mapping independently of the File.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {display_path}: {e}"))
-        })?;
+    /// opens the file exactly once. Mapping the fd the caller already holds is what keeps
+    /// that single open meaningful; reopening by path here would reintroduce the window
+    /// between the open and the read. `path` is used both to run the mmap trust-boundary
+    /// guard (via [`crate::weights::mmap_trust::map_after_untrusted_open`]) and to name the
+    /// file in error messages -- it should be the resolved real path when the caller has
+    /// one, matching that guard's own `path` requirement.
+    pub(crate) fn from_open_file(file: File, path: &Path) -> Result<Self, InferenceError> {
+        let display_path = path.display().to_string();
+        let mmap = crate::weights::mmap_trust::map_after_untrusted_open(&file, path)
+            .map_err(InferenceError::InvalidSafetensors)?;
 
         Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
     }
@@ -1415,7 +1414,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
         let (file, real_path) = open_manifest_entry_once(model_dir, &shard_file)?;
-        let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
+        let shard = SafetensorsFile::from_open_file(file, &real_path)?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
             tensors.insert(
@@ -1473,7 +1472,7 @@ impl ShardedSafetensors {
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
             let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
-            let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
+            let shard = SafetensorsFile::from_open_file(file, &real_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
         self.shards.get(shard_file).ok_or_else(|| {
