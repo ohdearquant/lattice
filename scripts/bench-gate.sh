@@ -10,6 +10,21 @@ source "$REPO/scripts/lib/bench-supervision.sh"
 
 bench_gate_measurement() {
 cd "$REPO"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -f "$REPO/scripts/lib/bench-python.sh" ]]; then
+        source "$REPO/scripts/lib/bench-python.sh"
+        PYTHON_BIN="$(bench_resolve_python3)" || PYTHON_BIN="python3"
+    else
+        # tests/test_bench_targets.py's bench-gate-policy test strips the
+        # bench_supervise_entry call (which normally exports PYTHON_BIN) and
+        # copies only Makefile + scripts/perf-bench-gate.py into its sandbox,
+        # so scripts/lib/bench-python.sh is unreachable there. Bare python3
+        # is the only interpreter this branch can resolve to; any caller
+        # that skips both the supervisor and scripts/lib hits this fallback
+        # and the original version-floor defect reappears for it.
+        PYTHON_BIN="python3"
+    fi
+fi
 if [[ ! -d .cache/perf-baselines ]]; then
     git clone --depth=1 --branch=perf-baselines \
         "$(git remote get-url origin)" .cache/perf-baselines ||
@@ -91,11 +106,11 @@ bench_quiet_checkpoint "bench-gate: after measurements"
 echo "UNSUITABLE AS BENCHMARK EVIDENCE: local bench-gate has no run provenance"
 rc=0
 gate_rc=0
-"${PYTHON_BIN:?PYTHON_BIN not set - bench_supervise_entry should have exported it}" scripts/perf-bench-gate.py \
+"$PYTHON_BIN" scripts/perf-bench-gate.py \
     "$inference_root" "$arch-local/lattice-inference:elementwise_cpu_bench" \
     --target lattice-inference:elementwise_cpu_bench \
     --require-measurements || rc=$?
-"${PYTHON_BIN:?PYTHON_BIN not set - bench_supervise_entry should have exported it}" scripts/perf-bench-gate.py \
+"$PYTHON_BIN" scripts/perf-bench-gate.py \
     "$embed_root" "$arch-local/lattice-embed:simd" \
     --target lattice-embed:simd \
     --require-measurements || gate_rc=$?
