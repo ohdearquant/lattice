@@ -123,6 +123,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/bench_gdn.rs",
     "examples/diff_attn_layer23.rs",
     "examples/diff_gdn_layer.rs",
+    "src/bin/gramtime_profile.rs",
     "src/bin/moe_admission_sim.rs",
     "src/bin/quantize_q4.rs",
     "src/bin/quantize_quarot.rs",
