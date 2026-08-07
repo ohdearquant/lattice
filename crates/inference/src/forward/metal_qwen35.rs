@@ -1617,6 +1617,17 @@ mod inner {
         pub(crate) compact_result: Vec<crate::sampling::Candidate>,
         // MTP per-session cache and activations (None if model has no MTP).
         pub(crate) mtp: Option<MetalMtpSession>,
+        /// True for the remainder of the current request once `generate()`'s
+        /// `use_mtp` (see [`super::mtp_route_active`]) commits to the MTP
+        /// greedy/verify path. Distinct from `mtp.is_some()`, which only
+        /// reports whether the checkpoint carries MTP weights: a checkpoint
+        /// can ship MTP weights while a specific request runs with MTP
+        /// disabled (`enable_mtp: Some(false)`), and pre-final-hidden-capture
+        /// gates must not treat that request as MTP-active just because the
+        /// weights happen to be resident (#1336 round 2). Reset to `false` by
+        /// `reset_state()`, which every generate entry point calls before
+        /// this flag is next read or set.
+        pub(crate) mtp_active: bool,
         pub(crate) gdn_checkpoints: Option<MetalGdnCheckpointPool>,
         pub(crate) last_pre_final_hidden: Vec<f32>,
         /// Raw (pre-final-RMSNorm) target hidden states captured by
@@ -3427,6 +3438,7 @@ mod inner {
                 compact_route: GpuTopkRoute::CpuFallback,
                 compact_result: Vec::new(),
                 mtp,
+                mtp_active: false,
                 gdn_checkpoints,
                 last_pre_final_hidden: vec![0.0f32; hidden],
                 mtp_prefill_hidden: Vec::new(),
@@ -5826,6 +5838,7 @@ mod inner {
                 position,
                 capture_hidden,
                 false,
+                true,
                 GdnStateTrafficScope::Decode,
                 None,
                 None,
@@ -5852,6 +5865,7 @@ mod inner {
                 position,
                 capture_hidden,
                 false,
+                true,
                 scope,
                 None,
                 None,
@@ -5884,6 +5898,7 @@ mod inner {
                 position,
                 false,
                 false,
+                true,
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 None,
@@ -5898,11 +5913,18 @@ mod inner {
         /// `forward_step_inner_impl`'s `mrope_cos_sin` doc). Used for image-pad
         /// prefill positions, where `injected_embedding` and `mrope_cos_sin` are
         /// both `Some`.
+        ///
+        /// `emit_head` gates the terminal RMSNorm + lm_head dispatch, same
+        /// contract as `forward_step_inner_impl`'s parameter of the same name —
+        /// pass `false` for a multimodal prefill position whose logits will
+        /// never be sampled (KV/GDN state still advances); pass `true` for every
+        /// decode step and for the prompt's final prefill position.
         fn forward_step_injected_mrope(
             &mut self,
             embedding: &[f32],
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            emit_head: bool,
             signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
@@ -5911,6 +5933,7 @@ mod inner {
                 position,
                 false,
                 false,
+                emit_head,
                 GdnStateTrafficScope::Decode,
                 Some(embedding),
                 mrope_cos_sin,
@@ -5925,11 +5948,14 @@ mod inner {
         /// vision delimiters keep the normal embedding lookup, but still rotate
         /// with the 3-axis table once an image has shifted the position
         /// coordinate) and for every decode step after a multimodal prefill.
+        ///
+        /// `emit_head`: see [`Self::forward_step_injected_mrope`]'s doc.
         fn forward_step_mrope(
             &mut self,
             token_id: u32,
             position: usize,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
+            emit_head: bool,
             signpost_scope: crate::forward::signpost::Scope,
         ) -> Vec<f32> {
             self.cross_turn_prefix_cache.clear();
@@ -5938,6 +5964,7 @@ mod inner {
                 position,
                 false,
                 false,
+                emit_head,
                 GdnStateTrafficScope::Decode,
                 None,
                 mrope_cos_sin,
@@ -5952,6 +5979,15 @@ mod inner {
         /// row for every full-attention layer in this step — mirrors
         /// `cpu_f16::full_attention_step_f16`'s `mrope_cos_sin` parameter. GDN
         /// layers never consume RoPE and are unaffected either way.
+        ///
+        /// `emit_head`, when `false`, skips the terminal RMSNorm + lm_head dispatch
+        /// (`encode_final_head`) and its GPU readback entirely — every layer still
+        /// runs, so the KV cache and GDN recurrent state are fully advanced, but
+        /// `logits` comes back empty (issue #1336: a multimodal prefill position
+        /// whose logits are never sampled has no reason to pay for the vocabulary
+        /// projection). Forced back to `true` whenever `capture_hidden` or an
+        /// active MTP session needs the pre-final hidden state this step, so a
+        /// caller cannot accidentally starve MTP capture by passing `false`.
         #[allow(clippy::too_many_arguments)]
         fn forward_step_inner_impl(
             &mut self,
@@ -5959,6 +5995,7 @@ mod inner {
             position: usize,
             capture_hidden: bool,
             skip_logits_readback: bool,
+            emit_head: bool,
             _traffic_scope: GdnStateTrafficScope,
             injected_embedding: Option<&[f32]>,
             mrope_cos_sin: Option<(&[f32], &[f32])>,
@@ -5970,6 +6007,19 @@ mod inner {
             );
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
+
+            // A caller that wants pre-final hidden capture (MTP) still needs the
+            // terminal RMSNorm dispatched even if it passed `emit_head=false`
+            // (only the multimodal prefill loop does today, and never with MTP
+            // active) — this keeps the flag safe by construction rather than by
+            // caller discipline. `mtp_active` is this request's own commitment
+            // to the MTP path (set by `generate()`'s `use_mtp`, cleared by
+            // `reset_state()`), not `self.session.mtp.is_some()`: the latter
+            // reports only that the checkpoint carries MTP weights, which stays
+            // true even when this request runs with `enable_mtp: Some(false)`
+            // (#1336 round 2 — that combination must still honor
+            // `emit_head=false` for the multimodal prefill loop).
+            let run_head = emit_head || capture_hidden || self.session.mtp_active;
 
             // Build the single-token M-RoPE cos/sin buffers once for this step (all
             // six GQA layers rotate with the same per-token row); `None` keeps every
@@ -6212,8 +6262,11 @@ mod inner {
                     &*(self.engine.queue.new_command_buffer() as *const metal::CommandBufferRef)
                 };
                 let head_enc = head_cmd.new_compute_command_encoder();
-                let topk_which_inner =
-                    self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling);
+                let topk_which_inner = if run_head {
+                    self.encode_final_head(head_enc, &cfg, capture_hidden, &mut prof, profiling)
+                } else {
+                    None
+                };
                 head_enc.end_encoding();
                 let t_gpu = std::time::Instant::now();
                 {
@@ -6319,7 +6372,7 @@ mod inner {
                     Vec::new()
                 };
 
-                let logits = if skip_logits_readback {
+                let logits = if !run_head || skip_logits_readback {
                     vec![]
                 } else if let Some(which) = topk_which_inner {
                     let _signpost_host_read = crate::forward::signpost::interval_in(
@@ -6400,8 +6453,11 @@ mod inner {
                 }
             } // end layer loop
 
-            let topk_which =
-                self.encode_final_head(enc, &cfg, capture_hidden, &mut prof, profiling);
+            let topk_which = if run_head {
+                self.encode_final_head(enc, &cfg, capture_hidden, &mut prof, profiling)
+            } else {
+                None
+            };
 
             // Single submit for entire forward pass + optional top-k.
             enc.end_encoding();
@@ -6491,7 +6547,7 @@ mod inner {
                 Vec::new()
             };
 
-            let logits = if skip_logits_readback {
+            let logits = if !run_head || skip_logits_readback {
                 vec![]
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
@@ -6951,6 +7007,7 @@ mod inner {
                 token_id,
                 position,
                 false,
+                true,
                 true,
                 GdnStateTrafficScope::Decode,
                 None,
@@ -9144,6 +9201,12 @@ mod inner {
                 use_compact,
             );
             if use_mtp {
+                // This request has committed to the MTP path (#1336 round 2) —
+                // downstream pre-final-hidden-capture gates key off this, not
+                // off `self.session.mtp.is_some()` (which only reports whether
+                // the checkpoint carries MTP weights, not whether this request
+                // uses them).
+                self.session.mtp_active = true;
                 if use_compact {
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -9953,6 +10016,7 @@ mod inner {
             // identical to the pre-MP3 text-only route.
             let mut visual_row = 0usize;
             let mut last_logits = Vec::new();
+            let last_prefill_pos = prompt_len - 1;
             for (pos, &token_id) in prompt_ids.iter().enumerate() {
                 if Self::multimodal_cancel_requested(&mut should_cancel) {
                     return Ok(Self::cancelled_multimodal_output(prompt_len));
@@ -9962,6 +10026,10 @@ mod inner {
                 } else {
                     None
                 };
+                // issue #1336: only the prompt's final position is ever sampled —
+                // every earlier position still advances KV/GDN state but skips the
+                // terminal RMSNorm/lm_head/vocab readback (`emit_head=false`).
+                let emit_head = pos == last_prefill_pos;
                 if has_image && token_id == request.image_token_id {
                     let start = visual_row * request.decoder_hidden_size;
                     let end = start + request.decoder_hidden_size;
@@ -9979,6 +10047,7 @@ mod inner {
                         row,
                         pos,
                         cos_sin,
+                        emit_head,
                         crate::forward::signpost::Scope::NotDecode,
                     );
                 } else {
@@ -9986,6 +10055,7 @@ mod inner {
                         token_id,
                         pos,
                         cos_sin,
+                        emit_head,
                         crate::forward::signpost::Scope::NotDecode,
                     );
                 }
@@ -10077,6 +10147,7 @@ mod inner {
                     last_token,
                     physical_pos,
                     mrope_cos_sin,
+                    true,
                     crate::forward::signpost::Scope::Decode,
                 );
                 if let Some(probe) = decode_logits_probe.as_deref_mut() {
@@ -10152,6 +10223,10 @@ mod inner {
             if let Some(ref mut mtp) = self.session.mtp {
                 mtp.cache.reset();
             }
+            // A fresh request has not yet decided whether it will take the MTP
+            // greedy/verify path (#1336 round 2) — `generate()` sets this back
+            // to `true` itself once `use_mtp` commits.
+            self.session.mtp_active = false;
             self.session.mtp_prefill_hidden.clear();
             if let Some(ref mut pool) = self.session.gdn_checkpoints {
                 pool.active_base_seq_len = None;
@@ -12647,6 +12722,7 @@ mod inner {
                     compact_route: GpuTopkRoute::CpuFallback,
                     compact_result: Vec::new(),
                     mtp: mtp_session,
+                    mtp_active: false,
                     gdn_checkpoints,
                     last_pre_final_hidden: vec![0.0f32; hidden],
                     mtp_prefill_hidden: Vec::new(),
@@ -25793,6 +25869,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     0,
                     false,
                     false,
+                    true,
                     GdnStateTrafficScope::Decode,
                     Some(&row),
                     None,
@@ -25808,6 +25885,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     0,
                     false,
                     false,
+                    true,
                     GdnStateTrafficScope::Decode,
                     Some(&row),
                     None,
@@ -25924,6 +26002,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 &row,
                 2,
                 Some((&cos_a, &sin_a)),
+                true,
                 crate::forward::signpost::Scope::NotDecode,
             );
             prime(&mut state);
@@ -25931,6 +26010,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 &row,
                 2,
                 Some((&cos_b, &sin_b)),
+                true,
                 crate::forward::signpost::Scope::NotDecode,
             );
 
@@ -25998,6 +26078,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                         row,
                         pos,
                         cos_sin,
+                        true,
                         crate::forward::signpost::Scope::NotDecode,
                     );
                 } else {
@@ -26005,6 +26086,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                         token_id,
                         pos,
                         cos_sin,
+                        true,
                         crate::forward::signpost::Scope::NotDecode,
                     );
                 }
@@ -26041,6 +26123,394 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  fallback — forcing the 1-D path produced indistinguishable final-prefill \
                  logits (max_abs_diff={max_abs_diff})"
             );
+        }
+
+        /// Issue #1336: mechanism-level proof that `emit_head=false` skips the
+        /// actual terminal RMSNorm + lm_head GPU dispatch, not merely its CPU
+        /// readback. Poisons the shared logits buffer with a sentinel pattern
+        /// before an `emit_head=false` step and asserts it is UNCHANGED
+        /// afterward — the only way the sentinel survives is if
+        /// `encode_final_head` (which writes this buffer) never ran.
+        ///
+        /// This is the must-fail-arm control the equivalence test below
+        /// cannot provide on its own: both of that test's arms pass
+        /// `emit_head=true` at the position they compare, so an
+        /// implementation that ignores the flag and always dispatches the
+        /// head would still pass it trivially. Here, `emit_head=true` is the
+        /// positive control (must overwrite the sentinel) and `emit_head=
+        /// false` is the subject (must not).
+        ///
+        /// Mutation-predicted: reverting `run_head`'s gating of
+        /// `self.encode_final_head(...)` in `forward_step_inner_impl` back to
+        /// an unconditional call reddens the `emit_head=false` assertion
+        /// below (the sentinel gets overwritten by the real lm_head GEMV
+        /// every time, regardless of the flag).
+        #[test]
+        fn forward_step_mrope_emit_head_false_skips_terminal_head_dispatch() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "forward_step_mrope_emit_head_false_skips_terminal_head_dispatch",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            let cfg = model.config().clone();
+            let probe_len = cfg.vocab_size.min(64);
+            let sentinel: f32 = -12_345.679;
+            let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                .expect("real-checkpoint state");
+
+            // SAFETY (both closures): `activations.logits` is StorageModeShared;
+            // no GPU work is in flight between test steps (each
+            // `forward_step_mrope` call waits for its own command buffer
+            // before returning), and `probe_len <= vocab_size`.
+            let poison = |state: &MetalQwen35State| unsafe {
+                let ptr = state.session.activations.logits.contents() as *mut f32;
+                for i in 0..probe_len {
+                    *ptr.add(i) = sentinel;
+                }
+            };
+            let read_probe = |state: &MetalQwen35State| -> Vec<f32> {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        state.session.activations.logits.contents() as *const f32,
+                        probe_len,
+                    )
+                    .to_vec()
+                }
+            };
+
+            // Control: emit_head=true must overwrite the poison.
+            state.reset_state();
+            poison(&state);
+            let control_logits = state.forward_step_mrope(
+                7,
+                0,
+                None,
+                true,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            assert!(
+                !control_logits.is_empty(),
+                "emit_head=true must return full vocab logits"
+            );
+            let after_true = read_probe(&state);
+            assert!(
+                after_true.iter().any(|&v| v != sentinel),
+                "control failed: emit_head=true must overwrite the poisoned logits buffer via \
+                 the real lm_head dispatch — if this fails, the poison/readback mechanism \
+                 itself is broken and the subject assertion below is meaningless"
+            );
+
+            // Subject: emit_head=false must leave the poison untouched.
+            state.reset_state();
+            poison(&state);
+            let subject_logits = state.forward_step_mrope(
+                7,
+                0,
+                None,
+                false,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            assert!(
+                subject_logits.is_empty(),
+                "emit_head=false must return no logits: nothing was computed this step"
+            );
+            let after_false = read_probe(&state);
+            assert_eq!(
+                after_false,
+                vec![sentinel; probe_len],
+                "emit_head=false must skip the terminal RMSNorm + lm_head dispatch entirely — \
+                 the logits buffer must remain untouched, not merely unread"
+            );
+        }
+
+        /// Issue #1336 round 2 (F1): `run_head` must key off THIS request's
+        /// own MTP activation (`session.mtp_active`), not off whether the
+        /// loaded checkpoint merely carries MTP weights
+        /// (`session.mtp.is_some()`). A checkpoint can ship MTP weights
+        /// while a specific request runs with MTP disabled
+        /// (`enable_mtp: Some(false)`, or simply a caller — like
+        /// `generate_multimodal_vision_impl`'s prefill loop — that never
+        /// takes `generate()`'s `use_mtp` branch at all); that combination
+        /// must still honor `emit_head=false`.
+        ///
+        /// Builds a session with MTP weights resident via the same
+        /// `metal_state_with_constant_zero_draft_mtp_for_test` fixture the
+        /// MTP-rollback tests above use (so `session.mtp.is_some() ==
+        /// true`), but drives `forward_step_mrope` directly — the same call
+        /// `generate_multimodal_vision_impl`'s prefill loop makes — without
+        /// ever calling `generate()`, so `session.mtp_active` stays at its
+        /// post-`reset_state()` default of `false`. This is exactly the
+        /// "MTP weights present, this request never activated MTP" case the
+        /// old `self.session.mtp.is_some()` gate could not distinguish from
+        /// "MTP weights present and this request is using them".
+        ///
+        /// Reuses `forward_step_mrope_emit_head_false_skips_terminal_head_dispatch`'s
+        /// poison/read_probe mechanism above: `emit_head=false` already
+        /// returns empty logits by contract whether or not the head actually
+        /// ran, so the only way to observe a stray dispatch is to poison the
+        /// shared logits buffer first and assert it survives untouched.
+        ///
+        /// Expected-redden check: before this fix, `run_head` computed
+        /// `emit_head || capture_hidden || self.session.mtp.is_some()`.
+        /// Reverting to that expression makes `run_head` evaluate to `true`
+        /// here purely from `session.mtp.is_some() == true` (both `emit_head`
+        /// and `capture_hidden` are `false`), so `encode_final_head` runs and
+        /// overwrites the sentinel — reddening only the final `assert_eq!`
+        /// below (the two `mtp_active` setup assertions above it stay green
+        /// either way, since they inspect the flag directly rather than
+        /// `run_head`'s output).
+        #[test]
+        fn forward_step_mrope_emit_head_false_skips_terminal_head_dispatch_with_mtp_weights_present_but_request_inactive()
+         {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            assert!(
+                state.session.mtp.is_some(),
+                "fixture setup: this test requires MTP weights to be resident — otherwise it \
+                 cannot distinguish the fixed gate from the pre-fix one"
+            );
+            assert!(
+                !state.session.mtp_active,
+                "fixture setup: a freshly-constructed session must not report MTP as active \
+                 for the request merely because the checkpoint carries MTP weights"
+            );
+
+            let probe_len = cfg.vocab_size.min(64);
+            let sentinel: f32 = -12_345.679;
+
+            // SAFETY: same as `forward_step_mrope_emit_head_false_skips_terminal_head_dispatch`
+            // above — `activations.logits` is StorageModeShared, no GPU work is in
+            // flight between test steps, and probe_len <= vocab_size.
+            let poison = |state: &MetalQwen35State| unsafe {
+                let ptr = state.session.activations.logits.contents() as *mut f32;
+                for i in 0..probe_len {
+                    *ptr.add(i) = sentinel;
+                }
+            };
+            let read_probe = |state: &MetalQwen35State| -> Vec<f32> {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        state.session.activations.logits.contents() as *const f32,
+                        probe_len,
+                    )
+                    .to_vec()
+                }
+            };
+
+            state.reset_state();
+            assert!(
+                state.session.mtp.is_some(),
+                "reset_state must not clear MTP weight residency"
+            );
+            assert!(
+                !state.session.mtp_active,
+                "reset_state must clear any stale per-request MTP activation from a prior call"
+            );
+            poison(&state);
+
+            let subject_logits = state.forward_step_mrope(
+                7,
+                0,
+                None,
+                false,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            assert!(
+                subject_logits.is_empty(),
+                "emit_head=false must return no logits regardless of whether MTP weights are \
+                 resident on the checkpoint"
+            );
+            let after_false = read_probe(&state);
+            assert_eq!(
+                after_false,
+                vec![sentinel; probe_len],
+                "emit_head=false must skip the terminal RMSNorm + lm_head dispatch even when \
+                 the checkpoint carries MTP weights and this request never activated MTP — \
+                 gating on `self.session.mtp.is_some()` instead of the request's own \
+                 `mtp_active` flag would dispatch the head here and overwrite the sentinel, \
+                 which is exactly the #1336-round-2 defeat this test guards against"
+            );
+        }
+
+        /// Issue #1336: `emit_head=false` on a non-final multimodal prefill
+        /// position must not change what that position contributes to the
+        /// residual stream, KV cache, or GDN recurrent state — only the
+        /// terminal RMSNorm/lm_head/vocab readback it skips. Runs the same
+        /// `vision_gate_fixture` prefill twice: once with `emit_head=true` at
+        /// every position (the "always-emitting reference path" the issue
+        /// calls out), once with `emit_head=false` at every position except
+        /// the last (mirrors `generate_multimodal_vision_impl`'s production
+        /// loop). Compares:
+        ///  - final-position logits: bit-identical
+        ///  - GDN recurrent state (every linear layer's conv + S-matrix
+        ///    buffers, via `MtpTargetVerifier::snapshot_gdn_states`):
+        ///    bit-identical
+        ///  - KV cache (every full-attention layer's written prefix):
+        ///    byte-identical
+        ///  - a subsequent decode step off each final state: bit-identical
+        ///    logits — the exact consumer a real state divergence would
+        ///    reach.
+        ///
+        /// This test alone cannot catch an `emit_head` no-op that always
+        /// dispatches the head (both arms compare identically in that case,
+        /// trivially) — that failure mode is covered by
+        /// `forward_step_mrope_emit_head_false_skips_terminal_head_dispatch`
+        /// above. Together they prove both halves the issue asks for: the
+        /// skip is real (mechanism test) and it is safe (this test).
+        #[test]
+        fn generate_multimodal_vision_emit_head_skip_matches_always_emit_reference() {
+            let Some(model) = require_metal_and_real_checkpoint_or_skip(
+                "generate_multimodal_vision_emit_head_skip_matches_always_emit_reference",
+            ) else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let cfg = model.config().clone();
+            let request = vision_gate_fixture(&cfg, 0.02);
+            let (_positions, tables) = request
+                .build_mrope_tables(&cfg)
+                .expect("fixture request builds M-RoPE tables");
+            let prompt_len = request.input_ids.len();
+
+            let run_prefill = |always_emit: bool| -> (Vec<f32>, MetalQwen35State) {
+                let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
+                    .expect("real-checkpoint state");
+                state.reset_state();
+                let mut visual_row = 0usize;
+                let mut last_logits = Vec::new();
+                for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                    let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
+                    let emit_head = always_emit || pos + 1 == prompt_len;
+                    if token_id == request.image_token_id {
+                        let start = visual_row * request.decoder_hidden_size;
+                        let end = start + request.decoder_hidden_size;
+                        let row = &request.post_merger_rows[start..end];
+                        visual_row += 1;
+                        last_logits = state.forward_step_injected_mrope(
+                            row,
+                            pos,
+                            cos_sin,
+                            emit_head,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
+                    } else {
+                        last_logits = state.forward_step_mrope(
+                            token_id,
+                            pos,
+                            cos_sin,
+                            emit_head,
+                            crate::forward::signpost::Scope::NotDecode,
+                        );
+                    }
+                }
+                (last_logits, state)
+            };
+
+            let (logits_reference, mut state_reference) = run_prefill(true);
+            let (logits_optimized, mut state_optimized) = run_prefill(false);
+
+            // Final-logit equivalence: bit-identical.
+            assert!(
+                !logits_reference.is_empty(),
+                "fixture's final position must produce real vocab logits"
+            );
+            assert_eq!(logits_reference.len(), logits_optimized.len());
+            for (i, (a, b)) in logits_reference.iter().zip(&logits_optimized).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "final-position logit {i} diverged between the always-emit reference and \
+                     the emit_head-skip optimization ({a} vs {b})"
+                );
+            }
+
+            // GDN recurrent-state equivalence.
+            let gdn_reference = state_reference.snapshot_gdn_states();
+            let gdn_optimized = state_optimized.snapshot_gdn_states();
+            assert_eq!(
+                gdn_reference, gdn_optimized,
+                "GDN recurrent state (conv + S-matrix buffers) diverged between the \
+                 always-emit reference and the emit_head-skip optimization"
+            );
+
+            // KV-cache equivalence: every full-attention layer's written prefix.
+            let kv_row_bytes = if state_reference.use_kv_f16 {
+                2usize
+            } else {
+                4usize
+            };
+            let used_bytes = prompt_len * cfg.full_kv_dim() * kv_row_bytes;
+            let num_full_layers = state_reference.session.kv_cache.k_bufs.len();
+            for i in 0..num_full_layers {
+                // SAFETY: both buffers are StorageModeShared; every command
+                // buffer in `run_prefill`'s loop above was waited on before
+                // the next step began (see `forward_step_inner_impl`).
+                unsafe {
+                    let k_ref = std::slice::from_raw_parts(
+                        state_reference.session.kv_cache.k_bufs[i].contents() as *const u8,
+                        used_bytes,
+                    );
+                    let k_opt = std::slice::from_raw_parts(
+                        state_optimized.session.kv_cache.k_bufs[i].contents() as *const u8,
+                        used_bytes,
+                    );
+                    assert_eq!(k_ref, k_opt, "K cache layer {i} diverged");
+                    let v_ref = std::slice::from_raw_parts(
+                        state_reference.session.kv_cache.v_bufs[i].contents() as *const u8,
+                        used_bytes,
+                    );
+                    let v_opt = std::slice::from_raw_parts(
+                        state_optimized.session.kv_cache.v_bufs[i].contents() as *const u8,
+                        used_bytes,
+                    );
+                    assert_eq!(v_ref, v_opt, "V cache layer {i} diverged");
+                }
+            }
+
+            // Decode continuation: the exact consumer "state equivalence"
+            // exists for — a subsequent decode step must sample identically
+            // off either state.
+            let physical_pos_ref = state_reference.session.kv_cache.seq_len;
+            let physical_pos_opt = state_optimized.session.kv_cache.seq_len;
+            assert_eq!(
+                physical_pos_ref, physical_pos_opt,
+                "KV cursor position diverged between the two prefill arms"
+            );
+            let decode_token = 5u32;
+            let decode_logits_ref = state_reference.forward_step_mrope(
+                decode_token,
+                physical_pos_ref,
+                None,
+                true,
+                crate::forward::signpost::Scope::Decode,
+            );
+            let decode_logits_opt = state_optimized.forward_step_mrope(
+                decode_token,
+                physical_pos_opt,
+                None,
+                true,
+                crate::forward::signpost::Scope::Decode,
+            );
+            assert_eq!(decode_logits_ref.len(), decode_logits_opt.len());
+            for (i, (a, b)) in decode_logits_ref.iter().zip(&decode_logits_opt).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "post-prefill decode-step logit {i} diverged — KV/GDN state after the \
+                     emit_head-skip optimization is not equivalent to the always-emit \
+                     reference ({a} vs {b})"
+                );
+            }
         }
 
         /// Qwen3.5 vision (ADR-069 Metal MP3 gate, test 3/4 — text-only
@@ -26155,6 +26625,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     token_id,
                     pos,
                     None,
+                    true,
                     crate::forward::signpost::Scope::NotDecode,
                 );
                 let b = state_plain_bits.forward_step(token_id, pos);
@@ -26175,6 +26646,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     next_id,
                     physical_pos,
                     None,
+                    true,
                     crate::forward::signpost::Scope::NotDecode,
                 );
                 let b = state_plain_bits.forward_step(next_id, physical_pos);
@@ -26331,6 +26803,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                             row,
                             pos,
                             cos_sin,
+                            true,
                             crate::forward::signpost::Scope::NotDecode,
                         );
                     } else {
@@ -26338,6 +26811,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                             token_id,
                             pos,
                             cos_sin,
+                            true,
                             crate::forward::signpost::Scope::NotDecode,
                         );
                     }
@@ -26369,6 +26843,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     first_id,
                     physical_pos,
                     cos_sin,
+                    true,
                     crate::forward::signpost::Scope::NotDecode,
                 )
             };
@@ -36501,6 +36976,129 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             )?;
             let _ = state.forward_prefill_batched_chunk(token_ids, start_pos, true, false, false);
             Ok(())
+        }
+
+        /// Issue #1336 harness support (`bin/bench_vision_prefill_ab.rs`): a
+        /// checkpoint-shaped multimodal-prefill fixture sized to a
+        /// caller-chosen visual-row count, generalizing the
+        /// `#[cfg(test)]`-only `vision_gate_fixture` (fixed at 4 rows,
+        /// adequate for a correctness gate but too short for the
+        /// terminal-head-skip saving to be a measurable fraction of total
+        /// prefill time). `t=1`, a square merged grid with
+        /// `side_merged = ceil(sqrt(num_visual_rows_target))`, so the actual
+        /// row count returned may exceed the target slightly (rounded up to
+        /// the next square); the harness reports the actual count.
+        ///
+        /// Per-lane-varying (not per-row-constant) synthetic content, same
+        /// reasoning as `vision_gate_fixture`: a constant vector is
+        /// invariant under Qwen3.5's RMSNorm one layer in. Real pixel
+        /// content is not required here — the emit_head optimization gates
+        /// the decoder's terminal RMSNorm + lm_head dispatch only, which is
+        /// insensitive to what values the injected embedding carries, only
+        /// to its shape (see this bin's module doc for the corollary: this
+        /// harness does not include ViT/merger cost).
+        pub fn vision_prefill_fixture(
+            cfg: &Qwen35Config,
+            num_visual_rows_target: usize,
+            seed: f32,
+        ) -> Result<crate::vision::multimodal::Qwen35VisionRequest, String> {
+            let vision_cfg = cfg
+                .vision_config
+                .as_ref()
+                .ok_or_else(|| "checkpoint carries no vision_config".to_string())?;
+            let image_token_id = cfg
+                .image_token_id
+                .ok_or_else(|| "checkpoint carries no image_token_id".to_string())?;
+            let merge = vision_cfg.spatial_merge_size;
+            if merge == 0 {
+                return Err("checkpoint vision_config.spatial_merge_size is 0".to_string());
+            }
+            let rows_target = num_visual_rows_target.max(1);
+            let side_merged = (rows_target as f64).sqrt().ceil() as usize;
+            let side_merged = side_merged.max(1);
+            let grid = crate::vision::qwen35_vit::GridThw {
+                t: 1,
+                h: side_merged * merge,
+                w: side_merged * merge,
+            };
+            let num_rows = (grid.t * grid.h * grid.w) / (merge * merge);
+
+            let mut input_ids = vec![10u32, 11];
+            input_ids.extend(std::iter::repeat_n(image_token_id, num_rows));
+            input_ids.push(12);
+
+            let mut post_merger_rows = vec![0.0f32; num_rows * cfg.hidden_size];
+            for (i, v) in post_merger_rows.iter_mut().enumerate() {
+                *v = seed + 0.01 * ((i % 97) as f32 - 48.0);
+            }
+
+            Ok(crate::vision::multimodal::Qwen35VisionRequest {
+                input_ids,
+                image_grids: vec![grid],
+                post_merger_rows,
+                image_token_id,
+                spatial_merge_size: merge,
+                decoder_hidden_size: cfg.hidden_size,
+            })
+        }
+
+        /// Issue #1336 harness support: runs one multimodal prefill over
+        /// `request`, selecting `emit_head` per position exactly the way
+        /// `generate_multimodal_vision_impl` does in production
+        /// (`pos == last_prefill_pos`) when `always_emit_head=false`, or
+        /// forcing it `true` at every position (the pre-#1336 baseline
+        /// shape) when `always_emit_head=true`. Both arms call the same
+        /// `forward_step_mrope`/`forward_step_injected_mrope` functions the
+        /// production path calls — same code, same binary, differing only
+        /// in this flag — mirroring
+        /// `generate_multimodal_vision_emit_head_skip_matches_always_emit_reference`'s
+        /// `run_prefill` closure.
+        ///
+        /// Returns nothing: like [`forward_prefill_production_chunk`], every
+        /// `forward_step_mrope`/`forward_step_injected_mrope` call already
+        /// waits for its own command buffer before returning, so the caller
+        /// times the call from outside with a plain CPU `Instant` — no
+        /// internal instrumentation is needed or added. `state` must already
+        /// be freshly reset (`state.reset_state()`) by the caller.
+        pub fn run_multimodal_prefill(
+            state: &mut MetalQwen35State,
+            request: &crate::vision::multimodal::Qwen35VisionRequest,
+            cfg: &Qwen35Config,
+            always_emit_head: bool,
+        ) -> Result<Vec<f32>, String> {
+            let (_positions, tables) = request
+                .build_mrope_tables(cfg)
+                .map_err(|e| format!("build_mrope_tables: {e}"))?;
+            let prompt_len = request.input_ids.len();
+
+            let mut visual_row = 0usize;
+            let mut last_logits = Vec::new();
+            for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
+                let emit_head = always_emit_head || pos + 1 == prompt_len;
+                if token_id == request.image_token_id {
+                    let row_start = visual_row * request.decoder_hidden_size;
+                    let row_end = row_start + request.decoder_hidden_size;
+                    let row = &request.post_merger_rows[row_start..row_end];
+                    visual_row += 1;
+                    last_logits = state.forward_step_injected_mrope(
+                        row,
+                        pos,
+                        cos_sin,
+                        emit_head,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
+                } else {
+                    last_logits = state.forward_step_mrope(
+                        token_id,
+                        pos,
+                        cos_sin,
+                        emit_head,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
+                }
+            }
+            Ok(last_logits)
         }
 
         #[cfg(test)]

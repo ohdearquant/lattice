@@ -93,6 +93,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "src/bin/bench_gdn_prefill_ab.rs",
     "src/bin/bench_logit_dump.rs",
     "src/bin/bench_lora_mixture.rs",
+    "src/bin/bench_vision_prefill_ab.rs",
     "src/bin/chat_metal.rs",
     "src/bin/dump_quarot_q4_golden.rs",
     "src/bin/eval_perplexity.rs",
@@ -206,7 +207,7 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs::ModelBackend::spawn_metal::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice/serve.rs:409:81",
+        recorded_position: "src/bin/lattice/serve.rs:423:81",
         reason: "ModelBackend::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {

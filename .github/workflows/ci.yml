@@ -355,6 +355,21 @@ jobs:
       - name: inference — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
+      # `bench-internals` gates the bench binaries under `src/bin/` (e.g.
+      # `bench_vision_prefill_ab`) and their `bench_support` module — without
+      # it in this feature list, `--all-targets` never compiles that surface,
+      # so lint debt there (an "items after a test module" error, #1336
+      # round 2) went undetected by this exact command until a manually
+      # widened invocation caught it. This is a separate --release step
+      # (rather than adding bench-internals to the step above) because
+      # `bench_vision_prefill_ab.rs:95` has a `compile_error!` gated on
+      # `debug_assertions` — "bench_vision_prefill_ab: MUST build --release
+      # (debug Metal timing is meaningless)" — so this surface cannot compile
+      # in a plain debug clippy pass, and forcing --release onto the fast
+      # debug lint above would slow it for everything else it covers.
+      - name: inference — metal-gpu bench clippy, release (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo clippy --release -p lattice-inference --all-targets --features f16,metal-gpu,bench-internals -- -D warnings
       # The worker module is macOS/metal-gpu-gated, but this lifecycle test
       # uses only a blocking thread-local destructor and never acquires a
       # Metal device. Run it explicitly so compiling the test is not mistaken

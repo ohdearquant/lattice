@@ -2752,6 +2752,12 @@ mod imp {
             .cloned()
     }
 
+    /// Presence-only boolean flag (no value): `--preload-vision`, not
+    /// `--preload-vision true`.
+    fn parse_flag(args: &[String], flag: &str) -> bool {
+        args.iter().any(|a| a == flag)
+    }
+
     /// Parses `--max-pending`, rejecting a malformed or negative value
     /// outright instead of silently substituting the default (issue #939):
     /// the prior `.and_then(|s| s.parse().ok()).unwrap_or(DEFAULT)` chain
@@ -2886,6 +2892,13 @@ mod imp {
         // runs one generation at a time.
         let max_pending: usize = parse_max_pending(&args)?;
 
+        // issue #1336: eagerly load vision weights at startup instead of on
+        // the first image request. Off by default -- lazy loading keeps
+        // text-only startup time and resident memory unchanged; see
+        // `lattice/main.rs`'s `--preload-vision` help text for the full
+        // startup-time/memory tradeoff this trades away.
+        let preload_vision = parse_flag(&args, "--preload-vision");
+
         eprintln!(
             "[lattice_serve] loading model from {} ({}) ...",
             model_dir.display(),
@@ -2906,7 +2919,14 @@ mod imp {
         let tokenizer_path_for_vocab = tokenizer_path.clone();
         let vision_config = Qwen35Config::from_model_dir(&model_dir)
             .map_err(|e| format!("config.json load failed: {e}"))?;
-        let vision_runtime = VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
+        let mut vision_runtime =
+            VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
+        if preload_vision && let Err(err) = vision_runtime.preload() {
+            eprintln!(
+                "[lattice_serve] WARNING: --preload-vision failed, falling back to lazy \
+                     vision loading: {err}"
+            );
+        }
         let (
             owner,
             jobs,

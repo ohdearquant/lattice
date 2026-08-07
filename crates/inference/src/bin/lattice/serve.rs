@@ -368,6 +368,7 @@ impl ModelBackend {
         model_dir: std::path::PathBuf,
         tokenizer_dir: Option<std::path::PathBuf>,
         max_pending: usize,
+        preload_vision: bool,
     ) -> Result<(Self, usize), String> {
         use lattice_inference::serve::metal_worker::{
             ContextWindowPolicy, MetalWorker, StartupError, VisionRuntime, WorkerMetadata,
@@ -399,7 +400,20 @@ impl ModelBackend {
         // first in `prepare_chat_request`.
         let max_context = crate::chat::chat_max_cache_len();
         let vision_config = crate::chat::load_q4_config(&model_dir)?;
-        let vision_runtime = VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
+        let mut vision_runtime =
+            VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
+        if preload_vision {
+            // issue #1336: eager-load now, on this startup thread, before the
+            // Metal worker thread spawns. Lazy stays the default (see the
+            // `--preload-vision` help text); a failure here must not abort
+            // startup — warn and fall back to the normal lazy load on the
+            // first image request, exactly as if this flag were absent.
+            if let Err(err) = vision_runtime.preload() {
+                eprintln!(
+                    "Warning: --preload-vision failed, falling back to lazy vision loading: {err}"
+                );
+            }
+        }
         let model_dir_for_loader = model_dir.clone();
         let tokenizer_path_for_loader = tokenizer_path.clone();
         let (owner, client, _meta) = MetalWorker::spawn_with_vision(

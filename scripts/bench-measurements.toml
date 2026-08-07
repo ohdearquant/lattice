@@ -106,6 +106,7 @@ paths = [
     "crates/inference/src/bin/bench_gdn_prefill_ab.rs",
     "crates/inference/src/bin/bench_logit_dump.rs",
     "crates/inference/src/bin/bench_lora_mixture.rs",
+    "crates/inference/src/bin/bench_vision_prefill_ab.rs",
     "crates/inference/src/bin/eval_perplexity.rs",
     "crates/inference/src/bin/gramperf_profile.rs",
     "crates/inference/src/bin/gramtime_profile.rs",
