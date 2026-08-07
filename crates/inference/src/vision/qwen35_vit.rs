@@ -105,6 +105,15 @@ pub fn preprocess_qwen35_image(
 /// grids above 256 pre-merge patches, and caps the preprocessed f32 patch
 /// buffer at 16 MiB, before decoding pixel data. The public embedding entry
 /// point above keeps its existing, checkpoint-defined scope.
+///
+/// # Errors
+///
+/// [`VisionError::DimensionsExceeded`] if the declared pixel dimensions,
+/// pre-merge patch grid, or preprocessed buffer size exceed the serving
+/// budgets above. [`VisionError::ImageDecode`] if the bytes are genuinely
+/// malformed (unrecognized format, corrupt data). [`VisionError::InvalidConfig`]
+/// if the decoded image's dimensions are not exact multiples of
+/// `patch_size * spatial_merge_size` (see [`preprocess_qwen35_image`]).
 pub fn preprocess_qwen35_image_for_serve(
     image_bytes: &[u8],
     cfg: &VisionModelConfig,
@@ -133,9 +142,21 @@ fn preprocess_qwen35_image_inner(
             .with_guessed_format()
             .map_err(|e| VisionError::ImageDecode(format!("format detection failed: {e}")))?;
         header_reader.limits(limits.clone());
-        let (header_width, header_height) = header_reader
-            .into_dimensions()
-            .map_err(|e| VisionError::ImageDecode(format!("dimension read failed: {e}")))?;
+        let (header_width, header_height) = header_reader.into_dimensions().map_err(|e| {
+            // `image::Limits::check_dimensions` reports an over-budget
+            // declared size as `ImageError::Limits`, distinct from every
+            // other reason header parsing can fail (corrupt/truncated
+            // header, unrecognized format) -- only the former is a
+            // dimension-budget rejection rather than a malformed image.
+            if matches!(e, image::ImageError::Limits(_)) {
+                VisionError::DimensionsExceeded(format!(
+                    "image dimensions exceed the serving maximum of \
+                     {MAX_IMAGE_DIMENSION_PIXELS}px per side: {e}"
+                ))
+            } else {
+                VisionError::ImageDecode(format!("dimension read failed: {e}"))
+            }
+        })?;
         let patches = (header_width as usize)
             .div_ceil(cfg.patch_size)
             .checked_mul((header_height as usize).div_ceil(cfg.patch_size))
@@ -143,7 +164,7 @@ fn preprocess_qwen35_image_inner(
                 VisionError::InvalidConfig("serving image patch count overflowed".to_string())
             })?;
         if patches > max_patches {
-            return Err(VisionError::InvalidConfig(format!(
+            return Err(VisionError::DimensionsExceeded(format!(
                 "image {header_width}x{header_height} produces {patches} patches; serving \
                  maximum is {max_patches}"
             )));
@@ -156,7 +177,7 @@ fn preprocess_qwen35_image_inner(
                 )
             })?;
         if preprocessed_bytes > MAX_SERVE_PREPROCESSED_BYTES {
-            return Err(VisionError::InvalidConfig(format!(
+            return Err(VisionError::DimensionsExceeded(format!(
                 "serving image preprocessing requires {preprocessed_bytes} bytes; maximum is \
                  {MAX_SERVE_PREPROCESSED_BYTES}"
             )));
@@ -675,11 +696,25 @@ mod tests {
         let err =
             preprocess_qwen35_image_inner(&over, &cfg, Some(MAX_SERVE_VISION_PATCHES)).unwrap_err();
         assert!(
-            matches!(err, VisionError::InvalidConfig(message) if message.contains("serving maximum is 256"))
+            matches!(err, VisionError::DimensionsExceeded(message) if message.contains("serving maximum is 256"))
         );
         assert!(
             preprocess_qwen35_image(&over, &cfg).is_ok(),
             "the serving-only latency budget must not narrow the embedding API"
+        );
+    }
+
+    #[test]
+    fn serving_preprocess_rejects_declared_pixel_dimensions_over_the_hard_cap() {
+        // A thin (1px tall) image keeps the PNG fixture tiny while still
+        // tripping `image::Limits::check_dimensions` on width alone, before
+        // any pixel data is decoded.
+        let cfg = tiny_cfg();
+        let over_width = make_test_png(MAX_IMAGE_DIMENSION_PIXELS + 1, 1);
+        let err = preprocess_qwen35_image_for_serve(&over_width, &cfg).unwrap_err();
+        assert!(
+            matches!(&err, VisionError::DimensionsExceeded(message) if message.contains("2048px")),
+            "expected DimensionsExceeded naming the 2048px cap, got: {err}"
         );
     }
 
@@ -717,7 +752,7 @@ mod tests {
         assert!(preprocess_qwen35_image_inner(&boundary, &cfg, Some(256)).is_ok());
         let err = preprocess_qwen35_image_inner(&boundary, &cfg, Some(200)).unwrap_err();
         assert!(
-            matches!(err, VisionError::InvalidConfig(message) if message.contains("serving maximum is 200"))
+            matches!(err, VisionError::DimensionsExceeded(message) if message.contains("serving maximum is 200"))
         );
     }
 
@@ -730,7 +765,7 @@ mod tests {
         let image = make_test_png(128, 128);
         let err = preprocess_qwen35_image_for_serve(&image, &cfg).unwrap_err();
         assert!(
-            matches!(err, VisionError::InvalidConfig(message) if message.contains("preprocessing requires"))
+            matches!(err, VisionError::DimensionsExceeded(message) if message.contains("preprocessing requires"))
         );
     }
 
