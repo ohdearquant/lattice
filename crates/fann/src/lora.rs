@@ -54,6 +54,58 @@ impl LoraDescriptor {
     }
 }
 
+/// Recognized LoRA target-module names across every architecture this
+/// project trains or serves adapters for: full-attention (GQA) `q_proj`,
+/// `k_proj`, `v_proj`, `o_proj`; linear-attention (GDN) `in_proj_qkv`,
+/// `in_proj_z`, `in_proj_b`, `in_proj_a`, `out_proj`; MLP `gate_proj`,
+/// `up_proj`, `down_proj`; BERT `query`, `key`, `value`, `attn_output`,
+/// `ffn_intermediate`, `ffn_output`.
+///
+/// This is a flat name allowlist, not an architecture-aware shape check —
+/// whether a given module is valid for a *specific* layer's type (e.g. a GDN
+/// module on a full-attention layer) is `qwen35_projection_shape`'s job in
+/// `lattice-inference`, which both `lattice-tune` and the Metal load path
+/// already call. This list exists so a descriptor's declared
+/// `target_modules` can be checked for typos or unrecognized names before
+/// any model architecture is known, in the one leaf crate both consumers share.
+pub const KNOWN_LORA_TARGET_MODULES: &[&str] = &[
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_b",
+    "in_proj_a",
+    "out_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "query",
+    "key",
+    "value",
+    "attn_output",
+    "ffn_intermediate",
+    "ffn_output",
+];
+
+/// Reject any `target_modules` entry that is not present in `known`.
+pub fn validate_target_modules(target_modules: &[String], known: &[&str]) -> Result<(), String> {
+    let unknown: Vec<&str> = target_modules
+        .iter()
+        .map(String::as_str)
+        .filter(|m| !known.contains(m))
+        .collect();
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "unknown LoRA target module(s): {}",
+            unknown.join(", ")
+        ))
+    }
+}
+
 /// Compute `alpha / rank`, treating rank `0` and any non-finite result as `0.0`.
 ///
 /// Free function form of [`LoraDescriptor::scale`] for callers that only
@@ -210,11 +262,17 @@ pub fn accumulate_planned_elements(
 /// Reject an aggregate element count exceeding [`MAX_BLEND_TOTAL_ELEMENTS`].
 pub fn check_aggregate_elements_cap(planned_elems: usize, ctx: &str) -> Result<(), String> {
     if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
+        // `MAX_BLEND_TOTAL_ELEMENTS * 4` is a compile-time constant expression:
+        // on a 32-bit `usize` target (e.g. `wasm32-unknown-unknown`) computing
+        // it in `usize` overflows u32::MAX and fails the build outright
+        // (`#[deny(arithmetic_overflow)]`), not just at large runtime inputs.
+        // Widening to `u64` first keeps the display math off the target's
+        // native word size; `fann` is a public leaf crate other targets embed.
+        let gib = (MAX_BLEND_TOTAL_ELEMENTS as u64 * 4) / (1024 * 1024 * 1024);
         Err(format!(
             "{ctx}: aggregate blend size {planned_elems} elements exceeds \
-             MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{} GiB f32); reduce the \
+             MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{gib} GiB f32); reduce the \
              number of adapters, their rank, or the number of target projections",
-            (MAX_BLEND_TOTAL_ELEMENTS * 4) / (1024 * 1024 * 1024)
         ))
     } else {
         Ok(())
@@ -279,7 +337,26 @@ mod tests {
     fn check_aggregate_elements_cap_rejects_over_budget() {
         let err = check_aggregate_elements_cap(MAX_BLEND_TOTAL_ELEMENTS + 1, "ctx").unwrap_err();
         assert!(err.contains("exceeds MAX_BLEND_TOTAL_ELEMENTS") || err.contains("aggregate"));
+        assert!(
+            err.contains("4 GiB"),
+            "error must report the 4 GiB budget; got: {err}"
+        );
         assert!(check_aggregate_elements_cap(MAX_BLEND_TOTAL_ELEMENTS, "ctx").is_ok());
+    }
+
+    /// `MAX_BLEND_TOTAL_ELEMENTS * 4` is a compile-time-constant expression:
+    /// on a 32-bit `usize` target (`wasm32-unknown-unknown`), evaluating it
+    /// in `usize` overflows u32::MAX and fails the build under
+    /// `#[deny(arithmetic_overflow)]`, regardless of `planned_elems` at
+    /// runtime — `cargo test` on this (64-bit) host cannot reproduce that,
+    /// so this pins the u64-widened math's result directly as a same-crate
+    /// regression guard; the 32-bit build itself was verified separately
+    /// with `rustc --target wasm32-unknown-unknown`.
+    #[test]
+    fn max_blend_total_elements_times_four_survives_u64_widening() {
+        let widened = (MAX_BLEND_TOTAL_ELEMENTS as u64).checked_mul(4);
+        assert!(widened.is_some(), "widened GiB math must not overflow u64");
+        assert_eq!(widened.unwrap() / (1024 * 1024 * 1024), 4);
     }
 
     #[test]
@@ -304,5 +381,23 @@ mod tests {
     fn accumulate_rank_overflow_errors() {
         let err = accumulate_rank(usize::MAX, 1, "ctx").unwrap_err();
         assert!(err.contains("overflowed usize"));
+    }
+
+    #[test]
+    fn validate_target_modules_accepts_known_names() {
+        let modules = vec!["q_proj".to_string(), "up_proj".to_string()];
+        assert!(validate_target_modules(&modules, KNOWN_LORA_TARGET_MODULES).is_ok());
+    }
+
+    #[test]
+    fn validate_target_modules_rejects_unknown_name() {
+        let modules = vec!["q_proj".to_string(), "not_a_real_module".to_string()];
+        let err = validate_target_modules(&modules, KNOWN_LORA_TARGET_MODULES).unwrap_err();
+        assert!(err.contains("not_a_real_module"));
+    }
+
+    #[test]
+    fn validate_target_modules_empty_is_ok() {
+        assert!(validate_target_modules(&[], KNOWN_LORA_TARGET_MODULES).is_ok());
     }
 }

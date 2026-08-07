@@ -1719,6 +1719,29 @@ mod inner {
     #[cfg(test)]
     pub(crate) const MAX_BLEND_RANK_TOTAL: usize = lattice_fann::lora::MAX_BLEND_RANK_TOTAL;
 
+    /// Reject any element of `inputs` whose inner layer slice is empty.
+    ///
+    /// An empty inner slice passes an outer `inputs.is_empty()` check (the
+    /// outer slice itself is non-empty) but contributes nothing to a
+    /// group-by-`(layer_idx, module)` pass, silently producing an empty
+    /// result instead of an admission error. Split out from
+    /// [`blend_lora_layer_data`] so callers that mutate state before
+    /// blending (e.g. [`MetalQwen35State::generate_with_lora_mixture`], which
+    /// unloads the currently loaded adapter first) can run this check first
+    /// and reject the request before that mutation, not after.
+    fn reject_empty_inner_layers(
+        inputs: &[(&[LoraLayerData], f32)],
+    ) -> Result<(), crate::error::InferenceError> {
+        for (idx, (layers, _)) in inputs.iter().enumerate() {
+            if layers.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: inputs[{idx}] has an empty layer slice"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Blend multiple sets of [`LoraLayerData`] into one rank-Σr set for use with
     /// the single-slot [`MetalQwen35State::load_lora_adapter`] API.
     ///
@@ -1740,6 +1763,7 @@ mod inner {
     ///
     /// Returns an error if:
     /// - `inputs` is empty
+    /// - Any element of `inputs` has an empty inner layer slice
     /// - Any weight is not finite
     /// - Two adapters have conflicting `d_in` / `d_out` for the same `(layer_idx, module)`
     /// - The summed rank for a single projection exceeds `MAX_BLEND_RANK_TOTAL`
@@ -1757,6 +1781,15 @@ mod inner {
                 "blend_lora_layer_data: inputs must not be empty".into(),
             ));
         }
+
+        // An empty inner layer slice passes the outer `inputs.is_empty()`
+        // guard above (the outer slice itself is non-empty) but contributes
+        // nothing to `grouped` below, silently producing `Ok(Vec::new())`
+        // instead of an admission error. Callers that unload the currently
+        // loaded adapter before blending (e.g. `generate_with_lora_mixture`)
+        // must reject this before that mutation, not after — see
+        // `reject_empty_inner_layers` and its call site there.
+        reject_empty_inner_layers(inputs)?;
 
         for (idx, (_, w)) in inputs.iter().enumerate() {
             lattice_fann::lora::check_finite_weight("blend_lora_layer_data", idx, *w)
@@ -3921,6 +3954,42 @@ mod inner {
             Ok(())
         }
 
+        /// Load a LoRA adapter using the shared cross-crate
+        /// [`lattice_fann::lora::LoraDescriptor`] as the source of the adapter's
+        /// scale and declared target modules, instead of a bare `scale: f32`
+        /// the caller must have derived correctly on its own.
+        ///
+        /// Validates `descriptor.alpha`/effective scale (finite) and
+        /// `descriptor.target_modules` (recognized names) before delegating
+        /// to [`Self::load_lora_adapter`] with `descriptor.scale()`. Every
+        /// per-layer, per-architecture shape check `load_lora_adapter` already
+        /// performs still applies on top of this.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the descriptor's alpha/scale is not finite, if
+        /// `target_modules` contains an unrecognized name, or for any reason
+        /// [`Self::load_lora_adapter`] itself would reject the call.
+        pub fn load_lora_adapter_with_descriptor(
+            &mut self,
+            layers: Vec<LoraLayerData>,
+            descriptor: &lattice_fann::lora::LoraDescriptor,
+            quarot_seed: Option<u64>,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            descriptor
+                .validate()
+                .map_err(InferenceError::InvalidInput)?;
+            lattice_fann::lora::validate_target_modules(
+                &descriptor.target_modules,
+                lattice_fann::lora::KNOWN_LORA_TARGET_MODULES,
+            )
+            .map_err(InferenceError::InvalidInput)?;
+
+            self.load_lora_adapter(layers, descriptor.scale(), quarot_seed)
+        }
+
         /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
         pub fn unload_lora_adapter(&mut self) {
             self.lora = None;
@@ -3992,6 +4061,13 @@ mod inner {
                 GenerationPreparation::Complete(output) => return Ok(output),
                 GenerationPreparation::Ready(_) => {}
             }
+
+            // Reject an empty inner layer slice here, before the adapter unload
+            // below — `blend_lora_layer_data` also runs this check, but only
+            // after the unload has already destroyed the previously loaded
+            // adapter. Admission errors must be returned before any existing
+            // adapter or prefix cache is changed (see this method's doc comment).
+            reject_empty_inner_layers(adapter_weights)?;
 
             // Unload any previously loaded adapter so the slot is free.
             self.unload_lora_adapter();
@@ -21929,6 +22005,66 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(result.is_err(), "zero d_in must return Err");
         }
 
+        // -----------------------------------------------------------------
+        // `generate_with_lora_mixture` must reject an empty inner layer
+        // slice before it unloads the currently loaded adapter — otherwise
+        // the request errors out *after* destroying a previously loaded
+        // adapter, contradicting this method's own admission-error promise
+        // ("Admission errors are returned before the existing adapter or
+        // prefix cache is changed"). Loads a real adapter first so the
+        // destructive path (`unload_lora_adapter`) has something to destroy,
+        // then asserts it is untouched after the rejected call.
+        // -----------------------------------------------------------------
+        #[test]
+        fn generate_with_lora_mixture_rejects_empty_inner_slice_without_unloading() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+
+            state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 1)], 1.0, None)
+                .expect("valid LoRA adapter loads");
+            assert!(
+                state.has_lora_adapter(),
+                "precondition: an adapter must be loaded before the rejected call"
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let empty: &[LoraLayerData] = &[];
+            let result =
+                state.generate_with_lora_mixture(&[(empty, 1.0)], "a", &tokenizer, &gen_cfg);
+            assert!(
+                result.is_err(),
+                "an empty inner layer slice must be rejected"
+            );
+            assert!(
+                state.has_lora_adapter(),
+                "the previously loaded adapter must survive a rejected request, \
+                 not be destroyed by the unconditional unload before blending"
+            );
+        }
+
         #[test]
         fn load_lora_adapter_rejects_out_of_range_layer_idx() {
             let _gpu_guard = gpu_test_lock();
@@ -34285,6 +34421,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 result.is_err(),
                 "mismatched B slice length must return an error"
+            );
+        }
+
+        // -----------------------------------------------------------------
+        // An empty inner layer slice passes the outer `inputs.is_empty()`
+        // guard (the outer slice has one entry) but must still be rejected,
+        // not silently produce an empty `Ok(Vec::new())` blend.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_lora_layer_data_rejects_empty_inner_layer_slice() {
+            let empty: &[LoraLayerData] = &[];
+            let result = blend_lora_layer_data(&[(empty, 1.0)]);
+            assert!(
+                result.is_err(),
+                "an empty inner layer slice must return an error, not Ok(Vec::new())"
             );
         }
 

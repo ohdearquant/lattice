@@ -37,6 +37,20 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
             .map_err(TuneError::Validation)?;
     }
 
+    // An adapter with no layers passes the outer `adapters.is_empty()` guard
+    // above (the outer slice itself is non-empty) but contributes nothing to
+    // `grouped` below, silently producing an empty-but-`Ok` blended adapter
+    // instead of an admission error — the same failure shape
+    // `blend_lora_layer_data` in `lattice-inference` rejects for its own
+    // empty inner layer slices.
+    for (idx, (adapter, _)) in adapters.iter().enumerate() {
+        if adapter.layers().is_empty() {
+            return Err(TuneError::Validation(format!(
+                "blend_lora_adapters: adapters[{idx}] has no layers"
+            )));
+        }
+    }
+
     // Group the union of projection keys with their folded source scales.
     let mut grouped: HashMap<(usize, String), Vec<(&LoraLayer, f32)>> = HashMap::new();
     for (adapter, weight) in adapters {
@@ -99,6 +113,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         rank: total_rank,
         alpha: total_rank as f32,
         target_modules,
+        dtype: "f32".into(),
     };
 
     LoraAdapter::new(config, blended_layers)
@@ -217,6 +232,7 @@ mod tests {
                 rank,
                 alpha: rank as f32, // scale = 1.0
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         )
@@ -369,6 +385,33 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Edge-case: an adapter with no layers is rejected explicitly, not
+    // silently blended into an empty-but-Ok adapter. Mirrors
+    // `blend_lora_layer_data`'s empty-inner-layer-slice rejection in
+    // `lattice-inference` (the two blends this crate and Metal both apply
+    // the same admission policy to).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_adapter_with_no_layers_returns_error() {
+        let empty_adapter = LoraAdapter::new(
+            LoraConfig {
+                rank: 1,
+                alpha: 1.0,
+                target_modules: vec![],
+                dtype: "f32".into(),
+            },
+            HashMap::new(),
+        )
+        .expect("an adapter with zero layers is itself a valid, if inert, adapter");
+
+        let result = blend_lora_adapters(&[(&empty_adapter, 1.0)]);
+        assert!(
+            result.is_err(),
+            "an adapter with no layers must be rejected, not silently blended into an empty adapter"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Edge-case: non-finite weight returns an error.
     // -----------------------------------------------------------------------
     #[test]
@@ -406,6 +449,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         )
@@ -448,6 +492,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         };
@@ -487,6 +532,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         };
@@ -529,6 +575,7 @@ mod tests {
                 rank,
                 alpha,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         )
@@ -636,6 +683,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         };
@@ -717,6 +765,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         };

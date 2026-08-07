@@ -191,12 +191,12 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/chat_metal.rs:773:39",
+        recorded_position: "src/bin/chat_metal.rs:800:39",
         reason: "run Q4 initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::new()#1",
-        recorded_position: "src/bin/chat_metal.rs:798:39",
+        recorded_position: "src/bin/chat_metal.rs:825:39",
         reason: "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {

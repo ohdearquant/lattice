@@ -75,6 +75,7 @@ fn make_adapter() -> LoraAdapter {
         rank: 8,
         alpha: 16.0,
         target_modules: vec!["query".into(), "value".into()],
+        dtype: "f32".into(),
     };
 
     let mut layers = HashMap::new();
