@@ -12,6 +12,7 @@
 /// with the model vocabulary to obtain a `GrammarEngine` that can be embedded
 /// in a `GenerateConfig`.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum GrammarSpec {
     /// JSON Schema (draft 2020-12 subset).
     ///

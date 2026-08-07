@@ -6,6 +6,7 @@ pub type Result<T> = std::result::Result<T, GpuForwardError>;
 
 /// **Unstable**: GPU forward pass error; variants may expand with new GPU backends.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GpuForwardError {
     NoAdapter,
     RequestDevice(wgpu::RequestDeviceError),

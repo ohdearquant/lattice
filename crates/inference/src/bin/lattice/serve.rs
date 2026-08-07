@@ -240,6 +240,15 @@ impl MetalHandle {
                 WorkerEvent::Cancelled => {
                     unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
                 }
+                // Unrecognized future event kind: mirror the
+                // `Failed`/`ConstraintBlocked` arm above and fail the
+                // request with a generic internal error rather than
+                // guessing.
+                _ => {
+                    return Err(ApiError::Internal {
+                        message: "generation failed: unrecognized worker event".to_string(),
+                    });
+                }
             }
         }
     }
@@ -447,6 +456,10 @@ impl ModelBackend {
             // for exhaustiveness and as defense in depth against any
             // other future `spawn_metal` caller.
             err @ StartupError::InvalidMaxPending { .. } => err.to_string(),
+            // Unrecognized future startup-failure kind: fall back to its
+            // `Display` text rather than guessing at a more specific
+            // wording, same as `InvalidMaxPending` above.
+            err => err.to_string(),
         })?;
         // The explicit owner is not needed by this binary: every
         // production `MetalWorkerClient` retains an owner clone. The

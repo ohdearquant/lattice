@@ -1721,6 +1721,10 @@ mod imp {
                 })
             }
             ModelFormat::Unknown => Err(model_format::unrecognized_format_message(model_dir)),
+            // Any format this binary doesn't yet know how to load is handled
+            // the same way as `Unknown`: report it rather than silently
+            // guessing a loader.
+            _ => Err(model_format::unrecognized_format_message(model_dir)),
         }
     }
 
@@ -2114,6 +2118,28 @@ mod imp {
                 WorkerEvent::Cancelled => {
                     unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
                 }
+                // Unrecognized future event kind as the very FIRST event:
+                // nothing has been committed to the client yet, so fail
+                // closed the same way the `Failed`/`ConstraintBlocked` arm
+                // above does rather than guessing at a status code.
+                _ => {
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        "/v1/chat/completions",
+                        500,
+                        None,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        true,
+                        Some("internal_error"),
+                    );
+                    return err_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "inference failed",
+                        "internal_error",
+                    );
+                }
             };
             let metrics = s.metrics.clone();
             let stream = futures::stream::unfold(
@@ -2267,6 +2293,35 @@ mod imp {
                                 Some(WorkerEvent::Cancelled) => unreachable!(
                                     "normalize_cancelled already rewrote Cancelled into Complete"
                                 ),
+                                // Unrecognized future event kind mid-stream: the
+                                // wire status was already committed to 200 SSE,
+                                // so mirror the `Failed`/`ConstraintBlocked` arm
+                                // above and fail the stream closed with a
+                                // generic internal error rather than guessing.
+                                Some(_) => {
+                                    let error = json!({
+                                        "error": {
+                                            "message": "inference failed",
+                                            "type": "server_error",
+                                            "code": "internal_error",
+                                            "param": null,
+                                        }
+                                    });
+                                    Some((
+                                        Ok(Event::default().data(error.to_string())),
+                                        (
+                                            rx,
+                                            Phase::Done(
+                                                completion_tokens,
+                                                0,
+                                                Some((500, "internal_error")),
+                                            ),
+                                            cancel_guard,
+                                            None,
+                                            metrics,
+                                        ),
+                                    ))
+                                }
                                 None => {
                                     let error = json!({
                                         "error": {
@@ -2477,6 +2532,28 @@ mod imp {
                     }
                     WorkerEvent::Cancelled => {
                         unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
+                    }
+                    // Unrecognized future event kind: the response has not
+                    // been committed yet, so mirror the `Failed` arm above
+                    // and fail closed with a generic internal error rather
+                    // than guessing.
+                    _ => {
+                        emit_serve_event(
+                            &s.metrics,
+                            "POST",
+                            "/v1/chat/completions",
+                            500,
+                            None,
+                            None,
+                            timer.elapsed().as_secs_f64() * 1000.0,
+                            false,
+                            Some("internal_error"),
+                        );
+                        return lattice_inference::serve::ApiError::ServerError {
+                            message: "inference failed".to_string(),
+                            code: "internal_error",
+                        }
+                        .into_response();
                     }
                 }
             }
@@ -2829,6 +2906,7 @@ mod imp {
                 ModelFormat::Q4 => "q4",
                 ModelFormat::Safetensors => "bf16",
                 ModelFormat::Unknown => "unknown",
+                _ => "unknown",
             }
         );
         // #832: `load_model` (unchanged) runs INSIDE this loader closure, on
@@ -2890,6 +2968,12 @@ mod imp {
             // #939: zero, or above `Semaphore::MAX_PERMITS` -- a
             // configuration error caught before `Semaphore::new` panics.
             Err(err @ StartupError::InvalidMaxPending { .. }) => {
+                return Err(err.to_string().into());
+            }
+            // Unrecognized future startup-failure kind: fall back to its
+            // `Display` text rather than guessing at a more specific
+            // wording, same as `InvalidMaxPending` above.
+            Err(err) => {
                 return Err(err.to_string().into());
             }
         };
@@ -5717,6 +5801,10 @@ mod imp {
                                     lattice_inference::forward::metal_qwen35::ChatRole::Assistant => {
                                         "assistant"
                                     }
+                                    // This fixture only ever constructs the
+                                    // three known roles; a future role isn't
+                                    // yet exercised by this test.
+                                    _ => "unknown",
                                 };
                                 (role.to_string(), m.content.clone())
                             })

@@ -370,6 +370,7 @@ mod route_predicate_tests {
 ///
 /// Role in a chat conversation.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ChatRole {
     System,
     User,
@@ -1621,6 +1622,14 @@ mod inner {
         pub(crate) mtp: Option<MetalMtpSession>,
         pub(crate) gdn_checkpoints: Option<MetalGdnCheckpointPool>,
         pub(crate) last_pre_final_hidden: Vec<f32>,
+        /// Raw (pre-final-RMSNorm) target hidden states captured by
+        /// `forward_prefill_batched_chunk` for every prompt position in the most
+        /// recent `forward_prefill`/`forward_prefill_all_logits` call, laid out as
+        /// `n * hidden_size` f32 values in prompt order (#1340). Cleared at the top
+        /// of `forward_prefill_impl` and drained by `mtp_prefill`, which rebuilds
+        /// the MTP draft head's KV cache from it so the first draft attends to the
+        /// prompt prefix instead of a single row.
+        pub(crate) mtp_prefill_hidden: Vec<f32>,
         /// Opt-in: when set, every forward path that applies the final RMSNorm
         /// also copies the last token's normed hidden state into
         /// `activations.final_hidden`. Off by default so the decode loop pays
@@ -3409,6 +3418,7 @@ mod inner {
                 mtp,
                 gdn_checkpoints,
                 last_pre_final_hidden: vec![0.0f32; hidden],
+                mtp_prefill_hidden: Vec::new(),
                 capture_final_hidden: false,
                 final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
                 position: 0,
@@ -5452,6 +5462,232 @@ mod inner {
             }
         }
 
+        /// Rebuilds the MTP draft head's KV cache from the prompt just processed by
+        /// `forward_prefill`/`forward_prefill_all_logits` (#1340).
+        ///
+        /// Without this, `reset_state` zeroes the MTP cache and the only prefill on
+        /// the Metal path fills the *target* model's cache, so the first
+        /// `mtp_forward_one` call of a generation dispatches attention with
+        /// `cache_len = 1` — the draft can only ever attend to the row it just
+        /// wrote, independent of the prompt.
+        ///
+        /// `mtp_forward_one(pending_token, pos)` pairs `pending_token`'s embedding
+        /// with `last_pre_final_hidden` — the target's pre-final hidden state from
+        /// the position *before* `pending_token`, i.e. the hidden state that
+        /// predicted it. This mirrors that pairing across the whole prompt: for each
+        /// position `p` in `1..prompt_ids.len()`, it pairs `prompt_ids[p]` with the
+        /// target's pre-final hidden state at position `p - 1`, captured into
+        /// `self.session.mtp_prefill_hidden` by `forward_prefill_batched_chunk`.
+        /// Position 0 has no predecessor hidden state (nothing came before the first
+        /// prompt token) and is intentionally not represented in the MTP cache, so a
+        /// prompt of length `L` yields `L - 1` prefilled entries; the live call for
+        /// the first generated token then appends the `L`-th, giving that call's
+        /// attention dispatch `cache_len == L` instead of `1`.
+        ///
+        /// No-op when the session has no MTP head, when the prompt is too short to
+        /// yield a pair, or when `mtp_prefill_hidden` was not populated for this
+        /// exact prompt (e.g. the LoRA-active prefill path, which forwards token by
+        /// token via `forward_step` and does not feed the accumulator) — captured
+        /// length is asserted against `prompt_ids.len() * hidden_size` and anything
+        /// else is treated as "nothing to prefill" rather than misinterpreted.
+        fn mtp_prefill(&mut self, prompt_ids: &[u32]) {
+            let captured = std::mem::take(&mut self.session.mtp_prefill_hidden);
+            if self.session.mtp.is_none() {
+                return;
+            }
+            let hidden = self.engine.config.hidden_size;
+            let n = prompt_ids.len();
+            if n < 2 || captured.len() != n * hidden {
+                return;
+            }
+            for p in 1..n {
+                let hidden_in = &captured[(p - 1) * hidden..p * hidden];
+                self.mtp_prefill_append(prompt_ids[p], hidden_in, p);
+            }
+        }
+
+        /// Appends one MTP cache entry (K/V only — no Q, attention, MLP, or logits)
+        /// for `token_id` at absolute position `position`, using `hidden_in` as the
+        /// target's pre-final hidden state input in place of
+        /// `self.session.last_pre_final_hidden`. Mirrors the CPU phase and GPU
+        /// dispatch sequence of `mtp_forward_one` up through the KV cache append —
+        /// everything after that point (attention, gating, MLP, logits) only matters
+        /// for a position acting as a *query*, and a prefilled position is only ever
+        /// a future *key*.
+        fn mtp_prefill_append(&mut self, token_id: u32, hidden_in: &[f32], position: usize) {
+            let cfg = self.engine.config.clone();
+            let hidden = cfg.hidden_size;
+            let kv_dim = cfg.full_kv_dim();
+            let num_kv_heads = cfg.num_key_value_heads;
+            let head_dim = cfg.head_dim as u32;
+            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
+
+            // ---- Phase 1: CPU (mirrors mtp_forward_one's embedding + hidden norm + fuse) ----
+            let mut normed_embed = vec![0.0f32; hidden];
+            assert!((token_id as usize) < cfg.vocab_size);
+            unsafe {
+                let src = (self.engine.embed_tokens.contents() as *const u16)
+                    .add(token_id as usize * hidden);
+                // SAFETY: embed_tokens row has hidden u16 values; normed_embed has hidden f32 values.
+                convert_f16_row(src, normed_embed.as_mut_ptr(), hidden);
+            }
+            if let Some(ref rot) = self.engine.quarot_rotation {
+                debug_assert_eq!(rot.dim(), normed_embed.len());
+                let _ = rot.apply_inverse(&mut normed_embed);
+            }
+            {
+                let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
+                let gamma = unsafe {
+                    std::slice::from_raw_parts(
+                        mtp_weights.pre_fc_norm_embedding.contents() as *const f32,
+                        hidden,
+                    )
+                };
+                let mut sum_sq = 0.0f32;
+                for &v in normed_embed.iter() {
+                    sum_sq += v * v;
+                }
+                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
+                for (v, &g) in normed_embed.iter_mut().zip(gamma.iter()) {
+                    *v = *v * inv_rms * g;
+                }
+            }
+
+            let mut normed_hidden = hidden_in.to_vec();
+            if let Some(ref rot) = self.engine.quarot_rotation {
+                debug_assert_eq!(rot.dim(), normed_hidden.len());
+                let _ = rot.apply_inverse(&mut normed_hidden);
+            }
+            {
+                let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
+                let gamma = unsafe {
+                    std::slice::from_raw_parts(
+                        mtp_weights.pre_fc_norm_hidden.contents() as *const f32,
+                        hidden,
+                    )
+                };
+                let mut sum_sq = 0.0f32;
+                for &v in normed_hidden.iter() {
+                    sum_sq += v * v;
+                }
+                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
+                for (v, &g) in normed_hidden.iter_mut().zip(gamma.iter()) {
+                    *v = *v * inv_rms * g;
+                }
+            }
+
+            {
+                let mtp = self.session.mtp.as_ref().unwrap();
+                let dst = mtp.activations.fused.contents() as *mut f32;
+                unsafe {
+                    for (i, &v) in normed_embed.iter().enumerate() {
+                        *dst.add(i) = v;
+                    }
+                    for (i, &v) in normed_hidden.iter().enumerate() {
+                        *dst.add(hidden + i) = v;
+                    }
+                }
+            }
+
+            // ---- Phase 2: GPU (K/V-only: fc, input-norm, k/v proj, k-norm, rope, cache append) ----
+            let (w_fc, w_input_ln, w_k_proj, w_v_proj, w_k_norm) = {
+                let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
+                let lw = &mtp_weights.layers[0];
+                (
+                    &mtp_weights.fc as *const Buffer,
+                    &lw.input_layernorm as *const Buffer,
+                    &lw.k_proj as *const Buffer,
+                    &lw.v_proj as *const Buffer,
+                    &lw.k_norm as *const Buffer,
+                )
+            };
+            let (buf_fused, buf_hidden, buf_residual, buf_k, buf_v) = {
+                let a = &self.session.mtp.as_ref().unwrap().activations;
+                (
+                    &a.fused as *const Buffer,
+                    &a.hidden as *const Buffer,
+                    &a.residual as *const Buffer,
+                    &a.k as *const Buffer,
+                    &a.v as *const Buffer,
+                )
+            };
+            let (buf_k_cache, buf_v_cache, mtp_seq_len) = {
+                let c = &self.session.mtp.as_ref().unwrap().cache;
+                (
+                    &c.k_buf as *const Buffer,
+                    &c.v_buf as *const Buffer,
+                    c.seq_len,
+                )
+            };
+
+            let cmd = self.engine.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            unsafe {
+                self.dispatch_matmul_half(
+                    enc,
+                    &*buf_fused,
+                    &*w_fc,
+                    &*buf_hidden,
+                    1,
+                    hidden as u32,
+                    (2 * hidden) as u32,
+                );
+                self.dispatch_copy_and_rms_norm(
+                    enc,
+                    &*buf_hidden,
+                    &*buf_residual,
+                    &*w_input_ln,
+                    hidden as u32,
+                    cfg.rms_norm_eps,
+                );
+                self.dispatch_matmul_half(
+                    enc,
+                    &*buf_hidden,
+                    &*w_k_proj,
+                    &*buf_k,
+                    1,
+                    kv_dim as u32,
+                    hidden as u32,
+                );
+                self.dispatch_matmul_half(
+                    enc,
+                    &*buf_hidden,
+                    &*w_v_proj,
+                    &*buf_v,
+                    1,
+                    kv_dim as u32,
+                    hidden as u32,
+                );
+                self.dispatch_per_head_rms_norm(
+                    enc,
+                    &*buf_k,
+                    &*w_k_norm,
+                    num_kv_heads as u32,
+                    head_dim,
+                    cfg.rms_norm_eps,
+                );
+                self.dispatch_partial_rope(
+                    enc,
+                    &*buf_k,
+                    num_kv_heads as u32,
+                    head_dim,
+                    half_rope_dim,
+                    position as u32,
+                    None,
+                );
+                let kv_cache_off = (mtp_seq_len * kv_dim) as u32;
+                self.dispatch_copy_offset(enc, &*buf_k, &*buf_k_cache, kv_dim as u32, kv_cache_off);
+                self.dispatch_copy_offset(enc, &*buf_v, &*buf_v_cache, kv_dim as u32, kv_cache_off);
+            }
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            if let Some(ref mut mtp) = self.session.mtp {
+                mtp.cache.seq_len += 1;
+            }
+        }
+
         /// Internal single-token forward step.
         ///
         /// When `capture_hidden` is true (or when `self.session.mtp` is loaded), copies the
@@ -6574,6 +6810,10 @@ mod inner {
         }
 
         fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
+            // Start of a fresh prompt pass: drop any hidden states captured by a
+            // previous prefill so `mtp_prefill` never pairs this prompt's tokens
+            // with a stale prior prompt's hidden states (#1340).
+            self.session.mtp_prefill_hidden.clear();
             let n = token_ids.len();
             let vocab = self.engine.config.vocab_size;
             // Validate all ids once at the entry point (O(seq_len)) before any GPU work.
@@ -7214,6 +7454,42 @@ mod inner {
                     full_idx += 1;
                 }
             }
+
+            // MTP prefill capture (#1340): `activations.hidden` currently holds the
+            // raw, pre-final-RMSNorm target hidden state for every one of this
+            // chunk's `n` positions. The tail below overwrites row `n-1` (default)
+            // or every row (`all_positions`) with its post-RMSNorm value in place,
+            // so this read must land before that dispatch runs — hence ending and
+            // committing the layer-loop's command buffer here instead of after the
+            // tail. `mtp_prefill` (called from `generate()`) drains the accumulated
+            // rows to rebuild the MTP draft head's KV cache from the prompt. Gated
+            // on `mtp.is_some()` so a session without an MTP head pays nothing extra
+            // — the pre-existing single-command-buffer path below is untouched.
+            let (cmd, enc) = if self.session.mtp.is_some() {
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                // SAFETY: the command buffer just completed; `hidden` (the
+                // activations buffer, not the local `hidden: usize` row-length) is
+                // StorageModeShared and the layer loop above wrote exactly `n`
+                // valid rows into it.
+                let raw_hidden =
+                    unsafe { read_buffer(&self.session.activations.hidden, n * hidden) };
+                self.session
+                    .mtp_prefill_hidden
+                    .extend_from_slice(&raw_hidden);
+
+                if !emit_logits {
+                    self.session.set_position(start_pos + n);
+                    return vec![];
+                }
+
+                let cmd = self.engine.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                (cmd, enc)
+            } else {
+                (cmd, enc)
+            };
 
             if !emit_logits {
                 // Intermediate chunk of a chunked, `!all_positions` prefill: the caller
@@ -8415,6 +8691,10 @@ mod inner {
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
+                // #1340: rebuild the MTP draft head's KV cache from the prompt
+                // before the first draft round, so it attends to the prompt prefix
+                // instead of the single row `reset_state` left it with.
+                self.mtp_prefill(&prompt_ids);
                 return Ok(self.generate_greedy_mtp(
                     &prefill_logits,
                     prompt_len,
@@ -9423,6 +9703,7 @@ mod inner {
             if let Some(ref mut mtp) = self.session.mtp {
                 mtp.cache.reset();
             }
+            self.session.mtp_prefill_hidden.clear();
             if let Some(ref mut pool) = self.session.gdn_checkpoints {
                 pool.active_base_seq_len = None;
             }
@@ -11917,6 +12198,7 @@ mod inner {
                     mtp: mtp_session,
                     gdn_checkpoints,
                     last_pre_final_hidden: vec![0.0f32; hidden],
+                    mtp_prefill_hidden: Vec::new(),
                     capture_final_hidden: false,
                     final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
                     position: 0,
@@ -12870,44 +13152,36 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
-            // Config preflight checks live here, in the public wrapper, and
-            // must return BEFORE the `match` below (PR #787): the
-            // error-recovery arm of that `match` unconditionally
-            // calls `reset_state()` and removes the cache slot on ANY `Err`
-            // from `_inner`, including a not-yet-attempted preflight
-            // rejection. A caller passing an unsupported config (e.g.
-            // `logprobs` or an active `enable_mtp`) never touches cache/session
-            // state in the first place, so routing that rejection through the
-            // destructive recovery path would evict a valid pre-existing
-            // cross-turn entry the call never mutated. Returning here, before
-            // `_inner` is even called, leaves any existing entry untouched.
-            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-            crate::model::qwen35::check_mtp_not_requested(gen_cfg)?;
-
-            // #856/#922/#827: prompt tokenization, the empty-prompt guard, and
-            // the prompt-plus-decode-budget context bound are delegated to the
-            // same `prepare_generation` shared preparation
-            // `generate_streaming_with_cancel` already routes through, closing
-            // the last unmigrated generation entry point (issue #827). This
-            // reuses `GenerationEntryContract::MetalStreaming`: the pieces
-            // `prepare_generation` actually governs here -- tokenize,
-            // `check_prompt_not_empty`, the vocab-admission no-op, the
-            // zero-budget completion shape, and `check_context_budget` --
-            // are byte-for-byte what this entry point ran inline before. The
-            // `logprobs`/`enable_mtp` preflights above are strictly narrower
-            // than `MetalStreaming`'s permissive `validate_capabilities` (which
-            // exists because plain streaming supports both), so they stay as
-            // explicit checks here rather than folding into the contract --
-            // that keeps their current position ahead of tokenization and
-            // their current per-check error text unchanged for callers that
-            // violate more than one guard at once.
+            // #856/#922/#827/#1354: prompt tokenization, the empty-prompt
+            // guard, and the prompt-plus-decode-budget context bound are
+            // delegated to the same `prepare_generation` shared preparation
+            // `generate_streaming_with_cancel` already routes through,
+            // closing the last unmigrated generation entry point (issue
+            // #827). This uses `GenerationEntryContract::MetalPrefixCacheStreaming`
+            // (#1354), not the plain-streaming `MetalStreaming` variant this
+            // call used to reuse: `MetalStreaming`'s permissive
+            // `validate_capabilities` exists because plain streaming
+            // supports both `logprobs` and `enable_mtp`, but this path does
+            // not, so folding those checks into that variant would have
+            // wrongly restricted plain streaming too. `MetalPrefixCacheStreaming`
+            // carries its own `check_logprobs_not_set` /
+            // `check_mtp_not_requested` guards in `validate_before_tokenization`
+            // (run ahead of tokenization inside `prepare_generation`, same
+            // position these two guards ran in as an explicit preflight
+            // here before this change), so the error text and precedence
+            // for a request that violates more than one guard at once are
+            // unchanged: this call must still return here, before any
+            // cache/session state mutation and before `_inner`'s
+            // destructive-on-`Err` recovery arm is reachable, so a rejected
+            // call never evicts a valid pre-existing cross-turn entry it
+            // never touched (PR #787).
             let prompt_prep = crate::model::qwen35::prepare_generation(
                 tokenizer,
                 prompt,
                 gen_cfg,
                 self.engine.config.vocab_size,
                 self.max_context(),
-                crate::model::qwen35::GenerationEntryContract::MetalStreaming,
+                crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming,
             )?;
             let (prompt_ids, rng_state) = match prompt_prep {
                 crate::model::qwen35::GenerationPreparation::Complete(output) => {
@@ -12931,8 +13205,9 @@ mod inner {
 
             // #835: validate the suffix a reuse plan would select for this
             // slot BEFORE calling `_inner` at all -- same reasoning as the
-            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
-            // above (PR #787): the `match` below unconditionally calls
+            // `check_logprobs_not_set`/`check_mtp_not_requested` guards
+            // `prepare_generation` already ran above, ahead of tokenization
+            // (PR #787, #1354): the `match` below unconditionally calls
             // `reset_state()` and evicts the cache slot on ANY `Err` from
             // `_inner`, so a suffix-validation-only rejection (out-of-vocab
             // token, empty suffix, or a suffix overflowing `max_cache_len`)
@@ -16747,6 +17022,58 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                  `mtp_forward_one` wrote this round; got {mtp_seq_len}, which means the \
                  next `mtp_forward_one` call will skip a slot and the attention window \
                  will read a never-written row"
+            );
+        }
+
+        // #1340: without `mtp_prefill`, `reset_state` zeroes the MTP cache and the
+        // only prefill on the Metal path fills the *target* model's cache, so the
+        // first `mtp_forward_one` call of a generation dispatches attention with
+        // `cache_len = 1` -- the draft attends to exactly the row it just wrote,
+        // independent of the prompt. This asserts the observable attention-set size
+        // (`cache.seq_len`, and the `cache_len` the first live dispatch sees), not
+        // generated text -- a target-verified MTP draft can never change output, so
+        // an output-only test cannot see this defect either way.
+        #[test]
+        fn mtp_prefill_builds_kv_cache_from_prompt_prefix() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_synthetic_mtp_for_test(&weights, &cfg, None);
+            assert!(
+                state.session.mtp.is_some(),
+                "synthetic MTP fixture must populate session.mtp"
+            );
+
+            let prompt_ids: Vec<u32> = vec![3, 7, 11, 19];
+            let prompt_len = prompt_ids.len();
+
+            let _ = state.forward_prefill(&prompt_ids);
+            state.mtp_prefill(&prompt_ids);
+
+            // One cache entry per prompt position beyond the first (position 0 has
+            // no predecessor hidden state to pair with), so the cache scales
+            // directly with the prompt instead of staying at 0.
+            assert_eq!(
+                state.session.mtp.as_ref().unwrap().cache.seq_len,
+                prompt_len - 1,
+                "mtp cache seq_len after prefill must reflect the prompt, not stay at 0"
+            );
+
+            // The first live draft call (mirroring `generate_greedy_mtp`'s first
+            // round) appends one more entry for the just-sampled token, so its
+            // attention dispatch sees cache_len == prompt_len, not 1.
+            let before = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            let pending_token = 5u32;
+            let _ = state.mtp_forward_one(pending_token, prompt_len);
+            let after = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            assert_eq!(after, before + 1);
+            assert_eq!(
+                after, prompt_len,
+                "the first draft's attention dispatch must see cache_len == prompt_len, not 1"
             );
         }
 
@@ -32720,9 +33047,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// entry is created (or consumed) for the rejected call.
         ///
         /// Mutation sensitivity: removing the `check_logprobs_not_set` call
-        /// at the top of `generate_streaming_with_prefix_cache_and_cancel_inner`
-        /// makes this assertion fail (the call returns `Ok` with empty
-        /// `token_logprobs` instead of `Err`).
+        /// from `GenerationEntryContract::MetalPrefixCacheStreaming`'s
+        /// `validate_before_tokenization` (#1354) makes this assertion fail
+        /// (the call returns `Ok` with empty `token_logprobs` instead of
+        /// `Err`).
         #[test]
         fn generate_streaming_with_prefix_cache_rejects_logprobs_request() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -32874,8 +33202,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// no indication the request was ignored.
         ///
         /// Mutation sensitivity: removing the `check_mtp_not_requested` call
-        /// in `generate_streaming_with_prefix_cache_and_cancel` makes this
-        /// assertion fail (the call returns `Ok` instead of `Err`).
+        /// from `GenerationEntryContract::MetalPrefixCacheStreaming`'s
+        /// `validate_before_tokenization` (#1354) makes this assertion fail
+        /// (the call returns `Ok` instead of `Err`).
         #[test]
         fn generate_streaming_with_prefix_cache_rejects_active_mtp_request() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -32921,6 +33250,115 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// #1354: a request that violates two guards at once must surface
+        /// the *specific* error the pre-refactor call order produces, not
+        /// merely *an* error -- a single-violation suite cannot distinguish
+        /// "checks order preserved" from "checks order silently changed"
+        /// because every single-violation test still passes either way.
+        /// `logprobs` and `enable_mtp` were both checked before tokenization
+        /// in the public wrapper, `logprobs` first; an empty prompt is only
+        /// discovered afterward, inside `prepare_generation`. A caller that
+        /// sets `logprobs` on an empty-prompt request must therefore still
+        /// see the logprobs error, not "empty prompt" -- and a caller that
+        /// sets both `logprobs` and `enable_mtp` must see the logprobs
+        /// error, not the MTP one, because logprobs is checked first.
+        ///
+        /// Mutation sensitivity: folding either preflight into
+        /// `prepare_generation`'s post-tokenization `validate_capabilities`
+        /// (rather than a pre-tokenization hook) flips the empty-prompt
+        /// cases to `Err(Inference("empty prompt"))`; swapping the
+        /// logprobs/MTP check order flips the combined case to the MTP
+        /// error text.
+        #[test]
+        fn generate_streaming_with_prefix_cache_multi_violation_requests_return_the_earlier_guards_error()
+         {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            // logprobs + enable_mtp both set: logprobs must win (checked first).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let both_capabilities_cfg = GenerateConfig {
+                enable_mtp: Some(true),
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &both_capabilities_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("logprobs")
+                ),
+                "logprobs and enable_mtp set together must reject with the \
+                 logprobs error (checked before MTP); got {result:?}"
+            );
+
+            // logprobs set + empty prompt: logprobs must win (checked before
+            // tokenization discovers the prompt is empty).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let logprobs_and_empty_cfg = GenerateConfig {
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &logprobs_and_empty_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("logprobs")
+                ),
+                "logprobs set on an empty-prompt request must reject with the \
+                 logprobs error, not \"empty prompt\"; got {result:?}"
+            );
+
+            // enable_mtp set + empty prompt: MTP must win (checked before
+            // tokenization discovers the prompt is empty).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let mtp_and_empty_cfg = GenerateConfig {
+                enable_mtp: Some(true),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &mtp_and_empty_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("enable_mtp")
+                ),
+                "enable_mtp set on an empty-prompt request must reject with \
+                 the MTP error, not \"empty prompt\"; got {result:?}"
+            );
+        }
+
         /// #827: `generate_streaming_with_prefix_cache_and_cancel_inner` was
         /// the last of the seven Qwen3.5 generation entry points that did not
         /// route through the shared `prepare_generation` preparation --
@@ -32932,14 +33370,14 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `generate_streaming_with_cancel` sibling and the prefix-cache
         /// entry point with the identical over-budget prompt/config on
         /// identically-configured fixtures, and asserts both reject with
-        /// the exact same `check_context_budget` text -- the arm
-        /// `GenerationEntryContract::MetalStreaming`'s `validate_context`
-        /// owns inside `prepare_generation`. Both entry points now resolve
-        /// that arm through the one shared call site instead of two
-        /// independently maintained copies, so a future change to the
-        /// bound (or to which contract this path is threaded through)
-        /// cannot silently diverge between the two without this test
-        /// catching it.
+        /// the exact same `check_context_budget` text -- the shared
+        /// `Self::MetalDirect | Self::MetalStreaming | Self::MetalPrefixCacheStreaming`
+        /// arm `validate_context` owns inside `prepare_generation` (#1354).
+        /// Both entry points now resolve that arm through the one shared
+        /// call site instead of two independently maintained copies, so a
+        /// future change to the bound (or to which contract either path is
+        /// threaded through) cannot silently diverge between the two
+        /// without this test catching it.
         #[test]
         fn generate_streaming_with_prefix_cache_context_rejection_matches_migrated_sibling() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -32996,9 +33434,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 streaming_msg, cached_msg,
                 "generate_streaming_with_prefix_cache_and_cancel must reject an \
                  over-budget prompt with the exact same check_context_budget text \
-                 generate_streaming_with_cancel produces (#827): both now route \
-                 through the same prepare_generation(..., \
-                 GenerationEntryContract::MetalStreaming) call"
+                 generate_streaming_with_cancel produces (#827): both route \
+                 through prepare_generation's shared validate_context arm, \
+                 albeit via different contract variants \
+                 (MetalStreaming / MetalPrefixCacheStreaming, #1354)"
             );
         }
 
@@ -35275,6 +35714,7 @@ pub fn mtp_greedy_round(
 
 /// Which logical traffic bucket a GDN state access belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GdnStateTrafficScope {
     /// Normal single-token decode (`forward_step`, self-spec draft/fallback).
     Decode,

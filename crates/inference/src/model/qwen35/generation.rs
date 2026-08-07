@@ -1155,6 +1155,7 @@ impl Qwen35Model {
 /// sampled token, and measuring `prefill_end` off the first delta fires it
 /// after sampling instead of before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RawGenEvent {
     /// Fired exactly once, after the prefill forward pass has produced
     /// logits and before the first token is sampled -- the true
@@ -2317,7 +2318,7 @@ pub(crate) fn check_reasoning_budget_not_set(
 /// draft/verify wiring at all -- gated identically to that Metal-only
 /// consumer (same gate as the `DecodePolicy`/`StepOutcome` re-export in
 /// `mod.rs`) so non-metal-gpu builds don't carry an unused function.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 pub(crate) fn check_mtp_not_requested(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
     let mtp_enabled = gen_cfg
         .enable_mtp

@@ -237,6 +237,16 @@ async fn main() {
                     );
                     std::process::exit(1);
                 }
+                // Any format this binary doesn't yet know how to serve is
+                // handled the same way as `Unknown`: report it and exit,
+                // rather than silently guessing a backend.
+                _ => {
+                    eprintln!(
+                        "Error: {}",
+                        backend::unrecognized_format_message(model_path)
+                    );
+                    std::process::exit(1);
+                }
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
 

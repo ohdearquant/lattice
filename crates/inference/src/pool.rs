@@ -16,6 +16,7 @@ use crate::forward::cpu::simd_config;
 /// Qwen3-Embedding models use `last_token_pool` (decoder-style) and do not use
 /// this enum — they have a separate inference path in `QwenModel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum BertPooling {
     /// Masked mean pooling (attention-mask-weighted average over all real tokens).
     ///
