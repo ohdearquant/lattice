@@ -34,7 +34,13 @@
 //!   global union across all states when it was withheld under the
 //!   partition's aggregate capacity budget.
 //! - `advance`: O(stack_depth) PDA step; typical depth 2–8.
-//! - `new`: O(|states| × vocab_size × max_token_len) — called once.
+//! - `new`: O(|states| × vocab_size × max_token_len) — called once. `|states|`
+//!   is capped at `MAX_GRAMMAR_STATES` (256) and is the dominant, schema-
+//!   dependent factor; see [`GrammarEngine::new`] for measured figures at
+//!   both ends of that range.
+//! - First `mask_logits` call on a state past the cap: builds a byte trie
+//!   over the vocabulary, `O(vocab_size × max_token_len)` with no `|states|`
+//!   term. See [`GrammarEngine::trie_build_ns`] for a measured figure.
 
 use crate::grammar::gbnf::parse_gbnf;
 use crate::grammar::json_schema::compile;
@@ -344,10 +350,37 @@ impl GrammarEngine {
     /// `vocab_bytes[i]` is the UTF-8 / byte-level representation of token `i`.
     /// For BPE tokenizers, obtain this via `BpeTokenizer::vocab_bytes(model_vocab_size)`.
     ///
-    /// This runs in O(|states| × vocab_size × max_token_len) time.  For
-    /// large vocabularies (e.g. Qwen3 at 248,320 tokens) this may take
-    /// 50–200 ms.  Cache the `GrammarEngine` across requests with the same
-    /// schema.
+    /// This runs in O(|states| × vocab_size × max_token_len) time, where
+    /// `|states|` is capped at `MAX_GRAMMAR_STATES` (256, see
+    /// `vocab_partition::MAX_GRAMMAR_STATES`) and is schema-dependent — a
+    /// timing figure is only meaningful alongside the `|states|` it was
+    /// measured at. Two reference points against the real Qwen3 tokenizer
+    /// (248,320 tokens):
+    ///
+    /// | schema                                             | \|states\| | measured |
+    /// |------------------------------------------------------|-----------|----------|
+    /// | bare 3-member string enum, no object wrapper          | 13        | ~0.2–0.6 s |
+    /// | 4-level nested object, 6 string enums (issue #734 repro) | 256 (cap) | ~21–45 s (up to ~155 s under heavy concurrent load) |
+    ///
+    /// Measured with `cargo run --release --bin gramtime_profile`
+    /// (`crates/inference/src/bin/gramtime_profile.rs`), 6–10 repetitions per
+    /// schema, on a shared development machine with other processes
+    /// competing for CPU — the low ends above are the least-contended
+    /// samples, not an idle-machine floor; see that binary's module doc for
+    /// full per-repetition figures and methodology. Per-(state, token)-pair
+    /// cost was **not** constant between the two schemas (roughly 2–5×
+    /// higher for the capped schema), plausibly because its states sit at
+    /// deeper, more backtracking-prone PDA stack configurations than the
+    /// enum's flat single-rule matching — so `|states|` alone does not fully
+    /// determine build time either, only bounds its order of magnitude.
+    ///
+    /// This cost is **construction only**. A schema whose state count hits
+    /// the cap pays a second, separate cost the first time `mask_logits` is
+    /// called on a state outside the precomputed set: see
+    /// [`Self::trie_build_ns`]. Caching the `GrammarEngine` across requests
+    /// with the same schema amortizes both — the constructor cost shown
+    /// here, and that first-mask trie build — over every subsequent request
+    /// against the same schema.
     pub fn new(spec: &GrammarSpec, vocab_bytes: Vec<Vec<u8>>) -> Result<Self, GrammarError> {
         let vocab_size = vocab_bytes.len();
 
@@ -406,6 +439,17 @@ impl GrammarEngine {
     /// if the trie has not been built yet (grammar never hit an over-cap
     /// state, or none has been masked yet). Diagnostic accessor for
     /// self-measurement harnesses.
+    ///
+    /// This cost is separate from — and not included in — [`Self::new`]'s
+    /// build time: `ByteTrie::build` depends only on `vocab_bytes`, not on
+    /// the grammar or its state count, and runs lazily on whichever request
+    /// is the *first* to call `mask_logits` from a state outside the
+    /// precomputed partition (i.e. only for schemas where `new` hit
+    /// `MAX_GRAMMAR_STATES`; see [`Self::exceeds_state_budget`]). Measured
+    /// directly against the real Qwen3 vocabulary (248,320 tokens, same
+    /// methodology as [`Self::new`]'s doc): ~85–150 ms typical, up to
+    /// ~310 ms under heavy concurrent machine load — see
+    /// `crates/inference/src/bin/gramtime_profile.rs`.
     pub fn trie_build_ns(&self) -> u64 {
         self.trie_build_ns.load(Ordering::Relaxed)
     }
@@ -538,6 +582,14 @@ impl GrammarEngine {
                 // step instead of re-walking each one independently).
                 // `mask_by_simulation` stays available as the oracle for the
                 // differential tests below and as a manual fallback.
+                //
+                // `mask_by_trie` builds the trie on the *first* call that
+                // reaches this branch for this engine (OnceLock) — a
+                // separate, one-time cost from `GrammarEngine::new`'s own
+                // build, measured at ~85-150ms for the real Qwen3
+                // vocabulary; see `Self::trie_build_ns`'s doc for figures
+                // and methodology. It lands on whichever request happens to
+                // be first, not on construction.
                 let t0 = profiling.then(std::time::Instant::now);
                 self.mask_by_trie(state, logits);
                 if let Some(t0) = t0 {
