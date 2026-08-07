@@ -256,6 +256,12 @@ impl From<crate::grammar::gbnf::GbnfError> for GrammarError {
     }
 }
 
+impl From<crate::grammar::pda::BuilderError> for GrammarError {
+    fn from(e: crate::grammar::pda::BuilderError) -> Self {
+        GrammarError(e.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State enumeration
 // ---------------------------------------------------------------------------

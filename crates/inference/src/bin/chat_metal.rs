@@ -806,6 +806,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ModelFormat::Unknown => {
             return Err(model_format::unrecognized_format_message(dir).into());
         }
+        // Any format this binary doesn't yet know how to load is handled
+        // the same way as `Unknown`: report it rather than silently
+        // guessing a loader.
+        _ => {
+            return Err(model_format::unrecognized_format_message(dir).into());
+        }
     }
 
     // ── Load LoRA adapter (if requested) ────────────────────────────────────

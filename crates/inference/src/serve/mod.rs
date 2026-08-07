@@ -270,6 +270,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// Structured HTTP error shared by both binaries, serializing to the OpenAI
 /// error envelope: `{"error": {"message", "type", "code", "param"}}`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ApiError {
     /// Caller mistake — HTTP 400.
     BadRequest { message: String, code: &'static str },

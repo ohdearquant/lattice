@@ -20,6 +20,7 @@ pub type AdapterId = String;
 /// Governance status of a LoRA adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AdapterStatus {
     /// Adapter may participate in a mixture.
     Approved,

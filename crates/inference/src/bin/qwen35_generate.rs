@@ -367,6 +367,9 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
                 raw_token_count += 1;
                 emit_token_available(t0, index);
             }
+            // Future event kinds are trace-only; this bench harness ignores
+            // ones it doesn't recognize rather than failing to build.
+            _ => {}
         },
     );
 
