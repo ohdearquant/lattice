@@ -36978,6 +36978,129 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             Ok(())
         }
 
+        /// Issue #1336 harness support (`bin/bench_vision_prefill_ab.rs`): a
+        /// checkpoint-shaped multimodal-prefill fixture sized to a
+        /// caller-chosen visual-row count, generalizing the
+        /// `#[cfg(test)]`-only `vision_gate_fixture` (fixed at 4 rows,
+        /// adequate for a correctness gate but too short for the
+        /// terminal-head-skip saving to be a measurable fraction of total
+        /// prefill time). `t=1`, a square merged grid with
+        /// `side_merged = ceil(sqrt(num_visual_rows_target))`, so the actual
+        /// row count returned may exceed the target slightly (rounded up to
+        /// the next square); the harness reports the actual count.
+        ///
+        /// Per-lane-varying (not per-row-constant) synthetic content, same
+        /// reasoning as `vision_gate_fixture`: a constant vector is
+        /// invariant under Qwen3.5's RMSNorm one layer in. Real pixel
+        /// content is not required here — the emit_head optimization gates
+        /// the decoder's terminal RMSNorm + lm_head dispatch only, which is
+        /// insensitive to what values the injected embedding carries, only
+        /// to its shape (see this bin's module doc for the corollary: this
+        /// harness does not include ViT/merger cost).
+        pub fn vision_prefill_fixture(
+            cfg: &Qwen35Config,
+            num_visual_rows_target: usize,
+            seed: f32,
+        ) -> Result<crate::vision::multimodal::Qwen35VisionRequest, String> {
+            let vision_cfg = cfg
+                .vision_config
+                .as_ref()
+                .ok_or_else(|| "checkpoint carries no vision_config".to_string())?;
+            let image_token_id = cfg
+                .image_token_id
+                .ok_or_else(|| "checkpoint carries no image_token_id".to_string())?;
+            let merge = vision_cfg.spatial_merge_size;
+            if merge == 0 {
+                return Err("checkpoint vision_config.spatial_merge_size is 0".to_string());
+            }
+            let rows_target = num_visual_rows_target.max(1);
+            let side_merged = (rows_target as f64).sqrt().ceil() as usize;
+            let side_merged = side_merged.max(1);
+            let grid = crate::vision::qwen35_vit::GridThw {
+                t: 1,
+                h: side_merged * merge,
+                w: side_merged * merge,
+            };
+            let num_rows = (grid.t * grid.h * grid.w) / (merge * merge);
+
+            let mut input_ids = vec![10u32, 11];
+            input_ids.extend(std::iter::repeat_n(image_token_id, num_rows));
+            input_ids.push(12);
+
+            let mut post_merger_rows = vec![0.0f32; num_rows * cfg.hidden_size];
+            for (i, v) in post_merger_rows.iter_mut().enumerate() {
+                *v = seed + 0.01 * ((i % 97) as f32 - 48.0);
+            }
+
+            Ok(crate::vision::multimodal::Qwen35VisionRequest {
+                input_ids,
+                image_grids: vec![grid],
+                post_merger_rows,
+                image_token_id,
+                spatial_merge_size: merge,
+                decoder_hidden_size: cfg.hidden_size,
+            })
+        }
+
+        /// Issue #1336 harness support: runs one multimodal prefill over
+        /// `request`, selecting `emit_head` per position exactly the way
+        /// `generate_multimodal_vision_impl` does in production
+        /// (`pos == last_prefill_pos`) when `always_emit_head=false`, or
+        /// forcing it `true` at every position (the pre-#1336 baseline
+        /// shape) when `always_emit_head=true`. Both arms call the same
+        /// `forward_step_mrope`/`forward_step_injected_mrope` functions the
+        /// production path calls — same code, same binary, differing only
+        /// in this flag — mirroring
+        /// `generate_multimodal_vision_emit_head_skip_matches_always_emit_reference`'s
+        /// `run_prefill` closure.
+        ///
+        /// Returns nothing: like [`forward_prefill_production_chunk`], every
+        /// `forward_step_mrope`/`forward_step_injected_mrope` call already
+        /// waits for its own command buffer before returning, so the caller
+        /// times the call from outside with a plain CPU `Instant` — no
+        /// internal instrumentation is needed or added. `state` must already
+        /// be freshly reset (`state.reset_state()`) by the caller.
+        pub fn run_multimodal_prefill(
+            state: &mut MetalQwen35State,
+            request: &crate::vision::multimodal::Qwen35VisionRequest,
+            cfg: &Qwen35Config,
+            always_emit_head: bool,
+        ) -> Result<Vec<f32>, String> {
+            let (_positions, tables) = request
+                .build_mrope_tables(cfg)
+                .map_err(|e| format!("build_mrope_tables: {e}"))?;
+            let prompt_len = request.input_ids.len();
+
+            let mut visual_row = 0usize;
+            let mut last_logits = Vec::new();
+            for (pos, &token_id) in request.input_ids.iter().enumerate() {
+                let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
+                let emit_head = always_emit_head || pos + 1 == prompt_len;
+                if token_id == request.image_token_id {
+                    let row_start = visual_row * request.decoder_hidden_size;
+                    let row_end = row_start + request.decoder_hidden_size;
+                    let row = &request.post_merger_rows[row_start..row_end];
+                    visual_row += 1;
+                    last_logits = state.forward_step_injected_mrope(
+                        row,
+                        pos,
+                        cos_sin,
+                        emit_head,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
+                } else {
+                    last_logits = state.forward_step_mrope(
+                        token_id,
+                        pos,
+                        cos_sin,
+                        emit_head,
+                        crate::forward::signpost::Scope::NotDecode,
+                    );
+                }
+            }
+            Ok(last_logits)
+        }
+
         #[cfg(test)]
         mod tests {
             use super::first_out_of_vocab;
@@ -37137,152 +37260,6 @@ mod public_scheduling_entry_point_tests {
                 item(real, declaration).contains(preflight),
                 "{declaration} must route through {preflight}"
             );
-        }
-
-        /// Issue #1336 harness support (`bin/bench_vision_prefill_ab.rs`): a
-        /// checkpoint-shaped multimodal-prefill fixture sized to a
-        /// caller-chosen visual-row count, generalizing the
-        /// `#[cfg(test)]`-only `vision_gate_fixture` (fixed at 4 rows,
-        /// adequate for a correctness gate but too short for the
-        /// terminal-head-skip saving to be a measurable fraction of total
-        /// prefill time). `t=1`, a square merged grid with
-        /// `side_merged = ceil(sqrt(num_visual_rows_target))`, so the actual
-        /// row count returned may exceed the target slightly (rounded up to
-        /// the next square); the harness reports the actual count.
-        ///
-        /// Per-lane-varying (not per-row-constant) synthetic content, same
-        /// reasoning as `vision_gate_fixture`: a constant vector is
-        /// invariant under Qwen3.5's RMSNorm one layer in. Real pixel
-        /// content is not required here — the emit_head optimization gates
-        /// the decoder's terminal RMSNorm + lm_head dispatch only, which is
-        /// insensitive to what values the injected embedding carries, only
-        /// to its shape (see this bin's module doc for the corollary: this
-        /// harness does not include ViT/merger cost).
-        pub fn vision_prefill_fixture(
-            cfg: &Qwen35Config,
-            num_visual_rows_target: usize,
-            seed: f32,
-        ) -> Result<crate::vision::multimodal::Qwen35VisionRequest, String> {
-            let vision_cfg = cfg
-                .vision_config
-                .as_ref()
-                .ok_or_else(|| "checkpoint carries no vision_config".to_string())?;
-            let image_token_id = cfg
-                .image_token_id
-                .ok_or_else(|| "checkpoint carries no image_token_id".to_string())?;
-            let merge = vision_cfg.spatial_merge_size;
-            if merge == 0 {
-                return Err("checkpoint vision_config.spatial_merge_size is 0".to_string());
-            }
-            let rows_target = num_visual_rows_target.max(1);
-            let side_merged = (rows_target as f64).sqrt().ceil() as usize;
-            let side_merged = side_merged.max(1);
-            let grid = crate::vision::qwen35_vit::GridThw {
-                t: 1,
-                h: side_merged * merge,
-                w: side_merged * merge,
-            };
-            let num_rows = (grid.t * grid.h * grid.w) / (merge * merge);
-
-            let mut input_ids = vec![10u32, 11];
-            input_ids.extend(std::iter::repeat_n(image_token_id, num_rows));
-            input_ids.push(12);
-
-            let mut post_merger_rows = vec![0.0f32; num_rows * cfg.hidden_size];
-            for (i, v) in post_merger_rows.iter_mut().enumerate() {
-                *v = seed + 0.01 * ((i % 97) as f32 - 48.0);
-            }
-
-            Ok(crate::vision::multimodal::Qwen35VisionRequest {
-                input_ids,
-                image_grids: vec![grid],
-                post_merger_rows,
-                image_token_id,
-                spatial_merge_size: merge,
-                decoder_hidden_size: cfg.hidden_size,
-            })
-        }
-
-        /// Issue #1336 harness support: runs one multimodal prefill over
-        /// `request`, selecting `emit_head` per position exactly the way
-        /// `generate_multimodal_vision_impl` does in production
-        /// (`pos == last_prefill_pos`) when `always_emit_head=false`, or
-        /// forcing it `true` at every position (the pre-#1336 baseline
-        /// shape) when `always_emit_head=true`. Both arms call the same
-        /// `forward_step_mrope`/`forward_step_injected_mrope` functions the
-        /// production path calls — same code, same binary, differing only
-        /// in this flag — mirroring
-        /// `generate_multimodal_vision_emit_head_skip_matches_always_emit_reference`'s
-        /// `run_prefill` closure.
-        ///
-        /// Returns nothing: like [`forward_prefill_production_chunk`], every
-        /// `forward_step_mrope`/`forward_step_injected_mrope` call already
-        /// waits for its own command buffer before returning, so the caller
-        /// times the call from outside with a plain CPU `Instant` — no
-        /// internal instrumentation is needed or added. `state` must already
-        /// be freshly reset (`state.reset_state()`) by the caller.
-        pub fn run_multimodal_prefill(
-            state: &mut MetalQwen35State,
-            request: &crate::vision::multimodal::Qwen35VisionRequest,
-            cfg: &Qwen35Config,
-            always_emit_head: bool,
-        ) -> Result<Vec<f32>, String> {
-            let (_positions, tables) = request
-                .build_mrope_tables(cfg)
-                .map_err(|e| format!("build_mrope_tables: {e}"))?;
-            let prompt_len = request.input_ids.len();
-
-            let mut visual_row = 0usize;
-            let mut last_logits = Vec::new();
-            for (pos, &token_id) in request.input_ids.iter().enumerate() {
-                let cos_sin = Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()));
-                let emit_head = always_emit_head || pos + 1 == prompt_len;
-                if token_id == request.image_token_id {
-                    let row_start = visual_row * request.decoder_hidden_size;
-                    let row_end = row_start + request.decoder_hidden_size;
-                    let row = &request.post_merger_rows[row_start..row_end];
-                    visual_row += 1;
-                    last_logits = state.forward_step_injected_mrope(
-                        row,
-                        pos,
-                        cos_sin,
-                        emit_head,
-                        crate::forward::signpost::Scope::NotDecode,
-                    );
-                } else {
-                    last_logits = state.forward_step_mrope(
-                        token_id,
-                        pos,
-                        cos_sin,
-                        emit_head,
-                        crate::forward::signpost::Scope::NotDecode,
-                    );
-                }
-            }
-            Ok(last_logits)
-        }
-
-        #[cfg(test)]
-        mod tests {
-            use super::first_out_of_vocab;
-
-            #[test]
-            fn first_out_of_vocab_accepts_in_range() {
-                assert_eq!(first_out_of_vocab(&[0, 1, 99], 100), None);
-                assert_eq!(first_out_of_vocab(&[], 100), None);
-            }
-
-            #[test]
-            fn first_out_of_vocab_finds_first_offender() {
-                // Two offenders; the FIRST (index 1) must be reported.
-                assert_eq!(first_out_of_vocab(&[5, 200, 300], 100), Some((1, 200)));
-            }
-
-            #[test]
-            fn first_out_of_vocab_rejects_id_equal_to_vocab() {
-                // vocab_size itself is out of range (valid ids are 0..vocab_size).
-                assert_eq!(first_out_of_vocab(&[100], 100), Some((0, 100)));
-            }
         }
     }
 }

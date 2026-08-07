@@ -1073,11 +1073,12 @@ jobs:
       # documents. LATTICE_METAL_TEST_ENFORCE=1 makes a missing device or
       # checkpoint a hard failure instead of the default dev-run skip.
       #
-      # The filter also selects two later additions that reuse this same
+      # The filter also selects later additions that reuse this same
       # checkpoint+device: `forward_step_mrope_emit_head_false_skips_terminal_head_dispatch`
       # (mechanism test: `emit_head=false` must skip the terminal RMSNorm +
-      # lm_head dispatch entirely, not merely its readback) and
-      # `generate_multimodal_vision_emit_head_skip_matches_always_emit_reference`
+      # lm_head dispatch entirely, not merely its readback), its MTP-weights
+      # variant `forward_step_mrope_emit_head_false_skips_terminal_head_dispatch_with_mtp_weights_present_but_request_inactive`,
+      # and `generate_multimodal_vision_emit_head_skip_matches_always_emit_reference`
       # (equivalence test: the skip must not change prefill state) via the
       # `emit_head` filter term, plus the checkpoint-free
       # `vision_runtime_preload_is_noop_when_unsupported` and
@@ -1092,7 +1093,7 @@ jobs:
       # (CPU f16 injection oracle), and
       # `shared_server_runner_drops_router_after_injected_shutdown` (serve-shutdown
       # regression matching only incidentally on the `injected` substring), so
-      # the exact-count grep below is 12 (8 `inject`-filter matches + 2
+      # the exact-count grep below is 13 (8 `inject`-filter matches + 3
       # `emit_head`-filter matches + 2 `vision_runtime_preload`-filter
       # matches), not 5 -- update it in the same PR if the matched test
       # surface changes. libtest ORs multiple filter arguments together, so
@@ -1117,7 +1118,7 @@ jobs:
             cat vision-mp2-inject-gate.log
             exit "$status"
           fi
-          grep -Eq '^test result: ok\. 12 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
+          grep -Eq '^test result: ok\. 13 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' vision-mp2-inject-gate.log
 
   # Fail-closed control-flow self-test for the Q4 PPL gate script (issue #616).
   # Cheap, deterministic, GPU-free (sandbox tree + stub eval_perplexity), so —
