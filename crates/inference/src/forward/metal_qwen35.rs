@@ -12808,44 +12808,36 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
-            // Config preflight checks live here, in the public wrapper, and
-            // must return BEFORE the `match` below (PR #787): the
-            // error-recovery arm of that `match` unconditionally
-            // calls `reset_state()` and removes the cache slot on ANY `Err`
-            // from `_inner`, including a not-yet-attempted preflight
-            // rejection. A caller passing an unsupported config (e.g.
-            // `logprobs` or an active `enable_mtp`) never touches cache/session
-            // state in the first place, so routing that rejection through the
-            // destructive recovery path would evict a valid pre-existing
-            // cross-turn entry the call never mutated. Returning here, before
-            // `_inner` is even called, leaves any existing entry untouched.
-            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-            crate::model::qwen35::check_mtp_not_requested(gen_cfg)?;
-
-            // #856/#922/#827: prompt tokenization, the empty-prompt guard, and
-            // the prompt-plus-decode-budget context bound are delegated to the
-            // same `prepare_generation` shared preparation
-            // `generate_streaming_with_cancel` already routes through, closing
-            // the last unmigrated generation entry point (issue #827). This
-            // reuses `GenerationEntryContract::MetalStreaming`: the pieces
-            // `prepare_generation` actually governs here -- tokenize,
-            // `check_prompt_not_empty`, the vocab-admission no-op, the
-            // zero-budget completion shape, and `check_context_budget` --
-            // are byte-for-byte what this entry point ran inline before. The
-            // `logprobs`/`enable_mtp` preflights above are strictly narrower
-            // than `MetalStreaming`'s permissive `validate_capabilities` (which
-            // exists because plain streaming supports both), so they stay as
-            // explicit checks here rather than folding into the contract --
-            // that keeps their current position ahead of tokenization and
-            // their current per-check error text unchanged for callers that
-            // violate more than one guard at once.
+            // #856/#922/#827/#1354: prompt tokenization, the empty-prompt
+            // guard, and the prompt-plus-decode-budget context bound are
+            // delegated to the same `prepare_generation` shared preparation
+            // `generate_streaming_with_cancel` already routes through,
+            // closing the last unmigrated generation entry point (issue
+            // #827). This uses `GenerationEntryContract::MetalPrefixCacheStreaming`
+            // (#1354), not the plain-streaming `MetalStreaming` variant this
+            // call used to reuse: `MetalStreaming`'s permissive
+            // `validate_capabilities` exists because plain streaming
+            // supports both `logprobs` and `enable_mtp`, but this path does
+            // not, so folding those checks into that variant would have
+            // wrongly restricted plain streaming too. `MetalPrefixCacheStreaming`
+            // carries its own `check_logprobs_not_set` /
+            // `check_mtp_not_requested` guards in `validate_before_tokenization`
+            // (run ahead of tokenization inside `prepare_generation`, same
+            // position these two guards ran in as an explicit preflight
+            // here before this change), so the error text and precedence
+            // for a request that violates more than one guard at once are
+            // unchanged: this call must still return here, before any
+            // cache/session state mutation and before `_inner`'s
+            // destructive-on-`Err` recovery arm is reachable, so a rejected
+            // call never evicts a valid pre-existing cross-turn entry it
+            // never touched (PR #787).
             let prompt_prep = crate::model::qwen35::prepare_generation(
                 tokenizer,
                 prompt,
                 gen_cfg,
                 self.engine.config.vocab_size,
                 self.max_context(),
-                crate::model::qwen35::GenerationEntryContract::MetalStreaming,
+                crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming,
             )?;
             let (prompt_ids, rng_state) = match prompt_prep {
                 crate::model::qwen35::GenerationPreparation::Complete(output) => {
@@ -12869,8 +12861,9 @@ mod inner {
 
             // #835: validate the suffix a reuse plan would select for this
             // slot BEFORE calling `_inner` at all -- same reasoning as the
-            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
-            // above (PR #787): the `match` below unconditionally calls
+            // `check_logprobs_not_set`/`check_mtp_not_requested` guards
+            // `prepare_generation` already ran above, ahead of tokenization
+            // (PR #787, #1354): the `match` below unconditionally calls
             // `reset_state()` and evicts the cache slot on ANY `Err` from
             // `_inner`, so a suffix-validation-only rejection (out-of-vocab
             // token, empty suffix, or a suffix overflowing `max_cache_len`)
@@ -32252,9 +32245,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// entry is created (or consumed) for the rejected call.
         ///
         /// Mutation sensitivity: removing the `check_logprobs_not_set` call
-        /// at the top of `generate_streaming_with_prefix_cache_and_cancel_inner`
-        /// makes this assertion fail (the call returns `Ok` with empty
-        /// `token_logprobs` instead of `Err`).
+        /// from `GenerationEntryContract::MetalPrefixCacheStreaming`'s
+        /// `validate_before_tokenization` (#1354) makes this assertion fail
+        /// (the call returns `Ok` with empty `token_logprobs` instead of
+        /// `Err`).
         #[test]
         fn generate_streaming_with_prefix_cache_rejects_logprobs_request() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -32406,8 +32400,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// no indication the request was ignored.
         ///
         /// Mutation sensitivity: removing the `check_mtp_not_requested` call
-        /// in `generate_streaming_with_prefix_cache_and_cancel` makes this
-        /// assertion fail (the call returns `Ok` instead of `Err`).
+        /// from `GenerationEntryContract::MetalPrefixCacheStreaming`'s
+        /// `validate_before_tokenization` (#1354) makes this assertion fail
+        /// (the call returns `Ok` instead of `Err`).
         #[test]
         fn generate_streaming_with_prefix_cache_rejects_active_mtp_request() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -32453,6 +32448,115 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// #1354: a request that violates two guards at once must surface
+        /// the *specific* error the pre-refactor call order produces, not
+        /// merely *an* error -- a single-violation suite cannot distinguish
+        /// "checks order preserved" from "checks order silently changed"
+        /// because every single-violation test still passes either way.
+        /// `logprobs` and `enable_mtp` were both checked before tokenization
+        /// in the public wrapper, `logprobs` first; an empty prompt is only
+        /// discovered afterward, inside `prepare_generation`. A caller that
+        /// sets `logprobs` on an empty-prompt request must therefore still
+        /// see the logprobs error, not "empty prompt" -- and a caller that
+        /// sets both `logprobs` and `enable_mtp` must see the logprobs
+        /// error, not the MTP one, because logprobs is checked first.
+        ///
+        /// Mutation sensitivity: folding either preflight into
+        /// `prepare_generation`'s post-tokenization `validate_capabilities`
+        /// (rather than a pre-tokenization hook) flips the empty-prompt
+        /// cases to `Err(Inference("empty prompt"))`; swapping the
+        /// logprobs/MTP check order flips the combined case to the MTP
+        /// error text.
+        #[test]
+        fn generate_streaming_with_prefix_cache_multi_violation_requests_return_the_earlier_guards_error()
+         {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            // logprobs + enable_mtp both set: logprobs must win (checked first).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let both_capabilities_cfg = GenerateConfig {
+                enable_mtp: Some(true),
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &both_capabilities_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("logprobs")
+                ),
+                "logprobs and enable_mtp set together must reject with the \
+                 logprobs error (checked before MTP); got {result:?}"
+            );
+
+            // logprobs set + empty prompt: logprobs must win (checked before
+            // tokenization discovers the prompt is empty).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let logprobs_and_empty_cfg = GenerateConfig {
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &logprobs_and_empty_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("logprobs")
+                ),
+                "logprobs set on an empty-prompt request must reject with the \
+                 logprobs error, not \"empty prompt\"; got {result:?}"
+            );
+
+            // enable_mtp set + empty prompt: MTP must win (checked before
+            // tokenization discovers the prompt is empty).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let mtp_and_empty_cfg = GenerateConfig {
+                enable_mtp: Some(true),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &mtp_and_empty_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("enable_mtp")
+                ),
+                "enable_mtp set on an empty-prompt request must reject with \
+                 the MTP error, not \"empty prompt\"; got {result:?}"
+            );
+        }
+
         /// #827: `generate_streaming_with_prefix_cache_and_cancel_inner` was
         /// the last of the seven Qwen3.5 generation entry points that did not
         /// route through the shared `prepare_generation` preparation --
@@ -32464,14 +32568,14 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `generate_streaming_with_cancel` sibling and the prefix-cache
         /// entry point with the identical over-budget prompt/config on
         /// identically-configured fixtures, and asserts both reject with
-        /// the exact same `check_context_budget` text -- the arm
-        /// `GenerationEntryContract::MetalStreaming`'s `validate_context`
-        /// owns inside `prepare_generation`. Both entry points now resolve
-        /// that arm through the one shared call site instead of two
-        /// independently maintained copies, so a future change to the
-        /// bound (or to which contract this path is threaded through)
-        /// cannot silently diverge between the two without this test
-        /// catching it.
+        /// the exact same `check_context_budget` text -- the shared
+        /// `Self::MetalDirect | Self::MetalStreaming | Self::MetalPrefixCacheStreaming`
+        /// arm `validate_context` owns inside `prepare_generation` (#1354).
+        /// Both entry points now resolve that arm through the one shared
+        /// call site instead of two independently maintained copies, so a
+        /// future change to the bound (or to which contract either path is
+        /// threaded through) cannot silently diverge between the two
+        /// without this test catching it.
         #[test]
         fn generate_streaming_with_prefix_cache_context_rejection_matches_migrated_sibling() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -32528,9 +32632,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 streaming_msg, cached_msg,
                 "generate_streaming_with_prefix_cache_and_cancel must reject an \
                  over-budget prompt with the exact same check_context_budget text \
-                 generate_streaming_with_cancel produces (#827): both now route \
-                 through the same prepare_generation(..., \
-                 GenerationEntryContract::MetalStreaming) call"
+                 generate_streaming_with_cancel produces (#827): both route \
+                 through prepare_generation's shared validate_context arm, \
+                 albeit via different contract variants \
+                 (MetalStreaming / MetalPrefixCacheStreaming, #1354)"
             );
         }
 
