@@ -1126,7 +1126,15 @@ mod tests {
         #[test]
         fn test_validate_against_unknown_module_errors() {
             let cfg = Qwen35Config::qwen35_0_8b();
-            let adapter = make_adapter_for_layer(3, "xq_proj_typo", 1024, 4096);
+            // "query" is in `KNOWN_LORA_TARGET_MODULES` (it's a BERT
+            // projection name), so construction passes the allowlist check
+            // in `LoraConfig::validate` and this test actually reaches
+            // `validate_against`'s own module-recognition rejection instead
+            // of failing at `make_adapter_for_layer`'s `.expect(..)`. A
+            // typo'd name like "xq_proj_typo" is rejected earlier, at
+            // construction, and is covered by
+            // `lora_adapter_new_rejects_unknown_target_module_via_shared_descriptor`.
+            let adapter = make_adapter_for_layer(3, "query", 1024, 4096);
             let err = adapter.validate_against(&cfg).unwrap_err();
             assert!(err.to_string().contains("not a recognised"));
         }
@@ -1373,7 +1381,16 @@ mod tests {
 
         #[test]
         fn test_validate_against_bert_unknown_module_rejected() {
-            let adapter = make_bert_adapter("xquery_typo", HIDDEN_SIZE, HIDDEN_SIZE);
+            // "q_proj" is in `KNOWN_LORA_TARGET_MODULES` (it's a Qwen3.5
+            // full-attention projection name), so construction passes the
+            // allowlist check in `LoraConfig::validate` and this test
+            // actually reaches `validate_against_bert`'s own
+            // module-recognition rejection instead of failing at
+            // `make_bert_adapter`'s `.expect(..)`. A typo'd name like
+            // "xquery_typo" is rejected earlier, at construction, and is
+            // covered by
+            // `lora_adapter_new_rejects_unknown_target_module_via_shared_descriptor`.
+            let adapter = make_bert_adapter("q_proj", HIDDEN_SIZE, HIDDEN_SIZE);
             let err = adapter
                 .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
                 .expect_err("unrecognised BERT module must be rejected");
