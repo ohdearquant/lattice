@@ -67,6 +67,7 @@ impl OnlineDriftConfig {
 /// **Stable** (provisional): four-variant status enum; new variants would be additive.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum OnlineDriftSignal {
     /// Not enough samples have been observed to fill both windows.
     Warming {

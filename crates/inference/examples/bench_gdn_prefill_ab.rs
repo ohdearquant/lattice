@@ -50,6 +50,7 @@ fn run() {
     eprintln!("[bench_gdn_prefill_ab] model_dir={}", model_dir.display());
     eprintln!("[bench_gdn_prefill_ab] lens={lens:?} warmups={warmups} runs={runs}");
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let t_load = Instant::now();
     let model = Qwen35Model::from_safetensors(&model_dir).expect("load qwen3.5-0.8b");
     let mut state =
@@ -126,6 +127,7 @@ fn run_interleaved(
     eprintln!("[bench_gdn_prefill_ab] model_dir={}", model_dir.display());
     eprintln!("[bench_gdn_prefill_ab] lens={lens:?} warmups={warmups} runs={runs}");
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let t_load = Instant::now();
     let model = Qwen35Model::from_safetensors(model_dir).expect("load qwen3.5-0.8b");
     let mut state =

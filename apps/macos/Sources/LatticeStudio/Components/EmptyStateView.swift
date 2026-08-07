@@ -75,6 +75,7 @@ struct EmptyStateView: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("EmptyStateView") {
     VStack(spacing: Theme.Space.xl) {
         // No action
@@ -110,3 +111,4 @@ struct EmptyStateView: View {
     .frame(width: 600, height: 700)
     .background(Theme.Palette.canvas)
 }
+#endif

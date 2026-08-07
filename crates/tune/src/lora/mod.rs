@@ -320,27 +320,18 @@ impl LoraAdapter {
                 )));
             }
 
-            let is_full = config.is_full_attention(*layer_idx);
-            let (expected_d_in, expected_d_out) = match (module.as_str(), is_full) {
-                ("q_proj", true) => (config.hidden_size, 2 * config.full_q_dim()),
-                ("k_proj", true) => (config.hidden_size, config.full_kv_dim()),
-                ("v_proj", true) => (config.hidden_size, config.full_kv_dim()),
-                ("o_proj", true) => (config.full_q_dim(), config.hidden_size),
-                ("in_proj_qkv", false) => (config.hidden_size, config.linear_qkv_dim()),
-                ("in_proj_z", false) => (config.hidden_size, config.linear_output_dim()),
-                // GDN beta/alpha widths are per value head, never key head.
-                ("in_proj_b", false) => (config.hidden_size, config.linear_num_value_heads()),
-                ("in_proj_a", false) => (config.hidden_size, config.linear_num_value_heads()),
-                ("out_proj", false) => (config.linear_output_dim(), config.hidden_size),
-                ("gate_proj", _) => (config.hidden_size, config.intermediate_size),
-                ("up_proj", _) => (config.hidden_size, config.intermediate_size),
-                ("down_proj", _) => (config.intermediate_size, config.hidden_size),
-                (m, _) => {
-                    return Err(crate::error::TuneError::Validation(format!(
-                        "LoRA module '{m}' (layer {layer_idx}) is not a recognised Qwen3.5 projection"
-                    )));
-                }
-            };
+            let expected = lattice_inference::lora_hook::qwen35_projection_shape(
+                config,
+                *layer_idx,
+                module,
+            )
+            .map_err(|_| {
+                crate::error::TuneError::Validation(format!(
+                    "LoRA module '{module}' (layer {layer_idx}) is not a recognised Qwen3.5 projection"
+                ))
+            })?;
+            let expected_d_in = expected.d_in;
+            let expected_d_out = expected.d_out;
 
             if layer.d_in != expected_d_in || layer.d_out != expected_d_out {
                 return Err(crate::error::TuneError::Validation(format!(
@@ -786,6 +777,35 @@ mod tests {
             // Layer 3 is full-attention; q_proj: d_in=hidden=1024, d_out=2*full_q_dim=4096.
             let adapter = make_adapter_for_layer(3, "q_proj", 1024, 4096);
             assert!(adapter.validate_against(&cfg).is_ok());
+        }
+
+        #[test]
+        fn test_validate_against_delegates_to_shared_qwen_projection_shape() {
+            use lattice_inference::lora_hook::{LoraProjectionShape, qwen35_projection_shape};
+
+            let cfg = Qwen35Config::qwen35_0_8b();
+            let shared = qwen35_projection_shape(&cfg, 3, "q_proj")
+                .expect("q_proj is valid on a full-attention layer");
+            assert_eq!(
+                shared,
+                LoraProjectionShape {
+                    d_in: 1024,
+                    d_out: 4096,
+                }
+            );
+
+            let matching = make_adapter_for_layer(3, "q_proj", shared.d_in, shared.d_out);
+            assert!(matching.validate_against(&cfg).is_ok());
+
+            let mismatched = make_adapter_for_layer(3, "q_proj", shared.d_in, shared.d_out - 1);
+            let err = mismatched
+                .validate_against(&cfg)
+                .expect_err("Tune must reject geometry that differs from the shared shape");
+            assert_eq!(
+                err.to_string(),
+                "Validation error: LoRA adapter dims mismatch for layer 3 module 'q_proj': \
+                 adapter has (d_in=1024, d_out=4095) but model expects (d_in=1024, d_out=4096)"
+            );
         }
 
         #[test]

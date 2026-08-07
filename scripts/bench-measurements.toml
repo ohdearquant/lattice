@@ -1,0 +1,334 @@
+schema = 1
+
+[contract]
+scope = "local script and Make measurement entry points"
+caller_trust = "cooperative"
+lock_ownership = "ordinary wrapper retains both descriptors through its dedicated supervisor; on abnormal exit, it drains descendants that remain in the cooperative process group before release, not deliberately detached children or loss of the lock-owning wrapper"
+pathname_check = "endpoint mismatch diagnostic; not rename-and-restore resistance"
+handoff_check = "instantaneous silent-pipe open-writer and lock-contention diagnostics; not authenticated ownership, continuous lock-lifetime proof, or deliberate same-user bypass resistance"
+rust_inventory_grammar = "crates/*/benches/*.rs; crates/inference/examples/*.rs; crates/inference/src/bin/*.rs; README.md"
+rust_inventory_limitation = "does not discover Rust tests, except the one tracked entry point below"
+# Confirmed measurement entry points outside the declared grammar. Unlike the
+# grammar above, Rust test targets are not globbed wholesale (most are
+# correctness, not measurement), so a test-directory measurement path is
+# tracked here by hand until it is reachable through a bounded glob.
+confirmed_outside_rust_inventory = ["crates/tune/tests/bench_backward_737.rs"]
+
+# The exclusions below are exact for rust_inventory_grammar rather than glob
+# waivers. A new matching path fails the scan until it is classified as either
+# a measurement entry point (`excluded_surface`, tracked to an issue) or an
+# explicitly justified non-measurement path (`non_measurement_surface`).
+
+[[excluded_surface]]
+family = "cargo-benchmark-sources"
+tracking_issue = "#1273"
+reason = "Direct Cargo benchmark targets are outside this local script supervisor."
+paths = [
+    "crates/embed/benches/embeddings.rs",
+    "crates/embed/benches/simd.rs",
+    "crates/embed/benches/simd_bench.rs",
+    "crates/embed/benches/simd_opt_bench.rs",
+    "crates/embed/benches/simsimd_comparison.rs",
+    "crates/fann/benches/router_online.rs",
+    "crates/inference/benches/attention_dispatch_bench.rs",
+    "crates/inference/benches/attn_opt_bench.rs",
+    "crates/inference/benches/cross_turn_prefix_cache_bench.rs",
+    "crates/inference/benches/decode_attn_bench.rs",
+    "crates/inference/benches/differential_attention_bench.rs",
+    "crates/inference/benches/e2e_bench.rs",
+    "crates/inference/benches/elementwise_bench.rs",
+    "crates/inference/benches/elementwise_cpu_bench.rs",
+    "crates/inference/benches/f16_convert_bench.rs",
+    "crates/inference/benches/gated_attention_bench.rs",
+    "crates/inference/benches/grammar_mask_bench.rs",
+    "crates/inference/benches/inference_bench.rs",
+    "crates/inference/benches/inference_perf.rs",
+    "crates/inference/benches/kv_cache_f16_bench.rs",
+    "crates/inference/benches/kv_cache_layout_bench.rs",
+    "crates/inference/benches/lm_head_bench.rs",
+    "crates/inference/benches/metal_decode_bench.rs",
+    "crates/inference/benches/metrics_bench.rs",
+    "crates/inference/benches/mtp_decode.rs",
+    "crates/inference/benches/native_sparse_attention_bench.rs",
+    "crates/inference/benches/pruning_bench.rs",
+    "crates/inference/benches/quarot_hadamard_bench.rs",
+    "crates/inference/benches/tokenizer_bench.rs",
+    "crates/inference/benches/topk_readback.rs",
+    "crates/transport/benches/round0_transport.rs",
+]
+
+[[excluded_surface]]
+family = "inference-bench-prefix-examples"
+tracking_issue = "#1273"
+reason = "Rust examples whose basenames match bench*.rs are outside this local script supervisor."
+paths = [
+    "crates/inference/examples/bench_concurrent.rs",
+    "crates/inference/examples/bench_dispatch.rs",
+    "crates/inference/examples/bench_dispatch2.rs",
+    "crates/inference/examples/bench_embed_quality.rs",
+    "crates/inference/examples/bench_embedding.rs",
+    "crates/inference/examples/bench_gdn.rs",
+    "crates/inference/examples/bench_gdn_decode.rs",
+    "crates/inference/examples/bench_gdn_prefill_ab.rs",
+    "crates/inference/examples/bench_gdn_state.rs",
+    "crates/inference/examples/bench_gpu.rs",
+    "crates/inference/examples/bench_metal.rs",
+    "crates/inference/examples/bench_mps_gemm.rs",
+    "crates/inference/examples/bench_persistent_state.rs",
+    "crates/inference/examples/bench_profile.rs",
+    "crates/inference/examples/bench_pruning.rs",
+    "crates/inference/examples/bench_q4_prefill.rs",
+    "crates/inference/examples/bench_q8_prefill.rs",
+    "crates/inference/examples/bench_quality.rs",
+    "crates/inference/examples/bench_simdgroup.rs",
+    "crates/inference/examples/bench_stability.rs",
+    "crates/inference/examples/bench_suite.rs",
+]
+
+[[excluded_surface]]
+family = "inference-non-bench-prefix-examples"
+tracking_issue = "#1273"
+reason = "Direct timing/profiling examples whose basenames do not match bench*.rs; previously tracked only in confirmed_outside_rust_inventory, which the prior filename-only grammar could not discover."
+paths = [
+    "crates/inference/examples/decode_profile.rs",
+    "crates/inference/examples/layer_sweep.rs",
+    "crates/inference/examples/profile_metal.rs",
+    "crates/inference/examples/profile_metal_decode.rs",
+]
+
+[[excluded_surface]]
+family = "inference-declared-binary-grammar"
+tracking_issue = "#1273"
+reason = "bench_*.rs and the four listed measurement binaries need a Rust-side supervision decision."
+paths = [
+    "crates/inference/src/bin/bench_decode_ab.rs",
+    "crates/inference/src/bin/bench_decode_slopefit.rs",
+    "crates/inference/src/bin/bench_gdn_prefill_ab.rs",
+    "crates/inference/src/bin/bench_logit_dump.rs",
+    "crates/inference/src/bin/bench_lora_mixture.rs",
+    "crates/inference/src/bin/eval_perplexity.rs",
+    "crates/inference/src/bin/gramperf_profile.rs",
+    "crates/inference/src/bin/gramtime_profile.rs",
+    "crates/inference/src/bin/ppl_metal.rs",
+]
+
+[[excluded_surface]]
+family = "inference-supervised-phase-event-binary"
+tracking_issue = "#1273"
+reason = "Product CLI whose --emit-phase-events mode emits machine-readable prefill/decode timing events; it is a real measurement surface, invoked as the CPU flagship measurement lane by scripts/bench_cpu_flagship_supervisor.py (entry: role=measurement, supervision=both-locks+quiet-baseline)."
+paths = ["crates/inference/src/bin/qwen35_generate.rs"]
+
+[[excluded_surface]]
+family = "documented-direct-cargo-commands"
+tracking_issue = "#1273"
+reason = "README commands remain direct until the Rust measurement interface is selected."
+paths = ["README.md"]
+
+# Rust paths that match rust_inventory_grammar but are not measurement entry
+# points at all: no Criterion harness, no raw Metal command-buffer dispatch,
+# and no timed output the way excluded_surface entries above produce one.
+# Each needs its own justification rather than a blanket "not a bench".
+[[non_measurement_surface]]
+path = "crates/inference/examples/diff_attn_layer23.rs"
+reason = "Correctness/parity comparison gate; prints a pass/fail diff, not a timed measurement."
+
+[[non_measurement_surface]]
+path = "crates/inference/examples/diff_gdn_layer.rs"
+reason = "Correctness/parity comparison gate; prints a pass/fail diff, not a timed measurement."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/chat_metal.rs"
+reason = "Long-running interactive product process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/main.rs"
+reason = "Long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/chat.rs"
+reason = "`lattice chat` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/serve.rs"
+reason = "`lattice serve` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/doctor.rs"
+reason = "`lattice doctor` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/prune_score.rs"
+reason = "`lattice prune-score` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice_serve.rs"
+reason = "Long-running server process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/dump_quarot_q4_golden.rs"
+reason = "Golden/correctness dump utility, not a timed benchmark."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/moe_admission_sim.rs"
+reason = "Admission simulation utility, not a Metal measurement harness."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/quantize_q4.rs"
+reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/quantize_quarot.rs"
+reason = "Weight-conversion tool; any elapsed-time logging is progress reporting, not a benchmark."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/backfill_qwen3.rs"
+reason = "One-time DB re-embedding migration utility; constructs QwenModel (not MetalQwen35State) and its rate/ETA printout is progress reporting for a human watching the migration run, not a timed measurement harness (same class as quantize_q4.rs/quantize_quarot.rs)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/qwen35_debug.rs"
+reason = "Interactive debug command, not a measurement harness."
+
+# Hosted workflow measurements are intentionally outside this local-machine
+# convention. Issue #1121 expressly excludes bench-update.yml.
+
+[[entry]]
+path = "scripts/adr064-gpu-decode-gate.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench-ci.sh"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench-command.sh"
+role = "supervisor"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/bench-compare.sh"
+role = "measurement"
+supervision = "both-locks+three-phase-quiet"
+
+[[entry]]
+path = "scripts/bench-gate.sh"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_context_scaling_chart.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_cpu_flagship_supervisor.py"
+role = "measurement"
+supervision = "both-locks+quiet-baseline"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_agentic.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_apples_precise.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_apples_to_apples.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_context_scaling.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_adapters_q4_apples.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_harness.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_decode_slopefit.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_decode_slopefit.sh"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_disposition_check.sh"
+role = "policy-check"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_gate_math.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_linkedin_post.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_quality.sh"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/bench_quality_selftest.sh"
+role = "policy-check"
+supervision = "none"
+
+[[entry]]
+path = "scripts/bench_wasm_simd.mjs"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+[[entry]]
+path = "scripts/compare_logits.py"
+role = "measurement"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/e2e-parity-local.sh"
+role = "measurement"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/e2e_parity_check.py"
+role = "measurement"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/fake_quant_pilot.py"
+role = "measurement"
+supervision = "both-locks+quiet"
+
+# Only `--run` is a measurement entry point and self-supervises. `--checkpoint`
+# is a bench-compare-internal gate that inherits bench-compare's held locks.
+[[entry]]
+path = "scripts/perf_governor.py"
+role = "measurement"
+supervision = "both-locks"
+
+[[entry]]
+path = "scripts/perf-bench-gate.py"
+role = "consumer"
+supervision = "none"
+
+[[entry]]
+path = "scripts/ppl_gate_check.py"
+role = "consumer"
+supervision = "none"

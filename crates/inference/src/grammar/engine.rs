@@ -29,9 +29,18 @@
 //! # Performance
 //!
 //! - `mask_logits`: O(vocab_size / 64) bitmask scan + O(k × stack_depth) for
-//!   context-dependent tokens, where k ≈ 1% of vocab_size.
+//!   context-dependent tokens, where k is the current grammar state's
+//!   precomputed candidate count when a state-local list was stored, or the
+//!   global union across all states when it was withheld under the
+//!   partition's aggregate capacity budget.
 //! - `advance`: O(stack_depth) PDA step; typical depth 2–8.
-//! - `new`: O(|states| × vocab_size × max_token_len) — called once.
+//! - `new`: O(|states| × vocab_size × max_token_len) — called once. `|states|`
+//!   is capped at `MAX_GRAMMAR_STATES` (256) and is the dominant, schema-
+//!   dependent factor; see [`GrammarEngine::new`] for measured figures at
+//!   both ends of that range.
+//! - First `mask_logits` call on a state past the cap: builds a byte trie
+//!   over the vocabulary, `O(vocab_size × max_token_len)` with no `|states|`
+//!   term. See [`GrammarEngine::trie_build_ns`] for a measured figure.
 
 use crate::grammar::gbnf::parse_gbnf;
 use crate::grammar::json_schema::compile;
@@ -62,8 +71,26 @@ thread_local! {
     static MASK_PROFILING_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static MASK_PROFILE: std::cell::RefCell<MaskProfile> =
         const { std::cell::RefCell::new(MaskProfile::new()) };
+    static CONTEXT_RECHECK_SIMULATED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static CONTEXT_RECHECK_CANDIDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static BUILD_PROFILE: std::cell::RefCell<BuildProfile> =
         const { std::cell::RefCell::new(BuildProfile::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONTEXT_RECHECK_CANDIDATES_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_context_recheck_candidates_for_test() {
+    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn take_context_recheck_candidates_for_test() -> u64 {
+    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(std::cell::Cell::get)
 }
 
 /// Aggregated per-decode-step grammar-masking cost, accumulated across every
@@ -131,12 +158,43 @@ impl BuildProfile {
 pub fn enable_mask_profiling() {
     MASK_PROFILING_ENABLED.with(|e| e.set(true));
     MASK_PROFILE.with(|p| *p.borrow_mut() = MaskProfile::new());
+    CONTEXT_RECHECK_SIMULATED.with(|c| c.set(0));
+    CONTEXT_RECHECK_CANDIDATES.with(|c| c.set(0));
 }
 
 /// Disable mask profiling and return the accumulated [`MaskProfile`].
 pub fn take_mask_profile() -> MaskProfile {
     MASK_PROFILING_ENABLED.with(|e| e.set(false));
     MASK_PROFILE.with(|p| *p.borrow())
+}
+
+/// Number of context-dependent candidates that actually reached
+/// `simulate_token` inside the recheck loop since the last
+/// [`enable_mask_profiling`] call (i.e. were not already pre-blocked by the
+/// precomputed bitmask). Distinguishes "the recheck loop ran"
+/// ([`MaskProfile::context_recheck_calls`]) from "the recheck loop did work".
+/// Tracked separately from [`MaskProfile`] so that surfacing it does not
+/// require adding a field to that exhaustively public, struct-literal-
+/// constructible type (a semver-major break). Unlike [`take_mask_profile`],
+/// this does not disable profiling, so it can be read mid-run.
+pub fn context_recheck_simulated() -> u64 {
+    CONTEXT_RECHECK_SIMULATED.with(std::cell::Cell::get)
+}
+
+/// Number of times the context-dependent recheck loop body was entered
+/// (i.e. the size of the candidate set the loop iterated over) since the
+/// last [`enable_mask_profiling`] call. Counted at loop entry, before the
+/// precomputed-bitmask short-circuit (`logits[token_id] ==
+/// f32::NEG_INFINITY`) skips a candidate. Distinguishes *which candidate
+/// set* the loop iterated (state-local vs. the conservative global union)
+/// from [`context_recheck_simulated`], which only counts candidates that
+/// survived that short-circuit to reach `simulate_token` — a metric that
+/// reads identically for either candidate set whenever the bitmask already
+/// rejects every out-of-group candidate. Tracked separately from
+/// [`MaskProfile`] for the same semver reason as
+/// [`context_recheck_simulated`].
+pub fn context_recheck_candidates() -> u64 {
+    CONTEXT_RECHECK_CANDIDATES.with(std::cell::Cell::get)
 }
 
 fn mask_profiling_enabled() -> bool {
@@ -194,6 +252,12 @@ impl From<crate::grammar::json_schema::SchemaError> for GrammarError {
 
 impl From<crate::grammar::gbnf::GbnfError> for GrammarError {
     fn from(e: crate::grammar::gbnf::GbnfError) -> Self {
+        GrammarError(e.0)
+    }
+}
+
+impl From<crate::grammar::pda::BuilderError> for GrammarError {
+    fn from(e: crate::grammar::pda::BuilderError) -> Self {
         GrammarError(e.0)
     }
 }
@@ -292,10 +356,37 @@ impl GrammarEngine {
     /// `vocab_bytes[i]` is the UTF-8 / byte-level representation of token `i`.
     /// For BPE tokenizers, obtain this via `BpeTokenizer::vocab_bytes(model_vocab_size)`.
     ///
-    /// This runs in O(|states| × vocab_size × max_token_len) time.  For
-    /// large vocabularies (e.g. Qwen3 at 248,320 tokens) this may take
-    /// 50–200 ms.  Cache the `GrammarEngine` across requests with the same
-    /// schema.
+    /// This runs in O(|states| × vocab_size × max_token_len) time, where
+    /// `|states|` is capped at `MAX_GRAMMAR_STATES` (256, see
+    /// `vocab_partition::MAX_GRAMMAR_STATES`) and is schema-dependent — a
+    /// timing figure is only meaningful alongside the `|states|` it was
+    /// measured at. Two reference points against the real Qwen3 tokenizer
+    /// (248,320 tokens):
+    ///
+    /// | schema                                             | \|states\| | measured |
+    /// |------------------------------------------------------|-----------|----------|
+    /// | bare 3-member string enum, no object wrapper          | 13        | ~0.2–0.6 s |
+    /// | 4-level nested object, 6 string enums (issue #734 repro) | 256 (cap) | ~21–45 s (up to ~155 s under heavy concurrent load) |
+    ///
+    /// Measured with `cargo run --release --bin gramtime_profile`
+    /// (`crates/inference/src/bin/gramtime_profile.rs`), 6–10 repetitions per
+    /// schema, on a shared development machine with other processes
+    /// competing for CPU — the low ends above are the least-contended
+    /// samples, not an idle-machine floor; see that binary's module doc for
+    /// full per-repetition figures and methodology. Per-(state, token)-pair
+    /// cost was **not** constant between the two schemas (roughly 2–5×
+    /// higher for the capped schema), plausibly because its states sit at
+    /// deeper, more backtracking-prone PDA stack configurations than the
+    /// enum's flat single-rule matching — so `|states|` alone does not fully
+    /// determine build time either, only bounds its order of magnitude.
+    ///
+    /// This cost is **construction only**. A schema whose state count hits
+    /// the cap pays a second, separate cost the first time `mask_logits` is
+    /// called on a state outside the precomputed set: see
+    /// [`Self::trie_build_ns`]. Caching the `GrammarEngine` across requests
+    /// with the same schema amortizes both — the constructor cost shown
+    /// here, and that first-mask trie build — over every subsequent request
+    /// against the same schema.
     pub fn new(spec: &GrammarSpec, vocab_bytes: Vec<Vec<u8>>) -> Result<Self, GrammarError> {
         let vocab_size = vocab_bytes.len();
 
@@ -354,6 +445,17 @@ impl GrammarEngine {
     /// if the trie has not been built yet (grammar never hit an over-cap
     /// state, or none has been masked yet). Diagnostic accessor for
     /// self-measurement harnesses.
+    ///
+    /// This cost is separate from — and not included in — [`Self::new`]'s
+    /// build time: `ByteTrie::build` depends only on `vocab_bytes`, not on
+    /// the grammar or its state count, and runs lazily on whichever request
+    /// is the *first* to call `mask_logits` from a state outside the
+    /// precomputed partition (i.e. only for schemas where `new` hit
+    /// `MAX_GRAMMAR_STATES`; see [`Self::exceeds_state_budget`]). Measured
+    /// directly against the real Qwen3 vocabulary (248,320 tokens, same
+    /// methodology as [`Self::new`]'s doc): ~85–150 ms typical, up to
+    /// ~310 ms under heavy concurrent machine load — see
+    /// `crates/inference/src/bin/gramtime_profile.rs`.
     pub fn trie_build_ns(&self) -> u64 {
         self.trie_build_ns.load(Ordering::Relaxed)
     }
@@ -393,7 +495,10 @@ impl GrammarEngine {
     /// The hot path is a bitmask scan over `vocab_size / 64` words (~3,880
     /// iterations for Qwen3's 248,320 tokens), taking under 40 µs on modern
     /// Apple Silicon.  Context-dependent tokens add O(k × stack_depth)
-    /// overhead (k ≈ 1% of vocab).
+    /// overhead, where k is the precomputed candidate count for this grammar
+    /// state when a state-local list was stored. A state whose list was
+    /// withheld under the partition's aggregate capacity budget conservatively
+    /// falls back to k being the union across every state.
     pub fn mask_logits(
         &self,
         state: &mut GrammarState,
@@ -423,7 +528,14 @@ impl GrammarEngine {
 
                 // Re-check context-dependent tokens at runtime.
                 let t1 = profiling.then(std::time::Instant::now);
-                for &token_id in self.partition.context_dependent_ids() {
+                let mut simulated = 0u64;
+                let mut visited = 0u64;
+                for &token_id in self.partition.context_dependent_ids_for_state(state_id) {
+                    #[cfg(test)]
+                    CONTEXT_RECHECK_CANDIDATES_FOR_TEST.with(|count| count.set(count.get() + 1));
+                    if profiling {
+                        visited += 1;
+                    }
                     if token_id >= self.vocab_size {
                         continue;
                     }
@@ -438,6 +550,9 @@ impl GrammarEngine {
                         continue;
                     }
                     let (result, _) = simulate_token(state, &self.grammar, token_bytes);
+                    if profiling {
+                        simulated += 1;
+                    }
                     match result {
                         // Byte-level rejection, or partial consumption (the token
                         // straddles a grammar boundary and cannot be generated as a
@@ -456,6 +571,8 @@ impl GrammarEngine {
                         p.context_recheck_calls += 1;
                         p.context_recheck_ns += ns;
                     });
+                    CONTEXT_RECHECK_SIMULATED.with(|c| c.set(c.get() + simulated));
+                    CONTEXT_RECHECK_CANDIDATES.with(|c| c.set(c.get() + visited));
                 }
             }
             None => {
@@ -471,6 +588,14 @@ impl GrammarEngine {
                 // step instead of re-walking each one independently).
                 // `mask_by_simulation` stays available as the oracle for the
                 // differential tests below and as a manual fallback.
+                //
+                // `mask_by_trie` builds the trie on the *first* call that
+                // reaches this branch for this engine (OnceLock) — a
+                // separate, one-time cost from `GrammarEngine::new`'s own
+                // build, measured at ~85-150ms for the real Qwen3
+                // vocabulary; see `Self::trie_build_ns`'s doc for figures
+                // and methodology. It lands on whichever request happens to
+                // be first, not on construction.
                 let t0 = profiling.then(std::time::Instant::now);
                 self.mask_by_trie(state, logits);
                 if let Some(t0) = t0 {
@@ -953,6 +1078,41 @@ mod tests {
             .expect_err("the public simulation path must reject the same mismatch");
         assert!(simulation_error.0.contains("logits length 1"));
         assert!(simulation_error.0.contains("vocabulary size 2"));
+    }
+
+    #[test]
+    fn mask_logits_rechecks_only_the_current_states_candidates() {
+        let spec = GrammarSpec::Gbnf("root ::= \"abcd\"\n".to_string());
+        let vocab = vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"d".to_vec(),
+            b"ax".to_vec(),
+            b"bx".to_vec(),
+            b"cx".to_vec(),
+            b"dx".to_vec(),
+        ];
+        let engine = GrammarEngine::new(&spec, vocab).expect("fixture grammar must compile");
+        let mut state = engine.initial_state();
+        assert!(engine.advance(&mut state, 0), "token 'a' must advance");
+
+        reset_context_recheck_candidates_for_test();
+        let mut actual = vec![0.0; 8];
+        engine
+            .mask_logits(&mut state, &mut actual)
+            .expect("fixture logits match the vocabulary");
+        assert_eq!(
+            take_context_recheck_candidates_for_test(),
+            1,
+            "state after 'a' must inspect only the 'bx' partial token"
+        );
+
+        let mut oracle = vec![0.0; 8];
+        engine
+            .mask_by_simulation(&state, &mut oracle)
+            .expect("fixture logits match the vocabulary");
+        assert_eq!(actual, oracle);
     }
 
     #[test]

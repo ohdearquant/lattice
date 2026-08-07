@@ -4,6 +4,7 @@
 /// `None` is reserved for non-generation returns (empty prompt, stub code paths) that do not
 /// correspond to any of these causes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StopReason {
     /// EOS token, configured stop-token id, or stop-string match.
     Eos,

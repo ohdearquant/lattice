@@ -1107,8 +1107,8 @@ mod tests {
     #[test]
     fn constructed_cache_eagerly_initializes_configured_len() {
         // Verifies that FlatKVCache::new immediately materializes all buffers
-        // at max_seq_len capacity (eager-allocation contract; issue #12 resolved by
-        // capping max_seq_len via GenerateConfig::kv_cache_capacity in generate()).
+        // at max_seq_len capacity (eager-allocation contract; callers must provide
+        // their bounded capacity up front).
         let config = FlatKVCacheConfig::for_qwen3(2, 2, 4, 16);
         let cache = FlatKVCache::new(config);
         let kv_dim = cache.kv_dim(); // 2 * 4 = 8
@@ -1203,7 +1203,7 @@ mod tests {
     //   - Builds deterministic Q/K/V tensors (xorshift32 PRNG, no model weights).
     //   - Runs scaled dot-product attention with f32 KV directly.
     //   - Stores same K/V in FlatKVCache (quantizes to f16), dequantizes via
-    //     the scratch-loop used by generate.rs, runs same attention.
+    //     the production-style scratch loop, runs the same attention.
     //   - Projects both outputs through a deterministic W_out to produce logits.
     //   - Asserts: logit_max_abs_diff < 0.02, top1_match_rate >= 0.95,
     //              nan_count == 0, synthetic_nll_delta_abs < 0.01.
@@ -1378,7 +1378,7 @@ mod tests {
                 };
                 let mut cache = FlatKVCache::new(cfg);
 
-                // Write K/V row by row (matching generate.rs prefill pattern).
+                // Write K/V row by row, matching the flat-cache prefill pattern.
                 {
                     let k_layer = cache.k_buffer_mut(0);
                     for (i, &val) in k_f32.iter().enumerate() {
@@ -1391,7 +1391,7 @@ mod tests {
                 }
                 cache.advance_by(seq_len).unwrap();
 
-                // Dequantize via the same scratch-loop pattern as generate.rs:463-466.
+                // Dequantize through the same scratch-loop pattern used by CPU paths.
                 let k_end = seq_len * KV_DIM;
                 let mut k_dequant = vec![0.0f32; k_end];
                 let mut v_dequant = vec![0.0f32; k_end];

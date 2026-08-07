@@ -1,6 +1,5 @@
 //! Qwen3.5 generation, streaming generation, prefill/decode loops, stop-streamer utilities, and stop-token helpers.
 use super::cache::{ForwardScratch, KvCache};
-use super::detokenize::{IncrementalDetokenizer, decode_tokens};
 use super::model::Qwen35Model;
 use super::sampling::sample_token;
 use super::stop_strings::{
@@ -16,6 +15,7 @@ use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
+use crate::tokenizer::detokenize::{IncrementalDetokenizer, decode_tokens};
 
 /// Test-only toggle forcing the pre-delegation serial prefill path
 /// (`prefill_tokens`) instead of `prefill_tokens_batched_for_generate`.
@@ -115,7 +115,7 @@ impl Qwen35Model {
 
         // Initialise per-request grammar state when grammar-constrained decoding
         // is requested. None when no grammar is set (zero-cost for unconstrained
-        // generation). Mirrors the pattern in crate::generate::generate.
+        // generation). Shared by every canonical Qwen3.5 entry point.
         let mut grammar_state: Option<GrammarState> =
             gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
@@ -220,8 +220,8 @@ impl Qwen35Model {
 
         // Advance grammar state after sampling. advance() returns false when the
         // grammar has no valid continuation for the selected token, signalling the
-        // end of grammar-constrained generation. Mirror the same early-return used
-        // in crate::generate::generate for parity.
+        // end of grammar-constrained generation. Keep the same early-return
+        // contract across the canonical direct and streaming paths.
         let grammar_complete =
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
                 if !engine.advance(gs, next_id) {
@@ -396,7 +396,7 @@ impl Qwen35Model {
         }
     }
 
-    /// Streaming variant of [`generate`] — identical token sequence, but invokes
+    /// Streaming variant of [`Self::generate`] — identical token sequence, but invokes
     /// `on_token` with incremental text deltas after each generated token.
     ///
     /// # Parity safety
@@ -1179,6 +1179,7 @@ impl Qwen35Model {
 /// sampled token, and measuring `prefill_end` off the first delta fires it
 /// after sampling instead of before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RawGenEvent {
     /// Fired exactly once, after the prefill forward pass has produced
     /// logits and before the first token is sampled -- the true
@@ -2245,8 +2246,8 @@ pub(crate) fn check_grammar_not_set(gen_cfg: &GenerateConfig) -> Result<(), Infe
     if gen_cfg.grammar.is_some() {
         return Err(InferenceError::InvalidInput(
             "grammar-constrained decoding is not yet supported on this path; \
-             use the Qwen3.5 CPU generate() / generate_streaming() or the generic \
-             generate() in src/generate.rs, which implement grammar masking"
+             use the Qwen3.5 CPU generate() / generate_streaming(), which implement \
+             grammar masking"
                 .into(),
         ));
     }

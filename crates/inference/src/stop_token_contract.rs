@@ -5,8 +5,7 @@
 //! `stop_token_ids`):
 //!
 //! - **INCLUDE**: the stop token is pushed into `token_ids`/`text` and then
-//!   generation halts (the generic [`crate::generate::generate`] path, and the
-//!   Metal MTP/self-speculative decode loops in
+//!   generation halts (the Metal MTP/self-speculative decode loops in
 //!   [`crate::forward::metal_qwen35`]).
 //! - **EXCLUDE**: the stop token is detected *before* it is pushed, so
 //!   `token_ids`/`text` never contain it (the Qwen3.5 CPU family in
@@ -21,8 +20,7 @@
 //! semantics most callers expect (the stop marker is a control signal, not
 //! content), and it
 //! composes correctly with string-level `stop_strings` truncation, which by
-//! construction already drops the matched suffix. `GenerateOutput`'s doc
-//! comment (in [`crate::generate`] and [`crate::model::qwen35_config`]) now
+//! construction already drops the matched suffix. [`crate::model::qwen35_config::GenerateOutput`]
 //! records this explicitly. The MTP and self-spec loops were the two sites
 //! that needed a production change; see `crates/inference/src/forward/metal_qwen35.rs`.
 //!
@@ -59,18 +57,6 @@
 //! `MetalQwen35State` construction path, which needs a live `MTLDevice`) for
 //! no contract-coverage benefit. Grep `stop_token_contract` or `#613` in
 //! `metal_qwen35.rs` to find them.
-//!
-//! **`crate::generate::generate` (the generic `QwenModel` path) is
-//! intentionally excluded from live coverage.** `QwenModel` holds
-//! `ManuallyDrop<QwenWeights<'static>>` fields behind a hand-written unsafe
-//! `Drop` impl that enforces a specific field drop order; building a
-//! throwaway test instance safely requires reproducing that unsafe
-//! self-referential setup outside of the real loader, which is
-//! disproportionate risk for a path whose stop-check fix is two one-line
-//! reorderings (already applied, see `crates/inference/src/generate.rs`).
-//! That fix is covered by reading the diff and the existing
-//! `crate::generate` unit tests that exercise `should_stop_token`, not by a
-//! new end-to-end fixture here.
 //!
 //! ## What "sweep" means here
 //!

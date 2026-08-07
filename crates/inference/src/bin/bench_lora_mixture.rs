@@ -180,6 +180,8 @@ fn run_gpu_decode_bench(
     use lattice_inference::tokenizer::BpeTokenizer;
     use std::time::Instant;
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
     let dir = std::path::Path::new(model_dir_str);
     if !dir.exists() {
         eprintln!("[bench_lora_mixture] model dir does not exist: {model_dir_str}");

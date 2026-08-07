@@ -966,8 +966,7 @@ pub(crate) fn open_and_mmap_q4_file(
     expected_shape: Option<&[usize]>,
     check: Q4BlockCheck<'_>,
 ) -> Result<(Q4FileHeader, memmap2::Mmap, Option<Q4BlocksChecked>), String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let (mut file, metadata) = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
     let header = validate_q4_file(&mut file, path, expected_shape)
         .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
 
@@ -976,6 +975,7 @@ pub(crate) fn open_and_mmap_q4_file(
     // process lifetime" invariant documented above.
     let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
         .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+    crate::weights::mmap_trust::verify_mmap_target_unchanged(&file, &metadata, path)?;
 
     let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
         format!(
@@ -1148,6 +1148,7 @@ fn read_f16_header(
 /// Why loading a `.f16` failed, when the caller needs to distinguish a shape
 /// disagreement from every other failure in order to report it well.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum F16LoadError {
     /// The header's declared shape disagreed with the shape the caller required.
     /// The payload was not read.

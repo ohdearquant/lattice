@@ -21,7 +21,9 @@
 //!     --test gemma4_e2e_forward_test -- --nocapture
 //! ```
 
+#[cfg(feature = "f16")]
 use lattice_inference::Tokenizer as _;
+#[cfg(feature = "f16")]
 use lattice_inference::model::gemma4_model::Gemma4Model;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -159,6 +161,7 @@ fn resolve_model_dir() -> Option<PathBuf> {
     }
 }
 
+#[cfg(feature = "f16")]
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter()

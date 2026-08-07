@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,12 +18,18 @@ SCHEMA = "perf-ambient-sample/v1"
 PHASES = ("before", "between", "after")
 
 
-def _criterion_root(parent: Path, name: str, ci_low: float) -> Path:
+def _criterion_root(
+    parent: Path,
+    name: str,
+    ci_low: float,
+    *,
+    baseline_name: str = "compare-base",
+) -> Path:
     root = parent / name / "criterion"
     bench = root / "group" / "bench"
-    for artifact in ("compare-base", "new", "change"):
+    for artifact in (baseline_name, "new", "change"):
         (bench / artifact).mkdir(parents=True)
-    (bench / "compare-base" / "estimates.json").write_text(
+    (bench / baseline_name / "estimates.json").write_text(
         '{"mean":{"point_estimate":100.0}}\n'
     )
     (bench / "new" / "estimates.json").write_text(
@@ -69,6 +77,205 @@ def _run(root: Path, samples: Path, status: Path, target: str) -> subprocess.Com
 
 
 class PerfBenchGateStatusTests(unittest.TestCase):
+    def test_single_abba_block_cannot_detect_sign_changing_order_effects(
+        self,
+    ) -> None:
+        spec = importlib.util.spec_from_file_location("perf_bench_gate", GATE)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        forward = module.BenchResult(
+            "group/bench", 0.10, 0.10, 0.10, 110.0, 100.0
+        )
+        reverse = module.BenchResult(
+            "group/bench", -0.10, -0.10, -0.10, 90.0, 100.0
+        )
+
+        result = module.order_balance_pair(forward, reverse)
+
+        self.assertAlmostEqual(result.point_pct, 10.554160, places=6)
+        self.assertAlmostEqual(result.order_bias_bound_pct, 0.503782, places=6)
+        self.assertEqual(result.verdict(), "FAIL")
+
+    def test_extra_reverse_comparison_is_an_input_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "forward", 0.095)
+            control = _criterion_root(
+                root,
+                "reverse",
+                0.095,
+                baseline_name="compare-head",
+            )
+            extra = control / "group" / "unexpected" / "change"
+            extra.mkdir(parents=True)
+            (extra / "estimates.json").write_text(
+                '{"mean":{"point_estimate":0.0,'
+                '"confidence_interval":{"lower_bound":0.0,'
+                '"upper_bound":0.0}}}\n'
+            )
+            samples = root / "ambient.jsonl"
+            _samples(samples, {phase: 95.0 for phase in PHASES})
+            status = root / "status.json"
+            target = "lattice-inference:elementwise_cpu_bench"
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(GATE),
+                    str(criterion),
+                    "fixture/extra-order-control",
+                    "--target",
+                    target,
+                    "--require-measurements",
+                    "--require-order-balance",
+                    "--order-control-root",
+                    str(control),
+                    "--ambient-samples",
+                    str(samples),
+                    "--status-out",
+                    str(status),
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "error")
+            self.assertIn("order-control comparison set differs", payload["reason"])
+            self.assertIn("group/unexpected", payload["reason"])
+
+    def test_malformed_reverse_numbers_are_input_errors_with_status(self) -> None:
+        cases = (
+            ("string point", ("point_estimate",), "corrupt"),
+            ("boolean CI", ("confidence_interval", "lower_bound"), True),
+        )
+        for label, path, invalid_value in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                criterion = _criterion_root(root, "forward", 0.095)
+                control = _criterion_root(
+                    root,
+                    "reverse",
+                    0.095,
+                    baseline_name="compare-head",
+                )
+                change_path = control / "group" / "bench" / "change" / "estimates.json"
+                change = json.loads(change_path.read_text())
+                destination = change["mean"]
+                for key in path[:-1]:
+                    destination = destination[key]
+                destination[path[-1]] = invalid_value
+                change_path.write_text(json.dumps(change))
+
+                samples = root / "ambient.jsonl"
+                _samples(samples, {phase: 95.0 for phase in PHASES})
+                status = root / "status.json"
+                target = "lattice-inference:elementwise_cpu_bench"
+                result = subprocess.run(
+                    [
+                        "python3",
+                        str(GATE),
+                        str(criterion),
+                        "fixture/malformed-order-control",
+                        "--target",
+                        target,
+                        "--require-measurements",
+                        "--require-order-balance",
+                        "--order-control-root",
+                        str(control),
+                        "--ambient-samples",
+                        str(samples),
+                        "--status-out",
+                        str(status),
+                    ],
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                payload = json.loads(status.read_text())
+                self.assertEqual(payload["verdict"], "error")
+                self.assertEqual(payload["exit_code"], 2)
+                self.assertIn("invalid order-control evidence", payload["reason"])
+
+    def test_required_order_balance_without_control_writes_error_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "forward", 0.095)
+            samples = root / "ambient.jsonl"
+            _samples(samples, {phase: 95.0 for phase in PHASES})
+            status = root / "status.json"
+            target = "lattice-inference:elementwise_cpu_bench"
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(GATE),
+                    str(criterion),
+                    "fixture/missing-order-control",
+                    "--target",
+                    target,
+                    "--require-measurements",
+                    "--require-order-balance",
+                    "--ambient-samples",
+                    str(samples),
+                    "--status-out",
+                    str(status),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "error")
+            self.assertEqual(payload["exit_code"], 2)
+            self.assertIn("needs --order-control-root", payload["reason"])
+
+    def test_gate_sized_order_bias_is_not_measurable_status(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "forward", 0.095)
+            control = _criterion_root(
+                root,
+                "reverse",
+                0.095,
+                baseline_name="compare-head",
+            )
+            samples = root / "ambient.jsonl"
+            _samples(samples, {phase: 95.0 for phase in PHASES})
+            status = root / "status.json"
+            target = "lattice-inference:elementwise_cpu_bench"
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(GATE),
+                    str(criterion),
+                    "fixture/order-bias",
+                    "--target",
+                    target,
+                    "--require-measurements",
+                    "--require-order-balance",
+                    "--order-control-root",
+                    str(control),
+                    "--ambient-samples",
+                    str(samples),
+                    "--status-out",
+                    str(status),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn("**⏸ NOT MEASURABLE**", result.stdout)
+            self.assertNotIn("✅ All 1 gated benches", result.stdout)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "not_measurable")
+            self.assertEqual(payload["exit_code"], 3)
+            self.assertIn("order-bias bound above", payload["reason"])
+            self.assertEqual(payload["measurement_count"], 1)
+            self.assertEqual(payload["ambient"]["assessment"], "valid")
+
     def test_completeness_error_outranks_not_measurable_for_informational_target(
         self,
     ) -> None:
@@ -210,6 +417,97 @@ class PerfBenchGateStatusTests(unittest.TestCase):
             self.assertEqual(payload["verdict"], "error")
             self.assertEqual(payload["exit_code"], 2)
             self.assertEqual(payload["ambient"]["assessment"], "invalid")
+
+    def test_stale_change_does_not_exempt_uncovered_head_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "covered", 0.0)
+
+            uncovered = criterion / "new_group" / "new_bench"
+            (uncovered / "new").mkdir(parents=True)
+            (uncovered / "new" / "estimates.json").write_text(
+                '{"mean":{"point_estimate":100.0}}\n'
+            )
+            # A stale, non-selected baseline comparison sits beside the head
+            # artifact. It must not be read as coverage for the selected
+            # baseline ("compare-base"), which has no estimate here at all.
+            (uncovered / "stale-baseline").mkdir(parents=True)
+            (uncovered / "stale-baseline" / "estimates.json").write_text(
+                '{"mean":{"point_estimate":90.0}}\n'
+            )
+            (uncovered / "change").mkdir(parents=True)
+            (uncovered / "change" / "estimates.json").write_text(json.dumps({
+                "mean": {
+                    "point_estimate": 0.10,
+                    "confidence_interval": {"lower_bound": 0.05, "upper_bound": 0.15},
+                },
+            }))
+
+            samples = root / "ambient.jsonl"
+            _samples(samples, {"before": 95.0, "between": 95.0, "after": 95.0})
+            status = root / "status.json"
+            result = _run(criterion, samples, status, "lattice-inference:fixture")
+
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("NO COVERAGE", result.stderr)
+            self.assertIn("new_group/new_bench", result.stderr)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "error")
+            self.assertEqual(payload["exit_code"], 2)
+            self.assertIn("NO COVERAGE", payload["reason"])
+
+    def test_root_level_estimates_ignored_in_report_only_mode(self) -> None:
+        # Root-level debris: a bare `cargo bench` (or stray output) can write
+        # new/estimates.json OR change/estimates.json directly under the
+        # Criterion root, with no benchmark directory above it. Both the
+        # head-side (new/) and change-side (change/) artifact names must be
+        # excluded the same way.
+        for debris_name in ("new", "change"):
+            with self.subTest(debris_name=debris_name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    criterion = _criterion_root(root, "pass", 0.0)
+                    (criterion / debris_name).mkdir(parents=True)
+                    (criterion / debris_name / "estimates.json").write_text(
+                        '{"mean":{"point_estimate":100.0}}\n'
+                    )
+
+                    result = subprocess.run(
+                        ["python3", str(GATE), str(criterion), "fixture/report-only"],
+                        text=True,
+                        capture_output=True,
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertNotIn(
+                        "is not below a Criterion benchmark directory", result.stderr
+                    )
+
+    def test_root_level_estimates_ignored_with_status_out(self) -> None:
+        for debris_name in ("new", "change"):
+            with self.subTest(debris_name=debris_name):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    criterion = _criterion_root(root, "pass", 0.0)
+                    (criterion / debris_name).mkdir(parents=True)
+                    (criterion / debris_name / "estimates.json").write_text(
+                        '{"mean":{"point_estimate":100.0}}\n'
+                    )
+
+                    samples = root / "ambient.jsonl"
+                    _samples(samples, {phase: 95.0 for phase in PHASES})
+                    status = root / "status.json"
+                    result = _run(criterion, samples, status, "lattice-inference:fixture")
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertTrue(
+                        status.exists(), "status file must be written even with root debris"
+                    )
+                    payload = json.loads(status.read_text())
+                    self.assertEqual(payload["verdict"], "pass")
+                    self.assertEqual(payload["exit_code"], 0)
 
     def test_non_voting_phase_is_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

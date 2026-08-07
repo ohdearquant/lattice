@@ -42,6 +42,8 @@ fn run_bench() {
     // Load CPU model for comparison
     println!("Loading CPU model...");
     let t0 = Instant::now();
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let cpu_model = lattice_inference::QwenModel::from_directory(dir).unwrap();
     let cpu_load_ms = t0.elapsed().as_millis();
     println!("  CPU model loaded in {cpu_load_ms}ms\n");

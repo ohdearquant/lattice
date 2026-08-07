@@ -14,6 +14,7 @@ fn main() {
         .unwrap_or(2048);
 
     eprintln!("[ppl_metal] loading {model_dir}");
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let model = Qwen35Model::from_safetensors(dir).expect("load model");
     let cfg = model.config().clone();
     let mut metal = MetalQwen35State::new(model.weights(), &cfg, 4096).expect("init metal");
