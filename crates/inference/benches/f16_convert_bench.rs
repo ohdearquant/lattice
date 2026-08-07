@@ -18,8 +18,12 @@
 //!
 //! ADR-058: every perf PR must include before/after bench output.
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use lattice_inference::weights::bench_support::f16_bits_to_f32;
+use criterion::{
+    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
+};
+use lattice_inference::weights::{SafetensorsFile, bench_support::f16_bits_to_f32};
+use std::fs;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Convert n f16 values (as u16 bits) at `src` into f32 values at `dst`,
@@ -70,5 +74,59 @@ fn bench_f16_convert(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "f16")]
+fn safetensors_fixture(dtype: &str, bits: u16, elements: usize) -> PathBuf {
+    let header = format!(
+        r#"{{"weight":{{"dtype":"{dtype}","shape":[{elements}],"data_offsets":[0,{}]}}}}"#,
+        elements * 2
+    );
+    let mut bytes = Vec::with_capacity(8 + header.len() + elements * 2);
+    bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(header.as_bytes());
+    bytes.extend_from_slice(&bits.to_le_bytes().repeat(elements));
+    let path = std::env::temp_dir().join(format!(
+        "lattice-ingress-widen-{}-{dtype}.safetensors",
+        std::process::id()
+    ));
+    fs::write(&path, bytes).expect("write safetensors benchmark fixture");
+    path
+}
+
+#[cfg(feature = "f16")]
+fn bench_safetensors_ingress_widen(c: &mut Criterion) {
+    const N: usize = 8 * 1024 * 1024;
+    let fixtures = [
+        ("F16", safetensors_fixture("F16", 0x3c00, N)),
+        ("BF16", safetensors_fixture("BF16", 0x3f80, N)),
+    ];
+
+    let mut group = c.benchmark_group("safetensors_ingress_widen");
+    group.measurement_time(Duration::from_secs(5));
+    group.throughput(Throughput::Elements(N as u64));
+
+    for (dtype, path) in &fixtures {
+        group.bench_with_input(BenchmarkId::new(*dtype, N), path, |b, path| {
+            b.iter_batched_ref(
+                || SafetensorsFile::open(path.as_path()).expect("open benchmark fixture"),
+                |weights| {
+                    let (values, shape) = weights
+                        .get_f32_tensor("weight")
+                        .expect("widen benchmark tensor");
+                    black_box((values.as_ptr(), values.len(), shape));
+                },
+                BatchSize::LargeInput,
+            )
+        });
+    }
+
+    group.finish();
+    for (_, path) in fixtures {
+        fs::remove_file(path).expect("remove safetensors benchmark fixture");
+    }
+}
+
+#[cfg(feature = "f16")]
+criterion_group!(benches, bench_f16_convert, bench_safetensors_ingress_widen);
+#[cfg(not(feature = "f16"))]
 criterion_group!(benches, bench_f16_convert);
 criterion_main!(benches);

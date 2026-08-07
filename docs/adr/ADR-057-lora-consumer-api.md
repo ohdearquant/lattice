@@ -11,6 +11,23 @@ public at `crates/tune/src/lora/safetensors.rs:439`. `adapt_step` (online gradie
 ships at `crates/tune/src/lora/online.rs:38`. The BERT hook, consumer docs, and
 inference-hook feature gate shipped across D1–D5. Status promoted from Draft to Accepted.
 
+## Amendment: shared Qwen projection geometry (2026-07-29)
+
+Tune validation and Metal adapter loading share one inference-owned Qwen projection-geometry
+source: `lattice_inference::lora_hook::qwen35_projection_shape`, which returns the documented
+`LoraProjectionShape` descriptor. `LoraAdapter::validate_against` delegates to that helper
+instead of maintaining a second shape table, while preserving lattice-tune's existing
+`TuneError::Validation` messages at its public boundary.
+
+Backend capability remains separate from neutral model geometry. The shared helper accepts
+all geometrically valid Gated DeltaNet projections, including `in_proj_a` and `in_proj_b`.
+Metal keeps a thin wrapper that rejects those two modules with its existing error because
+the fused recurrence kernel cannot apply their LoRA deltas. This separation prevents a
+backend limitation from making valid CPU/training adapters fail neutral validation.
+
+This amendment covers layer/module projection geometry only. Rank, alpha, dtype, adapter
+blending, and backend execution capability remain consumer- or backend-owned checks.
+
 ## Context
 
 khive's brain pack (ADR-032, ADR-042) consumes lattice as its inference and fine-tuning engine. Five gaps exist between what lattice exposes and what a downstream LoRA consumer needs for a complete adapter lifecycle:
@@ -275,6 +292,7 @@ Phases 1-3 are independent and can run in parallel. Phase 4 requires reading the
 - Issue #61: adapt_step for online single-event gradient steps
 - Issue #62: Typed ModuleName enum discussion
 - Issue #63: Downstream consumer Cargo.toml example
+- Issue #615: Shared LoRA adapter descriptor and blend validation
 - ADR-008: LoRA Injection via Trait Hook (`ADR-008-lora-injection.md`; trait shape, String key rationale)
 - ADR-031: LoRA adapter management (load/apply)
 - ADR-033: JIT adaptation (placeholder gap)

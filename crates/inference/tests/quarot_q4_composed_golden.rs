@@ -163,6 +163,7 @@ fn run_composed_gate(model_dir: &Path, q4_dir: &Path, golden: &Golden) {
     use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
+    let _gpu_guard = lattice_inference::measurement::gpu_test_lock();
     let cfg = Qwen35Config::from_config_json(&q4_dir.join("config.json"))
         .unwrap_or_else(|e| panic!("failed to parse {}/config.json: {e}", q4_dir.display()));
     let tokenizer_path = model_dir.join("tokenizer.json");

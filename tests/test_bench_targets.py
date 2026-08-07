@@ -73,9 +73,20 @@ class BenchTargetPolicyTests(unittest.TestCase):
         return manifest
 
     def test_workspace_bench_targets_are_executable(self) -> None:
+        manifests = sorted((ROOT / "crates").glob("*/Cargo.toml"))
+        self.assertGreater(
+            len(manifests),
+            0,
+            "bench-target sweep found zero crate manifests; this is an instrument defect, not a clean result",
+        )
+        self.assertIn(
+            ROOT / "crates" / "inference" / "Cargo.toml",
+            manifests,
+            "bench-target sweep did not reach crates/inference/Cargo.toml; check the workspace root and manifest glob",
+        )
         errors = [
             error
-            for manifest in sorted((ROOT / "crates").glob("*/Cargo.toml"))
+            for manifest in manifests
             for error in bench_target_errors(manifest)
         ]
         self.assertEqual(errors, [])
@@ -115,6 +126,26 @@ class BenchTargetPolicyTests(unittest.TestCase):
                 ROOT / "scripts" / "perf-bench-gate.py",
                 root / "scripts" / "perf-bench-gate.py",
             )
+            gate_script = (ROOT / "scripts" / "bench-gate.sh").read_text()
+            gate_script = gate_script.replace(
+                'source "$REPO/scripts/lib/bench-supervision.sh"\n'
+                "\nbench_gate_measurement() {\n",
+                "",
+            )
+            gate_script = gate_script.replace(
+                "\n}\n\n"
+                'bench_supervise_entry "bench-gate" durable '
+                'bench_gate_measurement "$@"\n',
+                "\n",
+            )
+            gate_script = re.sub(
+                r'^bench_quiet_checkpoint "bench-gate: [^"]+"$',
+                ":",
+                gate_script,
+                flags=re.MULTILINE,
+            )
+            (root / "scripts" / "bench-gate.sh").write_text(gate_script)
+            (root / "scripts" / "bench-gate.sh").chmod(0o755)
             baseline = root / ".cache" / "perf-baselines" / "testarch-testos"
             baseline.mkdir(parents=True)
             bindir = root / "bin"
@@ -147,5 +178,23 @@ class BenchTargetPolicyTests(unittest.TestCase):
             )
 
 
+def load_tests(
+    loader: unittest.TestLoader,
+    tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    del loader, pattern
+    if tests.countTestCases() == 0:
+        raise RuntimeError("no tests collected from tests.test_bench_targets")
+    return tests
+
+
+class _FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        if self.test.countTestCases() == 0:
+            raise SystemExit("no tests collected")
+        super().runTests()
+
+
 if __name__ == "__main__":
-    unittest.main()
+    _FailOnEmptyTestProgram()

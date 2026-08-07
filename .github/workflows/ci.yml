@@ -83,9 +83,36 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_HEAD_SHA: ${{ github.event.merge_group.head_sha || github.sha }}
+        shell: /usr/bin/env -u BASH_ENV -u ENV PATH=/usr/bin:/bin /bin/bash --noprofile --norc -e -u -o pipefail {0}
         run: |
           set -euo pipefail
-          CHANGED=$(./scripts/ci-changed-files.sh)
+          if [[ ! "$CI_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::base revision must be a nonempty 40-character hexadecimal commit ID" >&2
+            exit 2
+          fi
+          if [ "$CI_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "→ all-zero base revision: full matrix REQUIRED"
+            exit 0
+          fi
+          TRUSTED_DETECTOR=$(mktemp)
+          CHANGED_FILE=$(mktemp)
+          trap 'rm -f "$TRUSTED_DETECTOR" "$CHANGED_FILE"' EXIT
+          if /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/git --no-replace-objects show "${CI_BASE_SHA}:scripts/ci-changed-files.sh" > "$TRUSTED_DETECTOR"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::unable to load change detector from base revision (status $DETECTOR_STATUS)" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          if /usr/bin/env -i PATH=/usr/bin:/bin GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" CI_BASE_SHA="$CI_BASE_SHA" CI_HEAD_SHA="$CI_HEAD_SHA" /bin/sh "$TRUSTED_DETECTOR" > "$CHANGED_FILE"; then
+            :
+          else
+            DETECTOR_STATUS=$?
+            echo "::error::change detector failed with status $DETECTOR_STATUS" >&2
+            exit "$DETECTOR_STATUS"
+          fi
+          CHANGED=$(<"$CHANGED_FILE")
           echo "Changed files:"
           echo "$CHANGED"
           # Non-Rust set: **/*.md, docs/**, LICENSE*, .gitignore, and the
@@ -102,13 +129,16 @@ jobs:
           # apps/macos and a Rust path still leaves the Rust file in NON_DOCS
           # below, so code=true and the full matrix runs.
           #
-          # Two single greps against here-strings, not a `grep | grep -q` pipe:
+          # Keep the detector's self-relevance explicit instead of relying on
+          # its membership in the generic non-docs bucket below.
+          DETECTOR_CHANGED=$(grep -E '^scripts/ci-changed-files\.sh$' <<<"$CHANGED" || true)
+          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/|^scripts/ci-changed-files\.sh$)' <<<"$CHANGED" || true)
+          # Single greps against here-strings, not a `grep | grep -q` pipe:
           # a downstream `-q` can close its end of a pipe early and SIGPIPE the
           # upstream producer, and under `pipefail` that reports as the
           # pipeline's exit code instead of the match result (fail-open on a
           # large diff).
-          NON_DOCS=$(grep -vE '(\.md$|^docs/|^LICENSE|^\.gitignore$|^apps/macos/)' <<<"$CHANGED" || true)
-          if grep -q . <<<"$NON_DOCS"; then
+          if [ -n "$DETECTOR_CHANGED" ] || grep -q . <<<"$NON_DOCS"; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "→ non-docs files changed: full matrix REQUIRED"
           else
@@ -163,20 +193,14 @@ jobs:
         os: ${{ fromJSON(needs.changes.outputs.oslist) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: ./.github/actions/rust-setup
         with:
           components: rustfmt, clippy
-      - name: Pin the real toolchain bin on PATH
-        # Some macos-latest runner images ship ~/.cargo/bin/cargo as a copy of
-        # rustup-init rather than the rustup proxy, so `cargo fmt` fails with
-        # "error: unexpected argument 'fmt'". rustup itself is unaffected — resolve
-        # the real toolchain bin dir through it and put it first on PATH so every
-        # later step (cache, clean, ci.sh) gets a working cargo. No-op on healthy
-        # images and on Linux.
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
+          pin-cargo-path: true
           cache-on-failure: true
+      - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.x
       - name: Clean lattice crates (force rebuild, keep dep cache)
         run: |
           cargo clean -p lattice-inference 2>/dev/null || true
@@ -216,13 +240,10 @@ jobs:
         os: ${{ fromJSON(needs.changes.outputs.featureoslist) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: ./.github/actions/rust-setup
         with:
           components: clippy
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
+          pin-cargo-path: true
           shared-key: feature-matrix
           cache-on-failure: true
       - name: tune — safetensors + inference-hook + serde (compile tests)
@@ -268,6 +289,17 @@ jobs:
       # which is why the guard runs on the isolated resolve instead. See #1095.
       - name: embed — f16 native dependency load guard (standalone, no workspace unification)
         run: cargo test -p lattice-embed --test f16_feature_load_guard
+      # `-p lattice-inference` in isolation, default features only, no `--features`
+      # flag. Neither the pre-commit hook's `--workspace --all-targets` nor this
+      # job's own `f16,metal-gpu` clippy step below can see what this catches:
+      # `--workspace` lets another member's feature unification pull `f16` into
+      # lattice-inference for free, and the metal-gpu step enables it explicitly.
+      # Both masked four real dead-code items (two unused test imports, an unused
+      # test helper, an unused test-only method) that only this isolated,
+      # default-feature, per-crate scope reports (#1276). Run it so that scope
+      # divergence — locally-green, CI-green, and still rotting — cannot recur.
+      - name: inference — default-feature clippy, isolated (no workspace unification)
+        run: cargo clippy -p lattice-inference --all-targets -- -D warnings
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'
@@ -298,6 +330,26 @@ jobs:
       - name: inference — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
+      # The worker module is macOS/metal-gpu-gated, but this lifecycle test
+      # uses only a blocking thread-local destructor and never acquires a
+      # Metal device. Run it explicitly so compiling the test is not mistaken
+      # for exercising the deadline, and fail if the exact selector goes stale.
+      - name: inference — Metal worker shutdown deadline (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/metal-worker-shutdown-deadline-test.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu \
+            --lib serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor \
+            -- --exact >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -q 'test serve::metal_worker::tests::owner_shutdown_deadline_covers_blocking_thread_local_destructor ... ok' "$log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: embed — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-embed --features metal-gpu -- -D warnings
@@ -429,8 +481,8 @@ jobs:
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a
       # grammar that blocked every token silently emitted token 0 instead of
-      # failing closed, unlike the CPU paths (`crate::generate` /
-      # `model::qwen35::generation`), which have always guarded every
+      # failing closed, unlike the canonical CPU path
+      # (`model::qwen35::generation`), which has always guarded every
       # `mask_logits` call this way. These three hardware-gated integration
       # tests prove each real public Metal generation entry point (`generate`,
       # `generate_streaming`, `generate_streaming_with_prefix_cache`) now
@@ -582,11 +634,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
+          pin-cargo-path: true
           shared-key: rustdoc-lint
           cache-on-failure: true
       - name: cargo doc — broken-intra-doc-links and doc warnings (informational)
@@ -610,13 +660,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      - uses: ./.github/actions/rust-setup
         with:
           components: clippy
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
+          pin-cargo-path: true
           shared-key: unwrap-in-lib-lint
           cache-on-failure: true
       - name: clippy — unwrap/expect in library targets (informational)
@@ -642,9 +689,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
       - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
         with:
           version: '1.7.12'
+      - name: Install workflow parser
+        run: python3 -m pip install "PyYAML==6.0.3"
       - name: merge-queue config tests
         run: python3 tests/test_ci_changed_files.py -v
       - name: post-merge benchmark progression tests
@@ -659,8 +711,8 @@ jobs:
   # are never imported by these test files -- adapters are exercised only
   # through pure parsing helpers and the harness's own deterministic fake
   # adapters), no engine binary or model weights required — cheap
-  # ubuntu-only, so it is ungated like typos/actionlint above rather than
-  # routed through ci-gate. (The four adapter test files were not wired into
+  # ubuntu-only and routed through ci-gate below so any failure blocks merge.
+  # (The four adapter test files were not wired into
   # any CI job before this issue's step-2 migrations landed; this closes
   # that gap for all of them at once rather than repeating the same
   # omission per migrated script.)
@@ -711,25 +763,36 @@ jobs:
       # "nothing measured" as "nothing regressed"), and runs no benchmark.
       - name: python3 scripts/perf-bench-gate.py --selftest
         run: python3 scripts/perf-bench-gate.py --selftest
+      - name: python3 tests/test_perf_bench_gate_status.py
+        run: python3 tests/test_perf_bench_gate_status.py -v
       # bench-compare.sh's measurement-integrity guard. Drives the shipping
       # script in a disposable repo against a stub cargo, so it exercises the
       # real parser-to-guard path; no benchmark runs and no real cargo is
       # invoked, which keeps it in the same harness-plumbing scope as above.
       - name: python3 tests/test_bench_compare_measurement.py
         run: python3 tests/test_bench_compare_measurement.py -v
+      # bench_quality.sh's canonical-artifact publication guard. Runs the
+      # shipping script in a disposable repo with stub lattice/MLX scorers,
+      # proving failures preserve the tracked TSV and a complete run publishes
+      # all rows; no benchmark, model, GPU, network, or cargo build is used.
+      - name: bash scripts/bench_quality_selftest.sh
+        run: bash scripts/bench_quality_selftest.sh
       - name: python3 tests/test_bench_targets.py
         run: python3 tests/test_bench_targets.py -v
 
-      # bench-compare.sh's isolation guards: the lock proof (the measurement
-      # body refuses unless the supervisor that recorded the lock status is one
-      # of its own ancestors) and the ambient-load gate (below the idle floor a
-      # run is refused, not warned about). Same disposable-repo, stub-cargo
-      # shape as above — no benchmark runs and no real cargo is invoked. Wired
-      # here rather than left to a local run, because a guard whose only
-      # coverage is somebody remembering to run its test is the same shape as
-      # the lock the guard replaced.
+      # Local benchmark-supervision guards: bench-compare's dedicated supervisor
+      # verifies inherited descriptor capabilities; cooperating entrypoints
+      # sample receipt paths, an open pipe writer, and lock contention at handoff.
+      # Those point-in-time diagnostics neither authenticate a holder nor prove
+      # lock lifetime. The ambient-load gate refuses below the idle floor. Same
+      # disposable-repo, stub-cargo shape as above — no benchmark runs and no
+      # real cargo is invoked.
       - name: python3 tests/test_bench_locks.py
         run: python3 tests/test_bench_locks.py -v
+      # Advisory local measurement inventory + fail-closed lock/idle supervision.
+      # Uses disposable lock paths and stub commands; no benchmark runs.
+      - name: python3 tests/test_bench_measurement_supervision.py
+        run: python3 tests/test_bench_measurement_supervision.py -v
       - name: python3 tests/test_perf_governor.py
         run: python3 tests/test_perf_governor.py -v
 
@@ -757,6 +820,72 @@ jobs:
         with:
           package: lattice-fann,lattice-transport,lattice-inference,lattice-embed,lattice-tune
           feature-group: default-features
+      # Pure observer, added after the gate above and byte-for-byte unable to
+      # change its verdict. Under 0.x semver a workspace minor bump (e.g.
+      # 0.7.1 -> 0.8.0) reads to cargo-semver-checks as an assumed-major
+      # change, so every check is skipped and the action above still reports
+      # success — a green run that verified nothing. This block re-runs the
+      # check for one crate and discloses, on the step summary and as a
+      # workflow annotation, when the executed-check count is zero. Every
+      # step here is continue-on-error: an observer must never be able to
+      # fail the job it only reports on.
+      #
+      # Scoped to lattice-transport alone rather than repeating the gate's
+      # five-package check. The condition this observer detects is
+      # workspace-global by construction: every crate shares one
+      # `[workspace.package] version`, so a version bump voids the gate for
+      # all five simultaneously through that single shared value, and one
+      # crate's real `Checked N checks` line answers the question for the
+      # rest. lattice-transport and lattice-fann are the workspace's leaf
+      # crates (no internal path deps to build first); measured locally with
+      # a warm target dir (the state this step actually runs in, since the
+      # gate step above already built rustdoc JSON for all five crates in
+      # this same job) via
+      # `cargo semver-checks check-release -p <crate> --default-features`,
+      # lattice-transport finished in ~0.75-0.79s across two runs versus
+      # lattice-fann's ~1.0-1.2s, so lattice-transport is the cheaper pick.
+      # The disclosure step below is told which crate this is via
+      # --observed-package so its own text states the scope it actually
+      # checked, rather than implying workspace-wide coverage.
+      - name: Confirm cargo-semver-checks is on PATH
+        continue-on-error: true
+        run: |
+          if ! command -v cargo-semver-checks >/dev/null 2>&1; then
+            echo "::warning::cargo-semver-checks not found on PATH after the action step; installing it directly via 'cargo install --locked' so the disclosure re-run below can proceed"
+            cargo install cargo-semver-checks --locked
+          fi
+      # CARGO_TERM_COLOR=never is prevention, not the guarantee: the parser
+      # also strips ANSI escapes itself (scripts/semver-checks-disclose.py),
+      # since the tool can colour its output for reasons other than this
+      # variable and a parser that only works when an upstream env var was
+      # set correctly is not one that can be trusted on its own.
+      - name: Re-run semver-checks to capture executed-check counts
+        continue-on-error: true
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          cargo semver-checks check-release -p lattice-transport --default-features \
+            > "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" 2>&1 || true
+      # Every other Python step in this workflow uses bare python3 (see
+      # decode-harness-unit-tests below); match that convention rather than
+      # introducing a different one for this one step.
+      - name: Disclose zero-check semver-checks runs
+        continue-on-error: true
+        run: |
+          set +e
+          python3 scripts/semver-checks-disclose.py "${RUNNER_TEMP:-/tmp}/semver-checks-output.txt" --summary-out "$GITHUB_STEP_SUMMARY" --observed-package lattice-transport
+          status=$?
+          # 0 = ran to completion silently or with its own disclosure+warning;
+          # 1 = ran to completion and emitted its own could-not-read
+          # disclosure+warning. Any OTHER status means the interpreter or the
+          # script itself never got that far — command-not-found (127),
+          # permission denied (126), a bad argv, etc. — so this step must
+          # announce its own failure, or continue-on-error lets it vanish
+          # without a trace: a real run measured exactly that, a bare exit
+          # 127 with no annotation and a green, silent job.
+          if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+            echo "::warning::semver-checks disclosure step did not run to completion (exit $status) — this job's zero-check instrument produced no verdict at all, healthy or otherwise."
+          fi
 
   # REQUIRED status check (see the rollout note at the top of this file).
   # Always runs, always reports. `ci`, `feature-matrix`, and `msrv` are matrix
@@ -764,12 +893,13 @@ jobs:
   # safe required context: a matrix job skipped at job level never creates
   # its per-combination check runs at all, and a plain gated job that skips
   # reports success even if `changes` itself blew up. This job passes when
-  # there is nothing to check (docs-only) and mirrors the five gated jobs'
+  # there is nothing to compile (docs-only), still requires the unconditional
+  # harness unit tests, and mirrors the other gated jobs'
   # results when there is, exactly like `parity-gate` in e2e-parity.yml and
   # `app-binaries-gate` in app-binaries.yml.
   ci-gate:
     name: ci-gate
-    needs: [changes, ci, feature-matrix, msrv, semver-checks]
+    needs: [changes, ci, feature-matrix, msrv, semver-checks, decode-harness-unit-tests]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -781,12 +911,21 @@ jobs:
           FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
           MSRV_RESULT="${{ needs.msrv.result }}"
           SEMVER_RESULT="${{ needs.semver-checks.result }}"
-          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT"
+          DECODE_HARNESS_RESULT="${{ needs.decode-harness-unit-tests.result }}"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT decode-harness-unit-tests=$DECODE_HARNESS_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed, failing closed."
             exit 1
           fi
-          if [ "$CODE" != "true" ]; then
+          if [ "$DECODE_HARNESS_RESULT" != "success" ]; then
+            echo "::error::decode-harness-unit-tests did not succeed (result=$DECODE_HARNESS_RESULT)."
+            exit 1
+          fi
+          if [ "$CODE" != "true" ] && [ "$CODE" != "false" ]; then
+            echo "::error::code selector output is missing or invalid (value=$CODE)."
+            exit 1
+          fi
+          if [ "$CODE" = "false" ]; then
             echo "Docs-only change, heavy compile jobs not required. PASS."
             exit 0
           fi
@@ -816,5 +955,5 @@ jobs:
             echo "::error::semver-checks did not succeed (result=$SEMVER_RESULT)."
             exit 1
           fi
-          echo "Code changed; ci, feature-matrix, msrv, and semver-checks all PASSED."
+          echo "Code changed; ci, feature-matrix, msrv, semver-checks, and decode-harness-unit-tests all PASSED."
           exit 0

@@ -18,12 +18,12 @@
 /// `model.safetensors` → f16 weights.
 ///
 /// Usage (f16):
-///   LATTICE_MODEL_DIR=/Users/lion/.lattice/models/qwen3.5-0.8b \
+///   LATTICE_MODEL_DIR="${LATTICE_MODEL_CACHE:-$HOME/.lattice/models}/qwen3.5-0.8b" \
 ///   cargo run --release --example bench_gdn_state -p lattice-inference \
 ///     --features "f16,metal-gpu,gdn-state-counters"
 ///
 /// Usage (Q4):
-///   LATTICE_MODEL_DIR=/Users/lion/.lattice/models/qwen3.5-0.8b-q4 \
+///   LATTICE_MODEL_DIR="${LATTICE_MODEL_CACHE:-$HOME/.lattice/models}/qwen3.5-0.8b-q4" \
 ///   cargo run --release --example bench_gdn_state -p lattice-inference \
 ///     --features "f16,metal-gpu,gdn-state-counters"
 ///
@@ -82,6 +82,7 @@ fn run() {
         dir.display()
     );
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let mut state: MetalQwen35State = if is_q4 {
         let cfg = Qwen35Config::from_model_dir(dir).expect("load model config.json");
         let tokenizer_path = dir.join("tokenizer.json");

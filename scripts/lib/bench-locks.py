@@ -30,12 +30,18 @@ habit ships something that is silently absent on the machine that matters, and
 command-not-found inside a backgrounded leg is invisible. This uses fcntl.flock
 directly, which is what the fleet bench-window helper already does.
 
-THE LOCK FDS ARE NOT INHERITED by <cmd> or its descendants (subprocess's
-close_fds default). A leaked lock fd in a long-lived build daemon holds the
-window open machine-wide long after the run that took it, because a flock is
-released only when every descriptor referring to that open file description is
-closed. Children that must hold a lock get the descriptor passed on purpose;
-none do today.
+THE LOCK FDS ARE NOT INHERITED by default (subprocess's close_fds default). A
+leaked lock fd in a long-lived build daemon holds the window open machine-wide
+long after the run that took it, because a flock is released only when every
+descriptor referring to that open file description is closed.
+
+``--pass-lock-fds`` is the narrow exception for dedicated wrapper processes.
+The immediate supervisor verifies the descriptors and keeps them private while
+running descriptor-free measurement children. ``bench_supervision.py`` gives
+cooperating entry points a separate handoff pipe, never an open file description
+that can release either advisory lock. The bench-compare route uses that same
+supervisor boundary, so arbitrary commands and build descendants on these
+wrapper routes never receive the capabilities.
 
 WHY lsof IS ONLY A DIAGNOSTIC HERE. lsof lists processes that have the lock
 file OPEN, which is a superset of those holding a flock on it, and it does not
@@ -51,6 +57,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import os
+import signal
 import shutil
 import subprocess
 import sys
@@ -73,6 +80,7 @@ TIMEOUT_S = 1800
 PENDING_DIR = "/tmp/lion-bench-window-pending"
 
 LOCK_EXIT = 75
+REFUSAL_EXIT = 2
 
 
 def _log(msg: str) -> None:
@@ -196,6 +204,23 @@ def acquire(path: str, name: str) -> tuple[int, str]:
             time.sleep(2)
 
 
+def _terminate_process_group(pgid: int) -> bool:
+    """Keep the lock window closed until no in-group measurement can run."""
+
+    found_group = False
+    while True:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return found_group
+        except PermissionError:
+            # A zombie-only group can report EPERM until its new parent reaps it.
+            found_group = True
+        else:
+            found_group = True
+        time.sleep(0.01)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
@@ -204,6 +229,11 @@ def main() -> int:
         required=True,
         help="where to record this supervisor's PID and lock dispositions",
     )
+    ap.add_argument(
+        "--pass-lock-fds",
+        action="store_true",
+        help="pass both acquired lock descriptors to the immediate command",
+    )
     ap.add_argument("cmd", nargs=argparse.REMAINDER)
     args = ap.parse_args()
 
@@ -211,24 +241,56 @@ def main() -> int:
     if not cmd:
         ap.error("no command given after --")
 
-    os.makedirs(PENDING_DIR, exist_ok=True)
     marker = os.path.join(PENDING_DIR, str(os.getpid()))
     dispositions: list[str] = []
     fds: list[int] = []
     try:
-        with open(marker, "w") as fh:
-            fh.write(args.label + "\n")
+        try:
+            os.makedirs(PENDING_DIR, exist_ok=True)
+            with open(marker, "w") as fh:
+                fh.write(args.label + "\n")
 
-        for path, name in ((BENCH_WINDOW, "bench-window"), (GPU_LOCK, "Metal GPU")):
-            fd, how = acquire(path, name)
-            fds.append(fd)
-            dispositions.append(f"{name} ({path}): {how}")
+            for path, name in (
+                (BENCH_WINDOW, "bench-window"),
+                (GPU_LOCK, "Metal GPU"),
+            ):
+                fd, how = acquire(path, name)
+                fds.append(fd)
+                dispositions.append(f"{name} ({path}): {how}")
 
-        os.makedirs(os.path.dirname(os.path.abspath(args.status_file)), exist_ok=True)
-        with open(args.status_file, "w") as fh:
-            fh.write(f"supervisor_pid={os.getpid()}\n")
-            for line in dispositions:
-                fh.write(f"lock={line}\n")
+            os.makedirs(
+                os.path.dirname(os.path.abspath(args.status_file)), exist_ok=True
+            )
+            with open(args.status_file, "w") as fh:
+                fh.write(f"supervisor_pid={os.getpid()}\n")
+                for line in dispositions:
+                    fh.write(f"lock={line}\n")
+        except OSError as exc:
+            _log(f"cannot prepare bench-lock setup: {exc}; refusing to measure")
+            return REFUSAL_EXIT
+
+        if args.pass_lock_fds:
+            child_env = os.environ.copy()
+            child_env["LATTICE_BENCH_LOCK_FDS"] = ",".join(str(fd) for fd in fds)
+            proc = subprocess.Popen(
+                cmd,
+                env=child_env,
+                pass_fds=tuple(fds),
+                start_new_session=True,
+            )
+            try:
+                returncode = proc.wait()
+            except BaseException:
+                _terminate_process_group(proc.pid)
+                raise
+            live_descendants = _terminate_process_group(proc.pid)
+            if returncode == 0 and live_descendants:
+                _log(
+                    "measurement command exited with live process-group descendants; "
+                    "terminated them before releasing locks"
+                )
+                return REFUSAL_EXIT
+            return returncode
 
         # close_fds defaults True, so neither lock fd reaches cmd or anything
         # cmd spawns. Both stay held here for cmd's whole lifetime.

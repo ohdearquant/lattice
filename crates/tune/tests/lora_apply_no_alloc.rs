@@ -7,24 +7,35 @@
 //! from other integration tests, which run as separate processes) and
 //! asserts zero allocation-call deltas across both the missing-adapter fast
 //! path and the matched, rank-driven path.
+//!
+//! Counters are thread-local (#1272): the test body runs on a harness-spawned
+//! thread while other harness threads (result reporting, output capture,
+//! timing) remain live and may allocate during the measured window. A
+//! process-wide counter attributes that unrelated activity to
+//! `LoraAdapter::apply`, producing an intermittent nonzero delta with no
+//! code change — the same commit both failed and passed in CI. Scoping the
+//! counters to the measuring thread removes that cross-thread noise instead
+//! of tolerating it with a fudge-factor threshold.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use lattice_tune::lora::{LoraAdapter, LoraConfig, LoraLayer};
 
 struct CountingAlloc;
 
-static ALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
-static DEALLOC_CALLS: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static ALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
+    static DEALLOC_CALLS: Cell<u64> = const { Cell::new(0) };
+}
 
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_CALLS.with(|c| c.set(c.get() + 1));
         // SAFETY: `System` imposes the same contract on `alloc` that this
         // impl's caller has already satisfied, and `layout` reaches it
         // unchanged. Counting is side-effect free with respect to that
@@ -34,7 +45,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        DEALLOC_CALLS.with(|c| c.set(c.get() + 1));
         // SAFETY: every pointer this allocator hands out comes from `System`,
         // so a `ptr`/`layout` pair the caller validly passes here is one
         // `System` allocated under that same layout. Both are forwarded
@@ -43,7 +54,7 @@ unsafe impl GlobalAlloc for CountingAlloc {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOC_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOC_CALLS.with(|c| c.set(c.get() + 1));
         // SAFETY: same forwarding invariant as `dealloc` for `ptr`/`layout`,
         // and `new_size` is passed through untouched for `System` to validate
         // against its own contract.
@@ -52,11 +63,11 @@ unsafe impl GlobalAlloc for CountingAlloc {
 }
 
 fn alloc_calls() -> u64 {
-    ALLOC_CALLS.load(Ordering::Relaxed)
+    ALLOC_CALLS.with(Cell::get)
 }
 
 fn dealloc_calls() -> u64 {
-    DEALLOC_CALLS.load(Ordering::Relaxed)
+    DEALLOC_CALLS.with(Cell::get)
 }
 
 fn make_adapter() -> LoraAdapter {

@@ -1,10 +1,9 @@
 //! Shared OpenAI chat-completions request parsing and normalization.
 
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::value::RawValue;
-
-use crate::forward::metal_qwen35::ChatMessage;
 
 use super::{ApiError, REQUEST_BODY_LIMIT_BYTES};
 
@@ -13,11 +12,11 @@ use super::{ApiError, REQUEST_BODY_LIMIT_BYTES};
 /// formatting, or tokenization runs. [`REQUEST_BODY_LIMIT_BYTES`] bounds the
 /// wire size of a request but not the CPU/memory cost of processing it:
 /// a request built from many tiny (even empty) messages pays the per-message
-/// cost — a `ChatMessage` allocation, a chat-template formatting pass, and a
-/// share of tokenization — `messages.len()` times regardless of how little
-/// content each message carries. 4096 is generous headroom over any real
-/// chat history (a long-running multi-turn agent conversation runs to low
-/// hundreds of turns) while closing that amplification.
+/// cost — a normalized-message allocation, a chat-template formatting pass,
+/// and a share of tokenization — `messages.len()` times regardless of how
+/// little content each message carries. 4096 is generous headroom over any
+/// real chat history (a long-running multi-turn agent conversation runs to
+/// low hundreds of turns) while closing that amplification.
 pub const MAX_MESSAGE_COUNT: usize = 4096;
 
 /// Maximum summed byte length of all message content in a single chat
@@ -28,6 +27,19 @@ pub const MAX_MESSAGE_COUNT: usize = 4096;
 /// the current body-size cap and of which content encoding (a plain string
 /// vs. typed content parts) a client uses.
 pub const MAX_CUMULATIVE_CONTENT_BYTES: usize = REQUEST_BODY_LIMIT_BYTES;
+
+/// Maximum decoded bytes accepted for one inline chat image.
+///
+/// The daemon's existing validate-before-materialize preflight limits any
+/// content-part string to 65,536 bytes. A 48,000-byte binary payload expands
+/// to exactly 64,000 base64 bytes, leaving room for the longest accepted
+/// `data:image/*;base64,` prefix while keeping both HTTP binaries on the same
+/// effective image limit.
+pub const MAX_DECODED_IMAGE_BYTES: usize = 48_000;
+
+/// Maximum base64 payload length corresponding to
+/// [`MAX_DECODED_IMAGE_BYTES`].
+const MAX_ENCODED_IMAGE_BYTES: usize = 4 * MAX_DECODED_IMAGE_BYTES.div_ceil(3);
 
 /// Maximum byte length of a single stop string, enforced in
 /// [`parse_stop_strings`] before the string is stored in a
@@ -136,9 +148,54 @@ pub struct Message {
     pub content: MessageContent,
 }
 
+/// Validated role carried by a normalized serving-contract message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NormalizedChatRole {
+    /// System instruction.
+    System,
+    /// User input.
+    User,
+    /// Assistant response included in the request history.
+    Assistant,
+}
+
+impl NormalizedChatRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+        }
+    }
+}
+
+/// Backend-independent chat message produced by request normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedChatMessage {
+    /// Validated conversation role.
+    pub role: NormalizedChatRole,
+    /// Plain text content after typed text parts are concatenated.
+    pub content: String,
+    /// One inline image, preserving its position among the concatenated text
+    /// parts. Only user messages may carry an image.
+    pub image: Option<NormalizedChatImage>,
+}
+
+/// Validated inline image carried across the shared request contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedChatImage {
+    /// Base64-decoded PNG or JPEG file bytes after strict data-URI validation.
+    pub bytes: Vec<u8>,
+    /// UTF-8 byte offset into [`NormalizedChatMessage::content`] where the
+    /// image part appeared.
+    pub text_offset: usize,
+}
+
 /// Message content represented as a string or a list of typed parts.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum MessageContent {
     /// Plain text content.
     Text(String),
@@ -148,6 +205,7 @@ pub enum MessageContent {
 
 /// One typed OpenAI message-content part.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentPart {
     /// A text content part.
     Text { text: String },
@@ -255,6 +313,20 @@ pub struct GenerationDefaults {
     pub reasoning_budget: Option<usize>,
 }
 
+impl GenerationDefaults {
+    /// Standard serving defaults with a caller-selected generation-token budget.
+    pub const fn standard(max_tokens: usize) -> Self {
+        Self {
+            max_tokens,
+            temperature: 0.7,
+            top_k: 50,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+            reasoning_budget: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum ModelNamePolicy<'a> {
     RequiredExact(&'a str),
@@ -278,6 +350,7 @@ pub struct ServeProfile<'a> {
     reasoning_budget_supported: bool,
     structured_output_supported: bool,
     logprobs_supported: bool,
+    vision_supported: bool,
     /// Whether a conflicting `max_tokens`/`max_completion_tokens` pair is
     /// rejected ahead of the served-model check (matching each binary's
     /// pre-shared-contract precedence for this one check): `true` on the
@@ -297,9 +370,10 @@ impl<'a> ServeProfile<'a> {
             require_last_user: true,
             stop_supported: true,
             sampling_extensions_supported: false,
-            reasoning_budget_supported: false,
+            reasoning_budget_supported: true,
             structured_output_supported: false,
             logprobs_supported: true,
+            vision_supported: false,
             max_tokens_conflict_checked_early: false,
         }
     }
@@ -312,21 +386,31 @@ impl<'a> ServeProfile<'a> {
                 context: model_max_context,
             },
             require_last_user: false,
-            stop_supported: false,
+            stop_supported: true,
             sampling_extensions_supported: true,
             reasoning_budget_supported: true,
             structured_output_supported: true,
             logprobs_supported: false,
+            vision_supported: false,
             max_tokens_conflict_checked_early: true,
         }
+    }
+
+    /// Declare whether the loaded checkpoint can execute the vision path.
+    ///
+    /// Profiles default to text-only so callers must opt in from concrete
+    /// loaded-model metadata rather than from the requested model name.
+    pub const fn with_vision_support(mut self, supported: bool) -> Self {
+        self.vision_supported = supported;
+        self
     }
 }
 
 /// Fully normalized request fields consumed by generation adapters.
 #[derive(Debug)]
 pub struct ValidatedChatRequest {
-    /// Validated engine chat messages.
-    pub messages: Vec<ChatMessage>,
+    /// Validated backend-independent chat messages.
+    pub messages: Vec<NormalizedChatMessage>,
     /// Effective generation-token budget after profile policy.
     pub max_tokens: usize,
     /// Validated temperature in `[0.0, 2.0]`.
@@ -350,16 +434,61 @@ pub struct ValidatedChatRequest {
 }
 
 /// Normalize one shared wire request according to a named server profile.
-///
-/// `check_context` runs after messages and sampling scalars are validated but
-/// before stop strings are parsed. The unified server uses it for its prompt
-/// plus decode-window preflight; the daemon supplies a no-op because its
-/// worker performs the prompt-aware check after tokenization.
-pub fn normalize_request<C>(
+pub fn normalize_request(
     req: &ChatRequest,
     defaults: GenerationDefaults,
     profile: ServeProfile<'_>,
-    check_context: impl FnOnce(&[ChatMessage], usize) -> Result<C, ApiError>,
+) -> Result<ValidatedChatRequest, ApiError> {
+    normalize_request_inner(req, defaults, profile, |_, _, _| Ok(()))
+        .map(|(validated, ())| validated)
+}
+
+/// Normalize a request while preserving the unified server's context-check precedence.
+///
+/// `check_context` runs after message and sampling validation (including the
+/// resolved `reasoning_budget`, #831) but before stop parsing. It receives
+/// the effective `reasoning_budget` so it can apply the shared full-window
+/// formula (see [`validate_context_window_with_budget`]). Its returned
+/// prompt is paired with the normalized request so the unified server
+/// renders and tokenizes exactly once. The standalone daemon uses
+/// [`normalize_request`] because its worker performs the prompt-aware
+/// context check after tokenization.
+pub fn normalize_request_with_context_and_budget(
+    req: &ChatRequest,
+    defaults: GenerationDefaults,
+    profile: ServeProfile<'_>,
+    check_context: impl FnOnce(
+        &[NormalizedChatMessage],
+        usize,
+        Option<usize>,
+    ) -> Result<String, ApiError>,
+) -> Result<(ValidatedChatRequest, String), ApiError> {
+    normalize_request_inner(req, defaults, profile, check_context)
+}
+
+/// No-reasoning-budget form of [`normalize_request_with_context_and_budget`].
+///
+/// Delegates with the reasoning-budget argument dropped from the callback,
+/// preserving the published 2-arg-callback signature.
+pub fn normalize_request_with_context(
+    req: &ChatRequest,
+    defaults: GenerationDefaults,
+    profile: ServeProfile<'_>,
+    check_context: impl FnOnce(&[NormalizedChatMessage], usize) -> Result<String, ApiError>,
+) -> Result<(ValidatedChatRequest, String), ApiError> {
+    normalize_request_with_context_and_budget(
+        req,
+        defaults,
+        profile,
+        |messages, max_tokens, _reasoning_budget| check_context(messages, max_tokens),
+    )
+}
+
+fn normalize_request_inner<C>(
+    req: &ChatRequest,
+    defaults: GenerationDefaults,
+    profile: ServeProfile<'_>,
+    check_context: impl FnOnce(&[NormalizedChatMessage], usize, Option<usize>) -> Result<C, ApiError>,
 ) -> Result<(ValidatedChatRequest, C), ApiError> {
     reject_unsupported(req, profile)?;
     validate_model_name(req.model.as_deref(), profile.model_name)?;
@@ -389,8 +518,45 @@ pub fn normalize_request<C>(
     let temperature = validate_temperature(req.temperature.unwrap_or(defaults.temperature))?;
     let top_p = validate_top_p(req.top_p.unwrap_or(defaults.top_p))?;
     let logprobs = normalize_logprobs(req)?;
-    let messages = normalize_messages(&req.messages)?;
-    let context = check_context(&messages, max_tokens)?;
+    let messages = normalize_messages_with_vision(&req.messages, profile.vision_supported)?;
+    let has_image = messages.iter().any(|message| message.image.is_some());
+    if has_image && logprobs.is_some() {
+        unsupported("logprobs are not supported for image requests")?;
+    }
+    if has_image && req.stream.unwrap_or(false) {
+        unsupported("streaming is not supported for image requests")?;
+    }
+    if has_image
+        && req
+            .response_format
+            .as_ref()
+            .is_some_and(|format| format.r#type == "json_schema")
+    {
+        unsupported("json_schema response format is not supported for image requests")?;
+    }
+    // Resolved ahead of `check_context` (rather than in its pre-refactor spot
+    // after `check_context`/`stop`) so the shared full-window formula
+    // (`prompt + max_new_tokens + reasoning_budget + 1 <= max_context`, #831)
+    // has the effective reasoning budget in hand when it runs -- the window
+    // cannot be validated against a value that has not been parsed yet.
+    let mut reasoning_budget = if profile.reasoning_budget_supported {
+        parse_ignorable_field::<usize>(&req.reasoning_budget, "reasoning_budget")?
+            .filter(|&value| value > 0)
+            .or(defaults.reasoning_budget)
+    } else {
+        None
+    };
+    if let MaxTokensPolicy::ClampToContext { context } = profile.max_tokens {
+        let reasoning_room = context.saturating_sub(max_tokens).saturating_sub(1);
+        reasoning_budget = reasoning_budget
+            .map(|value| value.min(reasoning_room))
+            .filter(|&value| value > 0);
+    }
+    if has_image && reasoning_budget.is_some() {
+        unsupported("reasoning_budget is not supported for image requests")?;
+    }
+
+    let context = check_context(&messages, max_tokens, reasoning_budget)?;
     let stop_strings = if profile.stop_supported {
         parse_stop_strings(&req.stop)?
     } else {
@@ -408,19 +574,6 @@ pub fn normalize_request<C>(
     } else {
         defaults.repetition_penalty
     };
-    let mut reasoning_budget = if profile.reasoning_budget_supported {
-        parse_ignorable_field::<usize>(&req.reasoning_budget, "reasoning_budget")?
-            .filter(|&value| value > 0)
-            .or(defaults.reasoning_budget)
-    } else {
-        None
-    };
-    if let MaxTokensPolicy::ClampToContext { context } = profile.max_tokens {
-        let reasoning_room = context.saturating_sub(max_tokens).saturating_sub(1);
-        reasoning_budget = reasoning_budget
-            .map(|value| value.min(reasoning_room))
-            .filter(|&value| value > 0);
-    }
 
     Ok((
         ValidatedChatRequest {
@@ -479,9 +632,11 @@ fn reject_unsupported(req: &ChatRequest, profile: ServeProfile<'_>) -> Result<()
     if profile.max_tokens_conflict_checked_early {
         reject_conflicting_max_tokens(req)?;
     }
-    // top_k, repetition_penalty, and reasoning_budget are accepted-and-ignored
-    // (not rejected) on profiles that don't support them, matching each
-    // server's pre-shared-contract tolerance for these fields.
+    // top_k and repetition_penalty are accepted-and-ignored (not rejected) on
+    // profiles that don't support them, matching each server's
+    // pre-shared-contract tolerance for these fields. reasoning_budget is
+    // supported (applied, and strictly validated) on both profiles as of
+    // #831 -- it no longer belongs in this ignore list.
     if let Some(format) = &req.response_format
         && format.r#type != "text"
         && !(profile.structured_output_supported && format.r#type == "json_schema")
@@ -778,57 +933,165 @@ fn normalize_logprobs(req: &ChatRequest) -> Result<Option<usize>, ApiError> {
     Ok(Some(top_logprobs))
 }
 
-/// Validate and convert wire messages into engine chat messages.
-pub fn normalize_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> {
-    messages
-        .iter()
-        .map(|message| {
-            let content = message_text(&message.content)?;
-            match message.role.as_str() {
-                "system" => Ok(ChatMessage::system(content)),
-                "user" => Ok(ChatMessage::user(content)),
-                "assistant" => Ok(ChatMessage::assistant(content)),
-                "tool" | "developer" => Err(ApiError::BadRequest {
+/// Validate and convert wire messages into backend-independent chat messages.
+pub fn normalize_messages(messages: &[Message]) -> Result<Vec<NormalizedChatMessage>, ApiError> {
+    normalize_messages_with_vision(messages, false)
+}
+
+fn normalize_messages_with_vision(
+    messages: &[Message],
+    vision_supported: bool,
+) -> Result<Vec<NormalizedChatMessage>, ApiError> {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut request_has_image = false;
+    for message in messages {
+        let (content, image) =
+            normalize_message_content(&message.content, vision_supported, &mut request_has_image)?;
+        let role = match message.role.as_str() {
+            "system" => NormalizedChatRole::System,
+            "user" => NormalizedChatRole::User,
+            "assistant" => NormalizedChatRole::Assistant,
+            "tool" | "developer" => {
+                return Err(ApiError::BadRequest {
                     message: format!("role '{}' is not supported by this server", message.role),
                     code: "unsupported_feature",
-                }),
-                role => Err(ApiError::BadRequest {
+                });
+            }
+            role => {
+                return Err(ApiError::BadRequest {
                     message: format!(
                         "unsupported role '{role}'; must be 'system', 'user', or 'assistant'"
                     ),
                     code: "invalid_role",
-                }),
+                });
             }
-        })
-        .collect()
+        };
+        if image.is_some() && role != NormalizedChatRole::User {
+            return Err(ApiError::BadRequest {
+                message: "image content parts are supported only on user messages".to_string(),
+                code: "invalid_image_role",
+            });
+        }
+        normalized.push(NormalizedChatMessage {
+            role,
+            content,
+            image,
+        });
+    }
+    Ok(normalized)
 }
 
-fn message_text(content: &MessageContent) -> Result<String, ApiError> {
+fn normalize_message_content(
+    content: &MessageContent,
+    vision_supported: bool,
+    request_has_image: &mut bool,
+) -> Result<(String, Option<NormalizedChatImage>), ApiError> {
     match content {
-        MessageContent::Text(text) => Ok(text.clone()),
+        MessageContent::Text(text) => Ok((text.clone(), None)),
         MessageContent::Parts(parts) => {
             let mut output = String::new();
+            let mut image = None;
             for part in parts {
                 match part {
                     ContentPart::Text { text } => output.push_str(text),
-                    ContentPart::ImageUrl { .. } => {
-                        return Err(ApiError::BadRequest {
-                            message: "image input requires a vision-capable model".to_string(),
-                            code: "unsupported_feature",
+                    ContentPart::ImageUrl { image_url } => {
+                        if !vision_supported {
+                            return Err(ApiError::BadRequest {
+                                message: "image input requires a vision-capable model".to_string(),
+                                code: "vision_unsupported",
+                            });
+                        }
+                        if *request_has_image {
+                            return Err(ApiError::BadRequest {
+                                message: "only one image is supported per request".to_string(),
+                                code: "multiple_images_unsupported",
+                            });
+                        }
+                        let bytes = decode_inline_image(&image_url.url)?;
+                        *request_has_image = true;
+                        image = Some(NormalizedChatImage {
+                            bytes,
+                            text_offset: output.len(),
                         });
                     }
                     ContentPart::Unsupported { kind } => {
                         return Err(ApiError::BadRequest {
                             message: format!(
-                                "content part type '{kind}' is not supported; only 'text' parts are accepted"
+                                "content part type '{kind}' is not supported; only 'text' and \
+                                 'image_url' parts are accepted"
                             ),
                             code: "unsupported_feature",
                         });
                     }
                 }
             }
-            Ok(output)
+            Ok((output, image))
         }
+    }
+}
+
+fn decode_inline_image(url: &str) -> Result<Vec<u8>, ApiError> {
+    let Some(data) = url.strip_prefix("data:") else {
+        return Err(ApiError::BadRequest {
+            message: "image_url.url must be an inline data URI; remote URLs are not accepted"
+                .to_string(),
+            code: "unsupported_image_url_scheme",
+        });
+    };
+    let Some((metadata, payload)) = data.split_once(',') else {
+        return Err(invalid_image(
+            "image data URI is missing its comma separator",
+        ));
+    };
+    let Some(media_type) = metadata.strip_suffix(";base64") else {
+        return Err(invalid_image(
+            "image data URI must use the ';base64' encoding marker",
+        ));
+    };
+    let expected_format = match media_type {
+        "image/png" => image::ImageFormat::Png,
+        "image/jpeg" => image::ImageFormat::Jpeg,
+        _ => {
+            return Err(invalid_image(
+                "image data URI media type must be 'image/png' or 'image/jpeg'",
+            ));
+        }
+    };
+    if payload.is_empty() {
+        return Err(invalid_image("image data URI payload must not be empty"));
+    }
+    if payload.len() > MAX_ENCODED_IMAGE_BYTES {
+        return Err(invalid_image(format!(
+            "image data URI payload has {} base64 bytes; maximum is {MAX_ENCODED_IMAGE_BYTES}",
+            payload.len()
+        )));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|_| invalid_image("image data URI contains invalid base64"))?;
+    if bytes.is_empty() {
+        return Err(invalid_image("decoded image must not be empty"));
+    }
+    if bytes.len() > MAX_DECODED_IMAGE_BYTES {
+        return Err(invalid_image(format!(
+            "decoded image has {} bytes; maximum is {MAX_DECODED_IMAGE_BYTES}",
+            bytes.len()
+        )));
+    }
+    let actual_format = image::guess_format(&bytes)
+        .map_err(|_| invalid_image("decoded payload is not a recognized PNG or JPEG image"))?;
+    if actual_format != expected_format {
+        return Err(invalid_image(format!(
+            "image data URI declares {media_type} but payload is {actual_format:?}"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn invalid_image(message: impl Into<String>) -> ApiError {
+    ApiError::BadRequest {
+        message: message.into(),
+        code: "invalid_image",
     }
 }
 
@@ -906,15 +1169,30 @@ pub fn parse_stop_strings(stop: &Option<Value>) -> Result<Vec<String>, ApiError>
 }
 
 /// Reject prompt plus decode budgets that exceed a model context window.
-pub fn validate_context_window(
+///
+/// Shared saturating full-window formula (#831):
+/// `prompt + max_new_tokens + reasoning_budget + 1 <= max_context`. The `+1`
+/// reserves the generation-turn delimiter token, matching
+/// `check_prompt_fits_window`'s `PromptAndDecodeWithDelimiter` policy in
+/// `crates/inference/src/serve/metal_worker.rs` -- this is the one shared
+/// formula both `lattice serve`'s HTTP preflight (below) and that worker-side
+/// invariant compute, so neither binary can drift back to its own
+/// pre-#831 accounting independently.
+pub fn validate_context_window_with_budget(
     prompt_tokens: usize,
     max_tokens: usize,
+    reasoning_budget: Option<usize>,
     max_context: usize,
 ) -> Result<(), ApiError> {
-    if prompt_tokens == 0 || prompt_tokens.saturating_add(max_tokens) > max_context {
+    let reasoning_budget = reasoning_budget.unwrap_or(0);
+    let decode_budget = max_tokens.saturating_add(reasoning_budget);
+    let required = prompt_tokens
+        .saturating_add(decode_budget)
+        .saturating_add(1);
+    if prompt_tokens == 0 || required > max_context {
         return Err(ApiError::BadRequest {
             message: format!(
-                "prompt ({prompt_tokens} tokens) plus max_tokens ({max_tokens}) exceeds model context window ({max_context})"
+                "prompt ({prompt_tokens} tokens) plus max_tokens ({max_tokens}) plus reasoning_budget ({reasoning_budget}) exceeds model context window ({max_context}): {required} tokens required"
             ),
             code: "context_length_exceeded",
         });
@@ -922,23 +1200,246 @@ pub fn validate_context_window(
     Ok(())
 }
 
+/// No-reasoning-budget form of [`validate_context_window_with_budget`].
+///
+/// Delegates with `reasoning_budget = None`.
+pub fn validate_context_window(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    max_context: usize,
+) -> Result<(), ApiError> {
+    validate_context_window_with_budget(prompt_tokens, max_tokens, None, max_context)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::forward::metal_qwen35::ChatRole;
 
     fn request(body: &str) -> ChatRequest {
         serde_json::from_str(body).unwrap()
     }
 
     fn defaults() -> GenerationDefaults {
-        GenerationDefaults {
-            max_tokens: 16,
-            temperature: 0.7,
-            top_k: 50,
-            top_p: 0.9,
-            repetition_penalty: 1.1,
-            reasoning_budget: None,
+        GenerationDefaults::standard(16)
+    }
+
+    fn inline_image_request(role: &str, url: &str) -> ChatRequest {
+        request(&format!(
+            r#"{{"model":"model","messages":[{{"role":"{role}","content":[
+                {{"type":"text","text":"before"}},
+                {{"type":"image_url","image_url":{{"url":"{url}"}}}},
+                {{"type":"text","text":"after"}}
+            ]}}]}}"#
+        ))
+    }
+
+    fn valid_png_data_uri() -> String {
+        let image = image::RgbImage::new(1, 1);
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("PNG fixture must encode");
+        format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    }
+
+    fn vision_profile() -> ServeProfile<'static> {
+        ServeProfile::lattice("model", 32).with_vision_support(true)
+    }
+    #[test]
+    fn standard_generation_defaults_snapshot() {
+        let defaults = GenerationDefaults::standard(123);
+        assert_eq!(defaults.max_tokens, 123);
+        assert_eq!(defaults.temperature, 0.7);
+        assert_eq!(defaults.top_k, 50);
+        assert_eq!(defaults.top_p, 0.9);
+        assert_eq!(defaults.repetition_penalty, 1.1);
+        assert_eq!(defaults.reasoning_budget, None);
+    }
+
+    #[test]
+    fn contract_source_has_no_backend_message_dependency() {
+        let source = include_str!("contract.rs");
+        assert!(!source.contains(concat!("crate::", "forward")));
+    }
+
+    #[test]
+    fn vision_profile_preserves_inline_image_and_text_position() {
+        let req = inline_image_request("user", &valid_png_data_uri());
+        let validated = normalize_request(&req, defaults(), vision_profile()).unwrap();
+        let message = &validated.messages[0];
+        assert_eq!(message.content, "beforeafter");
+        let image = message
+            .image
+            .as_ref()
+            .expect("image must survive normalization");
+        assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(image.text_offset, "before".len());
+    }
+
+    #[test]
+    fn text_only_profile_rejects_image_by_loaded_capability() {
+        let req = inline_image_request("user", &valid_png_data_uri());
+        let err =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap_err();
+        assert_eq!(err.code(), "vision_unsupported");
+        assert_eq!(err.message(), "image input requires a vision-capable model");
+    }
+
+    #[test]
+    fn vision_profile_rejects_remote_image_urls() {
+        let req = inline_image_request("user", "https://example.com/image.png");
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "unsupported_image_url_scheme");
+    }
+
+    #[test]
+    fn vision_profile_rejects_malformed_or_empty_data_uris() {
+        for url in [
+            "data:image/png;base64",
+            "data:image/png,AAAA",
+            "data:text/plain;base64,cG5n",
+            "data:image/png;base64,",
+            "data:image/png;base64,***",
+            "data:image/png;base64,cG5n",
+        ] {
+            let req = inline_image_request("user", url);
+            let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+            assert_eq!(err.code(), "invalid_image", "url={url}");
+        }
+    }
+
+    #[test]
+    fn vision_profile_rejects_media_type_payload_mismatch() {
+        let uri = valid_png_data_uri().replacen("image/png", "image/jpeg", 1);
+        let req = inline_image_request("user", &uri);
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "invalid_image");
+        assert!(err.message().contains("declares image/jpeg"));
+    }
+
+    #[test]
+    fn vision_profile_rejects_oversized_decoded_image_before_allocation() {
+        let payload = "A".repeat(MAX_ENCODED_IMAGE_BYTES + 4);
+        let req = inline_image_request("user", &format!("data:image/png;base64,{payload}"));
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "invalid_image");
+        assert!(err.message().contains("base64 bytes; maximum"));
+    }
+
+    #[test]
+    fn vision_profile_rejects_multiple_images_across_messages() {
+        let uri = valid_png_data_uri();
+        let req = request(&format!(
+            r#"{{"model":"model","messages":[
+                {{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]}},
+                {{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]}}
+            ]}}"#
+        ));
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "multiple_images_unsupported");
+    }
+
+    #[test]
+    fn vision_profile_rejects_image_on_non_user_role() {
+        let uri = valid_png_data_uri();
+        let req = request(&format!(
+            r#"{{"model":"model","messages":[
+                {{"role":"system","content":[{{"type":"image_url","image_url":{{"url":"{uri}"}}}}]}},
+                {{"role":"user","content":"question"}}
+            ]}}"#
+        ));
+        let err = normalize_request(&req, defaults(), vision_profile()).unwrap_err();
+        assert_eq!(err.code(), "invalid_image_role");
+    }
+
+    #[test]
+    fn image_requests_reject_unwired_generation_extensions() {
+        let uri = valid_png_data_uri();
+        let mut req = inline_image_request("user", &uri);
+        req.stream = Some(true);
+        assert_eq!(
+            normalize_request(&req, defaults(), vision_profile())
+                .unwrap_err()
+                .code(),
+            "unsupported_feature"
+        );
+
+        let mut req = inline_image_request("user", &uri);
+        req.logprobs = Some(true);
+        assert_eq!(
+            normalize_request(&req, defaults(), vision_profile())
+                .unwrap_err()
+                .code(),
+            "unsupported_feature"
+        );
+
+        let mut req = inline_image_request("user", &uri);
+        req.reasoning_budget =
+            Some(serde_json::value::RawValue::from_string("4".to_string()).unwrap());
+        assert_eq!(
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice_serve("model", 32).with_vision_support(true),
+            )
+            .unwrap_err()
+            .code(),
+            "unsupported_feature"
+        );
+
+        let mut req = inline_image_request("user", &uri);
+        req.response_format = Some(ResponseFormat {
+            r#type: "json_schema".to_string(),
+            json_schema: None,
+        });
+        assert_eq!(
+            normalize_request(
+                &req,
+                defaults(),
+                ServeProfile::lattice_serve("model", 32).with_vision_support(true),
+            )
+            .unwrap_err()
+            .code(),
+            "unsupported_feature"
+        );
+    }
+
+    #[test]
+    fn serving_adapters_do_not_restate_standard_defaults() {
+        // `lattice` is now a module tree (#834), not a single file; concatenate
+        // its split source files so this still scans the same source text.
+        let lattice_source = concat!(
+            include_str!("../bin/lattice/main.rs"),
+            include_str!("../bin/lattice/chat.rs"),
+            include_str!("../bin/lattice/doctor.rs"),
+            include_str!("../bin/lattice/serve.rs"),
+        );
+        for (name, source) in [
+            ("lattice", lattice_source),
+            ("lattice_serve", include_str!("../bin/lattice_serve.rs")),
+        ] {
+            for literal in [
+                "temperature: 0.7",
+                "top_k: 50",
+                "top_p: 0.9",
+                "repetition_penalty: 1.1",
+                "unwrap_or(512)",
+                "unwrap_or(0.7)",
+                "unwrap_or(50)",
+                "unwrap_or(0.9)",
+                "unwrap_or(1.1)",
+            ] {
+                assert!(
+                    !source.contains(literal),
+                    "{name} restates canonical generation default {literal}"
+                );
+            }
         }
     }
 
@@ -966,7 +1467,7 @@ mod tests {
             ServeProfile::lattice_serve("model", 32),
         ] {
             assert_eq!(
-                normalize_request(&req, defaults(), profile, |_, _| Ok(()))
+                normalize_request(&req, defaults(), profile)
                     .unwrap_err()
                     .code(),
                 "invalid_temperature"
@@ -979,37 +1480,23 @@ mod tests {
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_tokens":31,"stop":"done"}"#,
         );
-        let (lattice, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let lattice =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
         assert_eq!(lattice.max_tokens, 31);
         assert_eq!(lattice.stop_strings, ["done"]);
-        assert_eq!(
-            normalize_request(
-                &req,
-                defaults(),
-                ServeProfile::lattice_serve("model", 16),
-                |_, _| Ok(())
-            )
-            .unwrap_err()
-            .code(),
-            "unsupported_feature"
-        );
+
+        // #831: lattice_serve now also accepts and propagates `stop`,
+        // aligned with the `lattice` profile (was previously rejected
+        // outright with unsupported_feature).
+        let daemon_with_stop =
+            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 100)).unwrap();
+        assert_eq!(daemon_with_stop.stop_strings, ["done"]);
 
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"max_tokens":31}"#,
         );
-        let (daemon, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice_serve("model", 16),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let daemon =
+            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 16)).unwrap();
         assert_eq!(daemon.max_tokens, 15);
     }
 
@@ -1022,107 +1509,94 @@ mod tests {
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":20,"repetition_penalty":1.2}"#,
         );
-        let (lattice, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let lattice =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
         assert_eq!(lattice.top_k, defaults().top_k);
         assert_eq!(lattice.repetition_penalty, defaults().repetition_penalty);
 
-        let (daemon, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice_serve("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let daemon =
+            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 32)).unwrap();
         assert_eq!(daemon.top_k, 20);
         assert_eq!(daemon.repetition_penalty, 1.2);
     }
 
     #[test]
-    fn lattice_profile_accepts_and_ignores_reasoning_budget() {
-        // Mirrors profiles_preserve_sampling_extension_policy for
-        // reasoning_budget: lattice serve must accept the field without a
-        // 400 and must not let it influence the effective budget.
+    fn both_profiles_apply_reasoning_budget() {
+        // #831 (maintainer-binding decision): `lattice serve` must actually
+        // apply `reasoning_budget`, matching `lattice_serve`'s pre-existing
+        // behavior, instead of accepting-and-ignoring it. Mutation-sensitive:
+        // dropping the reasoning_budget field assignment or zeroing it turns
+        // either assertion `None`.
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"reasoning_budget":40}"#,
         );
-        let (lattice, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap();
-        assert_eq!(lattice.reasoning_budget, None);
 
         // Context must leave enough decode room (>= reasoning_budget) so the
         // context-window clamp in normalize_request doesn't also shrink the
         // value under test; that clamp is exercised separately.
-        let (daemon, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice_serve("model", 100),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let lattice =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 100)).unwrap();
+        assert_eq!(lattice.reasoning_budget, Some(40));
+
+        let daemon =
+            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 100)).unwrap();
         assert_eq!(daemon.reasoning_budget, Some(40));
     }
 
     #[test]
     fn lattice_profile_tolerates_malformed_ignored_sampling_fields() {
         // Regression: pre-refactor, lattice serve's DTO didn't model
-        // top_k/repetition_penalty/reasoning_budget at all, so a
-        // type-mismatched value (e.g. a string where a number is expected)
-        // was silently ignored along with everything else serde didn't
-        // recognize. The shared typed DTO must preserve that tolerance
-        // rather than hard-failing the whole request with
-        // invalid_request_body before profile normalization runs.
+        // top_k/repetition_penalty at all, so a type-mismatched value (e.g. a
+        // string where a number is expected) was silently ignored along with
+        // everything else serde didn't recognize. The shared typed DTO must
+        // preserve that tolerance rather than hard-failing the whole request
+        // with invalid_request_body before profile normalization runs.
+        // `reasoning_budget` is excluded here (unlike pre-#831): the lattice
+        // profile now honors it, so a malformed value is strictly rejected —
+        // see `honoring_profile_still_rejects_malformed_sampling_fields`.
         let req = request(
-            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":"ignored","repetition_penalty":"x","reasoning_budget":"y"}"#,
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":"ignored","repetition_penalty":"x"}"#,
         );
-        let (lattice, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let lattice =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
         assert_eq!(lattice.top_k, defaults().top_k);
         assert_eq!(lattice.repetition_penalty, defaults().repetition_penalty);
-        assert_eq!(lattice.reasoning_budget, None);
     }
 
     #[test]
     fn honoring_profile_still_rejects_malformed_sampling_fields() {
-        // Control: a profile that actually USES top_k /
-        // repetition_penalty / reasoning_budget must keep strict
-        // validation — tolerance is scoped to profiles that ignore the
-        // field, not a blanket type-laxness relaxation.
-        for (field, bad_value) in [
-            ("top_k", r#""ignored""#),
-            ("repetition_penalty", r#""x""#),
-            ("reasoning_budget", r#""y""#),
-        ] {
+        // Control: a profile that actually USES top_k / repetition_penalty
+        // must keep strict validation — tolerance is scoped to profiles that
+        // ignore the field, not a blanket type-laxness relaxation. Neither
+        // profile ignores `reasoning_budget` as of #831, so both reject a
+        // malformed value.
+        for (field, bad_value) in [("top_k", r#""ignored""#), ("repetition_penalty", r#""x""#)] {
             let body = format!(
                 r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"{field}":{bad_value}}}"#
             );
             let req = request(&body);
             assert_eq!(
-                normalize_request(
-                    &req,
-                    defaults(),
-                    ServeProfile::lattice_serve("model", 32),
-                    |_, _| Ok(())
-                )
-                .unwrap_err()
-                .code(),
+                normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 32),)
+                    .unwrap_err()
+                    .code(),
                 "invalid_request_body",
                 "field {field} should have been rejected on the honoring profile"
+            );
+        }
+
+        let req = request(
+            r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"reasoning_budget":"y"}"#,
+        );
+        for profile in [
+            ServeProfile::lattice("model", 32),
+            ServeProfile::lattice_serve("model", 32),
+        ] {
+            assert_eq!(
+                normalize_request(&req, defaults(), profile)
+                    .unwrap_err()
+                    .code(),
+                "invalid_request_body",
+                "malformed reasoning_budget should have been rejected on both profiles"
             );
         }
     }
@@ -1180,14 +1654,9 @@ mod tests {
         );
         let req = request(&body);
         assert_eq!(
-            normalize_request(
-                &req,
-                defaults(),
-                ServeProfile::lattice("model", 32),
-                |_, _| Ok(())
-            )
-            .unwrap_err()
-            .code(),
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32),)
+                .unwrap_err()
+                .code(),
             "invalid_request_body"
         );
     }
@@ -1205,13 +1674,7 @@ mod tests {
             .collect();
         let body = format!(r#"{{"model":"model","messages":[{}]}}"#, messages.join(","));
         let req = request(&body);
-        normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
     }
 
     #[test]
@@ -1224,13 +1687,8 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"stop":"{big_stop}"}}"#
         );
         let req = request(&body);
-        let err = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap_err();
+        let err =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap_err();
         assert_eq!(err.code(), "invalid_request_body");
 
         // Same bound applies to each element of a stop array.
@@ -1239,14 +1697,9 @@ mod tests {
         );
         let req = request(&body);
         assert_eq!(
-            normalize_request(
-                &req,
-                defaults(),
-                ServeProfile::lattice("model", 32),
-                |_, _| Ok(())
-            )
-            .unwrap_err()
-            .code(),
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32),)
+                .unwrap_err()
+                .code(),
             "invalid_request_body"
         );
     }
@@ -1265,14 +1718,9 @@ mod tests {
         );
         let req = request(&body);
         assert_eq!(
-            normalize_request(
-                &req,
-                defaults(),
-                ServeProfile::lattice("model", 32),
-                |_, _| Ok(())
-            )
-            .unwrap_err()
-            .code(),
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32),)
+                .unwrap_err()
+                .code(),
             "invalid_request_body"
         );
     }
@@ -1284,13 +1732,8 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"stop":"{ok_stop}"}}"#
         );
         let req = request(&body);
-        let (validated, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let validated =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
         assert_eq!(validated.stop_strings, vec![ok_stop]);
     }
 
@@ -1310,13 +1753,8 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"top_k":{big_array}}}"#
         );
         let req = request(&body);
-        let err = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice_serve("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap_err();
+        let err = normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 32))
+            .unwrap_err();
         assert_eq!(err.code(), "invalid_request_body");
         assert_eq!(err.message(), "top_k must be a scalar value");
     }
@@ -1332,14 +1770,9 @@ mod tests {
             r#"{"model":"wrong-model","messages":[{"role":"user","content":"hi"}],"stream":true,"logprobs":true}"#,
         );
         assert_eq!(
-            normalize_request(
-                &req,
-                defaults(),
-                ServeProfile::lattice("served-model", 32),
-                |_, _| Ok(())
-            )
-            .unwrap_err()
-            .code(),
+            normalize_request(&req, defaults(), ServeProfile::lattice("served-model", 32),)
+                .unwrap_err()
+                .code(),
             "unsupported_feature"
         );
     }
@@ -1356,7 +1789,6 @@ mod tests {
                 &req,
                 defaults(),
                 ServeProfile::lattice_serve("served-model", 32),
-                |_, _| Ok(())
             )
             .unwrap_err()
             .code(),
@@ -1379,7 +1811,6 @@ mod tests {
                 &req,
                 defaults(),
                 ServeProfile::lattice_serve("served-model", 32),
-                |_, _| Ok(())
             )
             .unwrap_err()
             .code(),
@@ -1400,14 +1831,9 @@ mod tests {
             r#"{"model":"wrong-model","messages":[{"role":"user","content":"hi"}],"max_tokens":10,"max_completion_tokens":20}"#,
         );
         assert_eq!(
-            normalize_request(
-                &req,
-                defaults(),
-                ServeProfile::lattice("served-model", 32),
-                |_, _| Ok(())
-            )
-            .unwrap_err()
-            .code(),
+            normalize_request(&req, defaults(), ServeProfile::lattice("served-model", 32),)
+                .unwrap_err()
+                .code(),
             "model_not_found"
         );
     }
@@ -1421,14 +1847,9 @@ mod tests {
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}"#,
         );
         assert_eq!(
-            normalize_request(
-                &req,
-                defaults(),
-                ServeProfile::lattice("model", 32),
-                |_, _| Ok(())
-            )
-            .unwrap_err()
-            .code(),
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32),)
+                .unwrap_err()
+                .code(),
             "unsupported_feature"
         );
     }
@@ -1452,10 +1873,50 @@ mod tests {
 
     #[test]
     fn context_window_accepts_boundary_and_rejects_overflow() {
-        validate_context_window(8, 8, 16).unwrap();
+        // #831: the shared formula reserves one delimiter slot
+        // (`prompt + max_tokens + reasoning_budget + 1 <= max_context`), so
+        // the exact boundary now needs one fewer prompt/decode token than
+        // `max_context` to leave room for that reserved slot.
+        validate_context_window(7, 8, 16).unwrap();
         assert_eq!(
-            validate_context_window(8, 9, 16).unwrap_err().code(),
+            validate_context_window(8, 8, 16).unwrap_err().code(),
             "context_length_exceeded"
+        );
+    }
+
+    #[test]
+    fn context_window_accounts_for_reasoning_budget() {
+        // Mutation-sensitive: dropping the `+ reasoning_budget` term from
+        // `validate_context_window_with_budget`'s formula would accept this
+        // request (7 + 8 + 1 == 16), rather than rejecting it for the 4
+        // extra reasoning tokens (7 + 8 + 4 + 1 == 20 > 16).
+        validate_context_window_with_budget(7, 8, Some(0), 16).unwrap();
+        assert_eq!(
+            validate_context_window_with_budget(7, 8, Some(4), 16)
+                .unwrap_err()
+                .code(),
+            "context_length_exceeded"
+        );
+        validate_context_window_with_budget(3, 8, Some(4), 16).unwrap();
+    }
+
+    #[test]
+    fn context_window_error_message_names_reasoning_budget_on_reasoning_only_overflow() {
+        // prompt + max_tokens alone fit (3 + 4 + 1 == 8 <= 16), so this
+        // request is only rejected because of the reasoning budget -- the
+        // error text must say so, not just blame prompt/max_tokens (#1324
+        // review finding 4).
+        validate_context_window_with_budget(3, 4, None, 16).unwrap();
+        let err = validate_context_window_with_budget(3, 4, Some(10), 16).unwrap_err();
+        assert_eq!(err.code(), "context_length_exceeded");
+        let message = err.message();
+        assert!(
+            message.contains("reasoning_budget (10)"),
+            "error message must name the reasoning budget: {message}"
+        );
+        assert!(
+            message.contains("18 tokens required"),
+            "error message must name the total required tokens: {message}"
         );
     }
 
@@ -1503,11 +1964,9 @@ mod tests {
         serde_json::from_str(body).unwrap()
     }
 
-    // Both binaries keep `#[cfg(test)]`-local role/content copies for their
-    // own request-parsing tests, but production traffic on both servers
-    // normalizes messages through this shared `normalize_messages` — so the
-    // validator itself needs direct coverage or production behavior can
-    // drift while the binary-local test copies stay green.
+    // Production traffic on both servers normalizes messages through this
+    // contract-owned representation before one shared adapter crosses into
+    // the engine type.
     #[test]
     fn normalize_messages_accepts_system_user_assistant_roles() {
         let messages = [
@@ -1516,11 +1975,11 @@ mod tests {
             message(r#"{"role":"assistant","content":"asst"}"#),
         ];
         let normalized = normalize_messages(&messages).unwrap();
-        assert_eq!(normalized[0].role, ChatRole::System);
+        assert_eq!(normalized[0].role, NormalizedChatRole::System);
         assert_eq!(normalized[0].content, "sys");
-        assert_eq!(normalized[1].role, ChatRole::User);
+        assert_eq!(normalized[1].role, NormalizedChatRole::User);
         assert_eq!(normalized[1].content, "usr");
-        assert_eq!(normalized[2].role, ChatRole::Assistant);
+        assert_eq!(normalized[2].role, NormalizedChatRole::Assistant);
         assert_eq!(normalized[2].content, "asst");
     }
 
@@ -1572,13 +2031,8 @@ mod tests {
         let req = request(
             r#"{"model":"model","messages":[{"role":"user","content":"hi"}],"top_k":null,"repetition_penalty":null,"reasoning_budget":null}"#,
         );
-        let (daemon, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice_serve("model", 100),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let daemon =
+            normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 100)).unwrap();
         assert_eq!(daemon.top_k, defaults().top_k);
         assert_eq!(daemon.repetition_penalty, defaults().repetition_penalty);
         assert_eq!(daemon.reasoning_budget, None);
@@ -1597,13 +2051,8 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"top_k":{big_array}}}"#
         );
         let req = request(&body);
-        let err = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice_serve("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap_err();
+        let err = normalize_request(&req, defaults(), ServeProfile::lattice_serve("model", 32))
+            .unwrap_err();
         assert_eq!(err.code(), "invalid_request_body");
         assert_eq!(err.message(), "top_k must be a scalar value");
     }
@@ -1620,13 +2069,8 @@ mod tests {
             r#"{{"model":"model","messages":[{{"role":"user","content":"hi"}}],"top_k":{big_array}}}"#
         );
         let req = request(&body);
-        let (lattice, ()) = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap();
+        let lattice =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap();
         assert_eq!(lattice.top_k, defaults().top_k);
     }
 
@@ -1663,13 +2107,8 @@ mod tests {
             "response_format":{{"type":"json_schema","json_schema":{{"name":"n","strict":true,"schema":{nested}}}}}}}"#
         );
         let req = request(&body);
-        let err = normalize_request(
-            &req,
-            defaults(),
-            ServeProfile::lattice("model", 32),
-            |_, _| Ok(()),
-        )
-        .unwrap_err();
+        let err =
+            normalize_request(&req, defaults(), ServeProfile::lattice("model", 32)).unwrap_err();
         assert_eq!(err.code(), "unsupported_feature");
         assert_eq!(
             err.message(),

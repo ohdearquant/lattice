@@ -88,9 +88,10 @@ mod imp {
     use lattice_inference::serve::contract::{
         ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, normalize_messages,
     };
+    use lattice_inference::serve::into_engine_chat_messages;
     use lattice_inference::serve::metal_worker::{
-        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, WorkerEvent,
-        WorkerMetadata,
+        ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, VisionRuntime,
+        WorkerEvent, WorkerMetadata,
     };
     use lattice_inference::serve::metrics::ServeMetrics;
     /// Only used by the test module's `.tokenize(..)` calls on a real (tiny)
@@ -146,22 +147,11 @@ mod imp {
         }
     }
 
-    /// Server-side sampling defaults, overridable per-request.
-    #[derive(Clone)]
-    struct Defaults {
-        max_tokens: usize,
-        temperature: f32,
-        top_k: usize,
-        top_p: f32,
-        repetition_penalty: f32,
-        reasoning_budget: Option<usize>,
-    }
-
     #[derive(Clone)]
     pub struct AppState {
         jobs: MetalWorkerClient,
         model_id: Arc<str>,
-        defaults: Defaults,
+        defaults: GenerationDefaults,
         /// Runtime context window derived from the loaded model (#551): the
         /// exact KV cache length `load_model` allocated, never a hard-coded
         /// constant. See `model_context_from_config` and `build_cfg`.
@@ -207,9 +197,9 @@ mod imp {
     /// #551 fallback when the loaded model's config has no derivable context.
     const FALLBACK_MODEL_MAX_CONTEXT: usize = 4096;
 
-    /// #649: image input is accepted in the OpenAI wire shape but this server
-    /// has no vision tower, so it must fail closed with a clear message
-    /// rather than silently dropping the part or coercing it to text.
+    /// Capability-error wording pinned by text-only backend tests. Image
+    /// content is admitted only when the loaded worker advertises a complete
+    /// vision configuration.
     #[cfg(test)]
     const IMAGE_REQUIRES_VISION_MESSAGE: &str = "image input requires a vision-capable model";
 
@@ -1082,12 +1072,11 @@ mod imp {
 
     #[cfg(test)]
     impl MessageRole {
-        /// ADR-080 C2: differentiates the same
-        /// two cases `lattice.rs`'s `ValidatedRole::parse` does -- `tool`/
-        /// `developer` are real OpenAI roles this server does not implement
-        /// (`unsupported_feature`), while anything else is not an OpenAI
-        /// chat role at all (`invalid_role`). Previously both collapsed to
-        /// one generic message with no code differentiation.
+        /// ADR-080 C2: mirrors the shared contract's role classification:
+        /// `tool`/`developer` are real OpenAI roles this server does not
+        /// implement (`unsupported_feature`), while anything else is not an
+        /// OpenAI chat role at all (`invalid_role`). Previously both collapsed
+        /// to one generic message with no code differentiation.
         fn parse(raw: &str) -> Result<Self, RequestError> {
             match raw {
                 "system" => Ok(Self::System),
@@ -1734,6 +1723,10 @@ mod imp {
                 })
             }
             ModelFormat::Unknown => Err(model_format::unrecognized_format_message(model_dir)),
+            // Any format this binary doesn't yet know how to load is handled
+            // the same way as `Unknown`: report it rather than silently
+            // guessing a loader.
+            _ => Err(model_format::unrecognized_format_message(model_dir)),
         }
     }
 
@@ -1934,19 +1927,11 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
-        let defaults = GenerationDefaults {
-            max_tokens: s.defaults.max_tokens,
-            temperature: s.defaults.temperature,
-            top_k: s.defaults.top_k,
-            top_p: s.defaults.top_p,
-            repetition_penalty: s.defaults.repetition_penalty,
-            reasoning_budget: s.defaults.reasoning_budget,
-        };
-        let (validated, ()) = match normalize_request(
+        let validated = match normalize_request(
             &req,
-            defaults,
-            ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context),
-            |_, _| Ok(()),
+            s.defaults,
+            ServeProfile::lattice_serve(s.model_id.as_ref(), s.model_max_context)
+                .with_vision_support(s.jobs.supports_vision()),
         ) {
             Ok(validated) => validated,
             Err(err) => {
@@ -2003,7 +1988,23 @@ mod imp {
             cfg.enable_thinking = false;
         }
         let streaming = validated.stream;
-        let messages = validated.messages;
+        let messages = match into_engine_chat_messages(validated.messages) {
+            Ok(messages) => messages,
+            Err(err) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    "/v1/chat/completions",
+                    StatusCode::BAD_REQUEST.as_u16(),
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some(err.code()),
+                );
+                return err.into_response();
+            }
+        };
         let cfg = cfg;
         let model_id = s.model_id.to_string();
         let id = format!("chatcmpl-{}", unix_nanos());
@@ -2118,6 +2119,28 @@ mod imp {
                 ev @ (WorkerEvent::Delta(_) | WorkerEvent::Complete(_)) => ev,
                 WorkerEvent::Cancelled => {
                     unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
+                }
+                // Unrecognized future event kind as the very FIRST event:
+                // nothing has been committed to the client yet, so fail
+                // closed the same way the `Failed`/`ConstraintBlocked` arm
+                // above does rather than guessing at a status code.
+                _ => {
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        "/v1/chat/completions",
+                        500,
+                        None,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        true,
+                        Some("internal_error"),
+                    );
+                    return err_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "inference failed",
+                        "internal_error",
+                    );
                 }
             };
             let metrics = s.metrics.clone();
@@ -2272,6 +2295,35 @@ mod imp {
                                 Some(WorkerEvent::Cancelled) => unreachable!(
                                     "normalize_cancelled already rewrote Cancelled into Complete"
                                 ),
+                                // Unrecognized future event kind mid-stream: the
+                                // wire status was already committed to 200 SSE,
+                                // so mirror the `Failed`/`ConstraintBlocked` arm
+                                // above and fail the stream closed with a
+                                // generic internal error rather than guessing.
+                                Some(_) => {
+                                    let error = json!({
+                                        "error": {
+                                            "message": "inference failed",
+                                            "type": "server_error",
+                                            "code": "internal_error",
+                                            "param": null,
+                                        }
+                                    });
+                                    Some((
+                                        Ok(Event::default().data(error.to_string())),
+                                        (
+                                            rx,
+                                            Phase::Done(
+                                                completion_tokens,
+                                                0,
+                                                Some((500, "internal_error")),
+                                            ),
+                                            cancel_guard,
+                                            None,
+                                            metrics,
+                                        ),
+                                    ))
+                                }
                                 None => {
                                     let error = json!({
                                         "error": {
@@ -2482,6 +2534,28 @@ mod imp {
                     }
                     WorkerEvent::Cancelled => {
                         unreachable!("normalize_cancelled already rewrote Cancelled into Complete")
+                    }
+                    // Unrecognized future event kind: the response has not
+                    // been committed yet, so mirror the `Failed` arm above
+                    // and fail closed with a generic internal error rather
+                    // than guessing.
+                    _ => {
+                        emit_serve_event(
+                            &s.metrics,
+                            "POST",
+                            "/v1/chat/completions",
+                            500,
+                            None,
+                            None,
+                            timer.elapsed().as_secs_f64() * 1000.0,
+                            false,
+                            Some("internal_error"),
+                        );
+                        return lattice_inference::serve::ApiError::ServerError {
+                            message: "inference failed".to_string(),
+                            code: "internal_error",
+                        }
+                        .into_response();
                     }
                 }
             }
@@ -2785,22 +2859,23 @@ mod imp {
             })
             .unwrap_or(11435);
 
-        let defaults = Defaults {
+        let standard_defaults = GenerationDefaults::standard(512);
+        let defaults = GenerationDefaults {
             max_tokens: parse_arg(&args, "--max-tokens")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(512),
+                .unwrap_or(standard_defaults.max_tokens),
             temperature: parse_arg(&args, "--temperature")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(0.7),
+                .unwrap_or(standard_defaults.temperature),
             top_k: parse_arg(&args, "--top-k")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(50),
+                .unwrap_or(standard_defaults.top_k),
             top_p: parse_arg(&args, "--top-p")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(0.9),
+                .unwrap_or(standard_defaults.top_p),
             repetition_penalty: parse_arg(&args, "--repetition-penalty")
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(1.1),
+                .unwrap_or(standard_defaults.repetition_penalty),
             reasoning_budget: parse_arg(&args, "--reasoning-budget")
                 .and_then(|s| s.parse().ok())
                 .filter(|&n| n > 0),
@@ -2820,6 +2895,7 @@ mod imp {
                 ModelFormat::Q4 => "q4",
                 ModelFormat::Safetensors => "bf16",
                 ModelFormat::Unknown => "unknown",
+                _ => "unknown",
             }
         );
         // #832: `load_model` (unchanged) runs INSIDE this loader closure, on
@@ -2830,6 +2906,9 @@ mod imp {
         // did.
         let model_dir_for_loader = model_dir.clone();
         let tokenizer_path_for_vocab = tokenizer_path.clone();
+        let vision_config = Qwen35Config::from_model_dir(&model_dir)
+            .map_err(|e| format!("config.json load failed: {e}"))?;
+        let vision_runtime = VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
         let (
             owner,
             jobs,
@@ -2838,7 +2917,7 @@ mod imp {
                 model_max_context,
                 ..
             },
-        ) = match MetalWorker::spawn(
+        ) = match MetalWorker::spawn_with_vision(
             move || {
                 let LoadedModel {
                     metal,
@@ -2856,6 +2935,7 @@ mod imp {
                     },
                 ))
             },
+            vision_runtime,
             max_pending,
         ) {
             Ok(triple) => triple,
@@ -2872,14 +2952,22 @@ mod imp {
             Err(err @ StartupError::InvalidMaxPending { .. }) => {
                 return Err(err.to_string().into());
             }
+            // Unrecognized future startup-failure kind: fall back to its
+            // `Display` text rather than guessing at a more specific
+            // wording, same as `InvalidMaxPending` above.
+            Err(err) => {
+                return Err(err.to_string().into());
+            }
         };
-        // Retains the worker thread's `JoinHandle` for the life of the
-        // server (issue #833's seam: a future graceful-shutdown path has an
-        // obvious place to join it). Neither this binary's prior bare
-        // `mpsc::UnboundedSender<Job>` nor `lattice.rs`'s prior `MetalHandle`
-        // ever joined or explicitly shut down their worker thread either --
-        // the process exits and the OS reaps the detached thread -- so
-        // today's behavior is unchanged.
+        // Retain the explicit owner through the server lifetime. Every
+        // production client also retains an owner clone, so on a normal
+        // return whichever reference is dropped last performs the same
+        // bounded join after the final job sender closes. That guarantee
+        // does not reach the `std::process::exit` call on the server-error
+        // path below (nor any other fatal exit in this file):
+        // `std::process::exit` never runs destructors, so on those paths
+        // this owner -- and any surviving client-held owner clone -- is
+        // dropped without ever performing the bounded join.
         let _owner = owner;
 
         let model_id: Arc<str> = model_dir
@@ -2946,9 +3034,12 @@ mod imp {
                 "[lattice_serve]   POST /v1/chat/completions   GET /v1/models   GET /health   GET /metrics"
             );
             println!("@@lattice {}", json!({"ev": "ready", "port": port}));
-            axum::serve(listener, app)
-                .await
-                .map_err(|e| format!("serve error: {e}"))?;
+            if let Err(error) =
+                lattice_inference::serve::serve_until_shutdown(listener, app).await
+            {
+                eprintln!("Server error: {error}");
+                std::process::exit(1);
+            }
             Ok::<(), String>(())
         })?;
 
@@ -2963,7 +3054,9 @@ mod imp {
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use lattice_inference::serve::ApiError;
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
-        use lattice_inference::serve::metal_worker::{WorkerJob, spawn_fake, test_client_and_jobs};
+        use lattice_inference::serve::metal_worker::{
+            WorkerJob, spawn_fake, spawn_fake_with_vision, test_client_and_jobs,
+        };
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::sync::Arc;
 
@@ -2983,24 +3076,15 @@ mod imp {
 
         fn normalize_for_cfg(
             req: &ChatReq,
-            defaults: &Defaults,
+            defaults: &GenerationDefaults,
             model_max_context: usize,
         ) -> ValidatedChatRequest {
             normalize_request(
                 req,
-                GenerationDefaults {
-                    max_tokens: defaults.max_tokens,
-                    temperature: defaults.temperature,
-                    top_k: defaults.top_k,
-                    top_p: defaults.top_p,
-                    repetition_penalty: defaults.repetition_penalty,
-                    reasoning_budget: defaults.reasoning_budget,
-                },
+                *defaults,
                 ServeProfile::lattice_serve("", model_max_context),
-                |_, _| Ok(()),
             )
             .unwrap()
-            .0
         }
 
         // NOTE (issue #832): the FIFO/cancellation/window-check worker-loop
@@ -3044,14 +3128,7 @@ mod imp {
                 AppState {
                     jobs,
                     model_id: Arc::from("marker-test-model"),
-                    defaults: Defaults {
-                        max_tokens: 100,
-                        temperature: 0.7,
-                        top_k: 50,
-                        top_p: 0.9,
-                        repetition_penalty: 1.1,
-                        reasoning_budget: None,
-                    },
+                    defaults: GenerationDefaults::standard(100),
                     model_max_context: 4096,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -3066,7 +3143,7 @@ mod imp {
         // ── #641 / #649 request parsing and clamp tests ──────────────────
 
         #[test]
-        fn message_content_plain_string_to_chat_message() {
+        fn message_content_plain_string_normalizes() {
             let msg = InMsg {
                 role: "user".to_string(),
                 content: MessageContent::Text("hi".to_string()),
@@ -3075,7 +3152,7 @@ mod imp {
                 .expect("plain string content must parse");
             assert_eq!(
                 chat_message[0].role,
-                lattice_inference::forward::metal_qwen35::ChatRole::User
+                lattice_inference::serve::contract::NormalizedChatRole::User
             );
             assert_eq!(chat_message[0].content, "hi");
         }
@@ -3129,14 +3206,15 @@ mod imp {
             let err = normalize_messages(std::slice::from_ref(&msg)).unwrap_err();
             assert_eq!(
                 err.message(),
-                "content part type 'file' is not supported; only 'text' parts are accepted"
+                "content part type 'file' is not supported; only 'text' and 'image_url' parts are \
+                 accepted"
             );
         }
 
         #[test]
         fn message_role_unknown_rejected() {
-            // Not an OpenAI chat role at all -- `invalid_role`, matching
-            // `lattice.rs`'s `ValidatedRole::parse` for the same case.
+            // Not an OpenAI chat role at all -- `invalid_role`, matching the
+            // shared contract's production normalization for the same case.
             let err = MessageRole::parse("moderator").unwrap_err();
             assert_eq!(
                 err.message(),
@@ -3201,13 +3279,9 @@ mod imp {
 
         #[test]
         fn build_cfg_clamps_to_runtime_context() {
-            let defaults = Defaults {
-                max_tokens: 100,
-                temperature: 0.7,
-                top_k: 50,
-                top_p: 0.9,
-                repetition_penalty: 1.1,
+            let defaults = GenerationDefaults {
                 reasoning_budget: Some(50),
+                ..GenerationDefaults::standard(100)
             };
             let req = ChatReq {
                 model: None,
@@ -3345,20 +3419,30 @@ mod imp {
             AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: Defaults {
-                    max_tokens: 100,
-                    temperature: 0.7,
-                    top_k: 50,
-                    top_p: 0.9,
-                    repetition_penalty: 1.1,
-                    reasoning_budget: None,
-                },
+                defaults: GenerationDefaults::standard(100),
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: Arc::new(vec![]),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
             }
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        fn inline_png_data_uri() -> String {
+            use base64::Engine as _;
+            let image = image::RgbImage::new(32, 32);
+            let mut bytes = Vec::new();
+            image
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
+                .expect("PNG fixture must encode");
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -3448,9 +3532,81 @@ mod imp {
             );
             let response =
                 chat_completions(State(test_app_state()), test_json_headers(), body).await;
-            let (status, message) = error_message_of(response).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(message, IMAGE_REQUIRES_VISION_MESSAGE);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("error response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("error response must be JSON");
+            assert_eq!(value["error"]["code"], "vision_unsupported");
+            assert_eq!(
+                value["error"]["message"],
+                serde_json::Value::String(IMAGE_REQUIRES_VISION_MESSAGE.to_string())
+            );
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn chat_completions_vision_model_enqueues_image_on_shared_worker() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            let image_seen = Arc::new(AtomicBool::new(false));
+            let seen = Arc::clone(&image_seen);
+            let jobs = spawn_fake_with_vision(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                4096,
+                tokenizer,
+                move |messages, _cfg, prompt_tokens, _on_token, _should_cancel| {
+                    let image = messages[0]
+                        .image
+                        .as_ref()
+                        .expect("image must reach the common worker job");
+                    assert!(image.bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+                    assert_eq!(image.text_offset, "before".len());
+                    assert_eq!(messages[0].content, "beforeafter");
+                    seen.store(true, Ordering::SeqCst);
+                    Ok(GenerateOutput {
+                        text: "ok".to_string(),
+                        token_ids: vec![0],
+                        prompt_tokens,
+                        generated_tokens: 1,
+                        stopped: true,
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    })
+                },
+            );
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: GenerationDefaults::standard(16),
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: Arc::new(vec![]),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
+            let body = Body::from(
+                serde_json::json!({
+                    "model": "test-model",
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "before"},
+                            {"type": "image_url", "image_url": {"url": inline_png_data_uri()}},
+                            {"type": "text", "text": "after"}
+                        ]
+                    }]
+                })
+                .to_string(),
+            );
+
+            let response = chat_completions(State(state), test_json_headers(), body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(image_seen.load(Ordering::SeqCst));
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -3764,14 +3920,7 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: Defaults {
-                    max_tokens: 100,
-                    temperature: 0.7,
-                    top_k: 50,
-                    top_p: 0.9,
-                    repetition_penalty: 1.1,
-                    reasoning_budget: None,
-                },
+                defaults: GenerationDefaults::standard(100),
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3818,14 +3967,7 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: Defaults {
-                    max_tokens: 100,
-                    temperature: 0.7,
-                    top_k: 50,
-                    top_p: 0.9,
-                    repetition_penalty: 1.1,
-                    reasoning_budget: None,
-                },
+                defaults: GenerationDefaults::standard(100),
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3864,14 +4006,7 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: Defaults {
-                    max_tokens: 100,
-                    temperature: 0.7,
-                    top_k: 50,
-                    top_p: 0.9,
-                    repetition_penalty: 1.1,
-                    reasoning_budget: None,
-                },
+                defaults: GenerationDefaults::standard(100),
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3913,14 +4048,7 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: Defaults {
-                    max_tokens: 100,
-                    temperature: 0.7,
-                    top_k: 50,
-                    top_p: 0.9,
-                    repetition_penalty: 1.1,
-                    reasoning_budget: None,
-                },
+                defaults: GenerationDefaults::standard(100),
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -3967,14 +4095,7 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: Defaults {
-                    max_tokens: 100,
-                    temperature: 0.7,
-                    top_k: 50,
-                    top_p: 0.9,
-                    repetition_penalty: 1.1,
-                    reasoning_budget: None,
-                },
+                defaults: GenerationDefaults::standard(100),
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -4632,17 +4753,77 @@ mod imp {
             );
         }
 
+        // #831: `lattice_serve` now accepts and applies `stop`, aligned with
+        // `lattice serve` (was previously rejected outright with "stop is
+        // not supported by this server"). This drives the real worker
+        // thread (`spawn_fake`, issue #832's cross-binary test seam) end to
+        // end through `router()`, so the generate closure captures the
+        // `stop_strings` this binary's real `build_cfg` actually produced --
+        // not a value reconstructed independently in the test. Replaces the
+        // old `chat_completions_stop_400` (`test_app_state()`'s dropped-
+        // receiver job queue can't reach this far, since the request no
+        // longer short-circuits with a 400 before submission).
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
-        async fn chat_completions_stop_400() {
+        async fn chat_completions_stop_is_accepted_and_reaches_generate_config() {
+            use tower::ServiceExt as _;
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            let observed_stop: Arc<std::sync::Mutex<Option<Vec<String>>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let observed_for_closure = Arc::clone(&observed_stop);
+            let jobs = spawn_fake(
+                ContextWindowPolicy::PromptAndDecodeWithDelimiter,
+                4096,
+                tokenizer,
+                move |_messages, cfg, prompt_tokens, _on_token, _should_cancel| {
+                    *observed_for_closure
+                        .lock()
+                        .expect("observation mutex poisoned") = Some(cfg.stop_strings.clone());
+                    Ok(GenerateOutput {
+                        text: String::new(),
+                        token_ids: vec![],
+                        prompt_tokens,
+                        generated_tokens: 0,
+                        stopped: true,
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    })
+                },
+            );
+            let state = AppState {
+                jobs,
+                model_id: Arc::from("test-model"),
+                defaults: GenerationDefaults::standard(100),
+                model_max_context: 4096,
+                max_pending: 1_000_000,
+                metrics: Arc::new(ServeMetrics::default()),
+                vocab_bytes: Arc::new(vec![]),
+                grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            };
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stop":"\n"}"#.to_string(),
             );
-            let response =
-                chat_completions(State(test_app_state()), test_json_headers(), body).await;
-            let (status, message) = error_message_of(response).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST);
-            assert_eq!(message, "stop is not supported by this server");
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(body)
+                .expect("fixture request must build");
+            let response = router(state)
+                .oneshot(request)
+                .await
+                .expect("router must produce a response, not a transport error");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                observed_stop
+                    .lock()
+                    .expect("observation mutex poisoned")
+                    .clone(),
+                Some(vec!["\n".to_string()]),
+                "stop must reach the real GenerateConfig the worker's generate closure receives"
+            );
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -4691,14 +4872,7 @@ mod imp {
             let state = AppState {
                 jobs,
                 model_id: Arc::from("test-model"),
-                defaults: Defaults {
-                    max_tokens: 100,
-                    temperature: 0.7,
-                    top_k: 50,
-                    top_p: 0.9,
-                    repetition_penalty: 1.1,
-                    reasoning_budget: None,
-                },
+                defaults: GenerationDefaults::standard(100),
                 model_max_context: 4096,
                 max_pending: 1_000_000,
                 metrics: Arc::new(ServeMetrics::default()),
@@ -5130,14 +5304,7 @@ mod imp {
                 AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
-                    defaults: Defaults {
-                        max_tokens: 100,
-                        temperature: 0.7,
-                        top_k: 50,
-                        top_p: 0.9,
-                        repetition_penalty: 1.1,
-                        reasoning_budget: None,
-                    },
+                    defaults: GenerationDefaults::standard(100),
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -5236,14 +5403,7 @@ mod imp {
                 let state = AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
-                    defaults: Defaults {
-                        max_tokens: 100,
-                        temperature: 0.7,
-                        top_k: 50,
-                        top_p: 0.9,
-                        repetition_penalty: 1.1,
-                        reasoning_budget: None,
-                    },
+                    defaults: GenerationDefaults::standard(100),
                     model_max_context: 4096,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -5334,14 +5494,7 @@ mod imp {
 
         #[test]
         fn build_cfg_aliases_max_completion_tokens_when_max_tokens_absent() {
-            let defaults = Defaults {
-                max_tokens: 100,
-                temperature: 0.7,
-                top_k: 50,
-                top_p: 0.9,
-                repetition_penalty: 1.1,
-                reasoning_budget: None,
-            };
+            let defaults = GenerationDefaults::standard(100);
             let req = ChatReq {
                 model: None,
                 messages: vec![InMsg {
@@ -5478,14 +5631,7 @@ mod imp {
                 AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
-                    defaults: Defaults {
-                        max_tokens: 100,
-                        temperature: 0.7,
-                        top_k: 50,
-                        top_p: 0.9,
-                        repetition_penalty: 1.1,
-                        reasoning_budget: None,
-                    },
+                    defaults: GenerationDefaults::standard(100),
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -5637,6 +5783,10 @@ mod imp {
                                     lattice_inference::forward::metal_qwen35::ChatRole::Assistant => {
                                         "assistant"
                                     }
+                                    // This fixture only ever constructs the
+                                    // three known roles; a future role isn't
+                                    // yet exercised by this test.
+                                    _ => "unknown",
                                 };
                                 (role.to_string(), m.content.clone())
                             })
@@ -5672,14 +5822,7 @@ mod imp {
                 let state = AppState {
                     jobs,
                     model_id: Arc::from("test-model"),
-                    defaults: Defaults {
-                        max_tokens: 100,
-                        temperature: 0.7,
-                        top_k: 50,
-                        top_p: 0.9,
-                        repetition_penalty: 1.1,
-                        reasoning_budget: None,
-                    },
+                    defaults: GenerationDefaults::standard(100),
                     model_max_context,
                     max_pending: 1_000_000,
                     metrics: Arc::new(ServeMetrics::default()),
@@ -5702,7 +5845,7 @@ mod imp {
 
             /// The `GenerateConfig` `lattice_serve.rs`'s real `build_cfg` must
             /// produce for the fixed request `run_observed` sends, given
-            /// `run_observed`'s `Defaults` above: every explicitly-set field
+            /// `run_observed`'s `GenerationDefaults` above: every explicitly-set field
             /// mirrors the request; `build_cfg` always sets the remaining
             /// fields (`stop_token_ids`, `enable_thinking`, `enable_mtp`,
             /// `grammar`, `reasoning_budget`, `logprobs`, `stop_strings`) to

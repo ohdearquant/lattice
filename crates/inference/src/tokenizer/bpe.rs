@@ -18,8 +18,8 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::warn;
 
-const DEFAULT_BPE_CACHE_CAPACITY: usize = 8_192;
-const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
+pub(crate) const DEFAULT_BPE_CACHE_CAPACITY: usize = 8_192;
+pub(crate) const DEFAULT_BPE_MAX_SEQ_LEN: usize = 4_096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreTokenizeMode {
@@ -206,7 +206,7 @@ impl BpeTokenizer {
         )
     }
 
-    fn from_vocab_and_merges_with_config(
+    pub(crate) fn from_vocab_and_merges_with_config(
         vocab: HashMap<String, u32>,
         merges: Vec<(String, String)>,
         added_tokens: HashMap<String, u32>,
@@ -539,6 +539,31 @@ impl BpeTokenizer {
         self.tokenize_to_ids_into(text, &mut scratch)
     }
 
+    #[cfg(all(feature = "metal-gpu", feature = "serve"))]
+    pub(crate) fn tokenize_fragments_with_inserted_ids(
+        &self,
+        before: &str,
+        inserted_ids: &[u32],
+        after: &str,
+    ) -> Vec<u32> {
+        let mut scratch = TokenizeScratch::default();
+        scratch.ids.clear();
+        if self.inner.add_bos
+            && let Some(bos_id) = self.inner.bos_id
+        {
+            scratch.ids.push(bos_id);
+        }
+        self.tokenize_text_into(before, &mut scratch);
+        scratch.ids.extend_from_slice(inserted_ids);
+        self.tokenize_text_into(after, &mut scratch);
+        if self.inner.add_eos
+            && let Some(eos_id) = self.inner.eos_id
+        {
+            scratch.ids.push(eos_id);
+        }
+        scratch.ids
+    }
+
     fn tokenize_to_ids_into(&self, text: &str, scratch: &mut TokenizeScratch) -> Vec<u32> {
         scratch.ids.clear();
         if self.inner.add_bos
@@ -547,29 +572,7 @@ impl BpeTokenizer {
             scratch.ids.push(bos_id);
         }
 
-        let mut segment_start = 0usize;
-        let mut pos = 0usize;
-        while pos < text.len() {
-            if let Some((special_end, special_id)) = self.match_special(text, pos) {
-                if segment_start < pos {
-                    self.tokenize_regular_segment_into(&text[segment_start..pos], scratch);
-                }
-                scratch.ids.push(special_id);
-                pos = special_end;
-                segment_start = pos;
-                continue;
-            }
-
-            let ch = text[pos..]
-                .chars()
-                .next()
-                .expect("invariant: pos is inside non-empty UTF-8 text");
-            pos += ch.len_utf8();
-        }
-
-        if segment_start < text.len() {
-            self.tokenize_regular_segment_into(&text[segment_start..], scratch);
-        }
+        self.tokenize_text_into(text, scratch);
 
         if self.inner.add_eos {
             if let Some(eos_id) = self.inner.eos_id {
@@ -599,6 +602,31 @@ impl BpeTokenizer {
         }
 
         scratch.ids.clone()
+    }
+
+    fn tokenize_text_into(&self, text: &str, scratch: &mut TokenizeScratch) {
+        let mut segment_start = 0usize;
+        let mut pos = 0usize;
+        while pos < text.len() {
+            if let Some((special_end, special_id)) = self.match_special(text, pos) {
+                if segment_start < pos {
+                    self.tokenize_regular_segment_into(&text[segment_start..pos], scratch);
+                }
+                scratch.ids.push(special_id);
+                pos = special_end;
+                segment_start = pos;
+                continue;
+            }
+
+            let Some(ch) = text[pos..].chars().next() else {
+                break;
+            };
+            pos += ch.len_utf8();
+        }
+
+        if segment_start < text.len() {
+            self.tokenize_regular_segment_into(&text[segment_start..], scratch);
+        }
     }
 
     fn tokenize_regular_segment_into(&self, text: &str, scratch: &mut TokenizeScratch) {
@@ -1564,7 +1592,7 @@ mod tests {
         assert_eq!(ids, vec![11, 16]);
         // Regression: decode must reverse the byte-level encoding (the "Ġ"
         // prefix maps back to a space), not return an empty string — the
-        // prior generate.rs detokenize block discarded the text entirely.
+        // retired generic detokenize block discarded the text entirely.
         assert_eq!(tokenizer.decode(&ids), Some("hello world".to_string()));
         assert_eq!(tokenizer.decode(&[]), Some(String::new()));
     }
@@ -1690,83 +1718,6 @@ mod tests {
             .expect("matching vocab length");
         assert!(logits[100].is_finite());
         assert!(logits[101].is_finite());
-    }
-
-    #[test]
-    fn decode_and_incremental_detokenize_render_non_ascii_added_tokens() {
-        use crate::model::qwen35::detokenize::IncrementalDetokenizer;
-
-        let tokenizer = non_ascii_added_tokenizer();
-        assert_eq!(
-            tokenizer.token_bytes_for_id(100).as_deref(),
-            Some("好".as_bytes())
-        );
-        assert_eq!(
-            tokenizer.token_bytes_for_id(101).as_deref(),
-            Some("café".as_bytes())
-        );
-        assert_eq!(tokenizer.decode(&[100, 101]), Some("好café".to_string()));
-
-        let mut detok = IncrementalDetokenizer::new();
-        let mut text = String::new();
-        for id in [100, 101] {
-            text.push_str(&detok.push(&tokenizer, id));
-        }
-        text.push_str(&detok.finish());
-        assert_eq!(text, "好café");
-    }
-
-    #[test]
-    fn test_decode_renders_nonspecial_added_tokens() {
-        // Regression (qwen3.6-27b think-tag bug): added tokens with special=false
-        // (`</think>`, `<tool_call>`, FIM markers) live BEYOND the base vocab range,
-        // so before the fix `token_for_id` returned None and they decoded to the
-        // empty string — silently swallowed from the output stream even though the
-        // model sampled them correctly. They must now render as their literal text.
-        // special=true markers (im_end-style) must STILL be swallowed.
-        let mut vocab = HashMap::new();
-        for (s, i) in [("a", 0u32), ("b", 1), ("c", 2)] {
-            vocab.insert(s.to_string(), i);
-        }
-        // rendered_added = the special=false subset (content -> id), ids past base max.
-        let mut rendered = HashMap::new();
-        rendered.insert("</think>".to_string(), 100u32);
-        rendered.insert("<think>".to_string(), 101u32);
-        rendered.insert("<tool_call>".to_string(), 102u32);
-
-        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
-            vocab,
-            Vec::new(),
-            HashMap::new(),
-            rendered,
-            DEFAULT_BPE_CACHE_CAPACITY,
-            DEFAULT_BPE_MAX_SEQ_LEN,
-        )
-        .expect("construct tokenizer with rendered added tokens");
-
-        // special=false added tokens render verbatim (byte-level decode is identity
-        // for printable ASCII).
-        assert_eq!(tokenizer.decode(&[101]), Some("<think>".to_string()));
-        assert_eq!(tokenizer.decode(&[100]), Some("</think>".to_string()));
-        assert_eq!(tokenizer.decode(&[102]), Some("<tool_call>".to_string()));
-        // Mixed with base content tokens, in stream order.
-        assert_eq!(
-            tokenizer.decode(&[0, 1, 100, 2]),
-            Some("ab</think>c".to_string())
-        );
-        // An id present in neither base vocab nor the rendered set (e.g. a
-        // special=true marker) stays swallowed — token_for_id returns None.
-        assert_eq!(tokenizer.decode(&[200]), Some(String::new()));
-
-        // The incremental streaming detokenizer must agree byte-for-byte.
-        use crate::model::qwen35::detokenize::IncrementalDetokenizer;
-        let mut detok = IncrementalDetokenizer::new();
-        let mut out = String::new();
-        for id in [0u32, 100, 1] {
-            out.push_str(&detok.push(&tokenizer, id));
-        }
-        out.push_str(&detok.finish());
-        assert_eq!(out, "a</think>b");
     }
 
     #[test]

@@ -14,8 +14,8 @@ use lattice_inference::model::qwen35::Qwen35Model;
 use crate::error::{Result, TuneError};
 use crate::lora::train_core::{
     AdamConfig, Dims, GdnDims, GdnLoraParams, Head, LayerW, LoraParams, MixerKind, SeqCtx,
-    SlotLayout, TapeGeometry, TrainCtx, apply_adam_updates, forward_full, nll_and_grads, rand_fill,
-    shifted,
+    SlotLayout, TapeGeometry, TrainCtx, apply_adam_updates, apply_gdn_adam_updates, forward_full,
+    nll_and_grads, rand_fill, shifted,
 };
 use crate::lora::{AdamState, LoraAdapter, LoraConfig, LoraLayer};
 
@@ -236,6 +236,39 @@ pub fn train_micro_lora(
     pairs: &[TrainingPair],
     config: &MicroLoraConfig,
 ) -> Result<LoraAdapter> {
+    train_micro_lora_impl(model, pairs, config, false)
+}
+
+/// Train GQA `q_proj`/`v_proj` LoRA weights, and — when `train_gdn` is
+/// `true` — also train the five GDN LoRA projections (`in_proj_qkv`,
+/// `in_proj_z`, `in_proj_b`, `in_proj_a`, `out_proj`) on GatedDeltaNet
+/// layers inside the trainable window (`config.first_layer..=last_layer`).
+/// With `train_gdn: false` this reproduces [`train_micro_lora`]'s
+/// GQA-only, GDN-frozen behavior exactly.
+///
+/// A separate function rather than a new [`MicroLoraConfig`] field:
+/// `MicroLoraConfig` is publicly, exhaustively constructible and
+/// `cargo-semver-checks`' `constructible_struct_adds_field` gate covers
+/// `lattice-tune`, so adding a field to it would be a breaking change
+/// without an available major-version bump this cycle (the same
+/// constraint that kept `min_p` off `SamplingConfig`/`GenerateConfig` in
+/// `lattice-inference`).
+/// See [`docs/lora-core.md`](../../docs/lora-core.md#train_micro_lora) for the tape, limits, and implementation rationale.
+pub fn train_micro_lora_with_gdn(
+    model: &Qwen35Model,
+    pairs: &[TrainingPair],
+    config: &MicroLoraConfig,
+    train_gdn: bool,
+) -> Result<LoraAdapter> {
+    train_micro_lora_impl(model, pairs, config, train_gdn)
+}
+
+fn train_micro_lora_impl(
+    model: &Qwen35Model,
+    pairs: &[TrainingPair],
+    config: &MicroLoraConfig,
+    train_gdn: bool,
+) -> Result<LoraAdapter> {
     // Validate caller-controlled bounds before model access or allocation.
     let vocab_size = model.config().vocab_size;
     let num_hidden_layers = model.config().num_hidden_layers;
@@ -290,6 +323,7 @@ pub fn train_micro_lora(
     let top_layer = num_hidden_layers - 1;
     let mut layers: Vec<LayerW> = Vec::new();
     let mut slot_layers: Vec<usize> = Vec::new();
+    let mut gdn_slot_layers: Vec<usize> = Vec::new();
     for layer_idx in materialized_layer_range(first_layer, top_layer) {
         let trainable = layer_idx <= trainable_last;
         if let Some((w_q, w_k, w_v, w_o, q_norm, k_norm, pre, post, gate, up, down)) =
@@ -319,6 +353,13 @@ pub fn train_micro_lora(
                 lora_slot,
             });
         } else if let Some((gdn, pre, post, gate, up, down)) = model.gdn_layer_weights(layer_idx) {
+            let lora_slot = if train_gdn && trainable {
+                let slot = gdn_slot_layers.len();
+                gdn_slot_layers.push(layer_idx);
+                Some(slot)
+            } else {
+                None
+            };
             layers.push(LayerW {
                 kind: MixerKind::Gdn,
                 w_q: &[],
@@ -333,7 +374,7 @@ pub fn train_micro_lora(
                 w_gate: gate,
                 w_up: up,
                 w_down: down,
-                lora_slot: None,
+                lora_slot,
             });
         } else {
             return Err(TuneError::Validation(format!(
@@ -347,6 +388,7 @@ pub fn train_micro_lora(
             "no GQA layers in the configured range — nothing to train".to_string(),
         ));
     }
+    let num_gdn_slots = gdn_slot_layers.len();
 
     // Capture frozen-prefix state and RoPE tables after input validation.
     let mut caches: Vec<SeqCtx> = Vec::with_capacity(pairs.len());
@@ -409,13 +451,26 @@ pub fn train_micro_lora(
         })
         .collect();
 
+    // Initialize GDN A uniformly and B to zero (same rationale as the GQA
+    // loras above: the initial adapter is a no-op), continuing the same rng
+    // stream position rather than reseeding it, matching train_grad_full's
+    // zero_b_gdn_loras call convention.
+    let mut gdn_loras: Vec<GdnLoraParams> = (0..num_gdn_slots)
+        .map(|_| {
+            GdnLoraParams::shaped(
+                rank,
+                dims.hidden,
+                &gdn_dims,
+                |n| rand_fill(&mut rng, n, init_amp),
+                |n| vec![0.0; n],
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     let mut adam = AdamState::new();
     let (beta1, beta2, eps_adam) = (0.9f32, 0.999f32, 1e-8f32);
     let lr = config.learning_rate;
 
-    // This public entry point trains GQA slots only; GDN stays on the frozen path.
-    let gdn_loras: Vec<GdnLoraParams> = Vec::new();
-    let gdn_slot_layers: Vec<usize> = Vec::new();
     let train_ctx = TrainCtx::try_new(
         TapeGeometry::new(&dims, &gdn_dims, &cfg),
         rank,
@@ -426,10 +481,10 @@ pub fn train_micro_lora(
     for step in 1..=config.steps {
         let ctx = &caches[(step - 1) % caches.len()];
         let fwd = forward_full(ctx, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
-        let (_nll, _n, grads, _gdn_grads) =
-            nll_and_grads(&fwd, &layers, &loras, &head, &train_ctx)?;
+        let (_nll, _n, grads, gdn_grads) = nll_and_grads(&fwd, &layers, &loras, &head, &train_ctx)?;
 
         apply_adam_updates(&mut adam, &mut loras, &grads, &train_ctx);
+        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train_ctx);
     }
 
     // Assemble LoraAdapter from trained slot params.
@@ -456,10 +511,77 @@ pub fn train_micro_lora(
             },
         );
     }
+    let mut target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
+    if num_gdn_slots > 0 {
+        target_modules.extend([
+            "in_proj_qkv".to_string(),
+            "in_proj_z".to_string(),
+            "in_proj_b".to_string(),
+            "in_proj_a".to_string(),
+            "out_proj".to_string(),
+        ]);
+        for (s, &li) in gdn_slot_layers.iter().enumerate() {
+            let g = &gdn_loras[s];
+            adapter_layers.insert(
+                (li, "in_proj_qkv".to_string()),
+                LoraLayer {
+                    a: g.a_qkv.clone(),
+                    b: g.b_qkv.clone(),
+                    d_in: dims.hidden,
+                    d_out: gdn_dims.qkv_dim,
+                    rank,
+                },
+            );
+            adapter_layers.insert(
+                (li, "in_proj_z".to_string()),
+                LoraLayer {
+                    a: g.a_z.clone(),
+                    b: g.b_z.clone(),
+                    d_in: dims.hidden,
+                    d_out: gdn_dims.output_dim,
+                    rank,
+                },
+            );
+            adapter_layers.insert(
+                (li, "in_proj_b".to_string()),
+                LoraLayer {
+                    a: g.a_b.clone(),
+                    b: g.b_b.clone(),
+                    d_in: dims.hidden,
+                    // beta is projected per VALUE head (matches the shipping
+                    // gdn_fused forward and the f16 weight loader), not per
+                    // key head (#792).
+                    d_out: gdn_dims.value_heads,
+                    rank,
+                },
+            );
+            adapter_layers.insert(
+                (li, "in_proj_a".to_string()),
+                LoraLayer {
+                    a: g.a_a.clone(),
+                    b: g.b_a.clone(),
+                    d_in: dims.hidden,
+                    // alpha is likewise projected per VALUE head.
+                    d_out: gdn_dims.value_heads,
+                    rank,
+                },
+            );
+            adapter_layers.insert(
+                (li, "out_proj".to_string()),
+                LoraLayer {
+                    a: g.a_out.clone(),
+                    b: g.b_out.clone(),
+                    d_in: gdn_dims.output_dim,
+                    d_out: dims.hidden,
+                    rank,
+                },
+            );
+        }
+    }
     let lora_config = LoraConfig {
         rank,
         alpha,
-        target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        target_modules,
     };
     LoraAdapter::new(lora_config, adapter_layers)
 }

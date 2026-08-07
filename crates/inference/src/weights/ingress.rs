@@ -20,6 +20,28 @@
 
 use crate::error::InferenceError;
 
+#[cfg(test)]
+thread_local! {
+    static DECODED_F32_FINITE_CHECK_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn reset_decoded_f32_finite_check_count() {
+    DECODED_F32_FINITE_CHECK_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn decoded_f32_finite_check_count() -> usize {
+    DECODED_F32_FINITE_CHECK_COUNT.get()
+}
+
+#[cfg(test)]
+fn record_decoded_f32_finite_check() {
+    DECODED_F32_FINITE_CHECK_COUNT.set(DECODED_F32_FINITE_CHECK_COUNT.get() + 1);
+}
+
 /// Sealed carrier for one tensor's ingested payload plus its provenance.
 ///
 /// Construction only happens through the payload-specific constructors, so
@@ -43,6 +65,9 @@ enum IngestPayload<'a> {
         values: &'a [f32],
         dtype_label: &'static str,
         error_kind: IngressErrorKind,
+        /// Set only after widening's reduction has covered every value, avoiding
+        /// a second pass over a newly materialized tensor.
+        known_finite: bool,
     },
     /// Derived Q8 data and per-row scales.
     Q8 {
@@ -78,6 +103,162 @@ impl IngressErrorKind {
     }
 }
 
+/// Shared provenance, shape, and finite-value validator for one-pass
+/// decoders.
+///
+/// Byte-stream readers reduce raw non-finite markers while materializing
+/// each decode group, then use [`Self::finish_f64_materialization`].
+/// Narrowing writers use the shared finite-f16 encoder, then call
+/// [`Self::observe_finite`] before publishing a completed payload.
+pub(crate) struct DecodedTensorValidator<'a> {
+    source: &'a str,
+    tensor_name: &'a str,
+    shape: &'a [usize],
+    dtype_label: &'static str,
+    error_kind: IngressErrorKind,
+    numel: usize,
+    seen: usize,
+}
+
+impl<'a> DecodedTensorValidator<'a> {
+    fn new(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        dtype_label: &'static str,
+        error_kind: IngressErrorKind,
+        numel: usize,
+        decoded_len: usize,
+    ) -> Result<Self, InferenceError> {
+        if decoded_len != numel {
+            return Err(error_kind.error(format!(
+                "{source}: tensor {tensor_name} ({dtype_label}) decoded element count \
+                 {decoded_len} does not match shape {shape:?} (shape product {numel})",
+            )));
+        }
+        Ok(Self {
+            source,
+            tensor_name,
+            shape,
+            dtype_label,
+            error_kind,
+            numel,
+            seen: 0,
+        })
+    }
+
+    /// Construct a validator for one SafeTensors decode.
+    pub(crate) fn safetensors(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        dtype_label: &'static str,
+        decoded_len: usize,
+    ) -> Result<Self, InferenceError> {
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                InferenceError::InvalidSafetensors(format!(
+                    "{source}: tensor {tensor_name} shape {shape:?} overflows usize element count",
+                ))
+            })?;
+        Self::new(
+            source,
+            tensor_name,
+            shape,
+            dtype_label,
+            IngressErrorKind::InvalidSafetensors,
+            numel,
+            decoded_len,
+        )
+    }
+
+    /// Construct a validator for derived values before they are serialized.
+    pub(crate) fn decoded_input(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        dtype_label: &'static str,
+        decoded_len: usize,
+    ) -> Result<Self, InferenceError> {
+        let numel = shape
+            .iter()
+            .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "{source}: tensor {tensor_name} shape {shape:?} overflows usize element count",
+                ))
+            })?;
+        Self::new(
+            source,
+            tensor_name,
+            shape,
+            dtype_label,
+            IngressErrorKind::InvalidInput,
+            numel,
+            decoded_len,
+        )
+    }
+
+    #[cold]
+    fn reject_non_finite_at(&self, index: usize, value: f64) -> InferenceError {
+        self.error_kind.error(format!(
+            "{}: tensor {} ({}) has non-finite value {value} at element index \
+             {} of {} (shape {:?})",
+            self.source, self.tensor_name, self.dtype_label, index, self.numel, self.shape,
+        ))
+    }
+
+    #[cold]
+    fn reject_non_finite(&self, value: f64) -> InferenceError {
+        self.reject_non_finite_at(self.seen, value)
+    }
+
+    pub(crate) fn reject_f16_bits(&self, bits: u16) -> InferenceError {
+        let value = crate::weights::half_bits::f16_bits_to_f32(bits);
+        self.reject_non_finite(value as f64)
+    }
+
+    #[inline(always)]
+    pub(crate) fn observe_finite(&mut self) {
+        self.seen += 1;
+    }
+
+    /// Complete a one-pass f64 materialization whose decode loop reduced
+    /// raw non-finite markers without branching. The valid path never
+    /// traverses the materialized tensor again; only an already-invalid
+    /// input is scanned to recover its first offending index for diagnostics.
+    #[inline]
+    pub(crate) fn finish_f64_materialization(
+        self,
+        values: &[f64],
+        has_non_finite: bool,
+    ) -> Result<(), InferenceError> {
+        if has_non_finite
+            && let Some((index, &value)) = values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+        {
+            return Err(self.reject_non_finite_at(index, value));
+        }
+        Ok(())
+    }
+
+    /// Confirm the decoder observed exactly the declared element count.
+    #[inline]
+    pub(crate) fn finish(self) -> Result<(), InferenceError> {
+        if self.seen != self.numel {
+            return Err(self.error_kind.error(format!(
+                "{}: tensor {} ({}) decoder observed {} elements, expected {} for shape {:?}",
+                self.source, self.tensor_name, self.dtype_label, self.seen, self.numel, self.shape,
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl<'a> IngestedTensor<'a> {
     /// Wrap an already f32-widened tensor slice for validation.
     pub(crate) fn decoded_f32(
@@ -96,6 +277,29 @@ impl<'a> IngestedTensor<'a> {
                 values,
                 dtype_label,
                 error_kind: IngressErrorKind::InvalidSafetensors,
+                known_finite: false,
+            },
+        }
+    }
+
+    #[cfg(feature = "f16")]
+    pub(super) fn decoded_f32_known_finite(
+        source: &'a str,
+        tensor_name: &'a str,
+        shape: &'a [usize],
+        dtype_label: &'static str,
+        values: &'a [f32],
+    ) -> Self {
+        Self {
+            source,
+            tensor_name,
+            shape,
+            expected_shape: None,
+            payload: IngestPayload::DecodedF32 {
+                values,
+                dtype_label,
+                error_kind: IngressErrorKind::InvalidSafetensors,
+                known_finite: true,
             },
         }
     }
@@ -116,6 +320,7 @@ impl<'a> IngestedTensor<'a> {
                 values,
                 dtype_label: "F32",
                 error_kind: IngressErrorKind::InvalidInput,
+                known_finite: false,
             },
         }
     }
@@ -223,6 +428,7 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
             values,
             dtype_label,
             error_kind,
+            known_finite,
         } => {
             let numel = checked_shape_numel(&tensor)?;
             if values.len() != numel {
@@ -235,7 +441,13 @@ pub(crate) fn validate_ingested_tensor(tensor: IngestedTensor<'_>) -> Result<(),
                     tensor.shape,
                 )));
             }
-            if let Some((idx, bad)) = values.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+            if !known_finite
+                && let Some((idx, bad)) = values.iter().enumerate().find(|(_, v)| {
+                    #[cfg(test)]
+                    record_decoded_f32_finite_check();
+                    !v.is_finite()
+                })
+            {
                 return Err(error_kind.error(format!(
                     "{}: tensor {} ({dtype_label}) has non-finite value {bad} at element index \
                      {idx} of {numel} (shape {:?})",
@@ -355,8 +567,12 @@ mod tests {
     #[test]
     fn accepts_finite_values_including_signed_zero_and_subnormal() {
         let values = [0.0f32, -0.0, 1.0, -1.0, f32::MIN_POSITIVE / 2.0];
+        reset_decoded_f32_finite_check_count();
         let tensor = IngestedTensor::decoded_f32("test", "t", &[5], "F32", &values);
         assert!(validate_ingested_tensor(tensor).is_ok());
+        let checks = decoded_f32_finite_check_count();
+        assert_eq!(checks, values.len());
+        assert_ne!(checks, 0, "the test scan observable must collect checks");
     }
 
     #[test]

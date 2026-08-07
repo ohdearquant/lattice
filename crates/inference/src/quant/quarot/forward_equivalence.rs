@@ -3,10 +3,11 @@
 //!
 //! ## What this module owns
 //!
-//! [`assert_forward_equivalence_qwen35`] — the converter binary (step 3c-5)
-//! must call this gate AFTER running the full pipeline
-//! (materialize_lm_head → fuse_rmsnorms → absorb_rotations) and BEFORE
-//! quantizing or writing artifacts to disk. The gate runs two checks and
+//! The converter binary (step 3c-5) prepares this gate after
+//! `materialize_lm_head`, completes it after
+//! `fuse_rmsnorms → absorb_rotations`, and does so before quantizing or
+//! writing artifacts to disk. Direct map-backed callers use
+//! [`assert_forward_equivalence_qwen35`]. The gate runs two checks and
 //! refuses the conversion (`Err(InferenceError::Inference)`) when either
 //! exceeds `tolerance`:
 //!
@@ -27,7 +28,8 @@
 //!    corruption / missed rotation absorption / missed fusion on tensors
 //!    the chain probe does not consume — `k_proj`, `v_proj`, gate-z half
 //!    of `q_proj`, `in_proj_qkv`, `in_proj_a`, `in_proj_b` — and refuses
-//!    when a planned tensor is missing from either working set.
+//!    when a planned tensor is missing from its original source or the
+//!    rotated working set.
 //!
 //! The two checks are complementary: (1) catches residual-stream
 //! breakage holistically, (2) catches every planned tensor individually
@@ -129,10 +131,12 @@
 //!
 //! ## Tied vs untied originals
 //!
-//! For the typical converter flow, `materialize_lm_head_for_qwen35` runs
-//! BEFORE this gate, so both `original` (snapshot post-materialize, pre-fuse)
-//! and `rotated` have `lm_head.weight` populated. The probe uses it in
-//! both cases.
+//! For the converter flow, `materialize_lm_head_for_qwen35` runs before
+//! gate preparation, so the original chain logits use the materialized
+//! `lm_head.weight`. The post-rotation per-tensor check streams source
+//! matrices from the checkpoint reader. For a tied input, it reconstructs
+//! `lm_head.weight` from `embed_tokens.weight`, exactly matching
+//! materialization even if a stray lm_head tensor exists on disk.
 //!
 //! For callers that take the `original` snapshot BEFORE materialization
 //! (or for direct unit-level tests of a tied input) the probe falls back
@@ -150,11 +154,13 @@
 //! and the probe has no expert-mixing path.
 
 use std::collections::HashMap;
+use std::mem::size_of;
 
 use crate::error::InferenceError;
 use crate::model::qwen35::qwen_required_tensor_names;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::hadamard::RandomizedHadamard;
+use crate::quant::quarot::io::QuarotTensorReader;
 use crate::quant::quarot::lm_head::{
     QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
     qwen35_final_norm_fusion_target,
@@ -166,6 +172,236 @@ use crate::quant::quarot::rmsnorm_fusion::{
 };
 use crate::quant::quarot::rotation::{absorb_input_rotation_f64, absorb_output_rotation_f64};
 
+#[cfg(test)]
+pub(crate) mod pre_admission_allocation_tracking {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Phase {
+        Inactive,
+        WaitingForConverterBoundary,
+        BeforeRejection,
+        AfterRejection,
+        WaitingForMaterializedWorkingSetBoundary,
+        MaterializedWorkingSetBoundary,
+        MaterializedWorkingSetBoundaryCompleted,
+    }
+
+    #[derive(Clone, Copy)]
+    struct State {
+        phase: Phase,
+        before_rejection_allocation_calls: usize,
+        after_rejection_allocation_calls: usize,
+        materialized_working_set_allocation_calls: usize,
+        rejection_seen: bool,
+        reader_boundary_seen: bool,
+        materialized_working_set_boundary_seen: bool,
+        materialized_working_set_boundary_completed: bool,
+    }
+
+    const INACTIVE: State = State {
+        phase: Phase::Inactive,
+        before_rejection_allocation_calls: 0,
+        after_rejection_allocation_calls: 0,
+        materialized_working_set_allocation_calls: 0,
+        rejection_seen: false,
+        reader_boundary_seen: false,
+        materialized_working_set_boundary_seen: false,
+        materialized_working_set_boundary_completed: false,
+    };
+
+    std::thread_local! {
+        static STATE: Cell<State> = const { Cell::new(INACTIVE) };
+    }
+
+    struct TrackingAllocator;
+
+    #[global_allocator]
+    static GLOBAL: TrackingAllocator = TrackingAllocator;
+
+    fn record_allocation() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            match state.phase {
+                Phase::BeforeRejection => {
+                    state.before_rejection_allocation_calls =
+                        state.before_rejection_allocation_calls.saturating_add(1);
+                }
+                Phase::AfterRejection => {
+                    state.after_rejection_allocation_calls =
+                        state.after_rejection_allocation_calls.saturating_add(1);
+                }
+                Phase::MaterializedWorkingSetBoundary => {
+                    state.materialized_working_set_allocation_calls = state
+                        .materialized_working_set_allocation_calls
+                        .saturating_add(1);
+                }
+                Phase::Inactive
+                | Phase::WaitingForConverterBoundary
+                | Phase::WaitingForMaterializedWorkingSetBoundary
+                | Phase::MaterializedWorkingSetBoundaryCompleted => return,
+            }
+            cell.set(state);
+        });
+    }
+
+    // SAFETY: allocation requests are observed without modification and then
+    // forwarded unchanged to the system allocator.
+    unsafe impl GlobalAlloc for TrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            System.alloc(layout)
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_allocation();
+            System.alloc_zeroed(layout)
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            System.dealloc(ptr, layout);
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_allocation();
+            System.realloc(ptr, layout, new_size)
+        }
+    }
+
+    pub(crate) struct Guard {
+        active: bool,
+    }
+
+    pub(crate) struct Observation {
+        pub(crate) before_rejection_allocation_calls: usize,
+        pub(crate) after_rejection_allocation_calls: usize,
+        pub(crate) materialized_working_set_allocation_calls: usize,
+        pub(crate) rejection_seen: bool,
+        pub(crate) reader_boundary_seen: bool,
+        pub(crate) materialized_working_set_boundary_seen: bool,
+        pub(crate) materialized_working_set_boundary_completed: bool,
+    }
+
+    fn start_in_phase(phase: Phase) -> Guard {
+        STATE.with(|cell| {
+            assert_eq!(
+                cell.get().phase,
+                Phase::Inactive,
+                "allocation tracking already active"
+            );
+            cell.set(State { phase, ..INACTIVE });
+        });
+        Guard { active: true }
+    }
+
+    pub(super) fn start() -> Guard {
+        start_in_phase(Phase::BeforeRejection)
+    }
+
+    pub(crate) fn start_at_converter_boundary() -> Guard {
+        start_in_phase(Phase::WaitingForConverterBoundary)
+    }
+
+    pub(crate) fn start_at_materialized_working_set_boundary() -> Guard {
+        start_in_phase(Phase::WaitingForMaterializedWorkingSetBoundary)
+    }
+
+    pub(crate) fn mark_converter_boundary() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.phase == Phase::WaitingForConverterBoundary {
+                state.phase = Phase::BeforeRejection;
+                cell.set(state);
+            }
+        });
+    }
+
+    pub(crate) fn mark_reader_boundary() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.phase != Phase::Inactive {
+                state.reader_boundary_seen = true;
+                cell.set(state);
+            }
+        });
+    }
+
+    pub(crate) fn mark_materialized_working_set_boundary() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.phase != Phase::Inactive {
+                state.materialized_working_set_boundary_seen = true;
+            }
+            if state.phase == Phase::WaitingForMaterializedWorkingSetBoundary {
+                state.phase = Phase::MaterializedWorkingSetBoundary;
+            }
+            cell.set(state);
+        });
+    }
+
+    pub(crate) fn mark_materialized_working_set_boundary_completed() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.phase != Phase::Inactive {
+                state.materialized_working_set_boundary_completed = true;
+            }
+            if state.phase == Phase::MaterializedWorkingSetBoundary {
+                state.phase = Phase::MaterializedWorkingSetBoundaryCompleted;
+            }
+            cell.set(state);
+        });
+    }
+
+    pub(super) fn mark_rejection() {
+        let _ = STATE.try_with(|cell| {
+            let mut state = cell.get();
+            if state.phase == Phase::BeforeRejection {
+                state.phase = Phase::AfterRejection;
+                state.rejection_seen = true;
+                cell.set(state);
+            }
+        });
+    }
+
+    impl Guard {
+        pub(crate) fn finish(mut self) -> Observation {
+            self.active = false;
+            STATE.with(|cell| {
+                let state = cell.replace(INACTIVE);
+                Observation {
+                    before_rejection_allocation_calls: state.before_rejection_allocation_calls,
+                    after_rejection_allocation_calls: state.after_rejection_allocation_calls,
+                    materialized_working_set_allocation_calls: state
+                        .materialized_working_set_allocation_calls,
+                    rejection_seen: state.rejection_seen,
+                    reader_boundary_seen: state.reader_boundary_seen,
+                    materialized_working_set_boundary_seen: state
+                        .materialized_working_set_boundary_seen,
+                    materialized_working_set_boundary_completed: state
+                        .materialized_working_set_boundary_completed,
+                }
+            })
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = STATE.try_with(|cell| cell.set(INACTIVE));
+            }
+        }
+    }
+}
+
+/// Maximum retained bytes for chain-probe tokens, logit row descriptors, and
+/// complete f64 logit rows in a prepared forward-equivalence snapshot.
+///
+/// The default four probes for Qwen3.5-0.8B retain about 7.6 MiB. A 64 MiB
+/// ceiling permits 33 probes at its 248,320-token vocabulary while preventing
+/// caller-controlled probe counts from adding an unbounded resident working set.
+const MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES: usize = 64 * 1024 * 1024;
+
 /// Probe sample size + tolerance settings for
 /// [`assert_forward_equivalence_qwen35`].
 ///
@@ -174,12 +410,18 @@ use crate::quant::quarot::rotation::{absorb_input_rotation_f64, absorb_output_ro
 /// (`‖rotated_forward − original_forward‖ < 1e-5` on a small batch).
 #[derive(Debug, Clone)]
 pub struct ForwardEquivalenceConfig {
-    /// Number of token IDs to probe. Must be > 0.
+    /// Number of token IDs to probe. Must be > 0. The retained token and
+    /// complete-logit evidence must fit the 64 MiB preparation budget.
     pub num_probe_tokens: usize,
     /// Max-abs-error threshold (per-logit). Must be > 0.
     pub tolerance: f64,
     /// Seed for the deterministic token sampler.
     pub seed: u64,
+}
+
+pub(crate) struct ForwardEquivalenceAdmission<'cfg, 'forward> {
+    cfg: &'cfg Qwen35Config,
+    forward_cfg: &'forward ForwardEquivalenceConfig,
 }
 
 impl Default for ForwardEquivalenceConfig {
@@ -217,6 +459,231 @@ pub struct ForwardEquivalenceReport {
     pub tolerance: f64,
 }
 
+/// Original-side evidence retained while the converter mutates its f64
+/// working set in place.
+///
+/// The chain probe consumes the full original model, but only its logits
+/// are needed after rotation. Matrix equivalence separately needs the
+/// original RMSNorm scales and one planned matrix at a time; the scales
+/// live here while matrices are streamed from [`QuarotTensorReader`].
+/// Borrowing the admitted configuration and prepared rotation prevents
+/// completion from substituting either after the original evidence is captured.
+pub(crate) struct ForwardEquivalenceSnapshot<'a> {
+    cfg: &'a Qwen35Config,
+    rotation: &'a RandomizedHadamard,
+    probe_tokens: Vec<u32>,
+    original_logits: Vec<Vec<f64>>,
+    fusion_gammas: HashMap<String, TensorEntry>,
+    tolerance: f64,
+}
+
+trait OriginalTensorSource {
+    fn has_tensor(&self, name: &str) -> bool;
+
+    fn load_tensor(&self, name: &str) -> Result<TensorEntry, InferenceError>;
+}
+
+impl OriginalTensorSource for HashMap<String, TensorEntry> {
+    fn has_tensor(&self, name: &str) -> bool {
+        self.contains_key(name)
+    }
+
+    fn load_tensor(&self, name: &str) -> Result<TensorEntry, InferenceError> {
+        self.get(name)
+            .cloned()
+            .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+    }
+}
+
+struct ReaderOriginalTensorSource<'a> {
+    reader: &'a QuarotTensorReader,
+    tied_lm_head_from_embed: bool,
+}
+
+impl OriginalTensorSource for ReaderOriginalTensorSource<'_> {
+    fn has_tensor(&self, name: &str) -> bool {
+        if self.tied_lm_head_from_embed && name == QWEN35_LM_HEAD_NAME {
+            return false;
+        }
+        self.reader.has_tensor(name)
+    }
+
+    fn load_tensor(&self, name: &str) -> Result<TensorEntry, InferenceError> {
+        let (data, shape) = self.reader.read_tensor_f64(name)?;
+        Ok(TensorEntry {
+            name: name.to_string(),
+            shape,
+            data,
+        })
+    }
+}
+
+pub(crate) fn preflight_forward_equivalence_probe_budget(
+    cfg: &Qwen35Config,
+    forward_cfg: &ForwardEquivalenceConfig,
+) -> Result<(), InferenceError> {
+    let Some(logit_elements) = forward_cfg.num_probe_tokens.checked_mul(cfg.vocab_size) else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    let Some(logit_bytes) = logit_elements.checked_mul(size_of::<f64>()) else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    let Some(row_descriptor_bytes) = forward_cfg
+        .num_probe_tokens
+        .checked_mul(size_of::<Vec<f64>>())
+    else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    let Some(probe_token_bytes) = forward_cfg.num_probe_tokens.checked_mul(size_of::<u32>()) else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    let Some(retained_bytes) = logit_bytes
+        .checked_add(row_descriptor_bytes)
+        .and_then(|bytes| bytes.checked_add(probe_token_bytes))
+    else {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit size overflow"
+        ));
+    };
+    if retained_bytes > MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: retained chain-logit budget exceeded \
+             (num_probe_tokens={}, vocab_size={}, required_bytes={retained_bytes}, \
+             max_bytes={MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES})",
+            forward_cfg.num_probe_tokens, cfg.vocab_size
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_forward_equivalence_admission<'cfg, 'forward>(
+    cfg: &'cfg Qwen35Config,
+    forward_cfg: &'forward ForwardEquivalenceConfig,
+) -> Result<ForwardEquivalenceAdmission<'cfg, 'forward>, InferenceError> {
+    if cfg.is_moe() {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: MoE configs are deferred to v1 \
+             (the rotation/fusion pipeline rejects MoE upstream; this probe \
+             has no expert-mixing path)"
+        ));
+    }
+    if forward_cfg.num_probe_tokens == 0 {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: num_probe_tokens must be > 0"
+        ));
+    }
+    if !forward_cfg.tolerance.is_finite() || forward_cfg.tolerance <= 0.0 {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: tolerance must be a positive finite value, got {}",
+            forward_cfg.tolerance
+        ));
+    }
+    if cfg.vocab_size == 0 {
+        return reject_forward_equivalence_admission(format_args!(
+            "assert_forward_equivalence_qwen35: cfg.vocab_size must be > 0"
+        ));
+    }
+    preflight_forward_equivalence_probe_budget(cfg, forward_cfg)?;
+    Ok(ForwardEquivalenceAdmission { cfg, forward_cfg })
+}
+
+fn validate_forward_equivalence_rotation(
+    cfg: &Qwen35Config,
+    rotation: &RandomizedHadamard,
+) -> Result<(), InferenceError> {
+    if rotation.dim() != cfg.hidden_size {
+        return Err(InferenceError::Inference(format!(
+            "assert_forward_equivalence_qwen35: rotation.dim()={} != cfg.hidden_size={}",
+            rotation.dim(),
+            cfg.hidden_size
+        )));
+    }
+    Ok(())
+}
+
+fn reject_forward_equivalence_admission<T>(
+    message: std::fmt::Arguments<'_>,
+) -> Result<T, InferenceError> {
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_rejection();
+    Err(InferenceError::Inference(message.to_string()))
+}
+
+fn full_fusion_plan(cfg: &Qwen35Config) -> Result<Vec<RmsNormFusionTarget>, InferenceError> {
+    let mut fusion_plan = qwen35_per_layer_fusion_plan(cfg)?;
+    fusion_plan.push(qwen35_final_norm_fusion_target());
+    Ok(fusion_plan)
+}
+
+/// Capture the original-side evidence that cannot be recovered after the
+/// converter mutates its working set.
+///
+/// This retains `num_probe_tokens * vocab_size` chain logits and one
+/// `hidden_size` RMSNorm scale for each input/post-attention norm plus
+/// the final norm. Retained chain-probe evidence is admitted against the
+/// 64 MiB budget before any probe tokens or logits are allocated. Planned
+/// matrices are not retained.
+pub(crate) fn prepare_forward_equivalence_qwen35<'a>(
+    original: &HashMap<String, TensorEntry>,
+    cfg: &'a Qwen35Config,
+    rotation: &'a RandomizedHadamard,
+    forward_cfg: &ForwardEquivalenceConfig,
+) -> Result<ForwardEquivalenceSnapshot<'a>, InferenceError> {
+    let admission = validate_forward_equivalence_admission(cfg, forward_cfg)?;
+    prepare_forward_equivalence_qwen35_after_admission(original, rotation, admission)
+}
+
+pub(crate) fn prepare_forward_equivalence_qwen35_after_admission<'cfg, 'forward>(
+    original: &HashMap<String, TensorEntry>,
+    rotation: &'cfg RandomizedHadamard,
+    admission: ForwardEquivalenceAdmission<'cfg, 'forward>,
+) -> Result<ForwardEquivalenceSnapshot<'cfg>, InferenceError> {
+    let ForwardEquivalenceAdmission { cfg, forward_cfg } = admission;
+    validate_forward_equivalence_rotation(cfg, rotation)?;
+
+    let probe_tokens = deterministic_probe_tokens(
+        forward_cfg.seed,
+        forward_cfg.num_probe_tokens,
+        cfg.vocab_size,
+    );
+    let original_logits = probe_tokens
+        .iter()
+        .map(|&token| rotation_chain_probe_qwen35(original, cfg, token))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut fusion_gammas = HashMap::new();
+    for target in full_fusion_plan(cfg)? {
+        if fusion_gammas.contains_key(&target.norm_tensor) {
+            continue;
+        }
+        let gamma = original.get(&target.norm_tensor).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "prepare_forward_equivalence_qwen35: fusion gamma `{}` not in original \
+                 working set",
+                target.norm_tensor
+            ))
+        })?;
+        fusion_gammas.insert(target.norm_tensor, gamma.clone());
+    }
+
+    Ok(ForwardEquivalenceSnapshot {
+        cfg,
+        rotation,
+        probe_tokens,
+        original_logits,
+        fusion_gammas,
+        tolerance: forward_cfg.tolerance,
+    })
+}
+
 /// **Refuse-on-fail forward-equivalence gate** for QuaRot Qwen3.5 conversion.
 ///
 /// Runs both the rotation-chain probe and the per-tensor rotation-equivalence
@@ -247,7 +714,9 @@ pub struct ForwardEquivalenceReport {
 /// # Errors
 ///
 /// - `cfg.is_moe()` — MoE conversion is deferred to v1.
-/// - `forward_cfg.num_probe_tokens == 0` or `tolerance` is not a positive finite.
+/// - `forward_cfg.num_probe_tokens == 0`, its retained chain-logit evidence
+///   exceeds the 64 MiB budget (or its size calculation overflows), or
+///   `tolerance` is not a positive finite value.
 /// - `rotation.dim() != cfg.hidden_size`.
 /// - Any planned tensor is missing from either working set, or has the
 ///   wrong shape or data length.
@@ -261,51 +730,54 @@ pub fn assert_forward_equivalence_qwen35(
     rotation: &RandomizedHadamard,
     forward_cfg: &ForwardEquivalenceConfig,
 ) -> Result<ForwardEquivalenceReport, InferenceError> {
-    if cfg.is_moe() {
-        return Err(InferenceError::Inference(
-            "assert_forward_equivalence_qwen35: MoE configs are deferred to v1 \
-             (the rotation/fusion pipeline rejects MoE upstream; this probe \
-             has no expert-mixing path)"
-                .to_string(),
-        ));
-    }
-    if forward_cfg.num_probe_tokens == 0 {
-        return Err(InferenceError::Inference(
-            "assert_forward_equivalence_qwen35: num_probe_tokens must be > 0".to_string(),
-        ));
-    }
-    if !forward_cfg.tolerance.is_finite() || forward_cfg.tolerance <= 0.0 {
-        return Err(InferenceError::Inference(format!(
-            "assert_forward_equivalence_qwen35: tolerance must be a positive finite value, got {}",
-            forward_cfg.tolerance
-        )));
-    }
-    if cfg.vocab_size == 0 {
-        return Err(InferenceError::Inference(
-            "assert_forward_equivalence_qwen35: cfg.vocab_size must be > 0".to_string(),
-        ));
-    }
-    if rotation.dim() != cfg.hidden_size {
-        return Err(InferenceError::Inference(format!(
-            "assert_forward_equivalence_qwen35: rotation.dim()={} != cfg.hidden_size={}",
-            rotation.dim(),
-            cfg.hidden_size
-        )));
-    }
+    let snapshot = prepare_forward_equivalence_qwen35(original, cfg, rotation, forward_cfg)?;
+    assert_forward_equivalence_snapshot(snapshot, original, rotated)
+}
 
-    // 1. Rotation-chain probe.
-    let probe_tokens = deterministic_probe_tokens(
-        forward_cfg.seed,
-        forward_cfg.num_probe_tokens,
-        cfg.vocab_size,
-    );
+/// Complete a prepared equivalence gate while streaming original planned
+/// matrices from the mmap-backed checkpoint reader.
+///
+/// Configuration and rotation come only from `snapshot`, preserving the
+/// preparation admission and dimension check through completion.
+pub(crate) fn assert_prepared_forward_equivalence_qwen35(
+    snapshot: ForwardEquivalenceSnapshot<'_>,
+    reader: &QuarotTensorReader,
+    rotated: &HashMap<String, TensorEntry>,
+) -> Result<ForwardEquivalenceReport, InferenceError> {
+    let original = ReaderOriginalTensorSource {
+        reader,
+        tied_lm_head_from_embed: snapshot.cfg.tie_word_embeddings,
+    };
+    assert_forward_equivalence_snapshot(snapshot, &original, rotated)
+}
+
+fn assert_forward_equivalence_snapshot<S: OriginalTensorSource>(
+    snapshot: ForwardEquivalenceSnapshot<'_>,
+    original: &S,
+    rotated: &HashMap<String, TensorEntry>,
+) -> Result<ForwardEquivalenceReport, InferenceError> {
+    let ForwardEquivalenceSnapshot {
+        cfg,
+        rotation,
+        probe_tokens,
+        original_logits,
+        fusion_gammas,
+        tolerance,
+    } = snapshot;
+    if original_logits.len() != probe_tokens.len() {
+        return Err(InferenceError::Inference(format!(
+            "assert_forward_equivalence_qwen35: prepared probe count mismatch \
+             (tokens={}, original_logits={})",
+            probe_tokens.len(),
+            original_logits.len()
+        )));
+    }
 
     let mut chain_max_abs = 0.0_f64;
     let mut chain_total_abs = 0.0_f64;
     let mut chain_count: usize = 0;
 
-    for &token in &probe_tokens {
-        let logits_orig = rotation_chain_probe_qwen35(original, cfg, token)?;
+    for (&token, logits_orig) in probe_tokens.iter().zip(original_logits.iter()) {
         let logits_rot = rotation_chain_probe_qwen35(rotated, cfg, token)?;
         if logits_orig.len() != logits_rot.len() {
             return Err(InferenceError::Inference(format!(
@@ -338,13 +810,13 @@ pub fn assert_forward_equivalence_qwen35(
         0.0
     };
 
-    if chain_max_abs > forward_cfg.tolerance {
+    if chain_max_abs > tolerance {
         return Err(InferenceError::Inference(format!(
             "forward-equivalence refused: chain probe max_abs_error={chain_max_abs} \
-             exceeds tolerance={} (mean_abs_error={chain_mean_abs}, probe_tokens={:?}). \
+             exceeds tolerance={tolerance} (mean_abs_error={chain_mean_abs}, \
+             probe_tokens={probe_tokens:?}). \
              Do NOT write conversion artifacts — the pipeline produced logits \
-             that disagree with the original model.",
-            forward_cfg.tolerance, probe_tokens
+             that disagree with the original model."
         )));
     }
 
@@ -352,10 +824,10 @@ pub fn assert_forward_equivalence_qwen35(
     //    including the ones the chain probe shortcuts past (k_proj, v_proj,
     //    gate-z half of q_proj, in_proj_qkv, in_proj_a, in_proj_b).
     let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
-    let mut fusion_plan = qwen35_per_layer_fusion_plan(cfg)?;
-    fusion_plan.push(qwen35_final_norm_fusion_target());
+    let fusion_plan = full_fusion_plan(cfg)?;
     let per_tensor_max_abs = check_per_tensor_rotation_equivalence(
         original,
+        &fusion_gammas,
         rotated,
         cfg,
         rotation,
@@ -363,13 +835,13 @@ pub fn assert_forward_equivalence_qwen35(
         &fusion_plan,
     )?;
 
-    if per_tensor_max_abs > forward_cfg.tolerance {
+    if per_tensor_max_abs > tolerance {
         return Err(InferenceError::Inference(format!(
             "forward-equivalence refused: per-tensor max_abs_error={per_tensor_max_abs} \
-             exceeds tolerance={} (chain probe max={chain_max_abs}, mean={chain_mean_abs}). \
+             exceeds tolerance={tolerance} (chain probe max={chain_max_abs}, \
+             mean={chain_mean_abs}). \
              At least one planned tensor disagrees with the rotation/fusion algebra. \
-             Do NOT write conversion artifacts.",
-            forward_cfg.tolerance
+             Do NOT write conversion artifacts."
         )));
     }
 
@@ -378,7 +850,7 @@ pub fn assert_forward_equivalence_qwen35(
         max_abs_error: max_abs,
         mean_abs_error: chain_mean_abs,
         probe_tokens,
-        tolerance: forward_cfg.tolerance,
+        tolerance,
     })
 }
 
@@ -391,9 +863,9 @@ pub fn assert_forward_equivalence_qwen35(
 /// from the original-side source by applying the same primitives the
 /// pipeline does:
 ///
-/// - Input-side, fused: `clone → fuse_shifted_rmsnorm_into_next_layer_f64 → absorb_input_rotation_f64`
-/// - Input-side, no fusion (`embed_tokens` only): `clone → absorb_input_rotation_f64`
-/// - Output-side (`o_proj`, `out_proj`, `down_proj`): `clone → absorb_output_rotation_f64`
+/// - Input-side, fused: `source → fuse_shifted_rmsnorm_into_next_layer_f64 → absorb_input_rotation_f64`
+/// - Input-side, no fusion (`embed_tokens` only): `source → absorb_input_rotation_f64`
+/// - Output-side (`o_proj`, `out_proj`, `down_proj`): `source → absorb_output_rotation_f64`
 ///
 /// Then compares the reconstructed matrix to `rotated[name]` element-wise
 /// and tracks the max-abs delta across every planned tensor. This is a
@@ -417,8 +889,9 @@ pub fn assert_forward_equivalence_qwen35(
 /// - Output-side tensor unexpectedly carrying a fusion rule (rotation /
 ///   fusion plan inconsistency — should not happen with the Qwen3.5
 ///   plans).
-fn check_per_tensor_rotation_equivalence(
-    original: &HashMap<String, TensorEntry>,
+fn check_per_tensor_rotation_equivalence<S: OriginalTensorSource>(
+    original: &S,
+    fusion_gammas: &HashMap<String, TensorEntry>,
     rotated: &HashMap<String, TensorEntry>,
     cfg: &Qwen35Config,
     rotation: &RandomizedHadamard,
@@ -462,22 +935,29 @@ fn check_per_tensor_rotation_equivalence(
         // Source tensor on the `original` side. Tied configs may have
         // taken the snapshot before materialize, in which case lm_head
         // falls back to embed_tokens (the source materialize would clone).
-        let source = if let Some(t) = original.get(expected_name) {
-            t
+        let source_name = if original.has_tensor(expected_name) {
+            expected_name.as_str()
         } else if expected_name == QWEN35_LM_HEAD_NAME && cfg.tie_word_embeddings {
-            original.get(QWEN35_EMBED_TOKENS_NAME).ok_or_else(|| {
-                InferenceError::Inference(format!(
+            if !original.has_tensor(QWEN35_EMBED_TOKENS_NAME) {
+                return Err(InferenceError::Inference(format!(
                     "check_per_tensor_rotation_equivalence: tied config requires \
                      either `{QWEN35_LM_HEAD_NAME}` or `{QWEN35_EMBED_TOKENS_NAME}` in the \
-                     original working set as the source for lm_head reconstruction"
-                ))
-            })?
+                     original tensor source as the source for lm_head reconstruction"
+                )));
+            }
+            QWEN35_EMBED_TOKENS_NAME
         } else {
             return Err(InferenceError::Inference(format!(
                 "check_per_tensor_rotation_equivalence: planned tensor `{expected_name}` \
-                 missing from original working set"
+                 missing from original tensor source"
             )));
         };
+        let source = original.load_tensor(source_name).map_err(|err| {
+            InferenceError::Inference(format!(
+                "check_per_tensor_rotation_equivalence: failed to load original source \
+                 `{source_name}` for planned tensor `{expected_name}`: {err}"
+            ))
+        })?;
 
         let actual = rotated.get(expected_name).ok_or_else(|| {
             InferenceError::Inference(format!(
@@ -510,10 +990,7 @@ fn check_per_tensor_rotation_equivalence(
             )));
         }
 
-        // Reconstruct expected `W_rot` from `W_orig` using the same primitives
-        // the pipeline uses (fuse first if applicable, then absorb the rotation
-        // on the planned side).
-        let mut expected_rot = source.data.clone();
+        let mut expected_rot = source.data;
         match tensor_rotation.side {
             AbsorptionSide::InputSide => {
                 if cols != hidden {
@@ -523,11 +1000,11 @@ fn check_per_tensor_rotation_equivalence(
                     )));
                 }
                 if let Some(norm_name) = fusion_gamma.get(expected_name.as_str()) {
-                    let norm = original.get(*norm_name).ok_or_else(|| {
+                    let norm = fusion_gammas.get(*norm_name).ok_or_else(|| {
                         InferenceError::Inference(format!(
                             "check_per_tensor_rotation_equivalence: fusion gamma source \
-                             `{norm_name}` (for downstream `{expected_name}`) not in original \
-                             working set"
+                             `{norm_name}` (for downstream `{expected_name}`) not in prepared \
+                             original snapshot"
                         ))
                     })?;
                     if norm.shape.len() != 1 || norm.shape[0] != cols || norm.data.len() != cols {
@@ -1022,6 +1499,151 @@ mod tests {
         assert_eq!(cfg.num_hidden_layers, 2);
         assert_eq!(cfg.layer_types[0], LayerType::LinearAttention);
         assert_eq!(cfg.layer_types[1], LayerType::FullAttention);
+    }
+
+    #[test]
+    #[allow(
+        clippy::type_complexity,
+        reason = "the explicit completion signature is the compile-time assertion"
+    )]
+    fn prepared_completion_cannot_accept_dense_to_moe_handoff() {
+        let dense_cfg = tied_tiny_test_cfg();
+        let original = build_working_set(&dense_cfg, 0xA11C_E5E5);
+        let rotation = RandomizedHadamard::new(0xD3A5_EA5E, dense_cfg.hidden_size).unwrap();
+        let forward_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: 1,
+            ..Default::default()
+        };
+        let snapshot =
+            prepare_forward_equivalence_qwen35(&original, &dense_cfg, &rotation, &forward_cfg)
+                .unwrap();
+        assert!(std::ptr::eq(snapshot.cfg, &dense_cfg));
+        assert!(std::ptr::eq(snapshot.rotation, &rotation));
+
+        let mut mismatched_moe_cfg = dense_cfg.clone();
+        mismatched_moe_cfg.num_experts = Some(1);
+        assert!(!dense_cfg.is_moe());
+        assert!(mismatched_moe_cfg.is_moe());
+
+        let completion: for<'snapshot, 'reader, 'rotated> fn(
+            ForwardEquivalenceSnapshot<'snapshot>,
+            &'reader QuarotTensorReader,
+            &'rotated HashMap<String, TensorEntry>,
+        ) -> Result<
+            ForwardEquivalenceReport,
+            InferenceError,
+        > = assert_prepared_forward_equivalence_qwen35;
+
+        let _ = (completion, snapshot, mismatched_moe_cfg);
+    }
+
+    #[test]
+    fn prepared_snapshot_enforces_configured_logit_budget_before_tensor_access() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let original = HashMap::new();
+        let rotation = RandomizedHadamard::new(0x51A5_EEED, cfg.hidden_size).unwrap();
+        let bytes_per_probe =
+            cfg.vocab_size * size_of::<f64>() + size_of::<Vec<f64>>() + size_of::<u32>();
+        let max_probe_tokens = MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES / bytes_per_probe;
+        assert_eq!(max_probe_tokens, 33);
+        assert!(max_probe_tokens * bytes_per_probe <= MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES);
+        assert!(
+            (max_probe_tokens + 1) * bytes_per_probe > MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES
+        );
+
+        let at_limit_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: max_probe_tokens,
+            ..Default::default()
+        };
+        let at_limit =
+            prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &at_limit_cfg)
+                .err()
+                .expect("the empty fixture must fail at tensor access")
+                .to_string();
+        assert!(
+            at_limit.contains(QWEN35_EMBED_TOKENS_NAME),
+            "the largest in-budget probe count must reach tensor access: {at_limit}"
+        );
+
+        let over_limit_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: max_probe_tokens + 1,
+            ..Default::default()
+        };
+        let over_limit =
+            prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &over_limit_cfg)
+                .err()
+                .expect("the over-budget request must fail admission")
+                .to_string();
+        assert!(
+            over_limit.contains("retained chain-logit budget"),
+            "one probe past the configured limit must be rejected before tensor access: \
+             {over_limit}"
+        );
+        assert!(
+            !over_limit.contains(QWEN35_EMBED_TOKENS_NAME),
+            "budget rejection must precede tensor access: {over_limit}"
+        );
+    }
+
+    #[test]
+    fn prepared_snapshot_rejects_over_budget_before_any_owned_allocation() {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let original = HashMap::new();
+        let rotation = RandomizedHadamard::new(0x51A5_EEED, cfg.hidden_size).unwrap();
+        let bytes_per_probe =
+            cfg.vocab_size * size_of::<f64>() + size_of::<Vec<f64>>() + size_of::<u32>();
+        let max_probe_tokens = MAX_FORWARD_EQUIVALENCE_PROBE_SNAPSHOT_BYTES / bytes_per_probe;
+        let forward_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: max_probe_tokens + 1,
+            ..Default::default()
+        };
+
+        let tracking = pre_admission_allocation_tracking::start();
+        let result = prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &forward_cfg);
+        let observation = tracking.finish();
+
+        assert!(
+            observation.rejection_seen,
+            "the measured call must reach budget rejection"
+        );
+        assert_eq!(
+            observation.before_rejection_allocation_calls, 0,
+            "over-budget preparation allocated before rejecting"
+        );
+        assert!(
+            observation.after_rejection_allocation_calls > 0,
+            "the diagnostic allocation after budget rejection must be observed"
+        );
+        let error = result
+            .err()
+            .expect("the over-budget request must fail admission")
+            .to_string();
+        assert!(
+            error.contains("retained chain-logit budget"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn prepared_snapshot_rejects_logit_budget_arithmetic_overflow() {
+        let original = HashMap::new();
+        for (num_probe_tokens, vocab_size) in [(2, usize::MAX / 2 + 1), (1, usize::MAX / 8 + 1)] {
+            let mut cfg = tied_tiny_test_cfg();
+            cfg.vocab_size = vocab_size;
+            let rotation = RandomizedHadamard::new(0x51A5_EEED, cfg.hidden_size).unwrap();
+            let forward_cfg = ForwardEquivalenceConfig {
+                num_probe_tokens,
+                ..Default::default()
+            };
+            let err = prepare_forward_equivalence_qwen35(&original, &cfg, &rotation, &forward_cfg)
+                .err()
+                .expect("overflowing budget arithmetic must fail admission")
+                .to_string();
+            assert!(
+                err.contains("retained chain-logit size overflow"),
+                "overflowing budget arithmetic must return an error: {err}"
+            );
+        }
     }
 
     /// Happy path (untied): build → materialize is a no-op (already untied

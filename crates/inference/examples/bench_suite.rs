@@ -535,6 +535,7 @@ fn bench_llm_metal() -> Vec<Metric> {
     let tokenizer = BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json"))
         .expect("failed to load tokenizer");
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let t_init = Instant::now();
     let mut metal_state =
         MetalQwen35State::new(model.weights(), &cfg, 4096).expect("failed to init Metal GPU state");
@@ -610,6 +611,8 @@ fn bench_embedding() -> Vec<Metric> {
     }
 
     let t_load = Instant::now();
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let model =
         lattice_inference::QwenModel::from_directory(dir).expect("failed to load Qwen3-0.6B");
     let load_ms = t_load.elapsed().as_millis() as f64;

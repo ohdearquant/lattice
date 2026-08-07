@@ -60,6 +60,7 @@ fn load_state_and_tokenizer() -> Option<(MetalQwen35State, BpeTokenizer)> {
     let dir = safetensors_model_dir()?;
     let model = Qwen35Model::from_safetensors(&dir).ok()?;
     let cfg = model.config().clone();
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let state = MetalQwen35State::new(model.weights(), &cfg, 4096).ok()?;
     let tokenizer = BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json")).ok()?;
     Some((state, tokenizer))

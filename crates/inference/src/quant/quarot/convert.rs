@@ -3,7 +3,7 @@
 //! [`convert_quarot_qwen35`] reads `config.json` + SafeTensors from
 //! `input_dir`, runs the full pipeline
 //! (`materialize_lm_head` → `fuse_rmsnorms` → `absorb_rotations` →
-//! [`assert_forward_equivalence_qwen35`]) entirely in f64, and on success
+//! forward equivalence) entirely in f64, and on success
 //! writes the converted model to `output_dir`:
 //!
 //! - Planned (rotated) tensors → `<sanitized>.q4` via
@@ -32,7 +32,12 @@ use crate::error::InferenceError;
 use crate::model::qwen35::qwen_required_tensor_names;
 use crate::model::qwen35_config::Qwen35Config;
 use crate::quant::quarot::forward_equivalence::{
-    ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_forward_equivalence_qwen35,
+    ForwardEquivalenceConfig, ForwardEquivalenceReport, assert_prepared_forward_equivalence_qwen35,
+    prepare_forward_equivalence_qwen35_after_admission, validate_forward_equivalence_admission,
+};
+#[cfg(test)]
+use crate::quant::quarot::forward_equivalence::{
+    pre_admission_allocation_tracking, prepare_forward_equivalence_qwen35,
 };
 use crate::quant::quarot::hadamard::RandomizedHadamard;
 use crate::quant::quarot::io::{ArtifactVersion, OnlineArtifactDescriptor, QuarotTensorReader};
@@ -45,7 +50,8 @@ use crate::quant::quarot::pipeline::{
 };
 use crate::quant::quarot::plan::RotationPlan;
 use crate::quant::quarot::rmsnorm_fusion::qwen35_per_layer_fusion_plan;
-use crate::weights::q4_weights::{q4_f32_to_f16, quantize_f64_to_q4, save_q4_file};
+use crate::weights::ingress::DecodedTensorValidator;
+use crate::weights::q4_weights::{q4_f32_to_finite_f16, quantize_f64_to_q4, save_q4_file};
 
 /// Upper bound on `hidden_size` accepted by [`convert_quarot_qwen35`], well above any
 /// real Qwen3.5 checkpoint, guarding `RandomizedHadamard::new`'s config-sized allocation
@@ -124,6 +130,87 @@ struct IndexEntry {
     numel: usize,
 }
 
+/// Promotion status of a `quantize_quarot` artifact (issue #1103).
+///
+/// The converter's forward-equivalence gate (rotation correctness) and the
+/// ADR-044 PPL acceptance gate (quantization quality, run separately via
+/// `bin/eval_perplexity --q4-dir <baseline> --quarot-q4-dir <this output>`)
+/// check different things. `convert_quarot_qwen35` can only ever establish
+/// [`PromotionState::Unpromoted`] — it has no baseline Q4 directory or
+/// corpus to measure PPL against. Only [`record_ppl_gate_result`], called
+/// after the acceptance measurement actually runs, can flip this to
+/// [`PromotionState::Promoted`] or [`PromotionState::Rejected`].
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PromotionState {
+    /// The PPL acceptance gate has not been recorded against this
+    /// artifact. Default state for every artifact `convert_quarot_qwen35`
+    /// writes; a caller MUST NOT treat an unpromoted artifact as
+    /// quality-validated.
+    Unpromoted,
+    /// A recorded PPL measurement passed the acceptance threshold
+    /// (`delta < threshold`).
+    Promoted,
+    /// A recorded PPL measurement failed the acceptance threshold
+    /// (`delta >= threshold`).
+    Rejected,
+}
+
+/// A recorded ADR-044 dual-Q4 PPL acceptance measurement.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct PplGateRecord {
+    pub unrotated_ppl: f64,
+    pub quarot_ppl: f64,
+    /// `quarot_ppl - unrotated_ppl`.
+    pub delta: f64,
+    pub delta_threshold: f64,
+}
+
+/// Promotion marker persisted in `quantize_index.json` (issue #1103). Makes
+/// the two-step contract (forward-equivalence at convert time, PPL quality
+/// gate at measurement time) explicit and durable on the artifact itself,
+/// instead of letting a complete artifact + exit 0 read as "fully
+/// validated" when the quality gate never ran.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct PromotionRecord {
+    pub state: PromotionState,
+    /// Human-readable explanation of `state` — always present so a reader
+    /// never has to infer WHY from the state alone.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppl_gate: Option<PplGateRecord>,
+}
+
+impl PromotionRecord {
+    fn unpromoted() -> Self {
+        Self {
+            state: PromotionState::Unpromoted,
+            reason: "PPL acceptance gate has not been run against this artifact; run \
+                     `eval_perplexity --q4-dir <unrotated baseline> --quarot-q4-dir <this \
+                     output dir> --tokenizer-dir <src> --corpus-file <corpus>` to record a \
+                     result before treating it as quality-validated (ADR-044 step 4, #1103)."
+                .to_string(),
+            ppl_gate: None,
+        }
+    }
+}
+
+/// Legacy artifacts (pre-#1103) and any manifest missing the `promotion`
+/// field deserialize to this — still `Unpromoted`, with a reason that
+/// distinguishes "never recorded" from "predates promotion tracking".
+impl Default for PromotionRecord {
+    fn default() -> Self {
+        Self {
+            state: PromotionState::Unpromoted,
+            reason: "no promotion record present in quantize_index.json (artifact predates \
+                     #1103 promotion tracking, or the gate has not been run)"
+                .to_string(),
+            ppl_gate: None,
+        }
+    }
+}
+
 /// Wire format for `quantize_index.json` produced by `convert_quarot_qwen35`.
 ///
 /// ADR-051 §"quantize_quarot Binary Change": the rotation seed is the runtime's
@@ -156,6 +243,13 @@ struct QuantizeIndex {
     online: Option<OnlineArtifactDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     artifact_version: Option<ArtifactVersion>,
+    /// Promotion marker (#1103). `#[serde(default)]` keeps every manifest
+    /// written before this field existed byte-compatible on read: an
+    /// absent field deserializes to [`PromotionRecord::default`], which is
+    /// `Unpromoted` — the safe, fail-closed reading of "we don't know
+    /// whether the gate ran" for a manifest older than the tracking itself.
+    #[serde(default)]
+    promotion: PromotionRecord,
 }
 
 /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
@@ -294,6 +388,136 @@ pub(crate) fn read_quarot_seed_from_index(
     Ok(index.quarot_seed)
 }
 
+/// Record an ADR-044 dual-Q4 PPL acceptance measurement against a
+/// `quantize_quarot` output directory (issue #1103).
+///
+/// Reads the existing `quantize_index.json` in `quarot_dir` (must be the
+/// object-form QuaRot manifest — a bare-array `quantize_q4` manifest has no
+/// `promotion` field to record against and is rejected), flips `promotion`
+/// to [`PromotionState::Promoted`] when `quarot_ppl - unrotated_ppl <
+/// delta_threshold` or [`PromotionState::Rejected`] otherwise, and writes
+/// the manifest back. Every other field round-trips unchanged.
+///
+/// This function performs no PPL measurement itself — it only records a
+/// measurement the caller already computed (`bin/eval_perplexity`'s
+/// dual-Q4 mode calls this after printing its own verdict). Fail-closed: a
+/// missing, malformed, or bare-array manifest is `Err`, never a silent
+/// no-op — a caller that cannot durably record the result must not report
+/// success either.
+pub fn record_ppl_gate_result(
+    quarot_dir: &Path,
+    unrotated_ppl: f64,
+    quarot_ppl: f64,
+    delta_threshold: f64,
+) -> Result<PromotionRecord, InferenceError> {
+    let path = quarot_dir.join("quantize_index.json");
+    let bytes = fs::read(&path).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: failed to read {}: {e}",
+            path.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: {}: malformed quantize_index.json: {e}",
+            path.display()
+        ))
+    })?;
+    if value.is_array() {
+        return Err(InferenceError::Inference(format!(
+            "record_ppl_gate_result: {} is a bare-array manifest (quantize_q4 shape, no \
+             promotion field); only a quantize_quarot object-form manifest can record a \
+             PPL gate result",
+            path.display()
+        )));
+    }
+    let mut index: QuantizeIndex = serde_json::from_value(value).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: {}: malformed quantize_index.json: {e}",
+            path.display()
+        ))
+    })?;
+
+    let delta = quarot_ppl - unrotated_ppl;
+    let passed = delta < delta_threshold;
+    let record = PromotionRecord {
+        state: if passed {
+            PromotionState::Promoted
+        } else {
+            PromotionState::Rejected
+        },
+        reason: if passed {
+            format!(
+                "ADR-044 PPL acceptance gate passed: delta {delta:+.6} < threshold \
+                 {delta_threshold:.6} (quarot {quarot_ppl:.6} - unrotated {unrotated_ppl:.6})"
+            )
+        } else {
+            format!(
+                "ADR-044 PPL acceptance gate failed: delta {delta:+.6} >= threshold \
+                 {delta_threshold:.6} (quarot {quarot_ppl:.6} - unrotated {unrotated_ppl:.6})"
+            )
+        },
+        ppl_gate: Some(PplGateRecord {
+            unrotated_ppl,
+            quarot_ppl,
+            delta,
+            delta_threshold,
+        }),
+    };
+    index.promotion = record.clone();
+
+    let json = serde_json::to_string_pretty(&index).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: failed to serialize {}: {e}",
+            path.display()
+        ))
+    })?;
+    fs::write(&path, json).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: failed to write {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    Ok(record)
+}
+
+/// Read the current promotion marker from a `quantize_quarot` output
+/// directory (issue #1103). `Ok(PromotionRecord::default())` — i.e.
+/// [`PromotionState::Unpromoted`] — for a present object-form manifest with
+/// no `promotion` field (pre-#1103 artifact). `Err` for a missing manifest,
+/// malformed JSON, or a bare-array (`quantize_q4`) manifest, which has no
+/// promotion concept to read.
+pub fn read_promotion_record(quarot_dir: &Path) -> Result<PromotionRecord, InferenceError> {
+    let path = quarot_dir.join("quantize_index.json");
+    let bytes = fs::read(&path).map_err(|e| {
+        InferenceError::Inference(format!(
+            "read_promotion_record: failed to read {}: {e}",
+            path.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        InferenceError::Inference(format!(
+            "read_promotion_record: {}: malformed quantize_index.json: {e}",
+            path.display()
+        ))
+    })?;
+    if value.is_array() {
+        return Err(InferenceError::Inference(format!(
+            "read_promotion_record: {} is a bare-array manifest (quantize_q4 shape); it has \
+             no promotion field",
+            path.display()
+        )));
+    }
+    let index: QuantizeIndex = serde_json::from_value(value).map_err(|e| {
+        InferenceError::Inference(format!(
+            "read_promotion_record: {}: malformed quantize_index.json: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(index.promotion)
+}
+
 fn inject_quarot_seed(json: &str, seed: u64) -> Result<String, InferenceError> {
     let mut value: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| InferenceError::Inference(format!("inject_quarot_seed: invalid JSON: {e}")))?;
@@ -338,6 +562,7 @@ fn f16_file_byte_count(data_len: usize, shape_len: usize) -> u64 {
 
 fn write_mtp_weights_quarot(
     reader: &QuarotTensorReader,
+    source: &str,
     output_dir: &Path,
     dry_run: bool,
     index_entries: &mut Vec<IndexEntry>,
@@ -384,7 +609,7 @@ fn write_mtp_weights_quarot(
         *total_bytes_out += f16_file_byte_count(data.len(), shape.len());
         if !dry_run {
             let out_path = output_dir.join(&file_name);
-            write_f16_file(&out_path, &data, &shape)?;
+            write_f16_file(&out_path, source, name, &data, &shape)?;
         }
         *kept_f16 += 1;
         index_entries.push(IndexEntry {
@@ -495,7 +720,19 @@ pub fn convert_quarot_qwen35(
         ));
     }
 
+    let forward_cfg = ForwardEquivalenceConfig {
+        num_probe_tokens: opts.num_probe_tokens,
+        tolerance: opts.tolerance,
+        seed: opts.rotation_seed,
+    };
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_converter_boundary();
+    let forward_admission = validate_forward_equivalence_admission(&cfg, &forward_cfg)?;
+
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_reader_boundary();
     let reader = QuarotTensorReader::open(input_dir)?;
+    let input_source = input_dir.display().to_string();
     let required_names = qwen_required_tensor_names(&cfg);
     // Measure the on-disk footprint of the language-model tensors the pipeline
     // reads and writes, using SafeTensors header byte spans
@@ -550,30 +787,37 @@ pub fn convert_quarot_qwen35(
 
     let was_tied = cfg.tie_word_embeddings;
     if was_tied {
+        working_set.reserve(1);
+    }
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_materialized_working_set_boundary();
+    if was_tied {
         materialize_lm_head_for_qwen35(&mut working_set, &cfg)?;
     }
 
-    let original_snapshot = working_set.clone();
+    let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
+    // The historical `working_set.clone()` regression sat exactly here, between
+    // materialization and this prepare call (see git history at this path). Keep
+    // the `MaterializedWorkingSetBoundary` phase open through the call below so
+    // `converter_does_not_clone_materialized_working_set` observes allocations
+    // at the former clone site instead of stopping at materialization.
+    let equivalence_snapshot = prepare_forward_equivalence_qwen35_after_admission(
+        &working_set,
+        &rotation,
+        forward_admission,
+    )?;
+    #[cfg(test)]
+    pre_admission_allocation_tracking::mark_materialized_working_set_boundary_completed();
 
     let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg)?;
     fusion_plan.push(qwen35_final_norm_fusion_target());
     let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
-    let rotation = RandomizedHadamard::new(opts.rotation_seed, cfg.hidden_size)?;
 
     fuse_rmsnorms(&mut working_set, &fusion_plan)?;
     absorb_rotations(&mut working_set, &rotation_plan, &rotation)?;
 
-    let forward_equivalence = assert_forward_equivalence_qwen35(
-        &original_snapshot,
-        &working_set,
-        &cfg,
-        &rotation,
-        &ForwardEquivalenceConfig {
-            num_probe_tokens: opts.num_probe_tokens,
-            tolerance: opts.tolerance,
-            seed: opts.rotation_seed,
-        },
-    )?;
+    let forward_equivalence =
+        assert_prepared_forward_equivalence_qwen35(equivalence_snapshot, &reader, &working_set)?;
 
     if !opts.dry_run {
         fs::create_dir_all(output_dir).map_err(|e| {
@@ -638,7 +882,7 @@ pub fn convert_quarot_qwen35(
             if !opts.dry_run {
                 let file_name = format!("{sanitized}.f16");
                 let out_path = output_dir.join(&file_name);
-                write_f16_file(&out_path, &entry.data, &entry.shape)?;
+                write_f16_file(&out_path, &input_source, name, &entry.data, &entry.shape)?;
                 index_entries.push(IndexEntry {
                     name: name.clone(),
                     file: file_name,
@@ -654,6 +898,7 @@ pub fn convert_quarot_qwen35(
     if cfg.mtp_num_hidden_layers > 0 {
         write_mtp_weights_quarot(
             &reader,
+            &input_source,
             output_dir,
             opts.dry_run,
             &mut index_entries,
@@ -673,6 +918,11 @@ pub fn convert_quarot_qwen35(
             // here yet.
             online: None,
             artifact_version: None,
+            // #1103: every artifact this function writes starts
+            // Unpromoted — the forward-equivalence gate above verified
+            // rotation correctness, not quantization quality. Only
+            // `record_ppl_gate_result` can advance this state.
+            promotion: PromotionRecord::unpromoted(),
         };
         let index_json = serde_json::to_string_pretty(&index_record).map_err(|e| {
             InferenceError::Inference(format!(
@@ -799,7 +1049,26 @@ fn sanitize_tensor_name(name: &str) -> String {
 /// Returns the total number of bytes written. f64 → f16 goes through
 /// f32 to share the existing converter (rounding-aware) — sufficient
 /// for the runtime's f16 fast path.
-fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, InferenceError> {
+fn write_f16_file(
+    path: &Path,
+    source: &str,
+    tensor_name: &str,
+    data: &[f64],
+    shape: &[usize],
+) -> Result<usize, InferenceError> {
+    // Delay file creation until narrowing is proven finite so a rejected
+    // tensor cannot look like a completed KHF1 artifact.
+    let mut validator =
+        DecodedTensorValidator::decoded_input(source, tensor_name, shape, "F16", data.len())?;
+    let mut payload = Vec::with_capacity(data.len() * 2);
+    for &value in data {
+        let bits =
+            q4_f32_to_finite_f16(value as f32).map_err(|bits| validator.reject_f16_bits(bits))?;
+        validator.observe_finite();
+        payload.extend_from_slice(&bits.to_le_bytes());
+    }
+    validator.finish()?;
+
     let mut file = fs::File::create(path).map_err(|e| {
         InferenceError::Inference(format!(
             "write_f16_file: failed to create {}: {e}",
@@ -830,18 +1099,6 @@ fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, I
     write_all(&(data.len() as u64).to_le_bytes())?;
     bytes_written += 8;
 
-    let mut payload = Vec::with_capacity(data.len() * 2);
-    for &v in data {
-        // Use the subnormal-aware helper from `weights::q4_weights`. The
-        // hand-rolled flush-to-zero variant in `bin/quantize_q4.rs`
-        // silently rounds f16-subnormal-but-f32-normal values
-        // (~1e-7 range) to zero — relevant here because every kept
-        // tensor (norms, A_log, dt_bias, conv1d, etc.) passes through
-        // this path. `q4_f32_to_f16` round-trips through the f16
-        // subnormal range correctly.
-        let h = q4_f32_to_f16(v as f32);
-        payload.extend_from_slice(&h.to_le_bytes());
-    }
     write_all(&payload)?;
     bytes_written += payload.len();
 
@@ -852,6 +1109,10 @@ fn write_f16_file(path: &Path, data: &[f64], shape: &[usize]) -> Result<usize, I
 mod tests {
     use super::*;
     use crate::model::qwen35_config::{LayerType, compute_layer_types};
+    use crate::quant::quarot::lm_head::{
+        QWEN35_EMBED_TOKENS_NAME, QWEN35_FINAL_NORM_NAME, QWEN35_LM_HEAD_NAME,
+    };
+    use crate::weights::q4_weights::q4_f32_to_f16;
     use serde_json::Value;
     use std::path::PathBuf;
 
@@ -1038,8 +1299,16 @@ mod tests {
             .collect()
     }
 
+    const TIED_LM_HEAD_PERTURBED_INDEX: usize = 0;
+    const TIED_LM_HEAD_PERTURBATION: f64 = 1.0 / 32_768.0;
+
     /// Write every required tensor for `cfg` to a single safetensors file.
-    fn write_required_tensors_for(cfg: &Qwen35Config, path: &Path, seed: u64) {
+    fn write_required_tensors_for(
+        cfg: &Qwen35Config,
+        path: &Path,
+        seed: u64,
+        include_tied_lm_head: bool,
+    ) {
         let hidden = cfg.hidden_size;
         let vocab = cfg.vocab_size;
         let intermediate = cfg.intermediate_size;
@@ -1059,17 +1328,30 @@ mod tests {
             synth_data(n, s)
         };
 
+        let mut embed_tokens = next(vocab * hidden);
+        let mut final_norm = next(hidden);
+        let tied_lm_head = if cfg.tie_word_embeddings && include_tied_lm_head {
+            embed_tokens[TIED_LM_HEAD_PERTURBED_INDEX] = 0.25;
+            final_norm[TIED_LM_HEAD_PERTURBED_INDEX] = 0.0;
+            let mut lm_head = embed_tokens.clone();
+            lm_head[TIED_LM_HEAD_PERTURBED_INDEX] += TIED_LM_HEAD_PERTURBATION;
+            Some(lm_head)
+        } else {
+            None
+        };
         entries.push((
             "model.language_model.embed_tokens.weight".to_string(),
             vec![vocab, hidden],
-            next(vocab * hidden),
+            embed_tokens,
         ));
         entries.push((
             "model.language_model.norm.weight".to_string(),
             vec![hidden],
-            next(hidden),
+            final_norm,
         ));
-        if !cfg.tie_word_embeddings {
+        if let Some(lm_head) = tied_lm_head {
+            entries.push(("lm_head.weight".to_string(), vec![vocab, hidden], lm_head));
+        } else if !cfg.tie_word_embeddings {
             entries.push((
                 "lm_head.weight".to_string(),
                 vec![vocab, hidden],
@@ -1196,7 +1478,7 @@ mod tests {
     fn write_input_dir(cfg: &Qwen35Config, dir: &Path, seed: u64) {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("config.json"), tiny_config_json(cfg)).unwrap();
-        write_required_tensors_for(cfg, &dir.join("model.safetensors"), seed);
+        write_required_tensors_for(cfg, &dir.join("model.safetensors"), seed, false);
     }
 
     // ------------------------------------------------------------------
@@ -1290,6 +1572,250 @@ mod tests {
         let out_cfg_str = fs::read_to_string(output.join("config.json")).unwrap();
         let out_cfg = Qwen35Config::from_config_json_str(&out_cfg_str).unwrap();
         assert!(!out_cfg.tie_word_embeddings);
+    }
+
+    #[test]
+    fn converter_rejects_probe_budget_before_tensor_materialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
+
+        let tracking = pre_admission_allocation_tracking::start_at_converter_boundary();
+        let result = convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                num_probe_tokens: 2_000_000,
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        let observation = tracking.finish();
+
+        assert!(
+            observation.rejection_seen,
+            "the converter call must reach budget rejection"
+        );
+        assert_eq!(
+            observation.before_rejection_allocation_calls, 0,
+            "the converter allocated between config preflight and budget rejection"
+        );
+        assert!(
+            observation.after_rejection_allocation_calls > 0,
+            "the diagnostic allocation after budget rejection must be observed"
+        );
+        let error = result
+            .expect_err("the over-budget conversion must fail admission")
+            .to_string();
+        assert!(
+            error.contains("retained chain-logit budget"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn assert_config_rejected_before_tensor_materialization(
+        opts: ConversionOptions,
+        expected_error: &str,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 0x0A11_CE55);
+
+        let tracking = pre_admission_allocation_tracking::start_at_converter_boundary();
+        let result = convert_quarot_qwen35(&input, &output, &opts);
+        let observation = tracking.finish();
+
+        assert!(
+            observation.rejection_seen,
+            "the converter call must reach config admission rejection"
+        );
+        assert_eq!(
+            observation.before_rejection_allocation_calls, 0,
+            "config admission allocated before rejection"
+        );
+        assert!(
+            observation.after_rejection_allocation_calls > 0,
+            "the diagnostic allocation after config rejection must be observed"
+        );
+        assert!(
+            !observation.reader_boundary_seen,
+            "config admission rejection must precede reader access"
+        );
+        assert!(
+            !observation.materialized_working_set_boundary_seen,
+            "config admission rejection must precede tensor materialization"
+        );
+        let error = result
+            .expect_err("invalid forward-equivalence config must fail admission")
+            .to_string();
+        assert!(error.contains(expected_error), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn converter_rejects_zero_probe_count_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                num_probe_tokens: 0,
+                dry_run: true,
+                ..Default::default()
+            },
+            "num_probe_tokens must be > 0",
+        );
+    }
+
+    #[test]
+    fn converter_rejects_zero_tolerance_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                tolerance: 0.0,
+                dry_run: true,
+                ..Default::default()
+            },
+            "tolerance must be a positive finite value",
+        );
+    }
+
+    #[test]
+    fn converter_rejects_nan_tolerance_before_tensor_materialization() {
+        assert_config_rejected_before_tensor_materialization(
+            ConversionOptions {
+                tolerance: f64::NAN,
+                dry_run: true,
+                ..Default::default()
+            },
+            "tolerance must be a positive finite value",
+        );
+    }
+
+    #[test]
+    fn converter_does_not_clone_materialized_working_set() {
+        // Spans tied-head materialization through
+        // `prepare_forward_equivalence_qwen35_after_admission` — the step that
+        // replaced the historical full-working-set clone — so a reintroduced
+        // clone at that former site is observed, not skipped.
+        const REQUIRED_MATERIALIZATION_AND_PREPARE_ALLOCATION_CALLS: usize = 152;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 0xA110_CA7E);
+
+        let tracking =
+            pre_admission_allocation_tracking::start_at_materialized_working_set_boundary();
+        convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                num_probe_tokens: 2,
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let observation = tracking.finish();
+
+        assert!(
+            observation.materialized_working_set_boundary_seen,
+            "the converter must reach the materialized working-set boundary"
+        );
+        assert!(
+            observation.materialized_working_set_boundary_completed,
+            "the converter must close the materialized working-set boundary"
+        );
+        assert_eq!(
+            observation.materialized_working_set_allocation_calls,
+            REQUIRED_MATERIALIZATION_AND_PREPARE_ALLOCATION_CALLS,
+            "tied-head materialization and forward-equivalence preparation performed \
+             unexpected owned allocations (a reintroduced working-set clone would show up here)"
+        );
+    }
+
+    #[test]
+    fn prepared_equivalence_streams_original_tensors_and_refuses_corruption() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let cfg = tiny_cfg(true);
+        fs::create_dir_all(&input).unwrap();
+        fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 0x1074, true);
+
+        let reader = QuarotTensorReader::open(&input).unwrap();
+        assert!(
+            reader.has_tensor(QWEN35_LM_HEAD_NAME),
+            "the tied fixture must contain a competing on-disk lm_head"
+        );
+        let (disk_embed, _) = reader.read_tensor_f64(QWEN35_EMBED_TOKENS_NAME).unwrap();
+        let (disk_lm_head, _) = reader.read_tensor_f64(QWEN35_LM_HEAD_NAME).unwrap();
+        let (disk_final_norm, _) = reader.read_tensor_f64(QWEN35_FINAL_NORM_NAME).unwrap();
+        let differing_indices = disk_lm_head
+            .iter()
+            .zip(&disk_embed)
+            .enumerate()
+            .filter_map(|(index, (lm_head, embed))| (lm_head != embed).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            differing_indices,
+            vec![TIED_LM_HEAD_PERTURBED_INDEX],
+            "the competing lm_head must differ at exactly one element"
+        );
+        let source_delta = (disk_lm_head[TIED_LM_HEAD_PERTURBED_INDEX]
+            - disk_embed[TIED_LM_HEAD_PERTURBED_INDEX])
+            .abs();
+        assert_eq!(source_delta, TIED_LM_HEAD_PERTURBATION);
+        let tolerance = 1e-5;
+        let transformed_delta = source_delta
+            * (1.0 + disk_final_norm[TIED_LM_HEAD_PERTURBED_INDEX]).abs()
+            / (cfg.hidden_size as f64).sqrt();
+        assert!(
+            transformed_delta > tolerance && transformed_delta < 1.1 * tolerance,
+            "controlled post-fusion/rotation delta {transformed_delta} must sit just above \
+             tolerance {tolerance}"
+        );
+        let required_names = qwen_required_tensor_names(&cfg);
+        let mut working_set = load_tensors_f64(&reader, &required_names).unwrap();
+        materialize_lm_head_for_qwen35(&mut working_set, &cfg).unwrap();
+
+        let rotation = RandomizedHadamard::new(0xA11C_E5E5, cfg.hidden_size).unwrap();
+        let forward_cfg = ForwardEquivalenceConfig {
+            num_probe_tokens: 2,
+            tolerance,
+            ..Default::default()
+        };
+        let passing_snapshot =
+            prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)
+                .unwrap();
+        let refusing_snapshot =
+            prepare_forward_equivalence_qwen35(&working_set, &cfg, &rotation, &forward_cfg)
+                .unwrap();
+
+        let mut fusion_plan = qwen35_per_layer_fusion_plan(&cfg).unwrap();
+        fusion_plan.push(qwen35_final_norm_fusion_target());
+        let rotation_plan = RotationPlan::qwen35_residual_stream_linear_layers();
+        fuse_rmsnorms(&mut working_set, &fusion_plan).unwrap();
+        absorb_rotations(&mut working_set, &rotation_plan, &rotation).unwrap();
+
+        let report =
+            assert_prepared_forward_equivalence_qwen35(passing_snapshot, &reader, &working_set)
+                .unwrap();
+        assert!(report.max_abs_error <= forward_cfg.tolerance);
+
+        let chain_skipped = "model.language_model.layers.1.self_attn.k_proj.weight";
+        working_set
+            .get_mut(chain_skipped)
+            .expect("full-attention k_proj must exist")
+            .data[0] += 0.25;
+
+        let err =
+            assert_prepared_forward_equivalence_qwen35(refusing_snapshot, &reader, &working_set)
+                .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("per-tensor"), "unexpected error: {msg}");
     }
 
     // ------------------------------------------------------------------
@@ -1606,7 +2132,8 @@ mod tests {
         let p = tmp.path().join("test.f16");
         let data = vec![1.5_f64, -2.5, 0.25, -0.125];
         let shape = vec![2_usize, 2];
-        let bytes_written = write_f16_file(&p, &data, &shape).unwrap();
+        let bytes_written =
+            write_f16_file(&p, "fixture.safetensors", "fixture.weight", &data, &shape).unwrap();
         let raw = fs::read(&p).unwrap();
         assert_eq!(&raw[0..4], b"KHF1");
         assert_eq!(u32::from_le_bytes(raw[4..8].try_into().unwrap()), 1);
@@ -1619,7 +2146,43 @@ mod tests {
         assert_eq!(bytes_written, raw.len());
     }
 
-    /// Smoke check on `q4_f32_to_f16` (used by `write_f16_file`).
+    /// Mutation-sensitive lattice#801 output gate: accepting every encoded
+    /// bit pattern makes each case create a KHF1 file and return Ok.
+    #[test]
+    fn f16_writer_rejects_non_finite_or_overflowed_encoding_before_create() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (label, value) in [
+            ("nan", f64::NAN),
+            ("positive-infinity", f64::INFINITY),
+            ("negative-infinity", f64::NEG_INFINITY),
+            ("f32-overflow", f64::MAX),
+            ("f16-overflow", 100_000.0_f64),
+        ] {
+            let path = tmp.path().join(format!("{label}.f16"));
+            let err = write_f16_file(
+                &path,
+                "fixture.safetensors",
+                "fixture.weight",
+                &[value],
+                &[1],
+            )
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(
+                matches!(err, InferenceError::InvalidInput(_)),
+                "{label}: got {err:?}"
+            );
+            assert!(message.contains("non-finite value"), "{label}: got {err}");
+            assert!(message.contains("fixture.safetensors"));
+            assert!(message.contains("fixture.weight"));
+            assert!(
+                !path.exists(),
+                "{label}: invalid f16 encoding must be rejected before file creation"
+            );
+        }
+    }
+
+    /// Smoke check on the canonical encoder underlying `write_f16_file`.
     /// Includes an f16-subnormal regression, since fixed: the old local
     /// helper flushed every value below f16's smallest
     /// normal to zero, silently corrupting small-magnitude weights in
@@ -2342,7 +2905,7 @@ mod tests {
         fs::create_dir_all(&input).unwrap();
         fs::write(input.join("config.json"), tiny_config_json_with_mtp(&cfg)).unwrap();
         // Write only the main model tensors — no MTP tensors in the file.
-        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 71);
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 71, false);
 
         let report = convert_quarot_qwen35(
             &input,
@@ -2392,7 +2955,7 @@ mod tests {
         // defaults to 0 on deserialize) alongside the main safetensors.
         fs::create_dir_all(&input).unwrap();
         fs::write(input.join("config.json"), tiny_config_json(&cfg)).unwrap();
-        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 72);
+        write_required_tensors_for(&cfg, &input.join("model.safetensors"), 72, false);
 
         let report = convert_quarot_qwen35(
             &input,
@@ -2631,6 +3194,7 @@ mod tests {
             tensors: vec![],
             online: Some(descriptor.clone()),
             artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+            promotion: PromotionRecord::default(),
         };
         let json = serde_json::to_string(&index).unwrap();
         let round_tripped: QuantizeIndex = serde_json::from_str(&json).unwrap();
@@ -2671,6 +3235,7 @@ mod tests {
             tensors: vec![],
             online: Some(descriptor),
             artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+            promotion: PromotionRecord::default(),
         };
         let json = serde_json::to_string(&index).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -2726,6 +3291,7 @@ mod tests {
             tensors: vec![],
             online: Some(invalid_descriptor),
             artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+            promotion: PromotionRecord::default(),
         };
         let json = serde_json::to_string(&index).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -2775,6 +3341,7 @@ mod tests {
             tensors: vec![],
             online: Some(descriptor),
             artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+            promotion: PromotionRecord::default(),
         };
         let json = serde_json::to_string(&index).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -2836,5 +3403,218 @@ mod tests {
             err.contains("rotation descriptor is missing or null"),
             "got: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Promotion marker (#1103): the converter's forward-equivalence gate
+    // is not the ADR-044 PPL acceptance gate. `convert_quarot_qwen35` must
+    // never write an artifact that reads as quality-validated before the
+    // PPL gate has actually been recorded against it.
+    // ------------------------------------------------------------------
+
+    /// The defect class #1103 describes: a complete artifact + exit 0
+    /// reads as "validated" when the PPL quality gate never ran. This test
+    /// pins the fix — a fresh, successful conversion must write an
+    /// explicit `unpromoted` marker, not silence.
+    ///
+    /// Mutation check performed by hand while writing this test: changing
+    /// the `promotion: PromotionRecord::unpromoted()` field in
+    /// `convert_quarot_qwen35`'s `index_record` construction to
+    /// `PromotionRecord { state: PromotionState::Promoted, reason:
+    /// "stub".into(), ppl_gate: None }` (simulating the original defect —
+    /// a converter that marks itself validated without ever running the
+    /// quality gate) makes this test fail on the
+    /// `record.state == PromotionState::Unpromoted` assertion. Restoring
+    /// the real field makes it pass again. See REPORT.md for the recorded
+    /// before/after run output.
+    #[test]
+    fn convert_quarot_qwen35_writes_unpromoted_promotion_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 1);
+
+        convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xC0FFEE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        let record = read_promotion_record(&output).unwrap();
+        assert_eq!(
+            record.state,
+            PromotionState::Unpromoted,
+            "a fresh conversion must not claim promoted/rejected before the PPL \
+             acceptance gate has been recorded against it"
+        );
+        assert!(
+            record.ppl_gate.is_none(),
+            "no PPL gate has run yet; ppl_gate must be absent"
+        );
+        assert!(
+            record.reason.contains("PPL acceptance gate"),
+            "reason must explain WHY the artifact is unpromoted, got: {}",
+            record.reason
+        );
+
+        // Also visible directly in the raw JSON, for a reader who doesn't
+        // go through the typed helper.
+        let idx_str = fs::read_to_string(output.join("quantize_index.json")).unwrap();
+        let idx: Value = serde_json::from_str(&idx_str).unwrap();
+        assert_eq!(
+            idx.get("promotion").and_then(|p| p.get("state")),
+            Some(&Value::String("unpromoted".to_string())),
+            "quantize_index.json must carry a top-level, human-readable promotion.state"
+        );
+    }
+
+    /// Dry-run performs no writes at all (existing contract), so it must
+    /// not be mistaken for having recorded a promotion state either —
+    /// there is no `quantize_index.json` to read.
+    #[test]
+    fn convert_quarot_qwen35_dry_run_writes_no_promotion_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 1);
+
+        convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xC0FFEE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !output.join("quantize_index.json").exists(),
+            "dry-run must not write any files, including the promotion marker"
+        );
+    }
+
+    fn object_form_manifest_json(promoted_state: Option<&str>) -> String {
+        let mut obj = serde_json::json!({
+            "quarot_seed": 42,
+            "tensors": [],
+        });
+        if let Some(state) = promoted_state {
+            obj["promotion"] = serde_json::json!({"state": state, "reason": "test fixture"});
+        }
+        serde_json::to_string(&obj).unwrap()
+    }
+
+    #[test]
+    fn record_ppl_gate_result_promotes_on_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            object_form_manifest_json(None),
+        )
+        .unwrap();
+
+        let record = record_ppl_gate_result(tmp.path(), 25.0, 24.5, 0.5).unwrap();
+        assert_eq!(record.state, PromotionState::Promoted);
+        let gate = record.ppl_gate.clone().expect("ppl_gate must be recorded");
+        assert_eq!(gate.unrotated_ppl, 25.0);
+        assert_eq!(gate.quarot_ppl, 24.5);
+        assert!((gate.delta - (-0.5)).abs() < 1e-12);
+        assert_eq!(gate.delta_threshold, 0.5);
+
+        // Persisted, not just returned.
+        let reread = read_promotion_record(tmp.path()).unwrap();
+        assert_eq!(reread, record);
+    }
+
+    #[test]
+    fn record_ppl_gate_result_rejects_on_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            object_form_manifest_json(None),
+        )
+        .unwrap();
+
+        // delta == threshold is a fail (strict `<` to pass, per ADR-044).
+        let record = record_ppl_gate_result(tmp.path(), 25.0, 25.5, 0.5).unwrap();
+        assert_eq!(record.state, PromotionState::Rejected);
+
+        let reread = read_promotion_record(tmp.path()).unwrap();
+        assert_eq!(reread.state, PromotionState::Rejected);
+    }
+
+    #[test]
+    fn record_ppl_gate_result_overwrites_prior_state() {
+        // A re-recorded measurement (e.g. re-running the gate after a
+        // model fix) must overwrite the previous marker, not accumulate.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            object_form_manifest_json(Some("rejected")),
+        )
+        .unwrap();
+
+        let record = record_ppl_gate_result(tmp.path(), 25.0, 24.0, 0.5).unwrap();
+        assert_eq!(record.state, PromotionState::Promoted);
+        let reread = read_promotion_record(tmp.path()).unwrap();
+        assert_eq!(reread.state, PromotionState::Promoted);
+    }
+
+    #[test]
+    fn record_ppl_gate_result_rejects_bare_array_manifest() {
+        // `quantize_q4`'s manifest shape — a bare tensor array, no
+        // `promotion` concept at all. Recording against it is a caller
+        // bug (wrong directory), not a legitimate no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), r#"[]"#).unwrap();
+
+        let err = record_ppl_gate_result(tmp.path(), 25.0, 24.0, 0.5)
+            .expect_err("a bare-array manifest must be rejected, not silently accepted");
+        assert!(err.to_string().contains("bare-array"), "got: {err}");
+    }
+
+    #[test]
+    fn record_ppl_gate_result_errs_on_missing_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = record_ppl_gate_result(tmp.path(), 25.0, 24.0, 0.5)
+            .expect_err("recording against a directory with no manifest must fail closed");
+        assert!(err.to_string().contains("failed to read"), "got: {err}");
+    }
+
+    #[test]
+    fn read_promotion_record_defaults_to_unpromoted_for_legacy_manifest() {
+        // A manifest written before #1103 (no `promotion` field at all)
+        // must read as Unpromoted, not error and not silently claim
+        // Promoted.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"{"quarot_seed":7,"tensors":[]}"#,
+        )
+        .unwrap();
+
+        let record = read_promotion_record(tmp.path()).unwrap();
+        assert_eq!(record.state, PromotionState::Unpromoted);
+        assert!(record.reason.contains("predates"));
+    }
+
+    #[test]
+    fn read_promotion_record_rejects_bare_array_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), r#"[]"#).unwrap();
+        let err = read_promotion_record(tmp.path())
+            .expect_err("a bare-array manifest has no promotion field and must be rejected");
+        assert!(err.to_string().contains("bare-array"), "got: {err}");
     }
 }

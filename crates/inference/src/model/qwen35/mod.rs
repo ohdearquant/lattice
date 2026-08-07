@@ -11,10 +11,11 @@
 
 mod cache;
 mod debug;
-pub(crate) mod detokenize;
+mod embed;
 mod eval;
 mod forward;
 mod generation;
+mod generation_setup;
 mod loading;
 mod model;
 mod moe;
@@ -24,6 +25,7 @@ mod sampling;
 pub(crate) mod stop_strings;
 mod weights;
 
+pub use embed::HiddenPooling;
 pub use eval::{PerplexityConfig, PerplexityReport};
 /// Re-exported for the Metal Q4 perplexity harness in
 /// [`crate::forward::metal_qwen35`]; the CPU forward path consumes them
@@ -45,8 +47,8 @@ pub mod test_support;
 pub use model::Qwen35Model;
 pub use weights::ModelWeights;
 
+pub(crate) use crate::tokenizer::detokenize::decode_tokens;
 pub(crate) use cache::{ForwardScratch, KvCache, resize};
-pub(crate) use detokenize::decode_tokens;
 // Re-exported so that quantized CPU generate helpers (cpu_q8, cpu_f16,
 // neon_forward) can share the same typed grammar-not-set guard without
 // duplicating the predicate or the error message (#397/#398).
@@ -56,23 +58,22 @@ pub(crate) use generation::check_logprobs_not_set;
 // Sibling guards for `stop_strings` / `reasoning_budget` on the same unwired
 // paths (ADR-080 C3, #783).
 pub(crate) use generation::{check_reasoning_budget_not_set, check_stop_strings_not_set};
+pub(crate) use generation_setup::{
+    GenerationEntryContract, GenerationPlan, GenerationPreparation, prepare_generation,
+};
 // Shared empty-prompt preflight (#856): every CPU forward path (cpu_q8,
 // cpu_f16, neon_forward) and every Metal generation entry point
 // (forward::metal_qwen35) calls this instead of its own inline
 // `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
 pub(crate) use generation::check_prompt_not_empty;
-// Shared prompt-token admission guard for standalone CPU drivers whose
-// tokenizer and model config are supplied independently (#1083).
-pub(crate) use generation::check_prompt_ids_in_vocab;
 // Shared total-context admission bound (#922): every Metal generation entry
 // point (forward::metal_qwen35) calls this after check_prompt_not_empty to
 // mirror the CPU `generate`/`generate_streaming` total bound
 // (prompt_len + decode budget <= max_context), instead of only bounding the
 // prompt alone. Only the Metal (`mod inner`, gated identically) consumer
-// needs the re-export; the CPU forward paths (cpu_f16, cpu_q8, neon_forward)
-// already enforce this same bound with their own inline check and
-// `generation.rs` itself uses `check_context_budget` directly within its own
-// module.
+// needs the re-export; the standalone CPU paths (cpu_f16, cpu_q8,
+// neon_forward) enforce the same bound through `prepare_generation`, and
+// `generation.rs` uses `check_context_budget` directly within its own module.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::check_context_budget;
 // Shared backend-neutral decode-policy struct (reasoning-budget accounting +
@@ -83,11 +84,6 @@ pub(crate) use generation::check_context_budget;
 // uses `DecodePolicy` directly within its own module.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub(crate) use generation::{DecodePolicy, StepOutcome, StopCheckOutcome};
-// Sibling guard for `enable_mtp` on the cross-turn prefix-cache path, which
-// has no MTP draft/verify wiring (PR #787). Only
-// that Metal-only path needs it, same gate as `DecodePolicy`/`StepOutcome`.
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use generation::check_mtp_not_requested;
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{
@@ -99,7 +95,7 @@ pub(crate) use weights::{
 pub(crate) use weights::{MoeLayerWeights, MoeRouter, RoutedExperts, SharedExpert};
 
 #[cfg(test)]
-pub use detokenize::bytes_to_unicode;
+pub use crate::tokenizer::detokenize::bytes_to_unicode;
 // Needed by all generate paths (cpu_q8, cpu_f16, neon_forward)
 // and by tests. `pub(crate)` keeps it out of the public API surface.
 pub(crate) use generation::should_stop_token;

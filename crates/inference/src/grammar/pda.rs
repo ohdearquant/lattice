@@ -205,7 +205,7 @@ pub enum StepResult {
 /// 2. Get the current symbol at `(rule_id, alt_idx, sym_pos)`.
 /// 3. If terminal: match against `b`.  If match, increment `sym_pos`.
 ///    If the frame is exhausted, pop it and increment sym_pos of the parent
-///    (recursively until a non-exhausted frame is found or the stack is empty).
+///    (repeatedly until a non-exhausted frame is found or the stack is empty).
 /// 4. If non-terminal: push a new frame for the referenced rule (alt 0, pos 0)
 ///    and retry step 1 — but we do not consume a byte when pushing, so we
 ///    loop until we reach a terminal.
@@ -242,7 +242,7 @@ fn try_advance_byte(state: &mut GrammarState, grammar: &CompiledGrammar, b: u8) 
     false
 }
 
-/// Recursively advance `stack` by byte `b`.  Returns true on success.
+/// Advance `stack` by byte `b`. Returns true on success.
 fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: u8) -> bool {
     loop {
         if stack.is_empty() {
@@ -257,14 +257,21 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
 
         let frame_idx = stack.len() - 1;
         let frame = &stack[frame_idx];
-        let rule = &grammar.rules[frame.rule_id];
+        let Some(rule) = grammar.rules.get(frame.rule_id) else {
+            return false;
+        };
 
         // Rule with no alternatives: dead end → reject via next-alt or backtrack.
         if rule.alts.is_empty() {
-            return try_next_alt(stack, grammar, b, frame_idx);
+            if !try_next_alt(stack, grammar, frame_idx) {
+                return false;
+            }
+            continue;
         }
 
-        let alt = &rule.alts[frame.alt_idx];
+        let Some(alt) = rule.alts.get(frame.alt_idx) else {
+            return false;
+        };
 
         if frame.sym_pos >= alt.len() {
             // Current alternative exhausted: pop frame, advance parent.
@@ -301,7 +308,10 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
                     // the old `sym_pos == 0` heuristic and closes both halves of
                     // #353 (the trailing-comma over-acceptance and the
                     // nullable-prefix over-rejection).
-                    return try_next_alt(stack, grammar, b, frame_idx);
+                    if !try_next_alt(stack, grammar, frame_idx) {
+                        return false;
+                    }
+                    continue;
                 }
             }
             Symbol::AnyByte => {
@@ -315,7 +325,10 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
                 let rid = *rule_id;
                 // Push a new frame for the non-terminal's first alt.
                 // Before pushing, check if the referenced rule has any alts.
-                if grammar.rules[rid].alts.is_empty() {
+                let Some(referenced_rule) = grammar.rules.get(rid) else {
+                    return false;
+                };
+                if referenced_rule.alts.is_empty() {
                     // Empty rule = epsilon; advance past the non-terminal.
                     stack[frame_idx].sym_pos += 1;
                     continue;
@@ -336,8 +349,7 @@ fn try_advance_stack(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar, b: 
 fn try_next_alt(
     stack: &mut Vec<StackFrame>,
     grammar: &CompiledGrammar,
-    b: u8,
-    frame_idx: usize,
+    mut frame_idx: usize,
 ) -> bool {
     // Consumed-guard (#353). If this frame has consumed an input byte under its
     // current alternative it is committed: switching it to a sibling alternative
@@ -370,36 +382,38 @@ fn try_next_alt(
     // complete needs ambiguity-preserving matching (a trie/NFA compiled form or
     // parallel active stacks) and is out of scope here. See the
     // `shared_prefix_enum_known_limitation` regression anchor in json_schema.rs.
-    if stack[frame_idx].consumed {
-        return false;
-    }
+    loop {
+        if stack[frame_idx].consumed {
+            return false;
+        }
 
-    let rule_id = stack[frame_idx].rule_id;
-    let next_alt = stack[frame_idx].alt_idx + 1;
-    let num_alts = grammar.rules[rule_id].alts.len();
+        let rule_id = stack[frame_idx].rule_id;
+        let next_alt = stack[frame_idx].alt_idx + 1;
+        let Some(rule) = grammar.rules.get(rule_id) else {
+            return false;
+        };
+        let num_alts = rule.alts.len();
 
-    if next_alt >= num_alts {
+        if next_alt < num_alts {
+            // Switch to the next alternative in the same rule (reset position and the
+            // consumed flag — the new alternative has consumed nothing yet).
+            stack[frame_idx].alt_idx = next_alt;
+            stack[frame_idx].sym_pos = 0;
+            stack[frame_idx].consumed = false;
+            // Truncate any frames pushed during the failed attempt.
+            stack.truncate(frame_idx + 1);
+            return true;
+        }
+
         // No more alternatives at this (uncommitted) level: pop the frame and
-        // try the parent's next alternative. Sound because this frame consumed
-        // no byte under its current alternative, so removing it un-interprets
-        // nothing.
+        // inspect the parent. Sound because this frame consumed no byte under
+        // its current alternative, so removing it un-interprets nothing.
         if frame_idx == 0 {
             return false;
         }
         stack.truncate(frame_idx);
-        let parent_idx = stack.len() - 1;
-        return try_next_alt(stack, grammar, b, parent_idx);
+        frame_idx -= 1;
     }
-
-    // Switch to the next alternative in the same rule (reset position and the
-    // consumed flag — the new alternative has consumed nothing yet).
-    stack[frame_idx].alt_idx = next_alt;
-    stack[frame_idx].sym_pos = 0;
-    stack[frame_idx].consumed = false;
-    // Truncate any frames pushed during the failed attempt.
-    stack.truncate(frame_idx + 1);
-    // Retry with new alt.
-    try_advance_stack(stack, grammar, b)
 }
 
 /// Mark every frame currently on the stack as having consumed a byte under its
@@ -420,7 +434,13 @@ fn collapse_exhausted(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar) {
         match stack.last() {
             None => break,
             Some(frame) => {
-                let rule = &grammar.rules[frame.rule_id];
+                let Some(rule) = grammar.rules.get(frame.rule_id) else {
+                    // Invalid rule id: cannot determine whether this frame is
+                    // exhausted. Stop collapsing rather than index out of
+                    // bounds; the next operation on this state re-validates
+                    // the frame through the same guarded path and rejects.
+                    break;
+                };
                 // No alts: already dead-ended; pop.
                 if rule.alts.is_empty() {
                     stack.pop();
@@ -429,7 +449,9 @@ fn collapse_exhausted(stack: &mut Vec<StackFrame>, grammar: &CompiledGrammar) {
                     }
                     continue;
                 }
-                let alt = &rule.alts[frame.alt_idx];
+                let Some(alt) = rule.alts.get(frame.alt_idx) else {
+                    break;
+                };
                 if frame.sym_pos < alt.len() {
                     break;
                 }
@@ -471,7 +493,6 @@ fn is_accepting(state: &GrammarState, grammar: &CompiledGrammar) -> bool {
         if frame.alt_idx >= rule.alts.len() {
             return false;
         }
-        let alt = &rule.alts[frame.alt_idx];
         // Non-top frames: the child frame is handling the symbol at sym_pos,
         // so check nullable from sym_pos + 1.
         // Top frame: check nullable from sym_pos itself.
@@ -480,60 +501,171 @@ fn is_accepting(state: &GrammarState, grammar: &CompiledGrammar) -> bool {
         } else {
             frame.sym_pos + 1
         };
-        if !remaining_is_nullable(
-            grammar,
-            alt,
-            check_from,
-            &mut std::collections::HashSet::new(),
-        ) {
+        if !remaining_is_nullable(grammar, frame.rule_id, frame.alt_idx, check_from) {
             return false;
         }
     }
     true
 }
 
-/// Returns true if the symbols `alt[pos..]` can all derive the empty string.
-fn remaining_is_nullable(
-    grammar: &CompiledGrammar,
-    alt: &[Symbol],
-    pos: usize,
-    visited: &mut std::collections::HashSet<usize>,
-) -> bool {
-    for sym in &alt[pos..] {
-        match sym {
-            Symbol::Terminal(_) | Symbol::AnyByte => return false,
-            Symbol::NonTerminal(rid) => {
-                if !visited.insert(*rid) {
-                    // Already checking this rule (cycle): conservatively non-nullable.
-                    return false;
-                }
-                if !rule_is_nullable(grammar, *rid, visited) {
-                    visited.remove(rid);
-                    return false;
-                }
-                visited.remove(rid);
-            }
-        }
-    }
-    true
+#[derive(Clone, Copy)]
+enum NullableFrame {
+    /// Checking whether `grammar.rules[rule_id].alts[alt_idx][pos..]` is nullable.
+    Alt {
+        rule_id: usize,
+        alt_idx: usize,
+        pos: usize,
+    },
+    /// Checking whether any of `grammar.rules[rule_id].alts[alt_idx..]` is nullable.
+    Rule { rule_id: usize, alt_idx: usize },
 }
 
-/// Returns true if rule `rule_id` has at least one alternative that can
-/// derive the empty string.
-fn rule_is_nullable(
+std::thread_local! {
+    /// Per-thread worklist + cycle-guard for `remaining_is_nullable`, reused
+    /// across calls instead of allocated fresh each time.
+    ///
+    /// `is_accepting` calls this function once per PDA stack frame, and
+    /// `is_accepting` itself runs after every accepted byte (`advance_byte`)
+    /// and at grammar-state construction (`initial_grammar_state`) — a
+    /// per-candidate-token hot path (see `grammar_mask_bench`). A fresh
+    /// `Vec`/`HashSet` per call put a guaranteed heap allocation on that path
+    /// even for the overwhelmingly common shallow (depth-1, no `NonTerminal`)
+    /// case. Reusing thread-local buffers keeps the walk itself unchanged —
+    /// still an explicit heap-backed worklist, never native recursion — while
+    /// making the allocation one-time-per-thread instead of one-time-per-call:
+    /// `clear()` retains capacity, so after the first call reaches a given
+    /// depth, subsequent calls (including calls as deep as
+    /// `deeply_nested_nullable_chain_accepts_on_bounded_stack`'s
+    /// `MAX_PDA_DEPTH`-length chain) reuse that capacity with zero further
+    /// allocation. `remaining_is_nullable` does not call itself or otherwise
+    /// re-enter this function while a borrow is live, so `borrow_mut` never
+    /// contends within one thread; each thread gets its own buffers, so
+    /// parallel-beam grammar tracking across threads never contends either.
+    static NULLABLE_SCRATCH: std::cell::RefCell<(Vec<NullableFrame>, std::collections::HashSet<usize>)> =
+        std::cell::RefCell::new((Vec::new(), std::collections::HashSet::new()));
+}
+
+/// Returns true if `grammar.rules[rule_id].alts[alt_idx][pos..]` can derive
+/// the empty string, i.e. every remaining symbol is nullable.
+///
+/// This mirrors the natural mutually-recursive definition (an alt is nullable
+/// iff every remaining symbol is nullable; a non-terminal is nullable iff
+/// *some* alternative of the rule it names is nullable) but walks an explicit,
+/// heap-allocated worklist (`stack`) instead of native call frames. A cyclic
+/// grammar is bounded by the per-path `visited` guard below, same as before;
+/// an *acyclic* grammar is bounded by the number of distinct rules it can
+/// reference on one path (at most `grammar.rules.len()`), since `visited`
+/// forbids revisiting a rule id — either way the frames live on `stack`, not
+/// the native stack, so neither shape can overflow it. `MAX_PDA_DEPTH` is a
+/// different bound (the live PDA execution stack) and does not apply here.
+fn remaining_is_nullable(
     grammar: &CompiledGrammar,
     rule_id: usize,
-    visited: &mut std::collections::HashSet<usize>,
+    alt_idx: usize,
+    pos: usize,
 ) -> bool {
-    if rule_id >= grammar.rules.len() {
-        return false;
-    }
-    for alt in &grammar.rules[rule_id].alts {
-        if remaining_is_nullable(grammar, alt, 0, visited) {
-            return true;
+    use NullableFrame as Frame;
+
+    NULLABLE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let (stack, visited) = &mut *scratch;
+        stack.clear();
+        visited.clear();
+        stack.push(Frame::Alt {
+            rule_id,
+            alt_idx,
+            pos,
+        });
+        // The boolean result of the frame that just finished, to be consumed
+        // by the frame now on top of `stack`.
+        let mut pending: Option<bool> = None;
+
+        loop {
+            let Some(&frame) = stack.last() else {
+                return pending.unwrap_or(true);
+            };
+            match frame {
+                Frame::Alt {
+                    rule_id,
+                    alt_idx,
+                    mut pos,
+                } => {
+                    let alt = &grammar.rules[rule_id].alts[alt_idx];
+                    if let Some(sub) = pending.take() {
+                        // Resuming after the NonTerminal at `pos` was checked.
+                        if let Symbol::NonTerminal(rid) = alt[pos] {
+                            visited.remove(&rid);
+                        }
+                        if !sub {
+                            stack.pop();
+                            pending = Some(false);
+                            continue;
+                        }
+                        pos += 1;
+                    }
+                    match alt.get(pos) {
+                        None => {
+                            stack.pop();
+                            pending = Some(true);
+                        }
+                        Some(Symbol::Terminal(_)) | Some(Symbol::AnyByte) => {
+                            stack.pop();
+                            pending = Some(false);
+                        }
+                        Some(Symbol::NonTerminal(rid)) => {
+                            let rid = *rid;
+                            // Persist the (possibly advanced) `pos` before descending.
+                            *stack.last_mut().unwrap() = Frame::Alt {
+                                rule_id,
+                                alt_idx,
+                                pos,
+                            };
+                            if !visited.insert(rid) {
+                                // Already checking this rule on this path (cycle):
+                                // conservatively non-nullable.
+                                stack.pop();
+                                pending = Some(false);
+                            } else {
+                                stack.push(Frame::Rule {
+                                    rule_id: rid,
+                                    alt_idx: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+                Frame::Rule {
+                    rule_id,
+                    mut alt_idx,
+                } => {
+                    if let Some(sub) = pending.take() {
+                        if sub {
+                            stack.pop();
+                            pending = Some(true);
+                            continue;
+                        }
+                        alt_idx += 1;
+                    }
+                    let Some(rule) = grammar.rules.get(rule_id) else {
+                        stack.pop();
+                        pending = Some(false);
+                        continue;
+                    };
+                    if alt_idx >= rule.alts.len() {
+                        stack.pop();
+                        pending = Some(false);
+                    } else {
+                        *stack.last_mut().unwrap() = Frame::Rule { rule_id, alt_idx };
+                        stack.push(Frame::Alt {
+                            rule_id,
+                            alt_idx,
+                            pos: 0,
+                        });
+                    }
+                }
+            }
         }
-    }
-    false
+    })
 }
 
 /// Simulate advancing the PDA from `state` by consuming all bytes of `token`.
@@ -578,6 +710,17 @@ pub fn simulate_token(
 // Grammar builders for use by json_schema.rs and gbnf.rs
 // ---------------------------------------------------------------------------
 
+/// Error from a `GrammarBuilder` operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuilderError(pub String);
+
+impl std::fmt::Display for BuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "grammar builder error: {}", self.0)
+    }
+}
+impl std::error::Error for BuilderError {}
+
 /// Builder for assembling a `CompiledGrammar`.
 pub struct GrammarBuilder {
     rules: Vec<Rule>,
@@ -608,14 +751,27 @@ impl GrammarBuilder {
     }
 
     /// Add alternatives to an already-reserved rule.
-    pub fn set_alts(&mut self, id: usize, alts: Vec<Alt>) {
-        self.rules[id].alts = alts;
+    ///
+    /// Returns an error rather than panicking when `id` was never returned by
+    /// `reserve` on this builder (e.g. a foreign or stale id).
+    pub fn set_alts(&mut self, id: usize, alts: Vec<Alt>) -> Result<(), BuilderError> {
+        let Some(rule) = self.rules.get_mut(id) else {
+            return Err(BuilderError(format!(
+                "set_alts: rule id {id} was not reserved on this builder ({} rule(s) reserved)",
+                self.rules.len()
+            )));
+        };
+        rule.alts = alts;
+        Ok(())
     }
 
     /// Reserve and immediately set alternatives.
+    ///
+    /// `id` is always freshly reserved above, so this can never hit the
+    /// unreserved-id case `set_alts` guards against.
     pub fn add_rule(&mut self, name: &str, alts: Vec<Alt>) -> usize {
         let id = self.reserve(name);
-        self.set_alts(id, alts);
+        self.rules[id].alts = alts;
         id
     }
 
@@ -673,7 +829,7 @@ mod tests {
         let digit_alts: Vec<Alt> = (b'0'..=b'9')
             .map(|byte| vec![Symbol::Terminal(byte)])
             .collect();
-        b.set_alts(digit_id, digit_alts);
+        b.set_alts(digit_id, digit_alts).unwrap();
 
         // root = digit digit_rest
         // digit_rest = digit digit_rest | ε  (implemented as digit_rest = [empty alt])
@@ -684,7 +840,8 @@ mod tests {
                 vec![Symbol::NonTerminal(digit_id), Symbol::NonTerminal(rest_id)],
                 vec![], // epsilon
             ],
-        );
+        )
+        .unwrap();
 
         let root_id = b.reserve("root");
         b.set_alts(
@@ -693,7 +850,8 @@ mod tests {
                 Symbol::NonTerminal(digit_id),
                 Symbol::NonTerminal(rest_id),
             ]],
-        );
+        )
+        .unwrap();
         // Ensure root is at index 0.
         let mut grammar = b.build();
         // Swap root to position 0.
@@ -736,7 +894,8 @@ mod tests {
         let body_id = b.reserve("body");
         let tail_id = b.reserve("tail");
         let elem_id = b.reserve("elem");
-        b.set_alts(elem_id, vec![vec![Symbol::Terminal(b'x')]]);
+        b.set_alts(elem_id, vec![vec![Symbol::Terminal(b'x')]])
+            .unwrap();
         b.set_alts(
             tail_id,
             vec![
@@ -747,14 +906,16 @@ mod tests {
                 ],
                 vec![], // epsilon
             ],
-        );
+        )
+        .unwrap();
         b.set_alts(
             body_id,
             vec![
                 vec![Symbol::NonTerminal(elem_id), Symbol::NonTerminal(tail_id)],
                 vec![], // epsilon
             ],
-        );
+        )
+        .unwrap();
         b.set_alts(
             root_id,
             vec![vec![
@@ -762,7 +923,8 @@ mod tests {
                 Symbol::NonTerminal(body_id),
                 Symbol::Terminal(b']'),
             ]],
-        );
+        )
+        .unwrap();
         b.build()
     }
 
@@ -833,11 +995,13 @@ mod tests {
         b.set_alts(
             child_id,
             vec![vec![Symbol::Terminal(b'b'), Symbol::Terminal(b'c')]],
-        );
+        )
+        .unwrap();
         b.set_alts(
             root_id,
             vec![vec![Symbol::Terminal(b'a'), Symbol::NonTerminal(child_id)]],
-        );
+        )
+        .unwrap();
         let g = b.build();
 
         let mut state = GrammarState::initial();
@@ -865,6 +1029,141 @@ mod tests {
         assert_eq!(advance_byte(&mut s, &g, b'c'), StepResult::Rejected);
     }
 
+    #[test]
+    fn dead_child_backtracks_to_parent_alternative() {
+        let mut builder = GrammarBuilder::new();
+        let root_id = builder.reserve("root");
+        let dead_id = builder.reserve("dead");
+        builder
+            .set_alts(dead_id, vec![vec![Symbol::Terminal(b'y')]])
+            .unwrap();
+        builder
+            .set_alts(
+                root_id,
+                vec![
+                    vec![Symbol::NonTerminal(dead_id)],
+                    vec![Symbol::Terminal(b'x')],
+                ],
+            )
+            .unwrap();
+        let grammar = builder.build();
+        let mut state = GrammarState::initial();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Accepted
+        );
+        assert!(state.complete);
+    }
+
+    /// A production-valid nested grammar must reach a root sibling without
+    /// growing the native call stack while it exhausts uncommitted parents.
+    ///
+    /// The 64 KiB native thread stack makes a recursive parent walk overflow before
+    /// it can accept `x`; the iterative walk completes within the same bound.
+    #[test]
+    fn deeply_nested_parent_fallback_accepts_on_bounded_stack() {
+        let depth = MAX_PDA_DEPTH / 2;
+        let mut rules = Vec::with_capacity(depth);
+        rules.push(Rule {
+            name: "root".to_string(),
+            alts: vec![vec![Symbol::NonTerminal(1)], vec![Symbol::Terminal(b'x')]],
+        });
+        for rule_id in 1..depth - 1 {
+            rules.push(Rule {
+                name: String::new(),
+                alts: vec![vec![Symbol::NonTerminal(rule_id + 1)]],
+            });
+        }
+        rules.push(Rule {
+            name: String::new(),
+            alts: vec![vec![Symbol::Terminal(b'y')]],
+        });
+        let grammar = CompiledGrammar { rules };
+
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let mut state = GrammarState::initial();
+                assert_eq!(
+                    advance_byte(&mut state, &grammar, b'x'),
+                    StepResult::Accepted
+                );
+                assert!(state.complete);
+            })
+            .expect("bounded-stack regression thread spawns")
+            .join()
+            .expect("iterative fallback must not overflow the bounded stack");
+    }
+
+    /// A long *acyclic* chain of distinct nullable wrapper rules has no cycle
+    /// for `remaining_is_nullable`'s `visited` guard to catch, so unlike the
+    /// cyclic case its only historical bound was call-frame depth.
+    /// `is_accepting` runs on `initial_grammar_state`, before any byte is
+    /// consumed — a single-frame state referencing the head of such a chain
+    /// must not overflow the native stack even though `state.stack.len()`
+    /// never leaves 1 (the nullability walk descends the *static* rule graph,
+    /// not the PDA execution stack `MAX_PDA_DEPTH` bounds).
+    #[test]
+    fn deeply_nested_nullable_chain_accepts_on_bounded_stack() {
+        let depth = MAX_PDA_DEPTH;
+        let mut rules = Vec::with_capacity(depth);
+        for rule_id in 0..depth - 1 {
+            rules.push(Rule {
+                name: String::new(),
+                alts: vec![vec![Symbol::NonTerminal(rule_id + 1)]],
+            });
+        }
+        // The chain's tail is epsilon, so the whole chain is nullable.
+        rules.push(Rule {
+            name: String::new(),
+            alts: vec![vec![]],
+        });
+        let grammar = CompiledGrammar { rules };
+
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let state = initial_grammar_state(&grammar);
+                assert!(state.is_complete());
+            })
+            .expect("bounded-stack regression thread spawns")
+            .join()
+            .expect("iterative nullability walk must not overflow the bounded stack");
+    }
+
+    fn nested_terminal_grammar(depth: usize, terminal: u8) -> CompiledGrammar {
+        let mut rules = Vec::with_capacity(depth);
+        for rule_id in 0..depth - 1 {
+            rules.push(Rule {
+                name: String::new(),
+                alts: vec![vec![Symbol::NonTerminal(rule_id + 1)]],
+            });
+        }
+        rules.push(Rule {
+            name: String::new(),
+            alts: vec![vec![Symbol::Terminal(terminal)]],
+        });
+        CompiledGrammar { rules }
+    }
+
+    #[test]
+    fn nesting_depth_limit_matches_recursive_boundary() {
+        let at_limit = nested_terminal_grammar(MAX_PDA_DEPTH, b'x');
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &at_limit, b'x'),
+            StepResult::Accepted
+        );
+
+        let past_limit = nested_terminal_grammar(MAX_PDA_DEPTH + 1, b'x');
+        let mut state = GrammarState::initial();
+        assert_eq!(
+            advance_byte(&mut state, &past_limit, b'x'),
+            StepResult::Rejected
+        );
+    }
+
     /// Grammar: root = "a" nonterm | "x" ; nonterm = "cd"
     /// Root reserved first so it lands at index 0.
     fn leading_terminal_then_nt_grammar() -> CompiledGrammar {
@@ -874,14 +1173,16 @@ mod tests {
         b.set_alts(
             nt_id,
             vec![vec![Symbol::Terminal(b'c'), Symbol::Terminal(b'd')]],
-        );
+        )
+        .unwrap();
         b.set_alts(
             root_id,
             vec![
                 vec![Symbol::Terminal(b'a'), Symbol::NonTerminal(nt_id)],
                 vec![Symbol::Terminal(b'x')],
             ],
-        );
+        )
+        .unwrap();
         b.build()
     }
 
@@ -975,5 +1276,207 @@ mod tests {
         let id1 = builder.reserve("foo");
         let id2 = builder.reserve("foo");
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn missing_root_rule_id_rejects_without_panicking() {
+        let grammar = CompiledGrammar { rules: Vec::new() };
+        let mut state = GrammarState::initial();
+        let before = state.clone();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Rejected
+        );
+        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
+    }
+
+    #[test]
+    fn out_of_range_state_rule_id_rejects_without_panicking() {
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![vec![Symbol::Terminal(b'x')]],
+            }],
+        };
+        let mut state = GrammarState {
+            stack: vec![StackFrame {
+                rule_id: 1,
+                alt_idx: 0,
+                sym_pos: 0,
+                consumed: false,
+            }],
+            partial_token_bytes: Vec::new(),
+            complete: false,
+        };
+        let before = state.clone();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Rejected
+        );
+        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
+    }
+
+    #[test]
+    fn out_of_range_non_terminal_rule_id_rejects_without_panicking() {
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![vec![Symbol::NonTerminal(1)]],
+            }],
+        };
+        let mut state = GrammarState::initial();
+        let before = state.clone();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Rejected
+        );
+        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
+    }
+
+    #[test]
+    fn set_alts_out_of_range_id_returns_err() {
+        let mut b = GrammarBuilder::new();
+        let root_id = b.reserve("root");
+        assert_eq!(root_id, 0);
+
+        // No rule was ever reserved at id 5: out of range for a 1-rule builder.
+        let err = b
+            .set_alts(5, vec![vec![Symbol::Terminal(b'x')]])
+            .expect_err("set_alts on an unreserved id must return Err, not panic");
+        assert!(err.0.contains('5'), "error should name the bad id: {err:?}");
+    }
+
+    #[test]
+    fn set_alts_in_range_id_succeeds() {
+        let mut b = GrammarBuilder::new();
+        let id = b.reserve("root");
+        b.set_alts(id, vec![vec![Symbol::Terminal(b'x')]])
+            .expect("set_alts on a freshly reserved id must succeed");
+        let g = b.build();
+        assert!(accepts_str(&g, b"x"));
+    }
+
+    #[test]
+    fn out_of_range_alt_idx_rejects_without_panicking() {
+        // A directly-constructed StackFrame (public fields) can carry an
+        // alt_idx past the rule's alternative count even though the rule id
+        // itself is valid and non-empty. The main advance loop must reject
+        // this the same way it already rejects an out-of-range rule id,
+        // rather than indexing `rule.alts[alt_idx]` unchecked.
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "root".to_string(),
+                alts: vec![vec![Symbol::Terminal(b'x')]], // exactly one alt
+            }],
+        };
+        let mut state = GrammarState {
+            stack: vec![StackFrame {
+                rule_id: 0,
+                alt_idx: 7, // no alt at index 7
+                sym_pos: 0,
+                consumed: false,
+            }],
+            partial_token_bytes: Vec::new(),
+            complete: false,
+        };
+        let before = state.clone();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Rejected
+        );
+        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
+    }
+
+    #[test]
+    fn dangling_ancestor_rule_id_rejects_during_backtrack_without_panicking() {
+        // A non-top (ancestor) frame can carry a rule id that no longer
+        // exists in the grammar — the state a dangling NonTerminal reference
+        // would leave behind. The top frame is valid but its only alt
+        // mismatches the incoming byte, forcing `try_next_alt` to exhaust the
+        // top frame and walk into the invalid ancestor. That ancestor walk
+        // must reject, not index `grammar.rules[rule_id]` unchecked.
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "child".to_string(),
+                alts: vec![vec![Symbol::Terminal(b'z')]],
+            }],
+        };
+        let mut state = GrammarState {
+            stack: vec![
+                StackFrame {
+                    rule_id: 999, // dangling: no such rule
+                    alt_idx: 0,
+                    sym_pos: 0,
+                    consumed: false,
+                },
+                StackFrame {
+                    rule_id: 0, // valid, but its only alt won't match b'x'
+                    alt_idx: 0,
+                    sym_pos: 0,
+                    consumed: false,
+                },
+            ],
+            partial_token_bytes: Vec::new(),
+            complete: false,
+        };
+        let before = state.clone();
+
+        assert_eq!(
+            advance_byte(&mut state, &grammar, b'x'),
+            StepResult::Rejected
+        );
+        assert_eq!(state.stack, before.stack);
+        assert_eq!(state.partial_token_bytes, before.partial_token_bytes);
+        assert_eq!(state.complete, before.complete);
+    }
+
+    #[test]
+    fn dangling_ancestor_rule_id_stops_collapse_without_panicking() {
+        // Same dangling-ancestor shape as above, but reached via the
+        // post-match `collapse_exhausted` walk instead of `try_next_alt`:
+        // the top frame's byte DOES match and exhausts its only alt, so
+        // popping it advances into the invalid ancestor while collapsing.
+        let grammar = CompiledGrammar {
+            rules: vec![Rule {
+                name: "child".to_string(),
+                alts: vec![vec![Symbol::Terminal(b'x')]],
+            }],
+        };
+        let mut state = GrammarState {
+            stack: vec![
+                StackFrame {
+                    rule_id: 999, // dangling: no such rule
+                    alt_idx: 0,
+                    sym_pos: 0,
+                    consumed: false,
+                },
+                StackFrame {
+                    rule_id: 0, // valid; matches b'x' and then exhausts
+                    alt_idx: 0,
+                    sym_pos: 0,
+                    consumed: false,
+                },
+            ],
+            partial_token_bytes: Vec::new(),
+            complete: false,
+        };
+
+        // Must not panic. The byte match itself still succeeds (the top
+        // frame's own terminal matched); what must not panic is the
+        // subsequent collapse into the dangling ancestor.
+        let result = advance_byte(&mut state, &grammar, b'x');
+        assert_eq!(result, StepResult::Accepted);
     }
 }
