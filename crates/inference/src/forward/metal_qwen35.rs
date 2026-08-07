@@ -755,7 +755,12 @@ mod inner {
     ///
     /// # Safety invariant
     /// The mmap is read-only (`MAP_PRIVATE`) and the model files must not be
-    /// modified while the process is running.
+    /// modified while the process is running. [`crate::weights::mmap_trust::open_trusted_mmap_file`]
+    /// enforces the write-boundary half of that invariant (group/other-writable,
+    /// foreign ownership, a writable ancestor directory, or a permission-granting
+    /// extended ACL) the same way [`mmap_q4_weight`] does; same-uid mutation
+    /// through a second fd remains the documented residual, as for every mmap
+    /// site in this crate.
     ///
     /// Not yet called from live checkpoint loading (proven end-to-end by this
     /// module's `mmap_q3_weight_*` tests instead).
@@ -771,8 +776,7 @@ mod inner {
 
         validate_q3_mlp_role(tensor_name).map_err(|e| e.to_string())?;
 
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+        let (mut file, _metadata) = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
         let header = crate::weights::q3_weights::read_q3_header(&mut file)
             .map_err(|e| format!("failed to parse Q3 header {}: {e}", path.display()))?;
         let file_len = file
@@ -17674,6 +17678,66 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 result.is_ok(),
                 "mmap_q3_weight must accept a well-formed MLP-role payload: {:?}",
+                result.err()
+            );
+        }
+
+        // #1368: `mmap_q3_weight` must route through the same mmap trust
+        // boundary `mmap_q4_weight` already does -- proves the wiring, not
+        // just the underlying `open_trusted_mmap_file` predicate (already
+        // covered directly in `mmap_trust`'s own tests).
+        #[cfg(unix)]
+        #[test]
+        fn mmap_q3_weight_rejects_a_group_or_other_writable_file() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            let tmp = tempfile::tempdir().expect("tempdir create");
+            let path = tmp.path().join("writable.q3");
+            let tensor = crate::weights::q3_weights::Q3Tensor {
+                blocks: vec![
+                    crate::weights::q3_weights::Q3Block {
+                        scale: 0,
+                        bias: 0,
+                        packed: [0u8; 12]
+                    };
+                    2
+                ],
+                shape: vec![64],
+                original_len: 64,
+            };
+            crate::weights::q3_weights::save_q3_file(&path, &tensor)
+                .expect("save well-formed q3 file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+                .expect("chmod 0o666");
+
+            let result = mmap_q3_weight(
+                &device,
+                &path,
+                "model.layers.0.mlp.down_proj.weight",
+                "writable-file-rejected",
+            );
+            let Err(err) = result else {
+                panic!("a group/other-writable Q3 file must be refused")
+            };
+            assert!(
+                err.contains("refusing to load"),
+                "expected a trust-boundary refusal, got: {err}"
+            );
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod 0o600");
+            let result = mmap_q3_weight(
+                &device,
+                &path,
+                "model.layers.0.mlp.down_proj.weight",
+                "owner-only-accepted",
+            );
+            assert!(
+                result.is_ok(),
+                "an owner-only Q3 file must still be accepted: {:?}",
                 result.err()
             );
         }

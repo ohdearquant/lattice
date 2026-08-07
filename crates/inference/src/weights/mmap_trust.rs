@@ -7,9 +7,18 @@
 //! the process itself (or root, for shared root-deployed model directories)
 //! for as long as the mmap is alive, because a mutation after validation but
 //! before -- or during -- GPU reads bypasses every shape/bounds check this
-//! crate performs. [`open_trusted_mmap_file`] is the single chokepoint all
-//! five load sites route through so that guarantee holds identically for
-//! each of them.
+//! crate performs. [`open_trusted_mmap_file`] and
+//! [`reject_if_open_mmap_file_untrusted`] are the two chokepoints every load
+//! site routes through: the former opens the path itself under
+//! `O_NOFOLLOW`+`O_NONBLOCK` (Q4, Q3 -- lattice-produced quantized files that
+//! are never a HuggingFace hub-cache symlink), the latter takes a `File` the
+//! caller already opened by a path that must be allowed to resolve a
+//! final-component symlink (the F32/BF16 safetensors loader and the QuaRot
+//! reader both load HuggingFace hub-cache checkpoints, which symlink
+//! `model.safetensors` itself to blob storage -- `O_NOFOLLOW` would reject
+//! every such checkpoint outright). Both apply the identical mode/uid/ACL
+//! and parent-directory checks, so the trust guarantee holds the same way
+//! regardless of which open path a loader needs.
 //!
 //! POSIX mode bits + uid alone are not sufficient on macOS: an extended ACL
 //! (`chmod +a "someuser allow write" <path>`) can grant another principal
@@ -398,6 +407,32 @@ pub(crate) fn reject_if_mmap_file_trust_boundary_weak(
     _path: &Path,
 ) -> Result<(), String> {
     Ok(())
+}
+
+/// Run the same mode/uid/ACL and parent-directory trust checks
+/// [`open_trusted_mmap_file`] applies, against a `File` the caller already
+/// opened itself -- without that function's `O_NOFOLLOW`/`O_NONBLOCK`
+/// open-time guards.
+///
+/// Some loaders cannot use [`open_trusted_mmap_file`] because they must
+/// follow a symlink at the checkpoint's final path component: a
+/// HuggingFace-hub-cache checkpoint directory is a symlink farm
+/// (`snapshots/<rev>/model.safetensors -> ../../blobs/<sha>`), so
+/// `O_NOFOLLOW` would reject every hub-cache checkpoint outright, not just an
+/// attacker-planted one. Those loaders open the path with a plain, symlink-
+/// following `File::open` themselves (accepting the narrower TOCTOU window
+/// that implies, same as before this gate existed) and pass the resulting
+/// file here for the write-boundary checks this module exists to add:
+/// group/other-writable, foreign non-root ownership, a writable ancestor
+/// directory, or -- macOS only -- a permission-granting extended ACL. `file`
+/// must be the descriptor the caller is about to mmap (the fd-binding
+/// invariant applies here identically -- see the module doc comment), and
+/// `path` should be the resolved real path when the caller has one (so the
+/// parent-directory walk inspects the directories the mapped file actually
+/// lives under, not a symlink's location).
+pub(crate) fn reject_if_open_mmap_file_untrusted(file: &File, path: &Path) -> Result<(), String> {
+    reject_if_mmap_parent_directory_chain_weak(path)?;
+    reject_if_mmap_file_trust_boundary_weak(file, path)
 }
 
 /// `O_NONBLOCK`, `O_NOFOLLOW`, and `ELOOP` come from `libc` rather than a
@@ -1263,6 +1298,51 @@ mod tests {
         assert!(
             reject_if_mmap_file_trust_boundary_weak(&private_file, &path).is_ok(),
             "an owner-only file owned by the current process must be accepted"
+        );
+    }
+
+    // #1368: `reject_if_open_mmap_file_untrusted` is the chokepoint for
+    // loaders that must follow a final-component symlink (HuggingFace
+    // hub-cache checkpoints) and so cannot use `open_trusted_mmap_file`'s
+    // `O_NOFOLLOW` open. This proves it still closes the write-boundary gap
+    // that matters: a group/other-writable target file is refused even
+    // though the caller opened it through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn reject_if_open_mmap_file_untrusted_fails_closed_on_writable_file_reached_via_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let real_path = tmp.path().join("real_shard.safetensors");
+        std::fs::write(
+            &real_path,
+            b"not a real checkpoint, only permissions matter here",
+        )
+        .expect("write real fixture");
+        std::fs::set_permissions(&real_path, std::fs::Permissions::from_mode(0o666))
+            .expect("chmod 0o666");
+
+        let symlink_path = tmp.path().join("model.safetensors");
+        std::os::unix::fs::symlink(&real_path, &symlink_path).expect("create symlink fixture");
+
+        // The loaders this function serves open the path with a plain,
+        // symlink-following `File::open` -- not `open_trusted_mmap_file`,
+        // which would reject this symlink outright via `O_NOFOLLOW`.
+        let file = File::open(&symlink_path).expect("open through the symlink");
+        let result = reject_if_open_mmap_file_untrusted(&file, &symlink_path);
+        assert!(
+            result.is_err(),
+            "a group/other-writable target reached via a final-component symlink \
+             must still be refused"
+        );
+
+        std::fs::set_permissions(&real_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0o600");
+        let private_file = File::open(&symlink_path).expect("reopen through the symlink");
+        assert!(
+            reject_if_open_mmap_file_untrusted(&private_file, &symlink_path).is_ok(),
+            "an owner-only target reached via a final-component symlink must be accepted -- \
+             this function exists precisely so the symlink itself is not the rejection cause"
         );
     }
 
