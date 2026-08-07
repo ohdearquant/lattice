@@ -10394,6 +10394,7 @@ mod inner {
             let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
                 tokenizer,
                 gen_cfg.reasoning_budget,
+                gen_cfg.enable_thinking,
                 cfg.vocab_size,
             )?;
 
@@ -13222,6 +13223,7 @@ mod inner {
                 crate::model::qwen35::resolve_reasoning_close_token(
                     tokenizer,
                     gen_cfg.reasoning_budget,
+                    gen_cfg.enable_thinking,
                     self.engine.config.vocab_size,
                 )?;
             }
@@ -13335,6 +13337,7 @@ mod inner {
             let think_close_id = crate::model::qwen35::resolve_reasoning_close_token(
                 tokenizer,
                 gen_cfg.reasoning_budget,
+                gen_cfg.enable_thinking,
                 cfg.vocab_size,
             )?;
 

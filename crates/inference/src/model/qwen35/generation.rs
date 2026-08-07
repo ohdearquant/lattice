@@ -129,6 +129,7 @@ impl Qwen35Model {
         let think_close_id = resolve_reasoning_close_token(
             &self.tokenizer,
             gen_cfg.reasoning_budget,
+            gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
 
@@ -560,6 +561,7 @@ impl Qwen35Model {
         let think_close_id = resolve_reasoning_close_token(
             &self.tokenizer,
             gen_cfg.reasoning_budget,
+            gen_cfg.enable_thinking,
             cfg.vocab_size,
         )?;
 
@@ -2338,12 +2340,23 @@ pub(crate) const REASONING_CLOSE_MARKER: &str = "</think>";
 
 /// Resolve the closing marker required to enforce an active reasoning budget.
 ///
-/// Exact token-content lookup covers both base-vocabulary entries and added
-/// tokens regardless of their `special` flag. An active budget fails closed if
-/// the tokenizer has no representable `</think>` marker, if more than one id
-/// renders as that marker (the decode loop recognises only one, so the rest
-/// would close the block in the output while the budget kept counting), or if
-/// the resolved id
+/// `reasoning_budget` is inert when `enable_thinking` is false: with thinking
+/// disabled the caller is contracted to have primed the prompt so no
+/// reasoning block is produced (see [`GenerateConfig::enable_thinking`]), so
+/// there is nothing for a forced `</think>` to close. This mirrors
+/// [`force_close_think`], whose own `enable_thinking` guard already treats
+/// that combination as a no-op -- resolving (and possibly rejecting on) a
+/// close marker that forcing could never use would make the two functions
+/// disagree about what the field means. So this returns `Ok(None)` without
+/// touching the tokenizer whenever `enable_thinking` is false, exactly like
+/// the `None`/`Some(0)` budget case below.
+///
+/// When thinking is enabled, exact token-content lookup covers both
+/// base-vocabulary entries and added tokens regardless of their `special`
+/// flag. An active budget fails closed if the tokenizer has no representable
+/// `</think>` marker, if more than one id renders as that marker (the decode
+/// loop recognises only one, so the rest would close the block in the output
+/// while the budget kept counting), or if the resolved id
 /// is outside `vocab_size` (a mismatched or malicious tokenizer can declare
 /// `</think>` in its base vocabulary at an id the loaded model has no
 /// embedding/logit row for) -- the id is later forced into decoding, and
@@ -2352,9 +2365,10 @@ pub(crate) const REASONING_CLOSE_MARKER: &str = "</think>";
 pub(crate) fn resolve_reasoning_close_token(
     tokenizer: &BpeTokenizer,
     reasoning_budget: Option<usize>,
+    enable_thinking: bool,
     vocab_size: usize,
 ) -> Result<Option<u32>, InferenceError> {
-    if !matches!(reasoning_budget, Some(budget) if budget > 0) {
+    if !enable_thinking || !matches!(reasoning_budget, Some(budget) if budget > 0) {
         return Ok(None);
     }
 
@@ -3530,9 +3544,68 @@ mod tests {
         .expect("base-vocabulary tokenizer must load");
         assert_eq!(tokenizer.special_token_id("</think>"), None);
         assert_eq!(
-            resolve_reasoning_close_token(&tokenizer, Some(1), 97)
+            resolve_reasoning_close_token(&tokenizer, Some(1), true, 97)
                 .expect("base-vocabulary marker must resolve"),
             Some(7)
+        );
+    }
+
+    /// `reasoning_budget` is inert when `enable_thinking` is false, in both
+    /// tokenizer states: a tokenizer with a resolvable `</think>` marker
+    /// (which would otherwise resolve to `Some(id)`) and one with none at all
+    /// (which would otherwise reject with `InvalidInput`). Before this fix
+    /// the two functions disagreed about what `enable_thinking: false` means
+    /// for `reasoning_budget` -- `force_close_think` already treated it as a
+    /// no-op, but `resolve_reasoning_close_token` had no `enable_thinking`
+    /// parameter at all, so a marker-absent tokenizer under this combination
+    /// was rejected for a budget that could never have been enforced or
+    /// violated either way.
+    #[test]
+    fn reasoning_budget_inert_when_thinking_disabled_in_both_tokenizer_states() {
+        use std::collections::HashMap;
+
+        let with_marker = BpeTokenizer::from_vocab_and_merges(
+            HashMap::from([("</think>".to_string(), 7)]),
+            Vec::new(),
+        )
+        .expect("base-vocabulary tokenizer must load");
+        assert_eq!(
+            resolve_reasoning_close_token(&with_marker, Some(1), false, 97)
+                .expect("enable_thinking: false must never error, marker present or not"),
+            None,
+            "a marker-resolvable tokenizer must still resolve to None when thinking is \
+             disabled -- force_close_think never reads a close id in that state, so \
+             validating and returning one here would be dead work at best and a false \
+             rejection (e.g. on a stricter vocab_size bound) at worst"
+        );
+
+        let without_marker =
+            BpeTokenizer::from_vocab_and_merges(HashMap::from([("a".to_string(), 0)]), Vec::new())
+                .expect("marker-free tokenizer must load");
+        assert!(without_marker.token_ids_for_content("</think>").is_empty());
+        assert_eq!(
+            resolve_reasoning_close_token(&without_marker, Some(1), false, 97)
+                .expect("enable_thinking: false must never error, marker present or not"),
+            None,
+            "a budget that could not have been enforced or violated either way (no \
+             reasoning block is produced when thinking is disabled) must not be rejected \
+             just because the tokenizer happens to lack a </think> marker"
+        );
+
+        // Control: the identical marker-absent tokenizer and budget WITH
+        // thinking enabled must still reject, exactly as
+        // `reasoning_budget_rejects_tokenizer_without_close_marker` pins end
+        // to end. Without this, a resolver that always returned `Ok(None)`
+        // regardless of `enable_thinking` would pass both assertions above.
+        let result = resolve_reasoning_close_token(&without_marker, Some(1), true, 97);
+        assert!(
+            matches!(
+                result,
+                Err(InferenceError::InvalidInput(ref message))
+                    if message.contains("</think>") && message.contains("reasoning_budget")
+            ),
+            "enable_thinking: true on the same marker-absent tokenizer and budget must \
+             still fail closed; got {result:?}"
         );
     }
 
@@ -3549,11 +3622,12 @@ mod tests {
                 .expect("marker-free tokenizer must load");
         assert!(tokenizer.token_ids_for_content("</think>").is_empty());
         assert_eq!(
-            resolve_reasoning_close_token(&tokenizer, None, 97).expect("None budget never errors"),
+            resolve_reasoning_close_token(&tokenizer, None, true, 97)
+                .expect("None budget never errors"),
             None
         );
         assert_eq!(
-            resolve_reasoning_close_token(&tokenizer, Some(0), 97)
+            resolve_reasoning_close_token(&tokenizer, Some(0), true, 97)
                 .expect("zero budget never errors"),
             None
         );
@@ -3623,7 +3697,7 @@ mod tests {
 
         // vocab_size = 7 means valid ids are 0..=6; the resolved id (7) is
         // out of range.
-        let result = resolve_reasoning_close_token(&tokenizer, Some(1), 7);
+        let result = resolve_reasoning_close_token(&tokenizer, Some(1), true, 7);
         assert!(
             matches!(result, Err(InferenceError::InvalidInput(ref message)) if message.contains("vocab")),
             "a </think> id >= vocab_size must be rejected as InvalidInput before \
@@ -3632,7 +3706,7 @@ mod tests {
 
         // Sanity: the identical id resolves once vocab_size actually covers it.
         assert_eq!(
-            resolve_reasoning_close_token(&tokenizer, Some(1), 8)
+            resolve_reasoning_close_token(&tokenizer, Some(1), true, 8)
                 .expect("in-range marker must resolve"),
             Some(7)
         );
@@ -3686,7 +3760,7 @@ mod tests {
             "fixture precondition: the loader must actually produce two ids"
         );
 
-        let result = resolve_reasoning_close_token(&ambiguous, Some(1), 200);
+        let result = resolve_reasoning_close_token(&ambiguous, Some(1), true, 200);
         assert!(
             matches!(
                 result,
@@ -3714,7 +3788,7 @@ mod tests {
         )
         .expect("single-spelling tokenizer must load");
         assert_eq!(
-            resolve_reasoning_close_token(&unambiguous, Some(1), 200)
+            resolve_reasoning_close_token(&unambiguous, Some(1), true, 200)
                 .expect("an unambiguous marker must resolve"),
             Some(7)
         );
@@ -3756,7 +3830,7 @@ mod tests {
              collision was discarded at parse time and no resolver check can see it"
         );
 
-        let result = resolve_reasoning_close_token(&tokenizer, Some(1), 200);
+        let result = resolve_reasoning_close_token(&tokenizer, Some(1), true, 200);
         assert!(
             matches!(
                 result,
@@ -3784,7 +3858,7 @@ mod tests {
         )
         .expect("single-alias tokenizer must load");
         assert_eq!(
-            resolve_reasoning_close_token(&single, Some(1), 200)
+            resolve_reasoning_close_token(&single, Some(1), true, 200)
                 .expect("a single added-token alias must resolve"),
             Some(100)
         );

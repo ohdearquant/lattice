@@ -2445,9 +2445,18 @@ impl Default for GenerateConfig {
 /// Decide whether to force-close the thinking block this step (s1 budget forcing).
 ///
 /// Returns `Some(close_id)` to override the sampled token with `</think>`, else `None`.
-/// All conditions must hold: budget enabled and non-zero, thinking block is still open,
-/// enough tokens have been generated. Returns `None` immediately if any guard fails so
-/// the common disabled path costs a single `Option::None` check per step.
+/// All conditions must hold: thinking is enabled, budget enabled and non-zero, thinking
+/// block is still open, enough tokens have been generated. Returns `None` immediately if
+/// any guard fails so the common disabled path costs a single `Option::None` check per
+/// step.
+///
+/// `enable_thinking: false` makes `reasoning_budget` inert here regardless of its value --
+/// no reasoning block is produced in that state (the caller is contracted to have primed
+/// the prompt accordingly, see [`GenerateConfig::enable_thinking`]), so there is nothing to
+/// force-close. `resolve_reasoning_close_token` (`qwen35/generation.rs`), which resolves
+/// `close_id` for this function's `close_id` parameter, applies the identical
+/// short-circuit before validating the tokenizer, so the two functions agree about what the
+/// combination means instead of one rejecting it and the other silently no-opping.
 #[inline]
 pub(crate) fn force_close_think(
     reasoning_budget: Option<usize>,
