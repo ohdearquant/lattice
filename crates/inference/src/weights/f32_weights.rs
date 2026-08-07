@@ -15,6 +15,12 @@ enum DType {
     F32,
     F16,
     BF16,
+    /// OCP FP8 E4M3 ("FN": finite-only, no infinity), safetensors `F8_E4M3`.
+    /// Distinct from `F8_E4M3FNUZ`, which stays `Other` (lattice#684).
+    F8E4M3,
+    /// OCP FP8 E5M2, safetensors `F8_E5M2`. Distinct from `F8_E5M2FNUZ`,
+    /// which stays `Other` (lattice#684).
+    F8E5M2,
     /// A dtype safetensors defines but this crate does not materialize as
     /// f32 (I64, U8, BOOL, F64, ...). Tracked structurally (not silently
     /// dropped from `SafetensorsFile::tensors`) so extent validation still
@@ -31,6 +37,8 @@ impl DType {
             Self::F32 => "F32",
             Self::F16 => "F16",
             Self::BF16 => "BF16",
+            Self::F8E4M3 => "F8_E4M3",
+            Self::F8E5M2 => "F8_E5M2",
             Self::Other { label, .. } => label,
         }
     }
@@ -47,6 +55,8 @@ fn dtype_from_str(s: &str) -> Option<DType> {
         "F32" => DType::F32,
         "F16" => DType::F16,
         "BF16" => DType::BF16,
+        "F8_E4M3" => DType::F8E4M3,
+        "F8_E5M2" => DType::F8E5M2,
         _ => {
             let dtype = safetensors_dtype(s)?;
             DType::Other { label: dtype.name }
@@ -443,10 +453,76 @@ impl SafetensorsFile {
                     )));
                 }
             }
+            DType::F8E4M3 => {
+                #[cfg(feature = "f16")]
+                {
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| {
+                                let (values, has_non_finite) = convert_f8_e4m3_bytes_to_f32(bytes);
+                                let _ = meta.validated.get_or_init(|| {
+                                    let tensor = if has_non_finite {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    } else {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    };
+                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                        .map_err(|e| e.to_string())
+                                });
+                                values.into_boxed_slice()
+                            })
+                            .as_ref(),
+                        true,
+                    )
+                }
+                #[cfg(not(feature = "f16"))]
+                {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "tensor {name} is F8_E4M3 but lattice-inference was built without the f16 feature"
+                    )));
+                }
+            }
+            DType::F8E5M2 => {
+                #[cfg(feature = "f16")]
+                {
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| {
+                                let (values, has_non_finite) = convert_f8_e5m2_bytes_to_f32(bytes);
+                                let _ = meta.validated.get_or_init(|| {
+                                    let tensor = if has_non_finite {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    } else {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    };
+                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                        .map_err(|e| e.to_string())
+                                });
+                                values.into_boxed_slice()
+                            })
+                            .as_ref(),
+                        true,
+                    )
+                }
+                #[cfg(not(feature = "f16"))]
+                {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "tensor {name} is F8_E5M2 but lattice-inference was built without the f16 feature"
+                    )));
+                }
+            }
             DType::Other { label, .. } => {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "tensor {name} has unsupported dtype {label} (source: {}); only F32, F16, \
-                     and BF16 tensors can be materialized as f32",
+                     BF16, F8_E4M3, and F8_E5M2 tensors can be materialized as f32",
                     self.source
                 )));
             }
@@ -908,6 +984,30 @@ fn convert_bf16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     for chunk in bytes.chunks_exact(2) {
         let value =
             crate::weights::half_bits::bf16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        has_non_finite |= !value.is_finite();
+        out.push(value);
+    }
+    (out, has_non_finite)
+}
+
+#[cfg(feature = "f16")]
+fn convert_f8_e4m3_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut has_non_finite = false;
+    for &byte in bytes {
+        let value = crate::weights::half_bits::f8_e4m3_bits_to_f32(byte);
+        has_non_finite |= !value.is_finite();
+        out.push(value);
+    }
+    (out, has_non_finite)
+}
+
+#[cfg(feature = "f16")]
+fn convert_f8_e5m2_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut has_non_finite = false;
+    for &byte in bytes {
+        let value = crate::weights::half_bits::f8_e5m2_bits_to_f32(byte);
         has_non_finite |= !value.is_finite();
         out.push(value);
     }
@@ -2799,6 +2899,88 @@ mod tests {
         let err = sf
             .get_f32_tensor("t")
             .expect_err("BF16 +inf bit pattern must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f8_e4m3_tensor_decodes_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f8_e4m3_decode");
+        // 0x00 = +0.0, 0x38 = 1.0, 0xb8 = -1.0, 0x7e = 448.0 (largest finite E4M3).
+        let raw: [u8; 4] = [0x00, 0x38, 0xb8, 0x7e];
+        write_raw_tensor(&path, "t", "F8_E4M3", &[raw.len()], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let (values, shape) = sf
+            .get_f32_tensor("t")
+            .expect("finite F8_E4M3 values must decode");
+        assert_eq!(shape, &[raw.len()]);
+        assert_eq!(values, &[0.0f32, 1.0, -1.0, 448.0]);
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f8_e4m3_tensor_rejects_nan_bit_pattern_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f8_e4m3_nan");
+        // E4M3FN's sole NaN encoding: exponent and mantissa both all-ones.
+        let one_bits: u8 = 0x38;
+        let nan_bits: u8 = 0x7f;
+        write_raw_tensor(&path, "t", "F8_E4M3", &[2], &[one_bits, nan_bits]);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("F8_E4M3 NaN bit pattern must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("element index 1"),
+            "unexpected error: {err}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f8_e5m2_tensor_decodes_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f8_e5m2_decode");
+        // 0x00 = +0.0, 0x3c = 1.0, 0xbc = -1.0, 0x7b = 57344.0 (largest finite E5M2).
+        let raw: [u8; 4] = [0x00, 0x3c, 0xbc, 0x7b];
+        write_raw_tensor(&path, "t", "F8_E5M2", &[raw.len()], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let (values, shape) = sf
+            .get_f32_tensor("t")
+            .expect("finite F8_E5M2 values must decode");
+        assert_eq!(shape, &[raw.len()]);
+        assert_eq!(values, &[0.0f32, 1.0, -1.0, 57344.0]);
+
+        fs::remove_file(&path).ok();
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f8_e5m2_tensor_rejects_infinity_bit_pattern_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f8_e5m2_inf");
+        // E5M2 +infinity: exponent all-ones, mantissa zero.
+        let inf_bits: u8 = 0x7c;
+        let one_bits: u8 = 0x3c;
+        write_raw_tensor(&path, "t", "F8_E5M2", &[2], &[inf_bits, one_bits]);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("F8_E5M2 +inf bit pattern must be rejected");
         assert!(
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
