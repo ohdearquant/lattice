@@ -10615,7 +10615,8 @@ mod inner {
             }
 
             // Autoregressive decode with streaming.
-            // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
+            // cap = rb + max_new_tokens + 1 when budgeting (the +1 is the forced
+            // </think> delimiter); max_new_tokens otherwise (parity-safe).
             let cap = policy.cap();
             for _ in 1..cap {
                 // Initial-token grammar completion (recorded above) terminates
