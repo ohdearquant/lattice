@@ -7738,6 +7738,14 @@ mod inner {
                 }
 
                 // --- MTP draft phase ---
+                // `mtp_forward_one` writes exactly one MTP KV cache row (for
+                // `pending_token`) and advances `mtp.cache.seq_len` past it before this
+                // round's verify/rollback machinery runs. Snapshot the pre-draft cursor
+                // so a rejection restores the MTP cache to its state as of the top of
+                // this round, not as of after the draft's own write — `verify_tokens_batched`/
+                // `verify_tokens_batch_gemm` capture `mtp_base_seq_len` from whatever the
+                // cursor reads when *they* run, which is already past that row (#1341).
+                let mtp_seq_len_pre_draft = self.session.mtp.as_ref().map(|m| m.cache.seq_len);
                 let t_mtp = std::time::Instant::now();
                 let draft = self.mtp_forward_one(pending_token, pos);
                 metrics.mtp_ms += t_mtp.elapsed().as_secs_f64() * 1000.0;
@@ -7768,6 +7776,13 @@ mod inner {
                 };
                 metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
                 metrics.verify_calls += 1;
+                // Correct the base the verifier just captured: it read the MTP cursor
+                // after the draft phase already advanced it by one row, so restoring
+                // `base_mtp + slot` on rejection would double-count that row and leave
+                // the cursor one slot past the last one `mtp_forward_one` actually wrote.
+                if let Some(ref mut p) = self.session.gdn_checkpoints {
+                    p.mtp_base_seq_len = mtp_seq_len_pre_draft;
+                }
 
                 // Route the accept/reject decision through `rejection_sample_draft` so
                 // the live MTP loop and the trait-level `mtp_verify_draft` share the
@@ -16563,6 +16578,128 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(
                 max_abs_diff < 0.05,
                 "MTP draft logits diverged after QuaRot counter-rotation: max_abs_diff={max_abs_diff}"
+            );
+        }
+
+        // Issue #1341: a K=1 draft rejection must leave the MTP KV cache cursor at the
+        // row `mtp_forward_one` actually wrote, not one row past it. `mtp_forward_one`
+        // writes exactly one row (for `pending_token`) and advances `mtp.cache.seq_len`
+        // by 1 before verification even starts; `verify_tokens_batched` then snapshots
+        // that already-advanced value into `mtp_base_seq_len`. On rejection,
+        // `rollback_speculative_state_to` adds the verifier's accepted-token `slot` on
+        // top of that snapshot, double-counting the draft's own advance.
+        //
+        // A zeroed `fc` projection collapses the MTP head's output to the zero vector
+        // for any input, so `mtp_forward_one` always drafts token 0 (all-zero logits,
+        // first-wins argmax). `tiny_metal_qwen35_fixture`'s target stack has zero
+        // attention/FFN weights too, so its prediction after processing token `X` is
+        // driven entirely by `RMSNorm(embed_tokens[X])` through the tied lm_head — for
+        // `X == 2` (`embed_tokens[2] `'s only nonzero component is `+1`, and index 2 is
+        // the first vocab entry in that residue class) that prediction is token 2
+        // itself, which never equals the constant draft token 0. Round 1 is therefore
+        // a deterministic reject, driven through the real `generate_greedy_mtp` path.
+        fn constant_zero_draft_mtp_weights_for_test(
+            device: &Device,
+            cfg: &Qwen35Config,
+        ) -> MetalMtpWeights {
+            let mut weights = synthetic_mtp_weights_for_test(device, cfg);
+            weights.fc = make_buffer_f16(
+                device,
+                &vec![0.0f32; cfg.hidden_size * 2 * cfg.hidden_size],
+                "test.mtp.fc.constant_zero_draft",
+            );
+            weights
+        }
+
+        fn metal_state_with_constant_zero_draft_mtp_for_test(
+            weights: &ModelWeights,
+            cfg: &Qwen35Config,
+        ) -> MetalQwen35State {
+            let mut engine = MetalQwen35Engine::new(weights, cfg)
+                .expect("tiny MetalQwen35Engine with constant-draft MTP fixture constructs");
+            engine.mtp_weights = Some(constant_zero_draft_mtp_weights_for_test(
+                &engine.device,
+                cfg,
+            ));
+            let session = engine.new_session(16).expect("tiny MTP session constructs");
+            MetalQwen35State {
+                engine,
+                session,
+                lora: None,
+                use_gdn_chunked: true,
+                use_kv_f16: false,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
+            }
+        }
+
+        #[test]
+        fn rollback_speculative_state_to_preserves_mtp_cursor_after_k1_reject() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            assert!(
+                state.session.mtp.is_some(),
+                "constant-draft MTP fixture must populate session.mtp"
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(true),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            // Force `pending_first == 2` directly rather than relying on a real
+            // prefill: index 2 is the token whose real-model next-token prediction
+            // (token 2 itself, see above) is guaranteed to mismatch the constant
+            // draft (token 0).
+            let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
+            prefill_logits[2] = 100.0;
+
+            let pos_before = state.session.kv_cache.seq_len;
+            assert_eq!(pos_before, 0);
+            let out = state.generate_greedy_mtp(&prefill_logits, 0, &tokenizer, &gen_cfg);
+            assert!(
+                !out.stopped,
+                "test assumes round 1 does not hit EOS; got {out:?}"
+            );
+
+            // K=1 reject keeps only `pending_token` (2), advancing the KV cache by 1;
+            // a K=1 accept would keep `pending_token` + the draft, advancing by 2.
+            let kv_seq_len = state.session.kv_cache.seq_len;
+            assert_eq!(
+                kv_seq_len, 1,
+                "test setup assumption violated: expected round 1 to reject the \
+                 constant draft (token 0) in favor of the target's own prediction \
+                 (token 2), advancing the KV cache by 1; got {kv_seq_len}, meaning \
+                 the draft was accepted instead"
+            );
+
+            let mtp_seq_len = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            assert_eq!(
+                mtp_seq_len, 1,
+                "K=1 rejection must leave the MTP cursor at the single row \
+                 `mtp_forward_one` wrote this round; got {mtp_seq_len}, which means the \
+                 next `mtp_forward_one` call will skip a slot and the attention window \
+                 will read a never-written row"
             );
         }
 
