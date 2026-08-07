@@ -56,6 +56,7 @@ pub const MAX_QUANTIZE_INDEX_LEN: u64 = 16 * 1024 * 1024; // 16 MiB
 /// existing call sites that propagate errors as `String` via `?` are
 /// unaffected — the conversion happens automatically at the `?` site.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Q4ManifestError {
     /// The manifest path exists (as a directory entry — including a
     /// dangling symlink) but could not be stat'd, opened, or read: a
@@ -123,6 +124,7 @@ pub struct Q4ManifestEntry {
 /// same tensor entry list; only [`ManifestFlavor::QuaRot`] can carry a
 /// rotation seed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ManifestFlavor {
     /// `bin/quantize_q4.rs`: bare top-level JSON array of tensor entries.
     QuantizeQ4,

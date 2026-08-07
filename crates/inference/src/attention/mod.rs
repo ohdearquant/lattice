@@ -22,6 +22,7 @@ pub use self::standard::*;
 /// `CalibrationObserver`) use instead of the lossy string `name()`. Tag values
 /// are stable; variant names here match ADR-059's `AttentionTag` identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AttentionTag {
     Mha,
     Gqa,
@@ -55,6 +56,7 @@ pub enum AttentionTag {
 /// in subsequent phases (P2+). The enum is intentionally dead from a call-site
 /// perspective in P1; see ADR-059 §Implementation Phases.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub enum AttentionKind {
     /// Standard multi-head attention (BERT-style bidirectional encoder).
     ///

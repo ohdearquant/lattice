@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 /// Memory pressure levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MemoryPressure {
     /// < 60% usage - normal operation
     None,

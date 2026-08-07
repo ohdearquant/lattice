@@ -79,6 +79,7 @@ pub trait MemoryLike {
 /// **Stable** (provisional): two-variant enum; a `Custom` variant may be added but existing variants are stable.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DriftWeighting {
     /// Equal weight for all entries.
     Uniform,
@@ -91,6 +92,7 @@ pub enum DriftWeighting {
 /// **Stable** (provisional): two standard metrics; new entries (e.g., L1) would be additive.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum DriftMetricKind {
     /// Squared Euclidean distance (Wasserstein-2).
     SquaredEuclidean,

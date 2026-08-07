@@ -1148,6 +1148,7 @@ fn read_f16_header(
 /// Why loading a `.f16` failed, when the caller needs to distinguish a shape
 /// disagreement from every other failure in order to report it well.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum F16LoadError {
     /// The header's declared shape disagreed with the shape the caller required.
     /// The payload was not read.

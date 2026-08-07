@@ -370,6 +370,7 @@ mod route_predicate_tests {
 ///
 /// Role in a chat conversation.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ChatRole {
     System,
     User,
@@ -34733,6 +34734,7 @@ pub fn mtp_greedy_round(
 
 /// Which logical traffic bucket a GDN state access belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GdnStateTrafficScope {
     /// Normal single-token decode (`forward_step`, self-spec draft/fallback).
     Decode,

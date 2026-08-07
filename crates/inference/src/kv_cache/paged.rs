@@ -28,6 +28,7 @@ use crate::error::InferenceError;
 
 /// **Unstable**: element format used by paged KV storage.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CacheType {
     /// Store every KV element as an f32 value.
     #[default]
@@ -157,6 +158,7 @@ impl PagedKVCacheConfig {
 
 /// **Unstable**: eviction strategy for the paged KV cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EvictionPolicy {
     /// Panic when out of pages (fail-fast for debugging).
     None,
