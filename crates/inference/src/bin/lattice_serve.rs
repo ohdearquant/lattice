@@ -119,14 +119,6 @@ mod imp {
         WorkerEvent, WorkerMetadata,
     };
     use lattice_inference::serve::metrics::ServeMetrics;
-    /// Used by the embeddings handler's `.tokenize_batch(..)` call (prompt
-    /// token accounting) and by the test module's own tokenizer fixtures.
-    /// Production chat completions never tokenizes outside the shared worker
-    /// (`lattice_inference::serve::metal_worker`); embeddings has no
-    /// equivalent worker-side tokenizer to delegate to, since `BertModel`
-    /// (CPU-only) is loaded and owned directly by this binary, not the
-    /// shared Metal worker.
-    use lattice_inference::tokenizer::Tokenizer as _;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::{BertModel, BertPooling};
     use serde_json::{Value, json};
