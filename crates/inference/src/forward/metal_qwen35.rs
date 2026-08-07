@@ -17753,6 +17753,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .try_forward_step(1, 0)
                 .expect("first raw step at the live cursor must succeed");
             assert_eq!(state.session.kv_cache.seq_len, 1);
+            assert!(
+                state.has_gdn_layers(),
+                "mtp_loaded_live_hybrid_state_for_guard_test's tiny_hybrid_fixture \
+                 must retain its GDN layers for gdn_state_is_initial() to be meaningful"
+            );
             assert!(!state.gdn_state_is_initial());
             assert!(
                 !state.session.last_pre_final_hidden.is_empty(),
@@ -17796,16 +17801,33 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("cache-aware warm-up must establish live state");
             assert!(state.session.kv_cache.seq_len > 0);
             assert!(state.cross_turn_prefix_cache.entry.is_some());
-            // tiny_hybrid_fixture's GDN projection weights (in_proj_qkv, in_proj_z,
-            // in_proj_b, in_proj_a, conv1d_weight) are all zero and the GDN update has
-            // no bias term anywhere in its path, so q/k/v/conv-output are provably zero
-            // at every step (crates/inference/src/attention/gdn.rs: gated_delta_net_step,
-            // delta = (v - kv_mem) * beta with v == kv_mem == 0) — ordinary decoding can
-            // never move this fixture's recurrent state off its post-reset value, however
-            // many tokens are generated. Seed live GDN state directly instead, the same
-            // way `mtp_loaded_live_hybrid_state_for_guard_test` does, so the immutability
-            // assertions below exercise genuinely non-initial state rather than a
-            // vacuously-true reading of `gdn_state_is_initial()`.
+            // tiny_hybrid_fixture's in_proj_qkv and conv1d_weight are both zero, so the
+            // conv1d output (crates/inference/src/attention/gdn.rs: apply_causal_conv1d,
+            // `sum += conv_buffer[..] * conv_weight[..]` / `sum += new_input[ch] *
+            // conv_weight[..]`) is a product of a zero factor at every step — either
+            // factor alone zeroing it, both would have to go nonzero together to move it
+            // off zero — so q/k/v are provably zero at every step regardless of the other
+            // fixture values. With v == kv_mem == 0 (kv_mem = 0 because the recurrent
+            // state S starts at zero and only ever receives outer(k, delta) with
+            // delta == 0), `gated_delta_net_step`'s update (gdn.rs: decay `s *= g` at
+            // ~L291-294, then `S += outer(k, delta)` at ~L313-318) is homogeneous: g
+            // scales an already-zero S, and the injection term is zero too, so S cannot
+            // leave zero however many tokens are generated. This fixture does set
+            // a_log = -1.0, dt_bias = 0.0, and norm_weight = 1.0 (nonzero,
+            // zero-in-this-fixture, and nonzero respectively) — all three sit on the path
+            // (compute_decay_gate uses a_log and dt_bias for g; norm_weight scales the
+            // final gated-RMSNorm output) but the zero-state argument above never
+            // depends on their values, only on v and kv_mem being zero. The Metal shader
+            // (forward/shaders/qwen35.metal: gdn_recurrence_fused, ~L1099-1121) computes
+            // the same recurrence in reordered form (`kv_mem` from pre-decay S, then
+            // `delta = (v - g * kv_mem) * beta`, then `sr[i] = fma(k, delta, g * sr[i])`)
+            // and agrees algebraically with the CPU path above. Falsifier: this reasoning
+            // breaks the moment `make_gdn` sets *both* in_proj_qkv and conv1d_weight
+            // nonzero at once — that is the only way ordinary decoding can move q/k/v
+            // (and hence the recurrent state) off zero. Until then, seed live GDN state
+            // directly instead, the same way `mtp_loaded_live_hybrid_state_for_guard_test`
+            // does, so the immutability assertions below exercise genuinely non-initial
+            // state rather than a vacuously-true reading of `gdn_state_is_initial()`.
             assert!(
                 state.has_gdn_layers(),
                 "fixture must contain GDN layers for this predicate to be meaningful"
@@ -18278,6 +18300,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.path_proof_enabled = true;
 
             assert_eq!(state.session.kv_cache.seq_len, 0);
+            assert!(
+                state.has_gdn_layers(),
+                "forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv's \
+                 tiny_hybrid_fixture must retain its GDN layers for gdn_state_is_initial() \
+                 to be meaningful"
+            );
             assert!(state.gdn_state_is_initial());
             let mut seeded_gdn = state.snapshot_gdn_states();
             assert_eq!(seeded_gdn.len(), 3, "fixture must contain three GDN layers");
@@ -18287,6 +18315,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(
                 state.session.kv_cache.seq_len, 0,
                 "GDN-only forward must leave the first fresh-session disjunct false"
+            );
+            assert!(
+                state.has_gdn_layers(),
+                "forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv's \
+                 tiny_hybrid_fixture must retain its GDN layers for gdn_state_is_initial() \
+                 to be meaningful"
             );
             assert!(
                 !state.gdn_state_is_initial(),
