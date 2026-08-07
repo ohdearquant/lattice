@@ -150,6 +150,7 @@ pub struct Message {
 
 /// Validated role carried by a normalized serving-contract message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NormalizedChatRole {
     /// System instruction.
     System,
@@ -194,6 +195,7 @@ pub struct NormalizedChatImage {
 /// Message content represented as a string or a list of typed parts.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum MessageContent {
     /// Plain text content.
     Text(String),
@@ -203,6 +205,7 @@ pub enum MessageContent {
 
 /// One typed OpenAI message-content part.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ContentPart {
     /// A text content part.
     Text { text: String },
@@ -1409,8 +1412,16 @@ mod tests {
 
     #[test]
     fn serving_adapters_do_not_restate_standard_defaults() {
+        // `lattice` is now a module tree (#834), not a single file; concatenate
+        // its split source files so this still scans the same source text.
+        let lattice_source = concat!(
+            include_str!("../bin/lattice/main.rs"),
+            include_str!("../bin/lattice/chat.rs"),
+            include_str!("../bin/lattice/doctor.rs"),
+            include_str!("../bin/lattice/serve.rs"),
+        );
         for (name, source) in [
-            ("lattice", include_str!("../bin/lattice.rs")),
+            ("lattice", lattice_source),
             ("lattice_serve", include_str!("../bin/lattice_serve.rs")),
         ] {
             for literal in [

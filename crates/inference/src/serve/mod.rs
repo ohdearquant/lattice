@@ -270,6 +270,7 @@ async fn shutdown_signal() -> std::io::Result<()> {
 /// Structured HTTP error shared by both binaries, serializing to the OpenAI
 /// error envelope: `{"error": {"message", "type", "code", "param"}}`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ApiError {
     /// Caller mistake — HTTP 400.
     BadRequest { message: String, code: &'static str },
@@ -1774,7 +1775,15 @@ mod tests {
 
     #[test]
     fn both_server_binaries_use_shared_graceful_runner() {
-        let lattice = include_str!("../bin/lattice.rs");
+        // `lattice` is now a module tree (#834), not a single file; concatenate
+        // its split source files so the substring/window checks below still
+        // see the same source text as when it was one file.
+        let lattice = concat!(
+            include_str!("../bin/lattice/main.rs"),
+            include_str!("../bin/lattice/chat.rs"),
+            include_str!("../bin/lattice/doctor.rs"),
+            include_str!("../bin/lattice/serve.rs"),
+        );
         let lattice_serve = include_str!("../bin/lattice_serve.rs");
         for (name, source) in [("lattice", lattice), ("lattice_serve", lattice_serve)] {
             assert!(

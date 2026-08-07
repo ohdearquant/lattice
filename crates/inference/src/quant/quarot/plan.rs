@@ -207,6 +207,7 @@ pub struct TensorRotation {
 /// no online (runtime) rotation is wired yet — see [`OnlineRotationSpec`]
 /// for the artifact-level metadata these identifiers carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum RotationId {
     /// `R_res` of dimension `hidden_size`.
     ResidualStream,
@@ -247,6 +248,7 @@ impl RotationId {
 /// attaches to. Distinct from [`AbsorptionSide`], which describes which side
 /// of the *weight matrix* absorbs the offline counter-rotation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OnlineTransformSite {
     /// R3: full-attention gated context, immediately before `o_proj`.
     AttentionOutputPreOProj,

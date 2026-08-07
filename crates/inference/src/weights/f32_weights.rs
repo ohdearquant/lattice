@@ -2262,17 +2262,171 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
+    /// RAII guard for a scratch file under the OS temp directory: removes the
+    /// file when dropped, including when the drop runs during an unwinding
+    /// panic. Derefs to `Path` so call sites read like they hold a `PathBuf`.
+    ///
+    /// Call [`TempFileGuard::into_path`] when a test genuinely needs the file
+    /// to outlive the guard (e.g. for manual post-mortem inspection).
+    struct TempFileGuard(std::path::PathBuf);
+
+    impl TempFileGuard {
+        fn into_path(self) -> std::path::PathBuf {
+            let path = self.0.clone();
+            std::mem::forget(self);
+            path
+        }
+    }
+
+    impl std::ops::Deref for TempFileGuard {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempFileGuard {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    /// RAII guard for a scratch directory under the OS temp directory: removes
+    /// the directory tree when dropped, including when the drop runs during an
+    /// unwinding panic. Derefs to `Path` so call sites read like they hold a
+    /// `PathBuf`.
+    ///
+    /// Call [`TempDirGuard::into_path`] when a test genuinely needs the
+    /// directory to outlive the guard (e.g. for manual post-mortem inspection).
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl TempDirGuard {
+        fn into_path(self) -> std::path::PathBuf {
+            let path = self.0.clone();
+            std::mem::forget(self);
+            path
+        }
+    }
+
+    impl std::ops::Deref for TempDirGuard {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempDirGuard {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_path(name: &str) -> TempFileGuard {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("invariant: system time is after UNIX_EPOCH")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        TempFileGuard(std::env::temp_dir().join(format!(
             "{}_{}_{}.safetensors",
             name,
             std::process::id(),
             nanos
-        ))
+        )))
+    }
+
+    #[test]
+    fn temp_dir_guard_removes_directory_on_normal_drop() {
+        let dir = temp_dir("lattice_guard_drop_test");
+        let path = dir.to_path_buf();
+        assert!(path.is_dir(), "temp_dir must create the directory eagerly");
+
+        drop(dir);
+
+        assert!(
+            !path.exists(),
+            "TempDirGuard must remove its directory when dropped normally"
+        );
+    }
+
+    #[test]
+    fn temp_dir_guard_removes_directory_on_unwind() {
+        let dir = temp_dir("lattice_guard_unwind_test");
+        let path = dir.to_path_buf();
+        assert!(path.is_dir(), "temp_dir must create the directory eagerly");
+
+        // Rust runs destructors while a panic unwinds the stack, so moving the
+        // guard into a closure that panics -- then catching that panic --
+        // exercises exactly the cleanup path a failing/panicking test relies
+        // on. This assumes the default `panic = "unwind"` strategy; under
+        // `panic = "abort"` this test would abort the whole binary instead of
+        // failing quietly, which is the intended, visible failure mode for
+        // that profile misconfiguration.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _dir = dir;
+            panic!("intentional panic to exercise TempDirGuard unwind cleanup");
+        }));
+
+        assert!(result.is_err(), "the inner closure must have panicked");
+        assert!(
+            !path.exists(),
+            "TempDirGuard must remove its directory when its owning frame unwinds"
+        );
+    }
+
+    #[test]
+    fn temp_dir_guard_into_path_opts_out_of_cleanup() {
+        let dir = temp_dir("lattice_guard_leak_opt_out_test");
+        let path = dir.into_path();
+
+        assert!(
+            path.is_dir(),
+            "into_path must hand back the still-existing directory without removing it"
+        );
+
+        fs::remove_dir_all(&path).ok();
+    }
+
+    #[test]
+    fn temp_file_guard_removes_file_on_normal_drop() {
+        let guard = temp_path("lattice_guard_file_drop_test");
+        write_raw_safetensors(&guard, r#"{"__metadata__":{"format":"pt"}}"#, &[]);
+        let path = guard.to_path_buf();
+        assert!(path.is_file(), "test setup must have created the file");
+
+        drop(guard);
+
+        assert!(
+            !path.exists(),
+            "TempFileGuard must remove its file when dropped normally"
+        );
+    }
+
+    #[test]
+    fn temp_file_guard_into_path_opts_out_of_cleanup() {
+        let guard = temp_path("lattice_guard_file_leak_opt_out_test");
+        write_raw_safetensors(&guard, r#"{"__metadata__":{"format":"pt"}}"#, &[]);
+        let path = guard.into_path();
+
+        assert!(
+            path.is_file(),
+            "into_path must hand back the still-existing file without removing it"
+        );
+
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2309,8 +2463,6 @@ mod tests {
         assert_eq!(mat_shape, &[2, 2]);
         assert_eq!(vec_data, &[1.0, 2.0]);
         assert_eq!(mat_data, &[3.0, 4.0, 5.0, 6.0]);
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2339,8 +2491,6 @@ mod tests {
             err.to_string().contains("byte length mismatch"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2371,8 +2521,6 @@ mod tests {
             err.to_string().contains("byte length mismatch"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2400,8 +2548,6 @@ mod tests {
             err.to_string().contains("non-contiguous"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2416,8 +2562,6 @@ mod tests {
             err.to_string().contains("non-contiguous"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2436,8 +2580,6 @@ mod tests {
             err.to_string().contains("non-contiguous"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2452,8 +2594,6 @@ mod tests {
             err.to_string().contains("trailing or missing payload"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2468,8 +2608,6 @@ mod tests {
             err.to_string().contains("invalid data_offsets"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2602,8 +2740,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2622,8 +2758,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2642,8 +2776,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2686,8 +2818,6 @@ mod tests {
         // Second access must not panic or error — it should skip re-scanning.
         sf.get_f32_tensor("t")
             .expect("second access reuses cached validation");
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2715,8 +2845,6 @@ mod tests {
             !matches!(err, InferenceError::MissingTensor(_)),
             "must not be reported as a missing tensor: {err:?}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2744,8 +2872,6 @@ mod tests {
                 err.to_string().contains("unsupported dtype"),
                 "unexpected {dtype} materialization error: {err}"
             );
-
-            fs::remove_file(&path).ok();
         }
     }
 
@@ -2760,8 +2886,6 @@ mod tests {
             err.to_string().contains("not byte-aligned"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2775,8 +2899,6 @@ mod tests {
             err.to_string().contains("byte length mismatch"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2799,8 +2921,6 @@ mod tests {
             err.to_string().contains("unrecognized dtype"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2827,8 +2947,6 @@ mod tests {
             err.to_string().contains("element index 1"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2851,8 +2969,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2879,8 +2995,6 @@ mod tests {
             err.to_string().contains("element index 1"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2903,8 +3017,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2921,8 +3033,6 @@ mod tests {
             .expect("finite F8_E4M3 values must decode");
         assert_eq!(shape, &[raw.len()]);
         assert_eq!(values, &[0.0f32, 1.0, -1.0, 448.0]);
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2946,8 +3056,6 @@ mod tests {
             err.to_string().contains("element index 1"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2964,8 +3072,6 @@ mod tests {
             .expect("finite F8_E5M2 values must decode");
         assert_eq!(shape, &[raw.len()]);
         assert_eq!(values, &[0.0f32, 1.0, -1.0, 57344.0]);
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2985,8 +3091,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -3025,8 +3129,6 @@ mod tests {
                 .is_some(),
             "widening must publish its fused validation result"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -3049,8 +3151,6 @@ mod tests {
             0,
             "fused F16 validation must not rescan widened values"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -3089,8 +3189,6 @@ mod tests {
                 .is_some(),
             "widening must publish its fused validation result"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -3113,18 +3211,16 @@ mod tests {
             0,
             "fused BF16 validation must not rescan widened values"
         );
-
-        fs::remove_file(&path).ok();
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    fn temp_dir(name: &str) -> TempDirGuard {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("invariant: system time is after UNIX_EPOCH")
             .as_nanos();
         let path = std::env::temp_dir().join(format!("{}_{}_{}", name, std::process::id(), nanos));
         fs::create_dir_all(&path).expect("test setup: create temp dir");
-        path
+        TempDirGuard(path)
     }
 
     fn write_single_f32_tensor(path: &std::path::Path, name: &str, values: &[f32]) {
@@ -3203,8 +3299,6 @@ mod tests {
         assert_eq!(ta.shape, vec![2]);
         assert_eq!(tb.data, vec![3.0_f32, 4.0, 5.0]);
         assert_eq!(tb.shape, vec![3]);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// #1069: index-declared shard names are untrusted checkpoint content.
@@ -3224,8 +3318,6 @@ mod tests {
         );
         contained_shard_path(&dir, "sub/nested.safetensors")
             .expect("subdirectory entry beneath the model dir resolves");
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// #1069: an absolute index entry replaces the model directory entirely
@@ -3249,9 +3341,6 @@ mod tests {
                 || msg.contains("escapes model root"),
             "unexpected error: {err}"
         );
-
-        fs::remove_dir_all(&dir).ok();
-        fs::remove_dir_all(&outside).ok();
     }
 
     /// #1069: `..` components must not address files outside the model
@@ -3275,8 +3364,6 @@ mod tests {
             contained_shard_path(&dir, "../nonexistent.bin").is_err(),
             "traversal to a missing target must also fail"
         );
-
-        fs::remove_dir_all(&outer).ok();
     }
 
     /// The HuggingFace hub cache stores snapshots as symlink farms:
@@ -3310,8 +3397,6 @@ mod tests {
         let tensors =
             load_sharded(&dir).expect("hub-cache snapshot layout must load through the symlink");
         assert_eq!(tensors["tensor.a"].data, vec![1.0, 2.0]);
-
-        fs::remove_dir_all(&outer).ok();
     }
 
     /// #1069 end-to-end: a sharded index whose weight_map entry escapes the
@@ -3359,8 +3444,6 @@ mod tests {
                 || msg.contains("escapes model root"),
             "unexpected error: {err}"
         );
-
-        fs::remove_dir_all(&outer).ok();
     }
 
     #[test]
@@ -3401,8 +3484,6 @@ mod tests {
         assert_eq!(tx.shape, vec![2]);
         assert_eq!(ty.data, vec![3.0_f32, 4.0, 5.0]);
         assert_eq!(ty.shape, vec![3]);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3422,8 +3503,6 @@ mod tests {
             result.is_err(),
             "load_sharded must return Err when indexed shard file is absent"
         );
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     // --- CrossEncoderWeights tests ---
@@ -3485,7 +3564,6 @@ mod tests {
             "bias mismatch: {}",
             weights.classifier_bias
         );
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -3507,7 +3585,6 @@ mod tests {
             "bias mismatch: {}",
             weights.classifier_bias
         );
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -3529,7 +3606,6 @@ mod tests {
             matches!(err, InferenceError::ShapeMismatch { .. }),
             "expected ShapeMismatch, got {err:?}"
         );
-        fs::remove_file(&path).ok();
     }
 
     #[test]

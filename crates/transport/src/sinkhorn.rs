@@ -141,6 +141,7 @@ impl SinkhornWorkspace {
 ///
 /// **Stable** (provisional): error variants reflect the documented failure modes; new variants would be additive.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum SinkhornError {
     /// The problem has zero rows or columns.
     EmptyProblem,

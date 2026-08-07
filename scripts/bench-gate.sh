@@ -10,6 +10,21 @@ source "$REPO/scripts/lib/bench-supervision.sh"
 
 bench_gate_measurement() {
 cd "$REPO"
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+    if [[ -f "$REPO/scripts/lib/bench-python.sh" ]]; then
+        source "$REPO/scripts/lib/bench-python.sh"
+        PYTHON_BIN="$(bench_require_python3 "bench-gate.sh")" || exit 1
+    else
+        # Reached only when scripts/lib/bench-python.sh itself is missing
+        # from disk, so bench_require_python3 can't be sourced to name a
+        # floor violation. tests/test_bench_targets.py's bench-gate-policy
+        # test produces exactly that: it copies only Makefile +
+        # scripts/perf-bench-gate.py into its sandbox, so scripts/lib/ never
+        # exists there. Bare python3 is the only interpreter this branch can
+        # name.
+        PYTHON_BIN="python3"
+    fi
+fi
 if [[ ! -d .cache/perf-baselines ]]; then
     git clone --depth=1 --branch=perf-baselines \
         "$(git remote get-url origin)" .cache/perf-baselines ||
@@ -91,11 +106,11 @@ bench_quiet_checkpoint "bench-gate: after measurements"
 echo "UNSUITABLE AS BENCHMARK EVIDENCE: local bench-gate has no run provenance"
 rc=0
 gate_rc=0
-python3 scripts/perf-bench-gate.py \
+"$PYTHON_BIN" scripts/perf-bench-gate.py \
     "$inference_root" "$arch-local/lattice-inference:elementwise_cpu_bench" \
     --target lattice-inference:elementwise_cpu_bench \
     --require-measurements || rc=$?
-python3 scripts/perf-bench-gate.py \
+"$PYTHON_BIN" scripts/perf-bench-gate.py \
     "$embed_root" "$arch-local/lattice-embed:simd" \
     --target lattice-embed:simd \
     --require-measurements || gate_rc=$?

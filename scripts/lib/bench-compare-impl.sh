@@ -118,12 +118,28 @@ if ! REPO="$(cd "$(dirname "$0")/../.." && pwd)"; then
   printf 'directory was removed or is unreachable). Refusing to continue.\n' >&2 || :
   exit 2
 fi
+
+# scripts/bench-compare.sh (the entry point) resolves and exports PYTHON_BIN
+# before it hands off to this body, so the normal path just inherits it. This
+# file is also directly invocable (deliberately refused a few lines below,
+# once verify_locks runs) or unit-testable standalone, and neither of those
+# callers exports PYTHON_BIN — so resolve it here too, but only when it
+# didn't already arrive from an entry point, so the entry point's resolution
+# still governs the normal path.
+if [ -z "${PYTHON_BIN:-}" ]; then
+  source "$REPO/scripts/lib/bench-python.sh"
+  if ! PYTHON_BIN="$(bench_require_python3 "$0")"; then
+    exit 2
+  fi
+  export PYTHON_BIN
+fi
+
 QUICK_FLAGS="--quick"  # adaptive two-point samples in each of four ABBA arms
 RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 if [ -n "${BENCH_HOST_ID:-}" ]; then
   RUN_HOST_ID="configured:${BENCH_HOST_ID}"
 else
-  RUN_HOST_ID="$(python3 "$REPO/scripts/lib/bench-host-id.py")"
+  RUN_HOST_ID="$("$PYTHON_BIN" "$REPO/scripts/lib/bench-host-id.py")"
 fi
 RUN_OS="$(uname -srm)"
 PROVENANCE_FILE="$REPO/.cache/bench-run-provenance.txt"
@@ -185,7 +201,7 @@ verify_locks() {
     exit 2
   fi
 
-  if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
+  if ! "$PYTHON_BIN" "$REPO/scripts/lib/bench_supervision.py" verify; then
     echo "bench-compare: cooperative supervisor handoff failed —" \
          "refusing to measure." >&2
     exit 2
@@ -219,7 +235,7 @@ machine_state_probe() {
   fi
   if [ "$platform" = "Darwin" ]; then
     record="$(
-      python3 "$REPO/scripts/perf_governor.py" \
+      "$PYTHON_BIN" "$REPO/scripts/perf_governor.py" \
         --checkpoint \
         --label "$label" \
         --cooldown 30 \
@@ -227,7 +243,7 @@ machine_state_probe() {
     )" || rc=$?
   else
     record="$(
-      python3 "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
+      "$PYTHON_BIN" "$REPO/scripts/lib/machine-state-probe.py" --label "$label"
     )" || rc=$?
   fi
   if [ "$rc" -ne 0 ] || [ -z "$record" ]; then
@@ -247,7 +263,7 @@ quiet_gate() {
   if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
     probe_args+=(--phase "$phase" --jsonl-out "$AMBIENT_SAMPLES_FILE")
   fi
-  line="$(python3 "$REPO/scripts/lib/quiet-probe.py" "${probe_args[@]}")" || rc=$?
+  line="$("$PYTHON_BIN" "$REPO/scripts/lib/quiet-probe.py" "${probe_args[@]}")" || rc=$?
   echo "$line"
   QUIET_SAMPLES="${QUIET_SAMPLES}${QUIET_SAMPLES:+
 }$line"
@@ -508,18 +524,18 @@ clear_criterion_root "$HEAD_CONTROL_EMBED_CRITERION_ROOT"
 clear_criterion_root "$BASE_CONTROL_INFERENCE_CRITERION_ROOT"
 clear_criterion_root "$BASE_CONTROL_EMBED_CRITERION_ROOT"
 if [ "$FAIL_ON_REGRESSION" = "1" ]; then
-  python3 "$GATE_SCRIPT" "$BASE_INFERENCE_CRITERION_ROOT" \
+  "$PYTHON_BIN" "$GATE_SCRIPT" "$BASE_INFERENCE_CRITERION_ROOT" \
     --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
-  python3 "$GATE_SCRIPT" "$BASE_EMBED_CRITERION_ROOT" \
+  "$PYTHON_BIN" "$GATE_SCRIPT" "$BASE_EMBED_CRITERION_ROOT" \
     --baseline-name "$BENCH_BASELINE_NAME" --prepare-baseline-copy
 fi
-python3 "$GATE_SCRIPT" "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
+"$PYTHON_BIN" "$GATE_SCRIPT" "$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
   --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
-python3 "$GATE_SCRIPT" "$HEAD_CONTROL_EMBED_CRITERION_ROOT" \
+"$PYTHON_BIN" "$GATE_SCRIPT" "$HEAD_CONTROL_EMBED_CRITERION_ROOT" \
   --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
-python3 "$GATE_SCRIPT" "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
+"$PYTHON_BIN" "$GATE_SCRIPT" "$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
   --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
-python3 "$GATE_SCRIPT" "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
+"$PYTHON_BIN" "$GATE_SCRIPT" "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
   --baseline-name "$BENCH_HEAD_BASELINE_NAME" --prepare-baseline-copy
 
 # --- Measurement-integrity helpers ---
@@ -637,12 +653,12 @@ copy_base_artifacts() {
 
 prepare_target_root() {
   local target="$1" base_root="$2" head_root="$3" baseline_name="$4"
-  python3 "$GATE_SCRIPT" "$head_root" \
+  "$PYTHON_BIN" "$GATE_SCRIPT" "$head_root" \
     --baseline-name "$baseline_name" --prepare-baseline-copy
   copy_base_artifacts "$target selected baseline copy" \
     -a "$base_root/" "$head_root/" \
     --include="**/$baseline_name/**" --include='*/' --exclude='*'
-  python3 "$GATE_SCRIPT" "$head_root" \
+  "$PYTHON_BIN" "$GATE_SCRIPT" "$head_root" \
     --baseline-name "$baseline_name" --prepare-head
 }
 
@@ -946,7 +962,7 @@ run_target_gate() {
   fi
 
   if [ -d "$criterion_root" ]; then
-    python3 "$GATE_SCRIPT" \
+    "$PYTHON_BIN" "$GATE_SCRIPT" \
       "$criterion_root" "local-compare/$target" "${gate_args[@]}" 2>&1 || gate_rc=$?
   else
     gate_rc=2
@@ -1003,7 +1019,7 @@ echo "Done. Base=$BASE_REF ($BASE_SHA), Head=$HEAD_REF ($HEAD_SHA)"
 MEASUREMENT_RC=$?
 set -e
 
-if ! python3 "$REPO/scripts/lib/bench_supervision.py" verify; then
+if ! "$PYTHON_BIN" "$REPO/scripts/lib/bench_supervision.py" verify; then
   echo "bench-compare: final cooperative supervisor sample failed —" \
        "refusing to certify it." >&2
   exit 2

@@ -1,16 +1,20 @@
-//! Metal Qwen3.5 decode throughput benchmark.
+//! Metal Qwen3.5 decode and prefill throughput benchmarks.
 //!
-//! Measures single-token decode tok/s on M2 Max with both QuaRot Q4 and naive Q8 weights.
+//! Measures single-token decode tok/s on M2 Max with both QuaRot Q4 and naive Q8 weights, and
+//! Metal prefill latency directly (prompt-length parameterized) rather than diluted inside
+//! `metal_decode_q4`'s `forward_step` iterations, where the one-time prefill cost sits below
+//! the decode group's per-token noise floor (#1301).
 //! Requires:
 //! - Q4 model at `~/.lattice/models/qwen3.5-0.8b-q4-quarot/`
 //! - Q8/safetensors at `~/.lattice/models/qwen3.5-0.8b/`
 //! - tokenizer at `~/.lattice/models/qwen3.5-0.8b/tokenizer.json`
 //!
 //! Run: `cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode`
+//! Run (prefill only): `cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_prefill`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
@@ -285,5 +289,87 @@ fn bench_metal_decode_q8(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_metal_decode_q4, bench_metal_decode_q8);
+/// Prompt lengths swept by `metal_prefill_q4`, matching issue #1301's suggestion.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const PREFILL_PROMPT_LENGTHS: &[usize] = &[128, 512, 1024];
+
+/// Deterministic in-vocab token ids; content doesn't matter for a latency bench, only
+/// that every id is a valid embedding row (vocab_size is in the hundreds of thousands,
+/// so a small fixed range comfortably avoids the tokenizer's special-token ids near 0).
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn synthetic_prompt_tokens(len: usize) -> Vec<u32> {
+    (0..len as u32).map(|i| 1000 + (i % 4096)).collect()
+}
+
+fn bench_metal_prefill_q4(c: &mut Criterion) {
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        eprintln!("SKIP: metal_prefill bench requires macOS + metal-gpu feature");
+        let _ = c;
+        return;
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        let (mut state, _cfg) = match load_q4_state() {
+            Ok(loaded) => loaded,
+            Err(error @ Q4SetupError::ModelDirectoryMissing(_)) => {
+                eprintln!(
+                    "SKIP: {error}\n\
+                     (tokenizer expected at ~/.lattice/models/qwen3.5-0.8b/tokenizer.json)"
+                );
+                return;
+            }
+            // Same absent-vs-broken classification as bench_metal_decode_q4 above.
+            Err(error @ (Q4SetupError::HomeUnset | Q4SetupError::TokenizerMissing(_))) => {
+                eprintln!("SKIP: {error}");
+                return;
+            }
+            Err(error @ (Q4SetupError::Config(_) | Q4SetupError::State(_))) => {
+                panic!("Q4 setup failed on a present model: {error}");
+            }
+        };
+
+        let mut group = c.benchmark_group("metal_prefill_q4");
+        group.warm_up_time(Duration::from_secs(2));
+        group.measurement_time(Duration::from_secs(8));
+        group.sample_size(20);
+
+        for &prompt_len in PREFILL_PROMPT_LENGTHS {
+            let prompt_tokens = synthetic_prompt_tokens(prompt_len);
+            group.throughput(Throughput::Elements(prompt_len as u64));
+            group.bench_with_input(
+                BenchmarkId::new("forward_prefill", prompt_len),
+                &prompt_tokens,
+                |b, tokens| {
+                    // iter_custom keeps state.reset_state() (fresh KV cache + initial
+                    // GDN state) and Instant::now() bracketing outside the callback
+                    // Criterion measures: only forward_prefill itself is timed, so a
+                    // leaked cache/state from a prior iteration or from the one-time
+                    // model load above cannot show up in the reported duration.
+                    b.iter_custom(|iters| {
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iters {
+                            state.reset_state();
+                            let start = Instant::now();
+                            let logits = state.forward_prefill(std::hint::black_box(tokens));
+                            elapsed += start.elapsed();
+                            std::hint::black_box(logits);
+                        }
+                        elapsed
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_metal_decode_q4,
+    bench_metal_decode_q8,
+    bench_metal_prefill_q4
+);
 criterion_main!(benches);
