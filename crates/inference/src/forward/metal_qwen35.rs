@@ -6527,13 +6527,17 @@ mod inner {
             Ok(())
         }
 
-        /// The fresh-session predicate: `kv_cache.seq_len == 0 && gdn_state_is_initial()`.
+        /// The fresh-session predicate: `kv_cache.seq_len == 0 && gdn_state_is_initial()`,
+        /// with `gdn_state_is_initial()` treated as vacuously satisfied when the session
+        /// has no GDN layers at all — there is no recurrent state for such a session to
+        /// hold live, so `seq_len == 0` is already the complete freshness criterion.
         /// The ONLY place this predicate is computed — every caller that needs it goes
         /// through here (or through [`Self::check_hidden_prefill_fresh_session`], which
         /// wraps it) so a caller can never check `seq_len` without also checking GDN state.
         fn prefill_session_freshness(&self) -> (usize, bool) {
             let seq_len = self.session.kv_cache.seq_len;
-            (seq_len, seq_len == 0 && self.gdn_state_is_initial())
+            let gdn_fresh = !self.has_gdn_layers() || self.gdn_state_is_initial();
+            (seq_len, seq_len == 0 && gdn_fresh)
         }
 
         fn check_hidden_prefill_fresh_session(&self) -> Result<(), crate::error::InferenceError> {
@@ -6642,14 +6646,40 @@ mod inner {
             )
         }
 
+        /// True when the session has at least one GatedDeltaNet linear-attention
+        /// layer, i.e. `gdn_state_is_initial()` has a population to answer about.
+        /// A session with zero GDN layers holds no recurrent state at all — that
+        /// is a distinct fact from "the recurrent state is clean" and callers must
+        /// check this before asking [`Self::gdn_state_is_initial`], never conflate
+        /// the two by treating an empty population as if it were a clean one.
+        fn has_gdn_layers(&self) -> bool {
+            !self.session.gdn_gpu_conv_bufs.is_empty()
+        }
+
         /// True when every GDN recurrent-state buffer (S matrices and conv1d
         /// rolling buffers, for every linear-attention layer) holds its
         /// post-`reset_state()` zero value. Reads the live GPU buffers directly
         /// (same buffers and safety invariant as `snapshot_gdn_states`), so this
         /// reflects the state Metal dispatch will actually see, not the CPU
         /// `gdn_states` mirror.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the session has no GDN layers (`has_gdn_layers()` is
+        /// false). A vacuous "true" there would silently conflate "no buffers to
+        /// check" with "buffers checked and clean" — two different facts a caller
+        /// may need to tell apart. Callers that consider both cases equally fresh
+        /// (there is nothing to protect when there is no GDN state) must say so
+        /// explicitly at the call site, e.g. `!self.has_gdn_layers() ||
+        /// self.gdn_state_is_initial()`, as [`Self::prefill_session_freshness`]
+        /// does.
         fn gdn_state_is_initial(&self) -> bool {
             let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            assert!(
+                num_layers > 0,
+                "gdn_state_is_initial: session has no GDN layers; check has_gdn_layers() \
+                 first — an empty population and a clean population are not the same fact"
+            );
             for i in 0..num_layers {
                 let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
                 let s_buf = &self.session.gdn_gpu_s_matrices[i];
@@ -17734,6 +17764,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn raw_step_with_mtp_rejects_stale_live_cursor_without_mutation() {
+            use crate::speculative::MtpTargetVerifier as _;
+
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = Device::system_default() else {
                 eprintln!(
@@ -17763,8 +17795,25 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 )
                 .expect("cache-aware warm-up must establish live state");
             assert!(state.session.kv_cache.seq_len > 0);
-            assert!(!state.gdn_state_is_initial());
             assert!(state.cross_turn_prefix_cache.entry.is_some());
+            // tiny_hybrid_fixture's GDN projection weights (in_proj_qkv, in_proj_z,
+            // in_proj_b, in_proj_a, conv1d_weight) are all zero and the GDN update has
+            // no bias term anywhere in its path, so q/k/v/conv-output are provably zero
+            // at every step (crates/inference/src/attention/gdn.rs: gated_delta_net_step,
+            // delta = (v - kv_mem) * beta with v == kv_mem == 0) — ordinary decoding can
+            // never move this fixture's recurrent state off its post-reset value, however
+            // many tokens are generated. Seed live GDN state directly instead, the same
+            // way `mtp_loaded_live_hybrid_state_for_guard_test` does, so the immutability
+            // assertions below exercise genuinely non-initial state rather than a
+            // vacuously-true reading of `gdn_state_is_initial()`.
+            assert!(
+                state.has_gdn_layers(),
+                "fixture must contain GDN layers for this predicate to be meaningful"
+            );
+            let mut seeded_gdn = state.snapshot_gdn_states();
+            seeded_gdn[0].0[0] = 1.0;
+            state.restore_gdn_states(&seeded_gdn);
+            assert!(!state.gdn_state_is_initial());
             state.reset_path_proof_counters();
 
             let seq_len_before = state.session.kv_cache.seq_len;
@@ -18147,11 +18196,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             state.path_proof_enabled = true;
 
             // Establish live state: one token advances the KV cache cursor off
-            // zero. (`tiny_metal_qwen35_fixture` has no linear-attention layers,
-            // so `gdn_state_is_initial()` is vacuously true regardless of
-            // activity here; this test exercises the `kv_cache.seq_len` half of
-            // the fresh-session gate, which alone is already sufficient to
-            // reject this repro.)
+            // zero. (`tiny_metal_qwen35_fixture` has no linear-attention layers, so
+            // `has_gdn_layers()` is false and the fresh-session gate's GDN conjunct
+            // is vacuously satisfied regardless of activity here; this test
+            // exercises the `kv_cache.seq_len` half of the gate, which alone is
+            // already sufficient to reject this repro.)
             state
                 .forward_step_with_hidden(42, 0)
                 .expect("first token at position 0 succeeds");
@@ -18193,7 +18242,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // reset_state() clears both gates; the same call now succeeds.
             state.reset_state();
             assert_eq!(state.session.kv_cache.seq_len, 0);
-            assert!(state.gdn_state_is_initial());
+            // tiny_metal_qwen35_fixture has no linear-attention layers, so
+            // gdn_state_is_initial() has no population to check and panics if
+            // called (see its doc comment) — assert the population fact this test
+            // actually relies on instead of the vacuous predicate.
+            assert!(!state.has_gdn_layers());
             let (_, hidden) = state
                 .forward_prefill_with_hidden(&[2, 5])
                 .expect("prefill against a freshly reset session succeeds");
@@ -18273,6 +18326,46 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 state.snapshot_gdn_states(),
                 gdn_before,
                 "rejection must not mutate GDN recurrent state"
+            );
+        }
+
+        /// Mutation control for the `has_gdn_layers()` / `gdn_state_is_initial()` split:
+        /// calling `gdn_state_is_initial()` on a session with zero GDN layers must panic
+        /// rather than silently returning `true` (the pre-fix behavior, which conflated
+        /// "no buffers to check" with "buffers checked and clean"). See REPORT.md for the
+        /// paired before/after run that mutates this assertion away and observes the
+        /// control go blind.
+        #[test]
+        fn gdn_state_is_initial_panics_on_empty_population() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=gdn_state_is_initial_panics_on_empty_population \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (gdn_state_is_initial_panics_on_empty_population)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("tiny MetalQwen35State fixture constructs");
+            assert!(
+                !state.has_gdn_layers(),
+                "fixture must have zero GDN layers for this control"
+            );
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.gdn_state_is_initial()
+            }))
+            .is_err();
+            assert!(
+                panicked,
+                "gdn_state_is_initial() must panic on an empty GDN population instead of \
+                 silently returning true"
             );
         }
 
