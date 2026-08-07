@@ -2258,7 +2258,7 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
             "--test quarot_q4_composed_golden",
             '--features "f16,metal-gpu"',
             "LATTICE_METAL_TEST_ENFORCE: '1'",
-            "--lib inject -- --nocapture --test-threads=1",
+            "--lib inject",
             "--test vision_s5b_e2e_gate_test",
             "LATTICE_VISION_S5B_GREEDY_TOKENS",
             "--bin eval_perplexity --bin quantize_q4",
