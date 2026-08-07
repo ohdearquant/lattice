@@ -810,7 +810,8 @@ impl Qwen35Model {
             let mut stopped_by_caller = false;
             let mut stop_reason = StopReason::Length;
             // Decode loop (mirrors decode_loop free function exactly).
-            // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
+            // cap = rb + max_new_tokens + 1 when budgeting (the +1 is the forced
+            // </think> delimiter); max_new_tokens otherwise (parity-safe).
             let cap = policy.cap();
             for _ in 1..cap {
                 // Checked before any per-step work, independent of whether this
@@ -1022,7 +1023,8 @@ impl Qwen35Model {
             let mut confirmed_stop_string_match = false;
             let mut stop_reason = StopReason::Length;
             // Decode loop for the string-stop path.
-            // cap = rb + max_new_tokens when budgeting; max_new_tokens otherwise (parity-safe).
+            // cap = rb + max_new_tokens + 1 when budgeting (the +1 is the forced
+            // </think> delimiter); max_new_tokens otherwise (parity-safe).
             let cap = policy.cap();
             for _ in 1..cap {
                 if should_cancel() {
