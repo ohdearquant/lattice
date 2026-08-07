@@ -58,17 +58,13 @@ pub struct LoraConfig {
 
 impl LoraConfig {
     /// Compute the LoRA scaling factor: `alpha / rank`.
+    ///
+    /// Delegates to [`lattice_fann::lora::effective_scale`], the single
+    /// source of truth this crate shares with `lattice-inference`'s Metal
+    /// LoRA path so the zero-rank and non-finite fallbacks cannot drift
+    /// between the two.
     pub fn scale(&self) -> f32 {
-        let scale = if self.rank == 0 {
-            0.0
-        } else {
-            self.alpha / self.rank as f32
-        };
-        if self.alpha.is_finite() && scale.is_finite() {
-            scale
-        } else {
-            0.0
-        }
+        lattice_fann::lora::effective_scale(self.rank, self.alpha)
     }
 
     /// Validate that the LoRA alpha and effective scale are finite.
@@ -78,23 +74,8 @@ impl LoraConfig {
     /// Returns [`crate::error::TuneError::Validation`] when `alpha` or the
     /// effective `alpha / rank` scale is not finite.
     pub fn validate(&self) -> crate::error::Result<()> {
-        if !self.alpha.is_finite() {
-            return Err(crate::error::TuneError::Validation(format!(
-                "LoRA alpha must be finite, got {}",
-                self.alpha
-            )));
-        }
-        let scale = if self.rank == 0 {
-            0.0
-        } else {
-            self.alpha / self.rank as f32
-        };
-        if !scale.is_finite() {
-            return Err(crate::error::TuneError::Validation(format!(
-                "LoRA effective scale must be finite, got {scale}"
-            )));
-        }
-        Ok(())
+        lattice_fann::lora::validate_alpha_finite(self.rank, self.alpha)
+            .map_err(crate::error::TuneError::Validation)
     }
 }
 

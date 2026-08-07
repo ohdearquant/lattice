@@ -1702,17 +1702,13 @@ mod inner {
     /// The Metal GEMV kernels assume a modest rank budget (≤ ~64 per adapter in a
     /// typical mixture).  This cap bounds allocations and rejects adversarially large
     /// adapter pools before `Vec::with_capacity`.
-    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
-
-    /// Aggregate cap on a blended adapter's total element count, summed across
-    /// every (layer_idx, module) projection: Σ rank_total·(d_in + d_out). At f32
-    /// this bounds the blended-adapter allocation to ~4 GiB. MAX_BLEND_RANK_TOTAL
-    /// bounds one projection; this bounds the whole blend, so a full-model adapter
-    /// that keeps every projection near the per-group cap cannot drive a multi-GiB
-    /// aggregate allocation. A realistic micro-LoRA mixture is far below this; a
-    /// large-model mixture at modest summed rank stays within budget, while a
-    /// rank-4096-everywhere adapter (tens of GiB) is rejected before any allocation.
-    pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
+    ///
+    /// Re-exported from [`lattice_fann::lora::MAX_BLEND_RANK_TOTAL`], the shared
+    /// cap this crate and `lattice-tune`'s CPU LoRA blend both enforce. Only
+    /// referenced by tests below — non-test code calls `lattice_fann::lora::*`
+    /// directly so the cap itself lives in exactly one place.
+    #[cfg(test)]
+    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = lattice_fann::lora::MAX_BLEND_RANK_TOTAL;
 
     /// Blend multiple sets of [`LoraLayerData`] into one rank-Σr set for use with
     /// the single-slot [`MetalQwen35State::load_lora_adapter`] API.
@@ -1754,11 +1750,8 @@ mod inner {
         }
 
         for (idx, (_, w)) in inputs.iter().enumerate() {
-            if !w.is_finite() {
-                return Err(InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: weight at index {idx} is not finite ({w})"
-                )));
-            }
+            lattice_fann::lora::check_finite_weight("blend_lora_layer_data", idx, *w)
+                .map_err(InferenceError::InvalidInput)?;
         }
 
         // Group by (layer_idx, module): collect refs to layer data and effective weights.
@@ -1780,38 +1773,33 @@ mod inner {
         let mut planned_elems: usize = 0;
         for ((layer_idx, module), entries) in &grouped {
             let (first, _) = entries[0]; // each key was inserted with >=1 entry
-            let dims = first.d_in.checked_add(first.d_out).ok_or_else(|| {
-                InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: layer {layer_idx} module '{module}' d_in+d_out overflowed usize"
-                ))
-            })?;
             let mut group_rank: usize = 0;
             for (entry, _) in entries {
-                group_rank = group_rank.checked_add(entry.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank_total overflowed usize".into(),
-                    )
-                })?;
+                group_rank = lattice_fann::lora::accumulate_rank(
+                    group_rank,
+                    entry.rank,
+                    "blend_lora_layer_data",
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
-            let group_elems = group_rank.checked_mul(dims).ok_or_else(|| {
-                InferenceError::InvalidInput(
-                    "blend_lora_layer_data: rank_total*(d_in+d_out) overflowed usize".into(),
-                )
-            })?;
-            planned_elems = planned_elems.checked_add(group_elems).ok_or_else(|| {
-                InferenceError::InvalidInput(
-                    "blend_lora_layer_data: aggregate blend element count overflowed usize".into(),
-                )
-            })?;
+            let group_elems = lattice_fann::lora::checked_group_elements(
+                "blend_lora_layer_data",
+                *layer_idx,
+                module,
+                group_rank,
+                first.d_in,
+                first.d_out,
+            )
+            .map_err(InferenceError::InvalidInput)?;
+            planned_elems = lattice_fann::lora::accumulate_planned_elements(
+                planned_elems,
+                group_elems,
+                "blend_lora_layer_data",
+            )
+            .map_err(InferenceError::InvalidInput)?;
         }
-        if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
-            return Err(InferenceError::InvalidInput(format!(
-                "blend_lora_layer_data: aggregate blend size {planned_elems} elements exceeds \
-                 MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{} GiB f32); reduce the \
-                 number of adapters, their rank, or the number of target projections",
-                (MAX_BLEND_TOTAL_ELEMENTS * 4) / (1024 * 1024 * 1024)
-            )));
-        }
+        lattice_fann::lora::check_aggregate_elements_cap(planned_elems, "blend_lora_layer_data")
+            .map_err(InferenceError::InvalidInput)?;
 
         let mut result: Vec<LoraLayerData> = Vec::with_capacity(grouped.len());
         for ((layer_idx, module), entries) in grouped {
@@ -1821,64 +1809,46 @@ mod inner {
 
             // Validate dimension consistency across adapters for this projection.
             for (idx, (entry, _)) in entries.iter().enumerate() {
-                if entry.d_in != d_in || entry.d_out != d_out {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: layer {layer_idx} module '{module}' has \
-                         mismatched dimensions (entry 0: d_in={d_in}, d_out={d_out}; \
-                         entry {idx}: d_in={}, d_out={})",
-                        entry.d_in, entry.d_out
-                    )));
-                }
+                lattice_fann::lora::check_dims_match(
+                    "blend_lora_layer_data",
+                    layer_idx,
+                    &module,
+                    d_in,
+                    d_out,
+                    idx,
+                    entry.d_in,
+                    entry.d_out,
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
 
             // Accumulate rank_total with overflow protection and a hard cap
             // (MAX_BLEND_RANK_TOTAL is defined at module scope above this function).
             let mut rank_total: usize = 0;
             for (layer, _) in &entries {
-                rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank_total overflowed usize".into(),
-                    )
-                })?;
+                rank_total = lattice_fann::lora::accumulate_rank(
+                    rank_total,
+                    layer.rank,
+                    "blend_lora_layer_data",
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
-            if rank_total > MAX_BLEND_RANK_TOTAL {
-                return Err(InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: summed rank {rank_total} exceeds \
-                     MAX_BLEND_RANK_TOTAL={MAX_BLEND_RANK_TOTAL}"
-                )));
-            }
+            lattice_fann::lora::check_rank_total_cap(rank_total, "blend_lora_layer_data")
+                .map_err(InferenceError::InvalidInput)?;
 
             // Validate source slice lengths before any allocation: a malformed adapter
             // whose A or B buffer is the wrong size would cause out-of-bounds copies.
             for (idx, (entry, _)) in entries.iter().enumerate() {
-                let expected_a = entry.rank.checked_mul(d_in).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank*d_in overflowed usize".into(),
-                    )
-                })?;
-                let expected_b = d_out.checked_mul(entry.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: d_out*rank overflowed usize".into(),
-                    )
-                })?;
-                if entry.a.len() != expected_a {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: entry {idx} A slice length {} \
-                         does not match rank*d_in={}*{}={expected_a}",
-                        entry.a.len(),
-                        entry.rank,
-                        d_in,
-                    )));
-                }
-                if entry.b.len() != expected_b {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: entry {idx} B slice length {} \
-                         does not match d_out*rank={}*{}={expected_b}",
-                        entry.b.len(),
-                        d_out,
-                        entry.rank,
-                    )));
-                }
+                lattice_fann::lora::check_buffer_lengths(
+                    "blend_lora_layer_data",
+                    idx,
+                    entry.rank,
+                    d_in,
+                    d_out,
+                    entry.a.len(),
+                    entry.b.len(),
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
 
             let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
@@ -33923,7 +33893,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // -----------------------------------------------------------------
         #[test]
         fn blend_aggregate_budget_exceeded_returns_err() {
-            // MAX_BLEND_TOTAL_ELEMENTS is in scope via `use super::*` above.
             let rank = MAX_BLEND_RANK_TOTAL; // 4096 — exactly at per-group cap
             let d_in = 2048usize;
             let d_out = 2048usize;

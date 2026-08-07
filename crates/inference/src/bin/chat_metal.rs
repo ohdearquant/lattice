@@ -383,12 +383,15 @@ fn load_lora_safetensors(
     // Sort by layer_idx for deterministic load order.
     layers.sort_by_key(|l| (l.layer_idx, l.module.clone()));
 
-    // Compute scale = alpha / rank.
+    // Compute scale = alpha / rank via the shared lattice-fann helper (issue #615) —
     // Prefer __metadata__.alpha when available; fall back to alpha = rank (scale = 1.0),
     // matching the tune crate's own default for adapters without embedded metadata.
+    // A rank of 0 (malformed metadata) now resolves to scale = 0.0, matching
+    // `lattice_tune::lora::LoraConfig::scale` — this bin previously fell back to
+    // scale = 1.0 for that case, which is a drift this shares away rather than picks.
     let rank = rank_global.unwrap_or(1);
     let alpha = metadata_alpha.unwrap_or(rank as f32);
-    let scale = if rank > 0 { alpha / rank as f32 } else { 1.0 };
+    let scale = lattice_fann::lora::effective_scale(rank, alpha);
 
     eprintln!(
         "[chat_metal] LoRA: {} layer×module pairs, rank={}, alpha={}, scale={:.2}",
@@ -1325,5 +1328,19 @@ mod tests {
         let parsed =
             parse_serve_request_line(r#"{"prompt":"hi","stop":["\n"]}"#, defaults()).unwrap();
         assert_eq!(parsed.prompt, "hi");
+    }
+
+    // Pre-#615, this file's LoRA scale computation was `if rank > 0 { alpha /
+    // rank } else { 1.0 }` — a rank-0 adapter's scale silently resolved to
+    // 1.0 (full-strength passthrough of a degenerate zero-rank delta).
+    // `lattice_tune::lora::LoraConfig::scale` (crates/tune/src/lora/mod.rs)
+    // has always resolved the same input to 0.0 (an empty factorization
+    // contributes nothing). The two copies disagreed on this edge case;
+    // adopting the shared `lattice_fann::lora::effective_scale` here
+    // resolves it to tune's value. This pins that resolution so it cannot
+    // silently drift back to the old fallback.
+    #[test]
+    fn cm_chat_metal_zero_rank_scale_matches_tune_not_the_old_local_fallback() {
+        assert_eq!(lattice_fann::lora::effective_scale(0, 5.0), 0.0);
     }
 }
