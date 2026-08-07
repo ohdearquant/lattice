@@ -528,7 +528,7 @@ fn check_prompt_fits_window(
         ContextWindowPolicy::PromptAndMaxTokens => (cfg.max_new_tokens, 0),
         ContextWindowPolicy::PromptAndDecodeWithDelimiter => (
             cfg.max_new_tokens
-                .saturating_add(cfg.reasoning_budget.unwrap_or(0)),
+                .saturating_add(cfg.effective_reasoning_budget().unwrap_or(0)),
             1,
         ),
     };

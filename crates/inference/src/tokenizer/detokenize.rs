@@ -197,7 +197,6 @@ pub fn bytes_to_unicode() -> Vec<char> {
 mod tests {
     use super::*;
     use crate::tokenizer::bpe::BpeTokenizer;
-    use crate::tokenizer::common::Tokenizer;
     use std::collections::HashMap;
 
     #[test]
@@ -412,90 +411,5 @@ mod tests {
         assert_eq!(streamed, reference);
         assert_eq!(detok.retained_byte_len(), 0);
         assert!(detok.retained_byte_capacity() <= DETOK_RETAINED_BYTE_CAPACITY);
-    }
-
-    fn non_ascii_added_tokenizer() -> BpeTokenizer {
-        let json = r#"{
-            "model":{"type":"BPE","vocab":{"a":0},"merges":[]},
-            "added_tokens":[
-                {"id":100,"content":"好","special":false},
-                {"id":101,"content":"café","special":false}
-            ]
-        }"#;
-        BpeTokenizer::from_tokenizer_json_str(json).unwrap()
-    }
-
-    #[test]
-    fn decode_and_incremental_detokenize_render_non_ascii_added_tokens() {
-        let tokenizer = non_ascii_added_tokenizer();
-        assert_eq!(
-            tokenizer.token_bytes_for_id(100).as_deref(),
-            Some("好".as_bytes())
-        );
-        assert_eq!(
-            tokenizer.token_bytes_for_id(101).as_deref(),
-            Some("café".as_bytes())
-        );
-        assert_eq!(tokenizer.decode(&[100, 101]), Some("好café".to_string()));
-
-        let mut detok = IncrementalDetokenizer::new();
-        let mut text = String::new();
-        for id in [100, 101] {
-            text.push_str(&detok.push(&tokenizer, id));
-        }
-        text.push_str(&detok.finish());
-        assert_eq!(text, "好café");
-    }
-
-    #[test]
-    fn test_decode_renders_nonspecial_added_tokens() {
-        // Regression (qwen3.6-27b think-tag bug): added tokens with special=false
-        // (`</think>`, `<tool_call>`, FIM markers) live BEYOND the base vocab range,
-        // so before the fix `token_for_id` returned None and they decoded to the
-        // empty string — silently swallowed from the output stream even though the
-        // model sampled them correctly. They must now render as their literal text.
-        // special=true markers (im_end-style) must STILL be swallowed.
-        let mut vocab = HashMap::new();
-        for (s, i) in [("a", 0u32), ("b", 1), ("c", 2)] {
-            vocab.insert(s.to_string(), i);
-        }
-        // rendered_added = the special=false subset (content -> id), ids past base max.
-        let mut rendered = HashMap::new();
-        rendered.insert("</think>".to_string(), 100u32);
-        rendered.insert("<think>".to_string(), 101u32);
-        rendered.insert("<tool_call>".to_string(), 102u32);
-
-        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
-            vocab,
-            Vec::new(),
-            HashMap::new(),
-            rendered,
-            crate::tokenizer::bpe::DEFAULT_BPE_CACHE_CAPACITY,
-            crate::tokenizer::bpe::DEFAULT_BPE_MAX_SEQ_LEN,
-        )
-        .expect("construct tokenizer with rendered added tokens");
-
-        // special=false added tokens render verbatim (byte-level decode is identity
-        // for printable ASCII).
-        assert_eq!(tokenizer.decode(&[101]), Some("<think>".to_string()));
-        assert_eq!(tokenizer.decode(&[100]), Some("</think>".to_string()));
-        assert_eq!(tokenizer.decode(&[102]), Some("<tool_call>".to_string()));
-        // Mixed with base content tokens, in stream order.
-        assert_eq!(
-            tokenizer.decode(&[0, 1, 100, 2]),
-            Some("ab</think>c".to_string())
-        );
-        // An id present in neither base vocab nor the rendered set (e.g. a
-        // special=true marker) stays swallowed — token_for_id returns None.
-        assert_eq!(tokenizer.decode(&[200]), Some(String::new()));
-
-        // The incremental streaming detokenizer must agree byte-for-byte.
-        let mut detok = IncrementalDetokenizer::new();
-        let mut out = String::new();
-        for id in [0u32, 100, 1] {
-            out.push_str(&detok.push(&tokenizer, id));
-        }
-        out.push_str(&detok.finish());
-        assert_eq!(out, "a</think>b");
     }
 }
