@@ -31,6 +31,10 @@ use crate::model::qwen35_config::GenerateConfig;
 /// Shared chat-completions wire DTO and normalization policies.
 pub mod contract;
 
+/// Shared `/v1/embeddings` wire DTO, input normalization, and response
+/// building (issue #584).
+pub mod embeddings;
+
 /// Convert normalized contract messages into the engine's chat representation.
 ///
 /// Both HTTP binaries cross the contract/backend boundary through this one

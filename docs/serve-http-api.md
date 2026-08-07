@@ -27,7 +27,10 @@ This codebase has **two** separately built HTTP servers with confusingly similar
   `lattice serve`'s routes, and it is bound by the same `--host`/loopback-default rule. Do not
   point `--host` at a non-loopback address for either binary without an external auth layer
   (reverse proxy, firewall) in front -- `/metrics` exposes request volume/latency/error-rate shape
-  to anyone who can reach the listening address.
+  to anyone who can reach the listening address. Likewise, `lattice_serve` also has a
+  `POST /v1/embeddings` route (issue #584) that `lattice serve` does not -- see
+  [`docs/capability-matrix.md`](capability-matrix.md) for its request/response shape and error
+  codes, since it too is out of scope for this document.
 
 If you arrived here from an issue or note that points at `lattice_serve.rs` specifically: the
 README's actual HTTP API example — the thing that issue was asking to be expanded — targets
