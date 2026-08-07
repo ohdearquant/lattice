@@ -43,6 +43,10 @@ fn main() {
             eprintln!("Unrecognized model directory at {model_dir}");
             std::process::exit(1);
         }
+        other => {
+            eprintln!("Model format {other:?} at {model_dir} is not supported by this example");
+            std::process::exit(1);
+        }
     };
     let tokenizer =
         BpeTokenizer::from_tokenizer_json(&tokenizer_path).expect("load tokenizer.json");
