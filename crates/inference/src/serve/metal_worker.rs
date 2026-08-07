@@ -716,6 +716,38 @@ impl VisionRuntime {
         self.vision_supported.clone()
     }
 
+    /// Eagerly load vision weights now, ahead of the first image request
+    /// (`--preload-vision`). A no-op when there is nothing pending (already
+    /// loaded, or the checkpoint never advertised vision capability).
+    ///
+    /// On failure, deliberately leaves `state` at `Pending` rather than
+    /// `Failed` — unlike [`Self::get_or_load`]'s terminal-failure contract,
+    /// a startup preload attempt is a best-effort optimization: the caller
+    /// is expected to warn and continue, and the FIRST image request still
+    /// gets its own (possibly successful) lazy-load attempt via
+    /// `get_or_load`, exactly as if `--preload-vision` had never been
+    /// passed. This is what "falls back to lazy loading" means for this
+    /// flag: preload failing must never disable vision for the session.
+    pub fn preload(&mut self) -> Result<(), String> {
+        let (model_dir, config) = match &self.state {
+            VisionState::Pending { model_dir, config } => (model_dir.clone(), config.clone()),
+            VisionState::Unsupported | VisionState::Loaded(_) | VisionState::Failed(_) => {
+                return Ok(());
+            }
+        };
+        let mut never_cancel = || false;
+        match load_qwen35_vision_weights_with_cancel(&model_dir, &config, &mut never_cancel) {
+            Ok(Some(weights)) => {
+                self.state = VisionState::Loaded(weights);
+                Ok(())
+            }
+            // `never_cancel` always returns `false`, so `should_cancel` can never
+            // observe a cancellation request; `None` is unreachable in practice.
+            Ok(None) => Ok(()),
+            Err(err) => Err(format!("vision preload failed: {err}")),
+        }
+    }
+
     fn get_or_load(
         &mut self,
         should_cancel: &mut dyn FnMut() -> bool,
@@ -1797,6 +1829,124 @@ mod tests {
         config.vision_end_token_id = None;
         assert!(
             !VisionRuntime::from_model_config(temp.path().to_path_buf(), &config).is_supported()
+        );
+    }
+
+    /// A `Pending` runtime whose weight-source manifest passes the inventory
+    /// preflight (every expected tensor name is present) but whose backing
+    /// file is not real tensor data, so any actual load attempt fails —
+    /// mirrors the junk-payload fixture in
+    /// `vision_runtime_capability_requires_config_token_metadata_and_weight_source`.
+    /// Reused by the `--preload-vision` tests below, which care about the
+    /// *failure* path, not a successful load (a real checkpoint is needed
+    /// for that and is already covered by the `metal_qwen35` gate tests).
+    fn pending_vision_runtime_with_unloadable_weights() -> (tempfile::TempDir, VisionRuntime) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Qwen35Config::qwen35_0_8b();
+        config.vision_config = Some(tiny_vision_config(config.hidden_size));
+        config.image_token_id = Some(10);
+        config.vision_start_token_id = Some(11);
+        config.vision_end_token_id = Some(12);
+
+        let mut names = vec![
+            "model.visual.patch_embed.proj.weight".to_string(),
+            "model.visual.patch_embed.proj.bias".to_string(),
+            "model.visual.pos_embed.weight".to_string(),
+            "model.visual.merger.linear_fc1.weight".to_string(),
+            "model.visual.merger.linear_fc1.bias".to_string(),
+            "model.visual.merger.linear_fc2.weight".to_string(),
+            "model.visual.merger.linear_fc2.bias".to_string(),
+            "model.visual.merger.norm.weight".to_string(),
+            "model.visual.merger.norm.bias".to_string(),
+        ];
+        for suffix in [
+            "attn.qkv.weight",
+            "attn.qkv.bias",
+            "attn.proj.weight",
+            "attn.proj.bias",
+            "mlp.linear_fc1.weight",
+            "mlp.linear_fc1.bias",
+            "mlp.linear_fc2.weight",
+            "mlp.linear_fc2.bias",
+            "norm1.weight",
+            "norm1.bias",
+            "norm2.weight",
+            "norm2.bias",
+        ] {
+            names.push(format!("model.visual.blocks.0.{suffix}"));
+        }
+        std::fs::write(temp.path().join("visual.bin"), b"not real tensor data")
+            .expect("visual tensor marker");
+        let entries: Vec<_> = names
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "file": "visual.bin"}))
+            .collect();
+        std::fs::write(
+            temp.path().join("quantize_index.json"),
+            serde_json::to_vec(&entries).expect("manifest fixture"),
+        )
+        .expect("complete vision manifest");
+
+        let runtime = VisionRuntime::from_model_config(temp.path().to_path_buf(), &config);
+        assert!(
+            runtime.is_supported(),
+            "fixture must advertise capability so preload has a Pending state to act on"
+        );
+        (temp, runtime)
+    }
+
+    /// `--preload-vision` on a checkpoint with no vision capability (or an
+    /// already-resolved runtime) must not error and must not change
+    /// capability — there is nothing pending to load.
+    #[test]
+    fn vision_runtime_preload_is_noop_when_unsupported() {
+        let mut runtime = VisionRuntime::unsupported();
+        runtime
+            .preload()
+            .expect("preloading an unsupported runtime is a no-op, not an error");
+        assert!(!runtime.is_supported());
+    }
+
+    /// The failure-fallback contract `--preload-vision` depends on: a failed
+    /// eager load at startup must warn (the CLI layer's job) and leave the
+    /// runtime exactly as if `--preload-vision` had never been passed — still
+    /// `Pending`, still advertising capability, so the first real image
+    /// request gets its own normal lazy-load attempt rather than an
+    /// immediately-terminal one.
+    ///
+    /// Mutation-sensitivity: this is the test that reddens if `preload()` is
+    /// wired to `get_or_load()` directly (or otherwise poisons state to
+    /// `Failed` on error) instead of leaving `Pending` on failure — the
+    /// terminal-failure contract is correct for `get_or_load` (proven by
+    /// `vision_runtime_capability_requires_config_token_metadata_and_weight_source`
+    /// above) but wrong for `preload`, whose whole point is that failing must
+    /// not be terminal.
+    #[test]
+    fn vision_runtime_preload_failure_falls_back_to_lazy_pending_state() {
+        let (_temp, mut runtime) = pending_vision_runtime_with_unloadable_weights();
+
+        let preload_err = runtime
+            .preload()
+            .expect_err("junk tensor payload must fail preload");
+        assert!(preload_err.contains("vision preload failed"));
+        assert!(
+            runtime.is_supported(),
+            "a failed preload must not revoke vision capability — the CLI falls back to lazy \
+             loading, it does not disable vision for the session"
+        );
+
+        // The first real image request's lazy load must still be attempted
+        // fresh (not short-circuited by a stale `Failed` state left behind
+        // by preload) — same junk payload, so it fails too, but critically
+        // via `get_or_load`'s own (terminal) contract, not preload's.
+        let mut never_cancel = || false;
+        let lazy_err = runtime
+            .get_or_load(&mut never_cancel)
+            .expect_err("lazy load retries the same unloadable fixture and fails the same way");
+        assert!(lazy_err.contains("vision weights failed to load"));
+        assert!(
+            !runtime.is_supported(),
+            "get_or_load's own terminal-failure contract still applies once it actually runs"
         );
     }
 
