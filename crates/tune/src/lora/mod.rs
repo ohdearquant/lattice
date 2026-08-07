@@ -75,24 +75,28 @@ impl LoraConfig {
         lattice_fann::lora::effective_scale(self.rank, self.alpha)
     }
 
-    /// Validate that the LoRA alpha and effective scale are finite, and that
-    /// every declared target module is a recognized name.
+    /// Validate that the LoRA alpha and effective scale are finite.
+    ///
+    /// Deliberately does not check `target_modules` against any known-name
+    /// list: this is the identity check [`LoraAdapter::new`] runs on every
+    /// construction path (safetensors loading, blending, training), and the
+    /// adapter representation is model-neutral (see the module docs) — a
+    /// target module this crate does not yet recognize by name is not
+    /// necessarily invalid, only unusable until something that knows the
+    /// target architecture is asked to install it.
+    /// [`LoraAdapter::new_with_descriptor`] and
+    /// [`LoraAdapter::validate_against`]/[`LoraAdapter::validate_against_bert`]
+    /// enforce a known-name check where the architecture is actually known;
+    /// see `docs/lora-core.md#adapter-validation`.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::TuneError::Validation`] when `alpha` or the
-    /// effective `alpha / rank` scale is not finite, or when
-    /// `target_modules` contains a name outside
-    /// [`lattice_fann::lora::KNOWN_LORA_TARGET_MODULES`].
+    /// effective `alpha / rank` scale is not finite.
     pub fn validate(&self) -> crate::error::Result<()> {
         self.to_descriptor()
             .validate()
-            .map_err(crate::error::TuneError::Validation)?;
-        lattice_fann::lora::validate_target_modules(
-            &self.target_modules,
-            lattice_fann::lora::KNOWN_LORA_TARGET_MODULES,
-        )
-        .map_err(crate::error::TuneError::Validation)
+            .map_err(crate::error::TuneError::Validation)
     }
 
     /// Convert to the shared cross-crate [`lattice_fann::lora::LoraDescriptor`].
@@ -269,17 +273,31 @@ impl LoraAdapter {
     ///
     /// # Errors
     ///
-    /// Returns an error if the descriptor itself is invalid ([`LoraConfig::validate`]),
-    /// if any non-placeholder layer's `rank` disagrees with `descriptor.rank`,
+    /// Returns an error if the descriptor's alpha/effective scale is not
+    /// finite ([`LoraConfig::validate`]), if `target_modules` contains a
+    /// name outside [`lattice_fann::lora::KNOWN_LORA_TARGET_MODULES`], if
+    /// any non-placeholder layer's `rank` disagrees with `descriptor.rank`,
     /// if the set of modules present in `layers` disagrees with
     /// `descriptor.target_modules`, or for any reason [`Self::new`] itself
     /// would reject the call.
+    ///
+    /// The known-name check lives here rather than in [`LoraConfig::validate`]
+    /// (which [`Self::new`] also calls) so that the permissive bare
+    /// constructor stays permissive; this mirrors
+    /// `MetalQwen35State::load_lora_adapter_with_descriptor`, which performs
+    /// the identical two-step (`validate` then `validate_target_modules`) at
+    /// its own entry point.
     pub fn new_with_descriptor(
         descriptor: lattice_fann::lora::LoraDescriptor,
         layers: HashMap<(usize, String), LoraLayer>,
     ) -> crate::error::Result<Self> {
         let config = LoraConfig::from_descriptor(descriptor);
         config.validate()?;
+        lattice_fann::lora::validate_target_modules(
+            &config.target_modules,
+            lattice_fann::lora::KNOWN_LORA_TARGET_MODULES,
+        )
+        .map_err(crate::error::TuneError::Validation)?;
 
         for ((layer_idx, module), layer) in &layers {
             // Mirrors `Self::new`'s own placeholder exemption: an
@@ -835,11 +853,9 @@ mod tests {
     // `config.validate()` through `LoraConfig::to_descriptor()`, so a
     // descriptor built independently and round-tripped through
     // `LoraConfig::from_descriptor` / `to_descriptor` must come back
-    // unchanged, AND a target module unknown to the shared allowlist must be
-    // rejected at construction — not just by some unused helper. If a
-    // future change makes `LoraConfig` stop delegating to
+    // unchanged. If a future change makes `LoraConfig` stop delegating to
     // `LoraDescriptor` (e.g. reimplementing `scale`/`validate` locally),
-    // this test's round-trip or its unknown-module rejection breaks.
+    // this test's round-trip breaks.
     // -------------------------------------------------------------------
     #[test]
     fn lora_config_round_trips_through_shared_descriptor() {
@@ -854,20 +870,87 @@ mod tests {
         assert_eq!(config.scale(), descriptor.scale());
     }
 
+    // -------------------------------------------------------------------
+    // `LoraAdapter::new` is the generic construction chokepoint
+    // (safetensors loading, blending, training all route through it) and is
+    // deliberately permissive of unrecognized target-module names: the
+    // adapter representation is model-neutral (see the module docs), and an
+    // externally produced adapter naming a projection this crate does not
+    // yet know by name must still load. Name recognition is enforced only
+    // where the target architecture is actually known:
+    // `new_with_descriptor` (below) and `validate_against`/
+    // `validate_against_bert` (see `validate_against_tests` and the BERT
+    // test module).
+    // -------------------------------------------------------------------
     #[test]
-    fn lora_adapter_new_rejects_unknown_target_module_via_shared_descriptor() {
+    fn lora_adapter_new_accepts_unrecognized_target_module() {
         let config = LoraConfig {
             rank: 2,
             alpha: 2.0,
             target_modules: vec!["not_a_real_module".into()],
             dtype: "f32".into(),
         };
-        let err = LoraAdapter::new(config, HashMap::new())
-            .expect_err("unknown target module must be rejected at construction");
+        let adapter = LoraAdapter::new(config, HashMap::new())
+            .expect("LoraAdapter::new must not reject an unrecognized target module name");
+        assert_eq!(adapter.config().target_modules, ["not_a_real_module"]);
+    }
+
+    #[test]
+    fn new_with_descriptor_rejects_unrecognized_target_module() {
+        // The layer set below matches `target_modules` exactly (same key,
+        // same rank), so the pre-existing module-set-agreement check below
+        // this one in the function cannot be what rejects the call — only
+        // the allowlist check can. Without a matching layer this test would
+        // pass for the wrong reason (empty `layers` vs. non-empty
+        // `target_modules` already disagrees on its own).
+        let descriptor = lattice_fann::lora::LoraDescriptor {
+            rank: 2,
+            alpha: 2.0,
+            target_modules: vec!["not_a_real_module".into()],
+            dtype: "f32".into(),
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "not_a_real_module".into()),
+            LoraLayer {
+                a: vec![1.0; 2],
+                b: vec![1.0; 2],
+                d_in: 1,
+                d_out: 1,
+                rank: 2,
+            },
+        );
+        let err = LoraAdapter::new_with_descriptor(descriptor, layers)
+            .expect_err("new_with_descriptor must reject an unrecognized target module name");
         assert!(
             err.to_string().contains("not_a_real_module"),
             "error must name the unknown module via the shared validator; got: {err}"
         );
+    }
+
+    #[test]
+    fn new_with_descriptor_accepts_recognized_target_module() {
+        // Run alongside the rejection test above so a validator that
+        // rejects everything (rather than actually checking names) cannot
+        // pass by accident.
+        let descriptor = lattice_fann::lora::LoraDescriptor {
+            rank: 2,
+            alpha: 2.0,
+            target_modules: vec!["q_proj".into()],
+            dtype: "f32".into(),
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".into()),
+            LoraLayer {
+                a: vec![1.0; 2],
+                b: vec![1.0; 2],
+                d_in: 1,
+                d_out: 1,
+                rank: 2,
+            },
+        );
+        assert!(LoraAdapter::new_with_descriptor(descriptor, layers).is_ok());
     }
 
     // -------------------------------------------------------------------
@@ -1126,14 +1209,15 @@ mod tests {
         #[test]
         fn test_validate_against_unknown_module_errors() {
             let cfg = Qwen35Config::qwen35_0_8b();
-            // "query" is in `KNOWN_LORA_TARGET_MODULES` (it's a BERT
-            // projection name), so construction passes the allowlist check
-            // in `LoraConfig::validate` and this test actually reaches
-            // `validate_against`'s own module-recognition rejection instead
-            // of failing at `make_adapter_for_layer`'s `.expect(..)`. A
-            // typo'd name like "xq_proj_typo" is rejected earlier, at
-            // construction, and is covered by
-            // `lora_adapter_new_rejects_unknown_target_module_via_shared_descriptor`.
+            // `make_adapter_for_layer` builds through `LoraAdapter::new`,
+            // which accepts any target-module name (see
+            // `lora_adapter_new_accepts_unrecognized_target_module`), so
+            // both a name unknown to `KNOWN_LORA_TARGET_MODULES` and a name
+            // like "query" that is known but wrong for Qwen3.5 reach this
+            // point unchanged. "query" is used here (a real BERT projection
+            // name) specifically to prove `validate_against` rejects it on
+            // architecture grounds, not merely because the name is
+            // unrecognized anywhere.
             let adapter = make_adapter_for_layer(3, "query", 1024, 4096);
             let err = adapter.validate_against(&cfg).unwrap_err();
             assert!(err.to_string().contains("not a recognised"));
@@ -1381,15 +1465,12 @@ mod tests {
 
         #[test]
         fn test_validate_against_bert_unknown_module_rejected() {
-            // "q_proj" is in `KNOWN_LORA_TARGET_MODULES` (it's a Qwen3.5
-            // full-attention projection name), so construction passes the
-            // allowlist check in `LoraConfig::validate` and this test
-            // actually reaches `validate_against_bert`'s own
-            // module-recognition rejection instead of failing at
-            // `make_bert_adapter`'s `.expect(..)`. A typo'd name like
-            // "xquery_typo" is rejected earlier, at construction, and is
-            // covered by
-            // `lora_adapter_new_rejects_unknown_target_module_via_shared_descriptor`.
+            // `make_bert_adapter` builds through `LoraAdapter::new`, which
+            // accepts any target-module name (see
+            // `lora_adapter_new_accepts_unrecognized_target_module`). "q_proj"
+            // is used here (a real Qwen3.5 projection name, so it is not
+            // merely unrecognized anywhere) specifically to prove
+            // `validate_against_bert` rejects it on architecture grounds.
             let adapter = make_bert_adapter("q_proj", HIDDEN_SIZE, HIDDEN_SIZE);
             let err = adapter
                 .validate_against_bert(NUM_HIDDEN_LAYERS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
