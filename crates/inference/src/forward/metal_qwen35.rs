@@ -3759,6 +3759,17 @@ mod inner {
         /// (`in_proj_a`, `in_proj_b` not yet supported — consumed inside fused kernels).
         /// MLP modules (both layer types): `gate_proj`, `up_proj`, `down_proj`.
         ///
+        /// This is the deliberate low-level entry point: `scale` is applied
+        /// exactly as given, with no cross-check against any adapter
+        /// identity (no descriptor, no per-layer rank comparison, nothing
+        /// derived from `layers` itself). The caller owns the invariant that
+        /// `scale` is the correct `alpha / rank` for the adapter these
+        /// `layers` actually represent — this function has no way to verify
+        /// that on its own. Prefer [`Self::load_lora_adapter_with_descriptor`]
+        /// when `scale` should instead be derived from, and checked against,
+        /// a [`lattice_fann::lora::LoraDescriptor`]'s declared rank and
+        /// target modules.
+        ///
         /// # Errors
         ///
         /// Returns an error if:

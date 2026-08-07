@@ -308,6 +308,33 @@ mod tests {
         }
     }
 
+    /// Direct regression for the `rank == 0` short-circuit: without it,
+    /// `alpha / rank as f32` divides by zero and produces `+inf` for a
+    /// positive finite `alpha`, which the very next check (`!scale.is_finite()`)
+    /// would then reject — wrongly failing a legitimate zero-rank adapter
+    /// (an empty factorization contributing nothing) that this branch exists
+    /// to accept.
+    #[test]
+    fn validate_alpha_finite_accepts_zero_rank_with_finite_alpha() {
+        assert!(validate_alpha_finite(0, 1.0).is_ok());
+        assert_eq!(effective_scale(0, 1.0), 0.0);
+    }
+
+    /// Direct regression for the effective-scale finite guard itself
+    /// (distinct from the `rank == 0` branch above): a typical finite
+    /// `(rank, alpha)` pair must validate. Given `alpha` is already checked
+    /// finite and `rank == 0` is short-circuited above this line, `alpha /
+    /// rank as f32` for a nonzero `rank` cannot itself become non-finite —
+    /// so this guard has no reachable "must fail" input today, and this test
+    /// instead pins the guard's "must pass" side: inverting the
+    /// `!scale.is_finite()` condition would make this fail directly, at the
+    /// fann crate level, instead of only through the many downstream
+    /// `lattice-tune` callers that route through it.
+    #[test]
+    fn validate_alpha_finite_accepts_typical_finite_scale() {
+        assert!(validate_alpha_finite(8, 16.0).is_ok());
+    }
+
     #[test]
     fn descriptor_validate_delegates_to_free_function() {
         let d = LoraDescriptor {
@@ -369,6 +396,37 @@ mod tests {
     fn check_buffer_lengths_rejects_short_b() {
         let err = check_buffer_lengths("ctx", 0, 2, 4, 4, 8, 7).unwrap_err();
         assert!(err.contains("B slice length"));
+    }
+
+    /// Direct regression for the `rank.checked_mul(d_in)` overflow guard:
+    /// replacing it with `unwrap_or(0)` would silently treat an overflowing
+    /// `rank*d_in` as `0`, so any `a_len` would then satisfy `a_len ==
+    /// expected_a` only when `a_len == 0` — a real overflow would either
+    /// false-reject a correctly-sized (impossibly large) buffer or, worse,
+    /// false-accept an empty one. Neither `checked_group_elements`'s own
+    /// overflow tests above nor any existing `check_buffer_lengths` test
+    /// drives `rank*d_in` past `usize::MAX`.
+    #[test]
+    fn check_buffer_lengths_rejects_rank_times_d_in_overflow() {
+        let err = check_buffer_lengths("ctx", 0, usize::MAX, 2, 1, 0, 0).unwrap_err();
+        assert!(
+            err.contains("rank*d_in overflowed usize"),
+            "expected rank*d_in overflow message; got: {err}"
+        );
+    }
+
+    /// Mirror of the above for `d_out.checked_mul(rank)`. Both `expected_a`
+    /// and `expected_b` are computed before either length is checked, so
+    /// `rank*d_in` (`2*1=2`) must itself stay within bounds for this to
+    /// reach and isolate the `d_out*rank` guard rather than failing on the
+    /// earlier `rank*d_in` guard instead.
+    #[test]
+    fn check_buffer_lengths_rejects_d_out_times_rank_overflow() {
+        let err = check_buffer_lengths("ctx", 0, 2, 1, usize::MAX, 0, 0).unwrap_err();
+        assert!(
+            err.contains("d_out*rank overflowed usize"),
+            "expected d_out*rank overflow message; got: {err}"
+        );
     }
 
     #[test]

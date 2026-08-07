@@ -238,6 +238,82 @@ impl LoraAdapter {
         Ok(Self { config, layers })
     }
 
+    /// Construct an adapter from a shared cross-crate
+    /// [`lattice_fann::lora::LoraDescriptor`] and pre-built layers, enforcing
+    /// that the descriptor's declared identity actually matches the layer
+    /// data — the check [`Self::new`] deliberately does not make.
+    ///
+    /// [`Self::new`] only checks each layer's buffers against that *same*
+    /// layer's own `rank`/`d_in`/`d_out`; it never compares `config.rank`
+    /// (what [`LoraConfig::scale`] and hence [`Self::apply`] actually use)
+    /// against the layers it is handed, and never compares `config.target_modules`
+    /// against the layer keys present. That permissiveness is required by
+    /// [`crate::lora::blend::blend_lora_adapters`], which legitimately builds
+    /// adapters whose per-projection rank varies (the blended rank is the
+    /// *sum* of the source ranks for that projection, which can differ across
+    /// projection groups when the source adapters don't all cover the same
+    /// modules) alongside a single representative `config.rank`. This
+    /// constructor is for the opposite case: a single adapter loaded from a
+    /// descriptor that is supposed to describe every layer uniformly (e.g. an
+    /// external format's parsed identity plus its layers), where a
+    /// disagreement between the two is a bug in the caller, not a legitimate
+    /// blend artifact. It mirrors the identity check `lattice-inference`'s
+    /// Metal `load_lora_adapter_with_descriptor` performs at its own entry
+    /// point, so a descriptor's `rank`/`target_modules` mean the same thing
+    /// on both sides of the tune/Metal boundary.
+    ///
+    /// [`Self::new`] remains the right choice for blend-style construction,
+    /// or any caller that already owns the rank/module invariant itself;
+    /// this constructor is the stricter alternative for callers that want it
+    /// enforced instead of assumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the descriptor itself is invalid ([`LoraConfig::validate`]),
+    /// if any non-placeholder layer's `rank` disagrees with `descriptor.rank`,
+    /// if the set of modules present in `layers` disagrees with
+    /// `descriptor.target_modules`, or for any reason [`Self::new`] itself
+    /// would reject the call.
+    pub fn new_with_descriptor(
+        descriptor: lattice_fann::lora::LoraDescriptor,
+        layers: HashMap<(usize, String), LoraLayer>,
+    ) -> crate::error::Result<Self> {
+        let config = LoraConfig::from_descriptor(descriptor);
+        config.validate()?;
+
+        for ((layer_idx, module), layer) in &layers {
+            // Mirrors `Self::new`'s own placeholder exemption: an
+            // untrained/not-yet-populated module carries no rank-dependent
+            // data for this check to disagree over.
+            if layer.a.is_empty() && layer.b.is_empty() {
+                continue;
+            }
+            if layer.rank != config.rank {
+                return Err(crate::error::TuneError::Validation(format!(
+                    "LoRA layer {layer_idx} module '{module}': layer rank {} disagrees with \
+                     descriptor rank {}",
+                    layer.rank, config.rank
+                )));
+            }
+        }
+
+        let mut layer_modules: Vec<&str> = layers.keys().map(|(_, m)| m.as_str()).collect();
+        layer_modules.sort_unstable();
+        layer_modules.dedup();
+        let mut declared_modules: Vec<&str> =
+            config.target_modules.iter().map(String::as_str).collect();
+        declared_modules.sort_unstable();
+        declared_modules.dedup();
+        if layer_modules != declared_modules {
+            return Err(crate::error::TuneError::Validation(format!(
+                "LoRA adapter modules {layer_modules:?} disagree with descriptor \
+                 target_modules {declared_modules:?}"
+            )));
+        }
+
+        Self::new(config, layers)
+    }
+
     /// Return the validated adapter configuration.
     pub fn config(&self) -> &LoraConfig {
         &self.config
@@ -792,6 +868,161 @@ mod tests {
             err.to_string().contains("not_a_real_module"),
             "error must name the unknown module via the shared validator; got: {err}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Public-boundary tests for the descriptor/layer identity `Self::new`
+    // does not check: a descriptor declares `rank` and `target_modules`,
+    // but nothing before this constructor compared either against the
+    // layers actually supplied. The only in-tree caller that builds both a
+    // descriptor and its layers (`chat_metal`'s Metal-only LoRA loader)
+    // derives both from the same parsed tensors, so it can never produce a
+    // disagreement — these tests construct one directly.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn new_bare_constructor_permits_rank_disagreement_as_documented_escape_hatch() {
+        // The exact shape from the round's failing input: a config
+        // declaring rank=8 alongside a populated layer whose own rank is 4.
+        // `LoraAdapter::new` only checks the layer's buffers against its
+        // *own* declared rank/d_in/d_out, never against `config.rank`, so
+        // this constructs successfully — the documented, caller-owned
+        // bypass `new_with_descriptor` (below) closes for descriptor-backed
+        // construction.
+        let config = LoraConfig {
+            rank: 8,
+            alpha: 8.0,
+            target_modules: vec!["q_proj".into()],
+            dtype: "f32".into(),
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".into()),
+            LoraLayer {
+                a: vec![1.0; 4],
+                b: vec![1.0; 4],
+                d_in: 1,
+                d_out: 1,
+                rank: 4,
+            },
+        );
+        let adapter =
+            LoraAdapter::new(config, layers).expect("bare constructor does not cross-check rank");
+        assert_eq!(adapter.config().rank, 8);
+        assert_eq!(
+            adapter
+                .layers()
+                .get(&(0, "q_proj".to_string()))
+                .unwrap()
+                .rank,
+            4
+        );
+    }
+
+    #[test]
+    fn new_with_descriptor_rejects_rank_disagreement() {
+        let descriptor = lattice_fann::lora::LoraDescriptor {
+            rank: 8,
+            alpha: 8.0,
+            target_modules: vec!["q_proj".into()],
+            dtype: "f32".into(),
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".into()),
+            LoraLayer {
+                a: vec![1.0; 4],
+                b: vec![1.0; 4],
+                d_in: 1,
+                d_out: 1,
+                rank: 4,
+            },
+        );
+        let err = LoraAdapter::new_with_descriptor(descriptor, layers)
+            .expect_err("layer rank disagreeing with descriptor rank must be rejected");
+        assert!(
+            err.to_string()
+                .contains("layer rank 4 disagrees with descriptor rank 8"),
+            "error must name both ranks; got: {err}"
+        );
+    }
+
+    #[test]
+    fn new_with_descriptor_accepts_matching_rank() {
+        let descriptor = lattice_fann::lora::LoraDescriptor {
+            rank: 4,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".into()],
+            dtype: "f32".into(),
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".into()),
+            LoraLayer {
+                a: vec![1.0; 4],
+                b: vec![1.0; 4],
+                d_in: 1,
+                d_out: 1,
+                rank: 4,
+            },
+        );
+        assert!(LoraAdapter::new_with_descriptor(descriptor, layers).is_ok());
+    }
+
+    #[test]
+    fn new_with_descriptor_rejects_module_set_disagreement() {
+        // Descriptor declares only "q_proj", but the layers cover "v_proj"
+        // instead — the exact-module-set check `load_lora_adapter_with_descriptor`
+        // performs on the Metal side, mirrored here for the tune side.
+        let descriptor = lattice_fann::lora::LoraDescriptor {
+            rank: 4,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".into()],
+            dtype: "f32".into(),
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "v_proj".into()),
+            LoraLayer {
+                a: vec![1.0; 4],
+                b: vec![1.0; 4],
+                d_in: 1,
+                d_out: 1,
+                rank: 4,
+            },
+        );
+        let err = LoraAdapter::new_with_descriptor(descriptor, layers)
+            .expect_err("module set disagreeing with descriptor target_modules must be rejected");
+        assert!(
+            err.to_string().contains("disagree with descriptor"),
+            "error must report the module-set disagreement; got: {err}"
+        );
+    }
+
+    #[test]
+    fn new_with_descriptor_placeholder_layer_exempt_from_rank_check() {
+        // An untrained placeholder (both `a` and `b` empty) still declares
+        // its module in the map key, so it must count toward the module-set
+        // match, but its `rank` field is not meaningful data to compare
+        // against the descriptor.
+        let descriptor = lattice_fann::lora::LoraDescriptor {
+            rank: 4,
+            alpha: 4.0,
+            target_modules: vec!["q_proj".into()],
+            dtype: "f32".into(),
+        };
+        let mut layers = HashMap::new();
+        layers.insert(
+            (0, "q_proj".into()),
+            LoraLayer {
+                a: vec![],
+                b: vec![],
+                d_in: 1,
+                d_out: 1,
+                rank: 999, // deliberately disagreeing, but exempt: no data
+            },
+        );
+        assert!(LoraAdapter::new_with_descriptor(descriptor, layers).is_ok());
     }
 
     #[cfg(feature = "inference-hook")]
