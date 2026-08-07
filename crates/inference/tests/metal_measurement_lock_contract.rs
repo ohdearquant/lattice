@@ -182,7 +182,7 @@ const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
         "MetalChatBackend::load belongs to a long-running interactive process outside the bounded measurement-harness contract",
     ),
     (
-        "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs:400:81",
+        "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs:409:81",
         "MetalHandle::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
     ),
     (
