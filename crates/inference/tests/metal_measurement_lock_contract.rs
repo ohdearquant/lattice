@@ -185,11 +185,11 @@ const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
         "MetalHandle::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
     ),
     (
-        "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs:1693:47",
+        "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs:1694:47",
         "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     ),
     (
-        "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs:1713:47",
+        "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs:1714:47",
         "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
     ),
 ];
