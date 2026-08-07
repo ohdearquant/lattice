@@ -146,36 +146,12 @@ const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
 const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalQwen35State", "new"]),
     CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
+    // QwenModel::from_directory attempts MetalForwardPass::new internally
+    // (crates/inference/src/model/qwen.rs) whenever Metal is available, so
+    // every caller of it is a helper-mediated Metal construction site (#1274).
+    CallSelector::Path(&["QwenModel", "from_directory"]),
 ];
 const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
-    (
-        "bench:cross_turn_prefix_cache_bench:benches/cross_turn_prefix_cache_bench.rs=>benches/cross_turn_prefix_cache_bench.rs:63:35",
-        "load_state_and_tokenizer is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:lm_head_bench:benches/lm_head_bench.rs=>benches/lm_head_bench.rs:176:47",
-        "setup_lm_head_fixture Q8 initialization is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:lm_head_bench:benches/lm_head_bench.rs=>benches/lm_head_bench.rs:205:39",
-        "setup_lm_head_fixture Q4 initialization is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:metal_decode_bench:benches/metal_decode_bench.rs=>benches/metal_decode_bench.rs:88:27",
-        "load_q4_state is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:metal_decode_bench:benches/metal_decode_bench.rs=>benches/metal_decode_bench.rs:98:35",
-        "load_q8_state is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:mtp_decode:benches/mtp_decode.rs=>benches/mtp_decode.rs:103:49",
-        "bench_baseline is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:mtp_decode:benches/mtp_decode.rs=>benches/mtp_decode.rs:199:49",
-        "bench_mtp is an exact deferred Criterion construction tracked in #1274",
-    ),
     (
         "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs:444:27",
         "run state1 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
@@ -185,72 +161,12 @@ const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
         "run state2 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     ),
     (
-        "example:bench_gdn_decode:examples/bench_gdn_decode.rs=>examples/bench_gdn_decode.rs:44:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
+        "example:bench_embed_quality:examples/bench_embed_quality.rs=>examples/bench_embed_quality.rs:136:52",
+        "run_bench QwenModel::from_directory is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
     ),
     (
-        "example:bench_gdn_prefill_ab:examples/bench_gdn_prefill_ab.rs=>examples/bench_gdn_prefill_ab.rs:56:27",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_gdn_prefill_ab:examples/bench_gdn_prefill_ab.rs=>examples/bench_gdn_prefill_ab.rs:132:27",
-        "run_interleaved is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_gdn_state:examples/bench_gdn_state.rs=>examples/bench_gdn_state.rs:88:27",
-        "run Q4 branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_gdn_state:examples/bench_gdn_state.rs=>examples/bench_gdn_state.rs:92:27",
-        "run safetensors branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_persistent_state:examples/bench_persistent_state.rs=>examples/bench_persistent_state.rs:47:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_pruning:examples/bench_pruning.rs=>examples/bench_pruning.rs:98:49",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_q4_prefill:examples/bench_q4_prefill.rs=>examples/bench_q4_prefill.rs:38:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_q8_prefill:examples/bench_q8_prefill.rs=>examples/bench_q8_prefill.rs:47:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_quality:examples/bench_quality.rs=>examples/bench_quality.rs:121:39",
-        "run baseline is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_quality:examples/bench_quality.rs=>examples/bench_quality.rs:189:40",
-        "run pruned-8 branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_quality:examples/bench_quality.rs=>examples/bench_quality.rs:220:41",
-        "run pruned-12 branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_stability:examples/bench_stability.rs=>examples/bench_stability.rs:87:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_suite:examples/bench_suite.rs=>examples/bench_suite.rs:540:27",
-        "bench_llm_metal is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:decode_profile:examples/decode_profile.rs=>examples/decode_profile.rs:63:27",
-        "run Q4 branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:decode_profile:examples/decode_profile.rs=>examples/decode_profile.rs:67:27",
-        "run safetensors branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:profile_metal:examples/profile_metal.rs=>examples/profile_metal.rs:29:39",
-        "main is an exact deferred manually launched measurement construction tracked in #1274",
+        "bin:backfill_qwen3:src/bin/backfill_qwen3.rs=>src/bin/backfill_qwen3.rs:37:28",
+        "one-time DB embedding migration over an unbounded row count belongs to a long-running batch process outside the bounded measurement-harness contract",
     ),
     (
         "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs:770:39",

@@ -23,6 +23,8 @@ fn run() {
     use lattice_inference::model::qwen35_config::Qwen35Config;
     use std::time::Instant;
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
     let home = std::env::var("HOME").expect("HOME not set");
     let model_dir_str = std::env::var("LATTICE_MODEL_DIR")
         .unwrap_or_else(|_| format!("{home}/.lattice/models/qwen3.6-27b-q4"));
