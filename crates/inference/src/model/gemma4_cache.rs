@@ -487,7 +487,7 @@ impl Gemma4KvCache {
     /// gate) by pointing a shared layer at the wrong same-type owner's slot
     /// and showing the forward output diverges, without touching the
     /// weight-loading config the model was built against.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "f16"))]
     pub(crate) fn override_layer_slot_for_test(&mut self, layer: usize, slot: usize) {
         self.layer_kv_slot[layer] = slot;
     }

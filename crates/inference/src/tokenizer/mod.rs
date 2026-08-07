@@ -1,6 +1,7 @@
 //! Tokenizer module index and re-exports for WordPiece, BPE, common tokenizer types/loaders, and SentencePiece.
 pub mod bpe;
 pub mod common;
+pub(crate) mod detokenize;
 pub mod gemma_bpe;
 pub mod sentencepiece;
 pub mod wordpiece;

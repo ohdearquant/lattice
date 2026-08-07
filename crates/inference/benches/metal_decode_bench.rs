@@ -17,13 +17,54 @@ use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::model::qwen35_config::Qwen35Config;
 
-fn q4_model_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[derive(Debug)]
+enum Q4SetupError {
+    HomeUnset,
+    ModelDirectoryMissing(PathBuf),
+    TokenizerMissing(PathBuf),
+    Config(String),
+    State(String),
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+impl std::fmt::Display for Q4SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Q4SetupError::HomeUnset => write!(f, "HOME environment variable is not set"),
+            Q4SetupError::ModelDirectoryMissing(path) => {
+                write!(f, "Q4 model not found at {}", path.display())
+            }
+            Q4SetupError::TokenizerMissing(path) => {
+                write!(f, "tokenizer not found at {}", path.display())
+            }
+            Q4SetupError::Config(msg) => write!(f, "config load failed: {msg}"),
+            Q4SetupError::State(msg) => write!(f, "Q4 state construction failed: {msg}"),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn q4_model_dir_checked() -> Result<PathBuf, Q4SetupError> {
+    let home = std::env::var("HOME").map_err(|_| Q4SetupError::HomeUnset)?;
     let quarot = PathBuf::from(format!("{home}/.lattice/models/qwen3.5-0.8b-q4-quarot"));
     if quarot.join("config.json").exists() {
-        Some(quarot)
+        Ok(quarot)
     } else {
-        None
+        Err(Q4SetupError::ModelDirectoryMissing(quarot))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn tokenizer_path_checked() -> Result<PathBuf, Q4SetupError> {
+    let home = std::env::var("HOME").map_err(|_| Q4SetupError::HomeUnset)?;
+    let p = PathBuf::from(format!(
+        "{home}/.lattice/models/qwen3.5-0.8b/tokenizer.json"
+    ));
+    if p.exists() {
+        Ok(p)
+    } else {
+        Err(Q4SetupError::TokenizerMissing(p))
     }
 }
 
@@ -37,21 +78,15 @@ fn safetensors_model_dir() -> Option<PathBuf> {
     }
 }
 
-fn tokenizer_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let p = PathBuf::from(format!(
-        "{home}/.lattice/models/qwen3.5-0.8b/tokenizer.json"
-    ));
-    if p.exists() { Some(p) } else { None }
-}
-
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-fn load_q4_state() -> Option<(MetalQwen35State, Qwen35Config)> {
-    let dir = q4_model_dir()?;
-    let tok = tokenizer_path()?;
-    let cfg = Qwen35Config::from_config_json(&dir.join("config.json")).ok()?;
-    let state = MetalQwen35State::from_q4_dir(&dir, &tok, &cfg, 4096).ok()?;
-    Some((state, cfg))
+fn load_q4_state() -> Result<(MetalQwen35State, Qwen35Config), Q4SetupError> {
+    let dir = q4_model_dir_checked()?;
+    let tok = tokenizer_path_checked()?;
+    let cfg = Qwen35Config::from_config_json(&dir.join("config.json"))
+        .map_err(|error| Q4SetupError::Config(error.to_string()))?;
+    let state =
+        MetalQwen35State::from_q4_dir(&dir, &tok, &cfg, 4096).map_err(Q4SetupError::State)?;
+    Ok((state, cfg))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -130,12 +165,27 @@ fn bench_metal_decode_q4(c: &mut Criterion) {
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
-        let Some((mut state, cfg)) = load_q4_state() else {
-            eprintln!(
-                "SKIP: Q4 model not found at ~/.lattice/models/qwen3.5-0.8b-q4-quarot\n\
-                 (tokenizer expected at ~/.lattice/models/qwen3.5-0.8b/tokenizer.json)"
-            );
-            return;
+        let (mut state, cfg) = match load_q4_state() {
+            Ok(loaded) => loaded,
+            Err(error @ Q4SetupError::ModelDirectoryMissing(_)) => {
+                eprintln!(
+                    "SKIP: {error}\n\
+                     (tokenizer expected at ~/.lattice/models/qwen3.5-0.8b/tokenizer.json)"
+                );
+                return;
+            }
+            // HomeUnset and TokenizerMissing indicate the environment or model
+            // is simply absent (same class as ModelDirectoryMissing above), so
+            // they skip too. Config and State mean a model IS present and
+            // rejected the load -- that is a real regression, not an absent
+            // fixture, so it must fail the bench loudly rather than exit 0.
+            Err(error @ (Q4SetupError::HomeUnset | Q4SetupError::TokenizerMissing(_))) => {
+                eprintln!("SKIP: {error}");
+                return;
+            }
+            Err(error @ (Q4SetupError::Config(_) | Q4SetupError::State(_))) => {
+                panic!("Q4 setup failed on a present model: {error}");
+            }
         };
 
         let mut group = c.benchmark_group("metal_decode_q4");
