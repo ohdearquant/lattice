@@ -17494,7 +17494,17 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback)"
+                );
                 return;
             };
             let _gpu = gpu_test_lock();
@@ -17574,7 +17584,17 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback)"
+                );
                 return;
             };
             let _gpu = gpu_test_lock();
@@ -17671,6 +17691,84 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
             assert_eq!(ordinary.session.kv_cache.seq_len, tokens.len() + 1);
             assert_eq!(with_hidden.session.kv_cache.seq_len, tokens.len() + 1);
+        }
+
+        /// `tiny_metal_qwen35_fixture` (used by the two tests above) has zero
+        /// GDN/linear-attention layers — `has_gdn_layers()` is false for it — so
+        /// neither proves explicit hidden readback works on a hybrid GDN+full
+        /// session. This test mirrors their structure on `tiny_hybrid_fixture`
+        /// (3 GDN layers + 1 full-attention layer) to close that gap.
+        #[test]
+        fn forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback()
+         {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = Device::system_default() else {
+                eprintln!(
+                    "[METAL_TEST_SKIP] context=forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback \
+                     reason=no_metal_device"
+                );
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present \
+                     (forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback)"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut ordinary = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("ordinary tiny hybrid MetalQwen35State fixture constructs");
+            let mut with_hidden = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("hidden tiny hybrid MetalQwen35State fixture constructs");
+            assert!(
+                with_hidden.has_gdn_layers(),
+                "forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback's \
+                 tiny_hybrid_fixture must retain its GDN layers for this test to exercise the \
+                 GDN path"
+            );
+            ordinary.path_proof_enabled = true;
+            with_hidden.path_proof_enabled = true;
+            ordinary.reset_path_proof_counters();
+            with_hidden.reset_path_proof_counters();
+
+            let ordinary_logits = ordinary.forward_step(3, 0);
+            let (hidden_logits, hidden) = with_hidden
+                .forward_step_with_hidden(3, 0)
+                .expect("hidden-returning step on a fresh hybrid/GDN session succeeds");
+            assert_forward_rows_close("hybrid step logits", &ordinary_logits, &hidden_logits);
+            assert_eq!(ordinary.session.kv_cache.seq_len, 1);
+            assert_eq!(with_hidden.session.kv_cache.seq_len, 1);
+            assert_eq!(hidden.len(), cfg.hidden_size);
+            assert!(hidden.iter().all(|value| value.is_finite()));
+            assert!(hidden.iter().any(|&value| value != 0.0));
+            assert_forward_rows_close(
+                "hybrid returned and session hidden",
+                &hidden,
+                &with_hidden.session.last_pre_final_hidden,
+            );
+            assert!(
+                ordinary
+                    .session
+                    .last_pre_final_hidden
+                    .iter()
+                    .all(|&value| value == 0.0),
+                "ordinary hybrid step must not add an unconditional hidden readback"
+            );
+
+            let ordinary_hidden_proof = ordinary.hidden_readback_path_proof_snapshot();
+            let explicit_hidden_proof = with_hidden.hidden_readback_path_proof_snapshot();
+            assert_eq!(ordinary_hidden_proof.decode, 0);
+            assert_eq!(explicit_hidden_proof.decode, 1);
+
+            let ordinary_path = ordinary.path_proof_snapshot();
+            let explicit_path = with_hidden.path_proof_snapshot();
+            assert_eq!(ordinary_path.decode_kv_copy, explicit_path.decode_kv_copy);
+            assert!(explicit_path.decode_kv_copy > 0);
+            assert_eq!(
+                ordinary_path.decode_attn_direct,
+                explicit_path.decode_attn_direct
+            );
+            assert!(explicit_path.decode_attn_direct > 0);
         }
 
         /// Byte-for-byte snapshot of every KV buffer (K and V, every layer),
