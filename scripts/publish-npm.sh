@@ -66,11 +66,14 @@ NATIVE_DIR="$ROOT/npm/lattice-embed-native"
 # "main" field names -- not any *.node match, so a stale or misnamed binary
 # left over from a previous build fails closed instead of passing an
 # existence glob -- and require that package's declared name and version to
-# agree with the platform key and the main package's version. Finally replay
-# the same packlist content guard CI's package job runs
-# (assert-platform-packlist.mjs) directly here, so a bare `make publish-npm`
-# -- which never touches npm-prebuild.yml -- gets it too instead of skipping
-# straight to a real publish untested.
+# agree with the platform key and the main package's version, AND require
+# the main package's own optionalDependencies entry for this platform to be
+# pinned at that exact version too (not a range, wildcard, or "latest"),
+# since nothing else here reads what the main package advertises to
+# installers. Finally replay the same packlist content guard CI's package
+# job runs (assert-platform-packlist.mjs) directly here, so a bare `make
+# publish-npm` -- which never touches npm-prebuild.yml -- gets it too
+# instead of skipping straight to a real publish untested.
 # selftest-extraction-marker: PLATFORM_MATRIX_GUARD_BEGIN
 EXPECTED_PLATFORMS=$(node -p "Object.keys(require('$NATIVE_DIR/package.json').optionalDependencies).map(n => n.replace('@khive-ai/lattice-embed-', '')).join(' ')")
 
@@ -126,6 +129,39 @@ for platform in $EXPECTED_PLATFORMS; do
         exit 1
     fi
 
+    # The two checks above only read the platform package's OWN declared
+    # name/version -- neither reads what the main package's own
+    # optionalDependencies actually advertises for this platform. Those can
+    # disagree independently of everything checked so far: the main package
+    # could point installers at a different version (or a non-exact range)
+    # of this platform package than the one just validated, which every
+    # local-directory check above is blind to. Look the dependency value up
+    # by $expected_name (the canonical "@khive-ai/lattice-embed-$platform"
+    # key optionalDependencies is always keyed by), not by $plat_name -- a
+    # platform package whose own "name" field is wrong is already caught by
+    # the guard above and must not also determine which optionalDependencies
+    # key this check reads, or a defeated name guard would silently borrow
+    # this one's failure and this arm would stop isolating its own guard.
+    # Compare literal strings rather than semver-parsing the dependency
+    # value -- an exact string match against NATIVE_VERSION is
+    # simultaneously the "pinned to this release" check and a rejection of
+    # every non-exact form (^1.2.3, ~1.2.3, *, latest, a "x.y.z - a.b.c" or
+    # ">=x <y" range expression, or an empty/missing value), none of which
+    # can literal-equal a bare version string.
+    dep_version=$(node -p "
+        const deps = require('$NATIVE_DIR/package.json').optionalDependencies || {};
+        deps['$expected_name'] || ''
+    ")
+    if [ "$dep_version" != "$NATIVE_VERSION" ]; then
+        echo "ERROR: $NATIVE_DIR/package.json optionalDependencies declares" >&2
+        echo "       '$expected_name' at '$dep_version', but the exact version is" >&2
+        echo "       '$NATIVE_VERSION'. The main package's optionalDependencies must pin" >&2
+        echo "       each platform package to that exact version -- not a range, wildcard," >&2
+        echo "       or 'latest' -- so installers cannot resolve a differently-versioned" >&2
+        echo "       platform binary than the one validated here." >&2
+        exit 1
+    fi
+
     # The lookup's nonzero status must not trigger errexit here either --
     # land it in an `if` condition, same reasoning as check_version_available
     # below.
@@ -172,9 +208,11 @@ check_version_available() {
     # availability) or a lookup failure (DNS/TLS, registry 5xx, auth) that tells
     # us nothing about whether the version is free. `npm view --json` puts the
     # error body on stdout as {"error":{"code":...}}; only E404 counts as
-    # not-found (verified against npm 11.8.0's actual output for a missing
-    # package -- see fix_r4_report.md). Anything else must fail the release
-    # closed rather than be silently treated as "available".
+    # not-found -- verified directly against npm 11.8.0's actual output for a
+    # missing package: `npm view <missing-name>@<version> version --json`
+    # prints {"error":{"code":"E404","summary":"..."}} to stdout and exits
+    # nonzero. Anything else must fail the release closed rather than be
+    # silently treated as "available".
     error_code=$(printf '%s' "$view_out" | node -e "
         let input = '';
         process.stdin.on('data', c => input += c);
@@ -219,7 +257,9 @@ done
 # assert-packlist.mjs) is the purpose-built content guard for this package,
 # in the same shape the platform packages already get from
 # assert-platform-packlist.mjs in npm-prebuild.yml's package job.
+# selftest-extraction-marker: MAIN_PACKLIST_GUARD_BEGIN
 ( cd "$NATIVE_DIR" && npm run packlist )
+# selftest-extraction-marker: MAIN_PACKLIST_GUARD_END
 echo "Preflight OK."
 
 if [ "$MODE" = "dry-run" ]; then

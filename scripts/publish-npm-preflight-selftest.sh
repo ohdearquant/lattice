@@ -289,6 +289,11 @@ else
 fi
 
 # (m) a full, legitimate two-platform matrix -- must pass every new guard.
+# This fixture also doubles as the must-PASS control for the
+# optionalDependencies-value guard below: build_native_fixture's
+# "platform:version" pairs populate optionalDependencies at the same
+# version add_valid_platform gives each platform package, so (m) proves the
+# new check does not reject a genuinely matched matrix.
 NATIVE="$MSB/m-valid"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3" "linux-x64-gnu:1.2.3"
 add_valid_platform "$NATIVE" "darwin-arm64" "1.2.3"
 add_valid_platform "$NATIVE" "linux-x64-gnu" "1.2.3"
@@ -298,6 +303,162 @@ if printf '%s' "$OUT" | grep -qF "MATRIX_GUARD_PASSED"; then
   echo "  PASS:   -> guard reached the end of the extracted block"; pass=$((pass+1))
 else
   echo "  FAIL:   -> did not reach end of block (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+# (n) a platform package.json whose "name" field disagrees with its
+#     directory/optionalDependencies key -- passes the exact-.node-path check
+#     (right file, right place) so this arm isolates the name guard
+#     specifically; the misnamed-.node arm (i) isolates the exact-path guard,
+#     not this one.
+add_misnamed_platform() {  # $1=native $2=platform $3=version $4=wrong_name
+  native="$1"; platform="$2"; version="$3"; wrong_name="$4"
+  d="$native/npm/$platform"
+  mkdir -p "$d"
+  main="lattice-embed-native.$platform.node"
+  cat > "$d/package.json" <<EOF
+{"name": "$wrong_name", "version": "$version", "main": "$main", "files": ["$main"]}
+EOF
+  printf 'fake-binary' > "$d/$main"
+}
+NATIVE="$MSB/n-wrongname"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3"
+add_misnamed_platform "$NATIVE" "darwin-arm64" "1.2.3" "@khive-ai/lattice-embed-totally-wrong"
+run_matrix_case "$NATIVE"; rc=$?
+check "(n) platform package.json name mismatch fails closed" 1 $rc
+if printf '%s' "$OUT" | grep -qF "has name '@khive-ai/lattice-embed-totally-wrong'"; then
+  echo "  PASS:   -> name-mismatch diagnostic printed"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> missing name-mismatch diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+echo
+echo "=== publish-npm.sh optionalDependencies value guard self-test ==="
+# build_native_fixture's "platform:version" pairs set the optionalDependencies
+# VALUE independently of add_valid_platform's own version arg, so pinning
+# add_valid_platform at "1.2.3" (== NATIVE_VERSION, always "1.2.3" per
+# build_native_fixture) while varying only the optionalDependencies pair
+# isolates this guard from the pre-existing exact-path/name/version checks,
+# which all read the platform package's own files, never
+# optionalDependencies' value.
+depvalue_case() {  # $1=label $2=bad_dep_value $3=must_fail_msg_substring
+  label="$1"; bad="$2"; needle="$3"
+  NATIVE="$MSB/depvalue-$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '-')"
+  build_native_fixture "$NATIVE" "darwin-arm64:$bad"
+  add_valid_platform "$NATIVE" "darwin-arm64" "1.2.3"
+  run_matrix_case "$NATIVE"; rc=$?
+  check "$label fails closed" 1 $rc
+  if printf '%s' "$OUT" | grep -qF "$needle"; then
+    echo "  PASS:   -> optionalDependencies-value diagnostic printed"; pass=$((pass+1))
+  else
+    echo "  FAIL:   -> missing optionalDependencies-value diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+  fi
+}
+# (o) the originally measured defect: dependency value at a stale/different
+#     exact version than every platform package actually publishes at.
+depvalue_case "(o) optionalDependencies mismatched exact version" "9.9.9" "must pin"
+# (p) empty string value. Also stands in for a genuinely absent key: this
+#     guard's lookup is `deps['<name>'] || ''`, so a present-but-empty value
+#     and a missing key produce the identical dep_version='' and take the
+#     identical branch -- true key-absence can't be isolated as a SEPARATE
+#     arm here because EXPECTED_PLATFORMS is itself derived from
+#     Object.keys(optionalDependencies) a few lines above (selftest-extraction-marker:
+#     PLATFORM_MATRIX_GUARD_BEGIN), so a platform this loop ever reaches by
+#     construction always has a key -- an absent key never enters the loop at
+#     all and is instead the empty-optionalDependencies shape arm (h) covers,
+#     or (for one absent key among several present) the "missing native
+#     binary" shape arms (j) already cover, since a key-less platform has no
+#     $NATIVE_DIR/npm/<platform>/ directory backing it.
+depvalue_case "(p) optionalDependencies empty value" "" "must pin"
+# (q) caret range.
+depvalue_case "(q) optionalDependencies caret range" "^1.2.3" "must pin"
+# (r) tilde range.
+depvalue_case "(r) optionalDependencies tilde range" "~1.2.3" "must pin"
+# (s) wildcard.
+depvalue_case "(s) optionalDependencies wildcard" "*" "must pin"
+# (t) "latest" tag.
+depvalue_case "(t) optionalDependencies latest tag" "latest" "must pin"
+# (u) explicit range expression (comparator range, not just a bare operator).
+depvalue_case "(u) optionalDependencies range expression" ">=1.2.3 <2.0.0" "must pin"
+
+echo
+echo "=== publish-npm.sh main-package packlist guard self-test ==="
+# The matrix guard above never touches the main package's own packlist call
+# (scripts/publish-npm.sh: MAIN_PACKLIST_GUARD_BEGIN/END, `npm run packlist`
+# inside NATIVE_DIR) -- it is a separate, later step in the real script, so
+# it needs its own extraction and its own fixture: a minimal npm project
+# satisfying assert-packlist.mjs's required-files list, with an optional
+# extra path appended to "files" to trip a forbidden pattern.
+MAIN_PACKLIST_BODY="$(awk '/^# selftest-extraction-marker: MAIN_PACKLIST_GUARD_BEGIN$/,/^# selftest-extraction-marker: MAIN_PACKLIST_GUARD_END$/' "$SRC")"
+if [ -z "$MAIN_PACKLIST_BODY" ]; then
+  echo "FATAL: could not extract the main-package packlist guard from $SRC -- have its" >&2
+  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
+  echo "  extraction below would otherwise silently test nothing." >&2
+  exit 1
+fi
+
+REAL_MAIN_PACKLIST_ASSERT="$REPO/npm/lattice-embed-native/scripts/assert-packlist.mjs"
+if [ ! -f "$REAL_MAIN_PACKLIST_ASSERT" ]; then
+  echo "FATAL: $REAL_MAIN_PACKLIST_ASSERT not found -- has it moved?" >&2
+  exit 1
+fi
+
+MPB="$SB/main-packlist"
+mkdir -p "$MPB"
+
+# Build a fixture NATIVE_DIR ($1) with the minimal file set assert-packlist.mjs
+# requires (package.json, README.md, binding.js, index.js, index.d.ts), plus
+# a "scripts.packlist" entry matching the real package.json's, plus a copy of
+# the real assert-packlist.mjs. Extra args ($2...) are additional paths added
+# to "files" and created on disk, to trip the forbidden-pattern check.
+build_main_fixture() {
+  native="$1"; shift
+  mkdir -p "$native/scripts"
+  cp "$REAL_MAIN_PACKLIST_ASSERT" "$native/scripts/assert-packlist.mjs"
+  printf '# fixture readme\n' > "$native/README.md"
+  printf 'module.exports = {}\n' > "$native/binding.js"
+  printf 'module.exports = {}\n' > "$native/index.js"
+  printf 'export {}\n' > "$native/index.d.ts"
+  files_json='"README.md", "binding.js", "index.js", "index.d.ts", "package.json"'
+  for extra in "$@"; do
+    files_json="${files_json}, \"$extra\""
+    extra_dir=$(dirname "$extra")
+    [ "$extra_dir" != "." ] && mkdir -p "$native/$extra_dir"
+    printf 'extra fixture content\n' > "$native/$extra"
+  done
+  cat > "$native/package.json" <<EOF
+{"name": "@khive-ai/lattice-fixture-main", "version": "1.2.3", "files": [$files_json], "scripts": {"packlist": "npm pack --dry-run --json | node scripts/assert-packlist.mjs"}}
+EOF
+}
+
+run_main_packlist_case() {  # $1 = fixture NATIVE_DIR
+  RUNNER="$MPB/runner.sh"
+  {
+    printf 'NATIVE_DIR=%q\n' "$1"
+    printf '%s\n' "$MAIN_PACKLIST_BODY"
+    printf 'echo MAIN_PACKLIST_GUARD_PASSED\n'
+  } > "$RUNNER"
+  OUT="$(/bin/sh -c "set -e; . '$RUNNER'" 2>&1)"
+  return $?
+}
+
+# (v) a valid main-package fixture -- must pass the packlist call.
+NATIVE="$MPB/v-valid"; build_main_fixture "$NATIVE"
+run_main_packlist_case "$NATIVE"; rc=$?
+check "(v) main package packlist valid fixture passes" 0 $rc
+if printf '%s' "$OUT" | grep -qF "MAIN_PACKLIST_GUARD_PASSED"; then
+  echo "  PASS:   -> guard reached the end of the extracted block"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> did not reach end of block (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+# (w) a forbidden Rust source file included in the tarball -- must fail
+#     closed via assert-packlist.mjs's forbidden-pattern check (^src/).
+NATIVE="$MPB/w-forbidden"; build_main_fixture "$NATIVE" "src/lib.rs"
+run_main_packlist_case "$NATIVE"; rc=$?
+check "(w) main package packlist forbidden file fails closed" 1 $rc
+if printf '%s' "$OUT" | grep -qF "must not include src/lib.rs"; then
+  echo "  PASS:   -> forbidden-pattern diagnostic printed"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> missing forbidden-pattern diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
 fi
 
 echo "=== $pass passed, $fail failed ==="
