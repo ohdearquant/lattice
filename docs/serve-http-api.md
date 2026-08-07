@@ -213,13 +213,20 @@ use `{"type": "text", "text": "..."}`. A vision-capable Metal checkpoint also ac
 `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` part on a user
 message; JPEG uses `data:image/jpeg;base64,...`. The image may appear between text parts and keeps
 that position in the rendered multimodal prompt. The decoded payload is capped at 48,000 bytes,
-and each serving image is capped at 256 pre-merge patches (overridable via the
-`LATTICE_VISION_MAX_PATCHES` environment variable, which falls back to 256 for any unset, empty,
-malformed, zero, or negative value) and 16 MiB of preprocessed patch data.
+the declared pixel dimensions are capped at 2048px per side, and each serving image is capped at
+256 pre-merge patches (overridable via the `LATTICE_VISION_MAX_PATCHES` environment variable,
+which falls back to 256 for any unset, empty, malformed, zero, or negative value) and 16 MiB of
+preprocessed patch data — an image over any of those three budgets is rejected with 400
+`image_dimensions_exceeded` rather than the generic `invalid_image` (which stays reserved for a
+payload that genuinely isn't a decodable PNG or JPEG).
 Image requests must use `stream: false` (or omit `stream`) until the multimodal decoder supports
 incremental deltas. Remote URLs are never fetched, multi-image requests are rejected, and a
-text-only/CPU model returns 400 `vision_unsupported`. Audio/file parts remain unsupported rather
-than being silently dropped.
+text-only/CPU model returns 400 `vision_unsupported`. An image combined with
+`response_format.json_schema` or a nonzero `reasoning_budget` is rejected with 400
+`image_unsupported_combination` before the request reaches the shared Metal worker. A transient
+failure loading the vision checkpoint's weights returns 400 `vision_load_failed`; the load is
+retried on the next image request rather than failing every subsequent request for the life of the
+process. Audio/file parts remain unsupported rather than being silently dropped.
 
 `messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and `"developer"` are
 explicitly named and rejected (`"role 'tool' is not supported by this server"`); anything else
