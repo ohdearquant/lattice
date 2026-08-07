@@ -1620,6 +1620,17 @@ mod inner {
         pub(crate) compact_result: Vec<crate::sampling::Candidate>,
         // MTP per-session cache and activations (None if model has no MTP).
         pub(crate) mtp: Option<MetalMtpSession>,
+        /// True for the remainder of the current request once `generate()`'s
+        /// `use_mtp` (see [`super::mtp_route_active`]) commits to the MTP
+        /// greedy/verify path. Distinct from `mtp.is_some()`, which only
+        /// reports whether the checkpoint carries MTP weights: a checkpoint
+        /// can ship MTP weights while a specific request runs with MTP
+        /// disabled (`enable_mtp: Some(false)`), and pre-final-hidden-capture
+        /// gates must not treat that request as MTP-active just because the
+        /// weights happen to be resident (#1336 round 2). Reset to `false` by
+        /// `reset_state()`, which every generate entry point calls before
+        /// this flag is next read or set.
+        pub(crate) mtp_active: bool,
         pub(crate) gdn_checkpoints: Option<MetalGdnCheckpointPool>,
         pub(crate) last_pre_final_hidden: Vec<f32>,
         /// Raw (pre-final-RMSNorm) target hidden states captured by
@@ -3416,6 +3427,7 @@ mod inner {
                 compact_route: GpuTopkRoute::CpuFallback,
                 compact_result: Vec::new(),
                 mtp,
+                mtp_active: false,
                 gdn_checkpoints,
                 last_pre_final_hidden: vec![0.0f32; hidden],
                 mtp_prefill_hidden: Vec::new(),
@@ -5879,8 +5891,14 @@ mod inner {
             // terminal RMSNorm dispatched even if it passed `emit_head=false`
             // (only the multimodal prefill loop does today, and never with MTP
             // active) — this keeps the flag safe by construction rather than by
-            // caller discipline.
-            let run_head = emit_head || capture_hidden || self.session.mtp.is_some();
+            // caller discipline. `mtp_active` is this request's own commitment
+            // to the MTP path (set by `generate()`'s `use_mtp`, cleared by
+            // `reset_state()`), not `self.session.mtp.is_some()`: the latter
+            // reports only that the checkpoint carries MTP weights, which stays
+            // true even when this request runs with `enable_mtp: Some(false)`
+            // (#1336 round 2 — that combination must still honor
+            // `emit_head=false` for the multimodal prefill loop).
+            let run_head = emit_head || capture_hidden || self.session.mtp_active;
 
             // Build the single-token M-RoPE cos/sin buffers once for this step (all
             // six GQA layers rotate with the same per-token row); `None` keeps every
@@ -8687,6 +8705,12 @@ mod inner {
                 use_compact,
             );
             if use_mtp {
+                // This request has committed to the MTP path (#1336 round 2) —
+                // downstream pre-final-hidden-capture gates key off this, not
+                // off `self.session.mtp.is_some()` (which only reports whether
+                // the checkpoint carries MTP weights, not whether this request
+                // uses them).
+                self.session.mtp_active = true;
                 if use_compact {
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
@@ -9703,6 +9727,10 @@ mod inner {
             if let Some(ref mut mtp) = self.session.mtp {
                 mtp.cache.reset();
             }
+            // A fresh request has not yet decided whether it will take the MTP
+            // greedy/verify path (#1336 round 2) — `generate()` sets this back
+            // to `true` itself once `use_mtp` commits.
+            self.session.mtp_active = false;
             self.session.mtp_prefill_hidden.clear();
             if let Some(ref mut pool) = self.session.gdn_checkpoints {
                 pool.active_base_seq_len = None;
@@ -12196,6 +12224,7 @@ mod inner {
                     compact_route: GpuTopkRoute::CpuFallback,
                     compact_result: Vec::new(),
                     mtp: mtp_session,
+                    mtp_active: false,
                     gdn_checkpoints,
                     last_pre_final_hidden: vec![0.0f32; hidden],
                     mtp_prefill_hidden: Vec::new(),
@@ -24422,6 +24451,121 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        /// Issue #1336 round 2 (F1): `run_head` must key off THIS request's
+        /// own MTP activation (`session.mtp_active`), not off whether the
+        /// loaded checkpoint merely carries MTP weights
+        /// (`session.mtp.is_some()`). A checkpoint can ship MTP weights
+        /// while a specific request runs with MTP disabled
+        /// (`enable_mtp: Some(false)`, or simply a caller — like
+        /// `generate_multimodal_vision_impl`'s prefill loop — that never
+        /// takes `generate()`'s `use_mtp` branch at all); that combination
+        /// must still honor `emit_head=false`.
+        ///
+        /// Builds a session with MTP weights resident via the same
+        /// `metal_state_with_constant_zero_draft_mtp_for_test` fixture the
+        /// MTP-rollback tests above use (so `session.mtp.is_some() ==
+        /// true`), but drives `forward_step_mrope` directly — the same call
+        /// `generate_multimodal_vision_impl`'s prefill loop makes — without
+        /// ever calling `generate()`, so `session.mtp_active` stays at its
+        /// post-`reset_state()` default of `false`. This is exactly the
+        /// "MTP weights present, this request never activated MTP" case the
+        /// old `self.session.mtp.is_some()` gate could not distinguish from
+        /// "MTP weights present and this request is using them".
+        ///
+        /// Reuses `forward_step_mrope_emit_head_false_skips_terminal_head_dispatch`'s
+        /// poison/read_probe mechanism above: `emit_head=false` already
+        /// returns empty logits by contract whether or not the head actually
+        /// ran, so the only way to observe a stray dispatch is to poison the
+        /// shared logits buffer first and assert it survives untouched.
+        ///
+        /// Expected-redden check: before this fix, `run_head` computed
+        /// `emit_head || capture_hidden || self.session.mtp.is_some()`.
+        /// Reverting to that expression makes `run_head` evaluate to `true`
+        /// here purely from `session.mtp.is_some() == true` (both `emit_head`
+        /// and `capture_hidden` are `false`), so `encode_final_head` runs and
+        /// overwrites the sentinel — reddening only the final `assert_eq!`
+        /// below (the two `mtp_active` setup assertions above it stay green
+        /// either way, since they inspect the flag directly rather than
+        /// `run_head`'s output).
+        #[test]
+        fn forward_step_mrope_emit_head_false_skips_terminal_head_dispatch_with_mtp_weights_present_but_request_inactive()
+         {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
+            assert!(
+                state.session.mtp.is_some(),
+                "fixture setup: this test requires MTP weights to be resident — otherwise it \
+                 cannot distinguish the fixed gate from the pre-fix one"
+            );
+            assert!(
+                !state.session.mtp_active,
+                "fixture setup: a freshly-constructed session must not report MTP as active \
+                 for the request merely because the checkpoint carries MTP weights"
+            );
+
+            let probe_len = cfg.vocab_size.min(64);
+            let sentinel: f32 = -12_345.679;
+
+            // SAFETY: same as `forward_step_mrope_emit_head_false_skips_terminal_head_dispatch`
+            // above — `activations.logits` is StorageModeShared, no GPU work is in
+            // flight between test steps, and probe_len <= vocab_size.
+            let poison = |state: &MetalQwen35State| unsafe {
+                let ptr = state.session.activations.logits.contents() as *mut f32;
+                for i in 0..probe_len {
+                    *ptr.add(i) = sentinel;
+                }
+            };
+            let read_probe = |state: &MetalQwen35State| -> Vec<f32> {
+                unsafe {
+                    std::slice::from_raw_parts(
+                        state.session.activations.logits.contents() as *const f32,
+                        probe_len,
+                    )
+                    .to_vec()
+                }
+            };
+
+            state.reset_state();
+            assert!(
+                state.session.mtp.is_some(),
+                "reset_state must not clear MTP weight residency"
+            );
+            assert!(
+                !state.session.mtp_active,
+                "reset_state must clear any stale per-request MTP activation from a prior call"
+            );
+            poison(&state);
+
+            let subject_logits = state.forward_step_mrope(
+                7,
+                0,
+                None,
+                false,
+                crate::forward::signpost::Scope::NotDecode,
+            );
+            assert!(
+                subject_logits.is_empty(),
+                "emit_head=false must return no logits regardless of whether MTP weights are \
+                 resident on the checkpoint"
+            );
+            let after_false = read_probe(&state);
+            assert_eq!(
+                after_false,
+                vec![sentinel; probe_len],
+                "emit_head=false must skip the terminal RMSNorm + lm_head dispatch even when \
+                 the checkpoint carries MTP weights and this request never activated MTP — \
+                 gating on `self.session.mtp.is_some()` instead of the request's own \
+                 `mtp_active` flag would dispatch the head here and overwrite the sentinel, \
+                 which is exactly the #1336-round-2 defeat this test guards against"
+            );
+        }
+
         /// Issue #1336: `emit_head=false` on a non-final multimodal prefill
         /// position must not change what that position contributes to the
         /// residual stream, KV cache, or GDN recurrent state — only the
@@ -34963,29 +35107,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             MetalQwen35State::supports_gdn_chunked_prefill(&state.engine.config)
         }
 
-        #[cfg(test)]
-        mod tests {
-            use super::first_out_of_vocab;
-
-            #[test]
-            fn first_out_of_vocab_accepts_in_range() {
-                assert_eq!(first_out_of_vocab(&[0, 1, 99], 100), None);
-                assert_eq!(first_out_of_vocab(&[], 100), None);
-            }
-
-            #[test]
-            fn first_out_of_vocab_finds_first_offender() {
-                // Two offenders; the FIRST (index 1) must be reported.
-                assert_eq!(first_out_of_vocab(&[5, 200, 300], 100), Some((1, 200)));
-            }
-
-            #[test]
-            fn first_out_of_vocab_rejects_id_equal_to_vocab() {
-                // vocab_size itself is out of range (valid ids are 0..vocab_size).
-                assert_eq!(first_out_of_vocab(&[100], 100), Some((0, 100)));
-            }
-        }
-
         /// The session's `max_prefill` (single-command-buffer chunk cap; 512 for all
         /// current configs, `max_cache_len.min(512)`) — the caller-side chunking loop
         /// for [`forward_prefill_gdn_isolated_chunk`] must split prompts on this
@@ -35147,6 +35268,29 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 }
             }
             Ok(last_logits)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::first_out_of_vocab;
+
+            #[test]
+            fn first_out_of_vocab_accepts_in_range() {
+                assert_eq!(first_out_of_vocab(&[0, 1, 99], 100), None);
+                assert_eq!(first_out_of_vocab(&[], 100), None);
+            }
+
+            #[test]
+            fn first_out_of_vocab_finds_first_offender() {
+                // Two offenders; the FIRST (index 1) must be reported.
+                assert_eq!(first_out_of_vocab(&[5, 200, 300], 100), Some((1, 200)));
+            }
+
+            #[test]
+            fn first_out_of_vocab_rejects_id_equal_to_vocab() {
+                // vocab_size itself is out of range (valid ids are 0..vocab_size).
+                assert_eq!(first_out_of_vocab(&[100], 100), Some((0, 100)));
+            }
         }
     }
 }

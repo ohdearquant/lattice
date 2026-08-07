@@ -94,6 +94,34 @@ fn main() {
 ))]
 compile_error!("bench_vision_prefill_ab: MUST build --release (debug Metal timing is meaningless)");
 
+/// Rejects `repeats == 0` up front. Left unchecked, it leaves both timing
+/// vectors empty and [`median`]'s `v[v.len() / 2]` indexing panics deep
+/// inside the measurement loop — after the (slow) model load has already
+/// paid its cost. Fail with an operator-facing message before that point
+/// instead.
+fn validate_repeats(repeats: usize) -> Result<(), String> {
+    if repeats == 0 {
+        return Err(
+            "BENCH_REPEATS=0 would leave both timing vectors empty; set BENCH_REPEATS to a \
+             positive integer (default 5)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Sorts `values` in place and returns the median. Returns `Err` instead of
+/// panicking on an empty slice — [`validate_repeats`] is what keeps `run()`
+/// from ever reaching this on an empty vector, but the helper does not rely
+/// on that caller discipline to stay panic-free.
+fn median(values: &mut [f64]) -> Result<f64, String> {
+    if values.is_empty() {
+        return Err("median: cannot compute a median of an empty timing vector".to_string());
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in timing data"));
+    Ok(values[values.len() / 2])
+}
+
 #[cfg(all(
     target_os = "macos",
     feature = "metal-gpu",
@@ -124,6 +152,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
+    validate_repeats(repeats)?;
 
     eprintln!("[bench] loading {model_dir_str} (safetensors)");
     let model = Qwen35Model::from_safetensors(dir).map_err(|e| format!("load model: {e}"))?;
@@ -180,12 +209,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         optimized_ms.push(o);
     }
 
-    let median = |v: &mut Vec<f64>| -> f64 {
-        v.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in timing data"));
-        v[v.len() / 2]
-    };
-    let baseline_median = median(&mut baseline_ms);
-    let optimized_median = median(&mut optimized_ms);
+    let baseline_median = median(&mut baseline_ms)?;
+    let optimized_median = median(&mut optimized_ms)?;
     let delta_median_ms = baseline_median - optimized_median;
     let delta_median_pct = if baseline_median > 0.0 {
         100.0 * delta_median_ms / baseline_median
@@ -200,4 +225,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{median, validate_repeats};
+
+    #[test]
+    fn validate_repeats_rejects_zero() {
+        let err = validate_repeats(0).expect_err("BENCH_REPEATS=0 must be rejected");
+        assert!(
+            err.contains("BENCH_REPEATS=0"),
+            "error message must name the offending env var; got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_repeats_accepts_positive_values() {
+        assert!(validate_repeats(1).is_ok());
+        assert!(validate_repeats(5).is_ok());
+    }
+
+    #[test]
+    fn median_rejects_empty_slice_instead_of_panicking() {
+        let mut empty: Vec<f64> = Vec::new();
+        assert!(median(&mut empty).is_err());
+    }
+
+    #[test]
+    fn median_of_single_repeat_is_that_repeat() {
+        let mut v = vec![42.0];
+        assert_eq!(median(&mut v).unwrap(), 42.0);
+    }
+
+    #[test]
+    fn median_sorts_before_indexing() {
+        let mut v = vec![3.0, 1.0, 2.0];
+        assert_eq!(median(&mut v).unwrap(), 2.0);
+    }
 }
