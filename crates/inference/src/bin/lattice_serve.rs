@@ -2843,13 +2843,11 @@ mod imp {
             .map_err(|e| format!("config.json load failed: {e}"))?;
         let mut vision_runtime =
             VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
-        if preload_vision {
-            if let Err(err) = vision_runtime.preload() {
-                eprintln!(
-                    "[lattice_serve] WARNING: --preload-vision failed, falling back to lazy \
+        if preload_vision && let Err(err) = vision_runtime.preload() {
+            eprintln!(
+                "[lattice_serve] WARNING: --preload-vision failed, falling back to lazy \
                      vision loading: {err}"
-                );
-            }
+            );
         }
         let (
             owner,

@@ -24026,7 +24026,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             let cfg = model.config().clone();
             let probe_len = cfg.vocab_size.min(64);
-            let sentinel: f32 = -12345.6789;
+            let sentinel: f32 = -12_345.679;
             let mut state = MetalQwen35State::new(model.weights(), model.config(), 128)
                 .expect("real-checkpoint state");
 
