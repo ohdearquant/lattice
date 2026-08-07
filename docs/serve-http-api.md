@@ -81,14 +81,19 @@ pub fn router(state: AppState) -> Router {
 There is no `/v1/models`, `/v1/completions`, or any admin/metrics endpoint. If you need a model
 listing endpoint, that's `lattice_serve` (the other binary), not this one.
 
-Shut down with Ctrl-C — it's a graceful shutdown, not an immediate kill:
+Shut down with Ctrl-C, or with SIGTERM on Unix:
 
 ```
 ^CShutdown signal received, draining connections...
 ```
 
-(confirmed live: the process exits cleanly after printing this, rather than dropping in-flight
-connections.)
+The server stops accepting connections and gives tracked HTTP/1 connections up to five seconds to
+drain. If every connection cooperates, the process exits normally. If that interval expires, the
+server aborts the remaining connection tasks, allows up to three more seconds for cancellation
+cleanup, and then exits with status 1 even if cleanup completed during that second interval. This
+hard exit is a last resort: because it skips Rust destructors, it can truncate in-flight responses,
+leave files partially written, and discard unflushed telemetry. A second signal does not shorten
+these fixed shutdown intervals.
 
 ## Auth, rate limiting, and concurrency
 
@@ -185,6 +190,7 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     pub stop: Option<Value>,                         // string, or array of 1-4 non-empty strings
     pub seed: Option<u64>,
+    pub reasoning_budget: Option<usize>,             // optional; see "reasoning_budget" below
     pub response_format: Option<ResponseFormat>,     // only {"type": "text"} accepted
     pub tools: Option<Value>,                        // rejected if present
     pub tool_choice: Option<Value>,                  // rejected if present
@@ -193,11 +199,31 @@ pub struct ChatCompletionRequest {
 }
 ```
 
-`message.content` accepts either a plain string or an OpenAI-style content-parts array, but only
-`{"type": "text", "text": "..."}` parts — an image/audio/file part is rejected with 400, not
-silently dropped. `messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and
-`"developer"` are explicitly named and rejected (`"role 'tool' is not supported by this server"`);
-anything else gets a generic `"unsupported role '...'"` message.
+`reasoning_budget` (#831) sets an upper bound, in tokens, on Qwen3.5's `<think>...</think>`
+reasoning block before the final answer. Omitted or explicit `null` means no budget. An explicit
+`0` is treated the same as omitted (falls back to no budget), not as "force zero reasoning
+tokens." A malformed value — anything that isn't a positive integer scalar, e.g. a string or a
+nested object/array — is rejected with 400 `invalid_request_body`, the same as any other
+type-mismatched field on a profile that honors it; it is not silently ignored. When set, it is
+added to `max_tokens` for the context-admission check below (`prompt + max_tokens +
+reasoning_budget + 1 <= max_context`).
+
+`message.content` accepts either a plain string or an OpenAI-style content-parts array. Text parts
+use `{"type": "text", "text": "..."}`. A vision-capable Metal checkpoint also accepts one
+`{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` part on a user
+message; JPEG uses `data:image/jpeg;base64,...`. The image may appear between text parts and keeps
+that position in the rendered multimodal prompt. The decoded payload is capped at 48,000 bytes,
+and each serving image is capped at 256 pre-merge patches (overridable via the
+`LATTICE_VISION_MAX_PATCHES` environment variable, which falls back to 256 for any unset, empty,
+malformed, zero, or negative value) and 16 MiB of preprocessed patch data.
+Image requests must use `stream: false` (or omit `stream`) until the multimodal decoder supports
+incremental deltas. Remote URLs are never fetched, multi-image requests are rejected, and a
+text-only/CPU model returns 400 `vision_unsupported`. Audio/file parts remain unsupported rather
+than being silently dropped.
+
+`messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and `"developer"` are
+explicitly named and rejected (`"role 'tool' is not supported by this server"`); anything else
+gets a generic `"unsupported role '...'"` message.
 
 The struct's own doc comment on the `stream` field currently reads "SSE streaming — not yet
 supported; rejected with 400" — **this is stale and wrong**. Streaming is fully implemented (see
@@ -219,7 +245,9 @@ predict which error you'll get when more than one thing is wrong with a request:
    a user turn for the model to have something to respond to).
 6. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` are all in range.
 7. Every message renders into ChatML (role + content-part checks).
-8. The rendered prompt's token count plus `max_tokens` fits the model's context window.
+8. The rendered prompt's token count plus `max_tokens` plus `reasoning_budget` (plus one reserved
+   delimiter token) fits the model's context window (#831:
+   `prompt + max_tokens + reasoning_budget + 1 <= max_context`).
 9. `stop` parses into valid stop strings.
 
 ### Rejected requests — exact error shapes
@@ -358,11 +386,15 @@ Separately, for the Metal/Q4 backend specifically, the usable context window is 
 `MetalChatBackend::MAX_CACHE_LEN` (4096 tokens) regardless of the loaded model's actual
 `max_position_embeddings` (Qwen3.5-0.8B's config reports 262144) — `lattice doctor` will show you
 this cap directly (see [`docs/q4-quantization.md`](q4-quantization.md)). If your rendered prompt's
-token count plus `max_tokens` exceeds the effective context window, you get:
+token count plus `max_tokens` plus `reasoning_budget` (#831's full-window formula, see the
+validation-order step above) exceeds the effective context window, you get:
 
 ```
-{"error":{"message":"prompt (X tokens) plus max_tokens (Y) exceeds model context window (Z)","type":"invalid_request_error","code":"context_length_exceeded","param":null}}
+{"error":{"message":"prompt (X tokens) plus max_tokens (Y) plus reasoning_budget (R) exceeds model context window (Z): N tokens required","type":"invalid_request_error","code":"context_length_exceeded","param":null}}
 ```
+
+`R` is `0` when the request didn't set `reasoning_budget` — the message always names it, even for
+requests that never touched the field.
 
 The CPU (safetensors) backend doesn't have this particular cap — its `max_context()` comes from
 the model's own config — but the 4096 `max_tokens_cap` still applies to both backends equally.

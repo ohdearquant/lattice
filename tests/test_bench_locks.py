@@ -4,18 +4,18 @@
 The locking and ambient-load properties are about refusing rather than about
 measuring.
 
-The body refuses to measure unless the PID recorded in the lock status is one of
-its own ancestors. scripts/bench-compare.sh runs the measurement body under
-scripts/lib/bench-locks.py, which records its own PID after taking both
-machine-wide locks.
+The dedicated Python supervisor refuses to measure unless it holds inherited
+lock descriptors verified by fstat identity against the recorded lock paths
+and a non-blocking flock re-acquire. scripts/bench-compare.sh routes the body
+through that supervisor, which retains both descriptors and gives the shell
+only a non-lock handoff pipe.
 
-Stated exactly, because the tempting claim is one word wider than the truth: the
-file supplies the PID and the OS supplies the chain, so the check establishes a
-RELATION. It refuses a status file left over from a finished run, one copied
-from a different run, and accidental direct invocation -- the ways this actually
-gets run without isolation. It does not stop a caller who deliberately records
-an ancestor's PID. Closing that needs the lock descriptor rather than a PID, and
-arrives with the nested-acquirer work.
+A PID recorded in the lock status and found in this process's ancestry is only
+a RELATION, never a proof: the file supplies the PID and the OS supplies the
+chain, so a caller willing to record an ancestor's own PID -- its own shell's
+included -- used to get through with neither lock held. The dedicated supervisor
+requires both descriptor capabilities, and the body refuses a status receipt
+that arrives without its cooperative handoff pipe.
 
 A check that merely asserted the file exists would refuse none of the above.
 
@@ -51,6 +51,11 @@ STATE_PROBE = LIB / "machine-state-probe.py"
 HOST_ID = LIB / "bench-host-id.py"
 
 STUB_CARGO = """#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+elif [[ " $* " != *" --no-run "* ]]; then
+  printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
+fi
 exit 0
 """
 
@@ -152,8 +157,21 @@ class _Sandbox:
             'name = "criterion"\n'
             'version = "0.5.1"\n'
         )
+        # Declared-group reconciliation reads crates/<crate>/benches/<target>.rs
+        # from the checked-out worktree; the default targets need a stub here
+        # or bench-compare-impl.sh refuses with no declared-group source.
+        inference_benches = self.root / "crates" / "inference" / "benches"
+        inference_benches.mkdir(parents=True)
+        (inference_benches / "elementwise_cpu_bench.rs").write_text(
+            'let mut group = c.benchmark_group("rms_norm");\n'
+        )
+        embed_benches = self.root / "crates" / "embed" / "benches"
+        embed_benches.mkdir(parents=True)
+        (embed_benches / "simd.rs").write_text(
+            'let mut group = c.benchmark_group("simd_dot_product");\n'
+        )
         subprocess.run(
-            [*GIT, "-C", str(self.root), "add", "-f", "Cargo.lock"],
+            [*GIT, "-C", str(self.root), "add", "-f", "Cargo.lock", "crates"],
             check=True,
         )
         for i in range(2):
@@ -243,46 +261,38 @@ class LockPrecondition(unittest.TestCase):
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
             self.assertIn("no lock status", r.stderr)
 
-    def test_status_file_naming_a_non_ancestor_is_refused(self):
-        """A status file is not evidence unless its PID is really an ancestor.
+    def test_status_file_without_supervisor_handoff_is_refused(self):
+        """A status file without the supervisor handoff is only text.
 
-        Mutation-sensitive: replace the ancestry walk with a file-exists check
-        and this hand-written file satisfies it, which is the whole failure mode
-        the walk exists to remove. PID 1 is chosen because it always exists and
-        is never the parent chain of a test subprocess.
+        Mutation-sensitive: removing the handoff precondition lets this
+        caller-controlled receipt reach the measurement body directly.
         """
         with _Sandbox() as sb:
             sb.status.parent.mkdir(parents=True, exist_ok=True)
             sb.status.write_text("supervisor_pid=1\nlock=fabricated\n")
             r = sb.run([sb.impl], BENCH_IDLE_FLOOR="0")
             self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
-            self.assertIn("ancestor", r.stderr)
+            self.assertIn("LATTICE_BENCH_SUPERVISOR_FD", r.stderr)
+            self.assertNotIn("Run conditions", r.stdout)
 
-    def test_deliberately_recorded_ancestor_pid_is_accepted(self):
-        """The boundary of the guard, pinned as a fact rather than left in prose.
+    def test_deliberately_recorded_ancestor_pid_alone_is_refused(self):
+        """A caller-supplied ancestor PID is a relation, never a proof.
 
-        A caller who records a PID that really is one of its ancestors -- its own
-        shell, here -- passes the check with no lock held. That is the limit of
-        what a PID can establish: the file supplies the number, the OS confirms
-        only the relation.
+        A caller who records a PID that really is one of its ancestors -- its
+        own shell, here -- used to pass the check with no lock held, which is
+        exactly the stale-environment bypass: an exported status made an ordinary
+        invocation failure read as a supervised run. The body now requires the
+        dedicated supervisor's descriptor-free handoff, so this receipt-only
+        invocation is refused before the run-conditions banner.
 
-        This is a characterization test, not a wish. It exists so the comment
-        describing that limit cannot drift away from the code: strengthen the
-        guard to close this and the test fails, which is the signal to update
-        every place the limit is described.
+        Mutation-sensitive: reintroduce the ancestry-walk fallback and this run
+        reaches "Run conditions" again with neither lock held.
         """
         with _Sandbox() as sb:
             sb.status.parent.mkdir(parents=True, exist_ok=True)
             script = (
                 f'echo "supervisor_pid=$$" > {sb.status}\n'
                 f'echo "lock=fabricated, nothing is held" >> {sb.status}\n'
-                # The recording shell must stay alive as the parent. Two ways to
-                # lose it, both of which make the body inherit that PID as its
-                # OWN and get refused (the walk starts at PPID, so self never
-                # matches): an explicit `exec`, and bash's implicit exec of the
-                # LAST simple command in a -c script. The trailing statement
-                # below defeats the second. An interactive operator typing the
-                # command hits neither, which is the case being characterized.
                 f'bash {sb.impl} HEAD~1 HEAD\n'
                 'rc=$?\n'
                 'exit "$rc"\n'
@@ -290,32 +300,9 @@ class LockPrecondition(unittest.TestCase):
             r = subprocess.run(
                 ["bash", "-c", script], capture_output=True, text=True,
                 env={**sb.env, "BENCH_IDLE_FLOOR": "0"}, timeout=300)
-            self.assertNotIn("not an ancestor", r.stderr)
-            self.assertIn("Run conditions", r.stdout, f"stderr:\n{r.stderr}")
-
-    def test_ancestry_walk_refuses_with_a_diagnostic_when_ps_fails(self):
-        """A walk that cannot complete refuses, and says which case it is.
-
-        Under `set -o pipefail` a failing ps propagates out of the assignment
-        and `set -e` exits with ps's own status before the refusal is reached,
-        so the caller gets a bare 1 or 126 and no message. Still fail-closed,
-        but silently and with the wrong status, and it fires on the ordinary
-        case of an ancestor exiting mid-walk, not only where process inspection
-        is denied.
-
-        Mutation-sensitive: restore the bare `pid="$(ps ... | tr -d ' ')"`
-        assignment and this exits 1 with no diagnostic instead of 2 with one.
-        """
-        with _Sandbox() as sb, tempfile.TemporaryDirectory() as shim:
-            sb.status.parent.mkdir(parents=True, exist_ok=True)
-            sb.status.write_text("supervisor_pid=1\nlock=fabricated\n")
-            ps = Path(shim) / "ps"
-            ps.write_text("#!/usr/bin/env bash\nexit 1\n")
-            ps.chmod(0o755)
-            r = sb.run([sb.impl], BENCH_IDLE_FLOOR="0",
-                       PATH=f"{shim}:{sb.env['PATH']}")
-            self.assertEqual(r.returncode, 2, f"stderr:\n{r.stderr}")
-            self.assertIn("could not walk", r.stderr)
+            self.assertEqual(r.returncode, 2, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
+            self.assertIn("LATTICE_BENCH_SUPERVISOR_FD", r.stderr)
+            self.assertNotIn("Run conditions", r.stdout)
 
     def test_supervised_run_reaches_the_measurement(self):
         """Through the entry point the check passes and the body runs.
@@ -397,6 +384,9 @@ class HeadModeReporting(unittest.TestCase):
                 f'if [[ "$PWD" == *"/.cache/bench-compare-head" ]]; then\n'
                 f'  printf "%s\\n" changed > "{sb.root}/f1.txt"\n'
                 "fi\n"
+                'if [[ "${1:-}" != "--version" && " $* " != *" --no-run "* ]]; then\n'
+                "  printf '%s\\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'\n"
+                "fi\n"
                 "exit 0\n"
             )
             cargo.chmod(0o755)
@@ -421,6 +411,9 @@ class HeadModeReporting(unittest.TestCase):
                 f'  original="$(cat "{sb.root}/f1.txt")"\n'
                 f'  printf "%s" mutated-during-run > "{sb.root}/f1.txt"\n'
                 f'  printf "%s" "$original" > "{sb.root}/f1.txt"\n'
+                "fi\n"
+                'if [[ "${1:-}" != "--version" && " $* " != *" --no-run "* ]]; then\n'
+                "  printf '%s\\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'\n"
                 "fi\n"
                 "exit 0\n"
             )
@@ -454,6 +447,9 @@ class HeadModeReporting(unittest.TestCase):
                 "add f1.txt\n"
                 "  git -c core.hooksPath=/dev/null -c user.name=t -c user.email=t "
                 "commit -qm committed-during-run\n"
+                "fi\n"
+                'if [[ "${1:-}" != "--version" && " $* " != *" --no-run "* ]]; then\n'
+                "  printf '%s\\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'\n"
                 "fi\n"
                 "exit 0\n"
             )
@@ -525,7 +521,7 @@ class RunProvenanceHandoff(unittest.TestCase):
             ]
             self.assertEqual(
                 [state["label"] for state in states],
-                ["before base", "between phases", "after head"],
+                ["before first arm", "between order strata", "after final arm"],
             )
             self.assertTrue(
                 all(
@@ -693,7 +689,7 @@ class MachineStateGate(unittest.TestCase):
             self.assertEqual(r.returncode, 0, f"stderr:\n{r.stderr}")
             self.assertEqual(
                 sb.machine_state_labels(),
-                ["before base", "between phases", "after head"],
+                ["before first arm", "between order strata", "after final arm"],
             )
             _, separator, report = r.stdout.partition("=== Run conditions ===")
             self.assertTrue(separator, r.stdout)
@@ -705,7 +701,7 @@ class MachineStateGate(unittest.TestCase):
             ]
             self.assertEqual(
                 [state["label"] for state in states],
-                ["before base", "between phases", "after head"],
+                ["before first arm", "between order strata", "after final arm"],
             )
             self.assertTrue(
                 all(
@@ -726,55 +722,39 @@ class MachineStateGate(unittest.TestCase):
                 STUB_GOVERNOR_RC="2",
             )
             self.assertEqual(r.returncode, 2, f"stdout:\n{r.stdout}")
-            self.assertEqual(sb.machine_state_labels(), ["before base"])
-            self.assertIn("machine-state checkpoint 'before base' failed", r.stderr)
+            self.assertEqual(sb.machine_state_labels(), ["before first arm"])
+            self.assertIn(
+                "machine-state checkpoint 'before first arm' failed", r.stderr
+            )
             self.assertNotIn("Building + benching BASE", r.stdout)
 
-    def test_blocked_macos_checkpoint_reports_or_refuses_by_enforcement_mode(self):
-        with _Sandbox() as sb:
-            sb.force_platform("Darwin")
-            report_only = sb.run(
-                [sb.entry],
-                BENCH_IDLE_FLOOR="0",
-                STUB_GOVERNOR_RC="2",
-            )
-            self.assertEqual(
-                report_only.returncode,
-                0,
-                f"stdout:\n{report_only.stdout}\nstderr:\n{report_only.stderr}",
-            )
-            self.assertIn("Building + benching BASE", report_only.stdout)
-            self.assertIn("=== Run conditions ===", report_only.stdout)
-            self.assertIn("gate blocked (fixture block)", report_only.stdout)
-            self.assertIn(
-                "unsuitable as benchmark evidence",
-                report_only.stdout,
-            )
-            provenance = sb.root / ".cache" / "bench-run-provenance.txt"
-            states = [
-                json.loads(line.removeprefix("machine_state="))
-                for line in provenance.read_text().splitlines()
-                if line.startswith("machine_state=")
-            ]
-            self.assertEqual(len(states), 3)
-            self.assertTrue(
-                all(state["gate"]["status"] == "blocked" for state in states)
-            )
-
-        with _Sandbox() as sb:
-            sb.force_platform("Darwin")
-            enforcing = sb.run(
-                [sb.entry, "--fail-on-regression"],
-                BENCH_IDLE_FLOOR="0",
-                STUB_GOVERNOR_RC="2",
-            )
-            self.assertEqual(enforcing.returncode, 2, enforcing.stdout)
-            self.assertEqual(sb.machine_state_labels(), ["before base"])
-            self.assertIn(
-                "machine-state checkpoint 'before base' failed",
-                enforcing.stderr,
-            )
-            self.assertNotIn("Building + benching BASE", enforcing.stdout)
+    def test_blocked_macos_checkpoint_refuses_in_every_mode(self):
+        modes = {
+            "report-only": [],
+            "fail-on-regression": ["--fail-on-regression"],
+        }
+        self.assertGreater(len(modes), 0)
+        for mode, extra_args in modes.items():
+            with self.subTest(mode=mode), _Sandbox() as sb:
+                self.assertTrue(mode)
+                sb.force_platform("Darwin")
+                result = sb.run(
+                    [sb.entry, *extra_args],
+                    BENCH_IDLE_FLOOR="0",
+                    STUB_GOVERNOR_RC="2",
+                )
+                self.assertEqual(
+                    result.returncode,
+                    2,
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertEqual(sb.machine_state_labels(), ["before first arm"])
+                self.assertIn(
+                    "machine-state checkpoint 'before first arm' failed",
+                    result.stderr,
+                )
+                self.assertNotIn("Building + benching BASE", result.stdout)
+                self.assertNotIn("=== Run conditions ===", result.stdout)
 
 
 class ContentionDiagnostics(unittest.TestCase):
@@ -958,5 +938,234 @@ class AmbientLoadGate(unittest.TestCase):
             )
 
 
+class PreMeasurementSetupFailures(unittest.TestCase):
+    """A setup failure before any lock or measurement must exit 2, not 1.
+
+    scripts/lib/bench_supervision.py's status-directory mkdir and
+    scripts/lib/bench-locks.py's pending-marker mkdir both run before any
+    lock is held or any measurement command starts. An uncaught FileExistsError
+    there used to escape as Python's raw exit 1 -- the status this contract
+    reserves for a confirmed regression.
+    """
+
+    def test_supervision_status_dir_regular_file_refuses_with_exit_2(self):
+        """Mutation-sensitive: revert the try/except around ``status.parent.mkdir``
+        in bench_supervision.py's run_supervised and this run's exit code flips
+        from 2 to an uncaught-traceback 1."""
+        with _Sandbox() as sb:
+            cache_dir = sb.root / ".cache"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            (cache_dir / "bench-supervision").write_text("occupied")
+            helper = sb.root / "scripts" / "lib" / "bench_supervision.py"
+            r = subprocess.run(
+                [sys.executable, str(helper), "run", "--label", "bench-compare",
+                 "--", "/usr/bin/true"],
+                capture_output=True, text=True, cwd=str(sb.root), timeout=30)
+            self.assertEqual(
+                r.returncode, 2,
+                f"expected exit 2 (setup failure), got {r.returncode}\n"
+                f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
+            self.assertIn("cannot create", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_pending_marker_regular_file_refuses_with_exit_2(self):
+        """Mutation-sensitive: revert the try/except around the setup block
+        (PENDING_DIR mkdir through the status-file write) in bench-locks.py's
+        main() and this run's exit code flips from 2 to an uncaught-traceback 1.
+        """
+        with _Sandbox() as sb:
+            locks_path = sb.root / "scripts" / "lib" / "bench-locks.py"
+            match = re.search(r'^PENDING_DIR = "([^"]*)"$', locks_path.read_text(), re.M)
+            self.assertIsNotNone(match, "PENDING_DIR constant not found")
+            pending_dir = Path(match.group(1))
+            pending_dir.parent.mkdir(parents=True, exist_ok=True)
+            pending_dir.write_text("occupied")
+            status_file = sb.root.parent / "bench-locks-status-test.txt"
+            r = subprocess.run(
+                [sys.executable, str(locks_path), "--label", "test",
+                 "--status-file", str(status_file), "--", "/usr/bin/true"],
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(
+                r.returncode, 2,
+                f"expected exit 2 (setup failure), got {r.returncode}\n"
+                f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}")
+            self.assertIn("cannot prepare bench-lock setup", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+
+class SupervisionShellHelperFailures(unittest.TestCase):
+    """scripts/lib/bench-supervision.sh's helpers must not leak a raw exit 1.
+
+    Both bench_supervise_entry and bench_quiet_checkpoint resolve their own
+    repo root via an unguarded ``cd "$(dirname "${BASH_SOURCE[0]}")/../.."``
+    and, on refusal, write a FATAL diagnostic to fd 2 before their explicit
+    ``exit 2``. Under a caller's `set -e` (every real caller has one), a
+    failing root resolution or a closed-stderr diagnostic write is itself a
+    failing command and aborts with the shell's own exit 1 before the
+    explicit ``exit 2`` is ever reached.
+
+    Each helper's root-resolution guard is a separate copy in a separate
+    function, so each gets its own mutation-sensitive test:
+    test_root_resolution_failure_exits_2 (bench_quiet_checkpoint) and
+    test_supervise_entry_root_resolution_failure_exits_2
+    (bench_supervise_entry). The closed-stderr diagnostic-write guard is
+    tested once, against the branch it can actually reach; see
+    test_closed_stderr_quiet_probe_diagnostic_still_exits_2's docstring.
+    """
+
+    def test_root_resolution_failure_exits_2(self):
+        """Mutation-sensitive: revert the `if ! repo=... ; then ... fi` guard
+        around `bench_quiet_checkpoint`'s own `cd` in bench-supervision.sh
+        and this run's exit code flips from 2 to a raw 1 (or an unhandled
+        `set -e` abort). See test_supervise_entry_root_resolution_failure_exits_2
+        for the same guard on `bench_supervise_entry`'s separate `cd`.
+
+        `BASH_SOURCE[0]` for a function *defined inline inside a `bash -c`
+        string* is not reliably the argv0 passed alongside that string --
+        that binding is bash-build-dependent (confirmed to differ between
+        the Homebrew and system bash on this machine). A test that sets
+        argv0 to a nonexistent path and expects the guard's `cd` to fail on
+        that basis can pass locally and fail on CI (or vice versa) purely
+        because of which bash resolved BASH_SOURCE[0] to an empty string,
+        making `dirname` default to the process's cwd -- a real directory
+        the `cd` happily enters, so the guard never fires.
+
+        `BASH_SOURCE[0]` set by the `source` builtin, by contrast, is
+        pinned to the exact path given to `source` on every bash build:
+        there is no argv0 indirection to lose. So this test sources a real,
+        on-disk copy of the helper (giving BASH_SOURCE[0] a value no bash
+        version can second-guess), then deletes that copy's repo-root
+        ancestor *after* sourcing but *before* calling the function --
+        the function body was already parsed into memory, but the `cd`
+        it performs at call time now targets a directory that provably
+        does not exist, regardless of the test process's own cwd.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            vanished_root = Path(tmp) / "vanished-repo-root"
+            (vanished_root / "scripts" / "lib").mkdir(parents=True)
+            shutil.copy2(
+                LIB / "bench-supervision.sh",
+                vanished_root / "scripts" / "lib" / "bench-supervision.sh")
+            shutil.copy2(
+                LIB / "bench-python.sh",
+                vanished_root / "scripts" / "lib" / "bench-python.sh")
+            helper_path = vanished_root / "scripts" / "lib" / "bench-supervision.sh"
+            script = (
+                'set -e\n'
+                f'source "{helper_path}"\n'
+                f'rm -rf "{vanished_root}"\n'
+                'bench_quiet_checkpoint test-label\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            r.returncode, 2,
+            f"expected exit 2, got {r.returncode}\nstdout:\n{r.stdout}\n"
+            f"stderr:\n{r.stderr}")
+        self.assertIn(
+            "FATAL: cannot resolve the repository root", r.stderr,
+            "exit 2 alone does not pin this to the root-resolution guard; "
+            "bench_quiet_checkpoint's other failure branch (the quiet-probe "
+            "refusal) also exits 2 with a different message, so the "
+            f"guard-specific text must be present.\nstderr:\n{r.stderr}")
+
+    def test_supervise_entry_root_resolution_failure_exits_2(self):
+        """Mutation-sensitive: revert the `if ! repo=... ; then ... fi` guard
+        around bench_supervise_entry's own `cd` in bench-supervision.sh and
+        this run's exit code flips from 2 to a raw 1 (or an unhandled
+        `set -e` abort).
+
+        bench_supervise_entry resolves the repo root with the same unguarded
+        `cd "$(dirname "${BASH_SOURCE[0]}")/../.."` pattern as
+        bench_quiet_checkpoint, but as a separate copy in a separate
+        function -- reverting one function's guard leaves the other's
+        intact, so a test that only ever calls bench_quiet_checkpoint proves
+        nothing about this guard. Root resolution runs before
+        bench_supervise_entry inspects LATTICE_BENCH_LOCK_STATUS or any of
+        its other arguments, so a bare label/mode/measurement triple is
+        enough to reach it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            vanished_root = Path(tmp) / "vanished-repo-root"
+            (vanished_root / "scripts" / "lib").mkdir(parents=True)
+            shutil.copy2(
+                LIB / "bench-supervision.sh",
+                vanished_root / "scripts" / "lib" / "bench-supervision.sh")
+            shutil.copy2(
+                LIB / "bench-python.sh",
+                vanished_root / "scripts" / "lib" / "bench-python.sh")
+            helper_path = vanished_root / "scripts" / "lib" / "bench-supervision.sh"
+            script = (
+                'set -e\n'
+                f'source "{helper_path}"\n'
+                f'rm -rf "{vanished_root}"\n'
+                'bench_supervise_entry test-label direct dummy_measurement\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            r.returncode, 2,
+            f"expected exit 2, got {r.returncode}\nstdout:\n{r.stdout}\n"
+            f"stderr:\n{r.stderr}")
+        self.assertIn(
+            "FATAL: cannot resolve the repository root", r.stderr,
+            "exit 2 alone does not pin this to the root-resolution guard.\n"
+            f"stderr:\n{r.stderr}")
+
+    def test_closed_stderr_quiet_probe_diagnostic_still_exits_2(self):
+        """Mutation-sensitive: drop the `|| :` from the quiet-probe-refusal
+        echo in bench_quiet_checkpoint and this closed-stderr run flips from
+        2 to 1.
+
+        The fixture below builds a valid, on-disk repo root, so
+        bench_quiet_checkpoint's root-resolution `cd` succeeds and this test
+        never reaches the FATAL root-resolution branch or its diagnostic
+        printfs -- only quiet-probe.py's forced failure and the "machine was
+        not quiet" echo that follows it. A scratch mutant confirms both
+        halves: dropping `|| :` from the FATAL printfs (the unreached
+        branch) leaves this run at exit 2 unchanged, while dropping it from
+        this quiet-probe echo (the reached branch) flips the run to exit 1
+        under `set -e`. test_root_resolution_failure_exits_2 above is the
+        one that pins the FATAL branch, via a fixture that deletes the repo
+        root instead of building one.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            (root / "scripts" / "lib").mkdir(parents=True)
+            shutil.copy2(LIB / "bench-supervision.sh", root / "scripts" / "lib")
+            shutil.copy2(LIB / "bench-python.sh", root / "scripts" / "lib")
+            (root / "scripts" / "lib" / "quiet-probe.py").write_text(
+                "#!/usr/bin/env python3\nraise SystemExit(1)\n"
+            )
+            script = (
+                'set -e\n'
+                f'source "{root / "scripts" / "lib" / "bench-supervision.sh"}"\n'
+                'bench_quiet_checkpoint "closed-stderr-test" 2>&-\n'
+            )
+            r = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            r.returncode, 2,
+            f"expected exit 2, got {r.returncode}\nstdout:\n{r.stdout}")
+
+
+def load_tests(
+    loader: unittest.TestLoader,
+    tests: unittest.TestSuite,
+    pattern: str | None,
+) -> unittest.TestSuite:
+    del loader, pattern
+    if tests.countTestCases() == 0:
+        raise RuntimeError("no tests collected from tests.test_bench_locks")
+    return tests
+
+
+class _FailOnEmptyTestProgram(unittest.TestProgram):
+    def runTests(self) -> None:
+        if self.test.countTestCases() == 0:
+            raise SystemExit("no tests collected")
+        super().runTests()
+
+
 if __name__ == "__main__":
-    unittest.main()
+    _FailOnEmptyTestProgram()

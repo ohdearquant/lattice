@@ -7,7 +7,6 @@ debug
 
 # Cargo
 **/*.rs.bk
-Cargo.lock
 
 # IDE
 .idea/
@@ -69,6 +68,16 @@ Thumbs.db
 # Review scratch artifacts (repo-root only)
 /review*.md
 /pr_review*.md
+
+# Local analysis scratch produced at the repository root. These are working
+# notes, not source, and they are easy to sweep into a commit with `git add -A`.
+# Every pattern here is root-anchored on purpose: an unanchored `*_report.md`
+# would also match tracked paths such as .github/ISSUE_TEMPLATE/bug_report.md.
+/*_report.md
+/*_verdict.md
+/verdict*.md
+/FIX_INPUTS/
+/REVIEW_INPUTS/
 
 *__pycache__/
 uv.lock

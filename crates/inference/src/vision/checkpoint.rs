@@ -13,7 +13,7 @@
 //! S1/S2. This module only loads the real tensors as flat data; it does not
 //! wire them into any forward pass.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::InferenceError;
@@ -125,14 +125,31 @@ pub fn load_qwen35_vision_weights(
     model_dir: &Path,
     vision_cfg: &VisionModelConfig,
 ) -> Result<Qwen35VisionWeights, InferenceError> {
+    let mut never_cancel = || false;
+    match load_qwen35_vision_weights_with_cancel(model_dir, vision_cfg, &mut never_cancel)? {
+        Some(weights) => Ok(weights),
+        None => Err(InferenceError::Inference(
+            "non-cancellable vision weight load was cancelled".to_string(),
+        )),
+    }
+}
+
+pub(crate) fn load_qwen35_vision_weights_with_cancel(
+    model_dir: &Path,
+    vision_cfg: &VisionModelConfig,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Result<Option<Qwen35VisionWeights>, InferenceError> {
+    if should_cancel() {
+        return Ok(None);
+    }
     // Callers can construct `VisionModelConfig` directly (it's a public struct), so this
     // boundary re-validates rather than trusting that every caller went through
     // `Qwen35Config::from_config_json_str`'s parse-time check.
     vision_cfg.validate()?;
     if model_dir.join("quantize_index.json").exists() {
-        load_from_q4_dir(model_dir, vision_cfg)
+        load_from_q4_dir_with_cancel(model_dir, vision_cfg, should_cancel)
     } else if model_dir.join("model.safetensors.index.json").exists() {
-        load_from_fp16_dir(model_dir, vision_cfg)
+        load_from_fp16_dir_with_cancel(model_dir, vision_cfg, should_cancel)
     } else {
         Err(InferenceError::ModelNotFound(format!(
             "no model.safetensors.index.json or quantize_index.json in {} -- cannot load \
@@ -140,6 +157,96 @@ pub fn load_qwen35_vision_weights(
             model_dir.display()
         )))
     }
+}
+
+/// Validate the exact vision tensor inventory without materializing tensor data.
+///
+/// This is the serving capability preflight: every expected `model.visual.*`
+/// name must occur exactly once and every referenced shard/file must be
+/// openable before HTTP request normalization advertises vision support.
+pub fn validate_qwen35_vision_weight_inventory(
+    model_dir: &Path,
+    vision_cfg: &VisionModelConfig,
+) -> Result<(), InferenceError> {
+    vision_cfg.validate()?;
+    let expected: HashSet<String> = tensor_names(vision_cfg).into_iter().collect();
+    if model_dir.join("quantize_index.json").exists() {
+        let manifest = q4_manifest::load_manifest(model_dir)
+            .map_err(|err| {
+                InferenceError::InvalidSafetensors(format!(
+                    "failed to read quantize_index.json in {}: {err}",
+                    model_dir.display()
+                ))
+            })?
+            .ok_or_else(|| {
+                InferenceError::ModelNotFound(format!(
+                    "quantize_index.json missing in {}",
+                    model_dir.display()
+                ))
+            })?;
+        let mut actual = HashSet::with_capacity(expected.len());
+        for entry in manifest
+            .tensors
+            .iter()
+            .filter(|entry| entry.name.starts_with("model.visual."))
+        {
+            if !actual.insert(entry.name.clone()) {
+                return Err(InferenceError::Inference(format!(
+                    "vision checkpoint manifest in {} contains duplicate tensor {}",
+                    model_dir.display(),
+                    entry.name
+                )));
+            }
+            let _ = open_manifest_entry_once(model_dir, &entry.file)?;
+        }
+        if actual != expected {
+            return Err(InferenceError::Inference(format!(
+                "vision checkpoint inventory mismatch in {}: found {} unique model.visual.* \
+                 tensor(s), expected {} for depth {}",
+                model_dir.display(),
+                actual.len(),
+                expected.len(),
+                vision_cfg.depth
+            )));
+        }
+        return Ok(());
+    }
+
+    let index_path = model_dir.join("model.safetensors.index.json");
+    if index_path.exists() {
+        let reader = ShardedSafetensors::open_index(&index_path)?;
+        let actual: HashSet<String> = reader
+            .index()
+            .weight_map
+            .keys()
+            .filter(|name| name.starts_with("model.visual."))
+            .cloned()
+            .collect();
+        if actual != expected {
+            return Err(InferenceError::Inference(format!(
+                "vision checkpoint inventory mismatch in {}: found {} unique model.visual.* \
+                 tensor(s), expected {} for depth {}",
+                index_path.display(),
+                actual.len(),
+                expected.len(),
+                vision_cfg.depth
+            )));
+        }
+        let shards: HashSet<&str> = expected
+            .iter()
+            .filter_map(|name| reader.index().weight_map.get(name).map(String::as_str))
+            .collect();
+        for shard in shards {
+            let _ = open_manifest_entry_once(model_dir, shard)?;
+        }
+        return Ok(());
+    }
+
+    Err(InferenceError::ModelNotFound(format!(
+        "no model.safetensors.index.json or quantize_index.json in {} -- cannot validate \
+         model.visual.* vision tensors",
+        model_dir.display()
+    )))
 }
 
 /// The 153 real tensor names for a `depth`-block checkpoint (used to drive the fp16
@@ -184,7 +291,7 @@ fn tensor_names(vision_cfg: &VisionModelConfig) -> Vec<String> {
 fn expected_visual_tensor_shape(name: &str, vision_cfg: &VisionModelConfig) -> Option<Vec<usize>> {
     let hidden = vision_cfg.hidden_size;
     let qkv_out = 3 * hidden;
-    let mlp_intermediate = 4 * hidden;
+    let mlp_intermediate = vision_cfg.intermediate_size.unwrap_or(4 * hidden);
     let merge_in = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size * hidden;
     let out_hidden = vision_cfg.out_hidden_size;
 
@@ -223,12 +330,19 @@ fn expected_visual_tensor_shape(name: &str, vision_cfg: &VisionModelConfig) -> O
     }
 }
 
-fn load_from_fp16_dir(
+fn load_from_fp16_dir_with_cancel(
     model_dir: &Path,
     vision_cfg: &VisionModelConfig,
-) -> Result<Qwen35VisionWeights, InferenceError> {
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Result<Option<Qwen35VisionWeights>, InferenceError> {
+    if should_cancel() {
+        return Ok(None);
+    }
     let index_path = model_dir.join("model.safetensors.index.json");
     let mut reader = ShardedSafetensors::open_index(&index_path)?;
+    if should_cancel() {
+        return Ok(None);
+    }
 
     let expected_names = tensor_names(vision_cfg);
     // Inventory-exactness: this path only ever fetches the names it asks for, so an
@@ -252,8 +366,15 @@ fn load_from_fp16_dir(
         )));
     }
 
-    let tensors = fetch_expected_tensors(&mut reader, expected_names, vision_cfg)?;
-    assemble(tensors, vision_cfg)
+    let Some(tensors) =
+        fetch_expected_tensors_with_cancel(&mut reader, expected_names, vision_cfg, should_cancel)?
+    else {
+        return Ok(None);
+    };
+    if should_cancel() {
+        return Ok(None);
+    }
+    assemble(tensors, vision_cfg).map(Some)
 }
 
 /// Fetch every name in `names` from `source`, checking each one's header-declared shape
@@ -262,13 +383,35 @@ fn load_from_fp16_dir(
 /// rejected here instead of after a full owned read and allocation. Generic over
 /// `TensorSource` (rather than inlined into `load_from_fp16_dir`) so tests can exercise
 /// the preflight-before-materialize ordering with a mock source.
+#[cfg(test)]
 fn fetch_expected_tensors<T: TensorSource + ?Sized>(
     source: &mut T,
     names: Vec<String>,
     vision_cfg: &VisionModelConfig,
 ) -> Result<NamedTensors, InferenceError> {
+    let mut never_cancel = || false;
+    match fetch_expected_tensors_with_cancel(source, names, vision_cfg, &mut never_cancel)? {
+        Some(tensors) => Ok(tensors),
+        None => Err(InferenceError::Inference(
+            "non-cancellable vision tensor fetch was cancelled".to_string(),
+        )),
+    }
+}
+
+fn fetch_expected_tensors_with_cancel<T: TensorSource + ?Sized>(
+    source: &mut T,
+    names: Vec<String>,
+    vision_cfg: &VisionModelConfig,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Result<Option<NamedTensors>, InferenceError> {
+    if should_cancel() {
+        return Ok(None);
+    }
     let mut tensors = HashMap::with_capacity(names.len());
     for name in names {
+        if should_cancel() {
+            return Ok(None);
+        }
         if let Some(expected) = expected_visual_tensor_shape(&name, vision_cfg)
             && let Some(declared) = source.tensor_shape(&name)?
             && declared != expected
@@ -300,13 +443,20 @@ fn fetch_expected_tensors<T: TensorSource + ?Sized>(
         let (data, shape) = source.get_f32_tensor_owned(&name)?;
         tensors.insert(name, (data, shape));
     }
-    Ok(tensors)
+    if should_cancel() {
+        return Ok(None);
+    }
+    Ok(Some(tensors))
 }
 
-fn load_from_q4_dir(
+fn load_from_q4_dir_with_cancel(
     model_dir: &Path,
     vision_cfg: &VisionModelConfig,
-) -> Result<Qwen35VisionWeights, InferenceError> {
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Result<Option<Qwen35VisionWeights>, InferenceError> {
+    if should_cancel() {
+        return Ok(None);
+    }
     let manifest = q4_manifest::load_manifest(model_dir)
         .map_err(|e| {
             InferenceError::InvalidSafetensors(format!(
@@ -320,6 +470,9 @@ fn load_from_q4_dir(
                 model_dir.display()
             ))
         })?;
+    if should_cancel() {
+        return Ok(None);
+    }
 
     // FIX 4: `expected_names` is the exact, bounded (<= 12 * MAX_VISION_DEPTH + 9) set of
     // `model.visual.*` tensors `vision_cfg` implies. Previously every visual-prefixed
@@ -341,6 +494,9 @@ fn load_from_q4_dir(
         .iter()
         .filter(|e| e.name.starts_with("model.visual."))
     {
+        if should_cancel() {
+            return Ok(None);
+        }
         if !expected_names.contains(&entry.name) {
             return Err(InferenceError::Inference(format!(
                 "vision checkpoint manifest in {}: unexpected tensor {} not accounted for \
@@ -485,7 +641,10 @@ fn load_from_q4_dir(
         };
         tensors.insert(entry.name.clone(), (data, shape));
     }
-    assemble(tensors, vision_cfg)
+    if should_cancel() {
+        return Ok(None);
+    }
+    assemble(tensors, vision_cfg).map(Some)
 }
 
 /// Pull the 153 expected tensors out of a name→(data, shape) map, validating each one's
@@ -815,6 +974,86 @@ mod tests {
                 .get(name)
                 .map(|(d, s)| (d.clone(), s.clone()))
                 .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))
+        }
+    }
+
+    #[test]
+    fn cancellable_loader_stops_before_touching_the_model_directory() {
+        let result = load_qwen35_vision_weights_with_cancel(
+            Path::new("/path/that/must/not/be/read"),
+            &tiny_vision_cfg(),
+            &mut || true,
+        )
+        .expect("cancellation is not a loader failure");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tensor_fetch_polls_cancellation_between_materializations() {
+        let cfg = tiny_vision_cfg();
+        let names = tensor_names(&cfg);
+        let first_name = names[0].clone();
+        let tensors: HashMap<String, (Vec<f32>, Vec<usize>)> = tiny_expected_shapes()
+            .into_iter()
+            .map(|(name, shape)| {
+                let numel: usize = shape.iter().product();
+                (name, (vec![0.5f32; numel], shape))
+            })
+            .collect();
+        let mut source = CountingSource {
+            tensors,
+            materialized: std::cell::RefCell::new(std::collections::HashSet::new()),
+        };
+        let mut polls = 0;
+        let result = fetch_expected_tensors_with_cancel(&mut source, names, &cfg, &mut || {
+            polls += 1;
+            polls == 3
+        })
+        .expect("cancellation is not a tensor-fetch failure");
+        assert!(result.is_none());
+        assert_eq!(polls, 3);
+        assert_eq!(source.materialized.borrow().len(), 1);
+        assert!(source.materialized.borrow().contains(&first_name));
+    }
+
+    #[test]
+    fn tensor_fetch_accepts_configured_non_four_x_mlp_width() {
+        let mut cfg = tiny_vision_cfg();
+        cfg.hidden_size = 1152;
+        cfg.intermediate_size = Some(4304);
+        let expected = [
+            (
+                "model.visual.blocks.0.mlp.linear_fc1.weight",
+                vec![4304, 1152],
+            ),
+            ("model.visual.blocks.0.mlp.linear_fc1.bias", vec![4304]),
+            (
+                "model.visual.blocks.0.mlp.linear_fc2.weight",
+                vec![1152, 4304],
+            ),
+            ("model.visual.blocks.0.mlp.linear_fc2.bias", vec![1152]),
+        ];
+        let names = expected
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect::<Vec<_>>();
+        let tensors = expected
+            .iter()
+            .map(|(name, shape)| ((*name).to_string(), (Vec::new(), shape.clone())))
+            .collect();
+        let mut source = CountingSource {
+            tensors,
+            materialized: std::cell::RefCell::new(std::collections::HashSet::new()),
+        };
+
+        let fetched = fetch_expected_tensors(&mut source, names.clone(), &cfg)
+            .expect("configured 1152/4304 MLP shapes must pass loader preflight");
+        assert_eq!(fetched.len(), names.len());
+        for name in names {
+            assert!(
+                source.materialized.borrow().contains(&name),
+                "{name} must reach materialization after passing preflight"
+            );
         }
     }
 
@@ -1462,10 +1701,8 @@ mod tests {
     #[test]
     fn assemble_accepts_official_qwen35_vl_vision_mlp_dims() {
         // FIX 16 regression: official Qwen3.5-VL vision tower dims are hidden_size=1152,
-        // intermediate_size=4304 (NOT 4*1152=4608). Before this fix, `assemble` hardcoded
-        // `mlp_intermediate = 4 * hidden_size`, so a real checkpoint carrying a
-        // [4304, 1152] `mlp.linear_fc1.weight` would be rejected as a shape mismatch
-        // against the loader's wrongly-derived [4608, 1152] expectation.
+        // intermediate_size=4304 (NOT 4*1152=4608). Both loader preflight and `assemble`
+        // must derive the expected MLP shapes from that explicit checkpoint geometry.
         let mut cfg = tiny_vision_cfg();
         cfg.hidden_size = 1152;
         cfg.num_heads = 1; // must divide hidden_size; head geometry is irrelevant here

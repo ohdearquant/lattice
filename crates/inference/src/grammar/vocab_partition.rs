@@ -28,8 +28,11 @@
 //! 1. `VocabPartition::build(grammar, grammar_states, vocab_bytes)` — called once
 //!    at `GrammarEngine::new` time.
 //! 2. `VocabPartition::apply_mask(state_id, logits)` — called per decode step.
-//! 3. `VocabPartition::context_dependent_ids()` — returns token ids that need
-//!    runtime PDA inspection.
+//! 3. `VocabPartition::context_dependent_ids_for_state(state_id)` — returns
+//!    the token ids that need runtime PDA inspection in the current state,
+//!    when a state-local list was stored; a state whose list was withheld
+//!    under the aggregate capacity budget falls back to the global union
+//!    across every state.
 
 use crate::grammar::pda::{CompiledGrammar, GrammarState, SimResult, simulate_token};
 
@@ -52,6 +55,11 @@ pub struct VocabPartition {
     states: Vec<GrammarState>,
     /// Token ids that are context-dependent for at least one grammar state.
     context_dependent: Vec<usize>,
+    /// Context-dependent token ids indexed by precomputed grammar state.
+    ///
+    /// `None` uses the conservative global union because storing that state's
+    /// local set would exceed the aggregate memory budget.
+    context_dependent_by_state: Vec<Option<Vec<usize>>>,
 }
 
 impl VocabPartition {
@@ -83,8 +91,18 @@ impl VocabPartition {
         let effective_states = num_states.min(MAX_GRAMMAR_STATES);
         let mut masks = vec![0u64; effective_states * mask_stride];
         let mut ctx_dep_set = std::collections::HashSet::new();
+        let mut context_dependent_by_state = Vec::with_capacity(effective_states);
+        // Keep the aggregate payload capacity of the new state-local lists no
+        // larger than the existing mask table. A dense adversarial grammar can
+        // classify every token as context-dependent in every state; storing
+        // all of those ids would otherwise cost 64x the masks on 64-bit hosts.
+        // Falling back to the global union preserves exact masking semantics.
+        let context_entry_budget =
+            masks.len().saturating_mul(std::mem::size_of::<u64>()) / std::mem::size_of::<usize>();
+        let mut context_entries_stored = 0usize;
 
         for (state_id, grammar_state) in grammar_states[..effective_states].iter().enumerate() {
+            let mut state_context_dependent = Vec::new();
             for (token_id, token_bytes) in vocab_bytes.iter().enumerate() {
                 // Skip empty tokens.
                 if token_bytes.is_empty() {
@@ -102,6 +120,7 @@ impl VocabPartition {
                     SimResult::ContextDependent => {
                         // Mark as context-dependent.
                         ctx_dep_set.insert(token_id);
+                        state_context_dependent.push(token_id);
                         // Also set the bit optimistically (runtime check will verify).
                         let word = token_id / 64;
                         let bit = token_id % 64;
@@ -111,6 +130,14 @@ impl VocabPartition {
                         // Bit remains 0 (token disallowed).
                     }
                 }
+            }
+            state_context_dependent.shrink_to_fit();
+            let stored_capacity = state_context_dependent.capacity();
+            if context_entries_stored.saturating_add(stored_capacity) <= context_entry_budget {
+                context_entries_stored += stored_capacity;
+                context_dependent_by_state.push(Some(state_context_dependent));
+            } else {
+                context_dependent_by_state.push(None);
             }
         }
 
@@ -123,6 +150,7 @@ impl VocabPartition {
             vocab_size,
             states: grammar_states,
             context_dependent,
+            context_dependent_by_state,
         }
     }
 
@@ -178,6 +206,17 @@ impl VocabPartition {
         &self.context_dependent
     }
 
+    /// Returns the token ids that need runtime PDA inspection in `state_id`.
+    ///
+    /// An unknown state falls back to the conservative global union rather than
+    /// skipping runtime checks.
+    pub(crate) fn context_dependent_ids_for_state(&self, state_id: usize) -> &[usize] {
+        self.context_dependent_by_state
+            .get(state_id)
+            .and_then(Option::as_deref)
+            .unwrap_or(&self.context_dependent)
+    }
+
     /// Returns the number of precomputed grammar states.
     pub fn num_states(&self) -> usize {
         self.states.len().min(MAX_GRAMMAR_STATES)
@@ -222,7 +261,9 @@ impl VocabPartition {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grammar::pda::{CompiledGrammar, GrammarBuilder, GrammarState, Rule, Symbol};
+    use crate::grammar::pda::{
+        CompiledGrammar, GrammarBuilder, GrammarState, Rule, StepResult, Symbol, advance_byte,
+    };
 
     /// Grammar: root = 'a' | 'b'
     fn or_grammar() -> CompiledGrammar {
@@ -359,5 +400,79 @@ mod tests {
         assert!(logits[0] > f32::NEG_INFINITY);
         assert_eq!(logits[1], f32::NEG_INFINITY); // empty token not set
         assert!(logits[2] > f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn context_dependent_ids_are_partitioned_by_state() {
+        let mut builder = GrammarBuilder::new();
+        builder.add_rule(
+            "root",
+            vec![b"abcd".iter().copied().map(Symbol::Terminal).collect()],
+        );
+        let grammar = builder.build();
+
+        let state0 = GrammarState::initial();
+        let mut state1 = state0.clone();
+        assert_eq!(
+            advance_byte(&mut state1, &grammar, b'a'),
+            StepResult::Accepted
+        );
+        let mut state2 = state1.clone();
+        assert_eq!(
+            advance_byte(&mut state2, &grammar, b'b'),
+            StepResult::Accepted
+        );
+        let vocab = vec![b"ax".to_vec(), b"bx".to_vec(), b"cx".to_vec()];
+        let partition = VocabPartition::build(&grammar, vec![state0, state1, state2], &vocab);
+
+        assert_eq!(partition.context_dependent_ids(), &[0, 1, 2]);
+        assert_eq!(partition.context_dependent_ids_for_state(0), &[0]);
+        assert_eq!(partition.context_dependent_ids_for_state(1), &[1]);
+        assert_eq!(partition.context_dependent_ids_for_state(2), &[2]);
+        assert_eq!(
+            partition.context_dependent_ids_for_state(usize::MAX),
+            &[0, 1, 2],
+            "unknown states must use the conservative global union"
+        );
+    }
+
+    #[test]
+    fn dense_state_lists_fall_back_within_mask_sized_budget() {
+        let mut builder = GrammarBuilder::new();
+        builder.add_rule(
+            "root",
+            vec![b"aaaa".iter().copied().map(Symbol::Terminal).collect()],
+        );
+        let grammar = builder.build();
+
+        let state0 = GrammarState::initial();
+        let mut state1 = state0.clone();
+        assert_eq!(
+            advance_byte(&mut state1, &grammar, b'a'),
+            StepResult::Accepted
+        );
+        let mut state2 = state1.clone();
+        assert_eq!(
+            advance_byte(&mut state2, &grammar, b'a'),
+            StepResult::Accepted
+        );
+        let vocab = vec![b"ax".to_vec(); 128];
+        let partition = VocabPartition::build(&grammar, vec![state0, state1, state2], &vocab);
+
+        assert_eq!(partition.context_dependent_ids().len(), 128);
+        assert!(
+            partition
+                .context_dependent_by_state
+                .iter()
+                .all(Option::is_none),
+            "dense local lists must use the global fallback instead of exceeding the mask-sized \
+             storage budget"
+        );
+        for state_id in 0..3 {
+            assert_eq!(
+                partition.context_dependent_ids_for_state(state_id),
+                partition.context_dependent_ids()
+            );
+        }
     }
 }

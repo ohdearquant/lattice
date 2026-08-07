@@ -13,7 +13,7 @@ use lattice_embed::simd::{
     QuantizationTier, QuantizedData, QuantizedVector, SimdConfig, approximate_cosine_distance,
     approximate_cosine_distance_prepared, approximate_cosine_distance_prepared_with_meta,
     approximate_dot_product_prepared, approximate_int4_batch_prepared,
-    approximate_int8_batch_prepared,
+    approximate_int8_batch_prepared, manhattan_distance,
 };
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -1226,8 +1226,35 @@ fn bench_prepared_batch_sizes(c: &mut Criterion) {
     group.finish();
 }
 
+fn manhattan_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+}
+
+/// Compare SIMD vs scalar Manhattan (L1) distance.
+fn bench_manhattan_simd_vs_scalar(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simd_manhattan_distance");
+
+    for dim in DIMENSIONS {
+        let a = generate_vector(dim, 42);
+        let b = generate_vector(dim, 123);
+
+        group.throughput(Throughput::Elements(dim as u64));
+
+        group.bench_with_input(BenchmarkId::new("scalar", dim), &dim, |bench, _| {
+            bench.iter(|| black_box(manhattan_distance_scalar(black_box(&a), black_box(&b))));
+        });
+
+        group.bench_with_input(BenchmarkId::new("simd", dim), &dim, |bench, _| {
+            bench.iter(|| black_box(manhattan_distance(black_box(&a), black_box(&b))));
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     simd_benches,
+    bench_manhattan_simd_vs_scalar,
     bench_cosine_simd_vs_scalar,
     bench_dot_product_simd_vs_scalar,
     bench_normalize_simd_vs_scalar,

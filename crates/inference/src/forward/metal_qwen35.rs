@@ -26,608 +26,7 @@
 //! q/k/v/o_proj) and embed_tokens. Buffers kept as f32: norm weights, bias/log scalars,
 //! conv1d weights (small, read by CPU), RoPE tables, activation scratch buffers.
 
-// -----------------------------------------------------------------------------
-// MTP Q4/F16 tensor resolution (#630, #636) -- pure, `Device`-free, compiled
-// unconditionally in test builds (these previously lived inside
-// `mod inner`, gated on `metal-gpu`, so `cargo test -p lattice-inference --lib
-// resolve_mtp` with no features reported "running 0 tests" -- the exact
-// skip-pass class described below, just one layer up. `mod inner` re-imports
-// these via `use super::{...}` below.)
-// -----------------------------------------------------------------------------
-
-/// Build the sanitized MTP tensor file path (dots/slashes -> underscores),
-/// mirroring `MetalQwen35State::q4_tensor_path` -- duplicated here (rather than
-/// called through `MetalQwen35State`, which only exists under `metal-gpu`) so
-/// this module compiles and is unit-testable without the Metal feature at all
-/// (#636).
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-fn mtp_tensor_path(dir: &std::path::Path, tensor_name: &str, ext: &str) -> std::path::PathBuf {
-    let sanitized: String = tensor_name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    dir.join(format!("{sanitized}.{ext}"))
-}
-
-/// Failure modes for resolving a single MTP tensor from disk (#636).
-///
-/// `Missing` is the pre-existing graceful case: the caller (the MTP
-/// projection-load closure in [`load_mtp_q4_weights`]) turns it into a
-/// warn-and-fall-back-to-non-MTP-decode result via
-/// [`mtp_missing_weights_warning`]. `Incompatible` is new and
-/// deliberately NOT graceful: it means the on-disk artifact exists but
-/// cannot be trusted (a stale `.q4` sibling in a QuaRot rotated-space
-/// checkpoint, or a shape/transpose mismatch) — silently disabling MTP
-/// would be safe, but silently *loading* it would produce garbage
-/// drafts, so this propagates as a hard `from_q4_dir` load error
-/// instead.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-#[derive(Debug)]
-enum MtpLoadErr {
-    // The path is read by the real `metal-gpu` production caller
-    // (`load_mtp_q4_weights`) but only via `matches!` in the pure
-    // default-feature-only tests, so it looks unused in that specific
-    // build configuration.
-    Missing(#[allow(dead_code)] std::path::PathBuf),
-    Incompatible(String),
-}
-
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-impl From<std::path::PathBuf> for MtpLoadErr {
-    fn from(path: std::path::PathBuf) -> Self {
-        MtpLoadErr::Missing(path)
-    }
-}
-
-/// One MTP tensor's values as read from disk, before Metal buffer
-/// creation — deliberately `Device`-free so flavor selection and shape
-/// validation are unit-testable without a GPU (#636).
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-#[derive(Debug)]
-enum MtpTensorSource {
-    F16 {
-        // Read by the real `metal-gpu` production caller
-        // (`load_mtp_q4_weights`'s `load_proj_as_half`); only the
-        // `#[cfg(test)]`-only `shape()`/`is_q4()` accessors read this in a
-        // default-feature (no metal-gpu) test-only build.
-        #[allow(dead_code)]
-        values: Vec<f32>,
-        #[allow(dead_code)] // read via `shape()`, only exercised by `#[cfg(test)]` callers
-        shape: Vec<usize>,
-    },
-    Q4(crate::weights::q4_weights::Q4Tensor),
-}
-
-#[cfg(test)]
-impl MtpTensorSource {
-    /// Test-only accessor for the resolved on-disk shape, used to assert
-    /// which flavor + shape a `resolve_mtp_projection` call picked
-    /// without needing a Metal `Device`.
-    fn shape(&self) -> &[usize] {
-        match self {
-            MtpTensorSource::F16 { shape, .. } => shape,
-            MtpTensorSource::Q4(tensor) => &tensor.shape,
-        }
-    }
-
-    fn is_q4(&self) -> bool {
-        matches!(self, MtpTensorSource::Q4(_))
-    }
-}
-
-/// Resolve one of the 8 MTP projection matrices from `q4_dir`, pure
-/// CPU I/O only (no `Device`).
-///
-/// `quantize_q4` applies the same `should_quantize` name-suffix rule to
-/// MTP tensors as to the main model, so the 8 `*_proj*.weight` MTP
-/// matrices are written as `.q4` on a plain (non-rotated) Q4 checkpoint.
-/// `quantize_quarot` instead keeps every MTP tensor as unrotated `.f16`
-/// (ADR-051 Phase 1: MTP counter-rotation needs unquantized weights),
-/// and MUST NOT have a `.q4` sibling for any MTP tensor.
-///
-/// `allow_q4` therefore encodes the checkpoint flavor, determined by
-/// the caller BEFORE any projection is loaded (not sniffed per-file):
-/// `true` for a plain Q4 checkpoint (no QuaRot rotation seed anywhere),
-/// `false` for a QuaRot checkpoint. When `allow_q4` is `false` and a
-/// `.q4` sibling exists anyway, that is an incompatible stale artifact
-/// — `quantize_q4` was re-run into a QuaRot output directory (the
-/// converter reuses a non-empty output dir rather than rejecting it),
-/// producing rotated-space `.q4` weights that the runtime's
-/// counter-rotation (keyed off the same directory's `quarot_seed`)
-/// would silently apply on top of, corrupting every MTP draft without
-/// any load failure to reveal it (#636). This is
-/// rejected loudly instead of silently preferring `.f16`.
-///
-/// Also validates the resolved tensor's on-disk shape against
-/// `expected_shape`: a same-numel transposed file loads and generates
-/// tokens but produces garbage MTP drafts (#636), so
-/// shape mismatches are rejected the same way as an incompatible
-/// artifact rather than silently accepted.
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-fn resolve_mtp_projection(
-    q4_dir: &std::path::Path,
-    name: &str,
-    expected_shape: &[usize],
-    allow_q4: bool,
-) -> Result<MtpTensorSource, MtpLoadErr> {
-    use crate::weights::q4_weights::{load_f16_tensor_file, load_q4_file};
-
-    let q4_path = mtp_tensor_path(q4_dir, name, "q4");
-    if q4_path.exists() {
-        if !allow_q4 {
-            return Err(MtpLoadErr::Incompatible(format!(
-                "{}: incompatible stale MTP .q4 artifact found alongside a QuaRot \
-                 (rotated-space) checkpoint; QuaRot Phase 1 requires MTP projections \
-                 to remain unrotated .f16 — a .q4 sibling here means quantize_q4 was \
-                 re-run into a QuaRot output directory, and loading it would silently \
-                 apply counter-rotation on top of already-rotated-space weights, \
-                 corrupting every MTP draft without a load failure to reveal it. \
-                 Refusing to load — delete the stale .q4 file or regenerate the \
-                 checkpoint.",
-                q4_path.display()
-            )));
-        }
-        let tensor = load_q4_file(&q4_path).map_err(|_| MtpLoadErr::Missing(q4_path.clone()))?;
-        if tensor.shape != expected_shape {
-            return Err(MtpLoadErr::Incompatible(format!(
-                "{}: MTP tensor '{name}' has shape {:?}, expected {expected_shape:?} — \
-                 refusing to load (a mismatched/transposed weight file loads and \
-                 generates tokens but silently produces garbage MTP drafts)",
-                q4_path.display(),
-                tensor.shape
-            )));
-        }
-        return Ok(MtpTensorSource::Q4(tensor));
-    }
-
-    let f16_path = mtp_tensor_path(q4_dir, name, "f16");
-    if !f16_path.exists() {
-        return Err(MtpLoadErr::Missing(f16_path));
-    }
-    let (values, shape) =
-        load_f16_tensor_file(&f16_path).map_err(|_| MtpLoadErr::Missing(f16_path.clone()))?;
-    if shape != expected_shape {
-        return Err(MtpLoadErr::Incompatible(format!(
-            "{}: MTP tensor '{name}' has shape {shape:?}, expected {expected_shape:?} — \
-             refusing to load (a mismatched/transposed weight file loads and generates \
-             tokens but silently produces garbage MTP drafts)",
-            f16_path.display()
-        )));
-    }
-    Ok(MtpTensorSource::F16 { values, shape })
-}
-
-/// Resolve one of the 7 MTP norm tensors from `q4_dir`, pure CPU I/O
-/// only (no `Device`). Norms are never quantized by `should_quantize`
-/// in either quantizer, so they are always `.f16`-only regardless of
-/// checkpoint flavor; a `.q4` sibling under a norm's name is treated
-/// as an incompatible artifact rather than silently ignored (defense
-/// in depth — should never occur on a checkpoint from either
-/// quantizer). Also validates on-disk shape (#636).
-#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
-fn resolve_mtp_norm(
-    q4_dir: &std::path::Path,
-    name: &str,
-    expected_shape: &[usize],
-) -> Result<(Vec<f32>, Vec<usize>), MtpLoadErr> {
-    use crate::weights::q4_weights::load_f16_tensor_file;
-
-    let q4_path = mtp_tensor_path(q4_dir, name, "q4");
-    if q4_path.exists() {
-        return Err(MtpLoadErr::Incompatible(format!(
-            "{}: unexpected MTP .q4 artifact for norm tensor '{name}' — norms are never \
-             quantized by either quantizer; refusing to load an incompatible checkpoint",
-            q4_path.display()
-        )));
-    }
-    let f16_path = mtp_tensor_path(q4_dir, name, "f16");
-    if !f16_path.exists() {
-        return Err(MtpLoadErr::Missing(f16_path));
-    }
-    let (values, shape) =
-        load_f16_tensor_file(&f16_path).map_err(|_| MtpLoadErr::Missing(f16_path.clone()))?;
-    if shape != expected_shape {
-        return Err(MtpLoadErr::Incompatible(format!(
-            "{}: MTP norm tensor '{name}' has shape {shape:?}, expected \
-             {expected_shape:?} — refusing to load",
-            f16_path.display()
-        )));
-    }
-    Ok((values, shape))
-}
-
-#[cfg(test)]
-mod mtp_resolve_tests {
-    use super::*;
-    use crate::model::qwen35_config::{LayerType, Qwen35Config};
-
-    /// Minimal `Qwen35Config` for the pure `resolve_mtp_*` tests: no
-    /// `ModelWeights`/Metal `Device` construction at all (unlike
-    /// `tiny_metal_qwen35_fixture`, which lives inside `mod inner` and is
-    /// gated on the `metal-gpu` feature -- these tests must not depend on
-    /// it, or they'd silently disappear again on a Metal-less/no-feature
-    /// build, exactly the skip-pass class described above). Field values
-    /// mirror `tiny_metal_qwen35_fixture`'s config so the derived MTP
-    /// projection/norm shapes match the same real-checkpoint-verified
-    /// formulas.
-    fn tiny_mtp_test_config() -> Qwen35Config {
-        Qwen35Config {
-            hidden_size: 512,
-            num_hidden_layers: 1,
-            vocab_size: 64,
-            intermediate_size: 64,
-            rms_norm_eps: 1e-6,
-            num_attention_heads: 2,
-            num_key_value_heads: 1,
-            head_dim: 256,
-            rope_theta: 10_000_000.0,
-            partial_rotary_factor: 0.25,
-            rope_parameters: None,
-            linear_num_key_heads: 1,
-            linear_num_value_heads: Some(1),
-            linear_key_head_dim: 16,
-            linear_value_head_dim: 16,
-            linear_conv_kernel_dim: 4,
-            num_experts: None,
-            num_experts_per_tok: None,
-            moe_intermediate_size: None,
-            shared_expert_intermediate_size: None,
-            output_router_logits: false,
-            router_aux_loss_coef: None,
-            tie_word_embeddings: true,
-            mtp_num_hidden_layers: 1,
-            mtp_use_dedicated_embeddings: false,
-            full_attention_interval: 1,
-            layer_types: vec![LayerType::FullAttention],
-            layer_mask: vec![true],
-            eos_token_id: 63,
-            max_position_embeddings: 128,
-            quarot_rotation_seed: None,
-            vision_config: None,
-            image_token_id: None,
-            video_token_id: None,
-            vision_start_token_id: None,
-            vision_end_token_id: None,
-        }
-    }
-
-    // MTP Q4/F16 tensor resolution (#630, #636): `quantize_q4` applies its
-    // `should_quantize` name-suffix rule to MTP tensor names exactly like the
-    // main model, so the 8 `*_proj*` matrices (q/k/v/o_proj, gate/up/down_proj,
-    // fc) are written as `.q4` while the 7 norm tensors are written as `.f16`.
-    // `quantize_quarot` instead keeps ALL 15 MTP tensors as unrotated `.f16`
-    // (ADR-051 Phase 1: MTP counter-rotation needs unquantized weights).
-    // `resolve_mtp_projection`/`resolve_mtp_norm` must accept both flavors,
-    // reject a stale `.q4` MTP sibling under a QuaRot (`is_quarot=true`)
-    // directory, and reject a transposed/mismatched tensor
-    // shape. These tests live at the file top level,
-    // compiled unconditionally in any test build -- not gated on `metal-gpu`
-    // -- so this coverage never skip-passes on a Metal-less CI runner
-    // (see the module doc
-    // comment above `mtp_tensor_path` for why this code moved out of
-    // `mod inner` entirely).
-
-    /// Write a tiny `.f16` (KHF1) tensor file with the given `shape`,
-    /// filled with copies of `1.0`, mirroring the format
-    /// `load_f16_tensor_file` reads (crates/inference/src/weights/q4_weights.rs).
-    pub(crate) fn write_tiny_f16_fixture(dir: &std::path::Path, name: &str, shape: &[usize]) {
-        use crate::weights::q4_weights::q4_f32_to_f16;
-        let numel: usize = shape.iter().product();
-        let path = mtp_tensor_path(dir, name, "f16");
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"KHF1");
-        buf.extend_from_slice(&1u32.to_le_bytes()); // version
-        buf.extend_from_slice(&(shape.len() as u32).to_le_bytes()); // ndim
-        for &dim in shape {
-            buf.extend_from_slice(&(dim as u64).to_le_bytes());
-        }
-        buf.extend_from_slice(&(numel as u64).to_le_bytes()); // numel
-        for _ in 0..numel {
-            buf.extend_from_slice(&q4_f32_to_f16(1.0).to_le_bytes());
-        }
-        std::fs::write(&path, buf).expect("write .f16 fixture");
-    }
-
-    /// Write a tiny `.q4` tensor file with the given `shape`, filled with
-    /// copies of `0.1`.
-    pub(crate) fn write_tiny_q4_fixture(dir: &std::path::Path, name: &str, shape: &[usize]) {
-        use crate::weights::q4_weights::{quantize_f32_to_q4, save_q4_file};
-        let numel: usize = shape.iter().product();
-        let data = vec![0.1f32; numel];
-        let tensor = quantize_f32_to_q4(&data, shape).expect("quantize tiny tensor");
-        let path = mtp_tensor_path(dir, name, "q4");
-        save_q4_file(&path, &tensor).expect("save .q4 fixture");
-    }
-
-    /// Write a tiny `.q4` 2-D tensor `[rows, cols]` where every element in
-    /// row `r` is `row_value(r)` (constant within the row, distinct across
-    /// rows). Used to build a MoE router (`mlp.gate.weight`, `[E, H]`) whose
-    /// per-expert logit is fully controlled by the caller: since `cols` is a
-    /// multiple of the Q4 block size (32) in every fixture this is used
-    /// with, each row occupies whole blocks only (never split across two
-    /// different rows' values), so `quantize_f32_to_q4` reconstructs each
-    /// row's constant exactly (mod one f16 rounding of the input value —
-    /// see `q4_const_roundtrip` for the expected-readback helper).
-    // Only consumed by the Device-gated MoE integration tests in `mod
-    // inner::tests`, which don't exist in a default-feature (no metal-gpu)
-    // build -- looks dead in that configuration (same as
-    // `write_full_mtp_fixture` above).
-    #[allow(dead_code)]
-    pub(crate) fn write_tiny_q4_fixture_per_row(
-        dir: &std::path::Path,
-        name: &str,
-        rows: usize,
-        cols: usize,
-        row_value: impl Fn(usize) -> f32,
-    ) {
-        use crate::weights::q4_weights::{quantize_f32_to_q4, save_q4_file};
-        let mut data = Vec::with_capacity(rows * cols);
-        for r in 0..rows {
-            data.extend(std::iter::repeat_n(row_value(r), cols));
-        }
-        let tensor =
-            quantize_f32_to_q4(&data, &[rows, cols]).expect("quantize per-row tiny tensor");
-        let path = mtp_tensor_path(dir, name, "q4");
-        save_q4_file(&path, &tensor).expect("save .q4 fixture");
-    }
-
-    /// Write a tiny `.q4` 3-D tensor `[experts, mid, cols]` where every
-    /// element at `(e, m, _)` is `value(e, m)` (constant within an `(e, m)`
-    /// row, distinct per expert AND per position along `mid` — e.g. to
-    /// distinguish the fused gate/up halves of `experts.gate_up_proj`,
-    /// `[E, 2I, H]`, or to distinguish experts in `experts.down_proj`,
-    /// `[E, H, I]`). Same block-alignment argument as
-    /// `write_tiny_q4_fixture_per_row`: `cols` is always a multiple of 32 in
-    /// the fixtures this is used with, so every block sits inside exactly
-    /// one `(e, m)` row and quantization is exact.
-    // Only consumed by the Device-gated MoE integration tests in `mod
-    // inner::tests`; dead in a default-feature (no metal-gpu) build.
-    #[allow(dead_code)]
-    pub(crate) fn write_tiny_q4_fixture_per_expert_row(
-        dir: &std::path::Path,
-        name: &str,
-        experts: usize,
-        mid: usize,
-        cols: usize,
-        value: impl Fn(usize, usize) -> f32,
-    ) {
-        use crate::weights::q4_weights::{quantize_f32_to_q4, save_q4_file};
-        let mut data = Vec::with_capacity(experts * mid * cols);
-        for e in 0..experts {
-            for m in 0..mid {
-                data.extend(std::iter::repeat_n(value(e, m), cols));
-            }
-        }
-        let tensor = quantize_f32_to_q4(&data, &[experts, mid, cols])
-            .expect("quantize per-expert-row tiny tensor");
-        let path = mtp_tensor_path(dir, name, "q4");
-        save_q4_file(&path, &tensor).expect("save .q4 fixture");
-    }
-
-    /// The exact f32 value a constant-valued Q4 block round-trips to: Q4
-    /// asymmetric quantization stores `scale`/`bias` as f16 and, for a
-    /// constant block (`min == max == value`), always packs nibble `0`
-    /// (`(value - min) * inv_scale == 0`), so dequant reduces to `0 * scale
-    /// + bias == bias == f16(value)` regardless of the block's `scale`
-    /// field — exact modulo one f16 rounding of `value` itself.
-    ///
-    /// Lets tests assert readback against the value the pipeline will
-    /// actually produce, not the pre-quantization f32 the fixture requested.
-    // Only consumed by the Device-gated MoE integration tests in `mod
-    // inner::tests`; dead in a default-feature (no metal-gpu) build.
-    #[allow(dead_code)]
-    pub(crate) fn q4_const_roundtrip(value: f32) -> f32 {
-        use crate::weights::q4_weights::{q4_f16_to_f32, q4_f32_to_f16};
-        q4_f16_to_f32(q4_f32_to_f16(value))
-    }
-
-    /// The 8 MTP projection tensor names paired with their expected
-    /// on-disk shape, derived from the real qwen3.5-0.8b-q4 checkpoint
-    /// (`~/.lattice/models/qwen3.5-0.8b-q4/mtp_*.q4` headers, verified by
-    /// hand during #636 remediation): on-disk shape is always
-    /// `[d_out, d_in]`, matching `expected_lora_shape`'s `(d_in, d_out)`
-    /// convention reversed.
-    pub(crate) fn mtp_proj_names_and_shapes(cfg: &Qwen35Config) -> [(&'static str, Vec<usize>); 8] {
-        let hidden = cfg.hidden_size;
-        let q_dim = cfg.full_q_dim();
-        let kv_dim = cfg.full_kv_dim();
-        let inter = cfg.intermediate_size;
-        [
-            (
-                "mtp.layers.0.self_attn.q_proj.weight",
-                vec![2 * q_dim, hidden],
-            ),
-            ("mtp.layers.0.self_attn.k_proj.weight", vec![kv_dim, hidden]),
-            ("mtp.layers.0.self_attn.v_proj.weight", vec![kv_dim, hidden]),
-            ("mtp.layers.0.self_attn.o_proj.weight", vec![hidden, q_dim]),
-            ("mtp.layers.0.mlp.gate_proj.weight", vec![inter, hidden]),
-            ("mtp.layers.0.mlp.up_proj.weight", vec![inter, hidden]),
-            ("mtp.layers.0.mlp.down_proj.weight", vec![hidden, inter]),
-            ("mtp.fc.weight", vec![hidden, 2 * hidden]),
-        ]
-    }
-
-    /// The 7 MTP norm tensor names paired with their expected shape —
-    /// never quantized (`should_quantize` excludes anything containing
-    /// `norm.weight`). `q_norm`/`k_norm` are `[head_dim]`; the rest are
-    /// `[hidden]`.
-    // Only reachable via `write_full_mtp_fixture` (see its own
-    // `#[allow(dead_code)]` note above).
-    fn mtp_norm_names_and_shapes(cfg: &Qwen35Config) -> [(&'static str, Vec<usize>); 7] {
-        let hidden = cfg.hidden_size;
-        let head_dim = cfg.head_dim;
-        [
-            ("mtp.layers.0.input_layernorm.weight", vec![hidden]),
-            ("mtp.layers.0.post_attention_layernorm.weight", vec![hidden]),
-            ("mtp.layers.0.self_attn.q_norm.weight", vec![head_dim]),
-            ("mtp.layers.0.self_attn.k_norm.weight", vec![head_dim]),
-            ("mtp.norm.weight", vec![hidden]),
-            ("mtp.pre_fc_norm_embedding.weight", vec![hidden]),
-            ("mtp.pre_fc_norm_hidden.weight", vec![hidden]),
-        ]
-    }
-
-    /// Write a complete, well-formed MTP tensor set to `dir`: the 8
-    /// projections in `proj_flavor` (`.q4` or `.f16`) and the 7 norms as
-    /// `.f16`.
-    // Only consumed by the Device-gated integration tests in `mod
-    // inner::tests`, which don't exist in a default-feature (no
-    // metal-gpu) build -- looks dead in that configuration.
-    #[allow(dead_code)]
-    pub(crate) fn write_full_mtp_fixture(
-        dir: &std::path::Path,
-        cfg: &Qwen35Config,
-        proj_as_q4: bool,
-    ) {
-        for (name, shape) in mtp_proj_names_and_shapes(cfg) {
-            if proj_as_q4 {
-                write_tiny_q4_fixture(dir, name, &shape);
-            } else {
-                write_tiny_f16_fixture(dir, name, &shape);
-            }
-        }
-        for (name, shape) in mtp_norm_names_and_shapes(cfg) {
-            write_tiny_f16_fixture(dir, name, &shape);
-        }
-    }
-
-    // --- CPU-only, Device-free coverage of the flavor/shape logic itself ---
-    // (these never skip on a Metal-less CI runner.)
-
-    #[test]
-    fn resolve_mtp_projection_prefers_q4_when_allowed() {
-        let cfg = tiny_mtp_test_config();
-        let tmp = tempfile::tempdir().expect("tempdir create");
-        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0]; // q_proj
-        write_tiny_q4_fixture(tmp.path(), name, shape);
-
-        let resolved = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ true)
-            .expect("plain Q4 dir must resolve the .q4 sibling");
-        assert!(
-            resolved.is_q4(),
-            "allow_q4=true with a .q4 file present must prefer the .q4 flavor"
-        );
-        assert_eq!(resolved.shape(), shape.as_slice());
-    }
-
-    #[test]
-    fn resolve_mtp_projection_falls_back_to_f16_when_q4_absent() {
-        let cfg = tiny_mtp_test_config();
-        let tmp = tempfile::tempdir().expect("tempdir create");
-        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0];
-        write_tiny_f16_fixture(tmp.path(), name, shape);
-
-        let resolved = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ true)
-            .expect("QuaRot-shaped all-.f16 dir must resolve the .f16 sibling");
-        assert!(!resolved.is_q4(), "no .q4 file exists; must resolve .f16");
-    }
-
-    #[test]
-    fn resolve_mtp_projection_rejects_stale_q4_sibling_under_quarot() {
-        // A QuaRot (rotated-space) checkpoint directory
-        // must never load an MTP `.q4` sibling even if one exists —
-        // that shape is reachable when `quantize_q4` is re-run into an
-        // existing QuaRot output dir (the converter reuses a non-empty
-        // output dir rather than rejecting it). Silently preferring
-        // `.q4` there would load rotated-space weights while
-        // counter-rotation (keyed off the same dir's `quarot_seed`)
-        // stays enabled, corrupting every MTP draft with no load
-        // failure to reveal it.
-        let cfg = tiny_mtp_test_config();
-        let tmp = tempfile::tempdir().expect("tempdir create");
-        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0];
-        // Mixed/stale layout: BOTH a .q4 (leftover from a re-run
-        // quantize_q4) and the expected QuaRot .f16 exist side by side.
-        write_tiny_q4_fixture(tmp.path(), name, shape);
-        write_tiny_f16_fixture(tmp.path(), name, shape);
-
-        let err = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ false).expect_err(
-            "allow_q4=false (QuaRot flavor) with a .q4 sibling present must fail closed",
-        );
-        let MtpLoadErr::Incompatible(message) = err else {
-            panic!("expected Incompatible, got {err:?}");
-        };
-        assert!(
-            message.contains("incompatible") && message.contains(".q4"),
-            "error must name the incompatible .q4 artifact; got: {message}"
-        );
-    }
-
-    #[test]
-    fn resolve_mtp_projection_rejects_transposed_q4_shape() {
-        // A same-numel transposed file must not
-        // silently load — it would generate tokens but produce garbage
-        // MTP drafts (0% accept class).
-        let cfg = tiny_mtp_test_config();
-        let tmp = tempfile::tempdir().expect("tempdir create");
-        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0]; // q_proj: [2*q_dim, hidden]
-        let transposed: Vec<usize> = shape.iter().rev().copied().collect();
-        assert_ne!(
-            shape, &transposed,
-            "fixture cfg must have distinguishable q_proj dims for this test to be meaningful"
-        );
-        write_tiny_q4_fixture(tmp.path(), name, &transposed);
-
-        let err = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ true)
-            .expect_err("a transposed same-numel .q4 tensor must be rejected, not accepted");
-        let MtpLoadErr::Incompatible(message) = err else {
-            panic!("expected Incompatible, got {err:?}");
-        };
-        assert!(
-            message.contains("shape"),
-            "error must name the shape mismatch; got: {message}"
-        );
-    }
-
-    #[test]
-    fn resolve_mtp_projection_rejects_transposed_f16_shape() {
-        let cfg = tiny_mtp_test_config();
-        let tmp = tempfile::tempdir().expect("tempdir create");
-        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[6]; // down_proj: [hidden, inter]
-        let transposed: Vec<usize> = shape.iter().rev().copied().collect();
-        assert_ne!(
-            shape, &transposed,
-            "fixture cfg must have distinguishable down_proj dims for this test to be meaningful"
-        );
-        write_tiny_f16_fixture(tmp.path(), name, &transposed);
-
-        let err = resolve_mtp_projection(tmp.path(), name, shape, /* allow_q4 */ true)
-            .expect_err("a transposed same-numel .f16 tensor must be rejected, not accepted");
-        assert!(matches!(err, MtpLoadErr::Incompatible(_)));
-    }
-
-    #[test]
-    fn resolve_mtp_projection_reports_missing_when_neither_flavor_present() {
-        let cfg = tiny_mtp_test_config();
-        let tmp = tempfile::tempdir().expect("tempdir create");
-        let (name, shape) = &mtp_proj_names_and_shapes(&cfg)[0];
-
-        let err = resolve_mtp_projection(tmp.path(), name, shape, true)
-            .expect_err("neither flavor present must be Missing, not Ok");
-        assert!(matches!(err, MtpLoadErr::Missing(_)));
-    }
-
-    #[test]
-    fn resolve_mtp_norm_rejects_transposed_shape() {
-        let cfg = tiny_mtp_test_config();
-        let tmp = tempfile::tempdir().expect("tempdir create");
-        // input_layernorm is [hidden]; use a 2-D reshape as the "wrong
-        // shape" stand-in since a 1-D vector has no transpose.
-        let name = "mtp.layers.0.input_layernorm.weight";
-        let hidden = cfg.hidden_size;
-        write_tiny_f16_fixture(tmp.path(), name, &[hidden, 1]);
-
-        let err = resolve_mtp_norm(tmp.path(), name, &[hidden])
-            .expect_err("a reshaped norm tensor must be rejected, not accepted");
-        assert!(matches!(err, MtpLoadErr::Incompatible(_)));
-    }
-}
+mod mtp_weights;
 
 // -----------------------------------------------------------------------------
 // MTP / self-spec route-around predicates (PR #657) --
@@ -971,6 +370,7 @@ mod route_predicate_tests {
 ///
 /// Role in a chat conversation.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ChatRole {
     System,
     User,
@@ -978,7 +378,7 @@ pub enum ChatRole {
 }
 
 impl ChatRole {
-    fn as_str(&self) -> &str {
+    pub(crate) fn as_str(&self) -> &str {
         match self {
             ChatRole::System => "system",
             ChatRole::User => "user",
@@ -994,6 +394,18 @@ impl ChatRole {
 pub struct ChatMessage {
     pub role: ChatRole,
     pub content: String,
+    /// Inline image carried by a normalized chat content part.
+    pub image: Option<ChatImage>,
+}
+
+/// **Unstable**: one inline image attached to a chat message.
+#[derive(Debug, Clone)]
+pub struct ChatImage {
+    /// Base64-decoded PNG or JPEG file bytes.
+    pub bytes: Vec<u8>,
+    /// UTF-8 byte offset into [`ChatMessage::content`] where the image part
+    /// appeared.
+    pub text_offset: usize,
 }
 
 impl ChatMessage {
@@ -1002,6 +414,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content: content.into(),
+            image: None,
         }
     }
     /// **Unstable**: construct a user message.
@@ -1009,6 +422,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: content.into(),
+            image: None,
         }
     }
     /// **Unstable**: construct an assistant message.
@@ -1016,6 +430,23 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content: content.into(),
+            image: None,
+        }
+    }
+
+    /// **Unstable**: construct a user message with one inline image.
+    pub fn user_with_image(
+        content: impl Into<String>,
+        image_bytes: Vec<u8>,
+        text_offset: usize,
+    ) -> Self {
+        Self {
+            role: ChatRole::User,
+            content: content.into(),
+            image: Some(ChatImage {
+                bytes: image_bytes,
+                text_offset,
+            }),
         }
     }
 }
@@ -1025,6 +456,10 @@ impl ChatMessage {
 /// Format messages into Qwen3.5 chat template.
 /// Template: <|im_start|>{role}\n{content}<|im_end|>\n
 /// Final assistant turn left open for generation.
+///
+/// This formatter emits text turns only. Inline image payloads require the
+/// multimodal vision generation path; the public text-chat generation entry
+/// points reject such messages before calling this formatter.
 pub fn format_chat_template(messages: &[ChatMessage]) -> String {
     format_chat_template_parts(
         messages
@@ -1038,42 +473,64 @@ pub(crate) fn format_chat_template_parts<'a>(
 ) -> String {
     let mut prompt = String::new();
     for (role, content) in messages {
-        prompt.push_str("<|im_start|>");
-        prompt.push_str(role);
-        prompt.push('\n');
+        push_chat_turn_open(&mut prompt, role);
         prompt.push_str(content);
-        prompt.push_str("<|im_end|>\n");
+        push_chat_turn_close(&mut prompt);
     }
-    // Open assistant turn for generation
-    prompt.push_str("<|im_start|>assistant\n");
+    push_chat_generation_open(&mut prompt);
     prompt
+}
+
+pub(crate) fn push_chat_turn_open(prompt: &mut String, role: &str) {
+    prompt.push_str("<|im_start|>");
+    prompt.push_str(role);
+    prompt.push('\n');
+}
+
+pub(crate) fn push_chat_turn_close(prompt: &mut String) {
+    prompt.push_str("<|im_end|>\n");
+}
+
+/// Open the trailing assistant turn left unclosed for generation — shared by
+/// the canonical text-only renderer and the vision prompt builder so both
+/// paths emit the identical generation-turn opener.
+pub(crate) fn push_chat_generation_open(prompt: &mut String) {
+    push_chat_turn_open(prompt, ChatRole::Assistant.as_str());
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
+    mod dispatch;
+    mod layers;
+
     use super::GdnStateTrafficScope;
     // Chat message types + the shared ChatML renderer (#668) live at the file
     // top level (module-scope, above `mod inner`) so CPU-only builds can
     // render through the same `format_chat_template` this Metal path uses,
     // same reasoning as the MTP resolution helpers below.
     use super::{ChatMessage, format_chat_template};
-    // MTP Q4/F16 flavor + shape resolution (#630, #636) now lives at the file
-    // top level (module-scope, above `mod inner`) so it compiles and is
-    // unit-testable without the `metal-gpu` feature at all.
+    // MTP Q4/F16 flavor + shape resolution (#630, #636) lives in a private
+    // portable sibling module so it compiles and is unit-testable without the
+    // `metal-gpu` feature at all.
+    use super::mtp_weights::{
+        MtpLoadErr, MtpTensorSource, resolve_mtp_norm, resolve_mtp_projection,
+    };
     #[cfg(feature = "gdn-state-counters")]
     use super::{
         GdnStateCopyKind, GdnStateTrafficCounters, GdnStateTrafficReport, GdnStateTrafficShape,
     };
-    use super::{MtpLoadErr, MtpTensorSource, resolve_mtp_norm, resolve_mtp_projection};
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
-    use crate::model::qwen35::detokenize::IncrementalDetokenizer;
     use crate::model::qwen35::stop_strings::StopStringMatcher;
-    use crate::model::qwen35::{AttentionWeights, ModelWeights};
+    use crate::model::qwen35::{
+        AttentionWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
+        ModelWeights, prepare_generation,
+    };
     use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob};
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
+    use crate::tokenizer::detokenize::IncrementalDetokenizer;
     use crate::vision::multimodal::Qwen35VisionRequest;
     use crate::weights::q4_weights::quantize_row_q4_0;
     use metal::*;
@@ -1116,6 +573,12 @@ mod inner {
     ///   float Zero[8][8]   =  256 bytes
     ///   Total              = 10048 bytes < 32 KB → 2× occupancy on M1
     const MSL_Q8_TILED_SOURCE: &str = include_str!("shaders/gemm_q8_tiled.metal");
+
+    #[cfg(test)]
+    std::thread_local! {
+        static Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST: std::cell::Cell<u64> =
+            const { std::cell::Cell::new(0) };
+    }
 
     // ---------------------------------------------------------------------------
     // GPU Buffer Structures
@@ -1718,6 +1181,14 @@ mod inner {
         attn_partials: Buffer,
         // MTP: pre-final hidden state (before final RMSNorm) for the last processed token.
         pre_final_hidden: Buffer, // [hidden_size]
+        // Pooled-embedding capture: the last processed token's hidden state
+        // AFTER the final RMSNorm. Deliberately a separate buffer from
+        // `pre_final_hidden` above rather than a reuse: the two hold the same
+        // token at different points in the network, they differ by the norm's
+        // rescale, and a name that reads plausibly for both is how a caller
+        // ends up with numbers from the wrong layer. See
+        // `encode_capture_final_hidden`.
+        final_hidden: Buffer, // [hidden_size]
         // MTP: logits for all K verified tokens (K <= MTP_VERIFY_MAX_TOKENS).
         verify_logits: Buffer, // [MTP_VERIFY_MAX_TOKENS * vocab_size]
     }
@@ -1922,6 +1393,95 @@ mod inner {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SamplingRouteEnvironment {
+        compact: bool,
+        selection: bool,
+        approximate_top_p: bool,
+    }
+
+    impl SamplingRouteEnvironment {
+        fn current() -> Self {
+            Self {
+                compact: std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
+                selection: std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
+                approximate_top_p: std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SamplingRoutePlan {
+        use_compact: bool,
+        compact_route: GpuTopkRoute,
+        compact_topk: usize,
+    }
+
+    fn plan_sampling_route(
+        gen_cfg: &GenerateConfig,
+        history_is_empty: bool,
+        environment: SamplingRouteEnvironment,
+    ) -> SamplingRoutePlan {
+        let block_route = choose_gpu_block_topk_route(
+            gen_cfg.top_k,
+            gen_cfg.top_p,
+            environment.compact,
+            environment.approximate_top_p,
+        );
+        let route = if block_route != GpuTopkRoute::CpuFallback {
+            block_route
+        } else {
+            choose_gpu_topk_route(gen_cfg.top_k, environment.compact, environment.selection)
+        };
+        // This uniform `is_none()` check is not one policy for all three
+        // callers: direct and prefix-cache generation already rejected
+        // `logprobs: Some(_)` in their own `check_logprobs_not_set` preflight
+        // before ever reaching this function, so for them the check below is
+        // defense-in-depth and always sees `None`. Streaming has no such
+        // preflight -- it intentionally supports `logprobs: Some(_)` to
+        // capture per-token log-probabilities -- so for streaming this is the
+        // real, load-bearing full-logit gate: compact sampling cannot
+        // provide full-logit logprob semantics, so a logprobs capture
+        // request must force the full-logit (non-compact) path here.
+        let logprobs_eligible = gen_cfg.logprobs.is_none();
+        let use_compact = route != GpuTopkRoute::CpuFallback
+            && (gen_cfg.repetition_penalty == 1.0 || history_is_empty)
+            && gen_cfg.grammar.is_none()
+            && logprobs_eligible;
+
+        if use_compact {
+            SamplingRoutePlan {
+                use_compact,
+                compact_route: route,
+                compact_topk: match route {
+                    GpuTopkRoute::BlockArgmax => 1,
+                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
+                    _ => gen_cfg.top_k,
+                },
+            }
+        } else {
+            SamplingRoutePlan {
+                use_compact,
+                compact_route: GpuTopkRoute::CpuFallback,
+                compact_topk: 0,
+            }
+        }
+    }
+
+    fn apply_sampling_route_plan(
+        plan: SamplingRoutePlan,
+        compact_route: &mut GpuTopkRoute,
+        compact_topk: &mut usize,
+        compact_result: &mut Vec<crate::sampling::Candidate>,
+    ) -> bool {
+        *compact_route = plan.compact_route;
+        *compact_topk = plan.compact_topk;
+        if !plan.use_compact {
+            compact_result.clear();
+        }
+        plan.use_compact
+    }
+
     /// Resolves a `compact_route` to `(local_k, precompiled Stage-1 pipeline
     /// slot)`, or `None` if the route isn't a block-top-k route at all
     /// (`Argmax`/`Select64`/`HierarchicalK50`/`CpuFallback`) **or** if
@@ -2062,6 +1622,25 @@ mod inner {
         pub(crate) mtp: Option<MetalMtpSession>,
         pub(crate) gdn_checkpoints: Option<MetalGdnCheckpointPool>,
         pub(crate) last_pre_final_hidden: Vec<f32>,
+        /// Raw (pre-final-RMSNorm) target hidden states captured by
+        /// `forward_prefill_batched_chunk` for every prompt position in the most
+        /// recent `forward_prefill`/`forward_prefill_all_logits` call, laid out as
+        /// `n * hidden_size` f32 values in prompt order (#1340). Cleared at the top
+        /// of `forward_prefill_impl` and drained by `mtp_prefill`, which rebuilds
+        /// the MTP draft head's KV cache from it so the first draft attends to the
+        /// prompt prefix instead of a single row.
+        pub(crate) mtp_prefill_hidden: Vec<f32>,
+        /// Opt-in: when set, every forward path that applies the final RMSNorm
+        /// also copies the last token's normed hidden state into
+        /// `activations.final_hidden`. Off by default so the decode loop pays
+        /// nothing for a capture it never reads.
+        pub(crate) capture_final_hidden: bool,
+        /// Set at encode time by [`MetalQwen35State::encode_capture_final_hidden`],
+        /// cleared by the embedding API before it dispatches. It answers "did
+        /// THIS call write the capture buffer", which is the difference between
+        /// an embedding of the caller's tokens and a stale vector from whatever
+        /// ran last. A stale vector is well-formed, correctly sized, and wrong.
+        pub(crate) final_hidden_captured: std::sync::atomic::AtomicBool,
         /// Authoritative decode cursor; kept in sync with kv_cache.seq_len.
         #[allow(dead_code)]
         // read by tests; written by set_position for future concurrent API
@@ -2403,11 +1982,6 @@ mod inner {
         pub(crate) path_proof: PathProofCounters,
     }
 
-    enum GenerateAdmission {
-        Zero(GenerateOutput),
-        Ready(Vec<u32>),
-    }
-
     // ---------------------------------------------------------------------------
     // Cross-turn KV prefix cache (#462)
     // ---------------------------------------------------------------------------
@@ -2663,8 +2237,8 @@ mod inner {
     /// `group_size=6` model would silently drop attention output for 2 of every 6
     /// query heads in the group. `group_size` is validated to be in
     /// `1..=METAL_FLASH_MAX_GQA_GROUP` (8) by `validate_flash_decode_shape` before
-    /// either pipeline-construction call site (`new`, `from_q4_dir`) reaches this
-    /// function. This helper re-checks that invariant and returns `Err` for any
+    /// either constructor reaches the shared pipeline builder. This helper
+    /// re-checks that invariant and returns `Err` for any
     /// out-of-range input rather than rounding it: there is no variant with
     /// `MAX_GRP > 8`, so a `group_size >= 9` could only be mapped to `g8`, whose
     /// kernel guard would then silently write no attention. Failing closed here
@@ -3104,6 +2678,165 @@ mod inner {
         })
     }
 
+    fn build_pipelines(
+        device: &Device,
+        cfg: &Qwen35Config,
+    ) -> Result<MetalQwen35Pipelines, String> {
+        let prefill_grp_suffix =
+            prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
+
+        let opts = CompileOptions::new();
+        let library = device
+            .new_library_with_source(MSL_SOURCE, &opts)
+            .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
+
+        let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
+            let func = library
+                .get_function(name, None)
+                .map_err(|e| format!("function '{name}' not found: {e}"))?;
+            device
+                .new_compute_pipeline_state_with_function(&func)
+                .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
+        };
+
+        let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
+            // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
+            // The compile/pipeline `.ok()?` chain below falls back to the
+            // naive gemm_q4 on any device where the V3.0 source fails.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q4_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
+            // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
+            // gemv_q3_decode-only (M=1) path on any device/compile failure.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q3_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
+            // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                return None;
+            }
+            let tiled_opts = CompileOptions::new();
+            tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
+            let lib = device
+                .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
+                .ok()?;
+            let func = lib.get_function("gemm_q8_tiled", None).ok()?;
+            device.new_compute_pipeline_state_with_function(&func).ok()
+        };
+
+        Ok(MetalQwen35Pipelines {
+            gemv_decode: make_pipeline("gemv_decode_m1")?,
+            gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
+            gemv_q8: make_pipeline("gemv_q8_decode")?,
+            gemv_q4: make_pipeline("gemv_q4_decode")?,
+            gemm_q4: make_pipeline("gemm_q4")?,
+            gemm_q4_tiled: make_optional_gemm_q4_tiled(),
+            gemv_q3: make_pipeline("gemv_q3_decode")?,
+            gemm_q3_tiled: make_optional_gemm_q3_tiled(),
+            rms_norm: make_pipeline("rms_norm_qwen35")?,
+            partial_rope: make_pipeline("partial_rope_interleaved")?,
+            per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
+            decode_attention: make_pipeline("decode_attention")?,
+            sigmoid_gate: make_pipeline("sigmoid_gate")?,
+            scatter_q_gate: make_pipeline("scatter_q_gate")?,
+            silu_mul: make_pipeline("silu_mul")?,
+            silu_mul_fused: make_pipeline("silu_mul_fused")?,
+            copy: make_pipeline("copy_buf")?,
+            copy_offset: make_pipeline("copy_buf_offset")?,
+            conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
+            gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
+            gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
+            gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
+            gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
+            gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
+            gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
+            gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
+            gdn_recurrence_q36: library
+                .get_function("gdn_recurrence_fused_q36", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_precompute_keys: library
+                .get_function("gdn_precompute_keys", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_recurrence_sharded: library
+                .get_function("gdn_recurrence_sharded", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            gdn_norm_silu: library
+                .get_function("gdn_norm_silu", None)
+                .ok()
+                .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
+            fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
+            copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
+            add_and_copy: make_pipeline("add_and_copy")?,
+            copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
+            fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
+            gemm_q8: make_pipeline("gemm_q8")?,
+            gemm_q8_tiled: make_optional_gemm_q8_tiled(),
+            topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
+            argmax_first: make_pipeline("logits_argmax_first")?,
+            argmax_merge: make_pipeline("logits_argmax_merge")?,
+            topk_select50_first: make_pipeline("logits_topk_select50_first")?,
+            topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
+            decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
+            decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
+            lora_gemv_a: make_pipeline("lora_gemv_a")?,
+            lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
+            // ADR-053: MoE Metal dispatch kernels
+            moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
+            moe_scale_add: make_pipeline("moe_scale_add")?,
+            moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
+            moe_zero_buf: make_pipeline("zero_buf")?,
+            scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
+            per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
+            partial_rope_batch: make_pipeline("partial_rope_batch")?,
+            copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
+            prefill_attention_batched: make_pipeline(&format!(
+                "prefill_attention_batched_causal_{prefill_grp_suffix}"
+            ))?,
+            copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
+            copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
+            decode_attention_f16: make_pipeline("decode_attention_f16")?,
+            decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
+            prefill_attention_batched_f16: make_pipeline(&format!(
+                "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
+            ))?,
+            lm_head_block_topk_f16: make_lm_head_block_pipelines(
+                device,
+                &library,
+                "lm_head_block_topk_f16",
+                cfg.hidden_size as u32,
+            )?,
+            lm_head_block_topk_q4: make_lm_head_block_pipelines(
+                device,
+                &library,
+                "lm_head_block_topk_q4",
+                cfg.hidden_size as u32,
+            )?,
+        })
+    }
+
     impl MetalQwen35Engine {
         /// Load immutable model resources from CPU weights. Does NOT allocate any session state.
         ///
@@ -3133,165 +2866,7 @@ mod inner {
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
-            // Group-size-specialized prefill attention kernel (occupancy win):
-            // group_size is fixed for a loaded model, so selection happens once
-            // here rather than per-dispatch. See `prefill_maxgrp_suffix`'s doc
-            // comment for the ship-safety rounding-up guarantee — validated
-            // in-range by `validate_flash_decode_shape` above.
-            let prefill_grp_suffix =
-                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
-
-            // Compile shaders
-            let opts = CompileOptions::new();
-            let library = device
-                .new_library_with_source(MSL_SOURCE, &opts)
-                .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
-
-            let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
-                let func = library
-                    .get_function(name, None)
-                    .map_err(|e| format!("function '{name}' not found: {e}"))?;
-                device
-                    .new_compute_pipeline_state_with_function(&func)
-                    .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
-            };
-
-            let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
-                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
-                // The compile/pipeline `.ok()?` chain below falls back to the
-                // naive gemm_q4 on any device where the V3.0 source fails.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q4_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
-                // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
-                // gemv_q3_decode-only (M=1) path on any device/compile failure.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q3_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
-                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let pipelines = MetalQwen35Pipelines {
-                gemv_decode: make_pipeline("gemv_decode_m1")?,
-                gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
-                gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q4: make_pipeline("gemv_q4_decode")?,
-                gemm_q4: make_pipeline("gemm_q4")?,
-                gemm_q4_tiled: make_optional_gemm_q4_tiled(),
-                gemv_q3: make_pipeline("gemv_q3_decode")?,
-                gemm_q3_tiled: make_optional_gemm_q3_tiled(),
-                rms_norm: make_pipeline("rms_norm_qwen35")?,
-                partial_rope: make_pipeline("partial_rope_interleaved")?,
-                per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
-                decode_attention: make_pipeline("decode_attention")?,
-                sigmoid_gate: make_pipeline("sigmoid_gate")?,
-                scatter_q_gate: make_pipeline("scatter_q_gate")?,
-                silu_mul: make_pipeline("silu_mul")?,
-                silu_mul_fused: make_pipeline("silu_mul_fused")?,
-                copy: make_pipeline("copy_buf")?,
-                copy_offset: make_pipeline("copy_buf_offset")?,
-                conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
-                gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
-                gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
-                gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
-                gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
-                gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
-                gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
-                gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
-                gdn_recurrence_q36: library
-                    .get_function("gdn_recurrence_fused_q36", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_precompute_keys: library
-                    .get_function("gdn_precompute_keys", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_recurrence_sharded: library
-                    .get_function("gdn_recurrence_sharded", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_norm_silu: library
-                    .get_function("gdn_norm_silu", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
-                copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
-                add_and_copy: make_pipeline("add_and_copy")?,
-                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
-                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
-                gemm_q8: make_pipeline("gemm_q8")?,
-                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
-                argmax_first: make_pipeline("logits_argmax_first")?,
-                argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_select50_first: make_pipeline("logits_topk_select50_first")?,
-                topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
-                decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
-                decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
-                lora_gemv_a: make_pipeline("lora_gemv_a")?,
-                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
-                // ADR-053: MoE Metal dispatch kernels
-                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
-                moe_scale_add: make_pipeline("moe_scale_add")?,
-                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
-                moe_zero_buf: make_pipeline("zero_buf")?,
-                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
-                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
-                partial_rope_batch: make_pipeline("partial_rope_batch")?,
-                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
-                prefill_attention_batched: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}"
-                ))?,
-                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
-                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
-                decode_attention_f16: make_pipeline("decode_attention_f16")?,
-                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
-                prefill_attention_batched_f16: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
-                ))?,
-                lm_head_block_topk_f16: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_f16",
-                    cfg.hidden_size as u32,
-                )?,
-                lm_head_block_topk_q4: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_q4",
-                    cfg.hidden_size as u32,
-                )?,
-            };
+            let pipelines = build_pipelines(&device, cfg)?;
 
             // Upload per-layer weights
             let quant_tag = match quant_format {
@@ -3740,6 +3315,7 @@ mod inner {
                     )
                 },
                 pre_final_hidden: make_zero_buffer(device, hidden, "act_pre_final_hidden"),
+                final_hidden: make_zero_buffer(device, hidden, "act_final_hidden"),
                 verify_logits: make_zero_buffer(
                     device,
                     MTP_VERIFY_MAX_TOKENS * cfg.vocab_size,
@@ -3842,6 +3418,9 @@ mod inner {
                 mtp,
                 gdn_checkpoints,
                 last_pre_final_hidden: vec![0.0f32; hidden],
+                mtp_prefill_hidden: Vec::new(),
+                capture_final_hidden: false,
+                final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
                 position: 0,
                 #[cfg(feature = "gdn-state-counters")]
                 gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
@@ -4147,43 +3726,22 @@ mod inner {
             module: &str,
         ) -> Result<(usize, usize), crate::error::InferenceError> {
             use crate::error::InferenceError;
-            let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
-            let is_full = cfg.is_full_attention(layer_idx);
 
-            match (module, is_full) {
-                // Full-attention projections
-                ("q_proj", true) => Ok((hidden, 2 * cfg.full_q_dim())),
-                ("k_proj", true) => Ok((hidden, cfg.full_kv_dim())),
-                ("v_proj", true) => Ok((hidden, cfg.full_kv_dim())),
-                ("o_proj", true) => Ok((cfg.full_q_dim(), hidden)),
-                // GDN projections
-                ("in_proj_qkv", false) => Ok((hidden, cfg.linear_qkv_dim())),
-                ("in_proj_z", false) => Ok((hidden, cfg.linear_output_dim())),
-                ("in_proj_b" | "in_proj_a", false) => Err(InferenceError::Inference(format!(
+            if matches!(module, "in_proj_b" | "in_proj_a") {
+                if cfg.is_full_attention(layer_idx) {
+                    return Err(InferenceError::Inference(format!(
+                        "unknown LoRA module '{module}'"
+                    )));
+                }
+                return Err(InferenceError::Inference(format!(
                     "module '{module}' is not yet supported in Metal forward (consumed inside \
                      fused GDN recurrence kernel); target other GDN modules instead"
-                ))),
-                ("out_proj", false) => Ok((cfg.linear_output_dim(), hidden)),
-                // MLP projections (shared across both layer types)
-                ("gate_proj", _) => Ok((hidden, inter)),
-                ("up_proj", _) => Ok((hidden, inter)),
-                ("down_proj", _) => Ok((inter, hidden)),
-                // Wrong layer-type combinations
-                ("q_proj" | "k_proj" | "v_proj" | "o_proj", false) => {
-                    Err(InferenceError::Inference(format!(
-                        "module '{module}' is a full-attention projection but layer {layer_idx} is GDN"
-                    )))
-                }
-                ("in_proj_qkv" | "in_proj_z" | "out_proj", true) => {
-                    Err(InferenceError::Inference(format!(
-                        "module '{module}' is a GDN projection but layer {layer_idx} is full-attention"
-                    )))
-                }
-                _ => Err(InferenceError::Inference(format!(
-                    "unknown LoRA module '{module}'"
-                ))),
+                )));
             }
+
+            let shape = crate::lora_hook::qwen35_projection_shape(cfg, layer_idx, module)
+                .map_err(InferenceError::Inference)?;
+            Ok((shape.d_in, shape.d_out))
         }
 
         /// Load a LoRA adapter onto the Metal GPU for inference.
@@ -4460,9 +4018,9 @@ mod inner {
                 ));
             }
 
-            match self.preflight_generate(prompt, tokenizer, gen_cfg)? {
-                GenerateAdmission::Zero(output) => return Ok(output),
-                GenerateAdmission::Ready(_) => {}
+            match self.prepare_direct_generation(prompt, tokenizer, gen_cfg)? {
+                GenerationPreparation::Complete(output) => return Ok(output),
+                GenerationPreparation::Ready(_) => {}
             }
 
             // Unload any previously loaded adapter so the slot is free.
@@ -4484,55 +4042,6 @@ mod inner {
             self.unload_lora_adapter();
 
             output
-        }
-
-        /// Dispatch LoRA GEMV for a single projection: y += scale * B @ (A @ x).
-        ///
-        /// `x_byte_offset` is the byte offset into `x` where the input vector starts (usually 0,
-        /// non-zero for sub-slices of fused buffers such as the Z portion of `gdn_qkvz`).
-        /// `y_byte_offset` is the byte offset into `y` where the output vector starts (usually 0,
-        /// non-zero when accumulating into a sub-slice of a fused output buffer).
-        ///
-        /// No-op if no adapter is loaded or no adapter exists for the given layer/module.
-        fn dispatch_lora_if_active(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            x_byte_offset: u64,
-            y: &Buffer,
-            y_byte_offset: u64,
-            layer_idx: usize,
-            module: &str,
-        ) {
-            let Some(adapter) = &self.lora else { return };
-            let Some(proj) = adapter.get_projection(layer_idx, module) else {
-                return;
-            };
-
-            // Phase 1: intermediate = A @ x  (x read from x_byte_offset)
-            enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_a);
-            enc.set_buffer(0, Some(x), x_byte_offset);
-            enc.set_buffer(1, Some(&proj.a_buf), 0);
-            enc.set_buffer(2, Some(&adapter.intermediate), 0);
-            enc.set_bytes(3, 4, &proj.rank as *const u32 as *const _);
-            enc.set_bytes(4, 4, &proj.d_in as *const u32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(proj.rank as u64, 1, 1),
-                MTLSize::new(32, 4, 1),
-            );
-
-            // Phase 2: y += scale * B @ intermediate  (y written at y_byte_offset)
-            enc.set_compute_pipeline_state(&self.engine.pipelines.lora_gemv_b_accum);
-            enc.set_buffer(0, Some(&adapter.intermediate), 0);
-            enc.set_buffer(1, Some(&proj.b_buf), 0);
-            enc.set_buffer(2, Some(y), y_byte_offset);
-            enc.set_bytes(3, 4, &proj.d_out as *const u32 as *const _);
-            enc.set_bytes(4, 4, &proj.rank as *const u32 as *const _);
-            enc.set_bytes(5, 4, &adapter.scale as *const f32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(proj.d_out.div_ceil(256) as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
         }
 
         /// Copy live GDN conv/S buffers into the given checkpoint slot (blocking GPU blit).
@@ -4724,12 +4233,12 @@ mod inner {
             tokens: &[u32],
             start_pos: usize,
         ) -> Result<MetalVerifyOutput, crate::error::InferenceError> {
+            self.check_forward_range_capacity(start_pos, tokens.len(), true)?;
             if self.session.gdn_checkpoints.is_none() {
                 return Err(crate::error::InferenceError::Inference(
                     "GDN checkpoint pool required for verify_tokens_batched".into(),
                 ));
             }
-            self.check_forward_range_capacity(start_pos, tokens.len(), true)?;
             if let Some(ref mut p) = self.session.gdn_checkpoints {
                 p.active_base_seq_len = Some(start_pos);
                 p.mtp_base_seq_len = self.session.mtp.as_ref().map(|m| m.cache.seq_len);
@@ -4784,12 +4293,12 @@ mod inner {
                     "verify_batch: bad token count {n} (max {MTP_VERIFY_MAX_TOKENS})"
                 )));
             }
+            self.check_forward_range_capacity(start_pos, n, false)?;
             if self.session.gdn_checkpoints.is_none() {
                 return Err(crate::error::InferenceError::Inference(
                     "GDN checkpoint pool required for verify_tokens_batch_gemm".into(),
                 ));
             }
-            self.check_forward_range_capacity(start_pos, n, false)?;
 
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
@@ -5430,6 +4939,8 @@ mod inner {
                 m,
                 cfg.rms_norm_eps,
             );
+            // Site 1 of 3. `last_off` is the last of the K verified tokens.
+            self.encode_capture_final_hidden(enc, last_off, hidden);
 
             // Logits GEMM for all K tokens → verify_logits[K * vocab_size].
             self.dispatch_gemm(
@@ -5948,6 +5459,232 @@ mod inner {
             MetalMtpForwardOutput {
                 token_id: draft_token,
                 logits,
+            }
+        }
+
+        /// Rebuilds the MTP draft head's KV cache from the prompt just processed by
+        /// `forward_prefill`/`forward_prefill_all_logits` (#1340).
+        ///
+        /// Without this, `reset_state` zeroes the MTP cache and the only prefill on
+        /// the Metal path fills the *target* model's cache, so the first
+        /// `mtp_forward_one` call of a generation dispatches attention with
+        /// `cache_len = 1` — the draft can only ever attend to the row it just
+        /// wrote, independent of the prompt.
+        ///
+        /// `mtp_forward_one(pending_token, pos)` pairs `pending_token`'s embedding
+        /// with `last_pre_final_hidden` — the target's pre-final hidden state from
+        /// the position *before* `pending_token`, i.e. the hidden state that
+        /// predicted it. This mirrors that pairing across the whole prompt: for each
+        /// position `p` in `1..prompt_ids.len()`, it pairs `prompt_ids[p]` with the
+        /// target's pre-final hidden state at position `p - 1`, captured into
+        /// `self.session.mtp_prefill_hidden` by `forward_prefill_batched_chunk`.
+        /// Position 0 has no predecessor hidden state (nothing came before the first
+        /// prompt token) and is intentionally not represented in the MTP cache, so a
+        /// prompt of length `L` yields `L - 1` prefilled entries; the live call for
+        /// the first generated token then appends the `L`-th, giving that call's
+        /// attention dispatch `cache_len == L` instead of `1`.
+        ///
+        /// No-op when the session has no MTP head, when the prompt is too short to
+        /// yield a pair, or when `mtp_prefill_hidden` was not populated for this
+        /// exact prompt (e.g. the LoRA-active prefill path, which forwards token by
+        /// token via `forward_step` and does not feed the accumulator) — captured
+        /// length is asserted against `prompt_ids.len() * hidden_size` and anything
+        /// else is treated as "nothing to prefill" rather than misinterpreted.
+        fn mtp_prefill(&mut self, prompt_ids: &[u32]) {
+            let captured = std::mem::take(&mut self.session.mtp_prefill_hidden);
+            if self.session.mtp.is_none() {
+                return;
+            }
+            let hidden = self.engine.config.hidden_size;
+            let n = prompt_ids.len();
+            if n < 2 || captured.len() != n * hidden {
+                return;
+            }
+            for p in 1..n {
+                let hidden_in = &captured[(p - 1) * hidden..p * hidden];
+                self.mtp_prefill_append(prompt_ids[p], hidden_in, p);
+            }
+        }
+
+        /// Appends one MTP cache entry (K/V only — no Q, attention, MLP, or logits)
+        /// for `token_id` at absolute position `position`, using `hidden_in` as the
+        /// target's pre-final hidden state input in place of
+        /// `self.session.last_pre_final_hidden`. Mirrors the CPU phase and GPU
+        /// dispatch sequence of `mtp_forward_one` up through the KV cache append —
+        /// everything after that point (attention, gating, MLP, logits) only matters
+        /// for a position acting as a *query*, and a prefilled position is only ever
+        /// a future *key*.
+        fn mtp_prefill_append(&mut self, token_id: u32, hidden_in: &[f32], position: usize) {
+            let cfg = self.engine.config.clone();
+            let hidden = cfg.hidden_size;
+            let kv_dim = cfg.full_kv_dim();
+            let num_kv_heads = cfg.num_key_value_heads;
+            let head_dim = cfg.head_dim as u32;
+            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
+
+            // ---- Phase 1: CPU (mirrors mtp_forward_one's embedding + hidden norm + fuse) ----
+            let mut normed_embed = vec![0.0f32; hidden];
+            assert!((token_id as usize) < cfg.vocab_size);
+            unsafe {
+                let src = (self.engine.embed_tokens.contents() as *const u16)
+                    .add(token_id as usize * hidden);
+                // SAFETY: embed_tokens row has hidden u16 values; normed_embed has hidden f32 values.
+                convert_f16_row(src, normed_embed.as_mut_ptr(), hidden);
+            }
+            if let Some(ref rot) = self.engine.quarot_rotation {
+                debug_assert_eq!(rot.dim(), normed_embed.len());
+                let _ = rot.apply_inverse(&mut normed_embed);
+            }
+            {
+                let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
+                let gamma = unsafe {
+                    std::slice::from_raw_parts(
+                        mtp_weights.pre_fc_norm_embedding.contents() as *const f32,
+                        hidden,
+                    )
+                };
+                let mut sum_sq = 0.0f32;
+                for &v in normed_embed.iter() {
+                    sum_sq += v * v;
+                }
+                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
+                for (v, &g) in normed_embed.iter_mut().zip(gamma.iter()) {
+                    *v = *v * inv_rms * g;
+                }
+            }
+
+            let mut normed_hidden = hidden_in.to_vec();
+            if let Some(ref rot) = self.engine.quarot_rotation {
+                debug_assert_eq!(rot.dim(), normed_hidden.len());
+                let _ = rot.apply_inverse(&mut normed_hidden);
+            }
+            {
+                let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
+                let gamma = unsafe {
+                    std::slice::from_raw_parts(
+                        mtp_weights.pre_fc_norm_hidden.contents() as *const f32,
+                        hidden,
+                    )
+                };
+                let mut sum_sq = 0.0f32;
+                for &v in normed_hidden.iter() {
+                    sum_sq += v * v;
+                }
+                let inv_rms = 1.0 / (sum_sq / hidden as f32 + cfg.rms_norm_eps).sqrt();
+                for (v, &g) in normed_hidden.iter_mut().zip(gamma.iter()) {
+                    *v = *v * inv_rms * g;
+                }
+            }
+
+            {
+                let mtp = self.session.mtp.as_ref().unwrap();
+                let dst = mtp.activations.fused.contents() as *mut f32;
+                unsafe {
+                    for (i, &v) in normed_embed.iter().enumerate() {
+                        *dst.add(i) = v;
+                    }
+                    for (i, &v) in normed_hidden.iter().enumerate() {
+                        *dst.add(hidden + i) = v;
+                    }
+                }
+            }
+
+            // ---- Phase 2: GPU (K/V-only: fc, input-norm, k/v proj, k-norm, rope, cache append) ----
+            let (w_fc, w_input_ln, w_k_proj, w_v_proj, w_k_norm) = {
+                let mtp_weights = self.engine.mtp_weights.as_ref().unwrap();
+                let lw = &mtp_weights.layers[0];
+                (
+                    &mtp_weights.fc as *const Buffer,
+                    &lw.input_layernorm as *const Buffer,
+                    &lw.k_proj as *const Buffer,
+                    &lw.v_proj as *const Buffer,
+                    &lw.k_norm as *const Buffer,
+                )
+            };
+            let (buf_fused, buf_hidden, buf_residual, buf_k, buf_v) = {
+                let a = &self.session.mtp.as_ref().unwrap().activations;
+                (
+                    &a.fused as *const Buffer,
+                    &a.hidden as *const Buffer,
+                    &a.residual as *const Buffer,
+                    &a.k as *const Buffer,
+                    &a.v as *const Buffer,
+                )
+            };
+            let (buf_k_cache, buf_v_cache, mtp_seq_len) = {
+                let c = &self.session.mtp.as_ref().unwrap().cache;
+                (
+                    &c.k_buf as *const Buffer,
+                    &c.v_buf as *const Buffer,
+                    c.seq_len,
+                )
+            };
+
+            let cmd = self.engine.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            unsafe {
+                self.dispatch_matmul_half(
+                    enc,
+                    &*buf_fused,
+                    &*w_fc,
+                    &*buf_hidden,
+                    1,
+                    hidden as u32,
+                    (2 * hidden) as u32,
+                );
+                self.dispatch_copy_and_rms_norm(
+                    enc,
+                    &*buf_hidden,
+                    &*buf_residual,
+                    &*w_input_ln,
+                    hidden as u32,
+                    cfg.rms_norm_eps,
+                );
+                self.dispatch_matmul_half(
+                    enc,
+                    &*buf_hidden,
+                    &*w_k_proj,
+                    &*buf_k,
+                    1,
+                    kv_dim as u32,
+                    hidden as u32,
+                );
+                self.dispatch_matmul_half(
+                    enc,
+                    &*buf_hidden,
+                    &*w_v_proj,
+                    &*buf_v,
+                    1,
+                    kv_dim as u32,
+                    hidden as u32,
+                );
+                self.dispatch_per_head_rms_norm(
+                    enc,
+                    &*buf_k,
+                    &*w_k_norm,
+                    num_kv_heads as u32,
+                    head_dim,
+                    cfg.rms_norm_eps,
+                );
+                self.dispatch_partial_rope(
+                    enc,
+                    &*buf_k,
+                    num_kv_heads as u32,
+                    head_dim,
+                    half_rope_dim,
+                    position as u32,
+                    None,
+                );
+                let kv_cache_off = (mtp_seq_len * kv_dim) as u32;
+                self.dispatch_copy_offset(enc, &*buf_k, &*buf_k_cache, kv_dim as u32, kv_cache_off);
+                self.dispatch_copy_offset(enc, &*buf_v, &*buf_v_cache, kv_dim as u32, kv_cache_off);
+            }
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+
+            if let Some(ref mut mtp) = self.session.mtp {
+                mtp.cache.seq_len += 1;
             }
         }
 
@@ -7034,6 +6771,10 @@ mod inner {
         }
 
         fn forward_prefill_impl(&mut self, token_ids: &[u32], all_positions: bool) -> Vec<f32> {
+            // Start of a fresh prompt pass: drop any hidden states captured by a
+            // previous prefill so `mtp_prefill` never pairs this prompt's tokens
+            // with a stale prior prompt's hidden states (#1340).
+            self.session.mtp_prefill_hidden.clear();
             let n = token_ids.len();
             let vocab = self.engine.config.vocab_size;
             // Validate all ids once at the entry point (O(seq_len)) before any GPU work.
@@ -7675,6 +7416,42 @@ mod inner {
                 }
             }
 
+            // MTP prefill capture (#1340): `activations.hidden` currently holds the
+            // raw, pre-final-RMSNorm target hidden state for every one of this
+            // chunk's `n` positions. The tail below overwrites row `n-1` (default)
+            // or every row (`all_positions`) with its post-RMSNorm value in place,
+            // so this read must land before that dispatch runs — hence ending and
+            // committing the layer-loop's command buffer here instead of after the
+            // tail. `mtp_prefill` (called from `generate()`) drains the accumulated
+            // rows to rebuild the MTP draft head's KV cache from the prompt. Gated
+            // on `mtp.is_some()` so a session without an MTP head pays nothing extra
+            // — the pre-existing single-command-buffer path below is untouched.
+            let (cmd, enc) = if self.session.mtp.is_some() {
+                enc.end_encoding();
+                cmd.commit();
+                cmd.wait_until_completed();
+                // SAFETY: the command buffer just completed; `hidden` (the
+                // activations buffer, not the local `hidden: usize` row-length) is
+                // StorageModeShared and the layer loop above wrote exactly `n`
+                // valid rows into it.
+                let raw_hidden =
+                    unsafe { read_buffer(&self.session.activations.hidden, n * hidden) };
+                self.session
+                    .mtp_prefill_hidden
+                    .extend_from_slice(&raw_hidden);
+
+                if !emit_logits {
+                    self.session.set_position(start_pos + n);
+                    return vec![];
+                }
+
+                let cmd = self.engine.queue.new_command_buffer();
+                let enc = cmd.new_compute_command_encoder();
+                (cmd, enc)
+            } else {
+                (cmd, enc)
+            };
+
             if !emit_logits {
                 // Intermediate chunk of a chunked, `!all_positions` prefill: the caller
                 // only ever keeps the LAST chunk's logits, so the terminal tail below
@@ -7745,6 +7522,10 @@ mod inner {
                 // One threadgroup per row in batched mode, one for single-row mode.
                 enc.dispatch_thread_groups(MTLSize::new(nr as u64, 1, 1), MTLSize::new(256, 1, 1));
             }
+            // Site 2 of 3. `last_off` is normed under both branches above:
+            // `all_positions` norms every row including the last, and the
+            // single-token branch norms exactly that row.
+            self.encode_capture_final_hidden(enc, last_off, hidden);
 
             // lm_head — for Q8 format (auto-quantized from F16 source), use the
             // FP16 embed_tokens buffer to avoid the ~0.79 PPL gap from per-row
@@ -8177,7 +7958,7 @@ mod inner {
         ) -> GenerateOutput {
             let cfg = self.engine.config.clone();
 
-            // Mirror plain greedy `generate()` (generate.rs:235): max_new_tokens == 0
+            // Mirror canonical plain greedy generation: max_new_tokens == 0
             // means "generate nothing".  Return before sampling so we never emit a
             // token the caller did not ask for — including the case-A prefill-EOS path
             // below, which would otherwise emit one stop token for a zero budget.
@@ -8233,6 +8014,14 @@ mod inner {
                 }
 
                 // --- MTP draft phase ---
+                // `mtp_forward_one` writes exactly one MTP KV cache row (for
+                // `pending_token`) and advances `mtp.cache.seq_len` past it before this
+                // round's verify/rollback machinery runs. Snapshot the pre-draft cursor
+                // so a rejection restores the MTP cache to its state as of the top of
+                // this round, not as of after the draft's own write — `verify_tokens_batched`/
+                // `verify_tokens_batch_gemm` capture `mtp_base_seq_len` from whatever the
+                // cursor reads when *they* run, which is already past that row (#1341).
+                let mtp_seq_len_pre_draft = self.session.mtp.as_ref().map(|m| m.cache.seq_len);
                 let t_mtp = std::time::Instant::now();
                 let draft = self.mtp_forward_one(pending_token, pos);
                 metrics.mtp_ms += t_mtp.elapsed().as_secs_f64() * 1000.0;
@@ -8263,6 +8052,13 @@ mod inner {
                 };
                 metrics.verify_ms += t_verify.elapsed().as_secs_f64() * 1000.0;
                 metrics.verify_calls += 1;
+                // Correct the base the verifier just captured: it read the MTP cursor
+                // after the draft phase already advanced it by one row, so restoring
+                // `base_mtp + slot` on rejection would double-count that row and leave
+                // the cursor one slot past the last one `mtp_forward_one` actually wrote.
+                if let Some(ref mut p) = self.session.gdn_checkpoints {
+                    p.mtp_base_seq_len = mtp_seq_len_pre_draft;
+                }
 
                 // Route the accept/reject decision through `rejection_sample_draft` so
                 // the live MTP loop and the trait-level `mtp_verify_draft` share the
@@ -8423,7 +8219,7 @@ mod inner {
         ) -> GenerateOutput {
             let cfg = self.engine.config.clone();
 
-            // Mirror plain greedy `generate()` (generate.rs:293) and the sibling
+            // Mirror canonical plain greedy generation and the sibling
             // `generate_greedy_mtp`: max_new_tokens == 0 means "generate nothing".
             // Return before sampling so we never emit a token the caller did not ask
             // for — including the case-A prefill-EOS path below, which would otherwise
@@ -8733,38 +8529,38 @@ mod inner {
             }
         }
 
-        fn preflight_generate(
+        fn prepare_direct_generation(
             &self,
             prompt: &str,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
-        ) -> Result<GenerateAdmission, crate::error::InferenceError> {
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids = input.input_ids[..input.real_length].to_vec();
-            let prompt_len = prompt_ids.len();
-
-            crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
-            if gen_cfg.max_new_tokens == 0 {
-                return Ok(GenerateAdmission::Zero(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: false,
-                    stop_reason: Some(StopReason::Length),
-                    token_logprobs: vec![],
-                }));
-            }
-            crate::model::qwen35::check_reasoning_budget_not_set(gen_cfg)?;
-            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-            crate::model::qwen35::check_context_budget(
-                prompt_len,
-                gen_cfg.reasoning_budget,
-                gen_cfg.max_new_tokens,
+        ) -> Result<GenerationPreparation, crate::error::InferenceError> {
+            prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
                 self.max_context(),
-            )?;
+                GenerationEntryContract::MetalDirect,
+            )
+        }
 
-            Ok(GenerateAdmission::Ready(prompt_ids))
+        fn configure_sampling_route(
+            &mut self,
+            gen_cfg: &GenerateConfig,
+            history_is_empty: bool,
+        ) -> bool {
+            let plan = plan_sampling_route(
+                gen_cfg,
+                history_is_empty,
+                SamplingRouteEnvironment::current(),
+            );
+            apply_sampling_route_plan(
+                plan,
+                &mut self.session.compact_route,
+                &mut self.session.compact_topk,
+                &mut self.session.compact_result,
+            )
         }
 
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
@@ -8786,32 +8582,18 @@ mod inner {
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
 
-            let prompt_ids = match self.preflight_generate(prompt, tokenizer, gen_cfg)? {
-                GenerateAdmission::Zero(output) => return Ok(output),
-                GenerateAdmission::Ready(prompt_ids) => prompt_ids,
+            let plan = match self.prepare_direct_generation(prompt, tokenizer, gen_cfg)? {
+                GenerationPreparation::Complete(output) => return Ok(output),
+                GenerationPreparation::Ready(plan) => plan,
             };
-            let prompt_len = prompt_ids.len();
+            let GenerationPlan {
+                mut rng_state,
+                prompt_ids,
+                prompt_len,
+                ..
+            } = plan;
 
             let cfg = self.engine.config.clone();
-
-            // Initialize RNG
-            let mut rng_state = match gen_cfg.seed {
-                Some(s) => {
-                    if s == 0 {
-                        1
-                    } else {
-                        s
-                    }
-                }
-                None => {
-                    use std::time::SystemTime;
-                    let t = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x12345678_9abcdef0);
-                    if t == 0 { 1 } else { t }
-                }
-            };
 
             // Reset state for new generation
             self.reset_state();
@@ -8819,44 +8601,7 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
-            );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            // Repetition penalty requires full logits — disable compact mode when active.
-            // Grammar-constrained decoding also requires full logits (CpuFallback).
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -8907,6 +8652,10 @@ mod inner {
                     self.session.compact_topk = 0;
                     self.session.compact_route = GpuTopkRoute::CpuFallback;
                 }
+                // #1340: rebuild the MTP draft head's KV cache from the prompt
+                // before the first draft round, so it attends to the prompt prefix
+                // instead of the single row `reset_state` left it with.
+                self.mtp_prefill(&prompt_ids);
                 return Ok(self.generate_greedy_mtp(
                     &prefill_logits,
                     prompt_len,
@@ -9496,7 +9245,52 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
-            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None)
+            self.generate_multimodal_vision_impl(request, tokenizer, gen_cfg, None, None)
+        }
+
+        /// Generate from one vision request while polling caller cancellation.
+        ///
+        /// Cancellation is checked before prefill, before every prefill token,
+        /// after prefill, and before every decode step. The returned output
+        /// carries [`StopReason::Interrupt`] when cancellation wins.
+        pub fn generate_multimodal_vision_with_cancel<C>(
+            &mut self,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+            mut should_cancel: C,
+        ) -> Result<GenerateOutput, crate::error::InferenceError>
+        where
+            C: FnMut() -> bool,
+        {
+            self.generate_multimodal_vision_impl(
+                request,
+                tokenizer,
+                gen_cfg,
+                None,
+                Some(&mut should_cancel),
+            )
+        }
+
+        fn multimodal_cancel_requested(
+            should_cancel: &mut Option<&mut dyn FnMut() -> bool>,
+        ) -> bool {
+            match should_cancel {
+                Some(callback) => callback(),
+                None => false,
+            }
+        }
+
+        fn cancelled_multimodal_output(prompt_tokens: usize) -> GenerateOutput {
+            GenerateOutput {
+                text: String::new(),
+                token_ids: Vec::new(),
+                prompt_tokens,
+                generated_tokens: 0,
+                stopped: false,
+                stop_reason: Some(StopReason::Interrupt),
+                token_logprobs: Vec::new(),
+            }
         }
 
         /// Body of [`Self::generate_multimodal_vision`] with an optional
@@ -9515,6 +9309,7 @@ mod inner {
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut decode_logits_probe: Option<&mut Vec<Vec<f32>>>,
+            mut should_cancel: Option<&mut dyn FnMut() -> bool>,
         ) -> Result<GenerateOutput, crate::error::InferenceError> {
             use crate::error::InferenceError;
 
@@ -9625,6 +9420,10 @@ mod inner {
                 self.max_context(),
             )?;
 
+            if Self::multimodal_cancel_requested(&mut should_cancel) {
+                return Ok(Self::cancelled_multimodal_output(prompt_len));
+            }
+
             // Reset recurrent state for a clean generation.
             self.reset_state();
 
@@ -9659,6 +9458,9 @@ mod inner {
             let mut visual_row = 0usize;
             let mut last_logits = Vec::new();
             for (pos, &token_id) in prompt_ids.iter().enumerate() {
+                if Self::multimodal_cancel_requested(&mut should_cancel) {
+                    return Ok(Self::cancelled_multimodal_output(prompt_len));
+                }
                 let cos_sin = if has_image {
                     Some((tables.cos[pos].as_slice(), tables.sin[pos].as_slice()))
                 } else {
@@ -9691,6 +9493,9 @@ mod inner {
                         crate::forward::signpost::Scope::NotDecode,
                     );
                 }
+            }
+            if Self::multimodal_cancel_requested(&mut should_cancel) {
+                return Ok(Self::cancelled_multimodal_output(prompt_len));
             }
 
             let mut all_ids = prompt_ids.clone();
@@ -9733,6 +9538,10 @@ mod inner {
             // `decode_axis = physical_pos + rope_delta`, recomputed into a single
             // cos/sin row via the same `build_decode_cos_sin` the CPU oracle uses.
             while !stopped && generated_ids.len() < gen_cfg.max_new_tokens {
+                if Self::multimodal_cancel_requested(&mut should_cancel) {
+                    stop_reason = StopReason::Interrupt;
+                    break;
+                }
                 if self.session.kv_cache.seq_len >= self.session.kv_cache.max_cache_len {
                     stop_reason = StopReason::KvFull;
                     break;
@@ -9847,6 +9656,7 @@ mod inner {
             if let Some(ref mut mtp) = self.session.mtp {
                 mtp.cache.reset();
             }
+            self.session.mtp_prefill_hidden.clear();
             if let Some(ref mut pool) = self.session.gdn_checkpoints {
                 pool.active_base_seq_len = None;
             }
@@ -9892,1169 +9702,54 @@ mod inner {
         // Layer-encoding helpers (called from forward_step_inner)
         // ===================================================================
 
-        /// Encode the MLP tail shared by every layer (both GDN and GQA).
+        /// Copy the last token's hidden state into `activations.final_hidden`,
+        /// AFTER the final RMSNorm has been applied to it.
         ///
-        /// Dispatches: fused residual-add-norm → gate_up_proj GEMV → LoRA(gate/up) →
-        /// silu_mul → down_proj GEMV → LoRA(down) → residual-add-copy.
+        /// One implementation with three call sites, one per forward path that
+        /// dispatches the final norm, so the paths cannot drift apart. Grep
+        /// `engine.final_norm` to enumerate them; every hit is either a
+        /// dispatch immediately followed by a call to this, or the weight
+        /// buffer's own definition.
         ///
-        /// Pure extraction from `encode_gdn_layer` / `encode_gqa_layer`; the fused
-        /// path is byte-for-byte identical to inlining.
+        /// Placement after the norm is the whole point. The norm runs in place
+        /// on `activations.hidden`, so the same address holds a pre-norm vector
+        /// before it and a post-norm vector after, and the two differ by the
+        /// norm's rescale. A capture encoded before the norm returns
+        /// well-formed, correctly-sized, plausible numbers from the wrong point
+        /// in the network — which is exactly what `pre_final_hidden` above
+        /// holds for MTP, and exactly why this is a separate buffer.
         ///
-        /// # Preconditions
-        /// - `self.session.activations.residual` holds the post-attention residual.
-        /// - `self.session.activations.attn_out` holds the attention output.
-        /// - `self.session.activations.hidden` is scratch space.
-        ///
-        /// # Postconditions
-        /// - `self.session.activations.residual` and `.hidden` hold the post-FFN state.
-        fn encode_mlp_block(
-            &mut self,
-            enc: &ComputeCommandEncoderRef,
-            compact_idx: usize,
-            layer_idx: usize,
-            position: usize,
-            cfg: &Qwen35Config,
-            prof: &mut StepProfile,
-            profiling: bool,
-        ) {
-            let hidden = cfg.hidden_size;
-            let inter = cfg.intermediate_size;
-            let (_, common_w) = &self.engine.layer_weights[compact_idx];
-            let mlp_t0 = profiling.then(std::time::Instant::now);
-            self.dispatch_fused_residual_add_norm(
-                enc,
-                &self.session.activations.residual,
-                &self.session.activations.attn_out,
-                &self.session.activations.residual,
-                &self.session.activations.hidden,
-                &common_w.post_attention_layernorm,
-                hidden as u32,
-                cfg.rms_norm_eps,
-            );
-            // SAFETY: FFN weight buffers are live for the command buffer lifetime.
-            match &common_w.ffn {
-                MetalFfnWeights::Dense {
-                    gate_up_proj,
-                    down_proj,
-                } => {
-                    let w_gate_up = gate_up_proj as *const Q4WeightBuf;
-                    let w_down = down_proj as *const Q4WeightBuf;
-                    unsafe {
-                        self.dispatch_matmul(
-                            enc,
-                            &self.session.activations.hidden,
-                            &*w_gate_up,
-                            &self.session.activations.gate,
-                            1,
-                            (2 * inter) as u32,
-                            hidden as u32,
-                        );
-                    }
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.hidden,
-                        0,
-                        &self.session.activations.gate,
-                        0,
-                        layer_idx,
-                        "gate_proj",
-                    );
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.hidden,
-                        0,
-                        &self.session.activations.gate,
-                        (inter * std::mem::size_of::<f32>()) as u64,
-                        layer_idx,
-                        "up_proj",
-                    );
-                    self.dispatch_silu_mul_fused(enc, &self.session.activations.gate, inter as u32);
-                    unsafe {
-                        self.dispatch_matmul(
-                            enc,
-                            &self.session.activations.gate,
-                            &*w_down,
-                            &self.session.activations.ffn_out,
-                            1,
-                            hidden as u32,
-                            inter as u32,
-                        );
-                    }
-                    self.dispatch_lora_if_active(
-                        enc,
-                        &self.session.activations.gate,
-                        0,
-                        &self.session.activations.ffn_out,
-                        0,
-                        layer_idx,
-                        "down_proj",
-                    );
-                }
-                MetalFfnWeights::Moe(moe_bufs) => {
-                    let moe_ptr = moe_bufs.as_ref() as *const MoeMetalBuffers;
-                    // SAFETY: moe_bufs is owned by layer_weights which is live.
-                    unsafe {
-                        self.encode_moe_ffn(enc, &*moe_ptr, cfg, layer_idx, position);
-                    }
-                }
-            }
-            self.dispatch_add_and_copy(
-                enc,
-                &self.session.activations.ffn_out,
-                &self.session.activations.residual,
-                &self.session.activations.hidden,
-                hidden as u32,
-            );
-            if let Some(t0) = mlp_t0 {
-                prof.mlp_us += t0.elapsed().as_micros();
-            }
-        }
-
-        /// Encode all Metal commands for a single GDN (linear-attention) layer.
-        ///
-        /// All commands are appended to the already-open encoder `enc`; no new
-        /// command buffer is created here.  Returns `1` on every call (one GPU
-        /// recurrence dispatch issued per GDN layer).
-        fn encode_gdn_layer(
-            &mut self,
-            enc: &ComputeCommandEncoderRef,
-            compact_idx: usize,
-            linear_idx: usize,
-            position: usize,
-            layer_idx: usize,
-            cfg: &Qwen35Config,
-            prof: &mut StepProfile,
-            profiling: bool,
-            with_mlp: bool,
-        ) -> usize {
-            let hidden = cfg.hidden_size;
-            let (
-                w_in_proj_qkvz,
-                w_in_proj_b,
-                w_in_proj_a,
-                w_a_log,
-                w_dt_bias,
-                w_conv1d,
-                w_norm,
-                w_out_proj,
-            ) = {
-                let MetalLayerAttnWeights::Linear(gdn_w) =
-                    &self.engine.layer_weights[compact_idx].0
-                else {
-                    unreachable!()
-                };
-                (
-                    &gdn_w.in_proj_qkvz as *const Q4WeightBuf,
-                    &gdn_w.in_proj_b as *const Buffer,
-                    &gdn_w.in_proj_a as *const Buffer,
-                    &gdn_w.a_log as *const Buffer,
-                    &gdn_w.dt_bias as *const Buffer,
-                    &gdn_w.conv1d_weight as *const Buffer,
-                    &gdn_w.norm_weight as *const Buffer,
-                    &gdn_w.out_proj as *const Q4WeightBuf,
-                )
-            };
-            let (_, common_w) = &self.engine.layer_weights[compact_idx];
-            let qkv_d = cfg.linear_qkv_dim();
-            let out_d = cfg.linear_output_dim();
-            let ks = cfg.linear_conv_kernel_dim as u32;
-            let num_h = cfg.linear_num_key_heads;
-            let key_d = cfg.linear_key_head_dim;
-            let val_d = cfg.linear_value_head_dim;
-
-            // Pre-norm: save residual + normalize hidden in one dispatch
-            self.dispatch_copy_and_rms_norm(
-                enc,
-                &self.session.activations.hidden,
-                &self.session.activations.residual,
-                &common_w.input_layernorm,
-                hidden as u32,
-                cfg.rms_norm_eps,
-            );
-
-            // QKV + Z projections
-            // SAFETY: Raw projection buffer pointers were taken from
-            // self.engine.layer_weights and remain valid while self is borrowed;
-            // H4 fusion: one wider GEMV writes QKV||Z rows to gdn_qkvz (saves 1 dispatch/GDN layer).
-            // SAFETY: w_in_proj_qkvz holds contiguous Q4 rows [0..qkv_d) from qkv and
-            // [qkv_d..qkv_d+out_d) from z; output gdn_qkvz is (qkv_d+out_d) floats.
-            let proj_t0 = profiling.then(std::time::Instant::now);
-            unsafe {
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.hidden,
-                    &*w_in_proj_qkvz,
-                    &self.session.activations.gdn_qkvz,
-                    1,
-                    (qkv_d + out_d) as u32,
-                    hidden as u32,
-                );
-            }
-            if let Some(t0) = proj_t0 {
-                prof.projection_us += t0.elapsed().as_micros();
-            }
-
-            // LoRA for in_proj_qkv: accumulates into QKV portion (offset 0) of gdn_qkvz.
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.gdn_qkvz,
-                0,
-                layer_idx,
-                "in_proj_qkv",
-            );
-            // LoRA for in_proj_z: accumulates into Z portion (byte offset qkv_d * 4) of gdn_qkvz.
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.gdn_qkvz,
-                (qkv_d as u64) * 4,
-                layer_idx,
-                "in_proj_z",
-            );
-            // in_proj_b and in_proj_a: rejected at load time (consumed inside fused kernels).
-
-            // Conv1d + SiLU (GPU)
-            // SAFETY: Encoder commands reference live Metal buffers owned by
-            // self/layer weights; qkv_d and kernel_size match activation and
-            // weight buffer dimensions allocated during initialization.
-            unsafe {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
-                enc.set_buffer(1, Some(&self.session.activations.gdn_qkvz), 0); // QKV at offset 0 of fused buffer
-                enc.set_buffer(2, Some(&*w_conv1d), 0);
-                enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
-                let qd = qkv_d as u32;
-                enc.set_bytes(4, 4, &qd as *const u32 as *const _);
-                enc.set_bytes(5, 4, &ks as *const u32 as *const _);
-                let wg = 256u64;
-                enc.dispatch_threads(
-                    MTLSize::new(div_ceil(qkv_d as u64, wg) * wg, 1, 1),
-                    MTLSize::new(wg, 1, 1),
-                );
-            }
-
-            // GDN recurrence (GPU) — one threadgroup per value head
-            // SAFETY: All buffers are StorageModeShared and live for the
-            // command buffer; dimensions in GdnRecurParams are derived from
-            // the model config used to allocate the GDN state buffers.
-            let gdn_t0 = profiling.then(std::time::Instant::now);
-            unsafe {
-                #[repr(C)]
-                struct GdnRecurParams {
-                    key_dim: u32,
-                    value_dim: u32,
-                    num_key_heads: u32,
-                    num_value_heads: u32,
-                    hidden_size: u32,
-                    q_total: u32,
-                    v_offset: u32,
-                    scale: f32,
-                    eps: f32,
-                }
-                let num_vh = cfg.linear_num_value_heads();
-                let q_total = (num_h * key_d) as u32;
-                let params = GdnRecurParams {
-                    key_dim: key_d as u32,
-                    value_dim: val_d as u32,
-                    num_key_heads: num_h as u32,
-                    num_value_heads: num_vh as u32,
-                    hidden_size: hidden as u32,
-                    q_total,
-                    v_offset: q_total * 2,
-                    scale: 1.0 / (key_d as f32).sqrt(),
-                    eps: cfg.rms_norm_eps,
-                };
-                let z_byte_off = (qkv_d as u64) * 4; // byte offset to Z portion in gdn_qkvz
-                let use_q36 =
-                    key_d == 128 && val_d == 128 && hidden == 5120 && num_h == 16 && num_vh == 48;
-                // Chunked GDN prefill is prefill-only; single-token decode always uses serial path.
-                if self.use_gdn_chunked && !use_q36 {
-                    tracing::debug!(
-                        "chunked GDN prefill is prefill-only; encode_gdn_layer keeps serial recurrence"
-                    );
-                }
-                // H1+H3 three-kernel path: use when all three sharded kernels compiled.
-                let use_h1h3 = use_q36
-                    && self.engine.pipelines.gdn_precompute_keys.is_some()
-                    && self.engine.pipelines.gdn_recurrence_sharded.is_some()
-                    && self.engine.pipelines.gdn_norm_silu.is_some();
-                if use_h1h3 {
-                    let p_bytes = std::mem::size_of::<GdnRecurParams>() as u64;
-                    let p_ptr = &params as *const GdnRecurParams as *const _;
-
-                    // H3: precompute per-value-head decay/beta/g + per-key-head Q/K norms — num_vh TGs × 128 threads
-                    enc.set_compute_pipeline_state(
-                        self.engine.pipelines.gdn_precompute_keys.as_ref().unwrap(),
-                    );
-                    enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_out), 0);
-                    enc.set_buffer(1, Some(&self.session.activations.hidden), 0);
-                    enc.set_buffer(2, Some(&*w_in_proj_b), 0);
-                    enc.set_buffer(3, Some(&*w_in_proj_a), 0);
-                    enc.set_buffer(4, Some(&*w_a_log), 0);
-                    enc.set_buffer(5, Some(&*w_dt_bias), 0);
-                    enc.set_buffer(6, Some(&self.session.activations.gdn_key_scratch), 0);
-                    enc.set_bytes(7, p_bytes, p_ptr);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(num_vh as u64, 1, 1),
-                        MTLSize::new(128, 1, 1),
-                    );
-
-                    // H1: sharded recurrence — (val_d/4) × num_vh TGs, 32×4 threads
-                    enc.set_compute_pipeline_state(
-                        self.engine
-                            .pipelines
-                            .gdn_recurrence_sharded
-                            .as_ref()
-                            .unwrap(),
-                    );
-                    enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
-                    enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
-                    enc.set_buffer(2, Some(&self.session.activations.gdn_key_scratch), 0);
-                    enc.set_buffer(3, Some(&self.session.activations.gdn_raw_out), 0);
-                    enc.set_bytes(4, p_bytes, p_ptr);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new((val_d as u64).div_ceil(4), num_vh as u64, 1),
-                        MTLSize::new(32, 4, 1),
-                    );
-
-                    // Norm+SiLU: one TG per value head — 48 TGs × 128 threads
-                    enc.set_compute_pipeline_state(
-                        self.engine.pipelines.gdn_norm_silu.as_ref().unwrap(),
-                    );
-                    enc.set_buffer(0, Some(&self.session.activations.gdn_raw_out), 0);
-                    enc.set_buffer(1, Some(&self.session.activations.gdn_qkvz), z_byte_off);
-                    enc.set_buffer(2, Some(&*w_norm), 0);
-                    enc.set_buffer(3, Some(&self.session.activations.gdn_qkvz), z_byte_off);
-                    enc.set_bytes(4, p_bytes, p_ptr);
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(num_vh as u64, 1, 1),
-                        MTLSize::new(128, 1, 1),
-                    );
-                } else {
-                    // Fallback: H2+H4 fused kernel or generic
-                    let recur_pipe = use_q36
-                        .then_some(self.engine.pipelines.gdn_recurrence_q36.as_ref())
-                        .flatten()
-                        .unwrap_or(&self.engine.pipelines.gdn_recurrence);
-                    enc.set_compute_pipeline_state(recur_pipe);
-                    enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
-                    enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
-                    enc.set_buffer(2, Some(&self.session.activations.gdn_qkvz), z_byte_off);
-                    enc.set_buffer(3, Some(&self.session.activations.hidden), 0);
-                    enc.set_buffer(4, Some(&*w_in_proj_b), 0);
-                    enc.set_buffer(5, Some(&*w_in_proj_a), 0);
-                    enc.set_buffer(6, Some(&*w_a_log), 0);
-                    enc.set_buffer(7, Some(&*w_dt_bias), 0);
-                    enc.set_buffer(8, Some(&*w_norm), 0);
-                    enc.set_buffer(9, Some(&self.session.activations.gdn_qkvz), z_byte_off);
-                    enc.set_bytes(
-                        10,
-                        std::mem::size_of::<GdnRecurParams>() as u64,
-                        &params as *const GdnRecurParams as *const _,
-                    );
-                    enc.dispatch_thread_groups(
-                        MTLSize::new(num_vh as u64, 1, 1),
-                        MTLSize::new(128, 1, 1),
-                    );
-                }
-            }
-            if let Some(t0) = gdn_t0 {
-                prof.gdn_recurrence_us += t0.elapsed().as_micros();
-            }
-
-            // Output projection — reads norm output from Z portion of fused buffer.
-            // SAFETY: w_out_proj and gdn_qkvz are live for this command buffer;
-            // z_byte_off points to out_d norm values written by gdn_recurrence.
-            let out_proj_t0 = profiling.then(std::time::Instant::now);
-            unsafe {
-                self.dispatch_gemm(
-                    enc,
-                    &self.session.activations.gdn_qkvz,
-                    (qkv_d as u64) * 4,
-                    &*w_out_proj,
-                    &self.session.activations.attn_out,
-                    0,
-                    1,
-                    hidden as u32,
-                    out_d as u32,
-                );
-            }
-            if let Some(t0) = out_proj_t0 {
-                prof.projection_us += t0.elapsed().as_micros();
-            }
-
-            // LoRA for out_proj: x is the Z-normed portion of gdn_qkvz (at qkv_d * 4 bytes),
-            // y is attn_out (offset 0).
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.gdn_qkvz,
-                (qkv_d as u64) * 4,
-                &self.session.activations.attn_out,
-                0,
-                layer_idx,
-                "out_proj",
-            );
-
-            if with_mlp {
-                self.encode_mlp_block(enc, compact_idx, layer_idx, position, cfg, prof, profiling);
-            }
-
-            1 // one GDN GPU dispatch per layer
-        }
-
-        /// Encode all Metal commands for a single GQA (full-attention) layer.
-        ///
-        /// All commands are appended to the already-open encoder `enc`; no new
-        /// command buffer is created here.
-        #[allow(clippy::too_many_arguments)]
-        #[allow(clippy::too_many_arguments)]
-        fn encode_gqa_layer(
-            &mut self,
-            enc: &ComputeCommandEncoderRef,
-            compact_idx: usize,
-            full_idx: usize,
-            position: usize,
-            kv_dim: usize,
-            layer_idx: usize,
-            cfg: &Qwen35Config,
-            prof: &mut StepProfile,
-            profiling: bool,
-            with_mlp: bool,
-            mrope_override: Option<(&Buffer, &Buffer)>,
-        ) {
-            let hidden = cfg.hidden_size;
-            // GQA: SINGLE command buffer — pre-norm + projections + KV copy + attention + MLP
-            let (w_q_proj, w_k_proj, w_v_proj, w_o_proj, w_q_norm, w_k_norm) = {
-                let MetalLayerAttnWeights::Full(full_w) = &self.engine.layer_weights[compact_idx].0
-                else {
-                    unreachable!()
-                };
-                (
-                    &full_w.q_proj as *const Q4WeightBuf,
-                    &full_w.k_proj as *const Q4WeightBuf,
-                    &full_w.v_proj as *const Q4WeightBuf,
-                    &full_w.o_proj as *const Q4WeightBuf,
-                    &full_w.q_norm as *const Buffer,
-                    &full_w.k_norm as *const Buffer,
-                )
-            };
-            let (_, common_w) = &self.engine.layer_weights[compact_idx];
-            let q_dim = cfg.full_q_dim();
-            let head_dim = cfg.head_dim;
-            let num_q_heads = cfg.num_attention_heads;
-            let num_kv_heads = cfg.num_key_value_heads;
-            let half_rope_dim = (cfg.rope_dim() / 2) as u32;
-            assert!(
-                self.session.kv_cache.seq_len < self.session.kv_cache.max_cache_len,
-                "KV cache overflow: seq_len {} >= max_cache_len {}",
-                self.session.kv_cache.seq_len,
-                self.session.kv_cache.max_cache_len
-            );
-            let kv_cache_offset = (self.session.kv_cache.seq_len * kv_dim) as u32;
-            let cur_seq_len = (self.session.kv_cache.seq_len + 1) as u32;
-            let scale = 1.0 / (head_dim as f32).sqrt();
-
-            // Pre-norm: save residual + normalize hidden in one dispatch
-            self.dispatch_copy_and_rms_norm(
-                enc,
-                &self.session.activations.hidden,
-                &self.session.activations.residual,
-                &common_w.input_layernorm,
-                hidden as u32,
-                cfg.rms_norm_eps,
-            );
-
-            // Q/K/V projections + scatter + norms + RoPE
-            // SAFETY: Raw layer weight pointers were taken from
-            // self.engine.layer_weights and remain valid while self is borrowed;
-            // dispatch dimensions match the preallocated activation buffers.
-            let gqa_proj_t0 = profiling.then(std::time::Instant::now);
-            unsafe {
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.hidden,
-                    &*w_q_proj,
-                    &self.session.activations.q,
-                    1,
-                    (2 * q_dim) as u32,
-                    hidden as u32,
-                );
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.hidden,
-                    &*w_k_proj,
-                    &self.session.activations.k,
-                    1,
-                    kv_dim as u32,
-                    hidden as u32,
-                );
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.hidden,
-                    &*w_v_proj,
-                    &self.session.activations.v,
-                    1,
-                    kv_dim as u32,
-                    hidden as u32,
-                );
-            }
-            // LoRA for Q/K/V projections
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.q,
-                0,
-                layer_idx,
-                "q_proj",
-            );
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.k,
-                0,
-                layer_idx,
-                "k_proj",
-            );
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.hidden,
-                0,
-                &self.session.activations.v,
-                0,
-                layer_idx,
-                "v_proj",
-            );
-            if let Some(t0) = gqa_proj_t0 {
-                prof.projection_us += t0.elapsed().as_micros();
-            }
-            self.dispatch_scatter_q_gate(enc, num_q_heads as u32, head_dim as u32);
-            // SAFETY: Q/K norm buffers are live layer-owned buffers and the
-            // head counts/head_dim come from the same config used to size them.
-            unsafe {
-                self.dispatch_per_head_rms_norm(
-                    enc,
-                    &self.session.activations.q_separated,
-                    &*w_q_norm,
-                    num_q_heads as u32,
-                    head_dim as u32,
-                    cfg.rms_norm_eps,
-                );
-                self.dispatch_per_head_rms_norm(
-                    enc,
-                    &self.session.activations.k,
-                    &*w_k_norm,
-                    num_kv_heads as u32,
-                    head_dim as u32,
-                    cfg.rms_norm_eps,
-                );
-            }
-            self.dispatch_partial_rope(
-                enc,
-                &self.session.activations.q_separated,
-                num_q_heads as u32,
-                head_dim as u32,
-                half_rope_dim,
-                position as u32,
-                mrope_override,
-            );
-            self.dispatch_partial_rope(
-                enc,
-                &self.session.activations.k,
-                num_kv_heads as u32,
-                head_dim as u32,
-                half_rope_dim,
-                position as u32,
-                mrope_override,
-            );
-
-            // GPU KV cache copy
-            self.dispatch_copy_offset_kv(
-                enc,
-                &self.session.activations.k,
-                &self.session.kv_cache.k_bufs[full_idx],
-                kv_dim as u32,
-                kv_cache_offset,
-            );
-            self.dispatch_copy_offset_kv(
-                enc,
-                &self.session.activations.v,
-                &self.session.kv_cache.v_bufs[full_idx],
-                kv_dim as u32,
-                kv_cache_offset,
-            );
-
-            // Decode attention + gating + O projection
-            let gqa_attn_t0 = profiling.then(std::time::Instant::now);
-            self.dispatch_decode_attention(
-                enc,
-                &self.session.kv_cache.k_bufs[full_idx],
-                &self.session.kv_cache.v_bufs[full_idx],
-                cur_seq_len,
-                head_dim as u32,
-                num_q_heads as u32,
-                num_kv_heads as u32,
-                q_dim as u32,
-                kv_dim as u32,
-                scale,
-            );
-            self.dispatch_sigmoid_gate(enc, q_dim as u32);
-            if let Some(t0) = gqa_attn_t0 {
-                prof.gqa_attention_us += t0.elapsed().as_micros();
-            }
-            // SAFETY: The O-projection buffer pointer is live for the command
-            // buffer and dimensions match [hidden, q_dim].
-            let gqa_oproj_t0 = profiling.then(std::time::Instant::now);
-            unsafe {
-                self.dispatch_matmul(
-                    enc,
-                    &self.session.activations.attn_out,
-                    &*w_o_proj,
-                    &self.session.activations.ffn_out,
-                    1,
-                    hidden as u32,
-                    q_dim as u32,
-                );
-            }
-            // LoRA for o_proj: x = attn_out (gated attention output), y = ffn_out
-            self.dispatch_lora_if_active(
-                enc,
-                &self.session.activations.attn_out,
-                0,
-                &self.session.activations.ffn_out,
-                0,
-                layer_idx,
-                "o_proj",
-            );
-            self.dispatch_copy(
-                enc,
-                &self.session.activations.ffn_out,
-                &self.session.activations.attn_out,
-                hidden as u32,
-            );
-            if let Some(t0) = gqa_oproj_t0 {
-                prof.projection_us += t0.elapsed().as_micros();
-            }
-
-            if with_mlp {
-                self.encode_mlp_block(enc, compact_idx, layer_idx, position, cfg, prof, profiling);
-            }
-        }
-
-        /// Encode a MoE FFN step into an already-open compute command encoder.
-        ///
-        /// Implements ADR-053 D1–D4: CPU routing + single-encoder GPU dispatch for
-        /// all routed experts plus the shared expert, accumulating with router weights
-        /// via `moe_scale_add` / `moe_shared_gate_add` kernels.
-        ///
-        /// # Preconditions
-        /// - `moe` is a live reference to a `MoeMetalBuffers` owned by `self.engine.layer_weights`.
-        /// - `self.session.activations.hidden` holds the post-RMSNorm hidden state ([hidden] f32).
-        /// - The encoder `enc` is open and NOT yet committed.
-        ///
-        /// # Postconditions
-        /// - `self.session.activations.ffn_out` holds the MoE FFN output ([hidden] f32)
-        ///   ready for residual accumulation by the caller.
-        ///
-        /// # Safety
-        /// Reads `moe.router_gate.contents()` and `moe.shared_expert_gate.contents()` as
-        /// `*const f32` for CPU routing. Valid because both buffers use `StorageModeShared`
-        /// and no GPU work on those buffers is in flight (router runs before encoding starts).
-        /// Reads `self.session.activations.hidden.contents()` similarly (GPU idle at this point
-        /// — this is called before the encoder dispatches any hidden-state kernel).
-        unsafe fn encode_moe_ffn(
+        /// `src_row_offset_bytes` selects the row of `activations.hidden`
+        /// holding the token of interest: the last row on the batch paths, row
+        /// zero on the single-token decode path.
+        fn encode_capture_final_hidden(
             &self,
             enc: &ComputeCommandEncoderRef,
-            moe: &MoeMetalBuffers,
-            _cfg: &Qwen35Config,
-            layer_idx: usize,
-            token_idx: usize,
+            src_row_offset_bytes: u64,
+            hidden: usize,
         ) {
-            let hidden = moe.hidden;
-            let inter = moe.inter;
-            let shared_inter = moe.shared_inter;
-            let num_experts = moe.num_experts;
-            let top_k = moe.top_k;
-
-            // ── Step 0: Zero the accumulator on GPU ───────────────────────────────
-            let hidden_u32 = hidden as u32;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.moe_zero_buf);
-            enc.set_buffer(0, Some(&moe.scratch_out), 0);
-            enc.set_bytes(1, 4, &hidden_u32 as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
+            if !self.session.capture_final_hidden {
+                return;
+            }
+            // `&self`, not `&mut self`: two of the three call sites hold a live
+            // immutable borrow of `self.engine.queue`'s command buffer across
+            // the encode, so a `&mut self` helper cannot be called there at
+            // all. The record is therefore an atomic rather than a plain bool.
+            self.session
+                .final_hidden_captured
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
+            enc.set_buffer(
+                0,
+                Some(&self.session.activations.hidden),
+                src_row_offset_bytes,
             );
-
-            // ── Step 1: CPU routing ───────────────────────────────────────────────
-            // Read hidden activation (post-RMSNorm, CPU-accessible StorageModeShared).
-            let hidden_ptr = self.session.activations.hidden.contents() as *const f32;
-            let hidden_slice = std::slice::from_raw_parts(hidden_ptr, hidden);
-
-            // Read router gate weights [num_experts, hidden] f32.
-            let gate_ptr = moe.router_gate.contents() as *const f32;
-            let gate_slice = std::slice::from_raw_parts(gate_ptr, num_experts * hidden);
-
-            // Compute router logits: logits[e] = dot(hidden, gate_w[e])
-            let mut logits = vec![0.0f32; num_experts];
-            for e in 0..num_experts {
-                let row = &gate_slice[e * hidden..(e + 1) * hidden];
-                let mut acc = 0.0f32;
-                for i in 0..hidden {
-                    acc += hidden_slice[i] * row[i];
-                }
-                logits[e] = acc;
-            }
-
-            // Softmax over all experts (numerically stable).
-            let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut denom = 0.0f32;
-            for v in logits.iter_mut() {
-                *v = (*v - max_logit).exp();
-                denom += *v;
-            }
-            if denom > 0.0 {
-                for v in logits.iter_mut() {
-                    *v /= denom;
-                }
-            }
-
-            // Select top-k experts (insertion-sort into fixed-size array).
-            let mut selected: Vec<(usize, f32)> = vec![(usize::MAX, f32::NEG_INFINITY); top_k];
-            for (e, &prob) in logits.iter().enumerate() {
-                for rank in 0..top_k {
-                    if prob > selected[rank].1 {
-                        for shift in (rank + 1..top_k).rev() {
-                            selected[shift] = selected[shift - 1];
-                        }
-                        selected[rank] = (e, prob);
-                        break;
-                    }
-                }
-            }
-
-            // Test-only override (see `FORCED_MOE_EXPERTS_FOR_TEST`): replace
-            // the CPU-computed selection with a caller-chosen expert list so
-            // tests can drive a specific `ExpertSlotCache::resolve` sequence
-            // through this real, encoded command buffer.
-            #[cfg(test)]
-            FORCED_MOE_EXPERTS_FOR_TEST.with(|c| {
-                if let Some(forced_ids) = c.borrow().as_ref() {
-                    assert_eq!(
-                        forced_ids.len(),
-                        top_k,
-                        "set_forced_moe_experts_for_test: forced expert list length must equal top_k"
-                    );
-                    let weight = 1.0f32 / top_k as f32;
-                    for (slot, &expert_id) in selected.iter_mut().zip(forced_ids.iter()) {
-                        *slot = (expert_id, weight);
-                    }
-                }
-            });
-
-            // Renormalize selected weights to sum=1.
-            let top_sum: f32 = selected.iter().map(|(_, p)| *p).sum();
-            if top_sum > 0.0 {
-                for (_, prob) in selected.iter_mut() {
-                    *prob /= top_sum;
-                }
-            }
-
-            // #682 Stage 4: optional routing-divergence trace. Single
-            // branch-on-None (`with` + `borrow` on an unset thread-local) when
-            // disarmed, the production default — see `MOE_ROUTING_TRACE`.
-            MOE_ROUTING_TRACE.with(|c| {
-                if let Some(trace) = c.borrow_mut().as_mut() {
-                    trace.push(MoeRoutingTraceRecord {
-                        layer_idx,
-                        token_idx,
-                        selected_ids: selected.iter().map(|(id, _)| *id).collect(),
-                        gate_weights: selected.iter().map(|(_, w)| *w).collect(),
-                    });
-                }
-            });
-
-            // ── Step 2: Shared expert (always active) ─────────────────────────────
-            // Extracted into a closure (called exactly once, either inline
-            // below or from inside the prefetch scope's spawn/join window
-            // just after this) so its CPU encode time can overlap the
-            // routed-expert dequant phase without duplicating this body —
-            // see `moe_expert_cache`'s module doc comment.
-            let encode_step2 = || {
-                // Compute scalar sigmoid gate on CPU.
-                // SAFETY: `moe.shared_expert_gate` is a valid
-                // StorageModeShared buffer of at least `hidden` f32
-                // elements (same layout `MoeMetalBuffers` was constructed
-                // with) — same raw-pointer access pattern as this
-                // function's Step 1 above, just inside a nested closure
-                // (which does not inherit `encode_moe_ffn`'s
-                // `unsafe fn`-body allowance, so this needs its own block).
-                let sg_slice = unsafe {
-                    let sg_ptr = moe.shared_expert_gate.contents() as *const f32;
-                    std::slice::from_raw_parts(sg_ptr, hidden)
-                };
-                let gate_logit: f32 = hidden_slice
-                    .iter()
-                    .zip(sg_slice.iter())
-                    .map(|(x, g)| x * g)
-                    .sum();
-                let shared_gate_val = 1.0f32 / (1.0 + (-gate_logit).exp());
-
-                // Shared expert gate projection GEMV: scratch_gate[shared_inter] = W_gate * hidden
-                let shared_inter_u32 = shared_inter as u32;
-                let params_gate_up_sh = GemmParams {
-                    m: 1,
-                    n: shared_inter_u32,
-                    k: hidden_u32,
-                    lda: hidden_u32,
-                    ldb: hidden_u32,
-                    ldc: shared_inter_u32,
-                };
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
-                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-                enc.set_buffer(1, Some(&moe.shared_gate_proj), 0);
-                enc.set_buffer(2, Some(&moe.scratch_gate), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<GemmParams>() as u64,
-                    &params_gate_up_sh as *const GemmParams as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(shared_inter as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-
-                // Shared expert up projection GEMV: scratch_up[shared_inter] = W_up * hidden
-                let params_up_sh = GemmParams {
-                    m: 1,
-                    n: shared_inter_u32,
-                    k: hidden_u32,
-                    lda: hidden_u32,
-                    ldb: hidden_u32,
-                    ldc: shared_inter_u32,
-                };
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
-                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-                enc.set_buffer(1, Some(&moe.shared_up_proj), 0);
-                enc.set_buffer(2, Some(&moe.scratch_up), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<GemmParams>() as u64,
-                    &params_up_sh as *const GemmParams as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(shared_inter as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-
-                // SiLU-mul in-place on scratch_gate (gate[i] = silu(gate[i]) * up[i]).
-                let count_sh = shared_inter as u32;
-                enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul);
-                enc.set_buffer(0, Some(&moe.scratch_gate), 0);
-                enc.set_buffer(1, Some(&moe.scratch_up), 0);
-                enc.set_bytes(2, 4, &count_sh as *const u32 as *const _);
-                enc.dispatch_threads(
-                    MTLSize::new(div_ceil(shared_inter as u64, wg) * wg, 1, 1),
-                    MTLSize::new(wg, 1, 1),
-                );
-
-                // Shared expert down projection GEMV: scratch_expert_out[hidden] = W_down * scratch_gate
-                let params_down_sh = GemmParams {
-                    m: 1,
-                    n: hidden_u32,
-                    k: shared_inter_u32,
-                    lda: shared_inter_u32,
-                    ldb: shared_inter_u32,
-                    ldc: hidden_u32,
-                };
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
-                enc.set_buffer(0, Some(&moe.scratch_gate), 0);
-                enc.set_buffer(1, Some(&moe.shared_down_proj), 0);
-                enc.set_buffer(2, Some(&moe.scratch_expert_out), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<GemmParams>() as u64,
-                    &params_down_sh as *const GemmParams as *const _,
-                );
-                enc.dispatch_thread_groups(
-                    MTLSize::new(hidden as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-
-                // Accumulate: scratch_out += shared_gate_val * scratch_expert_out.
-                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_shared_gate_add);
-                enc.set_buffer(0, Some(&moe.scratch_out), 0);
-                enc.set_buffer(1, Some(&moe.scratch_expert_out), 0);
-                enc.set_bytes(2, 4, &shared_gate_val as *const f32 as *const _);
-                enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const _);
-                enc.dispatch_threads(
-                    MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
-                    MTLSize::new(wg, 1, 1),
-                );
-            };
-
-            // #682 Stage 2: plan every routed expert's cache load NOW —
-            // right after routing, before Step 2 is encoded — then spawn
-            // the dequant work for cache misses onto background thread(s)
-            // and encode Step 2 (above) while it runs, joining + applying
-            // results only after Step 2 is fully encoded. Cold-expert
-            // mmap reads + CPU dequant then genuinely overlap the
-            // shared-expert GEMV encoding instead of blocking in front of
-            // it (any already-cached routed experts cost nothing extra
-            // either way). This must run before `RoutedExpertStorage::
-            // Cached`'s `begin_token()` bookkeeping is otherwise
-            // consulted, and Step 3 below relies on every selected expert
-            // already being resident (`apply_prefetch_results` already
-            // run) by the time its loop runs. `RoutedExpertStorage::Eager`
-            // (the safetensors-upload path) has no cache to prefetch into
-            // — Step 2 just runs inline with nothing to overlap.
-            if let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed {
-                gate_up.borrow_mut().begin_token();
-                down.borrow_mut().begin_token();
-
-                let expert_ids: Vec<usize> = selected
-                    .iter()
-                    .filter(|&&(id, _)| id != usize::MAX)
-                    .map(|&(id, _)| id)
-                    .collect();
-
-                #[cfg(test)]
-                let parallel = MOE_PREFETCH_PARALLEL_FOR_TEST.with(|c| c.borrow().unwrap_or(true));
-                #[cfg(not(test))]
-                let parallel = true;
-
-                // `spawn_dequant`'s fault-injection hook is exercised
-                // directly against `ExpertSlotCache` (see
-                // `moe_prefetch_dequant_panic_recovers_via_readiness_reload`)
-                // rather than through this real encode path: a panic that
-                // unwinds through a live, not-yet-`endEncoding`'d Metal
-                // command encoder is an unrecoverable process abort, not
-                // something any amount of `catch_unwind` here could make
-                // safe to test.
-                let panic_on_expert: Option<usize> = None;
-
-                #[cfg(test)]
-                let ordering_gate =
-                    MOE_PREFETCH_ORDERING_GATE_FOR_TEST.with(|c| c.borrow_mut().take());
-
-                let gate_up_tasks = gate_up.borrow_mut().plan_prefetch(&expert_ids);
-                let down_tasks = down.borrow_mut().plan_prefetch(&expert_ids);
-
-                let gate_up_ref = gate_up.borrow();
-                let down_ref = down.borrow();
-
-                let (gate_up_join, down_join) = std::thread::scope(|scope| {
-                    let gate_up_handle = gate_up_ref.spawn_dequant(
-                        gate_up_tasks,
-                        parallel,
-                        panic_on_expert,
-                        #[cfg(test)]
-                        ordering_gate,
-                        scope,
-                    );
-                    let down_handle = down_ref.spawn_dequant(
-                        down_tasks,
-                        parallel,
-                        panic_on_expert,
-                        #[cfg(test)]
-                        None,
-                        scope,
-                    );
-
-                    encode_step2();
-
-                    #[cfg(test)]
-                    MOE_PREFETCH_STEP2_DONE_TX_FOR_TEST.with(|c| {
-                        if let Some(tx) = c.borrow_mut().take() {
-                            let _ = tx.send(());
-                        }
-                    });
-
-                    (
-                        gate_up_handle.map(std::thread::ScopedJoinHandle::join),
-                        down_handle.map(std::thread::ScopedJoinHandle::join),
-                    )
-                });
-
-                drop(gate_up_ref);
-                drop(down_ref);
-
-                // Apply whichever side(s) succeeded BEFORE propagating any
-                // panic, so a failure on one cache never discards the
-                // other's already-completed dequant work (its slots are
-                // marked ready and become immediately usable; only the
-                // failed side's slots stay unready, to be reloaded by the
-                // next `plan_prefetch` that needs them).
-                let mut panic_payload = None;
-                match gate_up_join {
-                    Some(Ok(results)) => gate_up.borrow_mut().apply_prefetch_results(&results),
-                    Some(Err(e)) => panic_payload = Some(e),
-                    None => {}
-                }
-                match down_join {
-                    Some(Ok(results)) => down.borrow_mut().apply_prefetch_results(&results),
-                    Some(Err(e)) => {
-                        panic_payload.get_or_insert(e);
-                    }
-                    None => {}
-                }
-                if let Some(e) = panic_payload {
-                    std::panic::resume_unwind(e);
-                }
-            } else {
-                encode_step2();
-            }
-
-            // ── Step 3: Routed experts ────────────────────────────────────────────
-            let inter_u32 = inter as u32;
-
-            // #682 Stage 2: `RoutedExpertStorage::Cached`'s "touched this
-            // token" bookkeeping was already cleared, and every selected
-            // expert already prefetched into its slot, right after
-            // routing (see above, before Step 2) — this loop now only
-            // looks resident slots up (`get_prefetched`), it never
-            // triggers a miss/dequant itself.
-
-            for &(expert_id, router_weight) in selected.iter() {
-                if expert_id == usize::MAX {
-                    // Unfilled slot (fewer than top_k experts passed threshold).
-                    continue;
-                }
-
-                // Resolve this expert's gate_up/down buffers plus the
-                // element offsets to address gate vs. up within the
-                // gate_up buffer. Eager: offsets are global (`expert_id *
-                // ...`) into the one giant resident buffer. Cached: the
-                // resolved buffer already IS just this expert's slice, so
-                // offsets are local (`0` for gate/down, `inter * hidden`
-                // for up within the fused per-expert gate_up slot).
-                let (gate_up_buf, gate_elem_off, up_elem_off, down_buf, down_elem_off) =
-                    match &moe.routed {
-                        RoutedExpertStorage::Eager { gate_up, down } => {
-                            // Expert e gate half starts at element: e * 2 * inter * hidden
-                            // Expert e up half starts at element:  e * 2 * inter * hidden + inter * hidden
-                            let gate_off = (expert_id * 2 * inter * hidden) as u32;
-                            let up_off = (expert_id * 2 * inter * hidden + inter * hidden) as u32;
-                            // Expert e down half starts at element: e * hidden * inter
-                            let down_off = (expert_id * hidden * inter) as u32;
-                            (gate_up.clone(), gate_off, up_off, down.clone(), down_off)
-                        }
-                        RoutedExpertStorage::Cached { gate_up, down } => {
-                            // #682 Stage 2: already prefetched above, right
-                            // after routing — this is a pure lookup, no
-                            // hit/miss accounting or eviction here.
-                            let gate_up_buf = gate_up.borrow().get_prefetched(expert_id).clone();
-                            let down_buf = down.borrow().get_prefetched(expert_id).clone();
-                            (gate_up_buf, 0u32, (inter * hidden) as u32, down_buf, 0u32)
-                        }
-                    };
-
-                // Gate GEMV: scratch_gate[inter] = W_gate[e] * hidden
-                let params_gate = GemmParams {
-                    m: 1,
-                    n: inter_u32,
-                    k: hidden_u32,
-                    lda: hidden_u32,
-                    ldb: hidden_u32,
-                    ldc: inter_u32,
-                };
-                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
-                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-                enc.set_buffer(1, Some(&gate_up_buf), 0);
-                enc.set_buffer(2, Some(&moe.scratch_gate), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<GemmParams>() as u64,
-                    &params_gate as *const GemmParams as *const _,
-                );
-                enc.set_bytes(4, 4, &gate_elem_off as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(inter as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-
-                // Up GEMV: scratch_up[inter] = W_up[e] * hidden
-                let params_up = GemmParams {
-                    m: 1,
-                    n: inter_u32,
-                    k: hidden_u32,
-                    lda: hidden_u32,
-                    ldb: hidden_u32,
-                    ldc: inter_u32,
-                };
-                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
-                enc.set_buffer(0, Some(&self.session.activations.hidden), 0);
-                enc.set_buffer(1, Some(&gate_up_buf), 0);
-                enc.set_buffer(2, Some(&moe.scratch_up), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<GemmParams>() as u64,
-                    &params_up as *const GemmParams as *const _,
-                );
-                enc.set_bytes(4, 4, &up_elem_off as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(inter as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-
-                // SiLU-mul in-place on scratch_gate.
-                let count_r = inter as u32;
-                enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul);
-                enc.set_buffer(0, Some(&moe.scratch_gate), 0);
-                enc.set_buffer(1, Some(&moe.scratch_up), 0);
-                enc.set_bytes(2, 4, &count_r as *const u32 as *const _);
-                enc.dispatch_threads(
-                    MTLSize::new(div_ceil(inter as u64, wg) * wg, 1, 1),
-                    MTLSize::new(wg, 1, 1),
-                );
-
-                // Down GEMV: scratch_expert_out[hidden] = W_down[e] * scratch_gate
-                let params_down = GemmParams {
-                    m: 1,
-                    n: hidden_u32,
-                    k: inter_u32,
-                    lda: inter_u32,
-                    ldb: inter_u32,
-                    ldc: hidden_u32,
-                };
-                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_expert_gemv);
-                enc.set_buffer(0, Some(&moe.scratch_gate), 0);
-                enc.set_buffer(1, Some(&down_buf), 0);
-                enc.set_buffer(2, Some(&moe.scratch_expert_out), 0);
-                enc.set_bytes(
-                    3,
-                    std::mem::size_of::<GemmParams>() as u64,
-                    &params_down as *const GemmParams as *const _,
-                );
-                enc.set_bytes(4, 4, &down_elem_off as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(hidden as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-
-                // Scale-and-accumulate: scratch_out += router_weight * scratch_expert_out.
-                enc.set_compute_pipeline_state(&self.engine.pipelines.moe_scale_add);
-                enc.set_buffer(0, Some(&moe.scratch_out), 0);
-                enc.set_buffer(1, Some(&moe.scratch_expert_out), 0);
-                enc.set_bytes(2, 4, &router_weight as *const f32 as *const _);
-                enc.set_bytes(3, 4, &hidden_u32 as *const u32 as *const _);
-                enc.dispatch_threads(
-                    MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
-                    MTLSize::new(wg, 1, 1),
-                );
-            }
-
-            // ── Step 4: Copy accumulator → ffn_out ───────────────────────────────
-            // `dispatch_copy` uses session.activations buffers; dispatch manually here.
-            enc.set_compute_pipeline_state(&self.engine.pipelines.copy);
-            enc.set_buffer(0, Some(&moe.scratch_out), 0);
-            enc.set_buffer(1, Some(&self.session.activations.ffn_out), 0);
-            enc.set_bytes(2, 4, &hidden_u32 as *const u32 as *const _);
+            enc.set_buffer(1, Some(&self.session.activations.final_hidden), 0);
+            let cnt = hidden as u32;
+            let dst_off = 0u32;
+            enc.set_bytes(2, 4, &cnt as *const u32 as *const _);
+            enc.set_bytes(3, 4, &dst_off as *const u32 as *const _);
+            let wg = 256u64;
             enc.dispatch_threads(
                 MTLSize::new(div_ceil(hidden as u64, wg) * wg, 1, 1),
                 MTLSize::new(wg, 1, 1),
@@ -11096,6 +9791,8 @@ mod inner {
                 1,
                 cfg.rms_norm_eps,
             );
+            // Site 3 of 3. Single-token path: the token of interest is row 0.
+            self.encode_capture_final_hidden(enc, 0, hidden);
             // Issue #171: lm_head two-stage block-top-k. When the route requires
             // only argmax/top-k (never the full logit vector), skip the full
             // [vocab_size] GEMV entirely — Stage 1 fuses the GEMV with a
@@ -11158,311 +9855,6 @@ mod inner {
             }
         }
 
-        // ===================================================================
-        // Dispatch helpers
-        // ===================================================================
-
-        /// Dispatch f16-weight matmul: C[M,N] = A[M,K] @ B_half[N,K]^T.
-        ///
-        /// A is f32 (activations), B is f16 (weights), C is f32 (output).
-        /// The MSL kernel loads weight tiles as `half` and widens to `float`
-        /// before accumulation, maintaining f32 precision in the dot product.
-        /// Dispatch optimized GEMV for M=1 decode (one threadgroup per output element).
-        /// Uses gemv_decode_m1: float4/half4 vectorized loads + simdgroup reduction.
-        fn dispatch_matmul_half(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            a: &Buffer,
-            b: &Buffer,
-            c: &Buffer,
-            m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            let params = GemmParams {
-                m,
-                n,
-                k,
-                lda: k,
-                ldb: k,
-                ldc: n,
-            };
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_decode);
-            enc.set_buffer(0, Some(a), 0);
-            enc.set_buffer(1, Some(b), 0);
-            enc.set_buffer(2, Some(c), 0);
-            enc.set_bytes(
-                3,
-                std::mem::size_of::<GemmParams>() as u64,
-                &params as *const GemmParams as *const _,
-            );
-            // One threadgroup per output element N, 256 threads per group.
-            enc.dispatch_thread_groups(MTLSize::new(n as u64, 1, 1), MTLSize::new(256, 1, 1));
-        }
-
-        /// Dispatch Q8_0 GEMV for M=1 decode. 2 rows per threadgroup, 128 threads.
-        /// Uses int8 × f32 direct multiply + simd_sum — no dequantization step.
-        fn dispatch_matmul_q8(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,       // activation [M,K] float (M=1 for decode)
-            qw: &Q4WeightBuf, // Q8_0 packed weights [N, K/32 * 34]
-            y: &Buffer,       // output [M,N] float
-            _m: u32,          // always 1 for decode (ignored)
-            n: u32,
-            k: u32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q8);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(&qw.buffer), 0);
-            enc.set_buffer(2, Some(y), 0);
-            enc.set_bytes(3, 4, &n as *const u32 as *const _);
-            enc.set_bytes(4, 4, &k as *const u32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(2) as u64, 1, 1),
-                MTLSize::new(32, 4, 1), // 128 threads: 32 lanes × 4 simdgroups
-            );
-        }
-
-        /// Q8 matmul with batch support and buffer offsets.
-        /// M=1 uses GEMV (decode hot path), M>1 uses GEMM (batch prefill).
-        fn dispatch_gemm_q8(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            x_offset: u64, // byte offset into x
-            qw: &Q4WeightBuf,
-            y: &Buffer,
-            y_offset: u64, // byte offset into y
-            m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            if m == 0 || n == 0 {
-                return;
-            }
-            assert!(
-                k > 0 && k.is_multiple_of(32),
-                "dispatch_gemm_q8 requires K non-zero and divisible by 32, got {k}"
-            );
-            if m <= 1 {
-                // GEMV decode path (M=1)
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q8);
-                enc.set_buffer(0, Some(x), x_offset);
-                enc.set_buffer(1, Some(&qw.buffer), 0);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &n as *const u32 as *const _);
-                enc.set_bytes(4, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, 1, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else if let Some(tiled) = self.engine.pipelines.gemm_q8_tiled.as_ref() {
-                // Tiled simdgroup-matrix GEMM (Apple7+, BM=64 × BN=32).
-                // Buffer bindings: buf(0)=QW, buf(1)=X, buf(2)=Y.
-                enc.set_compute_pipeline_state(tiled);
-                enc.set_buffer(0, Some(&qw.buffer), 0);
-                enc.set_buffer(1, Some(x), x_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else {
-                // Naive fallback GEMM. Buffer bindings: buf(0)=X, buf(1)=QW, buf(2)=Y.
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q8);
-                enc.set_buffer(0, Some(x), x_offset);
-                enc.set_buffer(1, Some(&qw.buffer), 0);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, m.div_ceil(4) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            }
-        }
-
-        fn dispatch_matmul_q4(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,       // activation [1,K] float
-            qw: &Q4WeightBuf, // Q4 packed weights [N, (K/32) * 20]; payload at qw.payload_offset
-            y: &Buffer,       // output [1,N] float
-            _m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q4);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(&qw.buffer), qw.payload_offset);
-            enc.set_buffer(2, Some(y), 0);
-            enc.set_bytes(3, 4, &n as *const u32 as *const _);
-            enc.set_bytes(4, 4, &k as *const u32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(n.div_ceil(2) as u64, 1, 1), // gemv_q4_decode writes NR=2 rows/threadgroup
-                MTLSize::new(32, 4, 1),
-            );
-        }
-
-        fn dispatch_gemm_q4(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            x_offset: u64,
-            qw: &Q4WeightBuf,
-            y: &Buffer,
-            y_offset: u64,
-            m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            if m == 0 || n == 0 {
-                return;
-            }
-            assert!(
-                k > 0 && k.is_multiple_of(32),
-                "dispatch_gemm_q4 requires K to be non-zero and divisible by 32, got {k}"
-            );
-
-            if m == 1 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q4);
-                enc.set_buffer(0, Some(x), x_offset);
-                enc.set_buffer(1, Some(&qw.buffer), qw.payload_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &n as *const u32 as *const _);
-                enc.set_bytes(4, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, 1, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else if let Some(tiled) = self.engine.pipelines.gemm_q4_tiled.as_ref() {
-                enc.set_compute_pipeline_state(tiled);
-                enc.set_buffer(0, Some(&qw.buffer), qw.payload_offset);
-                enc.set_buffer(1, Some(x), x_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q4);
-                enc.set_buffer(0, Some(&qw.buffer), qw.payload_offset);
-                enc.set_buffer(1, Some(x), x_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, m.div_ceil(4) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            }
-        }
-
-        fn dispatch_matmul(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            qw: &Q4WeightBuf,
-            y: &Buffer,
-            m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            match self.engine.quant_format {
-                QuantFormat::Q8_0 => self.dispatch_matmul_q8(enc, x, qw, y, m, n, k),
-                QuantFormat::Q4_0 => self.dispatch_matmul_q4(enc, x, qw, y, m, n, k),
-            }
-        }
-
-        /// Dispatch a Q3 GEMV/GEMM (ADR-072 P1, #420 Stage 2), mirroring
-        /// `dispatch_gemm_q4` exactly: `gemv_q3_decode` for M=1 (the decode-path
-        /// kernel that matters — decode is weight-bandwidth-bound), the tiled
-        /// simdgroup-matrix `gemm_q3_tiled` for M>1.
-        ///
-        /// Unlike Q4/Q8, there is no naive fallback GEMM for M>1 — Stage 2 scope
-        /// is `gemv_q3_decode` + `gemm_q3_tiled` only (see #420 design note §3),
-        /// so `gemm_q3_tiled` must be present (Apple7+) whenever this is called
-        /// with M>1. Callers that need to support non-Apple7 prefill would need
-        /// a naive `gemm_q3` kernel, out of Stage 2 scope.
-        ///
-        /// # Errors
-        /// Returns `Err` if `m > 1` and `gemm_q3_tiled` is unavailable (device
-        /// is not Apple7+, or the tiled kernel failed to compile) — Stage 2
-        /// has no naive Q3 GEMM fallback to fall back to (mirrors how
-        /// `mmap_q3_weight` propagates its fail-closed checks as `Result`
-        /// rather than panicking).
-        ///
-        /// # Panics
-        /// Panics if `k` is zero or not a multiple of 32 (a caller
-        /// programming error, not a runtime/capability condition).
-        #[allow(dead_code)] // wiring to real MLP dispatch is deferred past Stage 2
-        fn dispatch_gemm_q3(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            x_offset: u64,
-            qw: &Q3WeightBuf,
-            y: &Buffer,
-            y_offset: u64,
-            m: u32,
-            n: u32,
-            k: u32,
-        ) -> Result<(), String> {
-            if m == 0 || n == 0 {
-                return Ok(());
-            }
-            assert!(
-                k > 0 && k.is_multiple_of(32),
-                "dispatch_gemm_q3 requires K to be non-zero and divisible by 32, got {k}"
-            );
-
-            if m == 1 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q3);
-                enc.set_buffer(0, Some(x), x_offset);
-                enc.set_buffer(1, Some(&qw.buffer), qw.payload_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &n as *const u32 as *const _);
-                enc.set_bytes(4, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, 1, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else {
-                let tiled = self
-                    .engine
-                    .pipelines
-                    .gemm_q3_tiled
-                    .as_ref()
-                    .ok_or_else(|| {
-                        "dispatch_gemm_q3 called with M>1 but gemm_q3_tiled is unavailable \
-                     (device is not Apple7+, or the tiled kernel failed to compile); \
-                     Stage 2 has no naive Q3 GEMM fallback"
-                            .to_string()
-                    })?;
-                enc.set_compute_pipeline_state(tiled);
-                enc.set_buffer(0, Some(&qw.buffer), qw.payload_offset);
-                enc.set_buffer(1, Some(x), x_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            }
-            Ok(())
-        }
-
         // -----------------------------------------------------------------------
         // GDN chunked-scan helpers (default ON; LATTICE_GDN_CHUNKED=0 opts out)
         // -----------------------------------------------------------------------
@@ -11504,1191 +9896,6 @@ mod inner {
                 scale: 1.0 / (cfg.linear_key_head_dim as f32).sqrt(),
                 eps: cfg.rms_norm_eps,
             })
-        }
-
-        fn dispatch_gdn_chunked_prefill_layer(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            linear_idx: usize,
-            weights: GdnChunkedWeights<'_>,
-            params: GdnChunkParams,
-        ) {
-            self.dispatch_gdn_chunk_materialize_c32(enc, linear_idx, weights, params);
-            // MAJ-2 fix: conv_buf update runs in a separate dispatch AFTER the all-chunks
-            // materialize completes, so chunk 0's read and the last chunk's write cannot race.
-            self.dispatch_gdn_chunk_conv_buf_update_c32(enc, linear_idx, params);
-            self.dispatch_gdn_chunk_solve_c32(enc, params);
-
-            for chunk in 0..params.num_chunks {
-                let mut cp = params;
-                cp.active_chunk = chunk;
-                self.dispatch_gdn_chunk_residual_output_c32(enc, linear_idx, cp);
-                self.dispatch_gdn_chunk_state_update_c32(enc, linear_idx, cp);
-            }
-
-            self.dispatch_gdn_chunk_norm_silu_c32(enc, weights.norm_weight, params);
-        }
-
-        fn dispatch_gdn_chunk_materialize_c32(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            linear_idx: usize,
-            weights: GdnChunkedWeights<'_>,
-            params: GdnChunkParams,
-        ) {
-            let sc = &self.session.activations.gdn_chunk;
-            let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_materialize_c32);
-            enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
-            enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), 0);
-            enc.set_buffer(2, Some(weights.conv1d_weight), 0);
-            enc.set_buffer(3, Some(&self.session.activations.hidden), 0);
-            enc.set_buffer(4, Some(weights.in_proj_b), 0);
-            enc.set_buffer(5, Some(weights.in_proj_a), 0);
-            enc.set_buffer(6, Some(weights.a_log), 0);
-            enc.set_buffer(7, Some(weights.dt_bias), 0);
-            enc.set_buffer(8, Some(&sc.q), 0);
-            enc.set_buffer(9, Some(&sc.k), 0);
-            enc.set_buffer(10, Some(&sc.v), 0);
-            enc.set_buffer(11, Some(&sc.beta_log_alpha), 0);
-            enc.set_bytes(12, p_bytes, &params as *const GdnChunkParams as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(params.num_chunks as u64, params.num_value_heads as u64, 1),
-                MTLSize::new(32, 4, 1),
-            );
-        }
-
-        fn dispatch_gdn_chunk_conv_buf_update_c32(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            linear_idx: usize,
-            params: GdnChunkParams,
-        ) {
-            let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_conv_buf_update_c32);
-            enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
-            enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), 0);
-            enc.set_bytes(2, p_bytes, &params as *const GdnChunkParams as *const _);
-            // Grid: (1, num_value_heads, 1) — single threadgroup for the serial conv-buf update.
-            enc.dispatch_thread_groups(
-                MTLSize::new(1, params.num_value_heads as u64, 1),
-                MTLSize::new(32, 4, 1),
-            );
-        }
-
-        fn dispatch_gdn_chunk_solve_c32(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            params: GdnChunkParams,
-        ) {
-            let sc = &self.session.activations.gdn_chunk;
-            let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_solve_c32);
-            enc.set_buffer(0, Some(&sc.q), 0);
-            enc.set_buffer(1, Some(&sc.k), 0);
-            enc.set_buffer(2, Some(&sc.v), 0);
-            enc.set_buffer(3, Some(&sc.beta_log_alpha), 0);
-            enc.set_buffer(4, Some(&sc.gamma), 0);
-            enc.set_buffer(5, Some(&sc.gamma_end), 0);
-            enc.set_buffer(6, Some(&sc.kkt), 0);
-            enc.set_buffer(7, Some(&sc.qk_l), 0);
-            enc.set_buffer(8, Some(&sc.w), 0);
-            enc.set_buffer(9, Some(&sc.u), 0);
-            enc.set_buffer(10, Some(&sc.k_right), 0);
-            enc.set_bytes(11, p_bytes, &params as *const GdnChunkParams as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(params.num_chunks as u64, params.num_value_heads as u64, 1),
-                MTLSize::new(32, 4, 1),
-            );
-        }
-
-        fn dispatch_gdn_chunk_residual_output_c32(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            linear_idx: usize,
-            params: GdnChunkParams,
-        ) {
-            let sc = &self.session.activations.gdn_chunk;
-            let vd = params.value_dim as u64;
-            let num_v_tiles = vd.div_ceil(8);
-            let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_residual_output_c32);
-            enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
-            enc.set_buffer(1, Some(&sc.q), 0);
-            enc.set_buffer(2, Some(&sc.w), 0);
-            enc.set_buffer(3, Some(&sc.u), 0);
-            enc.set_buffer(4, Some(&sc.gamma), 0);
-            enc.set_buffer(5, Some(&sc.qk_l), 0);
-            enc.set_buffer(6, Some(&sc.r), 0);
-            enc.set_buffer(7, Some(&sc.raw_out), 0);
-            enc.set_bytes(8, p_bytes, &params as *const GdnChunkParams as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(num_v_tiles, params.num_value_heads as u64, 1),
-                MTLSize::new(32, 8, 1),
-            );
-        }
-
-        fn dispatch_gdn_chunk_state_update_c32(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            linear_idx: usize,
-            params: GdnChunkParams,
-        ) {
-            let sc = &self.session.activations.gdn_chunk;
-            let kd = params.key_dim as u64;
-            let vd = params.value_dim as u64;
-            let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_state_update_c32);
-            enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
-            enc.set_buffer(1, Some(&sc.r), 0);
-            enc.set_buffer(2, Some(&sc.k_right), 0);
-            enc.set_buffer(3, Some(&sc.gamma_end), 0);
-            enc.set_bytes(4, p_bytes, &params as *const GdnChunkParams as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(
-                    kd.div_ceil(16),
-                    vd.div_ceil(16),
-                    params.num_value_heads as u64,
-                ),
-                MTLSize::new(16, 16, 1),
-            );
-        }
-
-        fn dispatch_gdn_chunk_norm_silu_c32(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            norm_weight: &Buffer,
-            params: GdnChunkParams,
-        ) {
-            let sc = &self.session.activations.gdn_chunk;
-            let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_norm_silu_c32);
-            enc.set_buffer(0, Some(&sc.raw_out), 0);
-            enc.set_buffer(1, Some(&self.session.activations.gdn_z), 0);
-            enc.set_buffer(2, Some(norm_weight), 0);
-            enc.set_buffer(3, Some(&self.session.activations.gdn_z), 0);
-            enc.set_bytes(4, p_bytes, &params as *const GdnChunkParams as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(params.n_tokens as u64, params.num_value_heads as u64, 1),
-                MTLSize::new(128, 1, 1),
-            );
-        }
-
-        fn dispatch_gemm(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            x_offset: u64,
-            qw: &Q4WeightBuf,
-            y: &Buffer,
-            y_offset: u64,
-            m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            match self.engine.quant_format {
-                QuantFormat::Q8_0 => {
-                    self.dispatch_gemm_q8(enc, x, x_offset, qw, y, y_offset, m, n, k)
-                }
-                QuantFormat::Q4_0 => {
-                    self.dispatch_gemm_q4(enc, x, x_offset, qw, y, y_offset, m, n, k)
-                }
-            }
-        }
-
-        fn dispatch_rms_norm(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            gamma: &Buffer,
-            row_len: u32,
-            num_rows: u32,
-            eps: f32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.rms_norm);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(gamma), 0);
-            enc.set_bytes(2, 4, &row_len as *const u32 as *const _);
-            enc.set_bytes(3, 4, &num_rows as *const u32 as *const _);
-            enc.set_bytes(4, 4, &eps as *const f32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_thread_groups(MTLSize::new(num_rows as u64, 1, 1), MTLSize::new(wg, 1, 1));
-        }
-
-        fn dispatch_per_head_rms_norm(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            gamma: &Buffer,
-            num_heads: u32,
-            head_dim: u32,
-            eps: f32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.per_head_rms_norm);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(gamma), 0);
-            enc.set_bytes(2, 4, &num_heads as *const u32 as *const _);
-            enc.set_bytes(3, 4, &head_dim as *const u32 as *const _);
-            enc.set_bytes(4, 4, &eps as *const f32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_thread_groups(
-                MTLSize::new(num_heads as u64, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        /// `mrope_override`, when supplied (Qwen3.5 vision M-RoPE, ADR-069 MP3),
-        /// replaces the 1-D `engine.rope_cos`/`rope_sin` table indexed by
-        /// `position` with a caller-supplied single-token cos/sin row (indexed
-        /// at offset 0) — the interleaved-axis row built by
-        /// `Qwen35VisionRequest::build_mrope_tables`/`build_decode_cos_sin`.
-        /// The rotation kernel and its stride-half arithmetic are unchanged
-        /// either way; only the cos/sin row source differs, mirroring
-        /// `cpu_f16::full_attention_step_f16`'s `mrope_cos_sin` parameter.
-        fn dispatch_partial_rope(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            num_heads: u32,
-            head_dim: u32,
-            half_rope_dim: u32,
-            position: u32,
-            mrope_override: Option<(&Buffer, &Buffer)>,
-        ) {
-            let (cos_buf, sin_buf, pos_offset) = match mrope_override {
-                Some((cos_buf, sin_buf)) => (cos_buf, sin_buf, 0u32),
-                None => (&self.engine.rope_cos, &self.engine.rope_sin, position),
-            };
-            enc.set_compute_pipeline_state(&self.engine.pipelines.partial_rope);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(cos_buf), 0);
-            enc.set_buffer(2, Some(sin_buf), 0);
-            enc.set_bytes(3, 4, &num_heads as *const u32 as *const _);
-            enc.set_bytes(4, 4, &head_dim as *const u32 as *const _);
-            enc.set_bytes(5, 4, &half_rope_dim as *const u32 as *const _);
-            enc.set_bytes(6, 4, &pos_offset as *const u32 as *const _);
-            let total_pairs = num_heads * half_rope_dim;
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(total_pairs as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn dispatch_decode_attention(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            k_cache: &Buffer,
-            v_cache: &Buffer,
-            cache_len: u32,
-            head_dim: u32,
-            num_q_heads: u32,
-            num_kv_heads: u32,
-            q_dim: u32,
-            kv_dim: u32,
-            scale: f32,
-        ) {
-            const PARTITION_TOKENS: u32 = METAL_FLASH_PARTITION_TOKENS as u32;
-            const DIRECT_THRESHOLD: u32 = 512; // use direct path for short caches
-
-            validate_flash_decode_shape(
-                head_dim as usize,
-                num_q_heads as usize,
-                num_kv_heads as usize,
-                q_dim as usize,
-                kv_dim as usize,
-            )
-            .expect("invalid Metal FlashAttention decode shape");
-
-            let kv_f16 = self.use_kv_f16;
-
-            // Common buffer setup (same layout for both direct and partial kernels)
-            let set_common_bufs = |enc: &ComputeCommandEncoderRef, out_or_partials: &Buffer| {
-                enc.set_buffer(0, Some(&self.session.activations.q_separated), 0);
-                enc.set_buffer(1, Some(k_cache), 0);
-                enc.set_buffer(2, Some(v_cache), 0);
-                enc.set_buffer(3, Some(out_or_partials), 0);
-                enc.set_bytes(4, 4, &cache_len as *const u32 as *const _);
-                enc.set_bytes(5, 4, &head_dim as *const u32 as *const _);
-                enc.set_bytes(6, 4, &num_q_heads as *const u32 as *const _);
-                enc.set_bytes(7, 4, &num_kv_heads as *const u32 as *const _);
-                enc.set_bytes(8, 4, &q_dim as *const u32 as *const _);
-                enc.set_bytes(9, 4, &kv_dim as *const u32 as *const _);
-                enc.set_bytes(10, 4, &scale as *const f32 as *const _);
-            };
-
-            if cache_len <= DIRECT_THRESHOLD {
-                // Direct grouped flash decode: one threadgroup per KV head (H1+H2+H4+H5)
-                if kv_f16 {
-                    enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention_f16);
-                } else {
-                    enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attention);
-                }
-                set_common_bufs(enc, &self.session.activations.attn_out);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_kv_heads as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                if self.path_proof_enabled {
-                    self.path_proof
-                        .decode_attn_direct
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                // Partitioned flash decode (H3): partial kernel + reduce kernel.
-                // Split KV cache into PARTITION_TOKENS-token chunks for better occupancy.
-                let num_partitions = cache_len.div_ceil(PARTITION_TOKENS);
-
-                // Partial pass: one TG per (KV head, partition)
-                if kv_f16 {
-                    enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial_f16);
-                } else {
-                    enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_partial);
-                }
-                set_common_bufs(enc, &self.session.activations.attn_partials);
-                enc.set_bytes(11, 4, &PARTITION_TOKENS as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_kv_heads as u64, num_partitions as u64, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                if self.path_proof_enabled {
-                    self.path_proof
-                        .decode_attn_split_partial
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-
-                // Reduce pass: one TG per KV head, combines all partitions.
-                // decode_attention_flash_reduce reads f32 attn_partials, not KV — no f16 variant.
-                enc.set_compute_pipeline_state(&self.engine.pipelines.decode_attn_reduce);
-                enc.set_buffer(0, Some(&self.session.activations.attn_partials), 0);
-                enc.set_buffer(1, Some(&self.session.activations.attn_out), 0);
-                enc.set_bytes(2, 4, &num_q_heads as *const u32 as *const _);
-                enc.set_bytes(3, 4, &num_kv_heads as *const u32 as *const _);
-                enc.set_bytes(4, 4, &num_partitions as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(num_kv_heads as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                if self.path_proof_enabled {
-                    self.path_proof
-                        .decode_attn_split_reduce
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        fn dispatch_sigmoid_gate(&self, enc: &ComputeCommandEncoderRef, count: u32) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.sigmoid_gate);
-            enc.set_buffer(0, Some(&self.session.activations.attn_out), 0);
-            enc.set_buffer(1, Some(&self.session.activations.gate_z), 0);
-            enc.set_bytes(2, 4, &count as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        fn dispatch_scatter_q_gate(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            num_heads: u32,
-            head_dim: u32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.scatter_q_gate);
-            enc.set_buffer(0, Some(&self.session.activations.q), 0);
-            enc.set_buffer(1, Some(&self.session.activations.q_separated), 0);
-            enc.set_buffer(2, Some(&self.session.activations.gate_z), 0);
-            enc.set_bytes(3, 4, &num_heads as *const u32 as *const _);
-            enc.set_bytes(4, 4, &head_dim as *const u32 as *const _);
-            let total = num_heads * head_dim;
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(total as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        fn dispatch_scatter_q_gate_batch(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            num_tokens: u32,
-            num_heads: u32,
-            head_dim: u32,
-        ) {
-            let total = num_tokens * num_heads * head_dim;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.scatter_q_gate_batch);
-            enc.set_buffer(0, Some(&self.session.activations.q), 0);
-            enc.set_buffer(1, Some(&self.session.activations.q_separated), 0);
-            enc.set_buffer(2, Some(&self.session.activations.gate_z), 0);
-            enc.set_bytes(3, 4, &num_tokens as *const u32 as *const _);
-            enc.set_bytes(4, 4, &num_heads as *const u32 as *const _);
-            enc.set_bytes(5, 4, &head_dim as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(total as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        fn dispatch_per_head_rms_norm_batch(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            gamma: &Buffer,
-            num_tokens: u32,
-            num_heads: u32,
-            head_dim: u32,
-            eps: f32,
-        ) {
-            let total_groups = num_tokens * num_heads;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.per_head_rms_norm_batch);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(gamma), 0);
-            enc.set_bytes(2, 4, &num_tokens as *const u32 as *const _);
-            enc.set_bytes(3, 4, &num_heads as *const u32 as *const _);
-            enc.set_bytes(4, 4, &head_dim as *const u32 as *const _);
-            enc.set_bytes(5, 4, &eps as *const f32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_thread_groups(
-                MTLSize::new(total_groups as u64, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn dispatch_partial_rope_batch(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            num_tokens: u32,
-            num_heads: u32,
-            head_dim: u32,
-            half_rope_dim: u32,
-            base_pos: u32,
-        ) {
-            let total_pairs = num_tokens * num_heads * half_rope_dim;
-            enc.set_compute_pipeline_state(&self.engine.pipelines.partial_rope_batch);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(&self.engine.rope_cos), 0);
-            enc.set_buffer(2, Some(&self.engine.rope_sin), 0);
-            enc.set_bytes(3, 4, &num_tokens as *const u32 as *const _);
-            enc.set_bytes(4, 4, &num_heads as *const u32 as *const _);
-            enc.set_bytes(5, 4, &head_dim as *const u32 as *const _);
-            enc.set_bytes(6, 4, &half_rope_dim as *const u32 as *const _);
-            enc.set_bytes(7, 4, &base_pos as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(total_pairs as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn dispatch_copy_kv_cache_batch(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            k_src: &Buffer,
-            v_src: &Buffer,
-            k_cache: &Buffer,
-            v_cache: &Buffer,
-            num_tokens: u32,
-            kv_dim: u32,
-            base_pos: u32,
-        ) {
-            let total = num_tokens * kv_dim;
-            if self.use_kv_f16 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.copy_kv_cache_batch_f16);
-            } else {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.copy_kv_cache_batch);
-            }
-            enc.set_buffer(0, Some(k_src), 0);
-            enc.set_buffer(1, Some(v_src), 0);
-            enc.set_buffer(2, Some(k_cache), 0);
-            enc.set_buffer(3, Some(v_cache), 0);
-            enc.set_bytes(4, 4, &num_tokens as *const u32 as *const _);
-            enc.set_bytes(5, 4, &kv_dim as *const u32 as *const _);
-            enc.set_bytes(6, 4, &base_pos as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(total as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-            if self.path_proof_enabled {
-                self.path_proof
-                    .prefill_kv_batch
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        #[allow(clippy::too_many_arguments)]
-        fn dispatch_prefill_attention_batched(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            k_cache: &Buffer,
-            v_cache: &Buffer,
-            base_pos: u32,
-            num_tokens: u32,
-            head_dim: u32,
-            num_q_heads: u32,
-            num_kv_heads: u32,
-            q_dim: u32,
-            kv_dim: u32,
-            scale: f32,
-        ) -> Result<(), String> {
-            validate_flash_decode_shape(
-                head_dim as usize,
-                num_q_heads as usize,
-                num_kv_heads as usize,
-                q_dim as usize,
-                kv_dim as usize,
-            )?;
-            let cache_len_total = base_pos.checked_add(num_tokens).ok_or_else(|| {
-                "prefill_attention_batched: base_pos + num_tokens overflow".to_string()
-            })?;
-            if self.use_kv_f16 {
-                enc.set_compute_pipeline_state(
-                    &self.engine.pipelines.prefill_attention_batched_f16,
-                );
-            } else {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.prefill_attention_batched);
-            }
-            enc.set_buffer(0, Some(&self.session.activations.q_separated), 0);
-            enc.set_buffer(1, Some(k_cache), 0);
-            enc.set_buffer(2, Some(v_cache), 0);
-            enc.set_buffer(3, Some(&self.session.activations.attn_out), 0);
-            enc.set_bytes(4, 4, &base_pos as *const u32 as *const _);
-            enc.set_bytes(5, 4, &num_tokens as *const u32 as *const _);
-            enc.set_bytes(6, 4, &cache_len_total as *const u32 as *const _);
-            enc.set_bytes(7, 4, &head_dim as *const u32 as *const _);
-            enc.set_bytes(8, 4, &num_q_heads as *const u32 as *const _);
-            enc.set_bytes(9, 4, &num_kv_heads as *const u32 as *const _);
-            enc.set_bytes(10, 4, &q_dim as *const u32 as *const _);
-            enc.set_bytes(11, 4, &kv_dim as *const u32 as *const _);
-            enc.set_bytes(12, 4, &scale as *const f32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(num_kv_heads as u64, num_tokens as u64, 1),
-                MTLSize::new(256, 1, 1),
-            );
-            if self.path_proof_enabled {
-                self.path_proof
-                    .prefill_attn_batched
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(())
-        }
-
-        fn dispatch_silu_mul(&self, enc: &ComputeCommandEncoderRef, count: u32) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul);
-            enc.set_buffer(0, Some(&self.session.activations.gate), 0);
-            enc.set_buffer(1, Some(&self.session.activations.up), 0);
-            enc.set_bytes(2, 4, &count as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        // Dense decode fused: data[0..count] = silu(data[0..count]) * data[count..2*count]
-        fn dispatch_silu_mul_fused(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            data: &Buffer,
-            count: u32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.silu_mul_fused);
-            enc.set_buffer(0, Some(data), 0);
-            enc.set_bytes(2, 4, &count as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        // Variant of dispatch_gemm that adds qw_extra_offset bytes to the weight buffer binding.
-        // Used by batch Dense paths to access gate (offset=0) or up (offset=gate_byte_size)
-        // within the fused gate_up_proj buffer without modifying the MSL kernels.
-        fn dispatch_gemm_at(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            x_offset: u64,
-            qw: &Q4WeightBuf,
-            qw_extra_offset: u64,
-            y: &Buffer,
-            y_offset: u64,
-            m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            match self.engine.quant_format {
-                QuantFormat::Q8_0 => self.dispatch_gemm_q8_at(
-                    enc,
-                    x,
-                    x_offset,
-                    qw,
-                    qw_extra_offset,
-                    y,
-                    y_offset,
-                    m,
-                    n,
-                    k,
-                ),
-                QuantFormat::Q4_0 => self.dispatch_gemm_q4_at(
-                    enc,
-                    x,
-                    x_offset,
-                    qw,
-                    qw_extra_offset,
-                    y,
-                    y_offset,
-                    m,
-                    n,
-                    k,
-                ),
-            }
-        }
-
-        fn dispatch_gemm_q8_at(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            x_offset: u64,
-            qw: &Q4WeightBuf,
-            qw_extra_offset: u64,
-            y: &Buffer,
-            y_offset: u64,
-            m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            let wq_offset = qw.payload_offset + qw_extra_offset;
-            if m == 0 || n == 0 {
-                return;
-            }
-            assert!(
-                k > 0 && k.is_multiple_of(32),
-                "dispatch_gemm_q8_at requires K non-zero and divisible by 32, got {k}"
-            );
-            if m <= 1 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q8);
-                enc.set_buffer(0, Some(x), x_offset);
-                enc.set_buffer(1, Some(&qw.buffer), wq_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &n as *const u32 as *const _);
-                enc.set_bytes(4, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, 1, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else if let Some(tiled) = self.engine.pipelines.gemm_q8_tiled.as_ref() {
-                // Tiled path: buf(0)=QW (with offset), buf(1)=X, buf(2)=Y.
-                enc.set_compute_pipeline_state(tiled);
-                enc.set_buffer(0, Some(&qw.buffer), wq_offset);
-                enc.set_buffer(1, Some(x), x_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else {
-                // Naive fallback. Buffer bindings: buf(0)=X, buf(1)=QW, buf(2)=Y.
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q8);
-                enc.set_buffer(0, Some(x), x_offset);
-                enc.set_buffer(1, Some(&qw.buffer), wq_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, m.div_ceil(4) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            }
-        }
-
-        fn dispatch_gemm_q4_at(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            x: &Buffer,
-            x_offset: u64,
-            qw: &Q4WeightBuf,
-            qw_extra_offset: u64,
-            y: &Buffer,
-            y_offset: u64,
-            m: u32,
-            n: u32,
-            k: u32,
-        ) {
-            if m == 0 || n == 0 {
-                return;
-            }
-            assert!(
-                k > 0 && k.is_multiple_of(32),
-                "dispatch_gemm_q4_at requires K to be non-zero and divisible by 32, got {k}"
-            );
-            let wq_offset = qw.payload_offset + qw_extra_offset;
-            if m == 1 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemv_q4);
-                enc.set_buffer(0, Some(x), x_offset);
-                enc.set_buffer(1, Some(&qw.buffer), wq_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &n as *const u32 as *const _);
-                enc.set_bytes(4, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, 1, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else if let Some(tiled) = self.engine.pipelines.gemm_q4_tiled.as_ref() {
-                enc.set_compute_pipeline_state(tiled);
-                enc.set_buffer(0, Some(&qw.buffer), wq_offset);
-                enc.set_buffer(1, Some(x), x_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(32) as u64, m.div_ceil(64) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            } else {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q4);
-                enc.set_buffer(0, Some(&qw.buffer), wq_offset);
-                enc.set_buffer(1, Some(x), x_offset);
-                enc.set_buffer(2, Some(y), y_offset);
-                enc.set_bytes(3, 4, &m as *const u32 as *const _);
-                enc.set_bytes(4, 4, &n as *const u32 as *const _);
-                enc.set_bytes(5, 4, &k as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(n.div_ceil(2) as u64, m.div_ceil(4) as u64, 1),
-                    MTLSize::new(32, 4, 1),
-                );
-            }
-        }
-
-        fn dispatch_copy(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            src: &Buffer,
-            dst: &Buffer,
-            count: u32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.copy);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(dst), 0);
-            enc.set_bytes(2, 4, &count as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        fn dispatch_copy_offset(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            src: &Buffer,
-            dst: &Buffer,
-            count: u32,
-            dst_offset: u32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(dst), 0);
-            enc.set_bytes(2, 4, &count as *const u32 as *const _);
-            enc.set_bytes(3, 4, &dst_offset as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        /// Copy `count` f32 elements from `src` into the KV cache buffer `dst` at element
-        /// offset `dst_offset`. Selects the f16 narrowing kernel when `use_kv_f16` is set.
-        fn dispatch_copy_offset_kv(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            src: &Buffer,
-            dst: &Buffer,
-            count: u32,
-            dst_offset: u32,
-        ) {
-            if self.use_kv_f16 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset_f16);
-            } else {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.copy_offset);
-            }
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(dst), 0);
-            enc.set_bytes(2, 4, &count as *const u32 as *const _);
-            enc.set_bytes(3, 4, &dst_offset as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-            if self.path_proof_enabled {
-                self.path_proof
-                    .decode_kv_copy
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        /// Fused residual add + RMS norm.
-        /// residual_out = base + delta; normed_out = rms_norm(residual_out) * (1+gamma)
-        /// Replaces 4 dispatches (copy+add+copy+rms_norm) with 1.
-        fn dispatch_fused_residual_add_norm(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            base: &Buffer,
-            delta: &Buffer,
-            residual_out: &Buffer,
-            normed_out: &Buffer,
-            gamma: &Buffer,
-            row_len: u32,
-            eps: f32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.fused_residual_add_norm);
-            enc.set_buffer(0, Some(base), 0);
-            enc.set_buffer(1, Some(delta), 0);
-            enc.set_buffer(2, Some(residual_out), 0);
-            enc.set_buffer(3, Some(normed_out), 0);
-            enc.set_buffer(4, Some(gamma), 0);
-            enc.set_bytes(5, 4, &row_len as *const u32 as *const _);
-            enc.set_bytes(6, 4, &eps as *const f32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(wg, 1, 1));
-        }
-
-        /// Fused copy-then-RMS-norm for decode pre-norm: saves `src` to `residual_out`
-        /// and normalizes `src` in-place.  Replaces `dispatch_copy` + `dispatch_rms_norm`.
-        fn dispatch_copy_and_rms_norm(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            src: &Buffer,
-            residual_out: &Buffer,
-            gamma: &Buffer,
-            row_len: u32,
-            eps: f32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_and_rms_norm);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(residual_out), 0);
-            enc.set_buffer(2, Some(gamma), 0);
-            enc.set_bytes(3, 4, &row_len as *const u32 as *const _);
-            enc.set_bytes(4, 4, &eps as *const f32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(wg, 1, 1));
-        }
-
-        /// Batch copy-then-RMS-norm for prefill: copies `src` rows to `residual_out`
-        /// and normalizes `src` in-place.  Multi-row version.
-        fn dispatch_copy_and_rms_norm_batch(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            src: &Buffer,
-            residual_out: &Buffer,
-            gamma: &Buffer,
-            row_len: u32,
-            num_rows: u32,
-            eps: f32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.copy_and_rms_norm_batch);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(residual_out), 0);
-            enc.set_buffer(2, Some(gamma), 0);
-            enc.set_bytes(3, 4, &row_len as *const u32 as *const _);
-            enc.set_bytes(4, 4, &num_rows as *const u32 as *const _);
-            enc.set_bytes(5, 4, &eps as *const f32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_thread_groups(MTLSize::new(num_rows as u64, 1, 1), MTLSize::new(wg, 1, 1));
-        }
-
-        /// Batch fused residual-add + RMS-norm for prefill: `residual_out = base + delta`,
-        /// `normed_out = rms_norm(residual_out)`.  Multi-row version.
-        fn dispatch_fused_residual_add_norm_batch(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            base: &Buffer,
-            delta: &Buffer,
-            residual_out: &Buffer,
-            normed_out: &Buffer,
-            gamma: &Buffer,
-            row_len: u32,
-            num_rows: u32,
-            eps: f32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.fused_residual_add_norm_batch);
-            enc.set_buffer(0, Some(base), 0);
-            enc.set_buffer(1, Some(delta), 0);
-            enc.set_buffer(2, Some(residual_out), 0);
-            enc.set_buffer(3, Some(normed_out), 0);
-            enc.set_buffer(4, Some(gamma), 0);
-            enc.set_bytes(5, 4, &row_len as *const u32 as *const _);
-            enc.set_bytes(6, 4, &num_rows as *const u32 as *const _);
-            enc.set_bytes(7, 4, &eps as *const f32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_thread_groups(MTLSize::new(num_rows as u64, 1, 1), MTLSize::new(wg, 1, 1));
-        }
-
-        /// Fused add-into-residual + copy-to-hidden for decode end-of-layer.
-        /// `residual[i] += src[i]; dst[i] = residual[i]`.
-        /// Replaces `dispatch_add` + `dispatch_copy`.
-        fn dispatch_add_and_copy(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            src: &Buffer,
-            residual: &Buffer,
-            dst: &Buffer,
-            count: u32,
-        ) {
-            enc.set_compute_pipeline_state(&self.engine.pipelines.add_and_copy);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(residual), 0);
-            enc.set_buffer(2, Some(dst), 0);
-            enc.set_bytes(3, 4, &count as *const u32 as *const _);
-            let wg = 256u64;
-            enc.dispatch_threads(
-                MTLSize::new(div_ceil(count as u64, wg) * wg, 1, 1),
-                MTLSize::new(wg, 1, 1),
-            );
-        }
-
-        // -----------------------------------------------------------------------
-        // lm_head two-stage block-top-k dispatch helpers (issue #171)
-        // -----------------------------------------------------------------------
-
-        /// Stage 1: fused lm_head GEMV + block-local exact argmax/top-k.
-        /// Writes compact `(logit, token_id)` candidates into `topk_scratch_a`,
-        /// `local_k` per tile. Appended to the same encoder as the caller's
-        /// other dispatches — no second command-buffer round-trip.
-        ///
-        /// `hidden_offset` is the byte offset into
-        /// `self.session.activations.hidden` of the single post-RMSNorm token
-        /// row to project (0 for decode; the last-token offset for prefill).
-        ///
-        /// DISPATCH GEOMETRY: the kernel owns vocab rows on tg_pos.x, so x
-        /// groups must be `ceil(vocab_size / LM_HEAD_ROWS_PER_TG)`.
-        /// Under-dispatch leaves rows unwritten, which has previously
-        /// corrupted lm_head outputs silently in this codebase.
-        ///
-        /// `slot` is the precompiled Stage-1 pipeline index for `local_k`
-        /// (`LM_HEAD_LOCAL_KS[slot] == local_k`). Callers must obtain both via
-        /// `resolve_block_local_k`, which is the single place that validates
-        /// `local_k` against `LM_HEAD_LOCAL_KS` and falls back to the exact
-        /// full-logit path on an unsupported value — by the time `slot`
-        /// reaches this function it is already a valid array index, so this
-        /// dispatch-encoding helper (mid command-buffer, nothing sane to
-        /// "return an error" to) has no unsupported-LOCAL_K case left to
-        /// guard against.
-        ///
-        /// Returns the candidate-group count (Stage 2's `candidate_groups`).
-        fn dispatch_lm_head_block_stage1_enc(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            cfg: &Qwen35Config,
-            hidden_offset: u64,
-            local_k: u32,
-            slot: usize,
-        ) -> u32 {
-            let vocab_size = cfg.vocab_size as u32;
-            let row_groups = vocab_size.div_ceil(LM_HEAD_ROWS_PER_TG);
-
-            // Fail closed rather than silently overrunning topk_scratch_a: for every
-            // vocab_size, ceil(vocab/1024)*256 (the existing allocation, sized for the
-            // older fixed-256-per-group scheme) is provably >= ceil(vocab/256)*local_k
-            // (this Stage-1's worst case, local_k<=64) because 1024 = 4*256 and
-            // 256*8/1024 == 64*8/256 — the two schemes reserve the same 2 bytes/vocab-row
-            // asymptotically, and the coarser grouping's ceiling only adds headroom. This
-            // assert documents and guards that invariant instead of leaving it implicit.
-            let candidate_capacity = self.session.activations.topk_scratch_a.length() / 8;
-            let candidates_written = row_groups as u64 * local_k as u64;
-            assert!(
-                candidates_written <= candidate_capacity,
-                "lm_head block-topk Stage-1 would write {candidates_written} candidates \
-                 ({row_groups} groups * local_k {local_k}) but topk_scratch_a only holds \
-                 {candidate_capacity} — buffer-sizing invariant violated"
-            );
-
-            match self.engine.quant_format {
-                QuantFormat::Q8_0 => {
-                    enc.set_compute_pipeline_state(
-                        &self.engine.pipelines.lm_head_block_topk_f16[slot],
-                    );
-                    enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_offset);
-                    enc.set_buffer(1, Some(&self.engine.embed_tokens), 0);
-                    enc.set_buffer(2, Some(&self.session.activations.topk_scratch_a), 0);
-                    enc.set_bytes(3, 4, &vocab_size as *const u32 as *const _);
-                }
-                QuantFormat::Q4_0 => {
-                    let qw = &self.engine.embed_tokens_q8;
-                    enc.set_compute_pipeline_state(
-                        &self.engine.pipelines.lm_head_block_topk_q4[slot],
-                    );
-                    enc.set_buffer(0, Some(&self.session.activations.hidden), hidden_offset);
-                    enc.set_buffer(1, Some(&qw.buffer), qw.payload_offset);
-                    enc.set_buffer(2, Some(&self.session.activations.topk_scratch_a), 0);
-                    enc.set_bytes(3, 4, &vocab_size as *const u32 as *const _);
-                }
-            }
-            enc.dispatch_thread_groups(
-                MTLSize::new(row_groups as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-            row_groups
-        }
-
-        /// Stage 2: reduces the compact per-tile candidates Stage 1 already
-        /// wrote into `topk_scratch_a` to the global result. Reuses the exact
-        /// same `argmax_merge` / `topk_merge_pass` kernels as the existing
-        /// `dispatch_topk_enc` seam below — the only difference is that the
-        /// input candidates come from Stage 1's fused GEMV instead of a
-        /// full-logits first pass over a materialized `[vocab_size]` buffer.
-        /// Appended to the same encoder; no second command-buffer round-trip.
-        ///
-        /// Returns 0 if the final `local_k` candidates are in
-        /// `topk_scratch_a`, 1 for `topk_scratch_b`.
-        fn dispatch_block_topk_merge_enc(
-            &self,
-            enc: &ComputeCommandEncoderRef,
-            candidate_groups: u32,
-            local_k: u32,
-        ) -> u8 {
-            if local_k == 1 {
-                enc.set_compute_pipeline_state(&self.engine.pipelines.argmax_merge);
-                enc.set_buffer(0, Some(&self.session.activations.topk_scratch_a), 0);
-                enc.set_buffer(1, Some(&self.session.activations.topk_scratch_b), 0);
-                enc.set_bytes(2, 4, &candidate_groups as *const u32 as *const _);
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
-                return 1;
-            }
-
-            let mut current_groups = candidate_groups;
-            let mut which: u8 = 0;
-            while current_groups > 1 {
-                let fan_in: u32 = 16u32.min(current_groups);
-                let out_groups = current_groups.div_ceil(fan_in);
-                let (in_buf, out_buf) = if which == 0 {
-                    (
-                        &self.session.activations.topk_scratch_a,
-                        &self.session.activations.topk_scratch_b,
-                    )
-                } else {
-                    (
-                        &self.session.activations.topk_scratch_b,
-                        &self.session.activations.topk_scratch_a,
-                    )
-                };
-                enc.set_compute_pipeline_state(&self.engine.pipelines.topk_merge_pass);
-                enc.set_buffer(0, Some(in_buf), 0);
-                enc.set_buffer(1, Some(out_buf), 0);
-                enc.set_bytes(2, 4, &current_groups as *const u32 as *const _);
-                enc.set_bytes(3, 4, &local_k as *const u32 as *const _);
-                enc.set_bytes(4, 4, &fan_in as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(out_groups as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-                current_groups = out_groups;
-                which = 1 - which;
-            }
-            which
-        }
-
-        // -----------------------------------------------------------------------
-        // GPU Top-K dispatch helpers
-        // -----------------------------------------------------------------------
-
-        /// Dispatch top-k kernels into `enc` (same command buffer as the logits GEMV).
-        ///
-        /// Runs first-pass + iterative merge passes.  All dispatches are in the
-        /// same encoder so the GPU executes them in order without extra synchronisation.
-        ///
-        /// Returns 0 if the final result is in `topk_scratch_a`, 1 for `topk_scratch_b`.
-        /// The caller reads from that buffer after `wait_until_completed()`.
-        fn dispatch_topk_enc(&self, enc: &ComputeCommandEncoderRef, vocab_size: u32, k: u32) -> u8 {
-            // compact_route must be set before dispatch; CpuFallback means compact_topk=0.
-            debug_assert!(
-                self.session.compact_route != GpuTopkRoute::CpuFallback,
-                "dispatch_topk_enc called with CpuFallback route"
-            );
-            if k == 1 {
-                // Dedicated argmax: two passes, no sorting.
-                let groups = vocab_size.div_ceil(1024);
-                enc.set_compute_pipeline_state(&self.engine.pipelines.argmax_first);
-                enc.set_buffer(0, Some(&self.session.activations.logits), 0);
-                enc.set_buffer(1, Some(&self.session.activations.topk_scratch_a), 0);
-                enc.set_bytes(2, 4, &vocab_size as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(groups as u64, 1, 1),
-                    MTLSize::new(1024, 1, 1),
-                );
-
-                enc.set_compute_pipeline_state(&self.engine.pipelines.argmax_merge);
-                enc.set_buffer(0, Some(&self.session.activations.topk_scratch_a), 0);
-                enc.set_buffer(1, Some(&self.session.activations.topk_scratch_b), 0);
-                enc.set_bytes(2, 4, &groups as *const u32 as *const _);
-                enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1024, 1, 1));
-
-                return 1; // result in scratch_b[0]
-            }
-
-            // k > 1: hierarchical k=50 SIMD-group tournament (no bitonic sort).
-            debug_assert_eq!(k, 50, "only HierarchicalK50 route is supported for k>1");
-            debug_assert_eq!(self.session.compact_route, GpuTopkRoute::HierarchicalK50);
-
-            let tile = 1024u32;
-            let first_pass_groups = vocab_size.div_ceil(tile);
-
-            enc.set_compute_pipeline_state(&self.engine.pipelines.topk_select50_first);
-            enc.set_buffer(0, Some(&self.session.activations.logits), 0);
-            enc.set_buffer(1, Some(&self.session.activations.topk_scratch_a), 0);
-            enc.set_bytes(2, 4, &vocab_size as *const u32 as *const _);
-            enc.dispatch_thread_groups(
-                MTLSize::new(first_pass_groups as u64, 1, 1),
-                MTLSize::new(256, 1, 1),
-            );
-
-            let mut current_groups = first_pass_groups;
-            let mut which: u8 = 0;
-
-            while current_groups > 1 {
-                let fan_in: u32 = 16u32.min(current_groups);
-                let out_groups = current_groups.div_ceil(fan_in);
-
-                let (in_buf, out_buf) = if which == 0 {
-                    (
-                        &self.session.activations.topk_scratch_a,
-                        &self.session.activations.topk_scratch_b,
-                    )
-                } else {
-                    (
-                        &self.session.activations.topk_scratch_b,
-                        &self.session.activations.topk_scratch_a,
-                    )
-                };
-                enc.set_compute_pipeline_state(&self.engine.pipelines.topk_select50_merge);
-                enc.set_buffer(0, Some(in_buf), 0);
-                enc.set_buffer(1, Some(out_buf), 0);
-                enc.set_bytes(2, 4, &current_groups as *const u32 as *const _);
-                enc.set_bytes(3, 4, &fan_in as *const u32 as *const _);
-                enc.dispatch_thread_groups(
-                    MTLSize::new(out_groups as u64, 1, 1),
-                    MTLSize::new(256, 1, 1),
-                );
-
-                current_groups = out_groups;
-                which = 1 - which;
-            }
-
-            which
         }
 
         /// Read top-k compact candidates from the appropriate scratch buffer.
@@ -13010,12 +10217,26 @@ mod inner {
     }
 
     fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
-        crate::model::qwen35::detokenize::decode_tokens(tokenizer, ids)
+        crate::tokenizer::detokenize::decode_tokens(tokenizer, ids)
     }
 
     // -----------------------------------------------------------------------
     // Chat Completion API
     // -----------------------------------------------------------------------
+
+    const TEXT_CHAT_IMAGE_ERROR: &str =
+        "inline image messages require the multimodal vision generation path";
+
+    fn reject_inline_images_for_text_chat(
+        messages: &[ChatMessage],
+    ) -> Result<(), crate::error::InferenceError> {
+        if messages.iter().any(|message| message.image.is_some()) {
+            return Err(crate::error::InferenceError::InvalidInput(
+                TEXT_CHAT_IMAGE_ERROR.to_string(),
+            ));
+        }
+        Ok(())
+    }
 
     /// **Unstable**: output from chat completion; fields may expand with streaming and usage stats.
     ///
@@ -13044,14 +10265,17 @@ mod inner {
         ///
         /// # Errors
         ///
-        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
-        /// blocks every token — propagated from [`Self::generate`] (#611).
+        /// Returns `InferenceError::InvalidInput` if `messages` contains an
+        /// inline image, which requires the multimodal vision entry point, or
+        /// if grammar-constrained decoding blocks every token — propagated
+        /// from [`Self::generate`] (#611).
         pub fn chat_completion(
             &mut self,
             messages: &[ChatMessage],
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
         ) -> Result<ChatCompletionOutput, crate::error::InferenceError> {
+            reject_inline_images_for_text_chat(messages)?;
             let prompt = format_chat_template(messages);
             // Add <|im_end|> as stop token
             let mut cfg = gen_cfg.clone();
@@ -13131,64 +10355,25 @@ mod inner {
         {
             use crate::error::InferenceError;
 
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-            let prompt_len = prompt_ids.len();
-
-            // Empty prompt is rejected with a typed Err on every generation
-            // entry point as of #856 (this covers both `generate_streaming`
-            // and `generate_streaming_with_cancel`, since the former is a
-            // thin `should_cancel = || false` wrapper over this function).
-            // This used to return an empty
-            // Ok(GenerateOutput { stopped: false, stop_reason: None, .. }),
-            // diverging from the CPU streaming guard and the `generate()`
-            // guard above, which both reject via this exact same shared
-            // guard. See docs/generation-entrypoint-matrix.md row 2. Runs
-            // before `reset_state()` below, so a rejected request never
-            // mutates session/cache state.
-            crate::model::qwen35::check_prompt_not_empty(prompt_len)?;
-
-            // max_new_tokens == 0 means "generate nothing": return before prefill/sampling
-            // so we never emit a token the caller did not ask for, and on_token is never
-            // invoked. Mirrors the CPU generate_streaming() guard (model::qwen35::generation)
-            // and the generate() guard above.
-            if gen_cfg.max_new_tokens == 0 {
-                return Ok(GenerateOutput {
-                    text: String::new(),
-                    token_ids: vec![],
-                    prompt_tokens: prompt_len,
-                    generated_tokens: 0,
-                    stopped: false,
-                    stop_reason: Some(StopReason::Length),
-                    token_logprobs: vec![],
-                });
-            }
-
-            crate::model::qwen35::check_context_budget(
-                prompt_len,
-                gen_cfg.reasoning_budget,
-                gen_cfg.max_new_tokens,
+            let plan = match prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
                 self.max_context(),
-            )?;
+                GenerationEntryContract::MetalStreaming,
+            )? {
+                GenerationPreparation::Complete(output) => return Ok(output),
+                GenerationPreparation::Ready(plan) => plan,
+            };
+            let GenerationPlan {
+                mut rng_state,
+                prompt_ids,
+                prompt_len,
+                ..
+            } = plan;
 
             let cfg = self.engine.config.clone();
-            let mut rng_state = match gen_cfg.seed {
-                Some(s) => {
-                    if s == 0 {
-                        1
-                    } else {
-                        s
-                    }
-                }
-                None => {
-                    use std::time::SystemTime;
-                    let t = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x12345678_9abcdef0);
-                    if t == 0 { 1 } else { t }
-                }
-            };
 
             self.reset_state();
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
@@ -13199,43 +10384,7 @@ mod inner {
             // default (no logprobs requested) path pays no extra cost.
             let mut token_logprobs: Vec<TokenLogprob> = Vec::new();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
-            );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none()
-                && gen_cfg.logprobs.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
@@ -14250,14 +11399,6 @@ mod inner {
                 cfg.num_key_value_heads * cfg.head_dim,
             )?;
 
-            // Group-size-specialized prefill attention kernel (occupancy win):
-            // group_size is fixed for a loaded model, so selection happens once
-            // here rather than per-dispatch. See `prefill_maxgrp_suffix`'s doc
-            // comment for the ship-safety rounding-up guarantee — validated
-            // in-range by `validate_flash_decode_shape` above.
-            let prefill_grp_suffix =
-                prefill_maxgrp_suffix(cfg.num_attention_heads / cfg.num_key_value_heads)?;
-
             // Cache-capacity validation, matching `new_session` so a
             // `from_q4_dir` call cannot construct a runtime whose KV cap
             // outruns the RoPE table (`partial_rope_interleaved` indexes
@@ -14323,157 +11464,7 @@ mod inner {
                 ));
             }
 
-            // Compile shaders (same as new()).
-            let opts = CompileOptions::new();
-            let library = device
-                .new_library_with_source(MSL_SOURCE, &opts)
-                .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
-
-            let make_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
-                let func = library
-                    .get_function(name, None)
-                    .map_err(|e| format!("function '{name}' not found: {e}"))?;
-                device
-                    .new_compute_pipeline_state_with_function(&func)
-                    .map_err(|e| format!("pipeline for '{name}' failed: {e}"))
-            };
-
-            let make_optional_gemm_q4_tiled = || -> Option<ComputePipelineState> {
-                // simdgroup_float8x8 matrix ops are available since Apple7 (M1).
-                // The compile/pipeline `.ok()?` chain below falls back to the
-                // naive gemm_q4 on any device where the V3.0 source fails.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q4_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q4_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q3_tiled = || -> Option<ComputePipelineState> {
-                // Same Apple7 simdgroup-matrix gate as Q4/Q8; falls back to the
-                // gemv_q3_decode-only (M=1) path on any device/compile failure.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q3_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q3_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let make_optional_gemm_q8_tiled = || -> Option<ComputePipelineState> {
-                // Q8_0 simdgroup-matrix tiled GEMM: same Apple7 gate as Q4.
-                if !device.supports_family(MTLGPUFamily::Apple7) {
-                    return None;
-                }
-                let tiled_opts = CompileOptions::new();
-                tiled_opts.set_language_version(MTLLanguageVersion::V3_0);
-                let lib = device
-                    .new_library_with_source(MSL_Q8_TILED_SOURCE, &tiled_opts)
-                    .ok()?;
-                let func = lib.get_function("gemm_q8_tiled", None).ok()?;
-                device.new_compute_pipeline_state_with_function(&func).ok()
-            };
-
-            let pipelines = MetalQwen35Pipelines {
-                gemv_decode: make_pipeline("gemv_decode_m1")?,
-                gemv_decode_wide: make_pipeline("gemv_decode_wide_f16")?,
-                gemv_q8: make_pipeline("gemv_q8_decode")?,
-                gemv_q4: make_pipeline("gemv_q4_decode")?,
-                gemm_q4: make_pipeline("gemm_q4")?,
-                gemm_q4_tiled: make_optional_gemm_q4_tiled(),
-                gemv_q3: make_pipeline("gemv_q3_decode")?,
-                gemm_q3_tiled: make_optional_gemm_q3_tiled(),
-                rms_norm: make_pipeline("rms_norm_qwen35")?,
-                partial_rope: make_pipeline("partial_rope_interleaved")?,
-                per_head_rms_norm: make_pipeline("per_head_rms_norm")?,
-                decode_attention: make_pipeline("decode_attention")?,
-                sigmoid_gate: make_pipeline("sigmoid_gate")?,
-                scatter_q_gate: make_pipeline("scatter_q_gate")?,
-                silu_mul: make_pipeline("silu_mul")?,
-                silu_mul_fused: make_pipeline("silu_mul_fused")?,
-                copy: make_pipeline("copy_buf")?,
-                copy_offset: make_pipeline("copy_buf_offset")?,
-                conv1d_silu: make_pipeline("conv1d_depthwise_silu")?,
-                gdn_recurrence: make_pipeline("gdn_recurrence_fused")?,
-                gdn_chunk_materialize_c32: make_pipeline("gdn_chunk_materialize_c32")?,
-                gdn_chunk_solve_c32: make_pipeline("gdn_chunk_solve_c32")?,
-                gdn_chunk_residual_output_c32: make_pipeline("gdn_chunk_residual_output_c32")?,
-                gdn_chunk_state_update_c32: make_pipeline("gdn_chunk_state_update_c32")?,
-                gdn_chunk_norm_silu_c32: make_pipeline("gdn_chunk_norm_silu_c32")?,
-                gdn_chunk_conv_buf_update_c32: make_pipeline("gdn_chunk_conv_buf_update_c32")?,
-                gdn_recurrence_q36: library
-                    .get_function("gdn_recurrence_fused_q36", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_precompute_keys: library
-                    .get_function("gdn_precompute_keys", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_recurrence_sharded: library
-                    .get_function("gdn_recurrence_sharded", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                gdn_norm_silu: library
-                    .get_function("gdn_norm_silu", None)
-                    .ok()
-                    .and_then(|f| device.new_compute_pipeline_state_with_function(&f).ok()),
-                fused_residual_add_norm: make_pipeline("fused_residual_add_norm")?,
-                copy_and_rms_norm: make_pipeline("copy_and_rms_norm")?,
-                add_and_copy: make_pipeline("add_and_copy")?,
-                copy_and_rms_norm_batch: make_pipeline("copy_and_rms_norm_batch")?,
-                fused_residual_add_norm_batch: make_pipeline("fused_residual_add_norm_batch")?,
-                gemm_q8: make_pipeline("gemm_q8")?,
-                gemm_q8_tiled: make_optional_gemm_q8_tiled(),
-                topk_merge_pass: make_pipeline("logits_topk_merge_pass")?,
-                argmax_first: make_pipeline("logits_argmax_first")?,
-                argmax_merge: make_pipeline("logits_argmax_merge")?,
-                topk_select50_first: make_pipeline("logits_topk_select50_first")?,
-                topk_select50_merge: make_pipeline("logits_topk_select50_merge")?,
-                decode_attn_partial: make_pipeline("decode_attention_flash_partial")?,
-                decode_attn_reduce: make_pipeline("decode_attention_flash_reduce")?,
-                lora_gemv_a: make_pipeline("lora_gemv_a")?,
-                lora_gemv_b_accum: make_pipeline("lora_gemv_b_accum")?,
-                // ADR-053: MoE Metal dispatch kernels
-                moe_expert_gemv: make_pipeline("moe_expert_gemv")?,
-                moe_scale_add: make_pipeline("moe_scale_add")?,
-                moe_shared_gate_add: make_pipeline("moe_shared_gate_add")?,
-                moe_zero_buf: make_pipeline("zero_buf")?,
-                scatter_q_gate_batch: make_pipeline("scatter_q_gate_batch")?,
-                per_head_rms_norm_batch: make_pipeline("per_head_rms_norm_batch")?,
-                partial_rope_batch: make_pipeline("partial_rope_batch")?,
-                copy_kv_cache_batch: make_pipeline("copy_kv_cache_batch")?,
-                prefill_attention_batched: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}"
-                ))?,
-                copy_offset_f16: make_pipeline("copy_buf_offset_f16")?,
-                copy_kv_cache_batch_f16: make_pipeline("copy_kv_cache_batch_f16")?,
-                decode_attention_f16: make_pipeline("decode_attention_f16")?,
-                decode_attn_partial_f16: make_pipeline("decode_attention_flash_partial_f16")?,
-                prefill_attention_batched_f16: make_pipeline(&format!(
-                    "prefill_attention_batched_causal_{prefill_grp_suffix}_f16"
-                ))?,
-                lm_head_block_topk_f16: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_f16",
-                    cfg.hidden_size as u32,
-                )?,
-                lm_head_block_topk_q4: make_lm_head_block_pipelines(
-                    &device,
-                    &library,
-                    "lm_head_block_topk_q4",
-                    cfg.hidden_size as u32,
-                )?,
-            };
+            let pipelines = build_pipelines(&device, cfg)?;
 
             let hidden = cfg.hidden_size;
             let q_dim = cfg.full_q_dim();
@@ -14960,6 +11951,7 @@ mod inner {
                     )
                 },
                 pre_final_hidden: make_zero_buffer(&device, hidden, "act_pre_final_hidden"),
+                final_hidden: make_zero_buffer(&device, hidden, "act_final_hidden"),
                 verify_logits: make_zero_buffer(
                     &device,
                     MTP_VERIFY_MAX_TOKENS * cfg.vocab_size,
@@ -15159,6 +12151,9 @@ mod inner {
                     mtp: mtp_session,
                     gdn_checkpoints,
                     last_pre_final_hidden: vec![0.0f32; hidden],
+                    mtp_prefill_hidden: Vec::new(),
+                    capture_final_hidden: false,
+                    final_hidden_captured: std::sync::atomic::AtomicBool::new(false),
                     position: 0,
                     #[cfg(feature = "gdn-state-counters")]
                     gdn_state_traffic: if std::env::var_os("LATTICE_GDN_STATE_COUNTERS").is_some() {
@@ -15215,8 +12210,10 @@ mod inner {
         ///
         /// # Errors
         ///
-        /// Returns `InferenceError::InvalidInput` if grammar-constrained decoding
-        /// blocks every token — propagated from [`Self::generate_streaming_with_cancel`] (#611).
+        /// Returns `InferenceError::InvalidInput` if `messages` contains an
+        /// inline image, which requires the multimodal vision entry point, or
+        /// if grammar-constrained decoding blocks every token — propagated
+        /// from [`Self::generate_streaming_with_cancel`] (#611).
         pub fn chat_completion_streaming_with_cancel<F, C>(
             &mut self,
             messages: &[ChatMessage],
@@ -15229,6 +12226,7 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            reject_inline_images_for_text_chat(messages)?;
             let prompt = format_chat_template(messages);
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -15269,6 +12267,123 @@ mod inner {
         /// otherwise (KV-cache full assertion).
         pub fn max_context(&self) -> usize {
             self.session.kv_cache.max_cache_len
+        }
+
+        /// The model's hidden size, which is the length of every vector
+        /// [`Self::embed_tokens`] returns.
+        pub fn hidden_size(&self) -> usize {
+            self.engine.config.hidden_size
+        }
+
+        /// **Stable**: Metal sibling of
+        /// [`crate::model::qwen35::Qwen35Model::embed_tokens`] — embed `tokens`
+        /// as one `[hidden_size]` vector by pooling the model's final hidden
+        /// states.
+        ///
+        /// Returns the same quantity as the CPU method, from the same point in
+        /// the network: the last position's hidden state after the final
+        /// RMSNorm, before the language-model head. The two are held together
+        /// by an equivalence test rather than by inspection.
+        ///
+        /// The returned vector is **not** L2-normalized, matching the CPU
+        /// method and HuggingFace's `AutoModel`-plus-pooling convention.
+        ///
+        /// # Session state
+        ///
+        /// This resets the session before running. GDN recurrent state carries
+        /// across calls, so embedding without a reset would fold whatever the
+        /// session generated previously into the vector. Do not interleave this
+        /// with an in-progress generation and expect that generation to
+        /// continue.
+        ///
+        /// # Errors
+        ///
+        /// - `tokens` empty, longer than the session's context, or containing
+        ///   an id at or above `vocab_size`.
+        /// - [`HiddenPooling::Mean`], which this path does not implement. Mean
+        ///   pooling needs every position's *post-norm* hidden state, and the
+        ///   Metal prefill normalizes only the rows it is about to project to
+        ///   logits — the last row on the default path, and nothing at all on a
+        ///   non-final chunk of a long prompt, which returns before the norm.
+        ///   Producing a number here anyway would mean silently returning
+        ///   last-token pooling under a mean-pooling request, so this refuses
+        ///   instead. Use the CPU path for mean pooling.
+        pub fn embed_tokens(
+            &mut self,
+            tokens: &[u32],
+            pooling: crate::model::qwen35::HiddenPooling,
+        ) -> Result<Vec<f32>, crate::error::InferenceError> {
+            use crate::error::InferenceError;
+            use crate::model::qwen35::HiddenPooling;
+
+            if pooling != HiddenPooling::LastToken {
+                return Err(InferenceError::Inference(format!(
+                    "embed_tokens: the Metal path implements {:?} only; {pooling:?} \
+                     needs post-norm hidden states at every position, which this \
+                     forward path does not produce",
+                    HiddenPooling::LastToken
+                )));
+            }
+            if tokens.is_empty() {
+                return Err(InferenceError::Inference(
+                    "embed_tokens: need at least 1 token, got 0".to_string(),
+                ));
+            }
+            let max_context = self.max_context();
+            if tokens.len() > max_context {
+                return Err(InferenceError::Inference(format!(
+                    "embed_tokens: {} tokens exceeds session context {max_context}",
+                    tokens.len()
+                )));
+            }
+            let vocab = self.engine.config.vocab_size;
+            if let Some((i, &id)) = tokens
+                .iter()
+                .enumerate()
+                .find(|&(_, &id)| id as usize >= vocab)
+            {
+                // Checked here rather than left to `forward_prefill`, which
+                // asserts and panics. A library consumer passing raw ids gets a
+                // typed error, matching the CPU method.
+                return Err(InferenceError::Inference(format!(
+                    "embed_tokens: tokens[{i}]={id} is out of range: vocab_size is {vocab}"
+                )));
+            }
+
+            let hidden = self.engine.config.hidden_size;
+            self.reset_state();
+
+            let previous = self.session.capture_final_hidden;
+            self.session.capture_final_hidden = true;
+            self.session
+                .final_hidden_captured
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = self.forward_prefill(tokens);
+            self.session.capture_final_hidden = previous;
+
+            if !self
+                .session
+                .final_hidden_captured
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                // Fail closed. The capture buffer persists across calls, so
+                // returning its contents when this call did not write them
+                // would hand back a well-formed vector for somebody else's
+                // input — indistinguishable from a correct answer at the call
+                // site. A forward path that norms without capturing is a bug in
+                // this file, not a condition the caller can fix, so say so.
+                return Err(InferenceError::Inference(
+                    "embed_tokens: the forward path did not capture a final hidden state; \
+                     a final-RMSNorm site is missing its capture call"
+                        .to_string(),
+                ));
+            }
+
+            // SAFETY: `forward_prefill` waits on its command buffers before
+            // returning, and `final_hidden` is StorageModeShared and sized for
+            // `hidden` f32 values.
+            let v = unsafe { read_buffer(&self.session.activations.final_hidden, hidden) };
+            Ok(v)
         }
 
         /// **Unstable**: Metal Q4 sibling of [`crate::model::qwen35::Qwen35Model::compute_token_nlls`].
@@ -15990,47 +13105,62 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
-            // Config preflight checks live here, in the public wrapper, and
-            // must return BEFORE the `match` below (PR #787): the
-            // error-recovery arm of that `match` unconditionally
-            // calls `reset_state()` and removes the cache slot on ANY `Err`
-            // from `_inner`, including a not-yet-attempted preflight
-            // rejection. A caller passing an unsupported config (e.g.
-            // `logprobs` or an active `enable_mtp`) never touches cache/session
-            // state in the first place, so routing that rejection through the
-            // destructive recovery path would evict a valid pre-existing
-            // cross-turn entry the call never mutated. Returning here, before
-            // `_inner` is even called, leaves any existing entry untouched.
-            crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
-            crate::model::qwen35::check_mtp_not_requested(gen_cfg)?;
-
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-
-            // #856: empty prompt is rejected here too, same reasoning as the
-            // two preflights above (PR #787) -- `_inner` no longer special-
-            // cases an empty prompt as an early `Ok` (it now unifies on this
-            // exact typed `Err` like every other entry point, see
-            // `check_prompt_not_empty` and docs/generation-entrypoint-matrix.md
-            // row 2), so this must reject before `_inner` is even called, or
-            // the rejection would flow through the destructive `Err`-recovery
-            // match below and evict a valid pre-existing cross-turn entry
-            // this call never touched.
-            crate::model::qwen35::check_prompt_not_empty(prompt_ids.len())?;
-
-            if gen_cfg.max_new_tokens > 0 {
-                crate::model::qwen35::check_context_budget(
-                    prompt_ids.len(),
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.max_new_tokens,
-                    self.max_context(),
-                )?;
-            }
+            // #856/#922/#827/#1354: prompt tokenization, the empty-prompt
+            // guard, and the prompt-plus-decode-budget context bound are
+            // delegated to the same `prepare_generation` shared preparation
+            // `generate_streaming_with_cancel` already routes through,
+            // closing the last unmigrated generation entry point (issue
+            // #827). This uses `GenerationEntryContract::MetalPrefixCacheStreaming`
+            // (#1354), not the plain-streaming `MetalStreaming` variant this
+            // call used to reuse: `MetalStreaming`'s permissive
+            // `validate_capabilities` exists because plain streaming
+            // supports both `logprobs` and `enable_mtp`, but this path does
+            // not, so folding those checks into that variant would have
+            // wrongly restricted plain streaming too. `MetalPrefixCacheStreaming`
+            // carries its own `check_logprobs_not_set` /
+            // `check_mtp_not_requested` guards in `validate_before_tokenization`
+            // (run ahead of tokenization inside `prepare_generation`, same
+            // position these two guards ran in as an explicit preflight
+            // here before this change), so the error text and precedence
+            // for a request that violates more than one guard at once are
+            // unchanged: this call must still return here, before any
+            // cache/session state mutation and before `_inner`'s
+            // destructive-on-`Err` recovery arm is reachable, so a rejected
+            // call never evicts a valid pre-existing cross-turn entry it
+            // never touched (PR #787).
+            let prompt_prep = crate::model::qwen35::prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
+                self.max_context(),
+                crate::model::qwen35::GenerationEntryContract::MetalPrefixCacheStreaming,
+            )?;
+            let (prompt_ids, rng_state) = match prompt_prep {
+                crate::model::qwen35::GenerationPreparation::Complete(output) => {
+                    // Zero-budget requests return before any state mutation,
+                    // leaving an existing cache entry exactly as-is.
+                    return Ok(CachedGenerateOutput {
+                        cache: CrossTurnCacheStats {
+                            slot_id,
+                            prompt_tokens: output.prompt_tokens,
+                            reused_tokens: 0,
+                            prefetched_tokens: 0,
+                            mode: crate::kv_cache::PrefixReuseMode::FullRefill,
+                        },
+                        output,
+                    });
+                }
+                crate::model::qwen35::GenerationPreparation::Ready(plan) => {
+                    (plan.prompt_ids, plan.rng_state)
+                }
+            };
 
             // #835: validate the suffix a reuse plan would select for this
             // slot BEFORE calling `_inner` at all -- same reasoning as the
-            // `check_logprobs_not_set`/`check_mtp_not_requested` preflights
-            // above (PR #787): the `match` below unconditionally calls
+            // `check_logprobs_not_set`/`check_mtp_not_requested` guards
+            // `prepare_generation` already ran above, ahead of tokenization
+            // (PR #787, #1354): the `match` below unconditionally calls
             // `reset_state()` and evicts the cache slot on ANY `Err` from
             // `_inner`, so a suffix-validation-only rejection (out-of-vocab
             // token, empty suffix, or a suffix overflowing `max_cache_len`)
@@ -16039,15 +13169,17 @@ mod inner {
             // reachable), or a valid pre-existing cross-turn entry this call
             // never touched would be destroyed alongside it.
             //
-            if gen_cfg.max_new_tokens > 0 {
-                let metadata = self.cross_turn_metadata(tokenizer);
-                let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
-                self.plan_prefix_request(&prompt_ids, &plan)?;
-            }
+            // `prepare_generation`'s zero-budget short-circuit above already
+            // returned for `max_new_tokens == 0`, so `max_new_tokens > 0` is
+            // guaranteed from here on.
+            let metadata = self.cross_turn_metadata(tokenizer);
+            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+            self.plan_prefix_request(&prompt_ids, &plan)?;
 
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
                 prompt_ids,
+                rng_state,
                 tokenizer,
                 gen_cfg,
                 on_token,
@@ -16069,6 +13201,7 @@ mod inner {
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
             prompt_ids: Vec<u32>,
+            mut rng_state: u64,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut on_token: F,
@@ -16082,19 +13215,22 @@ mod inner {
             use crate::kv_cache::PrefixReuseMode;
 
             // The `logprobs` / `enable_mtp` / empty-prompt config preflight
-            // checks (PR #787, #856), and the suffix-content preflight below
-            // (#835), live in the public wrapper
-            // `generate_streaming_with_prefix_cache_and_cancel`, not here:
-            // that wrapper's error-recovery path unconditionally evicts the
-            // cache slot on any `Err` from this function, so a
+            // checks (PR #787, #856), the shared-preparation `rng_state`
+            // normalization and zero-budget short-circuit (#827), and the
+            // suffix-content preflight below (#835), live in the public
+            // wrapper `generate_streaming_with_prefix_cache_and_cancel`, not
+            // here: that wrapper's error-recovery path unconditionally
+            // evicts the cache slot on any `Err` from this function, so a
             // preflight-only rejection must never reach `_inner` in the first
             // place, or a valid pre-existing cross-turn entry this call never
-            // touched would be destroyed alongside it. `prompt_ids` arrives
-            // already tokenized by the wrapper (which needs them to run that
-            // preflight) so this function never re-tokenizes `prompt`, and
-            // is therefore guaranteed non-empty by the time it reaches this
-            // function -- unlike `logprobs`/`enable_mtp`/suffix-content,
-            // empty-prompt has no cheap "run it again here as defense in
+            // touched would be destroyed alongside it. `prompt_ids` and
+            // `rng_state` arrive already computed by the wrapper's
+            // `prepare_generation` call (which needs `prompt_ids` to run that
+            // preflight) so this function never re-tokenizes `prompt` and
+            // never re-derives the seed, and both are therefore guaranteed
+            // non-empty / normalized by the time they reach this function --
+            // unlike `logprobs`/`enable_mtp`/suffix-content, empty-prompt and
+            // zero-budget have no cheap "run it again here as defense in
             // depth" form: any duplicate check inside `_inner` would have to
             // return `Err`, and an `Err` from `_inner` is exactly what the
             // wrapper's blanket eviction match treats as cache-invalidating.
@@ -16105,53 +13241,18 @@ mod inner {
 
             let cfg = self.engine.config.clone();
 
-            let mut rng_state = match gen_cfg.seed {
-                Some(s) => {
-                    if s == 0 {
-                        1
-                    } else {
-                        s
-                    }
-                }
-                None => {
-                    use std::time::SystemTime;
-                    let t = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x12345678_9abcdef0);
-                    if t == 0 { 1 } else { t }
-                }
-            };
-
             let prompt_len = prompt_ids.len();
             debug_assert!(
                 prompt_len > 0,
                 "the wrapper's check_prompt_not_empty (#856) must reject an \
                  empty prompt before calling _inner"
             );
+            debug_assert!(
+                gen_cfg.max_new_tokens > 0,
+                "the wrapper's prepare_generation zero-budget short-circuit \
+                 (#827) must return before calling _inner"
+            );
 
-            // Zero-budget requests return before any state mutation, leaving an
-            // existing cache entry exactly as-is.
-            if gen_cfg.max_new_tokens == 0 {
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: false,
-                        stop_reason: Some(StopReason::Length),
-                        token_logprobs: vec![],
-                    },
-                    cache: CrossTurnCacheStats {
-                        slot_id,
-                        prompt_tokens: prompt_len,
-                        reused_tokens: 0,
-                        prefetched_tokens: 0,
-                        mode: PrefixReuseMode::FullRefill,
-                    },
-                });
-            }
             let metadata = self.cross_turn_metadata(tokenizer);
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
 
@@ -16215,43 +13316,7 @@ mod inner {
             let mut generated_ids: Vec<u32> = Vec::with_capacity(gen_cfg.max_new_tokens);
             let mut all_ids = prompt_ids.clone();
 
-            // Issue #171: try the block-top-k route first — far fewer threadgroups
-            // than the legacy HierarchicalK50/argmax routes, which stay reachable
-            // as a fallback for k values the block kernels don't cover.
-            let block_route = choose_gpu_block_topk_route(
-                gen_cfg.top_k,
-                gen_cfg.top_p,
-                std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                std::env::var("LATTICE_COMPACT_TOPP_APPROX").is_ok(),
-            );
-            let route = if block_route != GpuTopkRoute::CpuFallback {
-                block_route
-            } else {
-                choose_gpu_topk_route(
-                    gen_cfg.top_k,
-                    std::env::var("LATTICE_COMPACT_TOPK").is_ok(),
-                    std::env::var("LATTICE_COMPACT_TOPK_SELECT").is_ok(),
-                )
-            };
-            let use_compact = route != GpuTopkRoute::CpuFallback
-                && (gen_cfg.repetition_penalty == 1.0 || all_ids.is_empty())
-                && gen_cfg.grammar.is_none()
-                && gen_cfg.logprobs.is_none();
-            if use_compact {
-                self.session.compact_route = route;
-                self.session.compact_topk = match route {
-                    GpuTopkRoute::BlockArgmax => 1,
-                    GpuTopkRoute::BlockTopK { local_k } => local_k as usize,
-                    _ => gen_cfg.top_k,
-                };
-            } else {
-                // Issue #171: clear any compact request
-                // left over from a prior compact-eligible generation on this same
-                // state so the exact full-logit path isn't starved by stale state.
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
-                self.session.compact_topk = 0;
-                self.session.compact_result.clear();
-            }
+            let use_compact = self.configure_sampling_route(gen_cfg, all_ids.is_empty());
 
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
@@ -16771,6 +13836,12 @@ mod inner {
         /// of `generate_streaming_with_prefix_cache`. See
         /// [`Self::chat_completion_streaming_with_cancel`] for the analogous
         /// non-cache entry point this mirrors.
+        ///
+        /// # Errors
+        ///
+        /// Returns `InferenceError::InvalidInput` if `messages` contains an
+        /// inline image, which requires the multimodal vision entry point, or
+        /// if the delegated generation path rejects the input.
         pub fn chat_completion_streaming_with_prefix_cache_and_cancel<F, C>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
@@ -16784,6 +13855,7 @@ mod inner {
             F: FnMut(&str, u32) -> bool,
             C: FnMut() -> bool,
         {
+            reject_inline_images_for_text_chat(messages)?;
             let prompt = format_chat_template(messages);
             let mut cfg = gen_cfg.clone();
             if let Some(im_end_id) = tokenizer.special_token_id("<|im_end|>")
@@ -16818,21 +13890,27 @@ mod inner {
 
     #[cfg(test)]
     mod tests {
+        mod dispatch;
+
         use super::super::{
             LM_HEAD_TOPK_TIE_EPSILON, LM_HEAD_TOPK_TIE_EPSILON_Q4, TopkSetAgreement,
-            mtp_tensor_path, topk_set_agreement_or_boundary_tie,
+            topk_set_agreement_or_boundary_tie,
         };
         // Fixture helpers for the MTP Q4/F16 loader tests below now live in
-        // the top-level `mtp_resolve_tests` module (moved out of
+        // the portable `mtp_resolve_tests` module (moved out of
         // `mod inner` so the pure resolver tests compile without
         // `metal-gpu` -- these Device-gated integration tests still share
         // the same fixture writers).
-        use super::super::mtp_resolve_tests::{
-            mtp_proj_names_and_shapes, q4_const_roundtrip, write_full_mtp_fixture,
-            write_tiny_f16_fixture, write_tiny_q4_fixture, write_tiny_q4_fixture_per_expert_row,
-            write_tiny_q4_fixture_per_row,
+        use super::super::mtp_weights::{
+            mtp_resolve_tests::{
+                mtp_proj_names_and_shapes, q4_const_roundtrip, write_full_mtp_fixture,
+                write_tiny_f16_fixture, write_tiny_q4_fixture,
+                write_tiny_q4_fixture_per_expert_row, write_tiny_q4_fixture_per_row,
+            },
+            mtp_tensor_path,
         };
         use super::*;
+        use crate::measurement::gpu_test_lock;
         use crate::model::qwen35::{
             CommonLayerWeights, DenseFfnWeights, FeedForwardWeights, FullAttentionLayerWeights,
         };
@@ -16897,6 +13975,17 @@ mod inner {
                 .find("    mod tests {")
                 .expect("mod tests must exist in this file");
             let production_src = &src[..production_end];
+            let dispatch_src = include_str!("metal_qwen35/inner/dispatch.rs");
+            let layers_src = include_str!("metal_qwen35/inner/layers/mod.rs");
+            let gdn_layer_src = include_str!("metal_qwen35/inner/layers/gdn.rs");
+            let gqa_layer_src = include_str!("metal_qwen35/inner/layers/gqa.rs");
+            let production_sources = [
+                production_src,
+                dispatch_src,
+                layers_src,
+                gdn_layer_src,
+                gqa_layer_src,
+            ];
 
             for retired_declaration in [
                 concat!("fn full_attention_layer_step_by_", "idx("),
@@ -16907,14 +13996,17 @@ mod inner {
                 concat!("fn soft", "plus("),
             ] {
                 assert!(
-                    !production_src.contains(retired_declaration),
+                    !production_sources
+                        .iter()
+                        .any(|source| source.contains(retired_declaration)),
                     "retired closed call-chain member was restored: {retired_declaration}"
                 );
             }
             assert!(
-                !production_src.contains("\n        add: ComputePipelineState,")
-                    && !production_src
-                        .contains("\n                add: make_pipeline(\"add_buf\")?,"),
+                !production_sources.iter().any(|source| {
+                    source.contains("\n        add: ComputePipelineState,")
+                        || source.contains("\n                add: make_pipeline(\"add_buf\")?,")
+                }),
                 "the retired standalone add pipeline must not be registered"
             );
             assert!(
@@ -16929,6 +14021,126 @@ mod inner {
                     ),
                 "the release-build LATTICE_GDN_CPU fail-closed guard is independent \
                  of the retired debug reference functions and must remain"
+            );
+
+            assert_eq!(
+                production_src.matches("fn encode_gqa_layer(").count(),
+                0,
+                "encode_gqa_layer must stay out of the parent inner module"
+            );
+            assert_eq!(
+                gqa_layer_src.matches("fn encode_gqa_layer(").count(),
+                1,
+                "the GQA layer module must own exactly one encoder definition"
+            );
+            assert_eq!(
+                gqa_layer_src
+                    .matches("self.dispatch_lora_if_active(")
+                    .count(),
+                4,
+                "the GQA encoder must route all four projection adapters through the shared helper"
+            );
+            assert_eq!(
+                gqa_layer_src.matches("self.encode_mlp_block(").count(),
+                1,
+                "the GQA encoder must reuse the shared MLP helper"
+            );
+            for shared_helper in ["fn dispatch_lora_if_active(", "fn encode_mlp_block("] {
+                assert_eq!(
+                    layers_src.matches(shared_helper).count(),
+                    1,
+                    "layers/mod.rs must own exactly one shared helper definition: {shared_helper}"
+                );
+                assert!(
+                    !gqa_layer_src.contains(shared_helper),
+                    "the GQA layer module must not duplicate shared helper: {shared_helper}"
+                );
+            }
+        }
+
+        #[test]
+        fn metal_constructors_share_one_pipeline_builder() {
+            let src = include_str!("metal_qwen35.rs");
+            let production_end = src
+                .find("    mod tests {")
+                .expect("mod tests must exist in this file");
+            let production_src = &src[..production_end];
+
+            let new_start = production_src
+                .find("pub fn new(weights: &ModelWeights, cfg: &Qwen35Config)")
+                .expect("in-memory Metal engine constructor must exist");
+            let new_end = new_start
+                + production_src[new_start..]
+                    .find("\n        pub fn new_session(")
+                    .expect("new_session must follow the in-memory constructor");
+            let new_body = &production_src[new_start..new_end];
+
+            let q4_start = production_src
+                .find("pub fn from_q4_dir(")
+                .expect("Q4-directory Metal constructor must exist");
+            let q4_end = q4_start
+                + production_src[q4_start..]
+                    .find("\n        pub fn chat_completion_streaming<")
+                    .expect("chat completion must follow the Q4-directory constructor");
+            let q4_body = &production_src[q4_start..q4_end];
+
+            for (name, body) in [("new", new_body), ("from_q4_dir", q4_body)] {
+                assert_eq!(
+                    body.matches("build_pipelines(&device, cfg)?").count(),
+                    1,
+                    "{name} must call the shared pipeline builder exactly once"
+                );
+                assert!(
+                    !body.contains("new_library_with_source(MSL_SOURCE")
+                        && !body.contains("let make_pipeline =")
+                        && !body.contains("MetalQwen35Pipelines {"),
+                    "{name} must not carry an independent pipeline-registration block"
+                );
+            }
+
+            assert_eq!(
+                production_src.matches("fn build_pipelines(").count(),
+                1,
+                "production code must define exactly one shared pipeline builder"
+            );
+            assert_eq!(
+                production_src
+                    .matches("build_pipelines(&device, cfg)?")
+                    .count(),
+                2,
+                "only the two constructors should invoke the shared pipeline builder"
+            );
+            assert_eq!(
+                production_src
+                    .matches("new_library_with_source(MSL_SOURCE, &opts)")
+                    .count(),
+                1,
+                "the main Qwen3.5 MSL source must compile in one registration block"
+            );
+        }
+
+        #[test]
+        fn shared_pipeline_builder_resolves_every_required_pipeline() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(device) = Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _gpu = gpu_test_lock();
+            let (cfg, _) = tiny_hybrid_fixture();
+
+            let pipelines = build_pipelines(&device, &cfg)
+                .expect("every required pipeline lookup in the shared builder must resolve");
+            assert_eq!(
+                pipelines.lm_head_block_topk_f16.len(),
+                LM_HEAD_LOCAL_KS.len()
+            );
+            assert_eq!(
+                pipelines.lm_head_block_topk_q4.len(),
+                LM_HEAD_LOCAL_KS.len()
             );
         }
 
@@ -18090,6 +15302,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn test_gemv_decode_numerical() {
+            let _gpu_guard = gpu_test_lock();
             // Run a small GEMM through both f32 and f16 paths, compare results.
             let Some(device) = Device::system_default() else {
                 return;
@@ -18729,7 +15942,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // ── Route-logic unit tests (pure Rust, no Metal device needed) ────────
 
         #[test]
-        fn test_choose_gpu_topk_route_all_cases() {
+        fn sampling_route_legacy_helper_all_cases() {
             // k=0 → always CPU
             assert_eq!(
                 choose_gpu_topk_route(0, true, true),
@@ -18793,10 +16006,360 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        #[test]
+        fn sampling_route_block_helper_gate() {
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 0.9, true, false),
+                GpuTopkRoute::CpuFallback,
+                "top_p<1.0 without the approx gate must stay exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 0.9, true, true),
+                GpuTopkRoute::BlockTopK { local_k: 8 },
+                "top_p<1.0 WITH the explicit approx gate may take the block route"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(0, 1.0, true, false),
+                GpuTopkRoute::CpuFallback,
+                "top_k=0 means top-k DISABLED (full-distribution sampling), \
+                 not greedy; BlockArgmax here would collapse sampling to top-1"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(1, 1.0, true, false),
+                GpuTopkRoute::BlockArgmax
+            );
+            for &k in &[8u32, 16, 40, 64] {
+                assert_eq!(
+                    choose_gpu_block_topk_route(k as usize, 1.0, true, false),
+                    GpuTopkRoute::BlockTopK { local_k: k },
+                    "k={k} must map to BlockTopK"
+                );
+            }
+            assert_eq!(
+                choose_gpu_block_topk_route(50, 1.0, true, false),
+                GpuTopkRoute::CpuFallback,
+                "k=50 has no precompiled Stage-1 variant; must fall back exact"
+            );
+            assert_eq!(
+                choose_gpu_block_topk_route(8, 1.0, false, false),
+                GpuTopkRoute::CpuFallback,
+                "LATTICE_COMPACT_TOPK unset must stay exact regardless of k"
+            );
+        }
+
+        fn compact_sampling_config(top_k: usize) -> GenerateConfig {
+            GenerateConfig {
+                top_k,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                ..Default::default()
+            }
+        }
+
+        fn compact_sampling_environment() -> SamplingRouteEnvironment {
+            SamplingRouteEnvironment {
+                compact: true,
+                selection: true,
+                approximate_top_p: false,
+            }
+        }
+
+        #[test]
+        fn sampling_route_plan_composes_block_first_then_legacy_fallback() {
+            for (top_k, expected_route, expected_topk) in [
+                (1, GpuTopkRoute::BlockArgmax, 1),
+                (8, GpuTopkRoute::BlockTopK { local_k: 8 }, 8),
+                (16, GpuTopkRoute::BlockTopK { local_k: 16 }, 16),
+                (40, GpuTopkRoute::BlockTopK { local_k: 40 }, 40),
+                (64, GpuTopkRoute::BlockTopK { local_k: 64 }, 64),
+            ] {
+                let plan = plan_sampling_route(
+                    &compact_sampling_config(top_k),
+                    false,
+                    compact_sampling_environment(),
+                );
+                assert_eq!(
+                    plan,
+                    SamplingRoutePlan {
+                        use_compact: true,
+                        compact_route: expected_route,
+                        compact_topk: expected_topk,
+                    },
+                    "top_k={top_k}"
+                );
+            }
+
+            let legacy_plan = plan_sampling_route(
+                &compact_sampling_config(50),
+                false,
+                compact_sampling_environment(),
+            );
+            assert_eq!(
+                legacy_plan,
+                SamplingRoutePlan {
+                    use_compact: true,
+                    compact_route: GpuTopkRoute::HierarchicalK50,
+                    compact_topk: 50,
+                }
+            );
+        }
+
+        /// `plan_sampling_route` no longer takes a caller-distinguishing logprobs
+        /// policy: every caller (direct, streaming, prefix-cache generation)
+        /// reaches this function only once its own `check_logprobs_not_set`
+        /// preflight has already rejected `logprobs: Some(_)` for paths that
+        /// don't support it, or (streaming) captures logprobs itself and must
+        /// keep full logits. Both configurations below are reachable states a
+        /// real caller can pass in: `logprobs: None` (every caller, after its
+        /// own preflight) and `logprobs: Some(_)` (the streaming caller, which
+        /// has no such preflight and captures logprobs directly).
+        #[test]
+        fn sampling_route_plan_requires_full_logits_when_logprobs_requested() {
+            let no_logprobs = compact_sampling_config(1);
+            assert!(
+                plan_sampling_route(&no_logprobs, false, compact_sampling_environment())
+                    .use_compact,
+                "no logprobs requested must stay eligible for compact sampling"
+            );
+
+            let with_logprobs = GenerateConfig {
+                logprobs: Some(5),
+                ..compact_sampling_config(1)
+            };
+            assert_eq!(
+                plan_sampling_route(&with_logprobs, false, compact_sampling_environment()),
+                SamplingRoutePlan {
+                    use_compact: false,
+                    compact_route: GpuTopkRoute::CpuFallback,
+                    compact_topk: 0,
+                },
+                "a requested logprobs capture requires full logits"
+            );
+        }
+
+        #[test]
+        fn sampling_route_plan_preserves_grammar_and_repetition_gates() {
+            let penalized = GenerateConfig {
+                repetition_penalty: 1.1,
+                ..compact_sampling_config(8)
+            };
+            assert!(
+                !plan_sampling_route(&penalized, false, compact_sampling_environment(),)
+                    .use_compact,
+                "non-empty history with a repetition penalty requires full logits"
+            );
+            assert!(
+                plan_sampling_route(&penalized, true, compact_sampling_environment(),).use_compact,
+                "an empty history preserves the existing repetition-penalty exception"
+            );
+
+            use crate::grammar::{GrammarEngine, GrammarSpec};
+            let grammar = GrammarEngine::new(
+                &GrammarSpec::Gbnf("root ::= \"a\"\n".to_string()),
+                vec![b"a".to_vec()],
+            )
+            .expect("trivial grammar must compile");
+            let constrained = GenerateConfig {
+                grammar: Some(std::sync::Arc::new(grammar)),
+                ..compact_sampling_config(8)
+            };
+            assert!(
+                !plan_sampling_route(&constrained, false, compact_sampling_environment(),)
+                    .use_compact,
+                "grammar-constrained decoding requires full logits"
+            );
+        }
+
+        #[test]
+        fn sampling_route_state_transition_preserves_enabled_result_and_clears_fallback() {
+            let sentinel = crate::sampling::Candidate {
+                token_id: 17,
+                logit: 3.5,
+            };
+            let mut compact_route = GpuTopkRoute::CpuFallback;
+            let mut compact_topk = 0;
+            let mut compact_result = vec![sentinel];
+
+            let enabled = plan_sampling_route(
+                &compact_sampling_config(8),
+                false,
+                compact_sampling_environment(),
+            );
+            assert!(apply_sampling_route_plan(
+                enabled,
+                &mut compact_route,
+                &mut compact_topk,
+                &mut compact_result,
+            ));
+            assert_eq!(compact_route, GpuTopkRoute::BlockTopK { local_k: 8 });
+            assert_eq!(compact_topk, 8);
+            assert_eq!(
+                compact_result,
+                vec![sentinel],
+                "eligible routing preserves the existing compact_result until prefill replaces it"
+            );
+
+            let disabled = plan_sampling_route(
+                &compact_sampling_config(8),
+                false,
+                SamplingRouteEnvironment {
+                    compact: false,
+                    selection: true,
+                    approximate_top_p: true,
+                },
+            );
+            assert!(!apply_sampling_route_plan(
+                disabled,
+                &mut compact_route,
+                &mut compact_topk,
+                &mut compact_result,
+            ));
+            assert_eq!(compact_route, GpuTopkRoute::CpuFallback);
+            assert_eq!(compact_topk, 0);
+            assert!(
+                compact_result.is_empty(),
+                "fallback routing must clear stale compact candidates"
+            );
+        }
+
+        #[test]
+        fn sampling_route_configurator_owns_all_three_generation_call_sites() {
+            let source = include_str!("metal_qwen35.rs");
+            let production = source
+                .split_once("    // Tests\n")
+                .expect("inner test section marker must exist")
+                .0;
+            assert_eq!(
+                production.matches("self.configure_sampling_route(").count(),
+                3,
+                "direct, streaming, and prefix-cache generation must share the configurator"
+            );
+            assert_eq!(
+                production
+                    .matches("let block_route = choose_gpu_block_topk_route(")
+                    .count(),
+                1,
+                "route chooser composition must have one production owner"
+            );
+        }
+
+        /// Direct generation's `logprobs: Some(_)` admission is rejected by
+        /// `prepare_direct_generation`'s shared `GenerationEntryContract::MetalDirect`
+        /// capability check, strictly before either of the two paths that mutate
+        /// `InferenceSession::compact_route` / `compact_topk` /
+        /// `compact_result` can run: `reset_state()` and
+        /// `configure_sampling_route`. `generate()` propagates that `Err` via
+        /// `?` immediately after the `prepare_direct_generation` call, so a rejected
+        /// request must leave route state untouched.
+        ///
+        /// This replaces a prior test that only proved the ordering held in
+        /// the *source text* (`prepare_direct_generation` found lexically before
+        /// `configure_sampling_route`, with an unbounded "rest of the file"
+        /// slice as the search space). A source-text match cannot tell
+        /// whether the matched `configure_sampling_route` call even belongs
+        /// to `generate()`, and it cannot catch a caller that stores
+        /// `prepare_direct_generation`'s `Result` in a local, calls
+        /// `configure_sampling_route` unconditionally, and only applies `?`
+        /// afterward: textual order is preserved, the guard's `Err` is still
+        /// returned, yet route state has already been mutated. This test
+        /// proves the real invariant behaviourally instead: seed route state
+        /// to values `plan_sampling_route` would never leave in place for a
+        /// rejected request, run the real `generate()`, and assert the
+        /// seeded state survives untouched.
+        ///
+        /// Note the boundary this test does *not* cover: a `max_new_tokens:
+        /// 0` request short-circuits to `GenerationPreparation::Complete` inside
+        /// `prepare_direct_generation` *before* the logprobs capability check ever
+        /// runs, so a zero-budget request with `logprobs: Some(_)` is never
+        /// rejected at all -- it returns `Ok` and never touches sampling
+        /// routing either way. That path is untested here and must not be
+        /// read as if this test covered it.
+        ///
+        /// Mutation sensitivity: reordering `generate()` to call
+        /// `configure_sampling_route` before applying `prepare_direct_generation`'s
+        /// `?` -- even while keeping the *textual* prepare-before-configure
+        /// ordering -- lets this rejected request mutate `compact_route` /
+        /// `compact_topk` / `compact_result` before the error is returned, so
+        /// the "state unchanged" assertions below fail.
+        #[test]
+        fn direct_generate_rejects_logprobs_before_configuring_sampling_route() {
+            let Some(_) = metal::Device::system_default() else {
+                panic!(
+                    "this behavioural admission-order proof requires a real \
+                     Metal device and must fail closed rather than silently \
+                     skip -- a skipped run would report a pass over \
+                     assertions that never executed"
+                );
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+
+            // Sentinel values `plan_sampling_route` would never produce for
+            // this (rejected) request: a real route/topk pair, and a
+            // non-empty result buffer. If `configure_sampling_route` runs at
+            // all, `apply_sampling_route_plan` unconditionally overwrites
+            // `compact_route`/`compact_topk` from its plan and clears
+            // `compact_result` whenever `use_compact` is false -- which it
+            // always is here, since `logprobs: Some(_)` forces
+            // `logprobs_eligible = false`.
+            let sentinel_route = GpuTopkRoute::BlockArgmax;
+            let sentinel_topk = 7usize;
+            let sentinel_result = vec![crate::sampling::Candidate {
+                token_id: 99,
+                logit: 1.23,
+            }];
+            state.session.compact_route = sentinel_route;
+            state.session.compact_topk = sentinel_topk;
+            state.session.compact_result = sentinel_result.clone();
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: true,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: Some(0),
+            };
+
+            let result = state.generate("a", &tokenizer, &gen_cfg);
+            assert!(
+                matches!(result, Err(crate::error::InferenceError::InvalidInput(_))),
+                "logprobs: Some(_) with a nonzero budget must be rejected with \
+                 InvalidInput; got {result:?}"
+            );
+
+            assert_eq!(
+                state.session.compact_route, sentinel_route,
+                "a rejected logprobs request must not mutate compact_route -- \
+                 configure_sampling_route must be unreachable once the \
+                 preflight guard errors"
+            );
+            assert_eq!(
+                state.session.compact_topk, sentinel_topk,
+                "a rejected logprobs request must not mutate compact_topk"
+            );
+            assert_eq!(
+                state.session.compact_result, sentinel_result,
+                "a rejected logprobs request must not mutate compact_result"
+            );
+        }
+
         // ── GPU-CPU argmax parity tests (requires Metal device) ──────────────
 
         #[test]
         fn test_gpu_argmax_parity_k1() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -19037,6 +16600,101 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             (cfg, weights)
         }
 
+        fn tiny_metal_qwen35_vision_fixture() -> (Qwen35Config, ModelWeights) {
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.rope_parameters = Some(crate::model::qwen35_config::RopeParams {
+                rope_theta: 10_000_000.0,
+                partial_rotary_factor: Some(0.25),
+                mrope_section: Some(vec![11, 11, 10]),
+                mrope_interleaved: Some(true),
+            });
+            cfg.vision_config = Some(crate::model::qwen35_config::VisionModelConfig {
+                depth: 1,
+                hidden_size: 4,
+                num_heads: 1,
+                patch_size: 1,
+                spatial_merge_size: 2,
+                out_hidden_size: cfg.hidden_size,
+                temporal_patch_size: 1,
+                num_position_embeddings: 4,
+                in_channels: 3,
+                deepstack_visual_indexes: Vec::new(),
+                intermediate_size: Some(8),
+            });
+            cfg.image_token_id = Some(5);
+            cfg.video_token_id = Some(6);
+            cfg.vision_start_token_id = Some(7);
+            cfg.vision_end_token_id = Some(8);
+            (cfg, weights)
+        }
+
+        fn assert_text_chat_image_rejected<T>(result: Result<T, crate::error::InferenceError>) {
+            match result {
+                Err(crate::error::InferenceError::InvalidInput(message)) => {
+                    assert_eq!(message, TEXT_CHAT_IMAGE_ERROR);
+                }
+                Err(error) => panic!("inline image returned the wrong error: {error}"),
+                Ok(_) => panic!("text-only chat entry point silently accepted an inline image"),
+            }
+        }
+
+        #[test]
+        fn text_chat_image_guard_rejects_without_a_metal_device() {
+            assert_text_chat_image_rejected(reject_inline_images_for_text_chat(&[
+                ChatMessage::user_with_image("beforeafter", vec![1, 2, 3], "before".len()),
+            ]));
+        }
+
+        #[test]
+        fn text_chat_entrypoints_reject_inline_images_before_generation() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny Metal chat state");
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig::default();
+            let messages = [ChatMessage::user_with_image(
+                "beforeafter",
+                vec![0x89, b'P', b'N', b'G'],
+                "before".len(),
+            )];
+
+            assert_text_chat_image_rejected(state.chat_completion(&messages, &tokenizer, &gen_cfg));
+            assert_text_chat_image_rejected(state.chat_completion_streaming(
+                &messages,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            ));
+            assert_text_chat_image_rejected(state.chat_completion_streaming_with_cancel(
+                &messages,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+                || false,
+            ));
+            assert_text_chat_image_rejected(state.chat_completion_streaming_with_prefix_cache(
+                crate::kv_cache::CrossTurnSlotId::DEFAULT,
+                &messages,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            ));
+            assert_text_chat_image_rejected(
+                state.chat_completion_streaming_with_prefix_cache_and_cancel(
+                    crate::kv_cache::CrossTurnSlotId::DEFAULT,
+                    &messages,
+                    &tokenizer,
+                    &gen_cfg,
+                    |_, _| true,
+                    || false,
+                ),
+            );
+        }
+
         fn rotate_embedding_rows_for_test(
             weights: &mut ModelWeights,
             hidden: usize,
@@ -19139,6 +16797,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // unrotated reference path, within Metal f16/Q8 quantization tolerance.
         #[test]
         fn mtp_draft_logit_equivalence_with_quarot_counter_rotation() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19197,51 +16856,183 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
         }
 
+        // Issue #1341: a K=1 draft rejection must leave the MTP KV cache cursor at the
+        // row `mtp_forward_one` actually wrote, not one row past it. `mtp_forward_one`
+        // writes exactly one row (for `pending_token`) and advances `mtp.cache.seq_len`
+        // by 1 before verification even starts; `verify_tokens_batched` then snapshots
+        // that already-advanced value into `mtp_base_seq_len`. On rejection,
+        // `rollback_speculative_state_to` adds the verifier's accepted-token `slot` on
+        // top of that snapshot, double-counting the draft's own advance.
+        //
+        // A zeroed `fc` projection collapses the MTP head's output to the zero vector
+        // for any input, so `mtp_forward_one` always drafts token 0 (all-zero logits,
+        // first-wins argmax). `tiny_metal_qwen35_fixture`'s target stack has zero
+        // attention/FFN weights too, so its prediction after processing token `X` is
+        // driven entirely by `RMSNorm(embed_tokens[X])` through the tied lm_head — for
+        // `X == 2` (`embed_tokens[2] `'s only nonzero component is `+1`, and index 2 is
+        // the first vocab entry in that residue class) that prediction is token 2
+        // itself, which never equals the constant draft token 0. Round 1 is therefore
+        // a deterministic reject, driven through the real `generate_greedy_mtp` path.
+        fn constant_zero_draft_mtp_weights_for_test(
+            device: &Device,
+            cfg: &Qwen35Config,
+        ) -> MetalMtpWeights {
+            let mut weights = synthetic_mtp_weights_for_test(device, cfg);
+            weights.fc = make_buffer_f16(
+                device,
+                &vec![0.0f32; cfg.hidden_size * 2 * cfg.hidden_size],
+                "test.mtp.fc.constant_zero_draft",
+            );
+            weights
+        }
+
+        fn metal_state_with_constant_zero_draft_mtp_for_test(
+            weights: &ModelWeights,
+            cfg: &Qwen35Config,
+        ) -> MetalQwen35State {
+            let mut engine = MetalQwen35Engine::new(weights, cfg)
+                .expect("tiny MetalQwen35Engine with constant-draft MTP fixture constructs");
+            engine.mtp_weights = Some(constant_zero_draft_mtp_weights_for_test(
+                &engine.device,
+                cfg,
+            ));
+            let session = engine.new_session(16).expect("tiny MTP session constructs");
+            MetalQwen35State {
+                engine,
+                session,
+                lora: None,
+                use_gdn_chunked: true,
+                use_kv_f16: false,
+                cross_turn_prefix_cache: MetalCrossTurnPrefixCache::default(),
+                path_proof_enabled: false,
+                path_proof: PathProofCounters::default(),
+            }
+        }
+
         #[test]
-        fn test_metal_qwen35_golden_logit_snapshot_forward_step_token_42_pos_0() {
+        fn rollback_speculative_state_to_preserves_mtp_cursor_after_k1_reject() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
-            let (cfg, weights) = tiny_metal_qwen35_fixture();
-            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
-                .expect("tiny MetalQwen35State fixture constructs");
+            use crate::model::qwen35_config::GenerateConfig;
 
-            let logits = state.forward_step(42, 0);
-            assert_eq!(logits.len(), cfg.vocab_size);
-            let actual = &logits[..10];
-            // Math: token 42's embedding is one-hot: x[0]=1.0, x[1..]=0.0.
-            // All attention and FFN weights are zero → residual stream equals the
-            // raw embedding at every stage. final_norm then applies the shifted
-            // RMSNorm (qwen35_rms_norm convention: output = x * (1 + gamma) / rms(x)).
-            // With final_norm=[1.0] the scale is (1+1.0)=2; identity is gamma=0.
-            //   rms(x) = sqrt(1/512),  output[0] = 1.0 * (1+1.0) * sqrt(512) = 2*sqrt(512) ≈ 45.254.
-            // Tied lm_head col-0 pattern is [-1,0,1,-1,0,1,...], so logits ≈ ±45.25 / 0.
-            // (Issue #31: the original golden ±22.62 assumed plain-gamma; ±45.24 is correct.)
-            let expected = [
-                -45.243256_f32,
-                0.0,
-                45.243256,
-                -45.243256,
-                0.0,
-                45.243256,
-                -45.243256,
-                0.0,
-                45.243256,
-                -45.243256,
-            ];
-            let max_abs_diff = actual
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, e)| (a - e).abs())
-                .fold(0.0_f32, f32::max);
+            let tokenizer = single_char_vocab_tokenizer();
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_constant_zero_draft_mtp_for_test(&weights, &cfg);
             assert!(
-                max_abs_diff < 1e-4,
-                "golden first-10 logits changed: actual={actual:?} expected={expected:?} max_abs_diff={max_abs_diff}"
+                state.session.mtp.is_some(),
+                "constant-draft MTP fixture must populate session.mtp"
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 1,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(true),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            // Force `pending_first == 2` directly rather than relying on a real
+            // prefill: index 2 is the token whose real-model next-token prediction
+            // (token 2 itself, see above) is guaranteed to mismatch the constant
+            // draft (token 0).
+            let mut prefill_logits = vec![-1.0f32; cfg.vocab_size];
+            prefill_logits[2] = 100.0;
+
+            let pos_before = state.session.kv_cache.seq_len;
+            assert_eq!(pos_before, 0);
+            let out = state.generate_greedy_mtp(&prefill_logits, 0, &tokenizer, &gen_cfg);
+            assert!(
+                !out.stopped,
+                "test assumes round 1 does not hit EOS; got {out:?}"
+            );
+
+            // K=1 reject keeps only `pending_token` (2), advancing the KV cache by 1;
+            // a K=1 accept would keep `pending_token` + the draft, advancing by 2.
+            let kv_seq_len = state.session.kv_cache.seq_len;
+            assert_eq!(
+                kv_seq_len, 1,
+                "test setup assumption violated: expected round 1 to reject the \
+                 constant draft (token 0) in favor of the target's own prediction \
+                 (token 2), advancing the KV cache by 1; got {kv_seq_len}, meaning \
+                 the draft was accepted instead"
+            );
+
+            let mtp_seq_len = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            assert_eq!(
+                mtp_seq_len, 1,
+                "K=1 rejection must leave the MTP cursor at the single row \
+                 `mtp_forward_one` wrote this round; got {mtp_seq_len}, which means the \
+                 next `mtp_forward_one` call will skip a slot and the attention window \
+                 will read a never-written row"
+            );
+        }
+
+        // #1340: without `mtp_prefill`, `reset_state` zeroes the MTP cache and the
+        // only prefill on the Metal path fills the *target* model's cache, so the
+        // first `mtp_forward_one` call of a generation dispatches attention with
+        // `cache_len = 1` -- the draft attends to exactly the row it just wrote,
+        // independent of the prompt. This asserts the observable attention-set size
+        // (`cache.seq_len`, and the `cache_len` the first live dispatch sees), not
+        // generated text -- a target-verified MTP draft can never change output, so
+        // an output-only test cannot see this defect either way.
+        #[test]
+        fn mtp_prefill_builds_kv_cache_from_prompt_prefix() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+
+            let (mut cfg, weights) = tiny_metal_qwen35_fixture();
+            cfg.mtp_num_hidden_layers = 1;
+            let mut state = metal_state_with_synthetic_mtp_for_test(&weights, &cfg, None);
+            assert!(
+                state.session.mtp.is_some(),
+                "synthetic MTP fixture must populate session.mtp"
+            );
+
+            let prompt_ids: Vec<u32> = vec![3, 7, 11, 19];
+            let prompt_len = prompt_ids.len();
+
+            let _ = state.forward_prefill(&prompt_ids);
+            state.mtp_prefill(&prompt_ids);
+
+            // One cache entry per prompt position beyond the first (position 0 has
+            // no predecessor hidden state to pair with), so the cache scales
+            // directly with the prompt instead of staying at 0.
+            assert_eq!(
+                state.session.mtp.as_ref().unwrap().cache.seq_len,
+                prompt_len - 1,
+                "mtp cache seq_len after prefill must reflect the prompt, not stay at 0"
+            );
+
+            // The first live draft call (mirroring `generate_greedy_mtp`'s first
+            // round) appends one more entry for the just-sampled token, so its
+            // attention dispatch sees cache_len == prompt_len, not 1.
+            let before = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            let pending_token = 5u32;
+            let _ = state.mtp_forward_one(pending_token, prompt_len);
+            let after = state.session.mtp.as_ref().unwrap().cache.seq_len;
+            assert_eq!(after, before + 1);
+            assert_eq!(
+                after, prompt_len,
+                "the first draft's attention dispatch must see cache_len == prompt_len, not 1"
             );
         }
 
         #[test]
         fn forward_step_rejects_position_and_cache_capacity_before_dispatch() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19271,6 +17062,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn verify_tokens_rejects_out_of_range_start_pos_before_dispatch() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19349,6 +17141,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn verify_tokens_rejects_batch_exceeding_gdn_pool_capacity_before_dispatch() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19382,6 +17175,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn forward_prefill_layer_traces_rejects_token_sequence_past_cache_capacity() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19405,156 +17199,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
-        fn test_metal_qwen35_kv_cache_determinism_replay_5_tokens() {
-            let Some(_) = Device::system_default() else {
-                return;
-            };
-            let (cfg, weights) = tiny_metal_qwen35_fixture();
-            let tokens = [42_u32, 7, 13, 8, 42];
-            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
-                .expect("tiny MetalQwen35State fixture constructs");
-
-            // First pass
-            let mut first_logits: Vec<Vec<f32>> = Vec::new();
-            for &token in &tokens {
-                let pos = state.session.kv_cache.seq_len;
-                let logits = state.forward_step(token, pos);
-                assert_eq!(
-                    state.session.kv_cache.seq_len,
-                    pos + 1,
-                    "forward_step must advance seq_len exactly once"
-                );
-                first_logits.push(logits);
-            }
-            let first_seq_len = state.session.kv_cache.seq_len;
-
-            state.reset_state();
-
-            // Second pass (replay)
-            let mut second_logits: Vec<Vec<f32>> = Vec::new();
-            for &token in &tokens {
-                let pos = state.session.kv_cache.seq_len;
-                let logits = state.forward_step(token, pos);
-                assert_eq!(
-                    state.session.kv_cache.seq_len,
-                    pos + 1,
-                    "forward_step must advance seq_len exactly once"
-                );
-                second_logits.push(logits);
-            }
-            let second_seq_len = state.session.kv_cache.seq_len;
-
-            assert_eq!(first_seq_len, tokens.len(), "first pass seq_len");
-            assert_eq!(second_seq_len, tokens.len(), "second pass seq_len");
-            for (step, (first, second)) in first_logits.iter().zip(second_logits.iter()).enumerate()
-            {
-                let max_abs_diff = first
-                    .iter()
-                    .zip(second.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f32, f32::max);
-                assert!(
-                    max_abs_diff < 1e-4,
-                    "replay logits diverged at step {step}: max_abs_diff={max_abs_diff}"
-                );
-            }
-        }
-
-        /// Issue #252 (#238 follow-up): runtime capability probe for the f16
-        /// KV-cache Metal path. GitHub's hosted `macos-latest` runner exposes a
-        /// PARAVIRTUAL Metal GPU (not a real Apple7 device), so this test must
-        /// NOT gate on `supports_family(Apple7)` — it gates on whether the f16
-        /// KV kernels actually construct and execute, and fails loudly
-        /// (LATTICE_METAL_TEST_ENFORCE=1) instead of skip-passing when a Metal
-        /// device is absent.
-        #[test]
-        fn f16_kv_metal_path_executes_and_reports_capability() {
-            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
-            let Some(_) = Device::system_default() else {
-                eprintln!("[METAL_F16_KV_CAPABILITY] supported=false reason=no_metal_device");
-                assert!(
-                    !enforce,
-                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
-                );
-                return;
-            };
-
-            assert!(
-                matches!(
-                    std::env::var("LATTICE_KV_F16").as_deref(),
-                    Ok("1") | Ok("true")
-                ),
-                "f16 KV Metal probe must run with LATTICE_KV_F16=1"
-            );
-            assert!(
-                matches!(
-                    std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
-                    Ok("1") | Ok("true")
-                ),
-                "f16 KV Metal probe must run with LATTICE_METAL_PATH_PROOF=1"
-            );
-
-            let (cfg, weights) = tiny_metal_qwen35_fixture();
-            let mut state = match MetalQwen35State::new(&weights, &cfg, 16) {
-                Ok(state) => state,
-                Err(err) => {
-                    eprintln!(
-                        "[METAL_F16_KV_CAPABILITY] supported=false reason=construct_failed error={err}"
-                    );
-                    panic!("f16 KV Metal capability probe failed during state construction: {err}");
-                }
-            };
-
-            assert!(state.use_kv_f16, "state did not enable f16 KV cache");
-            assert!(state.use_kv_f16, "KV cache layout is not f16");
-            assert!(state.path_proof_enabled, "path-proof counters are disabled");
-
-            let expected_kv_bytes = 16 * cfg.full_kv_dim() * 2;
-            assert_eq!(
-                state.session.kv_cache.k_bufs[0].length() as usize,
-                expected_kv_bytes,
-                "K cache buffer must use f16 element size"
-            );
-
-            state.reset_path_proof_counters();
-            let _ = state.forward_prefill(&[1, 2, 3]);
-            let decode_pos = state.session.kv_cache.seq_len;
-            let _ = state.forward_step(4, decode_pos);
-
-            let proof = state.path_proof_snapshot();
-            eprintln!(
-                "[METAL_F16_KV_CAPABILITY] supported=true kv_f16={} prefill_kv_batch={} prefill_attn_batched={} decode_kv_copy={} decode_attn_direct={} decode_attn_split_partial={} decode_attn_split_reduce={}",
-                proof.kv_f16,
-                proof.prefill_kv_batch,
-                proof.prefill_attn_batched,
-                proof.decode_kv_copy,
-                proof.decode_attn_direct,
-                proof.decode_attn_split_partial,
-                proof.decode_attn_split_reduce,
-            );
-
-            assert!(proof.kv_f16, "path proof did not report kv_f16=true");
-            assert!(
-                proof.prefill_kv_batch > 0,
-                "f16 batch KV write did not execute"
-            );
-            assert!(
-                proof.prefill_attn_batched > 0,
-                "f16 batched prefill attention did not execute"
-            );
-            assert!(
-                proof.decode_kv_copy > 0,
-                "f16 decode KV copy did not execute"
-            );
-            assert!(
-                proof.decode_attn_direct > 0
-                    || (proof.decode_attn_split_partial > 0 && proof.decode_attn_split_reduce > 0),
-                "f16 decode attention did not execute"
-            );
-        }
-
-        #[test]
         fn test_metal_qwen35_engine_session_isolation() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19629,6 +17275,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_token_nlls_matches_manual_forward_loop() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19666,6 +17313,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_token_nlls_is_repeatable_under_self_reset() {
+            let _gpu_guard = gpu_test_lock();
             // The Metal harness resets recurrent state at the start of each
             // call. Two back-to-back calls on the same input must therefore
             // produce identical NLLs even though `forward_step` mutates the
@@ -19691,6 +17339,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_token_nlls_rejects_oversized_input() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19712,6 +17361,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_token_nlls_rejects_out_of_vocab_token() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19731,6 +17381,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_perplexity_equals_exp_mean_nll() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19763,6 +17414,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_perplexity_matches_compute_token_nlls_on_single_window() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -19796,6 +17448,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn metal_compute_perplexity_rejects_window_above_max_cache_len() {
+            let _gpu_guard = gpu_test_lock();
             // Counterpart of the CPU test:
             // `compute_perplexity_rejects_window_above_rope_capacity`. The
             // Metal-side cap is the KV-cache size, not the RoPE table.
@@ -21050,14 +18703,23 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[test]
         fn from_q4_dir_moe_forced_eviction_matches_zero_eviction_baseline() {
             let Some(device) = Device::system_default() else {
+                eprintln!(
+                    "[moe-eviction-route-proof] SKIPPED: no Metal device present on this machine"
+                );
                 return;
             };
-            // #899: on non-Apple7 devices (the paravirtual CI GPU is the only one
-            // this repo ever meets) the Q4 GEMM runtime gates route to fallback
-            // kernels, where this parity check diverges deterministically by a
-            // uniform ~0.074 logit shift. All production Apple Silicon is Apple7+;
-            // the fallback-path investigation is tracked in #899.
+            // #899: the paravirtual CI GPU diverges deterministically here, but
+            // this fixture cannot exercise the Apple7-gated Q4 GEMM selection:
+            // MoE batch prefill is rejected and every projection below runs at
+            // M=1, which dispatches GEMV before either GEMM branch. Keep the
+            // device exception explicit while the zero-dispatch assertion below
+            // prevents the paravirtual discrepancy from being misattributed to
+            // the fallback GEMM again.
             if !device.supports_family(MTLGPUFamily::Apple7) {
+                eprintln!(
+                    "[moe-eviction-route-proof] SKIPPED: device does not support Apple7 (fixture \
+                     cannot discriminate the Q4 GEMM fallback route on this GPU)"
+                );
                 return;
             }
             let _guard = gpu_test_lock();
@@ -21083,6 +18745,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
             let mut baseline = MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
                 .expect("baseline (N=num_experts) load must succeed");
+            assert!(
+                baseline.force_q4_gemm_fallback_for_test(),
+                "Apple7+ discrimination requires the tiled Q4 pipeline to exist before \
+                 forcing the non-Apple7 fallback selection"
+            );
+            MetalQwen35State::reset_q4_gemm_fallback_dispatches_for_test();
             let mut baseline_logits = Vec::new();
             for (position, &token) in tokens.iter().enumerate() {
                 baseline_logits = baseline.forward_step(token, position);
@@ -21097,6 +18765,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 MetalQwen35State::from_q4_dir(dir, tokenizer_path, &cfg, 16)
                     .expect("forced-eviction (N=2) load must succeed")
             };
+            assert!(
+                forced.force_q4_gemm_fallback_for_test(),
+                "Apple7+ discrimination requires the tiled Q4 pipeline to exist before \
+                 forcing the non-Apple7 fallback selection"
+            );
 
             let mut forced_logits = Vec::new();
             for (position, &token) in tokens.iter().enumerate() {
@@ -21115,6 +18788,23 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 forced_logits = forced.forward_step(token, position);
             }
 
+            let (_, common) = &forced.engine.layer_weights[0];
+            let MetalFfnWeights::Moe(moe) = &common.ffn else {
+                panic!("layer 0 must build MetalFfnWeights::Moe for an is_moe() config");
+            };
+            let RoutedExpertStorage::Cached { gate_up, down } = &moe.routed else {
+                panic!("from_q4_dir must build RoutedExpertStorage::Cached");
+            };
+            for (label, cache) in [("gate_up", gate_up), ("down", down)] {
+                let (_, _, evictions) = cache.borrow().hit_miss_eviction_counts();
+                eprintln!("[moe-eviction-proof] cache={label} evictions={evictions}");
+                assert!(
+                    evictions > 0,
+                    "{label} cache must evict at least one resident expert before logit parity \
+                     can establish that eviction is numerically transparent"
+                );
+            }
+
             assert_eq!(baseline_logits.len(), forced_logits.len());
             for (i, (b, f)) in baseline_logits.iter().zip(forced_logits.iter()).enumerate() {
                 assert!(
@@ -21126,6 +18816,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                      forced={forced_logits:?})"
                 );
             }
+            let fallback_dispatches = MetalQwen35State::q4_gemm_fallback_dispatches_for_test();
+            eprintln!(
+                "[moe-eviction-route-proof] q4_gemm_fallback_dispatches={fallback_dispatches} \
+                 route=m1-gemv"
+            );
+            assert_eq!(
+                fallback_dispatches, 0,
+                "MoE eviction parity must remain an M=1 GEMV test; a Q4 fallback GEMM dispatch \
+                 would invalidate #899's route discrimination"
+            );
         }
 
         /// Restores `FORCED_MOE_EXPERTS_FOR_TEST` to `None` on scope exit
@@ -22649,9 +20349,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // -------------------------------------------------------------------
         //
         // Pure, `Device`-free coverage of the flavor/shape-resolution logic
-        // itself (`resolve_mtp_projection`/`resolve_mtp_norm`) lives at the
-        // file top level in `mod mtp_resolve_tests`, compiled unconditionally
-        // in any test build (not gated on the `metal-gpu` feature), so it
+        // itself (`resolve_mtp_projection`/`resolve_mtp_norm`) lives in the
+        // private `mtp_weights::mtp_resolve_tests` module, compiled
+        // unconditionally in any test build (not gated on the `metal-gpu`
+        // feature), so it
         // never skip-passes on a Metal-less CI runner (#636 -- these
         // tests used to live right here, inside this `metal-gpu`-gated
         // `mod inner`, and `cargo test --lib resolve_mtp` with no features
@@ -22824,6 +20525,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn from_q4_dir_rejects_max_cache_len_above_max_position_embeddings() {
+            let _gpu_guard = gpu_test_lock();
             // `from_q4_dir` was missing the
             // `max_cache_len <= cfg.max_position_embeddings` guard that
             // `new_session` enforces. Without it, `--max-cache-len 999999
@@ -22853,6 +20555,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn from_q4_dir_rejects_zero_max_cache_len() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = Device::system_default() else {
                 return;
             };
@@ -22872,6 +20575,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn from_q4_dir_rejects_tied_config_with_lm_head_artifact() {
+            let _gpu_guard = gpu_test_lock();
             // The prior fix only caught the
             // `tie_word_embeddings=false` + missing `lm_head.q4` half of
             // the artifact contract. The opposite mismatch —
@@ -22915,6 +20619,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn from_q4_dir_rejects_untied_config_without_lm_head_artifact() {
+            let _gpu_guard = gpu_test_lock();
             // The loader silently fell back to
             // `embed_tokens` when `tie_word_embeddings=false` and
             // `lm_head.q4` was missing. That is exactly the contamination
@@ -22946,6 +20651,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn lora_gemv_kernel_matches_cpu_reference() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -23067,6 +20773,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_adapter_and_dispatch_lora_if_active() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -23187,6 +20894,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn gemm_q4_tiled_enabled_on_apple7_plus() {
+            let _gpu_guard = gpu_test_lock();
             // Regression guard for the M>1 prefill GEMM. The simdgroup-matrix
             // tiled Q4 kernel (`gemm_q4_tiled`) must be enabled on every Apple7+
             // GPU (M1 and up). It was previously gated behind Apple9, silently
@@ -23356,6 +21064,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// If half precision is extended to accumulators, tiled_vs_ref would likely exceed 0.015.
         #[test]
         fn gemm_q4_tiled_vs_naive_numeric_differential() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -23540,95 +21249,69 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        /// Regression for the Q4 decode dispatch-geometry bug (2026-06-26).
-        ///
-        /// `gemv_q4_decode` writes NR=2 output rows per threadgroup, so
-        /// `dispatch_matmul_q4` MUST launch `ceil(N/2)` groups. The prior `ceil(N/4)`
-        /// left the upper ~half of the rows unwritten — on the Q4 decode/logits path
-        /// (`final_logits` → `dispatch_matmul` for `QuantFormat::Q4_0`, N = vocab_size)
-        /// this silently corrupted every token after the first prefill token, because
-        /// the upper half of the vocabulary logits were never produced.
-        ///
-        /// N=6 is the minimal shape that exposes it: `ceil(6/4)=2` groups write only
-        /// rows 0..4 (rows 4,5 dropped); `ceil(6/2)=3` groups write all 6. Pre-fill Y
-        /// with a sentinel and assert every row is overwritten and matches the CPU
-        /// dequant reference. Reverting the fix to `div_ceil(4)` fails this test.
         #[test]
-        fn dispatch_matmul_q4_writes_all_rows() {
-            // Fail closed under enforce: a CI runner that provisions a Metal GPU but
-            // silently skips here would make this regression gate verify nothing —
-            // the same silent-skip class as the embed parity gate (#383). The
-            // dedicated macOS test step sets LATTICE_METAL_TEST_ENFORCE=1.
-            //
-            // Note: NO Apple7 family gate. `gemv_q4_decode` uses only `simd_sum` +
-            // threadgroup memory, not the Apple7-gated `simdgroup_matrix` MMA path,
-            // so it runs on GitHub's paravirtual macOS GPU (which reports a Metal
-            // device but NOT Apple7). The tiled-GEMM tests below DO need Apple7 and
-            // skip on CI; this decode-geometry test genuinely runs there.
-            let enforce = std::env::var("LATTICE_METAL_TEST_ENFORCE").is_ok();
+        fn forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference() {
             let Some(device) = Device::system_default() else {
-                assert!(
-                    !enforce,
-                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
-                );
+                eprintln!("[q4-fallback-proof] SKIPPED: no Metal device present on this machine");
                 return;
             };
+            if !device.supports_family(MTLGPUFamily::Apple7) {
+                eprintln!(
+                    "[q4-fallback-proof] SKIPPED: device does not support Apple7 (tiled Q4 \
+                     pipeline never built, so the fallback selection cannot be discriminated)"
+                );
+                return;
+            }
+            let _guard = gpu_test_lock();
             let (cfg, weights) = tiny_metal_qwen35_fixture();
-            let state =
+            let mut state =
                 MetalQwen35State::new(&weights, &cfg, 4).expect("tiny MetalQwen35State fixture");
+            assert!(
+                state.force_q4_gemm_fallback_for_test(),
+                "Apple7+ fixture must start with gemm_q4_tiled so the test-only override \
+                 discriminates the non-Apple7 selection"
+            );
+            MetalQwen35State::reset_q4_gemm_fallback_dispatches_for_test();
 
-            let (n, k) = (6usize, 64usize);
-            let (qw_raw, w_deq) = make_q4_weight_ref(&device, 0x0FF0_1234_u64, n, k);
-            let qw = Q4WeightBuf::from_buffer(qw_raw);
-
-            let mut xrng = 0x1234_5678_u64;
-            let x: Vec<f32> = (0..k)
-                .map(|_| {
-                    xrng = xrng
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    ((xrng >> 11) as u32 as f32 / u32::MAX as f32) * 2.0 - 1.0
-                })
+            let (m, n, k) = (8usize, 8usize, 64usize);
+            let (qw_buf, w_deq) = make_q4_weight_ref(&device, 0x899_u64, n, k);
+            let qw = Q4WeightBuf::from_buffer(qw_buf);
+            let x: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 37 % 251) as f32 - 125.0) / 127.0)
                 .collect();
             let x_buf = device.new_buffer_with_data(
                 x.as_ptr() as *const _,
-                (x.len() * 4) as u64,
+                (x.len() * std::mem::size_of::<f32>()) as u64,
                 MTLResourceOptions::StorageModeShared,
             );
-
-            // Pre-fill the output with a sentinel far outside the achievable result
-            // range (|y| < K = 64 here); any row left untouched keeps it.
-            const SENTINEL: f32 = -123_456.0;
-            let y_init = vec![SENTINEL; n];
-            let y_buf = device.new_buffer_with_data(
-                y_init.as_ptr() as *const _,
-                (n * 4) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
+            let y_buf =
+                device.new_buffer((m * n * 4) as u64, MTLResourceOptions::StorageModeShared);
 
             let cmd = state.engine.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
-            state.dispatch_matmul_q4(enc, &x_buf, &qw, &y_buf, 1, n as u32, k as u32);
+            state.dispatch_gemm_q4(enc, &x_buf, 0, &qw, &y_buf, 0, m as u32, n as u32, k as u32);
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
 
-            // SAFETY: StorageModeShared, GPU work completed, size matches allocation.
+            let fallback_dispatches = MetalQwen35State::q4_gemm_fallback_dispatches_for_test();
+            assert_eq!(
+                fallback_dispatches, 1,
+                "forced non-Apple7 selection must execute exactly one naive Q4 GEMM fallback"
+            );
+            let y_ref = cpu_matmul_ref(&x, &w_deq, m, n, k);
+            // SAFETY: the command buffer completed and y_buf contains m*n f32 values.
             let y: &[f32] =
-                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, n) };
-            let y_ref = cpu_matmul_ref(&x, &w_deq, 1, n, k);
-
-            for (row, &val) in y.iter().enumerate() {
-                assert!(
-                    val.to_bits() != SENTINEL.to_bits(),
-                    "row {row} of {n} never written — dispatch grid under-covers \
-                     gemv_q4_decode (NR=2 rows/group). This is the P0 decode-geometry bug."
-                );
-            }
+                unsafe { std::slice::from_raw_parts(y_buf.contents() as *const f32, m * n) };
             let diff = max_abs_diff(y, &y_ref);
+            eprintln!(
+                "[q4-fallback-proof] forced=true fallback_dispatches={fallback_dispatches} \
+                 max_abs_diff={diff:.4e}"
+            );
             assert!(
                 diff < 1e-3,
-                "dispatch_matmul_q4 result diverges from CPU dequant ref: max_abs_diff={diff:.4e}"
+                "forced non-Apple7 Q4 GEMM fallback diverged from the f32 dequant reference: \
+                 max_abs_diff={diff:.4e}"
             );
         }
 
@@ -23754,6 +21437,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn gemm_q8_tiled_enabled_on_apple7_plus() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -23772,6 +21456,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn gemm_q8_tiled_vs_naive_numeric_differential() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -23971,6 +21656,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// Measured on M1 (2026-06-24): mixed abs=9.6e-1, ref_max=4.21e3, rel=2.3e-4 (bound 2 %).
         #[test]
         fn gemm_q4_tiled_edge_scale_activation_coverage() {
+            let _gpu_guard = gpu_test_lock();
             let Some(device) = Device::system_default() else {
                 return;
             };
@@ -24200,6 +21886,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_short_a() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24215,6 +21902,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_short_b() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24230,6 +21918,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_zero_rank() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24251,6 +21940,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_zero_d_in() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24271,6 +21961,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_out_of_range_layer_idx() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24287,6 +21978,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_wrong_a_length_mismatched_dims() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24311,6 +22003,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_wrong_b_length_mismatched_dims() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24334,6 +22027,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_quarot_with_short_a() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24351,6 +22045,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_quarot_with_short_b() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_dev) = metal::Device::system_default() else {
                 return;
             };
@@ -24369,6 +22064,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_wrong_shape_for_module() {
+            let _gpu_guard = gpu_test_lock();
             // q_proj expects d_out = 2 * full_q_dim() = 1024, not hidden = 512
             let Some(_) = metal::Device::system_default() else {
                 return;
@@ -24392,6 +22088,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_gdn_module_on_full_attention_layer() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -24418,6 +22115,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_unknown_module() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -24440,6 +22138,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_duplicate_projection() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -24465,6 +22164,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_empty_layers() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -24476,6 +22176,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_non_finite_scale() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -24519,6 +22220,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn load_lora_adapter_rejects_in_proj_b_and_in_proj_a() {
+            let _gpu_guard = gpu_test_lock();
             use crate::model::qwen35_config::Qwen35Config;
             // Test the actual GDN-layer rejection branch (is_full=false)
             let mut gdn_cfg = Qwen35Config::qwen35_0_8b();
@@ -24561,7 +22263,40 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn expected_lora_shape_preserves_metal_in_proj_capability_filter_without_device() {
+            use crate::model::qwen35_config::Qwen35Config;
+
+            let mut gdn_cfg = Qwen35Config::qwen35_0_8b();
+            gdn_cfg.num_hidden_layers = 1;
+            gdn_cfg.layer_types = vec![LayerType::LinearAttention];
+            gdn_cfg.layer_mask = vec![true];
+
+            for module in ["in_proj_b", "in_proj_a"] {
+                let err = MetalQwen35State::expected_lora_shape(&gdn_cfg, 0, module)
+                    .expect_err("Metal cannot apply alpha/beta LoRA inside the fused GDN kernel");
+                assert_eq!(
+                    err.to_string(),
+                    format!(
+                        "Inference error: module '{module}' is not yet supported in Metal forward \
+                         (consumed inside fused GDN recurrence kernel); target other GDN modules instead"
+                    )
+                );
+            }
+
+            let full_cfg = Qwen35Config::qwen35_0_8b();
+            for module in ["in_proj_b", "in_proj_a"] {
+                let err = MetalQwen35State::expected_lora_shape(&full_cfg, 3, module)
+                    .expect_err("alpha/beta modules remain invalid on full-attention layers");
+                assert_eq!(
+                    err.to_string(),
+                    format!("Inference error: unknown LoRA module '{module}'")
+                );
+            }
+        }
+
+        #[test]
         fn lora_prefill_fallback_matches_sequential_with_adapter() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -25084,82 +22819,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
         }
 
-        #[test]
-        fn forward_step_gdn_only_does_not_advance_kv_cache() {
-            let Some(_) = metal::Device::system_default() else {
-                return;
-            };
-            let (cfg, weights) = tiny_hybrid_fixture();
-            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-
-            let seq_len_before = state.session.kv_cache.seq_len;
-            let logits = state.forward_step_gdn_only(0, 0);
-
-            assert_eq!(
-                state.session.kv_cache.seq_len, seq_len_before,
-                "forward_step_gdn_only must not advance KV cache"
-            );
-            assert_eq!(
-                logits.len(),
-                cfg.vocab_size,
-                "forward_step_gdn_only must return vocab_size logits"
-            );
-        }
-
-        #[test]
-        fn forward_step_gdn_only_returns_finite_logits() {
-            let Some(_) = metal::Device::system_default() else {
-                return;
-            };
-            let (cfg, weights) = tiny_hybrid_fixture();
-            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-
-            let logits = state.forward_step_gdn_only(1, 0);
-            assert!(
-                logits.iter().all(|v| v.is_finite()),
-                "all GDN-only logits must be finite"
-            );
-        }
-
-        /// Mutation-sensitive guard for the GDN decode decay-gate clamp.
-        ///
-        /// When `a_log > ~88`, the kernel's `exp(a_log)` overflows to `+inf`; when
-        /// `alpha + dt_bias` drives softplus to exactly `0.0`, the *unclamped*
-        /// product is `inf * 0 = NaN`, which poisons the recurrent state and every
-        /// subsequent logit (coherent-early / garbage-late on long generations).
-        /// The fix mirrors the CPU `compute_decay_gate` clamp (`exp(a_log).min(MAX)`).
-        /// This test FAILS (non-finite logits) if the decode clamp is reverted and
-        /// PASSES once it is present.
-        #[test]
-        fn forward_step_gdn_only_decay_gate_clamps_overflow() {
-            let Some(_) = metal::Device::system_default() else {
-                return;
-            };
-            let _guard = gpu_test_lock();
-            let (cfg, mut weights) = tiny_hybrid_fixture();
-
-            // Drive every GDN head into the overflow corner: a_log huge (exp -> +inf)
-            // and dt_bias very negative (softplus -> 0). Unclamped: inf * 0 = NaN.
-            for (attn, _) in weights.layers.iter_mut() {
-                if let AttentionWeights::Linear(gdn) = attn {
-                    for a in gdn.a_log.iter_mut() {
-                        *a = 100.0;
-                    }
-                    for b in gdn.dt_bias.iter_mut() {
-                        *b = -200.0;
-                    }
-                }
-            }
-
-            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
-            let logits = state.forward_step_gdn_only(1, 0);
-
-            assert!(
-                logits.iter().all(|v| v.is_finite()),
-                "GDN decode decay-gate must clamp exp(a_log) to finite; got non-finite \
-                 logits (inf * 0 = NaN poison) — the decode clamp was reverted"
-            );
-        }
+        mod layers;
 
         /// Issue #171 smoke test: the block-top-k Stage-1 (fused GEMV + block-local
         /// argmax) / Stage-2 (existing `argmax_merge`) dispatch must select the
@@ -25271,52 +22931,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // Mutation-sensitive correctness tests for
         // the lm_head two-stage block-top-k path (issue #171).
         // ===================================================================
-
-        /// Pure unit test for the route gate (no GPU). Design-spec "Routing
-        /// Rules": top_p < 1.0 must stay on the exact full-logit path
-        /// (`CpuFallback`) unless the explicit approximate gate is set, since
-        /// nucleus sampling over a truncated candidate set is not equivalent
-        /// to full-vocab nucleus sampling.
-        #[test]
-        fn choose_gpu_block_topk_route_gate() {
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 0.9, true, false),
-                GpuTopkRoute::CpuFallback,
-                "top_p<1.0 without the approx gate must stay exact"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 0.9, true, true),
-                GpuTopkRoute::BlockTopK { local_k: 8 },
-                "top_p<1.0 WITH the explicit approx gate may take the block route"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(0, 1.0, true, false),
-                GpuTopkRoute::CpuFallback,
-                "top_k=0 means top-k DISABLED (full-distribution sampling), \
-                 not greedy; BlockArgmax here would collapse sampling to top-1"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(1, 1.0, true, false),
-                GpuTopkRoute::BlockArgmax
-            );
-            for &k in &[8u32, 16, 40, 64] {
-                assert_eq!(
-                    choose_gpu_block_topk_route(k as usize, 1.0, true, false),
-                    GpuTopkRoute::BlockTopK { local_k: k },
-                    "k={k} must map to BlockTopK"
-                );
-            }
-            assert_eq!(
-                choose_gpu_block_topk_route(50, 1.0, true, false),
-                GpuTopkRoute::CpuFallback,
-                "k=50 has no precompiled Stage-1 variant; must fall back exact"
-            );
-            assert_eq!(
-                choose_gpu_block_topk_route(8, 1.0, false, false),
-                GpuTopkRoute::CpuFallback,
-                "LATTICE_COMPACT_TOPK unset must stay exact regardless of k"
-            );
-        }
 
         /// Same construction as `tiny_metal_qwen35_fixture` but with a
         /// caller-chosen vocab size and an all-zero embedding table (only
@@ -25633,7 +23247,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// setting them directly here isolates this test to the
         /// `reset_state`/route-builder clearing bug rather than also
         /// depending on route *selection*, which already has its own
-        /// coverage in `choose_gpu_block_topk_route_gate`).
+        /// coverage in `sampling_route_block_helper_gate`).
         ///
         /// MUTATION-SENSITIVE: commenting out the `reset_state` compact-state
         /// clear (the `self.session.compact_topk = 0; self.session.compact_route
@@ -26024,6 +23638,167 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 spatial_merge_size: merge,
                 decoder_hidden_size: cfg.hidden_size,
             }
+        }
+
+        fn assert_vision_state_reusable_after_cancel(
+            state: &mut MetalQwen35State,
+            weights: &ModelWeights,
+            cfg: &Qwen35Config,
+            request: &Qwen35VisionRequest,
+            tokenizer: &BpeTokenizer,
+            gen_cfg: &GenerateConfig,
+        ) {
+            let resumed = state
+                .generate_multimodal_vision(request, tokenizer, gen_cfg)
+                .expect("same state must remain usable after cancellation");
+            let mut fresh =
+                MetalQwen35State::new(weights, cfg, 32).expect("fresh tiny vision state");
+            let expected = fresh
+                .generate_multimodal_vision(request, tokenizer, gen_cfg)
+                .expect("fresh reference generation succeeds");
+            assert_eq!(
+                resumed.token_ids, expected.token_ids,
+                "generation after cancellation must match a fresh state"
+            );
+            assert_eq!(
+                resumed.stop_reason, expected.stop_reason,
+                "generation after cancellation must preserve the fresh stop reason"
+            );
+        }
+
+        #[test]
+        fn generate_multimodal_vision_cancel_immediate_preserves_and_reuses_state() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
+            let request = vision_gate_fixture(&cfg, 0.01);
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
+
+            let _ = state.forward_step(3, 0);
+            let retained_seq_len = state.session.kv_cache.seq_len;
+            assert!(retained_seq_len > 0, "precondition: state carries live KV");
+
+            let mut polls = 0usize;
+            let out = state
+                .generate_multimodal_vision_with_cancel(&request, &tokenizer, &gen_cfg, || {
+                    polls += 1;
+                    true
+                })
+                .expect("immediate cancellation returns an output");
+            assert_eq!(
+                polls, 1,
+                "immediate cancellation must stop at the first poll"
+            );
+            assert_eq!(out.stop_reason, Some(StopReason::Interrupt));
+            assert_eq!(out.generated_tokens, 0);
+            assert!(
+                !out.stopped,
+                "client cancellation is not an OpenAI stop condition"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len, retained_seq_len,
+                "immediate cancellation must happen before reset or prefill mutates state"
+            );
+
+            assert_vision_state_reusable_after_cancel(
+                &mut state, &weights, &cfg, &request, &tokenizer, &gen_cfg,
+            );
+        }
+
+        #[test]
+        fn generate_multimodal_vision_cancel_during_prefill_stops_before_next_token() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
+            let request = vision_gate_fixture(&cfg, 0.01);
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
+
+            let mut polls = 0usize;
+            let out = state
+                .generate_multimodal_vision_with_cancel(&request, &tokenizer, &gen_cfg, || {
+                    polls += 1;
+                    polls == 3
+                })
+                .expect("prefill cancellation returns an output");
+            assert_eq!(polls, 3);
+            assert_eq!(out.stop_reason, Some(StopReason::Interrupt));
+            assert_eq!(out.generated_tokens, 0);
+            assert_eq!(
+                state.session.kv_cache.seq_len, 1,
+                "only the first prompt token may reach the decoder"
+            );
+
+            assert_vision_state_reusable_after_cancel(
+                &mut state, &weights, &cfg, &request, &tokenizer, &gen_cfg,
+            );
+        }
+
+        #[test]
+        fn generate_multimodal_vision_cancel_mid_decode_is_bounded_and_reuses_state() {
+            let Some(_) = Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_metal_qwen35_vision_fixture();
+            let request = vision_gate_fixture(&cfg, 0.01);
+            let prompt_len = request.input_ids.len();
+            let tokenizer = minimal_bpe_tokenizer();
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                repetition_penalty: 1.0,
+                seed: Some(1),
+                stop_token_ids: vec![],
+                ..Default::default()
+            };
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny vision state");
+
+            let cancel_poll = prompt_len + 4;
+            let mut polls = 0usize;
+            let out = state
+                .generate_multimodal_vision_with_cancel(&request, &tokenizer, &gen_cfg, || {
+                    polls += 1;
+                    polls == cancel_poll
+                })
+                .expect("mid-decode cancellation returns an output");
+            assert_eq!(polls, cancel_poll);
+            assert_eq!(out.stop_reason, Some(StopReason::Interrupt));
+            assert_eq!(
+                out.generated_tokens, 2,
+                "one sampled token and one decoded token must precede cancellation"
+            );
+            assert!(out.generated_tokens < gen_cfg.max_new_tokens);
+            assert_eq!(
+                state.session.kv_cache.seq_len,
+                prompt_len + 1,
+                "only one autoregressive decode step may reach the decoder"
+            );
+
+            assert_vision_state_reusable_after_cancel(
+                &mut state, &weights, &cfg, &request, &tokenizer, &gen_cfg,
+            );
         }
 
         /// Qwen3.5 vision (ADR-069 Metal S5, MP2 gate): isolates `forward_step_injected`
@@ -26844,7 +24619,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("real-checkpoint state");
             let mut probed: Vec<Vec<f32>> = Vec::new();
             let out = state_fn
-                .generate_multimodal_vision_impl(&request, &tokenizer, &gen_cfg, Some(&mut probed))
+                .generate_multimodal_vision_impl(
+                    &request,
+                    &tokenizer,
+                    &gen_cfg,
+                    Some(&mut probed),
+                    None,
+                )
                 .expect("fixture multimodal generate succeeds");
             assert_eq!(
                 out.generated_tokens, 2,
@@ -27615,92 +25396,365 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             r
         }
 
-        /// Serializes GPU-heavy model tests onto the single shared Metal device —
-        /// across BOTH test threads in this process and any other process on the
-        /// machine.
-        ///
-        /// In-process half: the Metal batched/decode attention kernels carry a
-        /// runtime-only nondeterminism that perturbs logit values by small
-        /// magnitudes on roughly 1-in-N runs. Static analysis of
-        /// `gdn_recurrence_fused` and `decode_attention` found both barrier-correct
-        /// (no uninitialized threadgroup reads, no intra-dispatch cross-threadgroup
-        /// device race, no untracked buffers), so the hazard has not been
-        /// root-caused — it is only observable via GPU frame capture (Xcode Metal
-        /// debugger), which no run here has done yet. Concurrent GPU execution
-        /// amplifies it, and it perturbs the *serial* GDN reference that the
-        /// cross-algorithm parity tests compare against — producing false-positive
-        /// failures under `cargo test`'s default multi-threading. Argmax stays
-        /// stable across the perturbation; only logit values drift (see the
-        /// chunked-prefill parity test below for the magnitude evidence). The
-        /// chunked scan itself is deterministic (see
-        /// `gdn_chunked_b_vs_b_self_consistency`); serializing device access keeps
-        /// the serial reference clean run-to-run.
-        ///
-        /// Machine-level half (#628/#629 post-mortem): the in-process mutex cannot
-        /// stop concurrent `cargo test` runs launched from another process on the
-        /// machine, and concurrent Metal load provably corrupts real-checkpoint
-        /// numerics (boundary-tie margins inflated ~3x during a confirmed
-        /// contention window). So the guard also holds an exclusive advisory
-        /// `flock` on a fixed machine-wide path, `/tmp/lion-metal-gpu-test.lock`,
-        /// making cross-process serialization automatic instead of a convention
-        /// agents must remember. Any harness touching the Metal GPU should
-        /// acquire the same path.
-        ///
-        /// Acquisition order is mutex-then-file, so at most one thread per
-        /// process ever contends the file lock. The file lock is polled with
-        /// `try_lock` so a wedged holder surfaces as a clear panic after a
-        /// generous timeout instead of a silent infinite hang.
-        struct GpuTestGuard {
-            _process: std::sync::MutexGuard<'static, ()>,
-            // Held for the guard's lifetime; dropping the File closes the fd,
-            // which releases the flock.
-            _machine: std::fs::File,
+        // -------------------------------------------------------------
+        // Pooled hidden-state embeddings: CPU versus Metal equivalence.
+        //
+        // WHAT THIS GATES. `Qwen35Model::embed_tokens` and
+        // `MetalQwen35State::embed_tokens` are documented to return the same
+        // quantity: the last position's hidden state AFTER the final RMSNorm
+        // and before the language-model head. On the Metal side that vector is
+        // copied out of `activations.hidden` by `encode_capture_final_hidden`,
+        // encoded immediately after the norm dispatch, at three separate
+        // forward paths. Nothing about "immediately after" is enforced by the
+        // type system, and the buffer sitting beside it — `pre_final_hidden`,
+        // which MTP owns — holds the SAME TOKEN AT A DIFFERENT POINT IN THE
+        // NETWORK. A capture placed one dispatch too early returns a
+        // well-formed, correctly-sized vector differing from the reference only
+        // by the norm's per-channel rescale. No smoke test catches that. This
+        // does.
+        //
+        // WHY THE SAME WEIGHTS ON BOTH SIDES. Both engines are built from one
+        // `ModelWeights` loaded from one safetensors checkpoint, so a
+        // disagreement is a difference in what the two paths compute rather
+        // than quantization error. Comparing the f16 CPU model against a Q4
+        // Metal artifact would measure quantization and could not resolve a
+        // layer-offset bug underneath it.
+        //
+        // FAIL-CLOSED. Without a checkpoint these print a skip line and return.
+        // With LATTICE_HIDDEN_PARITY_ENFORCE=1 a missing model panics instead,
+        // so a provisioning failure cannot masquerade as a passing gate.
+        // Mirrors LATTICE_Q4_COMPOSED_GATE_ENFORCE in
+        // tests/quarot_q4_composed_golden.rs.
+        //
+        // MUTATION EVIDENCE. A test that passes with the fix reverted is
+        // decoration. Moving any of the three `encode_capture_final_hidden`
+        // calls to before its `dispatch_rms_norm` must make this fail. That
+        // check is run by hand, since it means editing the source under test.
+        //
+        //   LATTICE_MODEL_DIR=~/.lattice/models/qwen3.5-0.8b \
+        //   cargo test --release -p lattice-inference --features "f16,metal-gpu" \
+        //       hidden_state_ -- --nocapture --test-threads=1
+        // -------------------------------------------------------------
+
+        /// Cosine floor. The two paths run different kernels over the same
+        /// weights, so f32 accumulation order differs and bit equality is not
+        /// the contract. It is far tighter than the gap a mislocated capture
+        /// opens: the final norm rescales per channel by (1 + gamma), so a
+        /// pre-norm vector sits nowhere near cosine 0.999 of a post-norm one on
+        /// a checkpoint whose gamma is not zero — which
+        /// `hidden_parity_model()` establishes for the checkpoint in hand
+        /// rather than assuming.
+        const HIDDEN_PARITY_MIN_COSINE: f32 = 0.999;
+
+        /// Token ids kept small so they are in vocabulary for any Qwen3.5
+        /// checkpoint, and varied so the sequence is not a repeated token
+        /// (which would make the attention pattern degenerate).
+        const HIDDEN_PARITY_MULTI: &[u32] = &[1, 25, 9, 314, 77, 2, 1041, 58];
+        const HIDDEN_PARITY_SINGLE: &[u32] = &[314];
+
+        fn hidden_parity_model_dir() -> Option<std::path::PathBuf> {
+            let expand = |s: &str| match s.strip_prefix("~/") {
+                Some(rest) => match std::env::var("HOME") {
+                    Ok(home) => format!("{home}/{rest}"),
+                    Err(_) => s.to_string(),
+                },
+                None => s.to_string(),
+            };
+            if let Ok(d) = std::env::var("LATTICE_MODEL_DIR") {
+                let p = std::path::PathBuf::from(expand(&d));
+                return p.join("config.json").is_file().then_some(p);
+            }
+            let home = std::env::var("HOME").ok()?;
+            let p = std::path::PathBuf::from(home).join(".lattice/models/qwen3.5-0.8b");
+            p.join("config.json").is_file().then_some(p)
         }
 
-        const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-        const GPU_MACHINE_LOCK_TIMEOUT: std::time::Duration =
-            std::time::Duration::from_secs(30 * 60);
+        fn hidden_parity_enforced() -> bool {
+            matches!(
+                std::env::var("LATTICE_HIDDEN_PARITY_ENFORCE").as_deref(),
+                Ok("1") | Ok("true")
+            )
+        }
 
-        fn gpu_test_lock() -> GpuTestGuard {
-            use std::sync::Mutex;
-            static GPU_LOCK: Mutex<()> = Mutex::new(());
-            let process = GPU_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        /// Load the CPU model, or report why there is nothing to compare.
+        /// Returns `None` only in the un-enforced, no-checkpoint case.
+        fn hidden_parity_model() -> Option<crate::model::qwen35::Qwen35Model> {
+            let Some(dir) = hidden_parity_model_dir() else {
+                assert!(
+                    !hidden_parity_enforced(),
+                    "LATTICE_HIDDEN_PARITY_ENFORCE=1 but no checkpoint found: set \
+                     LATTICE_MODEL_DIR to a Qwen3.5 safetensors checkout. Refusing to \
+                     report a pass for a comparison that never ran."
+                );
+                println!(
+                    "SKIP hidden-state parity: no Qwen3.5 checkpoint (set \
+                     LATTICE_MODEL_DIR, or LATTICE_HIDDEN_PARITY_ENFORCE=1 to make \
+                     this a failure)"
+                );
+                return None;
+            };
+            println!("hidden-state parity model: {}", dir.display());
+            let model = crate::model::qwen35::Qwen35Model::from_safetensors(&dir)
+                .expect("load CPU model from LATTICE_MODEL_DIR");
 
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(GPU_MACHINE_LOCK_PATH)
-                .unwrap_or_else(|e| {
-                    panic!("gpu_test_lock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}")
+            // The control that keeps the comparison from being vacuous. If this
+            // checkpoint's final norm were an identity, a capture taken before
+            // it would equal one taken after, and every assertion below would
+            // pass while proving nothing about where the capture sits. Qwen3.5
+            // uses the (1 + gamma) convention, so identity is gamma == 0.
+            let gamma = &model.weights().final_norm;
+            let max_gamma = gamma.iter().fold(0.0f32, |m, g| m.max(g.abs()));
+            println!(
+                "control: final_norm has {} channels, max |gamma| = {max_gamma:.4}",
+                gamma.len()
+            );
+            assert!(
+                max_gamma > 1e-3,
+                "final_norm is indistinguishable from an identity on this checkpoint \
+                 (max |gamma| = {max_gamma}), so a pre-norm capture would score \
+                 identically to a post-norm one and this test cannot discriminate. \
+                 Use a different checkpoint rather than trusting the pass."
+            );
+            Some(model)
+        }
+
+        fn hidden_parity_cosine(a: &[f32], b: &[f32]) -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                na > 0.0 && nb > 0.0,
+                "a zero vector has no direction, so cosine is undefined rather than \
+                 low; one side produced all zeros (|a|={na}, |b|={nb})"
+            );
+            dot / (na * nb)
+        }
+
+        /// Max minus min. A capture returning a zeroed or constant buffer would
+        /// otherwise satisfy every equality assertion in the test.
+        fn hidden_parity_spread(v: &[f32]) -> f32 {
+            let mut lo = f32::INFINITY;
+            let mut hi = f32::NEG_INFINITY;
+            for &x in v {
+                lo = lo.min(x);
+                hi = hi.max(x);
+            }
+            hi - lo
+        }
+
+        #[test]
+        fn hidden_state_cpu_and_metal_embed_tokens_agree_on_real_weights() {
+            let _gpu = gpu_test_lock();
+            let Some(model) = hidden_parity_model() else {
+                return;
+            };
+            let cfg = model.config().clone();
+            let mut metal = MetalQwen35State::new(model.weights(), &cfg, 4096)
+                .expect("build Metal state from the same weights the CPU model holds");
+
+            assert_eq!(
+                model.hidden_size(),
+                metal.hidden_size(),
+                "the two paths disagree about hidden size before any vector is compared"
+            );
+
+            // Two sequences, because they take DIFFERENT forward paths on
+            // Metal: a multi-token prompt goes through the batched prefill
+            // chunk (capture site 2) and a single token goes through the decode
+            // head (capture site 3). Testing only the multi-token case would
+            // leave the single-token path uncovered while reading as coverage.
+            for (label, tokens) in [
+                ("multi-token (prefill path)", HIDDEN_PARITY_MULTI),
+                ("single token (decode path)", HIDDEN_PARITY_SINGLE),
+            ] {
+                let cpu = model
+                    .embed_tokens(tokens, crate::model::qwen35::HiddenPooling::LastToken)
+                    .expect("CPU embed");
+                let gpu = metal
+                    .embed_tokens(tokens, crate::model::qwen35::HiddenPooling::LastToken)
+                    .expect("Metal embed");
+
+                assert_eq!(cpu.len(), model.hidden_size(), "{label}: CPU length");
+                assert_eq!(gpu.len(), model.hidden_size(), "{label}: Metal length");
+
+                let cpu_spread = hidden_parity_spread(&cpu);
+                let gpu_spread = hidden_parity_spread(&gpu);
+                assert!(
+                    cpu_spread > 1e-4 && gpu_spread > 1e-4,
+                    "{label}: a vector is constant or near-constant (cpu spread \
+                     {cpu_spread}, metal spread {gpu_spread}); agreement between two \
+                     flat vectors is not evidence"
+                );
+
+                let cos = hidden_parity_cosine(&cpu, &gpu);
+                let mad = cpu
+                    .iter()
+                    .zip(&gpu)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                println!(
+                    "{label}: cosine {cos:.6}, max abs diff {mad:.3e}, spread {cpu_spread:.3}"
+                );
+                assert!(
+                    cos >= HIDDEN_PARITY_MIN_COSINE,
+                    "{label}: CPU and Metal disagree, cosine {cos} < \
+                     {HIDDEN_PARITY_MIN_COSINE}. If the gap is a uniform per-channel \
+                     rescale, the Metal capture is on the wrong side of the final RMSNorm."
+                );
+            }
+        }
+
+        /// Every final-RMSNorm dispatch is followed by a capture, enforced at
+        /// the source rather than by inspection.
+        ///
+        /// The runtime parity test above covers the two forward paths the
+        /// public `embed_tokens` can reach: the batched prefill chunk and the
+        /// single-token decode head. It does NOT cover the MTP verify path,
+        /// which is reachable only through speculative decoding and has no CPU
+        /// counterpart to compare against — moving that site's capture to the
+        /// wrong side of its norm leaves the parity test green, which was
+        /// measured, not assumed. No runtime test can cover a *fourth* site
+        /// somebody adds next year either.
+        ///
+        /// So the invariant is checked where it actually lives: in the text of
+        /// this file. Each dispatch against `engine.final_norm` must be
+        /// followed, within a short window, by an `encode_capture_final_hidden`
+        /// call. A new forward path that norms and forgets to capture fails
+        /// here with a line number instead of returning a stale vector at
+        /// runtime.
+        #[test]
+        fn hidden_state_every_final_norm_dispatch_is_followed_by_a_capture() {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/forward/metal_qwen35.rs");
+            // Fail closed: an unreadable source file is an instrument failure,
+            // not an absence of violations.
+            let src = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!(
+                    "cannot read {} to check the capture invariant: {e}",
+                    path.display()
+                )
+            });
+            let all_lines: Vec<&str> = src.lines().collect();
+
+            // Scan production code only. This test's own body quotes the match
+            // patterns as string literals, so scanning the whole file makes the
+            // test match itself — it did, on the first run, and the failure was
+            // its own source line. Fail closed if the boundary is not found
+            // rather than silently scanning everything again.
+            let tests_start = all_lines
+                .iter()
+                .position(|l| l.trim() == "mod tests {")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "cannot find the `mod tests {{` boundary in {}; refusing to scan \
+                         the test module's own pattern literals as if they were dispatch sites",
+                        path.display()
+                    )
                 });
-            let deadline = std::time::Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
-            loop {
-                match file.try_lock() {
-                    Ok(()) => break,
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        if std::time::Instant::now() >= deadline {
-                            panic!(
-                                "gpu_test_lock: another process has held \
-                                 {GPU_MACHINE_LOCK_PATH} for over {}s — a Metal \
-                                 test run elsewhere on this machine is wedged or \
-                                 genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
-                                GPU_MACHINE_LOCK_TIMEOUT.as_secs()
-                            );
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    Err(std::fs::TryLockError::Error(e)) => {
-                        panic!("gpu_test_lock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
-                    }
+            let lines = &all_lines[..tests_start];
+
+            // A dispatch site binds the weight buffer, so require the line to
+            // be a buffer argument rather than prose mentioning the name.
+            let sites: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, l)| {
+                    let t = l.trim();
+                    !t.starts_with("//")
+                        && (t == "&self.engine.final_norm,"
+                            || t.contains("Some(&self.engine.final_norm)"))
+                })
+                .map(|(i, _)| i)
+                .collect();
+
+            // Positive control. A pattern that matches nothing would otherwise
+            // report a clean pass over an empty set — the failure mode this
+            // whole test exists to prevent, one level up.
+            assert!(
+                sites.len() >= 3,
+                "expected at least 3 final-norm dispatch sites, found {}. The match \
+                 pattern has drifted from the code; fix the pattern rather than \
+                 trusting the pass.",
+                sites.len()
+            );
+
+            // Window: the norm dispatch's own argument list, then the capture.
+            // Wide enough for a multi-line dispatch, narrow enough that a
+            // capture belonging to some later block cannot satisfy it.
+            const WINDOW: usize = 14;
+            let mut uncovered = Vec::new();
+            for &site in &sites {
+                let end = (site + WINDOW).min(lines.len());
+                let covered = lines[site..end]
+                    .iter()
+                    .any(|l| l.contains("encode_capture_final_hidden("));
+                if !covered {
+                    uncovered.push(site + 1);
                 }
             }
-            GpuTestGuard {
-                _process: process,
-                _machine: file,
-            }
+            assert!(
+                uncovered.is_empty(),
+                "final-RMSNorm dispatch without a following encode_capture_final_hidden \
+                 at line(s) {uncovered:?} of {}. A forward path that norms without \
+                 capturing leaves `activations.final_hidden` holding whatever the \
+                 previous call left there, and embed_tokens would return a well-formed \
+                 vector for somebody else's input.",
+                path.display()
+            );
+            println!(
+                "capture invariant: {} final-norm dispatch sites, all covered",
+                sites.len()
+            );
+        }
+
+        #[test]
+        fn hidden_state_metal_refuses_mean_pooling_rather_than_substituting_last_token() {
+            let _gpu = gpu_test_lock();
+            let Some(model) = hidden_parity_model() else {
+                return;
+            };
+            let cfg = model.config().clone();
+            let mut metal =
+                MetalQwen35State::new(model.weights(), &cfg, 4096).expect("build Metal state");
+
+            let err = metal
+                .embed_tokens(
+                    HIDDEN_PARITY_MULTI,
+                    crate::model::qwen35::HiddenPooling::Mean,
+                )
+                .expect_err(
+                    "Metal must refuse mean pooling, not quietly return last-token pooling",
+                );
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Mean"),
+                "the refusal should name the pooling mode it cannot serve: {msg}"
+            );
+        }
+
+        #[test]
+        fn hidden_state_metal_rejects_out_of_vocab_and_empty_input_without_panicking() {
+            let _gpu = gpu_test_lock();
+            let Some(model) = hidden_parity_model() else {
+                return;
+            };
+            let cfg = model.config().clone();
+            let mut metal =
+                MetalQwen35State::new(model.weights(), &cfg, 4096).expect("build Metal state");
+
+            let err = metal
+                .embed_tokens(&[], crate::model::qwen35::HiddenPooling::LastToken)
+                .expect_err("empty input must be rejected");
+            assert!(err.to_string().contains("at least 1 token"), "{err}");
+
+            // `forward_prefill` asserts on an out-of-range id, so without a
+            // check ahead of it a library consumer gets a panic where the CPU
+            // sibling returns an error.
+            let bad = cfg.vocab_size as u32;
+            let err = metal
+                .embed_tokens(&[bad], crate::model::qwen35::HiddenPooling::LastToken)
+                .expect_err("out-of-vocab id must be rejected");
+            assert!(err.to_string().contains("vocab_size"), "{err}");
         }
 
         fn minimal_bpe_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
@@ -28016,6 +26070,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn self_spec_checkpoint_pool_allocated_when_env_set() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -28034,6 +26089,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn generate_greedy_self_spec_output_token_count_within_budget() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -28144,7 +26200,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `好` (`0xE5 0xA5 0xBD`), exactly as a real byte-level BPE vocab
         /// would encode it, so ids 30/31 decode to genuine CJK bytes if sampled.
         fn multibyte_vocab_tokenizer() -> crate::tokenizer::bpe::BpeTokenizer {
-            use crate::model::qwen35::detokenize::bytes_to_unicode;
+            use crate::tokenizer::detokenize::bytes_to_unicode;
             use std::collections::HashMap;
             let byte_encoder = bytes_to_unicode();
             let byte_level_token = |bytes: &[u8]| -> String {
@@ -28988,6 +27044,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// caller has stopped consuming the stream.
         #[test]
         fn stop_reason_interrupt_on_stream_callback_false() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29056,6 +27113,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// called.
         #[test]
         fn stop_reason_interrupt_when_cancelled_before_prefill_starts() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29137,6 +27195,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// loop's own independent check, not the callback, is what halts it.
         #[test]
         fn stop_reason_interrupt_when_should_cancel_alone_stops_mid_decode() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29213,14 +27272,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// token is ever pushed into the output, matching the CPU `generate()`
         /// contract (model::qwen35::generation): zero tokens, `StopReason::Length`.
         ///
-        /// Mutation sensitivity: without the guard, `generate` samples the prefill
-        /// token from `prefill_logits` and pushes it into `generated_ids` before the
-        /// (empty, since `1..0` has no elements) decode loop runs, so
-        /// `generated_tokens` would be 1 instead of 0. `eos_token_id` is pushed out
-        /// of the reachable vocab range so this holds regardless of which token
-        /// greedy sampling picks at prefill.
+        /// Mutation sensitivity: treating the shared preparation's
+        /// `GenerationPreparation::Complete` as ready would let `generate` sample
+        /// the prefill token and push it into `generated_ids` before the empty
+        /// decode loop runs, so `generated_tokens` would be 1 instead of 0.
+        /// `eos_token_id` is pushed out of the reachable vocab range so this holds
+        /// regardless of which token greedy sampling picks at prefill.
         #[test]
         fn metal_generate_zero_budget_reports_length() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29272,16 +27332,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// stop_reason: None, .. })` it used to return. See
         /// docs/generation-entrypoint-matrix.md row 2.
         ///
-        /// This is the production-seam test for the guard added to `generate`
-        /// itself; `check_prompt_not_empty_rejects_zero` /
-        /// `_allows_nonzero` (model::qwen35::generation) already cover the
-        /// pure guard logic without a GPU device.
+        /// This is the production-seam test for `generate`'s shared preparation
+        /// call; the generation-setup tests cover the pure contract without a GPU.
         ///
-        /// Mutation sensitivity: reverting the `check_prompt_not_empty` call
-        /// in `generate` lets this request proceed through prefill and
-        /// sampling instead of erroring, so `result.is_err()` fails (and the
-        /// old `Ok` shape would additionally have `stop_reason: None`, the
-        /// invariant-violating result #856 fixes).
+        /// Mutation sensitivity: bypassing `prepare_direct_generation` in
+        /// `generate` lets this request proceed through prefill and sampling
+        /// instead of erroring, so `result.is_err()` fails.
         ///
         /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
@@ -29332,14 +27388,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `InvalidInput` error, rather than silently ignoring the budget and
         /// generating unbudgeted output (ADR-080 C3, #783).
         ///
-        /// This is the production-seam test for the guard added to `generate`
-        /// itself, proving the call site is real — `route_predicate_tests`
-        /// and `multimodal_preflight_tests` already cover the pure guard
-        /// logic without a GPU device.
+        /// This is the production-seam test for `generate`'s
+        /// `GenerationEntryContract::MetalDirect`, proving the caller selects
+        /// the fail-closed contract.
         ///
-        /// Mutation sensitivity: removing the `check_reasoning_budget_not_set`
-        /// call from `generate` lets this request proceed through prefill and
-        /// sampling instead of erroring, so `result.is_err()` fails.
+        /// Mutation sensitivity: selecting `MetalStreaming` instead lets this
+        /// request proceed through prefill and sampling instead of erroring, so
+        /// `result.is_err()` fails.
         #[test]
         fn metal_generate_plain_rejects_reasoning_budget_config() {
             let Some(_) = metal::Device::system_default() else {
@@ -29384,9 +27439,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// request around the MTP/self-spec predicates alone would not have
         /// closed this, since the plain fallback path is exactly as silent.
         ///
-        /// Mutation sensitivity: removing the `check_logprobs_not_set` call
-        /// from `generate` lets this request proceed through prefill and
-        /// sampling instead of erroring, so `result.is_err()` fails.
+        /// Mutation sensitivity: selecting `MetalStreaming` instead lets this
+        /// request proceed through prefill and sampling instead of erroring, so
+        /// `result.is_err()` fails.
         #[test]
         fn metal_generate_plain_rejects_logprobs_config() {
             let Some(_) = metal::Device::system_default() else {
@@ -29431,10 +27486,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// call site fixed by #856), so this one test covers both. See
         /// docs/generation-entrypoint-matrix.md row 2.
         ///
-        /// Mutation sensitivity: reverting the `check_prompt_not_empty` call
-        /// in `generate_streaming_with_cancel` lets this request proceed
-        /// through prefill and sampling instead of erroring, so
-        /// `result.is_err()` fails.
+        /// Mutation sensitivity: bypassing the shared `prepare_generation`
+        /// call in `generate_streaming_with_cancel` lets this request proceed
+        /// through prefill and sampling instead of erroring.
         ///
         /// Honors
         /// `LATTICE_METAL_TEST_ENFORCE` like the prefix-cache empty-prompt
@@ -29496,13 +27550,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// `generate_streaming()` contract (model::qwen35::generation): zero tokens,
         /// `StopReason::Length`, and `on_token` never invoked.
         ///
-        /// Mutation sensitivity: without the guard, `generate_streaming` samples the
-        /// prefill token, pushes it into `generated_ids`, and feeds its delta to
-        /// `on_token` before the (empty, since `decode_cap(None, 0) == 0` makes
-        /// `1..0` have no elements) decode loop runs, so `generated_tokens` would be
-        /// 1 and the callback would fire at least once instead of staying silent.
+        /// Mutation sensitivity: treating the shared preparation's
+        /// `GenerationPreparation::Complete` as ready would make streaming sample
+        /// and emit the prefill token before the empty decode loop runs, so
+        /// `generated_tokens` would be 1 and the callback would fire.
         #[test]
         fn metal_generate_streaming_zero_budget_reports_length() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29567,6 +27621,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// iterations rather than being satisfied by the prefill token alone.
         #[test]
         fn streaming_text_accumulates_every_loop_delta_not_only_prefill() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29622,6 +27677,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn self_spec_pool_holds_one_slot_per_verify_token_plus_base() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29664,6 +27720,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// the check would fail.
         #[test]
         fn self_spec_slot0_holds_pre_draft_state_after_round() {
+            let _gpu_guard = gpu_test_lock();
             let Some(_) = metal::Device::system_default() else {
                 return;
             };
@@ -29835,6 +27892,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
         #[test]
         fn snapshot_gdn_states_roundtrips_through_metal_buffers() {
+            let _gpu_guard = gpu_test_lock();
             use crate::speculative::MtpTargetVerifier;
             let Some(_) = metal::Device::system_default() else {
                 return;
@@ -30035,6 +28093,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn metal_qwen35_chunked_prefill_long_prompt_matches_step_loop() {
+            let _gpu_guard = gpu_test_lock();
             // Parity gate: chunked forward_prefill must agree with token-by-token
             // forward_step on a prompt longer than max_prefill (≈512).
             // Tests that RoPE offsets, KV cache rows, attention cache_len, and
@@ -30144,6 +28203,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn metal_qwen35_chunked_prefill_length_1_final_chunk_matches_step_loop() {
+            let _gpu_guard = gpu_test_lock();
             // Degenerate-boundary gate: a prompt of exactly max_prefill + 1 tokens
             // decomposes into chunks [max_prefill, 1]. The length-1 final chunk
             // goes through forward_prefill_batched_chunk with n=1 (single-iteration
@@ -30335,6 +28395,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
         fn metal_qwen35_prefill_all_logits_long_prompt_no_longer_panics() {
+            let _gpu_guard = gpu_test_lock();
             // Regression gate: forward_prefill_all_logits must NOT panic when
             // n > max_prefill and LoRA is inactive. Old code panicked; new code
             // chunks the request and concatenates per-chunk all-position logits.
@@ -34655,9 +32716,10 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// entry is created (or consumed) for the rejected call.
         ///
         /// Mutation sensitivity: removing the `check_logprobs_not_set` call
-        /// at the top of `generate_streaming_with_prefix_cache_and_cancel_inner`
-        /// makes this assertion fail (the call returns `Ok` with empty
-        /// `token_logprobs` instead of `Err`).
+        /// from `GenerationEntryContract::MetalPrefixCacheStreaming`'s
+        /// `validate_before_tokenization` (#1354) makes this assertion fail
+        /// (the call returns `Ok` with empty `token_logprobs` instead of
+        /// `Err`).
         #[test]
         fn generate_streaming_with_prefix_cache_rejects_logprobs_request() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -34809,8 +32871,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// no indication the request was ignored.
         ///
         /// Mutation sensitivity: removing the `check_mtp_not_requested` call
-        /// in `generate_streaming_with_prefix_cache_and_cancel` makes this
-        /// assertion fail (the call returns `Ok` instead of `Err`).
+        /// from `GenerationEntryContract::MetalPrefixCacheStreaming`'s
+        /// `validate_before_tokenization` (#1354) makes this assertion fail
+        /// (the call returns `Ok` instead of `Err`).
         #[test]
         fn generate_streaming_with_prefix_cache_rejects_active_mtp_request() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
@@ -34853,6 +32916,197 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 state.cross_turn_prefix_cache.entry.is_none(),
                 "an MTP-rejected call must not create or leave a cache \
                  entry behind -- the guard runs before any state mutation"
+            );
+        }
+
+        /// #1354: a request that violates two guards at once must surface
+        /// the *specific* error the pre-refactor call order produces, not
+        /// merely *an* error -- a single-violation suite cannot distinguish
+        /// "checks order preserved" from "checks order silently changed"
+        /// because every single-violation test still passes either way.
+        /// `logprobs` and `enable_mtp` were both checked before tokenization
+        /// in the public wrapper, `logprobs` first; an empty prompt is only
+        /// discovered afterward, inside `prepare_generation`. A caller that
+        /// sets `logprobs` on an empty-prompt request must therefore still
+        /// see the logprobs error, not "empty prompt" -- and a caller that
+        /// sets both `logprobs` and `enable_mtp` must see the logprobs
+        /// error, not the MTP one, because logprobs is checked first.
+        ///
+        /// Mutation sensitivity: folding either preflight into
+        /// `prepare_generation`'s post-tokenization `validate_capabilities`
+        /// (rather than a pre-tokenization hook) flips the empty-prompt
+        /// cases to `Err(Inference("empty prompt"))`; swapping the
+        /// logprobs/MTP check order flips the combined case to the MTP
+        /// error text.
+        #[test]
+        fn generate_streaming_with_prefix_cache_multi_violation_requests_return_the_earlier_guards_error()
+         {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+
+            // logprobs + enable_mtp both set: logprobs must win (checked first).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let both_capabilities_cfg = GenerateConfig {
+                enable_mtp: Some(true),
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "a",
+                &tokenizer,
+                &both_capabilities_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("logprobs")
+                ),
+                "logprobs and enable_mtp set together must reject with the \
+                 logprobs error (checked before MTP); got {result:?}"
+            );
+
+            // logprobs set + empty prompt: logprobs must win (checked before
+            // tokenization discovers the prompt is empty).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let logprobs_and_empty_cfg = GenerateConfig {
+                logprobs: Some(0),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &logprobs_and_empty_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("logprobs")
+                ),
+                "logprobs set on an empty-prompt request must reject with the \
+                 logprobs error, not \"empty prompt\"; got {result:?}"
+            );
+
+            // enable_mtp set + empty prompt: MTP must win (checked before
+            // tokenization discovers the prompt is empty).
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let mtp_and_empty_cfg = GenerateConfig {
+                enable_mtp: Some(true),
+                ..cross_turn_test_gen_cfg(1, 2)
+            };
+            let result = state.generate_streaming_with_prefix_cache(
+                slot_id,
+                "",
+                &tokenizer,
+                &mtp_and_empty_cfg,
+                |_, _| true,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(InferenceError::InvalidInput(ref msg)) if msg.contains("enable_mtp")
+                ),
+                "enable_mtp set on an empty-prompt request must reject with \
+                 the MTP error, not \"empty prompt\"; got {result:?}"
+            );
+        }
+
+        /// #827: `generate_streaming_with_prefix_cache_and_cancel_inner` was
+        /// the last of the seven Qwen3.5 generation entry points that did not
+        /// route through the shared `prepare_generation` preparation --
+        /// it derived its RNG seed with its own inline copy of the
+        /// normalize-seed arithmetic instead. This is a behavioural check,
+        /// not a textual one (grepping the source for `prepare_generation`
+        /// would prove the call is written, not that admission actually
+        /// runs through it): it drives the already-migrated
+        /// `generate_streaming_with_cancel` sibling and the prefix-cache
+        /// entry point with the identical over-budget prompt/config on
+        /// identically-configured fixtures, and asserts both reject with
+        /// the exact same `check_context_budget` text -- the shared
+        /// `Self::MetalDirect | Self::MetalStreaming | Self::MetalPrefixCacheStreaming`
+        /// arm `validate_context` owns inside `prepare_generation` (#1354).
+        /// Both entry points now resolve that arm through the one shared
+        /// call site instead of two independently maintained copies, so a
+        /// future change to the bound (or to which contract either path is
+        /// threaded through) cannot silently diverge between the two
+        /// without this test catching it.
+        #[test]
+        fn generate_streaming_with_prefix_cache_context_rejection_matches_migrated_sibling() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let gen_cfg = cross_turn_test_gen_cfg(1, 1);
+            let over_budget_prompt = "a".repeat(32);
+
+            let mut streaming =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let streaming_result = streaming.generate_streaming_with_cancel(
+                &over_budget_prompt,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+                || false,
+            );
+            assert_context_budget_error(&streaming_result, 32, 1, 32);
+
+            let mut cached =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let cached_result = cached.generate_streaming_with_prefix_cache(
+                slot_id,
+                &over_budget_prompt,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+            assert_context_budget_error(&cached_result, 32, 1, 32);
+
+            let (
+                Err(InferenceError::Inference(streaming_msg)),
+                Err(InferenceError::Inference(cached_msg)),
+            ) = (&streaming_result, &cached_result)
+            else {
+                panic!(
+                    "both entry points must reject with InferenceError::Inference; \
+                     got streaming={streaming_result:?} cached={cached_result:?}"
+                );
+            };
+            assert_eq!(
+                streaming_msg, cached_msg,
+                "generate_streaming_with_prefix_cache_and_cancel must reject an \
+                 over-budget prompt with the exact same check_context_budget text \
+                 generate_streaming_with_cancel produces (#827): both route \
+                 through prepare_generation's shared validate_context arm, \
+                 albeit via different contract variants \
+                 (MetalStreaming / MetalPrefixCacheStreaming, #1354)"
             );
         }
 
@@ -36923,8 +35177,8 @@ mod multimodal_preflight_tests {
 // `generate`, `generate_streaming_with_cancel`, and
 // `generate_streaming_with_prefix_cache_inner` all apply grammar masking via
 // `GrammarEngine::mask_logits`, which sets every disallowed logit position to
-// `f32::NEG_INFINITY`. `crate::model::qwen35::generation` and `crate::generate`
-// (the CPU paths) each guard every `mask_logits` call with a `has_finite_logit`
+// `f32::NEG_INFINITY`. `crate::model::qwen35::generation` (the canonical CPU path)
+// guards every `mask_logits` call with a `has_finite_logit`
 // check and fail closed with `InferenceError::GrammarConstraintBlocked` when
 // the grammar blocks every token — otherwise the sampler's non-finite-max short-circuit
 // would silently return the first candidate's token id (numerically safe, but
@@ -37049,11 +35303,10 @@ pub enum MtpRoundOutcome {
 ///   choice for the draft position, replaces the rejected draft).
 /// * `is_stop` – Returns `true` for EOS / stop-token IDs.
 ///
-/// # Stop-token contract (#613, matches plain greedy `generate()`)
+/// # Stop-token contract (#613, matches canonical plain greedy generation)
 ///
 /// Plain greedy never appends the terminating stop token to the output
-/// (generate.rs checks `config.eos_token_id == Some(token)` *before*
-/// `generated_ids.push(token)` and skips the push on a match). This function
+/// (it checks the stop condition before appending the token). This function
 /// honours the same invariant for every terminal case: a token that is itself
 /// a stop token is never included in the emitted vector.
 ///
@@ -37130,6 +35383,7 @@ pub fn mtp_greedy_round(
 
 /// Which logical traffic bucket a GDN state access belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GdnStateTrafficScope {
     /// Normal single-token decode (`forward_step`, self-spec draft/fallback).
     Decode,
@@ -37610,6 +35864,22 @@ impl MetalQwen35State {
         0
     }
 
+    /// **Unstable**: hidden size stub; always 0 without metal-gpu feature.
+    pub fn hidden_size(&self) -> usize {
+        0
+    }
+
+    /// **Stable**: pooled-embedding stub; always errors without metal-gpu feature.
+    pub fn embed_tokens(
+        &mut self,
+        _tokens: &[u32],
+        _pooling: crate::model::qwen35::HiddenPooling,
+    ) -> Result<Vec<f32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
     /// **Unstable**: Metal Q4 per-token NLL stub; always errors without metal-gpu feature.
     pub fn compute_token_nlls(
         &mut self,
@@ -37771,7 +36041,7 @@ mod mtp_greedy_round_tests {
     // greedily pick argmax at each position, stop when argmax is a stop
     // token (excluding that stop token from the output), or at max_len.
     //
-    // Stop-token contract (#613): matches generate.rs's fixed logic — the
+    // Stop-token contract (#613): the
     // is_stop check happens BEFORE the push, so a stop token is never
     // present in `token_ids`/`text`. The stop still consumes the position
     // (an "attempt" within max_len), it's just not emitted.
@@ -38677,7 +36947,7 @@ mod mtp_greedy_round_tests {
 // post-fix decision logic for each termination path WITHOUT re-deriving it from
 // the buggy pre-fix code, so it acts as an independent reference.
 //
-// Stop-token contract (#613, matches generate.rs / GenerateOutput docs): the
+// Stop-token contract (#613, matches canonical GenerateOutput docs): the
 // terminating token is EXCLUDED from token_ids/text at every termination path:
 //   A:  prefill argmax is stop → emit [], generated_tokens = 0.
 //   R:  rejection: target replacement is stop → emit [pending] (replacement excluded).

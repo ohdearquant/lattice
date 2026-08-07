@@ -27,6 +27,8 @@ fn main() {
         if dir.join("model.safetensors").exists() {
             println!("--- Pure Rust (Accelerate AMX) ---");
             let t0 = Instant::now();
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
             let model = lattice_inference::QwenModel::from_directory(dir).unwrap();
             println!("  Load: {:.0}ms", t0.elapsed().as_millis());
 

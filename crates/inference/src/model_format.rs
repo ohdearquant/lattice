@@ -32,6 +32,7 @@ use std::path::Path;
 
 /// The on-disk format of a model directory, decided before any tensor I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ModelFormat {
     /// `model.safetensors` or `model.safetensors.index.json` present.
     Safetensors,

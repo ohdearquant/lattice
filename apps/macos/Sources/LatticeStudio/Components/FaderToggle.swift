@@ -154,6 +154,7 @@ struct FaderToggle: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("FaderToggle") {
     @Previewable @State var isOnB: Bool = false
 
@@ -182,3 +183,4 @@ struct FaderToggle: View {
     .background(Theme.Palette.canvas)
     .frame(width: 400)
 }
+#endif
