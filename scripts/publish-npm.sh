@@ -53,17 +53,43 @@ NATIVE_DIR="$ROOT/npm/lattice-embed-native"
 ( cd "$NATIVE_DIR" && npm run artifacts >/dev/null 2>&1 || true )
 
 # Require every platform advertised in the main package's
-# optionalDependencies to carry its native binary -- not any nonempty subset.
+# optionalDependencies to carry its native binary -- not any nonempty subset,
+# and not a zero-length set either (an empty optionalDependencies object is
+# valid JSON and iterates zero times, which would otherwise publish the wasm
+# and native-main packages with no platform binaries backing them at all).
 # The real publish path only ever runs in CI against the full napi build
-# matrix; a partial local checkout must fail closed here rather than
-# silently release a package whose optionalDependencies point at platforms
-# nobody published this round.
+# matrix; a partial or empty local checkout must fail closed here rather
+# than silently release a package whose optionalDependencies point at
+# platforms nobody published this round.
+#
+# Per platform, require the EXACT .node file that platform package's own
+# "main" field names -- not any *.node match, so a stale or misnamed binary
+# left over from a previous build fails closed instead of passing an
+# existence glob -- and require that package's declared name and version to
+# agree with the platform key and the main package's version. Finally replay
+# the same packlist content guard CI's package job runs
+# (assert-platform-packlist.mjs) directly here, so a bare `make publish-npm`
+# -- which never touches npm-prebuild.yml -- gets it too instead of skipping
+# straight to a real publish untested.
+# selftest-extraction-marker: PLATFORM_MATRIX_GUARD_BEGIN
 EXPECTED_PLATFORMS=$(node -p "Object.keys(require('$NATIVE_DIR/package.json').optionalDependencies).map(n => n.replace('@khive-ai/lattice-embed-', '')).join(' ')")
+
+if [ -z "$EXPECTED_PLATFORMS" ]; then
+    echo "ERROR: $NATIVE_DIR/package.json optionalDependencies is empty -- refusing to" >&2
+    echo "       publish a native release with zero platform binaries. A real release" >&2
+    echo "       always lists every supported napi target there; an empty set means the" >&2
+    echo "       checkout or the metadata itself is broken, not that this round has no" >&2
+    echo "       platform binaries to ship." >&2
+    exit 1
+fi
+
+NATIVE_VERSION=$(node -p "require('$NATIVE_DIR/package.json').version")
 
 PLATFORM_DIRS=""
 for platform in $EXPECTED_PLATFORMS; do
     pkgdir="$NATIVE_DIR/npm/$platform/"
-    if [ ! -d "$pkgdir" ] || ! ls "$pkgdir"*.node >/dev/null 2>&1; then
+    pkgjson="${pkgdir}package.json"
+    if [ ! -f "$pkgjson" ]; then
         echo "ERROR: missing native binary for platform '$platform' under $pkgdir" >&2
         echo "       the release must include every platform listed in" >&2
         echo "       $NATIVE_DIR/package.json optionalDependencies, not a subset." >&2
@@ -72,8 +98,53 @@ for platform in $EXPECTED_PLATFORMS; do
         echo "       the npm-native-prebuilds artifact first." >&2
         exit 1
     fi
+
+    node_rel=$(node -p "require('$pkgjson').main || ''")
+    node_path="${pkgdir}${node_rel}"
+    if [ -z "$node_rel" ] || [ ! -f "$node_path" ]; then
+        echo "ERROR: missing native binary for platform '$platform': expected $node_path" >&2
+        echo "       (the exact filename $pkgjson's \"main\" field names), not any *.node match." >&2
+        echo "       Cross-platform binaries come from the napi build matrix in CI;" >&2
+        echo "       run this from npm-prebuild.yml's publish job, which downloads" >&2
+        echo "       the npm-native-prebuilds artifact first." >&2
+        exit 1
+    fi
+
+    plat_name=$(node -p "require('$pkgjson').name")
+    expected_name="@khive-ai/lattice-embed-$platform"
+    if [ "$plat_name" != "$expected_name" ]; then
+        echo "ERROR: $pkgjson has name '$plat_name', expected '$expected_name' for" >&2
+        echo "       platform '$platform'." >&2
+        exit 1
+    fi
+
+    plat_version=$(node -p "require('$pkgjson').version")
+    if [ "$plat_version" != "$NATIVE_VERSION" ]; then
+        echo "ERROR: $pkgjson is at version $plat_version, but $NATIVE_DIR/package.json" >&2
+        echo "       is at $NATIVE_VERSION. Platform packages must move in lockstep with" >&2
+        echo "       the main native package." >&2
+        exit 1
+    fi
+
+    # The lookup's nonzero status must not trigger errexit here either --
+    # land it in an `if` condition, same reasoning as check_version_available
+    # below.
+    if ! pack_json=$(cd "$pkgdir" && npm pack --dry-run --json 2>/dev/null); then
+        echo "ERROR: npm pack --dry-run failed for platform '$platform' under $pkgdir" >&2
+        exit 1
+    fi
+    if ! printf '%s' "$pack_json" | node "$NATIVE_DIR/scripts/assert-platform-packlist.mjs" >/dev/null; then
+        echo "ERROR: platform packlist guard failed for '$platform' under $pkgdir -- the" >&2
+        echo "       packed tarball did not contain exactly package.json + one .node file" >&2
+        echo "       (+ optional README). Re-run 'cd $pkgdir && npm pack --dry-run --json |" >&2
+        echo "       node $NATIVE_DIR/scripts/assert-platform-packlist.mjs' to see the" >&2
+        echo "       assertion detail." >&2
+        exit 1
+    fi
+
     PLATFORM_DIRS="$PLATFORM_DIRS $pkgdir"
 done
+# selftest-extraction-marker: PLATFORM_MATRIX_GUARD_END
 
 # ---- Preflight: verify none of the packages we're about to publish already
 # exist on npm. name@version tuples are immutable, so a collision discovered
