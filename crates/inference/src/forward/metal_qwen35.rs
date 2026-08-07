@@ -12822,28 +12822,50 @@ mod inner {
             crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
             crate::model::qwen35::check_mtp_not_requested(gen_cfg)?;
 
-            let input = tokenizer.tokenize(prompt);
-            let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
-
-            // #856: empty prompt is rejected here too, same reasoning as the
-            // two preflights above (PR #787) -- `_inner` no longer special-
-            // cases an empty prompt as an early `Ok` (it now unifies on this
-            // exact typed `Err` like every other entry point, see
-            // `check_prompt_not_empty` and docs/generation-entrypoint-matrix.md
-            // row 2), so this must reject before `_inner` is even called, or
-            // the rejection would flow through the destructive `Err`-recovery
-            // match below and evict a valid pre-existing cross-turn entry
-            // this call never touched.
-            crate::model::qwen35::check_prompt_not_empty(prompt_ids.len())?;
-
-            if gen_cfg.max_new_tokens > 0 {
-                crate::model::qwen35::check_context_budget(
-                    prompt_ids.len(),
-                    gen_cfg.reasoning_budget,
-                    gen_cfg.max_new_tokens,
-                    self.max_context(),
-                )?;
-            }
+            // #856/#922/#827: prompt tokenization, the empty-prompt guard, and
+            // the prompt-plus-decode-budget context bound are delegated to the
+            // same `prepare_generation` shared preparation
+            // `generate_streaming_with_cancel` already routes through, closing
+            // the last unmigrated generation entry point (issue #827). This
+            // reuses `GenerationEntryContract::MetalStreaming`: the pieces
+            // `prepare_generation` actually governs here -- tokenize,
+            // `check_prompt_not_empty`, the vocab-admission no-op, the
+            // zero-budget completion shape, and `check_context_budget` --
+            // are byte-for-byte what this entry point ran inline before. The
+            // `logprobs`/`enable_mtp` preflights above are strictly narrower
+            // than `MetalStreaming`'s permissive `validate_capabilities` (which
+            // exists because plain streaming supports both), so they stay as
+            // explicit checks here rather than folding into the contract --
+            // that keeps their current position ahead of tokenization and
+            // their current per-check error text unchanged for callers that
+            // violate more than one guard at once.
+            let prompt_prep = crate::model::qwen35::prepare_generation(
+                tokenizer,
+                prompt,
+                gen_cfg,
+                self.engine.config.vocab_size,
+                self.max_context(),
+                crate::model::qwen35::GenerationEntryContract::MetalStreaming,
+            )?;
+            let (prompt_ids, rng_state) = match prompt_prep {
+                crate::model::qwen35::GenerationPreparation::Complete(output) => {
+                    // Zero-budget requests return before any state mutation,
+                    // leaving an existing cache entry exactly as-is.
+                    return Ok(CachedGenerateOutput {
+                        cache: CrossTurnCacheStats {
+                            slot_id,
+                            prompt_tokens: output.prompt_tokens,
+                            reused_tokens: 0,
+                            prefetched_tokens: 0,
+                            mode: crate::kv_cache::PrefixReuseMode::FullRefill,
+                        },
+                        output,
+                    });
+                }
+                crate::model::qwen35::GenerationPreparation::Ready(plan) => {
+                    (plan.prompt_ids, plan.rng_state)
+                }
+            };
 
             // #835: validate the suffix a reuse plan would select for this
             // slot BEFORE calling `_inner` at all -- same reasoning as the
@@ -12857,15 +12879,17 @@ mod inner {
             // reachable), or a valid pre-existing cross-turn entry this call
             // never touched would be destroyed alongside it.
             //
-            if gen_cfg.max_new_tokens > 0 {
-                let metadata = self.cross_turn_metadata(tokenizer);
-                let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
-                self.plan_prefix_request(&prompt_ids, &plan)?;
-            }
+            // `prepare_generation`'s zero-budget short-circuit above already
+            // returned for `max_new_tokens == 0`, so `max_new_tokens > 0` is
+            // guaranteed from here on.
+            let metadata = self.cross_turn_metadata(tokenizer);
+            let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
+            self.plan_prefix_request(&prompt_ids, &plan)?;
 
             match self.generate_streaming_with_prefix_cache_and_cancel_inner(
                 slot_id,
                 prompt_ids,
+                rng_state,
                 tokenizer,
                 gen_cfg,
                 on_token,
@@ -12887,6 +12911,7 @@ mod inner {
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
             prompt_ids: Vec<u32>,
+            mut rng_state: u64,
             tokenizer: &BpeTokenizer,
             gen_cfg: &GenerateConfig,
             mut on_token: F,
@@ -12900,19 +12925,22 @@ mod inner {
             use crate::kv_cache::PrefixReuseMode;
 
             // The `logprobs` / `enable_mtp` / empty-prompt config preflight
-            // checks (PR #787, #856), and the suffix-content preflight below
-            // (#835), live in the public wrapper
-            // `generate_streaming_with_prefix_cache_and_cancel`, not here:
-            // that wrapper's error-recovery path unconditionally evicts the
-            // cache slot on any `Err` from this function, so a
+            // checks (PR #787, #856), the shared-preparation `rng_state`
+            // normalization and zero-budget short-circuit (#827), and the
+            // suffix-content preflight below (#835), live in the public
+            // wrapper `generate_streaming_with_prefix_cache_and_cancel`, not
+            // here: that wrapper's error-recovery path unconditionally
+            // evicts the cache slot on any `Err` from this function, so a
             // preflight-only rejection must never reach `_inner` in the first
             // place, or a valid pre-existing cross-turn entry this call never
-            // touched would be destroyed alongside it. `prompt_ids` arrives
-            // already tokenized by the wrapper (which needs them to run that
-            // preflight) so this function never re-tokenizes `prompt`, and
-            // is therefore guaranteed non-empty by the time it reaches this
-            // function -- unlike `logprobs`/`enable_mtp`/suffix-content,
-            // empty-prompt has no cheap "run it again here as defense in
+            // touched would be destroyed alongside it. `prompt_ids` and
+            // `rng_state` arrive already computed by the wrapper's
+            // `prepare_generation` call (which needs `prompt_ids` to run that
+            // preflight) so this function never re-tokenizes `prompt` and
+            // never re-derives the seed, and both are therefore guaranteed
+            // non-empty / normalized by the time they reach this function --
+            // unlike `logprobs`/`enable_mtp`/suffix-content, empty-prompt and
+            // zero-budget have no cheap "run it again here as defense in
             // depth" form: any duplicate check inside `_inner` would have to
             // return `Err`, and an `Err` from `_inner` is exactly what the
             // wrapper's blanket eviction match treats as cache-invalidating.
@@ -12923,53 +12951,18 @@ mod inner {
 
             let cfg = self.engine.config.clone();
 
-            let mut rng_state = match gen_cfg.seed {
-                Some(s) => {
-                    if s == 0 {
-                        1
-                    } else {
-                        s
-                    }
-                }
-                None => {
-                    use std::time::SystemTime;
-                    let t = SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .map(|d| d.as_nanos() as u64)
-                        .unwrap_or(0x12345678_9abcdef0);
-                    if t == 0 { 1 } else { t }
-                }
-            };
-
             let prompt_len = prompt_ids.len();
             debug_assert!(
                 prompt_len > 0,
                 "the wrapper's check_prompt_not_empty (#856) must reject an \
                  empty prompt before calling _inner"
             );
+            debug_assert!(
+                gen_cfg.max_new_tokens > 0,
+                "the wrapper's prepare_generation zero-budget short-circuit \
+                 (#827) must return before calling _inner"
+            );
 
-            // Zero-budget requests return before any state mutation, leaving an
-            // existing cache entry exactly as-is.
-            if gen_cfg.max_new_tokens == 0 {
-                return Ok(CachedGenerateOutput {
-                    output: GenerateOutput {
-                        text: String::new(),
-                        token_ids: vec![],
-                        prompt_tokens: prompt_len,
-                        generated_tokens: 0,
-                        stopped: false,
-                        stop_reason: Some(StopReason::Length),
-                        token_logprobs: vec![],
-                    },
-                    cache: CrossTurnCacheStats {
-                        slot_id,
-                        prompt_tokens: prompt_len,
-                        reused_tokens: 0,
-                        prefetched_tokens: 0,
-                        mode: PrefixReuseMode::FullRefill,
-                    },
-                });
-            }
             let metadata = self.cross_turn_metadata(tokenizer);
             let plan = self.plan_cross_turn_reuse(slot_id, &metadata, &prompt_ids);
 
@@ -32457,6 +32450,87 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 state.cross_turn_prefix_cache.entry.is_none(),
                 "an MTP-rejected call must not create or leave a cache \
                  entry behind -- the guard runs before any state mutation"
+            );
+        }
+
+        /// #827: `generate_streaming_with_prefix_cache_and_cancel_inner` was
+        /// the last of the seven Qwen3.5 generation entry points that did not
+        /// route through the shared `prepare_generation` preparation --
+        /// it derived its RNG seed with its own inline copy of the
+        /// normalize-seed arithmetic instead. This is a behavioural check,
+        /// not a textual one (grepping the source for `prepare_generation`
+        /// would prove the call is written, not that admission actually
+        /// runs through it): it drives the already-migrated
+        /// `generate_streaming_with_cancel` sibling and the prefix-cache
+        /// entry point with the identical over-budget prompt/config on
+        /// identically-configured fixtures, and asserts both reject with
+        /// the exact same `check_context_budget` text -- the arm
+        /// `GenerationEntryContract::MetalStreaming`'s `validate_context`
+        /// owns inside `prepare_generation`. Both entry points now resolve
+        /// that arm through the one shared call site instead of two
+        /// independently maintained copies, so a future change to the
+        /// bound (or to which contract this path is threaded through)
+        /// cannot silently diverge between the two without this test
+        /// catching it.
+        #[test]
+        fn generate_streaming_with_prefix_cache_context_rejection_matches_migrated_sibling() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+
+            use crate::error::InferenceError;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let gen_cfg = cross_turn_test_gen_cfg(1, 1);
+            let over_budget_prompt = "a".repeat(32);
+
+            let mut streaming =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let streaming_result = streaming.generate_streaming_with_cancel(
+                &over_budget_prompt,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+                || false,
+            );
+            assert_context_budget_error(&streaming_result, 32, 1, 32);
+
+            let mut cached =
+                MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
+            let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
+            let cached_result = cached.generate_streaming_with_prefix_cache(
+                slot_id,
+                &over_budget_prompt,
+                &tokenizer,
+                &gen_cfg,
+                |_, _| true,
+            );
+            assert_context_budget_error(&cached_result, 32, 1, 32);
+
+            let (
+                Err(InferenceError::Inference(streaming_msg)),
+                Err(InferenceError::Inference(cached_msg)),
+            ) = (&streaming_result, &cached_result)
+            else {
+                panic!(
+                    "both entry points must reject with InferenceError::Inference; \
+                     got streaming={streaming_result:?} cached={cached_result:?}"
+                );
+            };
+            assert_eq!(
+                streaming_msg, cached_msg,
+                "generate_streaming_with_prefix_cache_and_cancel must reject an \
+                 over-budget prompt with the exact same check_context_budget text \
+                 generate_streaming_with_cancel produces (#827): both now route \
+                 through the same prepare_generation(..., \
+                 GenerationEntryContract::MetalStreaming) call"
             );
         }
 
