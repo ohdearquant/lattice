@@ -95,7 +95,13 @@ use preprocess::PreprocessConfig;
 use vit::{ViT, VisionWeights};
 
 /// Errors produced by the vision encoder pipeline.
+///
+/// Marked `#[non_exhaustive]` so that distinguishing a new failure mode is a
+/// minor change rather than a major one. Adding `DimensionsExceeded` was a
+/// breaking change only because this enum was exhaustive; that cost is paid
+/// once here.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum VisionError {
     /// Raw image bytes could not be decoded (unsupported format, corrupt data).
     ImageDecode(String),
