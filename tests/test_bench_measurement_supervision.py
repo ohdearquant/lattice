@@ -995,13 +995,24 @@ class InventoryContract(unittest.TestCase):
                 final_measurement = max(measurements)
                 self.assertGreater(final_probe, final_measurement)
                 if path == "scripts/bench-gate.sh":
-                    gate_calls = [
-                        line_number
+                    gate_invocations = [
+                        (line_number, _shell_command_argv(tokens))
                         for line_number, tokens in commands
-                        if _shell_command_argv(tokens)[:2]
-                        == ["python3", "scripts/perf-bench-gate.py"]
+                        if len(_shell_command_argv(tokens)) >= 2
+                        and _shell_command_argv(tokens)[1]
+                        == "scripts/perf-bench-gate.py"
                     ]
+                    gate_calls = [line_number for line_number, _ in gate_invocations]
                     self.assertTrue(gate_calls)
+                    # The interpreter is resolved by the harness, not taken from
+                    # PATH: a bare python3 here is the defect this asserts against.
+                    self.assertFalse(
+                        [
+                            line_number
+                            for line_number, argv in gate_invocations
+                            if argv[0].strip('"') == "python3"
+                        ]
+                    )
                     self.assertLess(
                         final_probe,
                         min(gate_calls),

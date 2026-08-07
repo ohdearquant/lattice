@@ -480,7 +480,6 @@ fn is_accepting(state: &GrammarState, grammar: &CompiledGrammar) -> bool {
         if frame.alt_idx >= rule.alts.len() {
             return false;
         }
-        let alt = &rule.alts[frame.alt_idx];
         // Non-top frames: the child frame is handling the symbol at sym_pos,
         // so check nullable from sym_pos + 1.
         // Top frame: check nullable from sym_pos itself.
@@ -489,60 +488,171 @@ fn is_accepting(state: &GrammarState, grammar: &CompiledGrammar) -> bool {
         } else {
             frame.sym_pos + 1
         };
-        if !remaining_is_nullable(
-            grammar,
-            alt,
-            check_from,
-            &mut std::collections::HashSet::new(),
-        ) {
+        if !remaining_is_nullable(grammar, frame.rule_id, frame.alt_idx, check_from) {
             return false;
         }
     }
     true
 }
 
-/// Returns true if the symbols `alt[pos..]` can all derive the empty string.
-fn remaining_is_nullable(
-    grammar: &CompiledGrammar,
-    alt: &[Symbol],
-    pos: usize,
-    visited: &mut std::collections::HashSet<usize>,
-) -> bool {
-    for sym in &alt[pos..] {
-        match sym {
-            Symbol::Terminal(_) | Symbol::AnyByte => return false,
-            Symbol::NonTerminal(rid) => {
-                if !visited.insert(*rid) {
-                    // Already checking this rule (cycle): conservatively non-nullable.
-                    return false;
-                }
-                if !rule_is_nullable(grammar, *rid, visited) {
-                    visited.remove(rid);
-                    return false;
-                }
-                visited.remove(rid);
-            }
-        }
-    }
-    true
+#[derive(Clone, Copy)]
+enum NullableFrame {
+    /// Checking whether `grammar.rules[rule_id].alts[alt_idx][pos..]` is nullable.
+    Alt {
+        rule_id: usize,
+        alt_idx: usize,
+        pos: usize,
+    },
+    /// Checking whether any of `grammar.rules[rule_id].alts[alt_idx..]` is nullable.
+    Rule { rule_id: usize, alt_idx: usize },
 }
 
-/// Returns true if rule `rule_id` has at least one alternative that can
-/// derive the empty string.
-fn rule_is_nullable(
+std::thread_local! {
+    /// Per-thread worklist + cycle-guard for `remaining_is_nullable`, reused
+    /// across calls instead of allocated fresh each time.
+    ///
+    /// `is_accepting` calls this function once per PDA stack frame, and
+    /// `is_accepting` itself runs after every accepted byte (`advance_byte`)
+    /// and at grammar-state construction (`initial_grammar_state`) — a
+    /// per-candidate-token hot path (see `grammar_mask_bench`). A fresh
+    /// `Vec`/`HashSet` per call put a guaranteed heap allocation on that path
+    /// even for the overwhelmingly common shallow (depth-1, no `NonTerminal`)
+    /// case. Reusing thread-local buffers keeps the walk itself unchanged —
+    /// still an explicit heap-backed worklist, never native recursion — while
+    /// making the allocation one-time-per-thread instead of one-time-per-call:
+    /// `clear()` retains capacity, so after the first call reaches a given
+    /// depth, subsequent calls (including calls as deep as
+    /// `deeply_nested_nullable_chain_accepts_on_bounded_stack`'s
+    /// `MAX_PDA_DEPTH`-length chain) reuse that capacity with zero further
+    /// allocation. `remaining_is_nullable` does not call itself or otherwise
+    /// re-enter this function while a borrow is live, so `borrow_mut` never
+    /// contends within one thread; each thread gets its own buffers, so
+    /// parallel-beam grammar tracking across threads never contends either.
+    static NULLABLE_SCRATCH: std::cell::RefCell<(Vec<NullableFrame>, std::collections::HashSet<usize>)> =
+        std::cell::RefCell::new((Vec::new(), std::collections::HashSet::new()));
+}
+
+/// Returns true if `grammar.rules[rule_id].alts[alt_idx][pos..]` can derive
+/// the empty string, i.e. every remaining symbol is nullable.
+///
+/// This mirrors the natural mutually-recursive definition (an alt is nullable
+/// iff every remaining symbol is nullable; a non-terminal is nullable iff
+/// *some* alternative of the rule it names is nullable) but walks an explicit,
+/// heap-allocated worklist (`stack`) instead of native call frames. A cyclic
+/// grammar is bounded by the per-path `visited` guard below, same as before;
+/// an *acyclic* grammar is bounded by the number of distinct rules it can
+/// reference on one path (at most `grammar.rules.len()`), since `visited`
+/// forbids revisiting a rule id — either way the frames live on `stack`, not
+/// the native stack, so neither shape can overflow it. `MAX_PDA_DEPTH` is a
+/// different bound (the live PDA execution stack) and does not apply here.
+fn remaining_is_nullable(
     grammar: &CompiledGrammar,
     rule_id: usize,
-    visited: &mut std::collections::HashSet<usize>,
+    alt_idx: usize,
+    pos: usize,
 ) -> bool {
-    if rule_id >= grammar.rules.len() {
-        return false;
-    }
-    for alt in &grammar.rules[rule_id].alts {
-        if remaining_is_nullable(grammar, alt, 0, visited) {
-            return true;
+    use NullableFrame as Frame;
+
+    NULLABLE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let (stack, visited) = &mut *scratch;
+        stack.clear();
+        visited.clear();
+        stack.push(Frame::Alt {
+            rule_id,
+            alt_idx,
+            pos,
+        });
+        // The boolean result of the frame that just finished, to be consumed
+        // by the frame now on top of `stack`.
+        let mut pending: Option<bool> = None;
+
+        loop {
+            let Some(&frame) = stack.last() else {
+                return pending.unwrap_or(true);
+            };
+            match frame {
+                Frame::Alt {
+                    rule_id,
+                    alt_idx,
+                    mut pos,
+                } => {
+                    let alt = &grammar.rules[rule_id].alts[alt_idx];
+                    if let Some(sub) = pending.take() {
+                        // Resuming after the NonTerminal at `pos` was checked.
+                        if let Symbol::NonTerminal(rid) = alt[pos] {
+                            visited.remove(&rid);
+                        }
+                        if !sub {
+                            stack.pop();
+                            pending = Some(false);
+                            continue;
+                        }
+                        pos += 1;
+                    }
+                    match alt.get(pos) {
+                        None => {
+                            stack.pop();
+                            pending = Some(true);
+                        }
+                        Some(Symbol::Terminal(_)) | Some(Symbol::AnyByte) => {
+                            stack.pop();
+                            pending = Some(false);
+                        }
+                        Some(Symbol::NonTerminal(rid)) => {
+                            let rid = *rid;
+                            // Persist the (possibly advanced) `pos` before descending.
+                            *stack.last_mut().unwrap() = Frame::Alt {
+                                rule_id,
+                                alt_idx,
+                                pos,
+                            };
+                            if !visited.insert(rid) {
+                                // Already checking this rule on this path (cycle):
+                                // conservatively non-nullable.
+                                stack.pop();
+                                pending = Some(false);
+                            } else {
+                                stack.push(Frame::Rule {
+                                    rule_id: rid,
+                                    alt_idx: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+                Frame::Rule {
+                    rule_id,
+                    mut alt_idx,
+                } => {
+                    if let Some(sub) = pending.take() {
+                        if sub {
+                            stack.pop();
+                            pending = Some(true);
+                            continue;
+                        }
+                        alt_idx += 1;
+                    }
+                    let Some(rule) = grammar.rules.get(rule_id) else {
+                        stack.pop();
+                        pending = Some(false);
+                        continue;
+                    };
+                    if alt_idx >= rule.alts.len() {
+                        stack.pop();
+                        pending = Some(false);
+                    } else {
+                        *stack.last_mut().unwrap() = Frame::Rule { rule_id, alt_idx };
+                        stack.push(Frame::Alt {
+                            rule_id,
+                            alt_idx,
+                            pos: 0,
+                        });
+                    }
+                }
+            }
         }
-    }
-    false
+    })
 }
 
 /// Simulate advancing the PDA from `state` by consuming all bytes of `token`.
@@ -935,6 +1045,42 @@ mod tests {
             .expect("bounded-stack regression thread spawns")
             .join()
             .expect("iterative fallback must not overflow the bounded stack");
+    }
+
+    /// A long *acyclic* chain of distinct nullable wrapper rules has no cycle
+    /// for `remaining_is_nullable`'s `visited` guard to catch, so unlike the
+    /// cyclic case its only historical bound was call-frame depth.
+    /// `is_accepting` runs on `initial_grammar_state`, before any byte is
+    /// consumed — a single-frame state referencing the head of such a chain
+    /// must not overflow the native stack even though `state.stack.len()`
+    /// never leaves 1 (the nullability walk descends the *static* rule graph,
+    /// not the PDA execution stack `MAX_PDA_DEPTH` bounds).
+    #[test]
+    fn deeply_nested_nullable_chain_accepts_on_bounded_stack() {
+        let depth = MAX_PDA_DEPTH;
+        let mut rules = Vec::with_capacity(depth);
+        for rule_id in 0..depth - 1 {
+            rules.push(Rule {
+                name: String::new(),
+                alts: vec![vec![Symbol::NonTerminal(rule_id + 1)]],
+            });
+        }
+        // The chain's tail is epsilon, so the whole chain is nullable.
+        rules.push(Rule {
+            name: String::new(),
+            alts: vec![vec![]],
+        });
+        let grammar = CompiledGrammar { rules };
+
+        std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || {
+                let state = initial_grammar_state(&grammar);
+                assert!(state.is_complete());
+            })
+            .expect("bounded-stack regression thread spawns")
+            .join()
+            .expect("iterative nullability walk must not overflow the bounded stack");
     }
 
     fn nested_terminal_grammar(depth: usize, terminal: u8) -> CompiledGrammar {

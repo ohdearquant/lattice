@@ -12,7 +12,10 @@
 # golden on the required leg, non-finite golden/tolerance).
 set -uo pipefail
 
-SRC="$(cd "$(dirname "$0")/.." && pwd)/scripts/ppl_gate_check.py"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="$REPO/scripts/ppl_gate_check.py"
+source "$REPO/scripts/lib/bench-python.sh"
+PYTHON_BIN="$(bench_require_python3 "ppl_gate_check_selftest.sh")" || exit 1
 SB="$(mktemp -d)/repo"
 mkdir -p "$SB/scripts" "$SB/target/release" \
          "$SB/crates/inference/tests/fixtures/ppl_gate_v1" \
@@ -41,7 +44,7 @@ run() {  # extra env as "KEY=VAL" args; captures combined output to $OUT, return
   OUT="$(cd "$SB" && env LATTICE_PPL_Q4_DIR="$SB/q4dir" \
         LATTICE_PPL_TOKENIZER_DIR="$SB/tokdir" \
         PPL_GATE_REPORT="$SB/report.md" "$@" \
-        python3 scripts/ppl_gate_check.py 2>&1)"
+        "$PYTHON_BIN" scripts/ppl_gate_check.py 2>&1)"
   return $?
 }
 
@@ -77,14 +80,14 @@ echo "some corpus text" > "$SB/docs/bench_results/wiki.test.raw"
 golden 16.60; stub 16.61 0
 OUT="$(cd "$SB" && env LATTICE_PPL_Q4_DIR="$SB/nonexistent" \
       LATTICE_PPL_TOKENIZER_DIR="$SB/tokdir" PPL_GATE_REPORT="$SB/report.md" \
-      python3 scripts/ppl_gate_check.py 2>&1)"
+      "$PYTHON_BIN" scripts/ppl_gate_check.py 2>&1)"
 check "q4 dir missing -> exit1" 1 $? "not a directory"
 
 # path resolution: $VAR / ~ in the env value must be expanded, not taken literally
 golden null; stub 16.60 0
 OUT="$(cd "$SB" && env LATTICE_PPL_Q4_DIR="$SB/q4dir" REALTOK="$SB/tokdir" \
       LATTICE_PPL_TOKENIZER_DIR='${REALTOK}' PPL_GATE_REPORT="$SB/report.md" \
-      python3 scripts/ppl_gate_check.py 2>&1)"
+      "$PYTHON_BIN" scripts/ppl_gate_check.py 2>&1)"
 check "env-var in path is expanded (not literal) -> exit0" 0 $? "measured PPL"
 
 golden 16.60; stub 16.61 0

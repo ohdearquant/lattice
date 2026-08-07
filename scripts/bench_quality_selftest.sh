@@ -6,6 +6,8 @@ set -uo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/scripts/bench_quality.sh"
 SRC_ROOT="${SRC%/scripts/bench_quality.sh}"
+source "$SRC_ROOT/scripts/lib/bench-python.sh"
+PYTHON_BIN="$(bench_require_python3 "bench_quality_selftest.sh")" || exit 1
 SB_ROOT="$(mktemp -d)"
 SB="$SB_ROOT/repo"
 trap 'chmod -R u+w "$SB_ROOT" 2>/dev/null; rm -rf "$SB_ROOT"' EXIT
@@ -42,7 +44,7 @@ then
   exit 1
 fi
 
-if ! python3 - \
+if ! "$PYTHON_BIN" - \
   "$SB/scripts/lib/bench-locks.py" \
   "$SB/bench-window.lock" \
   "$SB/metal-gpu.lock" \
