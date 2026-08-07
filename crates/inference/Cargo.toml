@@ -100,6 +100,15 @@ pollster = { version = "0.4", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
+# Not called directly: forces `image`'s transitive `zune-jpeg` to build with
+# its `log` feature (which pulls in `zune-core/log`) via Cargo feature
+# unification. Without it, `zune-jpeg 0.5.15` fails to compile against
+# `zune-core 0.5.2` -- a `warn!` call with no trailing semicolon is the last
+# statement of an `else` block, and with `log` off the macro expands to
+# nothing, leaving the block with no tail expression. Our lockfile pins
+# `zune-core 0.5.1` (unaffected), but `cargo-semver-checks` resolves fresh
+# and ignores the lockfile, so it hits 0.5.2 and fails.
+zune-jpeg = { version = "0.5", features = ["log"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 lattice-fann = { version = "0.9.0", path = "../fann", optional = true }
 
