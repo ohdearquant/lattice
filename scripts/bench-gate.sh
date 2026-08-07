@@ -13,15 +13,15 @@ cd "$REPO"
 if [[ -z "${PYTHON_BIN:-}" ]]; then
     if [[ -f "$REPO/scripts/lib/bench-python.sh" ]]; then
         source "$REPO/scripts/lib/bench-python.sh"
-        PYTHON_BIN="$(bench_resolve_python3)" || PYTHON_BIN="python3"
+        PYTHON_BIN="$(bench_require_python3 "bench-gate.sh")" || exit 1
     else
-        # tests/test_bench_targets.py's bench-gate-policy test strips the
-        # bench_supervise_entry call (which normally exports PYTHON_BIN) and
-        # copies only Makefile + scripts/perf-bench-gate.py into its sandbox,
-        # so scripts/lib/bench-python.sh is unreachable there. Bare python3
-        # is the only interpreter this branch can resolve to; any caller
-        # that skips both the supervisor and scripts/lib hits this fallback
-        # and the original version-floor defect reappears for it.
+        # Reached only when scripts/lib/bench-python.sh itself is missing
+        # from disk, so bench_require_python3 can't be sourced to name a
+        # floor violation. tests/test_bench_targets.py's bench-gate-policy
+        # test produces exactly that: it copies only Makefile +
+        # scripts/perf-bench-gate.py into its sandbox, so scripts/lib/ never
+        # exists there. Bare python3 is the only interpreter this branch can
+        # name.
         PYTHON_BIN="python3"
     fi
 fi
