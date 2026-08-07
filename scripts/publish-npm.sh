@@ -292,15 +292,45 @@ full_dryrun_guard() {
 
 # Guard: `npm publish --dry-run` above packs the main package but never
 # examines its contents -- it only proves the tarball builds, not that the
-# tarball's contents are correct. `npm run packlist`
-# (npm/lattice-embed-native's own assert-packlist.mjs) is the purpose-built
+# tarball's contents are correct. assert-packlist.mjs is the purpose-built
 # content guard for this package, in the same shape the platform packages
 # already get from assert-platform-packlist.mjs in npm-prebuild.yml's
-# package job. Like full_dryrun_guard, this has no explicit `exit N` and
-# relies on set -e alone -- same reasoning, called as a bare statement with
-# no `local`.
+# package job.
+#
+# This calls `npm pack --dry-run --json` directly and pipes its captured
+# output to the assertion, the same way platform_matrix_guard's packlist
+# check above does -- it does NOT run `npm run packlist` (the package.json
+# script that wraps the identical pipeline). A shell pipeline's exit status
+# is its last command's by default, so `npm pack --dry-run --json | node
+# scripts/assert-packlist.mjs` only reports node's exit code: a failing
+# `npm pack` that still emits a well-formed manifest on stdout before dying
+# lets the assertion parse that manifest, exit 0, and the pipeline reports
+# success. Capturing $pack_json in an `if VAR=$(...)` first, as done here,
+# makes the command substitution's own exit status observable and land in
+# an `if`, without errexit firing on it -- same technique
+# check_version_available uses above, and the same reason
+# platform_matrix_guard's own npm-pack call already does this rather than
+# piping. Fixing the package.json script instead (e.g. adding
+# `set -o pipefail` to the "packlist" script body) was rejected: npm invokes
+# "scripts" entries through the platform's default shell, which is not
+# guaranteed to support `set -o pipefail` (dash does not), so that fix would
+# be silently inert on some platforms; capturing and checking status here
+# needs no shell feature beyond command substitution, which every #!/bin/sh
+# implementation already provides. `npm run packlist` has no other caller in
+# this repo (grepped `.github/workflows/*.yml`, `Makefile`, and `scripts/`),
+# so bypassing it here does not change behavior anywhere else.
 main_packlist_guard() {
-    ( cd "$NATIVE_DIR" && npm run packlist )
+    if ! pack_json=$(cd "$NATIVE_DIR" && npm pack --dry-run --json 2>/dev/null); then
+        echo "ERROR: npm pack --dry-run failed for the native main package under $NATIVE_DIR" >&2
+        exit 1
+    fi
+    if ! printf '%s' "$pack_json" | node "$NATIVE_DIR/scripts/assert-packlist.mjs" >/dev/null; then
+        echo "ERROR: main packlist guard failed for $NATIVE_DIR -- the packed tarball did" >&2
+        echo "       not satisfy assert-packlist.mjs's required-file or forbidden-pattern" >&2
+        echo "       checks. Re-run 'cd $NATIVE_DIR && npm pack --dry-run --json | node" >&2
+        echo "       scripts/assert-packlist.mjs' to see the assertion detail." >&2
+        exit 1
+    fi
 }
 
 main() {

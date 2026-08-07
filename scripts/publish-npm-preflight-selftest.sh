@@ -167,17 +167,30 @@ if [ ! -f "$REAL_PACKLIST_ASSERT" ]; then
   exit 1
 fi
 
+# main_packlist_guard (unlike the old npm-run-based version) makes a real
+# `node scripts/assert-packlist.mjs` call -- not a call the generic e2e npm
+# stubs' `run) exit 0 ;;` case can absorb -- so every build_native_fixture
+# fixture needs this file present too, not just the platform-matrix ones
+# that only ever call platform_matrix_guard.
+REAL_MAIN_PACKLIST_ASSERT="$REPO/npm/lattice-embed-native/scripts/assert-packlist.mjs"
+if [ ! -f "$REAL_MAIN_PACKLIST_ASSERT" ]; then
+  echo "FATAL: $REAL_MAIN_PACKLIST_ASSERT not found -- has it moved?" >&2
+  exit 1
+fi
+
 MSB="$SB/matrix"
 mkdir -p "$MSB"
 
 # Build a fixture NATIVE_DIR ($1) whose optionalDependencies match the
 # platform/version pairs given as "$2..." (each "platform:version"). Copies
-# the real assert-platform-packlist.mjs alongside it so the packlist guard
-# step exercises the actual production check, not a stand-in.
+# the real assert-platform-packlist.mjs and assert-packlist.mjs alongside it
+# so the packlist guard steps exercise the actual production checks, not a
+# stand-in.
 build_native_fixture() {
   native="$1"; shift
   mkdir -p "$native/scripts"
   cp "$REAL_PACKLIST_ASSERT" "$native/scripts/assert-platform-packlist.mjs"
+  cp "$REAL_MAIN_PACKLIST_ASSERT" "$native/scripts/assert-packlist.mjs"
   deps=""
   sep=""
   for pv in "$@"; do
@@ -630,7 +643,12 @@ run_dryrun_case() {  # $1 = absolute dir the stub should fail in, or "" for none
   fail_dir="$1"
   cat > "$DSB/stub-bin/npm" <<EOF
 #!/usr/bin/env bash
+echo "\$*" >> "$DSB/calls.log"
 if [ "\$1" = "publish" ]; then
+  if [ "\$2" != "--dry-run" ]; then
+    echo "REAL PUBLISH DETECTED in full-dryrun-guard stub: npm \$* in \$PWD (missing --dry-run)" >&2
+    exit 98
+  fi
   if [ "\$PWD" = "$fail_dir" ]; then
     echo "npm error simulated dry-run failure for selftest arm (bb) in \$PWD" >&2
     exit 1
@@ -780,6 +798,7 @@ EGENSTUB="$SB/e2e-stub-bin"
 mkdir -p "$EGENSTUB"
 cat > "$EGENSTUB/npm" <<'NPMSTUB'
 #!/usr/bin/env bash
+echo "$*" >> "$(dirname "$0")/calls.log"
 case "$1" in
   run)
     exit 0
@@ -789,10 +808,18 @@ case "$1" in
     exit 1
     ;;
   pack)
-    echo '[{"files":[{"path":"package.json"},{"path":"lattice-embed-native.darwin-arm64.node"}]}]'
+    if [ "$(basename "$PWD")" = "lattice-embed-native" ]; then
+      echo '[{"files":[{"path":"package.json"},{"path":"README.md"},{"path":"binding.js"},{"path":"index.js"},{"path":"index.d.ts"}]}]'
+    else
+      echo '[{"files":[{"path":"package.json"},{"path":"lattice-embed-native.darwin-arm64.node"}]}]'
+    fi
     exit 0
     ;;
   publish)
+    if [ "$2" != "--dry-run" ]; then
+      echo "REAL PUBLISH DETECTED in e2e stub: npm $* in $PWD (missing --dry-run)" >&2
+      exit 98
+    fi
     exit 0
     ;;
   *)
@@ -844,6 +871,89 @@ if printf '%s' "$OUT" | grep -qF "missing native binary for platform 'darwin-arm
 else
   echo "  FAIL:   -> missing matrix-guard diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
 fi
+
+echo
+echo "=== publish-npm.sh full-script dry-run call-set wiring self-test ==="
+# (gg) and (gg2) prove the unsourced path reaches completion and fails closed
+# on a broken matrix, but neither one proves WHICH guards actually ran to get
+# there -- deleting main_packlist_guard's or full_dryrun_guard's call from
+# main() (the wiring gap Finding 4 names) still lets this well-formed fixture
+# sail through to "Dry run complete" with nothing above to notice the missing
+# call, because both arms only assert banners and an exit code. Rerun the
+# same unsourced --dry-run path with a stub that logs "$1 $2 basename($PWD)"
+# for every npm invocation it receives, then assert that the three call-site
+# families the review named -- version check (npm view), full dry run (npm
+# publish --dry-run per package), and main packlist (npm pack --dry-run
+# against the native package) -- actually landed in the log. A direct call
+# to the guard function (as the arms above (v)-(cc) do) only proves the
+# function itself works; this proves main() still reaches it.
+HSB="$SB/e2e-callset"
+mkdir -p "$HSB/repo/scripts" "$HSB/repo/npm/lattice-embed-wasm"
+cp "$SRC" "$HSB/repo/scripts/publish-npm.sh"
+chmod +x "$HSB/repo/scripts/publish-npm.sh"
+cat > "$HSB/repo/npm/lattice-embed-wasm/package.json" <<'EOF'
+{"name": "@khive-ai/lattice-fixture-wasm", "version": "1.2.3"}
+EOF
+NATIVE3="$HSB/repo/npm/lattice-embed-native"
+build_native_fixture "$NATIVE3" "darwin-arm64:1.2.3"
+add_valid_platform "$NATIVE3" "darwin-arm64" "1.2.3"
+
+HGENSTUB="$SB/e2e-callset-stub-bin"
+mkdir -p "$HGENSTUB"
+: > "$HSB/calls.log"
+cat > "$HGENSTUB/npm" <<EOF
+#!/usr/bin/env bash
+echo "\$1 \$2 \$(basename "\$PWD")" >> "$HSB/calls.log"
+case "\$1" in
+  run)
+    exit 0
+    ;;
+  view)
+    echo '{"error":{"code":"E404","summary":"Not Found"}}'
+    exit 1
+    ;;
+  pack)
+    if [ "\$(basename "\$PWD")" = "lattice-embed-native" ]; then
+      echo '[{"files":[{"path":"package.json"},{"path":"README.md"},{"path":"binding.js"},{"path":"index.js"},{"path":"index.d.ts"}]}]'
+    else
+      echo '[{"files":[{"path":"package.json"},{"path":"lattice-embed-native.darwin-arm64.node"}]}]'
+    fi
+    exit 0
+    ;;
+  publish)
+    if [ "\$2" != "--dry-run" ]; then
+      echo "REAL PUBLISH DETECTED in call-set stub: npm \$* in \$PWD (missing --dry-run)" >&2
+      exit 98
+    fi
+    exit 0
+    ;;
+  *)
+    echo "unexpected npm invocation in call-set stub: \$*" >&2
+    exit 99
+    ;;
+esac
+EOF
+chmod +x "$HGENSTUB/npm"
+
+OUT="$(cd "$HSB/repo" && PATH="$HGENSTUB:$PATH" NPM_CONFIG_CACHE="$SB/npm-cache-e2e-callset" /bin/sh scripts/publish-npm.sh --dry-run 2>&1)"
+rc=$?
+check "(hh) full script dry-run with call-logging stub reaches completion" 0 $rc
+
+CALLS="$(cat "$HSB/calls.log" 2>/dev/null)"
+assert_call() {  # $1=label $2=needle
+  if printf '%s\n' "$CALLS" | /usr/bin/grep -qF -- "$2"; then
+    echo "  PASS:   -> (hh) saw $1: $2"; pass=$((pass+1))
+  else
+    echo "  FAIL:   -> (hh) missing $1: $2 (log: $(printf '%s' "$CALLS" | tr '\n' '|'))"; fail=$((fail+1))
+  fi
+}
+assert_call "version check on the wasm package" "view @khive-ai/lattice-fixture-wasm@1.2.3"
+assert_call "version check on the platform package" "view @khive-ai/lattice-embed-darwin-arm64@1.2.3"
+assert_call "version check on the native package" "view @khive-ai/lattice-embed@1.2.3"
+assert_call "full dry run of the wasm package" "publish --dry-run lattice-embed-wasm"
+assert_call "full dry run of the platform package" "publish --dry-run darwin-arm64"
+assert_call "full dry run of the native package" "publish --dry-run lattice-embed-native"
+assert_call "main packlist run" "pack --dry-run lattice-embed-native"
 
 echo
 echo "=== marker-extraction mechanism removal self-test ==="
