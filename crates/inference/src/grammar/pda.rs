@@ -495,6 +495,43 @@ fn is_accepting(state: &GrammarState, grammar: &CompiledGrammar) -> bool {
     true
 }
 
+#[derive(Clone, Copy)]
+enum NullableFrame {
+    /// Checking whether `grammar.rules[rule_id].alts[alt_idx][pos..]` is nullable.
+    Alt {
+        rule_id: usize,
+        alt_idx: usize,
+        pos: usize,
+    },
+    /// Checking whether any of `grammar.rules[rule_id].alts[alt_idx..]` is nullable.
+    Rule { rule_id: usize, alt_idx: usize },
+}
+
+std::thread_local! {
+    /// Per-thread worklist + cycle-guard for `remaining_is_nullable`, reused
+    /// across calls instead of allocated fresh each time.
+    ///
+    /// `is_accepting` calls this function once per PDA stack frame, and
+    /// `is_accepting` itself runs after every accepted byte (`advance_byte`)
+    /// and at grammar-state construction (`initial_grammar_state`) — a
+    /// per-candidate-token hot path (see `grammar_mask_bench`). A fresh
+    /// `Vec`/`HashSet` per call put a guaranteed heap allocation on that path
+    /// even for the overwhelmingly common shallow (depth-1, no `NonTerminal`)
+    /// case. Reusing thread-local buffers keeps the walk itself unchanged —
+    /// still an explicit heap-backed worklist, never native recursion — while
+    /// making the allocation one-time-per-thread instead of one-time-per-call:
+    /// `clear()` retains capacity, so after the first call reaches a given
+    /// depth, subsequent calls (including calls as deep as
+    /// `deeply_nested_nullable_chain_accepts_on_bounded_stack`'s
+    /// `MAX_PDA_DEPTH`-length chain) reuse that capacity with zero further
+    /// allocation. `remaining_is_nullable` does not call itself or otherwise
+    /// re-enter this function while a borrow is live, so `borrow_mut` never
+    /// contends within one thread; each thread gets its own buffers, so
+    /// parallel-beam grammar tracking across threads never contends either.
+    static NULLABLE_SCRATCH: std::cell::RefCell<(Vec<NullableFrame>, std::collections::HashSet<usize>)> =
+        std::cell::RefCell::new((Vec::new(), std::collections::HashSet::new()));
+}
+
 /// Returns true if `grammar.rules[rule_id].alts[alt_idx][pos..]` can derive
 /// the empty string, i.e. every remaining symbol is nullable.
 ///
@@ -514,113 +551,108 @@ fn remaining_is_nullable(
     alt_idx: usize,
     pos: usize,
 ) -> bool {
-    #[derive(Clone, Copy)]
-    enum Frame {
-        /// Checking whether `grammar.rules[rule_id].alts[alt_idx][pos..]` is nullable.
-        Alt {
-            rule_id: usize,
-            alt_idx: usize,
-            pos: usize,
-        },
-        /// Checking whether any of `grammar.rules[rule_id].alts[alt_idx..]` is nullable.
-        Rule { rule_id: usize, alt_idx: usize },
-    }
+    use NullableFrame as Frame;
 
-    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut stack = vec![Frame::Alt {
-        rule_id,
-        alt_idx,
-        pos,
-    }];
-    // The boolean result of the frame that just finished, to be consumed by
-    // the frame now on top of `stack`.
-    let mut pending: Option<bool> = None;
+    NULLABLE_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let (stack, visited) = &mut *scratch;
+        stack.clear();
+        visited.clear();
+        stack.push(Frame::Alt {
+            rule_id,
+            alt_idx,
+            pos,
+        });
+        // The boolean result of the frame that just finished, to be consumed
+        // by the frame now on top of `stack`.
+        let mut pending: Option<bool> = None;
 
-    loop {
-        let Some(&frame) = stack.last() else {
-            return pending.unwrap_or(true);
-        };
-        match frame {
-            Frame::Alt {
-                rule_id,
-                alt_idx,
-                mut pos,
-            } => {
-                let alt = &grammar.rules[rule_id].alts[alt_idx];
-                if let Some(sub) = pending.take() {
-                    // Resuming after the NonTerminal at `pos` was checked.
-                    if let Symbol::NonTerminal(rid) = alt[pos] {
-                        visited.remove(&rid);
-                    }
-                    if !sub {
-                        stack.pop();
-                        pending = Some(false);
-                        continue;
-                    }
-                    pos += 1;
-                }
-                match alt.get(pos) {
-                    None => {
-                        stack.pop();
-                        pending = Some(true);
-                    }
-                    Some(Symbol::Terminal(_)) | Some(Symbol::AnyByte) => {
-                        stack.pop();
-                        pending = Some(false);
-                    }
-                    Some(Symbol::NonTerminal(rid)) => {
-                        let rid = *rid;
-                        // Persist the (possibly advanced) `pos` before descending.
-                        *stack.last_mut().unwrap() = Frame::Alt {
-                            rule_id,
-                            alt_idx,
-                            pos,
-                        };
-                        if !visited.insert(rid) {
-                            // Already checking this rule on this path (cycle):
-                            // conservatively non-nullable.
+        loop {
+            let Some(&frame) = stack.last() else {
+                return pending.unwrap_or(true);
+            };
+            match frame {
+                Frame::Alt {
+                    rule_id,
+                    alt_idx,
+                    mut pos,
+                } => {
+                    let alt = &grammar.rules[rule_id].alts[alt_idx];
+                    if let Some(sub) = pending.take() {
+                        // Resuming after the NonTerminal at `pos` was checked.
+                        if let Symbol::NonTerminal(rid) = alt[pos] {
+                            visited.remove(&rid);
+                        }
+                        if !sub {
                             stack.pop();
                             pending = Some(false);
-                        } else {
-                            stack.push(Frame::Rule {
-                                rule_id: rid,
-                                alt_idx: 0,
-                            });
+                            continue;
+                        }
+                        pos += 1;
+                    }
+                    match alt.get(pos) {
+                        None => {
+                            stack.pop();
+                            pending = Some(true);
+                        }
+                        Some(Symbol::Terminal(_)) | Some(Symbol::AnyByte) => {
+                            stack.pop();
+                            pending = Some(false);
+                        }
+                        Some(Symbol::NonTerminal(rid)) => {
+                            let rid = *rid;
+                            // Persist the (possibly advanced) `pos` before descending.
+                            *stack.last_mut().unwrap() = Frame::Alt {
+                                rule_id,
+                                alt_idx,
+                                pos,
+                            };
+                            if !visited.insert(rid) {
+                                // Already checking this rule on this path (cycle):
+                                // conservatively non-nullable.
+                                stack.pop();
+                                pending = Some(false);
+                            } else {
+                                stack.push(Frame::Rule {
+                                    rule_id: rid,
+                                    alt_idx: 0,
+                                });
+                            }
                         }
                     }
                 }
-            }
-            Frame::Rule {
-                rule_id,
-                mut alt_idx,
-            } => {
-                if let Some(sub) = pending.take() {
-                    if sub {
-                        stack.pop();
-                        pending = Some(true);
-                        continue;
+                Frame::Rule {
+                    rule_id,
+                    mut alt_idx,
+                } => {
+                    if let Some(sub) = pending.take() {
+                        if sub {
+                            stack.pop();
+                            pending = Some(true);
+                            continue;
+                        }
+                        alt_idx += 1;
                     }
-                    alt_idx += 1;
-                }
-                let Some(rule) = grammar.rules.get(rule_id) else {
-                    stack.pop();
-                    pending = Some(false);
-                    continue;
-                };
-                if alt_idx >= rule.alts.len() {
-                    stack.pop();
-                    pending = Some(false);
-                } else {
-                    *stack.last_mut().unwrap() = Frame::Rule { rule_id, alt_idx };
-                    stack.push(Frame::Alt {
-                        rule_id,
-                        alt_idx,
-                        pos: 0,
-                    });
+                    let Some(rule) = grammar.rules.get(rule_id) else {
+                        stack.pop();
+                        pending = Some(false);
+                        continue;
+                    };
+                    if alt_idx >= rule.alts.len() {
+                        stack.pop();
+                        pending = Some(false);
+                    } else {
+                        *stack.last_mut().unwrap() = Frame::Rule { rule_id, alt_idx };
+                        stack.push(Frame::Alt {
+                            rule_id,
+                            alt_idx,
+                            pos: 0,
+                        });
+                    }
                 }
             }
         }
-    }
+    })
 }
 
 /// Simulate advancing the PDA from `state` by consuming all bytes of `token`.
