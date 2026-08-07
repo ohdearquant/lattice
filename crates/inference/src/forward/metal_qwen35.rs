@@ -26,6 +26,7 @@
 //! q/k/v/o_proj) and embed_tokens. Buffers kept as f32: norm weights, bias/log scalars,
 //! conv1d weights (small, read by CPU), RoPE tables, activation scratch buffers.
 
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 mod mtp_weights;
 
 // -----------------------------------------------------------------------------
@@ -501,9 +502,11 @@ pub(crate) fn push_chat_generation_open(prompt: &mut String) {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     mod dispatch;
+    mod gdn_state;
     mod layers;
 
     use super::GdnStateTrafficScope;
+    use gdn_state::{MetalGdnState, MetalGdnStatePrecision, active_gdn_layer_indices};
     // Chat message types + the shared ChatML renderer (#668) live at the file
     // top level (module-scope, above `mod inner`) so CPU-only builds can
     // render through the same `format_chat_template` this Metal path uses,
@@ -1055,20 +1058,19 @@ mod inner {
     }
 
     impl MetalGdnCheckpointPool {
-        fn new(
-            device: &Device,
-            max_tokens: usize,
-            conv_bufs: &[Buffer],
-            s_matrices: &[Buffer],
-        ) -> Self {
-            let num_layers = conv_bufs.len();
+        fn new(device: &Device, max_tokens: usize, state: &MetalGdnState) -> Self {
+            let num_layers = state.len();
+            let geometry = state.geometry();
+            debug_assert_eq!(geometry.allocated_layers, num_layers);
+            debug_assert!(geometry.active_layers <= geometry.architectural_layers);
+            debug_assert_eq!(state.precision(), MetalGdnStatePrecision::F32);
             let slots = max_tokens + 1;
             let conv_slots = (0..slots)
                 .map(|slot| {
                     (0..num_layers)
                         .map(|i| {
                             let buf = device.new_buffer(
-                                conv_bufs[i].length(),
+                                state.layer(i).conv_buffer().length(),
                                 MTLResourceOptions::StorageModeShared,
                             );
                             buf.set_label(&format!("gdn_ckpt_conv_s{slot}_l{i}"));
@@ -1082,7 +1084,7 @@ mod inner {
                     (0..num_layers)
                         .map(|i| {
                             let buf = device.new_buffer(
-                                s_matrices[i].length(),
+                                state.layer(i).s_matrix().length(),
                                 MTLResourceOptions::StorageModeShared,
                             );
                             buf.set_label(&format!("gdn_ckpt_s_s{slot}_l{i}"));
@@ -1606,9 +1608,8 @@ mod inner {
         // GDN GPU scratch buffer, to be wired in a future GPU-GDN pass. Not yet
         // tracked by a filed issue.
         pub(crate) gdn_scratch: GatedDeltaNetFusedScratch,
-        pub(crate) gdn_gpu_conv_bufs: Vec<Buffer>, // [num_linear_layers] each [qkv_dim * buf_len]
-        pub(crate) gdn_gpu_s_matrices: Vec<Buffer>, // [num_linear_layers] each [num_heads * vd * kd]
-        pub(crate) gdn_gpu_conv_out: Buffer,        // [qkv_dim] temporary conv1d output
+        pub(crate) gdn_gpu_state: MetalGdnState,
+        pub(crate) gdn_gpu_conv_out: Buffer, // [qkv_dim] temporary conv1d output
         pub(crate) kv_cache: MetalKvCache,
         /// Maximum batch prefill length (activation buffers sized for this).
         pub(crate) max_prefill: usize,
@@ -3333,23 +3334,8 @@ mod inner {
                 .collect();
             let gdn_scratch = GatedDeltaNetFusedScratch::default();
 
-            let num_value_heads = cfg.linear_num_value_heads();
-            let key_dim = cfg.linear_key_head_dim;
-            let value_dim = cfg.linear_value_head_dim;
             let qkv_dim2 = cfg.linear_qkv_dim();
-            let buf_len = cfg.linear_conv_kernel_dim.saturating_sub(1);
-            let gdn_gpu_conv_bufs: Vec<Buffer> = (0..num_linear)
-                .map(|i| make_zero_buffer(device, qkv_dim2 * buf_len, &format!("gdn_conv_{i}")))
-                .collect();
-            let gdn_gpu_s_matrices: Vec<Buffer> = (0..num_linear)
-                .map(|i| {
-                    make_zero_buffer(
-                        device,
-                        num_value_heads * value_dim * key_dim,
-                        &format!("gdn_s_{i}"),
-                    )
-                })
-                .collect();
+            let gdn_gpu_state = MetalGdnState::new(device, cfg, num_linear);
             let gdn_gpu_conv_out = make_zero_buffer(device, qkv_dim2, "gdn_conv_out");
             let kv_cache = MetalKvCache::new(device, num_full, kv_dim, max_cache_len, use_kv_f16);
 
@@ -3399,8 +3385,7 @@ mod inner {
                 Some(MetalGdnCheckpointPool::new(
                     device,
                     checkpoint_max_tokens,
-                    &gdn_gpu_conv_bufs,
-                    &gdn_gpu_s_matrices,
+                    &gdn_gpu_state,
                 ))
             } else {
                 None
@@ -3410,8 +3395,7 @@ mod inner {
                 activations,
                 gdn_states,
                 gdn_scratch,
-                gdn_gpu_conv_bufs,
-                gdn_gpu_s_matrices,
+                gdn_gpu_state,
                 gdn_gpu_conv_out,
                 kv_cache,
                 max_prefill,
@@ -4145,18 +4129,18 @@ mod inner {
             slot: usize,
             _traffic_scope: GdnStateTrafficScope,
         ) -> Result<(), crate::error::InferenceError> {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             let conv_sizes: Vec<u64> = self
                 .session
-                .gdn_gpu_conv_bufs
-                .iter()
-                .map(|b| b.length())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.conv_buffer().length())
                 .collect();
             let s_sizes: Vec<u64> = self
                 .session
-                .gdn_gpu_s_matrices
-                .iter()
-                .map(|b| b.length())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.s_matrix().length())
                 .collect();
             // Resolve the checkpoint pool BEFORE allocating Metal command objects
             // so an uninitialized pool returns Err without leaking an un-ended
@@ -4169,20 +4153,15 @@ mod inner {
             let cmd = self.engine.queue.new_command_buffer();
             let enc = cmd.new_blit_command_encoder();
             for i in 0..num_layers {
+                let layer = self.session.gdn_gpu_state.layer(i);
                 enc.copy_from_buffer(
-                    &self.session.gdn_gpu_conv_bufs[i],
+                    layer.conv_buffer(),
                     0,
                     &pool.conv_slots[slot][i],
                     0,
                     conv_sizes[i],
                 );
-                enc.copy_from_buffer(
-                    &self.session.gdn_gpu_s_matrices[i],
-                    0,
-                    &pool.s_slots[slot][i],
-                    0,
-                    s_sizes[i],
-                );
+                enc.copy_from_buffer(layer.s_matrix(), 0, &pool.s_slots[slot][i], 0, s_sizes[i]);
             }
             enc.end_encoding();
             cmd.commit();
@@ -4198,18 +4177,18 @@ mod inner {
             slot: usize,
             _traffic_scope: GdnStateTrafficScope,
         ) -> Result<(), crate::error::InferenceError> {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             let conv_sizes: Vec<u64> = self
                 .session
-                .gdn_gpu_conv_bufs
-                .iter()
-                .map(|b| b.length())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.conv_buffer().length())
                 .collect();
             let s_sizes: Vec<u64> = self
                 .session
-                .gdn_gpu_s_matrices
-                .iter()
-                .map(|b| b.length())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.s_matrix().length())
                 .collect();
             // Resolve the checkpoint pool BEFORE allocating Metal command objects
             // so an uninitialized pool returns Err without leaking an un-ended
@@ -4222,20 +4201,15 @@ mod inner {
             let cmd = self.engine.queue.new_command_buffer();
             let enc = cmd.new_blit_command_encoder();
             for i in 0..num_layers {
+                let layer = self.session.gdn_gpu_state.layer(i);
                 enc.copy_from_buffer(
                     &pool.conv_slots[slot][i],
                     0,
-                    &self.session.gdn_gpu_conv_bufs[i],
+                    layer.conv_buffer(),
                     0,
                     conv_sizes[i],
                 );
-                enc.copy_from_buffer(
-                    &pool.s_slots[slot][i],
-                    0,
-                    &self.session.gdn_gpu_s_matrices[i],
-                    0,
-                    s_sizes[i],
-                );
+                enc.copy_from_buffer(&pool.s_slots[slot][i], 0, layer.s_matrix(), 0, s_sizes[i]);
             }
             enc.end_encoding();
             cmd.commit();
@@ -4565,7 +4539,11 @@ mod inner {
                         let h_off = (t * hidden) as u64 * 4;
                         unsafe {
                             enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                            enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+                            enc.set_buffer(
+                                0,
+                                Some(self.session.gdn_gpu_state.layer(linear_idx).conv_buffer()),
+                                0,
+                            );
                             enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), qkv_off);
                             enc.set_buffer(2, Some(&*w_conv), 0);
                             enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
@@ -4606,7 +4584,7 @@ mod inner {
                             enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_recurrence);
                             enc.set_buffer(
                                 0,
-                                Some(&self.session.gdn_gpu_s_matrices[linear_idx]),
+                                Some(self.session.gdn_gpu_state.layer(linear_idx).s_matrix()),
                                 0,
                             );
                             enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
@@ -7147,7 +7125,11 @@ mod inner {
                 let h_off = (t * cfg.hidden_size) as u64 * 4;
 
                 enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+                enc.set_buffer(
+                    0,
+                    Some(self.session.gdn_gpu_state.layer(linear_idx).conv_buffer()),
+                    0,
+                );
                 enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), qkv_off);
                 enc.set_buffer(2, Some(&gdn_w.conv1d_weight), 0);
                 enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
@@ -7162,7 +7144,11 @@ mod inner {
                 );
 
                 enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_recurrence);
-                enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
+                enc.set_buffer(
+                    0,
+                    Some(self.session.gdn_gpu_state.layer(linear_idx).s_matrix()),
+                    0,
+                );
                 enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
                 enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
                 enc.set_buffer(3, Some(&self.session.activations.hidden), h_off);
@@ -9730,7 +9716,8 @@ mod inner {
                 .map(|_| GatedDeltaNetState::new(cfg))
                 .collect();
             // Zero GPU GDN buffers
-            for buf in &self.session.gdn_gpu_conv_bufs {
+            for layer in self.session.gdn_gpu_state.layers() {
+                let buf = layer.conv_buffer();
                 // SAFETY: Each buffer is StorageModeShared, no command buffer is
                 // in flight during reset_state, and length() is the allocated size.
                 unsafe {
@@ -9738,7 +9725,8 @@ mod inner {
                     std::ptr::write_bytes(ptr, 0, buf.length() as usize);
                 }
             }
-            for buf in &self.session.gdn_gpu_s_matrices {
+            for layer in self.session.gdn_gpu_state.layers() {
+                let buf = layer.s_matrix();
                 // SAFETY: Each buffer is StorageModeShared, no command buffer is
                 // in flight during reset_state, and length() is the allocated size.
                 unsafe {
@@ -12059,30 +12047,15 @@ mod inner {
             // ----------------------------------------------------------------
             // GDN recurrent states (same as new())
             // ----------------------------------------------------------------
-            let num_linear = cfg.num_active_linear_attention_layers();
+            let num_linear = active_gdn_layer_indices(cfg).len();
             let num_full = cfg.num_active_full_attention_layers();
             let gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
                 .map(|_| GatedDeltaNetState::new(cfg))
                 .collect();
             let gdn_scratch = GatedDeltaNetFusedScratch::default();
 
-            let num_value_heads = cfg.linear_num_value_heads();
-            let key_dim = cfg.linear_key_head_dim;
-            let value_dim = cfg.linear_value_head_dim;
             let qkv_dim = cfg.linear_qkv_dim();
-            let buf_len = cfg.linear_conv_kernel_dim.saturating_sub(1);
-            let gdn_gpu_conv_bufs: Vec<Buffer> = (0..num_linear)
-                .map(|i| make_zero_buffer(&device, qkv_dim * buf_len, &format!("gdn_conv_{i}")))
-                .collect();
-            let gdn_gpu_s_matrices: Vec<Buffer> = (0..num_linear)
-                .map(|i| {
-                    make_zero_buffer(
-                        &device,
-                        num_value_heads * value_dim * key_dim,
-                        &format!("gdn_s_{i}"),
-                    )
-                })
-                .collect();
+            let gdn_gpu_state = MetalGdnState::new(&device, cfg, num_linear);
             let gdn_gpu_conv_out = make_zero_buffer(&device, qkv_dim, "gdn_conv_out");
 
             let use_kv_f16 = matches!(
@@ -12193,8 +12166,7 @@ mod inner {
                 Some(MetalGdnCheckpointPool::new(
                     &device,
                     checkpoint_max_tokens,
-                    &gdn_gpu_conv_bufs,
-                    &gdn_gpu_s_matrices,
+                    &gdn_gpu_state,
                 ))
             } else {
                 None
@@ -12237,8 +12209,7 @@ mod inner {
                     activations,
                     gdn_states,
                     gdn_scratch,
-                    gdn_gpu_conv_bufs,
-                    gdn_gpu_s_matrices,
+                    gdn_gpu_state,
                     gdn_gpu_conv_out,
                     kv_cache,
                     max_prefill,
@@ -12605,11 +12576,12 @@ mod inner {
         }
 
         fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             let mut snap = Vec::with_capacity(num_layers);
             for i in 0..num_layers {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let layer = self.session.gdn_gpu_state.layer(i);
+                let conv_buf = layer.conv_buffer();
+                let s_buf = layer.s_matrix();
                 let conv_floats = (conv_buf.length() / 4) as usize;
                 let s_floats = (s_buf.length() / 4) as usize;
                 // SAFETY: GPU buffers are StorageModeShared (allocated with
@@ -12651,7 +12623,7 @@ mod inner {
         ) -> Result<(), crate::error::InferenceError> {
             use crate::error::InferenceError;
 
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             if snapshot.len() != num_layers {
                 return Err(InferenceError::PrefixCache(format!(
                     "restore_gdn_states: snapshot has {} layers, expected {num_layers}",
@@ -12659,8 +12631,9 @@ mod inner {
                 )));
             }
             for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let layer = self.session.gdn_gpu_state.layer(i);
+                let conv_buf = layer.conv_buffer();
+                let s_buf = layer.s_matrix();
                 let conv_floats = (conv_buf.length() / 4) as usize;
                 let s_floats = (s_buf.length() / 4) as usize;
                 if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
@@ -12677,8 +12650,9 @@ mod inner {
 
         fn restore_gdn_states_validated(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
             for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let layer = self.session.gdn_gpu_state.layer(i);
+                let conv_buf = layer.conv_buffer();
+                let s_buf = layer.s_matrix();
                 // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
                 // the buffer directly; validation above proves each snapshot exactly
                 // matches its destination, and callers invoke this outside any in-flight
@@ -14136,12 +14110,14 @@ mod inner {
                 .expect("mod tests must exist in this file");
             let production_src = &src[..production_end];
             let dispatch_src = include_str!("metal_qwen35/inner/dispatch.rs");
+            let gdn_state_src = include_str!("metal_qwen35/inner/gdn_state.rs");
             let layers_src = include_str!("metal_qwen35/inner/layers/mod.rs");
             let gdn_layer_src = include_str!("metal_qwen35/inner/layers/gdn.rs");
             let gqa_layer_src = include_str!("metal_qwen35/inner/layers/gqa.rs");
             let production_sources = [
                 production_src,
                 dispatch_src,
+                gdn_state_src,
                 layers_src,
                 gdn_layer_src,
                 gqa_layer_src,
@@ -14276,6 +14252,37 @@ mod inner {
                     .count(),
                 1,
                 "the main Qwen3.5 MSL source must compile in one registration block"
+            );
+        }
+
+        /// Behavioral guard for the allocation policy `from_q4_dir` uses to size
+        /// typed Metal GDN state (`active_gdn_layer_indices`, called at the
+        /// `num_linear` assignment above the `MetalGdnState::new` call in
+        /// `from_q4_dir`). Exercises the same pure decision the constructor makes
+        /// — which layer indices are GatedDeltaNet AND unpruned — without a GPU
+        /// or a model fixture download.
+        #[test]
+        fn q4_constructor_allocates_typed_gdn_state_for_active_layers() {
+            let (cfg, _weights) = tiny_hybrid_fixture();
+            // tiny_hybrid_fixture: layer_types = [Linear, Linear, Linear, Full],
+            // layer_mask all active — every linear-attention layer is selected,
+            // the full-attention layer (index 3) is excluded.
+            assert_eq!(super::active_gdn_layer_indices(&cfg), vec![0, 1, 2]);
+            assert_eq!(
+                super::active_gdn_layer_indices(&cfg).len(),
+                cfg.num_active_linear_attention_layers()
+            );
+
+            let mut pruned = cfg.clone();
+            pruned.layer_mask[1] = false;
+            assert_eq!(
+                super::active_gdn_layer_indices(&pruned),
+                vec![0, 2],
+                "a pruned linear-attention layer must not receive typed GDN state"
+            );
+            assert_eq!(
+                super::active_gdn_layer_indices(&pruned).len(),
+                pruned.num_active_linear_attention_layers()
             );
         }
 
@@ -27976,7 +27983,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // pre-draft / post-draft slot contents are observably distinct. The exact
             // values don't matter — only that conv rolling and S-matrix decay would
             // perturb them if GDN-only draft forwards touched the captured slot.
-            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: StorageModeShared; no command buffer in flight in the test.
                 unsafe {
@@ -27986,7 +27994,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 }
             }
-            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.conv_buffer();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -28124,7 +28133,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             });
 
             // Write a recognizable pattern into the live GPU GDN buffers.
-            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: StorageModeShared buffer; no command buffer in flight in the test.
                 unsafe {
@@ -28134,7 +28144,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 }
             }
-            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.conv_buffer();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -28146,10 +28157,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
 
             let snap = state.snapshot_gdn_states();
-            assert_eq!(snap.len(), state.session.gdn_gpu_s_matrices.len());
+            assert_eq!(snap.len(), state.session.gdn_gpu_state.len());
 
             // Clobber the live buffers.
-            for buf in &state.session.gdn_gpu_s_matrices {
+            for layer in state.session.gdn_gpu_state.layers() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -28159,7 +28171,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 }
             }
-            for buf in &state.session.gdn_gpu_conv_bufs {
+            for layer in state.session.gdn_gpu_state.layers() {
+                let buf = layer.conv_buffer();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -28172,7 +28185,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             state.restore_gdn_states(&snap);
 
-            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 let live = unsafe {
@@ -28208,7 +28222,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
             malformed.pop();
 
-            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: StorageModeShared buffer; no command buffer is in flight.
                 unsafe {
@@ -28218,7 +28233,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 }
             }
-            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.conv_buffer();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -29038,7 +29054,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         /// Gate 3: Chunked-vs-serial GDN state diff.  After running the chunked prefill path the
-        /// final S matrices in `gdn_gpu_s_matrices` must match what the serial token-by-token path
+        /// final S matrices in the typed GDN state must match what the serial token-by-token path
         /// produces, within max_rel_diff < 1e-3.
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
@@ -35637,10 +35653,10 @@ pub enum GdnStateCopyKind {
 
 /// Per-layer and aggregate GDN recurrent-state byte shape, derived from config.
 ///
-/// Mirrors the buffer sizes `new_session_inner` allocates: each
-/// `gdn_gpu_conv_bufs[i]` holds `linear_qkv_dim * (linear_conv_kernel_dim - 1)`
-/// f32 values, each `gdn_gpu_s_matrices[i]` holds
-/// `linear_num_value_heads * linear_value_head_dim * linear_key_head_dim` f32 values.
+/// Mirrors the buffer sizes `new_session_inner` allocates: each typed Metal GDN
+/// layer owns `linear_qkv_dim * (linear_conv_kernel_dim - 1)` conv-history f32
+/// values and `linear_num_value_heads * linear_value_head_dim *
+/// linear_key_head_dim` recurrent-matrix f32 values.
 #[cfg(feature = "gdn-state-counters")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GdnStateTrafficShape {
