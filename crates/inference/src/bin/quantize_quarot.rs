@@ -36,7 +36,12 @@
 //!
 //! Exit codes:
 //! - `0`: conversion succeeded; output dir is complete (or dry-run
-//!   verified the pipeline).
+//!   verified the pipeline). This means the forward-equivalence gate
+//!   passed — it does NOT mean the artifact is quality-validated. Every
+//!   non-dry-run artifact is written with `quantize_index.json`'s
+//!   `promotion` field set to `unpromoted` (see #1103); only a separate
+//!   `eval_perplexity --q4-dir <baseline> --quarot-q4-dir <this output>`
+//!   run can record a `promoted`/`rejected` verdict against it.
 //! - `1`: error (refuse-on-fail, missing file, parse failure, etc.).
 //!   Standard error contains the diagnostic; output dir is left empty
 //!   when the forward-equivalence gate refused.
@@ -162,6 +167,20 @@ fn main() -> ExitCode {
     let elapsed = start.elapsed();
 
     print_report(&report, elapsed.as_secs_f64());
+    if !dry_run {
+        eprintln!();
+        eprintln!("=== Promotion (ADR-044 / #1103) ===");
+        eprintln!("State:             UNPROMOTED");
+        eprintln!(
+            "Reason:            forward-equivalence gate passed (rotation correctness); \
+             the PPL acceptance gate (quantization quality) has not been run."
+        );
+        eprintln!(
+            "Next step:         eval_perplexity --q4-dir <unrotated baseline> \
+             --quarot-q4-dir {} --tokenizer-dir <src> --corpus-file <corpus>",
+            output_dir.display()
+        );
+    }
     ExitCode::SUCCESS
 }
 

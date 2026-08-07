@@ -14,7 +14,11 @@
 //!   `quantize_quarot` directory, prints both reports, then the
 //!   `quarot - unrotated` PPL delta and the ADR-044 acceptance gate
 //!   verdict (< 0.5 PPL by default; override with `--delta-threshold`).
-//!   This is the ADR-044 step-4 acceptance measurement.
+//!   This is the ADR-044 step-4 acceptance measurement — it is also the
+//!   ONLY thing that can advance a `quantize_quarot` artifact's promotion
+//!   marker (#1103) out of `unpromoted`: this mode records the measured
+//!   delta/verdict into `<quarot-q4-dir>/quantize_index.json`'s
+//!   `promotion` field (`promoted` on PASS, `rejected` on FAIL).
 //! - `--quarot-q4-dir <PATH>` alone: runs only the QuaRot-Q4 forward path
 //!   (rarely useful — typically you want the unrotated baseline alongside).
 //!
@@ -92,6 +96,7 @@ use lattice_inference::error::InferenceError;
 use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
 use lattice_inference::model::qwen35::{PerplexityConfig, PerplexityReport, Qwen35Model};
 use lattice_inference::model::qwen35_config::Qwen35Config;
+use lattice_inference::quant::quarot::convert::record_ppl_gate_result;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 use lattice_inference::tokenizer::common::Tokenizer;
 
@@ -440,7 +445,11 @@ fn main() -> ExitCode {
         None
     };
 
-    // Dual mode — compute delta and verdict.
+    // Dual mode — compute delta and verdict, then durably record the
+    // result against the QuaRot artifact's own promotion marker (#1103).
+    // This IS the ADR-044 step-4 acceptance measurement `quantize_quarot`
+    // itself cannot run (no baseline dir or corpus) — recording here closes
+    // the gap between "converter exits 0" and "quality gate ran".
     if let (Some(u), Some(q)) = (&unrotated_report, &quarot_report) {
         let threshold = delta_threshold.unwrap_or(0.5);
         let delta = q.ppl - u.ppl;
@@ -450,6 +459,24 @@ fn main() -> ExitCode {
         println!("QuaRot Q4 PPL:    {:.6}", q.ppl);
         println!("PPL delta:        {delta:+.6}  (quarot - unrotated)");
         println!("Threshold:        < {threshold:.6}");
+
+        let quarot_dir = quarot_q4_dir.as_deref().expect("quarot_report is Some");
+        let record = match record_ppl_gate_result(quarot_dir, u.ppl, q.ppl, threshold) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "ERROR: PPL delta was measured but could not be recorded against {}: {e}",
+                    quarot_dir.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        println!(
+            "Promotion:        {:?} (recorded to {}/quantize_index.json)",
+            record.state,
+            quarot_dir.display()
+        );
+
         if delta < threshold {
             println!("Verdict:          PASS");
             return ExitCode::SUCCESS;

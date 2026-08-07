@@ -22,6 +22,8 @@ fn main() {
     use lattice_inference::model_format::{ModelFormat, detect_format};
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
     eprintln!("[bench] Loading model...");
     let t0 = std::time::Instant::now();
     let (mut metal, quant_label) = match detect_format(dir) {

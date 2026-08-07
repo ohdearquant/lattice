@@ -130,6 +130,86 @@ struct IndexEntry {
     numel: usize,
 }
 
+/// Promotion status of a `quantize_quarot` artifact (issue #1103).
+///
+/// The converter's forward-equivalence gate (rotation correctness) and the
+/// ADR-044 PPL acceptance gate (quantization quality, run separately via
+/// `bin/eval_perplexity --q4-dir <baseline> --quarot-q4-dir <this output>`)
+/// check different things. `convert_quarot_qwen35` can only ever establish
+/// [`PromotionState::Unpromoted`] — it has no baseline Q4 directory or
+/// corpus to measure PPL against. Only [`record_ppl_gate_result`], called
+/// after the acceptance measurement actually runs, can flip this to
+/// [`PromotionState::Promoted`] or [`PromotionState::Rejected`].
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromotionState {
+    /// The PPL acceptance gate has not been recorded against this
+    /// artifact. Default state for every artifact `convert_quarot_qwen35`
+    /// writes; a caller MUST NOT treat an unpromoted artifact as
+    /// quality-validated.
+    Unpromoted,
+    /// A recorded PPL measurement passed the acceptance threshold
+    /// (`delta < threshold`).
+    Promoted,
+    /// A recorded PPL measurement failed the acceptance threshold
+    /// (`delta >= threshold`).
+    Rejected,
+}
+
+/// A recorded ADR-044 dual-Q4 PPL acceptance measurement.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct PplGateRecord {
+    pub unrotated_ppl: f64,
+    pub quarot_ppl: f64,
+    /// `quarot_ppl - unrotated_ppl`.
+    pub delta: f64,
+    pub delta_threshold: f64,
+}
+
+/// Promotion marker persisted in `quantize_index.json` (issue #1103). Makes
+/// the two-step contract (forward-equivalence at convert time, PPL quality
+/// gate at measurement time) explicit and durable on the artifact itself,
+/// instead of letting a complete artifact + exit 0 read as "fully
+/// validated" when the quality gate never ran.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct PromotionRecord {
+    pub state: PromotionState,
+    /// Human-readable explanation of `state` — always present so a reader
+    /// never has to infer WHY from the state alone.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ppl_gate: Option<PplGateRecord>,
+}
+
+impl PromotionRecord {
+    fn unpromoted() -> Self {
+        Self {
+            state: PromotionState::Unpromoted,
+            reason: "PPL acceptance gate has not been run against this artifact; run \
+                     `eval_perplexity --q4-dir <unrotated baseline> --quarot-q4-dir <this \
+                     output dir> --tokenizer-dir <src> --corpus-file <corpus>` to record a \
+                     result before treating it as quality-validated (ADR-044 step 4, #1103)."
+                .to_string(),
+            ppl_gate: None,
+        }
+    }
+}
+
+/// Legacy artifacts (pre-#1103) and any manifest missing the `promotion`
+/// field deserialize to this — still `Unpromoted`, with a reason that
+/// distinguishes "never recorded" from "predates promotion tracking".
+impl Default for PromotionRecord {
+    fn default() -> Self {
+        Self {
+            state: PromotionState::Unpromoted,
+            reason: "no promotion record present in quantize_index.json (artifact predates \
+                     #1103 promotion tracking, or the gate has not been run)"
+                .to_string(),
+            ppl_gate: None,
+        }
+    }
+}
+
 /// Wire format for `quantize_index.json` produced by `convert_quarot_qwen35`.
 ///
 /// ADR-051 §"quantize_quarot Binary Change": the rotation seed is the runtime's
@@ -162,6 +242,13 @@ struct QuantizeIndex {
     online: Option<OnlineArtifactDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     artifact_version: Option<ArtifactVersion>,
+    /// Promotion marker (#1103). `#[serde(default)]` keeps every manifest
+    /// written before this field existed byte-compatible on read: an
+    /// absent field deserializes to [`PromotionRecord::default`], which is
+    /// `Unpromoted` — the safe, fail-closed reading of "we don't know
+    /// whether the gate ran" for a manifest older than the tracking itself.
+    #[serde(default)]
+    promotion: PromotionRecord,
 }
 
 /// Read the QuaRot rotation seed from `quantize_index.json` per ADR-051.
@@ -298,6 +385,136 @@ pub(crate) fn read_quarot_seed_from_index(
         })?;
     }
     Ok(index.quarot_seed)
+}
+
+/// Record an ADR-044 dual-Q4 PPL acceptance measurement against a
+/// `quantize_quarot` output directory (issue #1103).
+///
+/// Reads the existing `quantize_index.json` in `quarot_dir` (must be the
+/// object-form QuaRot manifest — a bare-array `quantize_q4` manifest has no
+/// `promotion` field to record against and is rejected), flips `promotion`
+/// to [`PromotionState::Promoted`] when `quarot_ppl - unrotated_ppl <
+/// delta_threshold` or [`PromotionState::Rejected`] otherwise, and writes
+/// the manifest back. Every other field round-trips unchanged.
+///
+/// This function performs no PPL measurement itself — it only records a
+/// measurement the caller already computed (`bin/eval_perplexity`'s
+/// dual-Q4 mode calls this after printing its own verdict). Fail-closed: a
+/// missing, malformed, or bare-array manifest is `Err`, never a silent
+/// no-op — a caller that cannot durably record the result must not report
+/// success either.
+pub fn record_ppl_gate_result(
+    quarot_dir: &Path,
+    unrotated_ppl: f64,
+    quarot_ppl: f64,
+    delta_threshold: f64,
+) -> Result<PromotionRecord, InferenceError> {
+    let path = quarot_dir.join("quantize_index.json");
+    let bytes = fs::read(&path).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: failed to read {}: {e}",
+            path.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: {}: malformed quantize_index.json: {e}",
+            path.display()
+        ))
+    })?;
+    if value.is_array() {
+        return Err(InferenceError::Inference(format!(
+            "record_ppl_gate_result: {} is a bare-array manifest (quantize_q4 shape, no \
+             promotion field); only a quantize_quarot object-form manifest can record a \
+             PPL gate result",
+            path.display()
+        )));
+    }
+    let mut index: QuantizeIndex = serde_json::from_value(value).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: {}: malformed quantize_index.json: {e}",
+            path.display()
+        ))
+    })?;
+
+    let delta = quarot_ppl - unrotated_ppl;
+    let passed = delta < delta_threshold;
+    let record = PromotionRecord {
+        state: if passed {
+            PromotionState::Promoted
+        } else {
+            PromotionState::Rejected
+        },
+        reason: if passed {
+            format!(
+                "ADR-044 PPL acceptance gate passed: delta {delta:+.6} < threshold \
+                 {delta_threshold:.6} (quarot {quarot_ppl:.6} - unrotated {unrotated_ppl:.6})"
+            )
+        } else {
+            format!(
+                "ADR-044 PPL acceptance gate failed: delta {delta:+.6} >= threshold \
+                 {delta_threshold:.6} (quarot {quarot_ppl:.6} - unrotated {unrotated_ppl:.6})"
+            )
+        },
+        ppl_gate: Some(PplGateRecord {
+            unrotated_ppl,
+            quarot_ppl,
+            delta,
+            delta_threshold,
+        }),
+    };
+    index.promotion = record.clone();
+
+    let json = serde_json::to_string_pretty(&index).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: failed to serialize {}: {e}",
+            path.display()
+        ))
+    })?;
+    fs::write(&path, json).map_err(|e| {
+        InferenceError::Inference(format!(
+            "record_ppl_gate_result: failed to write {}: {e}",
+            path.display()
+        ))
+    })?;
+
+    Ok(record)
+}
+
+/// Read the current promotion marker from a `quantize_quarot` output
+/// directory (issue #1103). `Ok(PromotionRecord::default())` — i.e.
+/// [`PromotionState::Unpromoted`] — for a present object-form manifest with
+/// no `promotion` field (pre-#1103 artifact). `Err` for a missing manifest,
+/// malformed JSON, or a bare-array (`quantize_q4`) manifest, which has no
+/// promotion concept to read.
+pub fn read_promotion_record(quarot_dir: &Path) -> Result<PromotionRecord, InferenceError> {
+    let path = quarot_dir.join("quantize_index.json");
+    let bytes = fs::read(&path).map_err(|e| {
+        InferenceError::Inference(format!(
+            "read_promotion_record: failed to read {}: {e}",
+            path.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+        InferenceError::Inference(format!(
+            "read_promotion_record: {}: malformed quantize_index.json: {e}",
+            path.display()
+        ))
+    })?;
+    if value.is_array() {
+        return Err(InferenceError::Inference(format!(
+            "read_promotion_record: {} is a bare-array manifest (quantize_q4 shape); it has \
+             no promotion field",
+            path.display()
+        )));
+    }
+    let index: QuantizeIndex = serde_json::from_value(value).map_err(|e| {
+        InferenceError::Inference(format!(
+            "read_promotion_record: {}: malformed quantize_index.json: {e}",
+            path.display()
+        ))
+    })?;
+    Ok(index.promotion)
 }
 
 fn inject_quarot_seed(json: &str, seed: u64) -> Result<String, InferenceError> {
@@ -700,6 +917,11 @@ pub fn convert_quarot_qwen35(
             // here yet.
             online: None,
             artifact_version: None,
+            // #1103: every artifact this function writes starts
+            // Unpromoted — the forward-equivalence gate above verified
+            // rotation correctness, not quantization quality. Only
+            // `record_ppl_gate_result` can advance this state.
+            promotion: PromotionRecord::unpromoted(),
         };
         let index_json = serde_json::to_string_pretty(&index_record).map_err(|e| {
             InferenceError::Inference(format!(
@@ -2971,6 +3193,7 @@ mod tests {
             tensors: vec![],
             online: Some(descriptor.clone()),
             artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+            promotion: PromotionRecord::default(),
         };
         let json = serde_json::to_string(&index).unwrap();
         let round_tripped: QuantizeIndex = serde_json::from_str(&json).unwrap();
@@ -3011,6 +3234,7 @@ mod tests {
             tensors: vec![],
             online: Some(descriptor),
             artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+            promotion: PromotionRecord::default(),
         };
         let json = serde_json::to_string(&index).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -3066,6 +3290,7 @@ mod tests {
             tensors: vec![],
             online: Some(invalid_descriptor),
             artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+            promotion: PromotionRecord::default(),
         };
         let json = serde_json::to_string(&index).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -3115,6 +3340,7 @@ mod tests {
             tensors: vec![],
             online: Some(descriptor),
             artifact_version: Some(crate::quant::quarot::io::ArtifactVersion::V1Online),
+            promotion: PromotionRecord::default(),
         };
         let json = serde_json::to_string(&index).unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -3176,5 +3402,218 @@ mod tests {
             err.contains("rotation descriptor is missing or null"),
             "got: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Promotion marker (#1103): the converter's forward-equivalence gate
+    // is not the ADR-044 PPL acceptance gate. `convert_quarot_qwen35` must
+    // never write an artifact that reads as quality-validated before the
+    // PPL gate has actually been recorded against it.
+    // ------------------------------------------------------------------
+
+    /// The defect class #1103 describes: a complete artifact + exit 0
+    /// reads as "validated" when the PPL quality gate never ran. This test
+    /// pins the fix — a fresh, successful conversion must write an
+    /// explicit `unpromoted` marker, not silence.
+    ///
+    /// Mutation check performed by hand while writing this test: changing
+    /// the `promotion: PromotionRecord::unpromoted()` field in
+    /// `convert_quarot_qwen35`'s `index_record` construction to
+    /// `PromotionRecord { state: PromotionState::Promoted, reason:
+    /// "stub".into(), ppl_gate: None }` (simulating the original defect —
+    /// a converter that marks itself validated without ever running the
+    /// quality gate) makes this test fail on the
+    /// `record.state == PromotionState::Unpromoted` assertion. Restoring
+    /// the real field makes it pass again. See REPORT.md for the recorded
+    /// before/after run output.
+    #[test]
+    fn convert_quarot_qwen35_writes_unpromoted_promotion_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 1);
+
+        convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xC0FFEE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: false,
+            },
+        )
+        .unwrap();
+
+        let record = read_promotion_record(&output).unwrap();
+        assert_eq!(
+            record.state,
+            PromotionState::Unpromoted,
+            "a fresh conversion must not claim promoted/rejected before the PPL \
+             acceptance gate has been recorded against it"
+        );
+        assert!(
+            record.ppl_gate.is_none(),
+            "no PPL gate has run yet; ppl_gate must be absent"
+        );
+        assert!(
+            record.reason.contains("PPL acceptance gate"),
+            "reason must explain WHY the artifact is unpromoted, got: {}",
+            record.reason
+        );
+
+        // Also visible directly in the raw JSON, for a reader who doesn't
+        // go through the typed helper.
+        let idx_str = fs::read_to_string(output.join("quantize_index.json")).unwrap();
+        let idx: Value = serde_json::from_str(&idx_str).unwrap();
+        assert_eq!(
+            idx.get("promotion").and_then(|p| p.get("state")),
+            Some(&Value::String("unpromoted".to_string())),
+            "quantize_index.json must carry a top-level, human-readable promotion.state"
+        );
+    }
+
+    /// Dry-run performs no writes at all (existing contract), so it must
+    /// not be mistaken for having recorded a promotion state either —
+    /// there is no `quantize_index.json` to read.
+    #[test]
+    fn convert_quarot_qwen35_dry_run_writes_no_promotion_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let input = tmp.path().join("input");
+        let output = tmp.path().join("output");
+        let cfg = tiny_cfg(true);
+        write_input_dir(&cfg, &input, 1);
+
+        convert_quarot_qwen35(
+            &input,
+            &output,
+            &ConversionOptions {
+                rotation_seed: 0xC0FFEE,
+                tolerance: 1e-5,
+                num_probe_tokens: 2,
+                dry_run: true,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !output.join("quantize_index.json").exists(),
+            "dry-run must not write any files, including the promotion marker"
+        );
+    }
+
+    fn object_form_manifest_json(promoted_state: Option<&str>) -> String {
+        let mut obj = serde_json::json!({
+            "quarot_seed": 42,
+            "tensors": [],
+        });
+        if let Some(state) = promoted_state {
+            obj["promotion"] = serde_json::json!({"state": state, "reason": "test fixture"});
+        }
+        serde_json::to_string(&obj).unwrap()
+    }
+
+    #[test]
+    fn record_ppl_gate_result_promotes_on_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            object_form_manifest_json(None),
+        )
+        .unwrap();
+
+        let record = record_ppl_gate_result(tmp.path(), 25.0, 24.5, 0.5).unwrap();
+        assert_eq!(record.state, PromotionState::Promoted);
+        let gate = record.ppl_gate.clone().expect("ppl_gate must be recorded");
+        assert_eq!(gate.unrotated_ppl, 25.0);
+        assert_eq!(gate.quarot_ppl, 24.5);
+        assert!((gate.delta - (-0.5)).abs() < 1e-12);
+        assert_eq!(gate.delta_threshold, 0.5);
+
+        // Persisted, not just returned.
+        let reread = read_promotion_record(tmp.path()).unwrap();
+        assert_eq!(reread, record);
+    }
+
+    #[test]
+    fn record_ppl_gate_result_rejects_on_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            object_form_manifest_json(None),
+        )
+        .unwrap();
+
+        // delta == threshold is a fail (strict `<` to pass, per ADR-044).
+        let record = record_ppl_gate_result(tmp.path(), 25.0, 25.5, 0.5).unwrap();
+        assert_eq!(record.state, PromotionState::Rejected);
+
+        let reread = read_promotion_record(tmp.path()).unwrap();
+        assert_eq!(reread.state, PromotionState::Rejected);
+    }
+
+    #[test]
+    fn record_ppl_gate_result_overwrites_prior_state() {
+        // A re-recorded measurement (e.g. re-running the gate after a
+        // model fix) must overwrite the previous marker, not accumulate.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            object_form_manifest_json(Some("rejected")),
+        )
+        .unwrap();
+
+        let record = record_ppl_gate_result(tmp.path(), 25.0, 24.0, 0.5).unwrap();
+        assert_eq!(record.state, PromotionState::Promoted);
+        let reread = read_promotion_record(tmp.path()).unwrap();
+        assert_eq!(reread.state, PromotionState::Promoted);
+    }
+
+    #[test]
+    fn record_ppl_gate_result_rejects_bare_array_manifest() {
+        // `quantize_q4`'s manifest shape — a bare tensor array, no
+        // `promotion` concept at all. Recording against it is a caller
+        // bug (wrong directory), not a legitimate no-op.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), r#"[]"#).unwrap();
+
+        let err = record_ppl_gate_result(tmp.path(), 25.0, 24.0, 0.5)
+            .expect_err("a bare-array manifest must be rejected, not silently accepted");
+        assert!(err.to_string().contains("bare-array"), "got: {err}");
+    }
+
+    #[test]
+    fn record_ppl_gate_result_errs_on_missing_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = record_ppl_gate_result(tmp.path(), 25.0, 24.0, 0.5)
+            .expect_err("recording against a directory with no manifest must fail closed");
+        assert!(err.to_string().contains("failed to read"), "got: {err}");
+    }
+
+    #[test]
+    fn read_promotion_record_defaults_to_unpromoted_for_legacy_manifest() {
+        // A manifest written before #1103 (no `promotion` field at all)
+        // must read as Unpromoted, not error and not silently claim
+        // Promoted.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("quantize_index.json"),
+            r#"{"quarot_seed":7,"tensors":[]}"#,
+        )
+        .unwrap();
+
+        let record = read_promotion_record(tmp.path()).unwrap();
+        assert_eq!(record.state, PromotionState::Unpromoted);
+        assert!(record.reason.contains("predates"));
+    }
+
+    #[test]
+    fn read_promotion_record_rejects_bare_array_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), r#"[]"#).unwrap();
+        let err = read_promotion_record(tmp.path())
+            .expect_err("a bare-array manifest has no promotion field and must be rejected");
+        assert!(err.to_string().contains("bare-array"), "got: {err}");
     }
 }

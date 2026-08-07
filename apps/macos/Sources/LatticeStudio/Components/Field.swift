@@ -151,7 +151,7 @@ struct LatticeNumericField: View {
 
         LatticeField(prompt: "Model name or path", text: .constant(""))
 
-        LatticeField(prompt: "Dataset path", text: .constant("/Users/lion/data/train.jsonl"))
+        LatticeField(prompt: "Dataset path", text: .constant("~/data/train.jsonl"))
 
         LatticeField(prompt: "With error", text: .constant("bad-path"), errorMessage: "File not found")
 
