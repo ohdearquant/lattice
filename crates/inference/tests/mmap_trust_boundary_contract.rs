@@ -24,11 +24,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use syn::{Block, Expr, ExprCall, ExprMethodCall, ImplItem, Item, Stmt};
+use syn::{BinOp, Block, Expr, ExprCall, ExprMethodCall, ImplItem, Item, Stmt};
 
 /// Free functions this crate's mmap trust boundary exposes. A call to either
-/// one, anywhere in the function enclosing a construction site, counts as
-/// that site being guarded.
+/// one counts as guarding a construction site when [`walk_expr`] determines
+/// it runs on a path that necessarily executes before the site, in the same
+/// enclosing function -- not merely "anywhere in the function" (see
+/// [`walk_expr`]'s doc comment for exactly what "necessarily executes before"
+/// does and does not cover).
 const GUARD_FUNCTION_NAMES: &[&str] = &[
     "open_trusted_mmap_file",
     "reject_if_open_mmap_file_untrusted",
@@ -109,7 +112,8 @@ fn impl_self_type_label(self_ty: &syn::Type) -> String {
 
 /// Every free function and `impl` method in a parsed file, named by its
 /// enclosing `mod`/`impl` path (matching `EXPECTED_MMAP_CONSTRUCTION_SITES`'
-/// key format) and paired with its body for the two finder visitors below.
+/// key format) and paired with its body for [`walk_block`]/[`walk_expr`]
+/// below.
 fn collect_functions<'a>(
     items: &'a [Item],
     path: &mut Vec<String>,
@@ -212,9 +216,21 @@ struct SiteObservation {
 ///
 /// What DOES count as "necessarily executes before" and so threads the flag
 /// straight through: sequential statements in the same block, `unsafe { .. }`
-/// and bare `{ .. }` blocks, `?`, casts, references, field/index access, and
+/// and bare `{ .. }` blocks, `?`, casts, references, field/index access,
 /// method-call/call receivers and arguments (in left-to-right evaluation
-/// order), and binary/assignment operands.
+/// order), assignment operands, and the operands of every binary operator
+/// that Rust evaluates unconditionally (arithmetic, comparison, bitwise, ...).
+///
+/// **`&&`/`||` are handled as a branch boundary, not threaded through.** Like
+/// `if`/`else`, Rust may skip the right operand entirely (`true || x` never
+/// runs `x`; `false && x` never runs `x`), so a guard call inside the right
+/// operand of `&&`/`||` is never credited to the binary expression's own
+/// outgoing state, and so never reaches sites after it -- only whatever
+/// `guarded` state the left operand (which always runs) produced does. The
+/// right operand is still walked so a construction site inside it is
+/// discovered and, symmetrically, still sees the left operand's guard state
+/// as input, since the left operand necessarily runs first whenever the
+/// right one runs at all.
 fn walk_expr(expr: &Expr, guarded_in: bool, sites: &mut Vec<SiteObservation>) -> bool {
     match expr {
         Expr::Block(block) => walk_block(&block.block, guarded_in, sites),
@@ -307,7 +323,18 @@ fn walk_expr(expr: &Expr, guarded_in: bool, sites: &mut Vec<SiteObservation>) ->
         }
         Expr::Binary(binary) => {
             let guarded = walk_expr(&binary.left, guarded_in, sites);
-            walk_expr(&binary.right, guarded, sites)
+            match binary.op {
+                BinOp::And(_) | BinOp::Or(_) => {
+                    // `&&`/`||` short-circuit: the right operand may never run.
+                    // Walk it so a construction site inside is still discovered,
+                    // but a guard call inside it must not be credited to sites
+                    // that follow the whole expression -- only `guarded` (the
+                    // state after the left operand, which always runs) does.
+                    walk_expr(&binary.right, guarded, sites);
+                    guarded
+                }
+                _ => walk_expr(&binary.right, guarded, sites),
+            }
         }
         Expr::Assign(assign) => {
             let guarded = walk_expr(&assign.left, guarded_in, sites);
@@ -384,6 +411,65 @@ fn walk_block(block: &Block, guarded_in: bool, sites: &mut Vec<SiteObservation>)
         };
     }
     guarded
+}
+
+/// Regression fixture for the `||` short-circuit hole: `true || guard(..)`
+/// never evaluates the guard at runtime, so it must not be credited to the
+/// `Mmap::map()` call that follows. Parses a synthetic [`Block`] directly and
+/// drives [`walk_block`] on it, rather than routing through the `src/` scan
+/// and [`EXPECTED_MMAP_CONSTRUCTION_SITES`] inventory used by the tests
+/// below -- this file has no existing indirection for exercising a shape
+/// without a real construction site in `src/`, and adding a `src/`-only
+/// fixture would touch production source for a case that has nothing to do
+/// with a real loader.
+#[test]
+fn walk_expr_does_not_credit_a_guard_call_inside_an_or_short_circuit() {
+    let block: Block = syn::parse_str(
+        r#"{
+            true || open_trusted_mmap_file(&file).is_ok();
+            Mmap::map(&file)
+        }"#,
+    )
+    .expect("parse `||` short-circuit fixture");
+    let mut sites = Vec::new();
+    walk_block(&block, false, &mut sites);
+    assert_eq!(
+        sites.len(),
+        1,
+        "fixture must discover exactly the Mmap::map() construction site"
+    );
+    assert_eq!(sites[0].selector, "Mmap::map()");
+    assert!(
+        !sites[0].dominated_by_guard,
+        "a guard call reachable only through the right operand of `||` must not be credited: \
+         `true || open_trusted_mmap_file(..)` never evaluates the guard at runtime"
+    );
+}
+
+/// Mirror of the `||` fixture above for `&&`: `false && guard(..)` never
+/// evaluates the guard at runtime either.
+#[test]
+fn walk_expr_does_not_credit_a_guard_call_inside_an_and_short_circuit() {
+    let block: Block = syn::parse_str(
+        r#"{
+            false && open_trusted_mmap_file(&file).is_ok();
+            Mmap::map(&file)
+        }"#,
+    )
+    .expect("parse `&&` short-circuit fixture");
+    let mut sites = Vec::new();
+    walk_block(&block, false, &mut sites);
+    assert_eq!(
+        sites.len(),
+        1,
+        "fixture must discover exactly the Mmap::map() construction site"
+    );
+    assert_eq!(sites[0].selector, "Mmap::map()");
+    assert!(
+        !sites[0].dominated_by_guard,
+        "a guard call reachable only through the right operand of `&&` must not be credited: \
+         `false && open_trusted_mmap_file(..)` never evaluates the guard at runtime"
+    );
 }
 
 #[test]
