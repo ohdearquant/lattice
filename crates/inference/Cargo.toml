@@ -369,6 +369,11 @@ name = "attention_dispatch_bench"
 harness = false
 
 [[bench]]
+name = "backward_stage0"
+harness = false
+required-features = ["train-backward"]
+
+[[bench]]
 name = "f16_convert_bench"
 harness = false
 required-features = ["bench-internals"]
