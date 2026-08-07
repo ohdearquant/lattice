@@ -140,8 +140,24 @@ path = "crates/inference/src/bin/chat_metal.rs"
 reason = "Long-running interactive product process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
-path = "crates/inference/src/bin/lattice.rs"
+path = "crates/inference/src/bin/lattice/main.rs"
 reason = "Long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/chat.rs"
+reason = "`lattice chat` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/serve.rs"
+reason = "`lattice serve` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/doctor.rs"
+reason = "`lattice doctor` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
+
+[[non_measurement_surface]]
+path = "crates/inference/src/bin/lattice/prune_score.rs"
+reason = "`lattice prune-score` subcommand module of the long-running product CLI process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
 [[non_measurement_surface]]
 path = "crates/inference/src/bin/lattice_serve.rs"

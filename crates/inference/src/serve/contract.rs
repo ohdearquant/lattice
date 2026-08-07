@@ -1409,8 +1409,16 @@ mod tests {
 
     #[test]
     fn serving_adapters_do_not_restate_standard_defaults() {
+        // `lattice` is now a module tree (#834), not a single file; concatenate
+        // its split source files so this still scans the same source text.
+        let lattice_source = concat!(
+            include_str!("../bin/lattice/main.rs"),
+            include_str!("../bin/lattice/chat.rs"),
+            include_str!("../bin/lattice/doctor.rs"),
+            include_str!("../bin/lattice/serve.rs"),
+        );
         for (name, source) in [
-            ("lattice", include_str!("../bin/lattice.rs")),
+            ("lattice", lattice_source),
             ("lattice_serve", include_str!("../bin/lattice_serve.rs")),
         ] {
             for literal in [

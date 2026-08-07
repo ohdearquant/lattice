@@ -7,11 +7,15 @@ new features don't silently land in only one of them. It is the reference #589 a
 
 Same trap as `docs/serve-http-api.md` and `docs/cross-turn-cache.md` describe -- read this first:
 
-- **`lattice` CLI** (`crates/inference/src/bin/lattice.rs`) -- one binary, three subcommands:
-  `lattice chat` (interactive REPL), `lattice serve` (an HTTP server, OpenAI-compatible), `lattice
-  doctor` (preflight check, no model weights loaded). This is the README-documented, actively
-  developed surface. Its `serve` subcommand is itself an HTTP server -- when a row below says
-  "supported" for this column via HTTP, it means `lattice serve`'s router, not `lattice chat`.
+- **`lattice` CLI** (`crates/inference/src/bin/lattice/` -- `main.rs` dispatch, `chat.rs` REPL,
+  `doctor.rs` preflight, `serve.rs` HTTP API; split from a single `lattice.rs` file in #834) --
+  one binary, three subcommands: `lattice chat` (interactive REPL), `lattice serve` (an HTTP
+  server, OpenAI-compatible), `lattice doctor` (preflight check, no model weights loaded). This is
+  the README-documented, actively developed surface. Its `serve` subcommand is itself an HTTP
+  server -- when a row below says "supported" for this column via HTTP, it means `lattice
+  serve`'s router, not `lattice chat`. Below, unqualified `lattice.rs:NNN` line citations predate
+  the #834 split and are stale on file/line but not on subcommand/behavior; re-derive against the
+  split files rather than trusting the number.
 - **`lattice_serve`** (`crates/inference/src/bin/lattice_serve.rs`) -- a separate, standalone
   binary purpose-built as the HTTP daemon the macOS Lattice Studio app spawns and talks to
   (introduced PR #435). Metal-GPU-only, its own fixed route list, its own request struct.

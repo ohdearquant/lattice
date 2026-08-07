@@ -144,6 +144,12 @@ def discovered_declared_rust_inventory_paths() -> set[str]:
     just ones whose basename happens to start with `bench`. A path that
     matches this glob and is not in excluded_surface or
     non_measurement_surface fails the fail-closed test below.
+
+    Broadened again to descend into subdirectories of src/bin (multi-file
+    binaries such as lattice's chat/serve/doctor/prune-score split): a
+    `[[bin]]` target's `path` no longer has to be a single top-level file,
+    and a glob that only matched top-level files would let a split binary's
+    modules go both unclassified and unseen by this fail-closed discovery.
     """
     paths = {
         str(path.relative_to(REPO))
@@ -156,6 +162,10 @@ def discovered_declared_rust_inventory_paths() -> set[str]:
     paths.update(
         str(path.relative_to(REPO))
         for path in (REPO / "crates/inference/src/bin").glob("*.rs")
+    )
+    paths.update(
+        str(path.relative_to(REPO))
+        for path in (REPO / "crates/inference/src/bin").glob("*/*.rs")
     )
     paths.add("README.md")
     return paths
