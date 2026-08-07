@@ -104,6 +104,10 @@ fn euclidean_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
         .sqrt()
 }
 
+fn manhattan_distance_scalar(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).sum()
+}
+
 // ============================================================================
 // COMPARISON BENCHMARKS
 // ============================================================================
@@ -220,6 +224,28 @@ fn bench_euclidean_simd_vs_scalar(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("simd", dim), &dim, |bench, _| {
             bench.iter(|| black_box(simd::euclidean_distance(black_box(&a), black_box(&b))));
+        });
+    }
+
+    group.finish();
+}
+
+/// Compare SIMD vs scalar Manhattan (L1) distance.
+fn bench_manhattan_simd_vs_scalar(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simd_manhattan_distance");
+
+    for dim in DIMENSIONS {
+        let a = generate_vector(dim, 42);
+        let b = generate_vector(dim, 123);
+
+        group.throughput(Throughput::Elements(dim as u64));
+
+        group.bench_with_input(BenchmarkId::new("scalar", dim), &dim, |bench, _| {
+            bench.iter(|| black_box(manhattan_distance_scalar(black_box(&a), black_box(&b))));
+        });
+
+        group.bench_with_input(BenchmarkId::new("simd", dim), &dim, |bench, _| {
+            bench.iter(|| black_box(manhattan_distance(black_box(&a), black_box(&b))));
         });
     }
 
@@ -1259,6 +1285,7 @@ criterion_group!(
     bench_dot_product_simd_vs_scalar,
     bench_normalize_simd_vs_scalar,
     bench_euclidean_simd_vs_scalar,
+    bench_manhattan_simd_vs_scalar,
     bench_batch_cosine,
     bench_throughput_384,
     bench_quantization,
