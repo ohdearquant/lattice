@@ -2609,9 +2609,17 @@ class ImplBodyInheritsResolvedPythonInterpreter(unittest.TestCase):
         "unbound variable" error (lattice#1333's original failure mode) and
         not with a silent fall back to an unqualified `python3`.
 
-        PATH here is deliberately narrowed to /bin:/usr/bin, where macOS
-        ships only a pre-3.11 /usr/bin/python3, so bench_require_python3 has
-        no qualifying candidate and must refuse with its own diagnostic.
+        PATH here is a fixture-only directory that shadows every name
+        bench_resolve_python3 tries (python3.13, python3.12, python3.11,
+        python3) with a stub that always fails the version-floor probe, so
+        bench_require_python3 has no qualifying candidate regardless of
+        what real interpreters the host running this test happens to ship.
+        A bare /bin:/usr/bin PATH is not a portable way to get that: it
+        relies on the host's system python3 being pre-3.11, which is true
+        of macOS but not of Ubuntu 24.04 CI images, whose /usr/bin/python3
+        is 3.12 and would satisfy the floor -- letting resolution succeed
+        and fall through to the next real checkpoint (the lock-status
+        guard) instead of exercising this refusal.
         """
         with tempfile.TemporaryDirectory() as tmp:
             root = self._build_fixture(tmp)
@@ -2619,8 +2627,14 @@ class ImplBodyInheritsResolvedPythonInterpreter(unittest.TestCase):
                 REPO / "scripts" / "lib" / "bench-python.sh",
                 root / "scripts" / "lib" / "bench-python.sh",
             )
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            for name in ("python3.13", "python3.12", "python3.11", "python3"):
+                stub = bindir / name
+                stub.write_text("#!/usr/bin/env bash\nexit 1\n")
+                stub.chmod(0o755)
             env = {
-                "PATH": "/bin:/usr/bin",
+                "PATH": f"{bindir}:/usr/bin:/bin",
                 "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
             }
             for name in (
