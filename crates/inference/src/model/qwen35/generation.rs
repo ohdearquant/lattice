@@ -1155,6 +1155,7 @@ impl Qwen35Model {
 /// sampled token, and measuring `prefill_end` off the first delta fires it
 /// after sampling instead of before.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RawGenEvent {
     /// Fired exactly once, after the prefill forward pass has produced
     /// logits and before the first token is sampled -- the true

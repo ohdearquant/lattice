@@ -12,6 +12,7 @@ pub type Result<T> = std::result::Result<T, TuneError>;
 
 /// Error types for lattice-tune training infrastructure
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum TuneError {
     /// Dataset error
     #[error("Dataset error: {0}")]

@@ -30,6 +30,7 @@ pub use lattice_fann::training::DiagonalFisher;
 /// Implicit signals (dwell time, follow-up rate) carry half magnitude.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum PreferenceSignal {
     /// Explicit positive: the selected adapter produced a useful response.
     Positive,

@@ -96,6 +96,7 @@ use vit::{ViT, VisionWeights};
 
 /// Errors produced by the vision encoder pipeline.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum VisionError {
     /// Raw image bytes could not be decoded (unsupported format, corrupt data).
     ImageDecode(String),

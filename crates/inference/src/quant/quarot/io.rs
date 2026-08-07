@@ -62,6 +62,7 @@ use crate::weights::{contained_shard_path, parse_index};
 /// record provenance in its output metadata. The converter always promotes
 /// to f64 internally; this is informational, not a control knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SourceDType {
     F32,
     F16,
@@ -374,6 +375,7 @@ impl Backing {
 /// [`OnlineRotationSpec`] — that combination cannot occur from a real v0
 /// artifact and is evidence of a corrupted or hand-edited index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub enum ArtifactVersion {
     #[serde(rename = "v0-residual")]
     V0Residual,
