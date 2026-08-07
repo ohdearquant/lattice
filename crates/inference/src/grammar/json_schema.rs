@@ -154,6 +154,12 @@ impl std::fmt::Display for SchemaError {
 
 impl std::error::Error for SchemaError {}
 
+impl From<crate::grammar::pda::BuilderError> for SchemaError {
+    fn from(e: crate::grammar::pda::BuilderError) -> Self {
+        SchemaError(e.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
@@ -173,7 +179,7 @@ pub fn compile_json_schema(schema: &Value) -> Result<CompiledGrammar, SchemaErro
     // first in CompileCtx::new().
     let root_id = ctx.builder.reserve("root");
     let root_alts = ctx.compile_schema(schema, &[])?;
-    ctx.builder.set_alts(root_id, root_alts);
+    ctx.builder.set_alts(root_id, root_alts)?;
     // Ensure all deferred rules have been resolved.
     ctx.resolve_pending()?;
     let mut grammar = ctx.builder.build();
@@ -262,7 +268,7 @@ impl<'a> CompileCtx<'a> {
         }
         let mut builder = GrammarBuilder::new();
         // Pre-register built-in rules.
-        register_builtins(&mut builder);
+        register_builtins(&mut builder)?;
         Ok(Self {
             defs,
             builder,
@@ -1032,7 +1038,7 @@ impl<'a> CompileCtx<'a> {
         let id = self.builder.reserve(&rule_name);
         // Compile the target and set alts.
         let alts = self.compile_schema(target, &[])?;
-        self.builder.set_alts(id, alts);
+        self.builder.set_alts(id, alts)?;
         Ok(vec![vec![Symbol::NonTerminal(id)]])
     }
 
@@ -1222,7 +1228,7 @@ impl<'a> CompileCtx<'a> {
                             Some(schema) => self.compile_schema(schema, &[])?,
                             None => self.any_value_alts(),
                         };
-                        self.builder.set_alts(id, val_alts);
+                        self.builder.set_alts(id, val_alts)?;
                         id
                     };
 
@@ -1237,7 +1243,7 @@ impl<'a> CompileCtx<'a> {
                         pair_alt.push(Symbol::Terminal(b':'));
                         pair_alt.push(Symbol::NonTerminal(ws_id));
                         pair_alt.push(Symbol::NonTerminal(val_id));
-                        self.builder.set_alts(id, vec![pair_alt]);
+                        self.builder.set_alts(id, vec![pair_alt])?;
                         id
                     };
 
@@ -1273,7 +1279,7 @@ impl<'a> CompileCtx<'a> {
 
                 // Build right-nested tail-chain rules (issue #355).
                 // tail(0, false) is the entry point: no property emitted yet.
-                let tail_id = self.build_object_tail(obj_idx, &props_info, 0, false, ws_id);
+                let tail_id = self.build_object_tail(obj_idx, &props_info, 0, false, ws_id)?;
 
                 // Object rule: `{` ws tail(0, false) ws `}`
                 let main_alt = vec![
@@ -1353,21 +1359,21 @@ impl<'a> CompileCtx<'a> {
         i: usize,
         started: bool,
         ws_id: usize,
-    ) -> usize {
+    ) -> Result<usize, SchemaError> {
         let started_char = if started { 's' } else { 'f' };
         let rule_name = format!("obj_{obj_idx}_tail_{i}_{started_char}");
 
         // Memoization: if this (obj_idx, i, started) variant was already built,
         // return its id without rebuilding.
         if let Some(id) = self.builder.rule_id(&rule_name) {
-            return id;
+            return Ok(id);
         }
 
         // Base case: all properties processed → epsilon.
         if i == props.len() {
             let id = self.builder.reserve(&rule_name);
-            self.builder.set_alts(id, vec![vec![]]); // epsilon alternative
-            return id;
+            self.builder.set_alts(id, vec![vec![]])?; // epsilon alternative
+            return Ok(id);
         }
 
         // Reserve first so that any recursive call that would reference *this*
@@ -1379,7 +1385,7 @@ impl<'a> CompileCtx<'a> {
 
         let alts: Vec<Alt> = if is_required {
             // Required: one alternative (no choice).
-            let next_id = self.build_object_tail(obj_idx, props, i + 1, true, ws_id);
+            let next_id = self.build_object_tail(obj_idx, props, i + 1, true, ws_id)?;
             if started {
                 // "," ws pair_i tail(i+1, true)
                 // Leading "," is a terminal at sym_pos==0 of this alternative.
@@ -1400,8 +1406,8 @@ impl<'a> CompileCtx<'a> {
             // Optional: emit alt | skip alt.
             // next_started_id: tail after emitting P_i (started=true regardless).
             // next_same_id:    tail after skipping P_i (started unchanged).
-            let next_started_id = self.build_object_tail(obj_idx, props, i + 1, true, ws_id);
-            let next_same_id = self.build_object_tail(obj_idx, props, i + 1, started, ws_id);
+            let next_started_id = self.build_object_tail(obj_idx, props, i + 1, true, ws_id)?;
+            let next_same_id = self.build_object_tail(obj_idx, props, i + 1, started, ws_id)?;
 
             let emit_alt: Alt = if started {
                 // INLINED key for started=true optionals: instead of using
@@ -1458,8 +1464,8 @@ impl<'a> CompileCtx<'a> {
             vec![emit_alt, skip_alt]
         };
 
-        self.builder.set_alts(id, alts);
-        id
+        self.builder.set_alts(id, alts)?;
+        Ok(id)
     }
 
     /// Compile an `array` schema.
@@ -1549,7 +1555,7 @@ impl<'a> CompileCtx<'a> {
                     let pos_rule = format!("arr_{n}_prefix_{i}");
                     let pos_id = self.builder.reserve(&pos_rule);
                     let pos_alts = self.compile_schema(pos_schema, &[])?;
-                    self.builder.set_alts(pos_id, pos_alts);
+                    self.builder.set_alts(pos_id, pos_alts)?;
                     pos_ids.push(pos_id);
                 }
 
@@ -1572,11 +1578,11 @@ impl<'a> CompileCtx<'a> {
                     let item_rule = format!("arr_{n}_item");
                     let item_id = self.builder.reserve(&item_rule);
                     let item_alts = self.compile_schema(items_schema, &[])?;
-                    self.builder.set_alts(item_id, item_alts);
+                    self.builder.set_alts(item_id, item_alts)?;
 
                     // depth=1: leading-comma continuation after the fixed prefix.
                     let slack = max_items.map(|m| m - p);
-                    let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id);
+                    let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id)?;
                     alt.push(Symbol::NonTerminal(tail_id));
                 }
 
@@ -1596,9 +1602,9 @@ impl<'a> CompileCtx<'a> {
             let item_rule = format!("arr_{n}_item");
             let item_id = self.builder.reserve(&item_rule);
             let item_alts = self.compile_schema(items_schema, &[])?;
-            self.builder.set_alts(item_id, item_alts);
+            self.builder.set_alts(item_id, item_alts)?;
 
-            let alt = self.build_cardinality_array_alt(n, item_id, ws_id, min_items, max_items);
+            let alt = self.build_cardinality_array_alt(n, item_id, ws_id, min_items, max_items)?;
             return Ok(vec![alt]);
         }
 
@@ -1609,7 +1615,7 @@ impl<'a> CompileCtx<'a> {
         } else {
             let id = self.builder.reserve(any_val_rule);
             let any_alts = self.any_value_alts();
-            self.builder.set_alts(id, any_alts);
+            self.builder.set_alts(id, any_alts)?;
             id
         };
 
@@ -1617,7 +1623,7 @@ impl<'a> CompileCtx<'a> {
         if min_items > 0 || max_items.is_some() {
             let n = self.array_counter;
             self.array_counter += 1;
-            let alt = self.build_cardinality_array_alt(n, any_id, ws_id, min_items, max_items);
+            let alt = self.build_cardinality_array_alt(n, any_id, ws_id, min_items, max_items)?;
             return Ok(vec![alt]);
         }
 
@@ -1637,7 +1643,7 @@ impl<'a> CompileCtx<'a> {
                 ],
                 vec![],
             ];
-            self.builder.set_alts(id, tail_alts);
+            self.builder.set_alts(id, tail_alts)?;
             id
         };
 
@@ -1652,7 +1658,7 @@ impl<'a> CompileCtx<'a> {
                     vec![Symbol::NonTerminal(any_id), Symbol::NonTerminal(tail_id)],
                     vec![],
                 ],
-            );
+            )?;
             id
         };
 
@@ -1675,7 +1681,7 @@ impl<'a> CompileCtx<'a> {
         ws_id: usize,
         min_items: usize,
         max_items: Option<usize>,
-    ) -> Alt {
+    ) -> Result<Alt, SchemaError> {
         let mut alt: Alt = vec![Symbol::Terminal(b'[')];
         alt.push(Symbol::NonTerminal(ws_id));
 
@@ -1692,7 +1698,7 @@ impl<'a> CompileCtx<'a> {
                 if slack != Some(0) {
                     // Build optional body: first item is optional, subsequent
                     // items each carry a leading comma.
-                    let body_id = self.build_bounded_tail(n, 0, slack, item_id, ws_id);
+                    let body_id = self.build_bounded_tail(n, 0, slack, item_id, ws_id)?;
                     alt.push(Symbol::NonTerminal(body_id));
                 }
             }
@@ -1710,14 +1716,14 @@ impl<'a> CompileCtx<'a> {
 
                 // Append optional tail for additional items (up to slack more).
                 if slack != Some(0) {
-                    let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id);
+                    let tail_id = self.build_bounded_tail(n, 1, slack, item_id, ws_id)?;
                     alt.push(Symbol::NonTerminal(tail_id));
                 }
             }
         }
 
         alt.push(Symbol::Terminal(b']'));
-        alt
+        Ok(alt)
     }
 
     /// Build a rule representing "zero or more additional items (with leading commas),
@@ -1738,7 +1744,7 @@ impl<'a> CompileCtx<'a> {
         slack: Option<usize>,
         item_id: usize,
         ws_id: usize,
-    ) -> usize {
+    ) -> Result<usize, SchemaError> {
         match slack {
             None => {
                 // Unbounded tail: arr_{n}_tail_{depth} = (,? ws item ws arr_{n}_tail_{depth}) | ε
@@ -1762,7 +1768,7 @@ impl<'a> CompileCtx<'a> {
                         Symbol::NonTerminal(cont_id),
                     ];
                     self.builder
-                        .set_alts(cont_id, vec![cont_alt, vec![] /* epsilon */]);
+                        .set_alts(cont_id, vec![cont_alt, vec![] /* epsilon */])?;
                     vec![
                         Symbol::NonTerminal(item_id),
                         Symbol::NonTerminal(ws_id),
@@ -1779,15 +1785,15 @@ impl<'a> CompileCtx<'a> {
                     ]
                 };
                 self.builder
-                    .set_alts(id, vec![body_alt, vec![] /* epsilon */]);
-                id
+                    .set_alts(id, vec![body_alt, vec![] /* epsilon */])?;
+                Ok(id)
             }
             Some(0) => {
                 // No slack: epsilon rule (no additional items allowed).
                 let rule_name = format!("arr_{arr_n}_opt_{depth}_0");
                 let id = self.builder.reserve(&rule_name);
-                self.builder.set_alts(id, vec![vec![] /* epsilon */]);
-                id
+                self.builder.set_alts(id, vec![vec![] /* epsilon */])?;
+                Ok(id)
             }
             Some(k) => {
                 // Bounded tail: nested-optional chain of depth k.
@@ -1796,7 +1802,7 @@ impl<'a> CompileCtx<'a> {
                 let id = self.builder.reserve(&rule_name);
                 // Recursively build the inner optional (one fewer slot).
                 let inner_id =
-                    self.build_bounded_tail(arr_n, depth + 1, Some(k - 1), item_id, ws_id);
+                    self.build_bounded_tail(arr_n, depth + 1, Some(k - 1), item_id, ws_id)?;
                 let body_alt: Alt = if depth == 0 {
                     // Optional head: no leading comma on first item.
                     vec![
@@ -1815,8 +1821,8 @@ impl<'a> CompileCtx<'a> {
                     ]
                 };
                 self.builder
-                    .set_alts(id, vec![body_alt, vec![] /* epsilon */]);
-                id
+                    .set_alts(id, vec![body_alt, vec![] /* epsilon */])?;
+                Ok(id)
             }
         }
     }
@@ -1997,7 +2003,7 @@ impl<'a> CompileCtx<'a> {
 // ---------------------------------------------------------------------------
 
 /// Register primitive grammar rules into the builder.
-fn register_builtins(b: &mut GrammarBuilder) {
+fn register_builtins(b: &mut GrammarBuilder) -> Result<(), SchemaError> {
     // ws = (' ' | '\t' | '\n' | '\r')* (zero or more whitespace bytes)
     let ws_id = b.reserve("ws");
     let ws_tail = b.reserve("ws_tail");
@@ -2010,8 +2016,8 @@ fn register_builtins(b: &mut GrammarBuilder) {
             vec![Symbol::Terminal(b'\r'), Symbol::NonTerminal(ws_tail)],
             vec![], // epsilon
         ],
-    );
-    b.set_alts(ws_id, vec![vec![Symbol::NonTerminal(ws_tail)]]);
+    )?;
+    b.set_alts(ws_id, vec![vec![Symbol::NonTerminal(ws_tail)]])?;
 
     // json_string = '"' string_inner '"'
     // string_inner = char* where char is one of:
@@ -2033,7 +2039,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
         (0x80u8..=0xBF)
             .map(|byte| vec![Symbol::Terminal(byte)])
             .collect(),
-    );
+    )?;
 
     // Hex digit for \uXXXX escapes: 0-9, A-F, a-f.
     let hex_id = b.reserve("json_hex_digit");
@@ -2042,7 +2048,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
         .chain(b'a'..=b'f')
         .map(|byte| vec![Symbol::Terminal(byte)])
         .collect();
-    b.set_alts(hex_id, hex_alts);
+    b.set_alts(hex_id, hex_alts)?;
 
     // Legal escape body (the byte(s) following '\').
     let escape_id = b.reserve("json_escape");
@@ -2063,7 +2069,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
         Symbol::NonTerminal(hex_id),
         Symbol::NonTerminal(hex_id),
     ]);
-    b.set_alts(escape_id, escape_alts);
+    b.set_alts(escape_id, escape_alts)?;
 
     let mut char_alts: Vec<Alt> = Vec::new();
 
@@ -2114,14 +2120,14 @@ fn register_builtins(b: &mut GrammarBuilder) {
         (0xA0u8..=0xBF)
             .map(|byte| vec![Symbol::Terminal(byte)])
             .collect(),
-    );
+    )?;
     let ed_second_id = b.reserve("json_utf8_ed_second");
     b.set_alts(
         ed_second_id,
         (0x80u8..=0x9F)
             .map(|byte| vec![Symbol::Terminal(byte)])
             .collect(),
-    );
+    )?;
     char_alts.push(vec![
         Symbol::Terminal(0xE0),
         Symbol::NonTerminal(e0_second_id),
@@ -2153,14 +2159,14 @@ fn register_builtins(b: &mut GrammarBuilder) {
         (0x90u8..=0xBF)
             .map(|byte| vec![Symbol::Terminal(byte)])
             .collect(),
-    );
+    )?;
     let f4_second_id = b.reserve("json_utf8_f4_second");
     b.set_alts(
         f4_second_id,
         (0x80u8..=0x8F)
             .map(|byte| vec![Symbol::Terminal(byte)])
             .collect(),
-    );
+    )?;
     char_alts.push(vec![
         Symbol::Terminal(0xF0),
         Symbol::NonTerminal(f0_second_id),
@@ -2182,7 +2188,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
         ]);
     }
 
-    b.set_alts(str_char_id, char_alts);
+    b.set_alts(str_char_id, char_alts)?;
 
     // json_string_inner = (json_string_char json_string_inner) | ε
     b.set_alts(
@@ -2194,7 +2200,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
             ],
             vec![], // epsilon
         ],
-    );
+    )?;
     b.set_alts(
         str_id,
         vec![vec![
@@ -2202,7 +2208,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
             Symbol::NonTerminal(str_inner_id),
             Symbol::Terminal(b'"'),
         ]],
-    );
+    )?;
 
     // json_number = '-'? digit+ ('.' digit+)? (('e'|'E') ('+'|'-')? digit+)?
     // We approximate with a rule that matches the common case.
@@ -2211,7 +2217,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
     let digit_alts: Vec<Alt> = (b'0'..=b'9')
         .map(|byte| vec![Symbol::Terminal(byte)])
         .collect();
-    b.set_alts(digit_id, digit_alts);
+    b.set_alts(digit_id, digit_alts)?;
 
     // json_digits = digit digit_tail
     // json_digit_tail = digit digit_tail | ε   (nullable tail ensures
@@ -2227,21 +2233,21 @@ fn register_builtins(b: &mut GrammarBuilder) {
             ],
             vec![], // epsilon
         ],
-    );
+    )?;
     b.set_alts(
         digits_id,
         vec![vec![
             Symbol::NonTerminal(digit_id),
             Symbol::NonTerminal(digit_tail_id),
         ]],
-    );
+    )?;
 
     // json_nonzero = '1' | '2' | ... | '9'
     let nonzero_id = b.reserve("json_nonzero");
     let nonzero_alts: Vec<Alt> = (b'1'..=b'9')
         .map(|byte| vec![Symbol::Terminal(byte)])
         .collect();
-    b.set_alts(nonzero_id, nonzero_alts);
+    b.set_alts(nonzero_id, nonzero_alts)?;
 
     // json_int_part = '0' | nonzero digit_tail
     // Strict JSON integer part: forbids leading zeros (e.g. "01" rejected).
@@ -2259,11 +2265,11 @@ fn register_builtins(b: &mut GrammarBuilder) {
                 Symbol::NonTerminal(digit_tail_id),
             ],
         ],
-    );
+    )?;
 
     // Optional sign
     let opt_sign_id = b.reserve("json_opt_sign");
-    b.set_alts(opt_sign_id, vec![vec![Symbol::Terminal(b'-')], vec![]]);
+    b.set_alts(opt_sign_id, vec![vec![Symbol::Terminal(b'-')], vec![]])?;
 
     // Optional fraction: '.' digits  (leading zeros legal here, e.g. 1.05)
     let opt_frac_id = b.reserve("json_opt_frac");
@@ -2273,7 +2279,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
             vec![Symbol::Terminal(b'.'), Symbol::NonTerminal(digits_id)],
             vec![],
         ],
-    );
+    )?;
 
     // Optional exponent: (e|E) (sign?) digits  (leading zeros legal, e.g. 1e08)
     let exp_sign_id = b.reserve("json_exp_sign");
@@ -2284,7 +2290,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
             vec![Symbol::Terminal(b'-')],
             vec![],
         ],
-    );
+    )?;
     let opt_exp_id = b.reserve("json_opt_exp");
     b.set_alts(
         opt_exp_id,
@@ -2301,7 +2307,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
             ],
             vec![],
         ],
-    );
+    )?;
 
     // json_number = '-'? int_part ('.' digits)? (('e'|'E') sign? digits)?
     // Uses int_part (not digits) for the integer part to reject leading zeros.
@@ -2313,7 +2319,7 @@ fn register_builtins(b: &mut GrammarBuilder) {
             Symbol::NonTerminal(opt_frac_id),
             Symbol::NonTerminal(opt_exp_id),
         ]],
-    );
+    )?;
 
     // json_integer = '-'? int_part  (rejects leading zeros)
     let int_id = b.reserve("json_integer");
@@ -2323,15 +2329,16 @@ fn register_builtins(b: &mut GrammarBuilder) {
             Symbol::NonTerminal(opt_sign_id),
             Symbol::NonTerminal(int_part_id),
         ]],
-    );
+    )?;
 
     // json_boolean = "true" | "false"
     let bool_id = b.reserve("json_boolean");
-    b.set_alts(bool_id, vec![bytes_to_alt(b"true"), bytes_to_alt(b"false")]);
+    b.set_alts(bool_id, vec![bytes_to_alt(b"true"), bytes_to_alt(b"false")])?;
 
     // json_null = "null"
     let null_id = b.reserve("json_null");
-    b.set_alts(null_id, vec![bytes_to_alt(b"null")]);
+    b.set_alts(null_id, vec![bytes_to_alt(b"null")])?;
+    Ok(())
 }
 
 fn bytes_to_alt(bytes: &[u8]) -> Alt {
@@ -2436,7 +2443,7 @@ fn build_trie_node(
         }
     }
 
-    builder.set_alts(id, alts);
+    builder.set_alts(id, alts)?;
     Ok(id)
 }
 

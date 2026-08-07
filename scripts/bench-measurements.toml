@@ -99,7 +99,7 @@ paths = [
 [[excluded_surface]]
 family = "inference-declared-binary-grammar"
 tracking_issue = "#1273"
-reason = "bench_*.rs and the three listed measurement binaries need a Rust-side supervision decision."
+reason = "bench_*.rs and the four listed measurement binaries need a Rust-side supervision decision."
 paths = [
     "crates/inference/src/bin/bench_decode_ab.rs",
     "crates/inference/src/bin/bench_decode_slopefit.rs",
@@ -108,6 +108,7 @@ paths = [
     "crates/inference/src/bin/bench_lora_mixture.rs",
     "crates/inference/src/bin/eval_perplexity.rs",
     "crates/inference/src/bin/gramperf_profile.rs",
+    "crates/inference/src/bin/gramtime_profile.rs",
     "crates/inference/src/bin/ppl_metal.rs",
 ]
 

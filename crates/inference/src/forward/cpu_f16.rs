@@ -1353,6 +1353,7 @@ pub fn generate_multimodal_f16(
 /// vector. Picking (or fine-tuning) a checkpoint for retrieval quality is a
 /// separate, later decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PoolingStrategy {
     /// Mean over the hidden states at the request's `<|image_pad|>`
     /// positions (the visual tokens). For a text-only request — no image

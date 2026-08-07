@@ -16,6 +16,7 @@ use crate::error::{EmbedError, Result};
 /// When both query and stored vectors carry `UnitNorm`, cosine similarity equals
 /// the dot product — the norm division can be skipped entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NormalizationHint {
     /// No guarantee — full cosine (with norm division) is required.
     Unknown,
@@ -27,6 +28,7 @@ pub enum NormalizationHint {
 ///
 /// Quantization precision tier, ordered from highest to lowest fidelity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum QuantizationTier {
     /// Full f32 precision (4 bytes/dim, 1x baseline).
     Full,
@@ -90,6 +92,7 @@ impl QuantizationTier {
 /// Wraps the tier-specific vector types into a single enum for
 /// uniform storage and distance dispatch.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum QuantizedData {
     /// Full-precision f32 vector.
     Full(Vec<f32>),
@@ -166,6 +169,7 @@ impl QuantizedData {
 
 /// **Unstable**: pre-quantized query for repeated same-tier distance computation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum PreparedQuery {
     /// Full f32 query.
     Full(Vec<f32>),
