@@ -1711,17 +1711,36 @@ mod inner {
     /// The Metal GEMV kernels assume a modest rank budget (≤ ~64 per adapter in a
     /// typical mixture).  This cap bounds allocations and rejects adversarially large
     /// adapter pools before `Vec::with_capacity`.
-    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
+    ///
+    /// Re-exported from [`lattice_fann::lora::MAX_BLEND_RANK_TOTAL`], the shared
+    /// cap this crate and `lattice-tune`'s CPU LoRA blend both enforce. Only
+    /// referenced by tests below — non-test code calls `lattice_fann::lora::*`
+    /// directly so the cap itself lives in exactly one place.
+    #[cfg(test)]
+    pub(crate) const MAX_BLEND_RANK_TOTAL: usize = lattice_fann::lora::MAX_BLEND_RANK_TOTAL;
 
-    /// Aggregate cap on a blended adapter's total element count, summed across
-    /// every (layer_idx, module) projection: Σ rank_total·(d_in + d_out). At f32
-    /// this bounds the blended-adapter allocation to ~4 GiB. MAX_BLEND_RANK_TOTAL
-    /// bounds one projection; this bounds the whole blend, so a full-model adapter
-    /// that keeps every projection near the per-group cap cannot drive a multi-GiB
-    /// aggregate allocation. A realistic micro-LoRA mixture is far below this; a
-    /// large-model mixture at modest summed rank stays within budget, while a
-    /// rank-4096-everywhere adapter (tens of GiB) is rejected before any allocation.
-    pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
+    /// Reject any element of `inputs` whose inner layer slice is empty.
+    ///
+    /// An empty inner slice passes an outer `inputs.is_empty()` check (the
+    /// outer slice itself is non-empty) but contributes nothing to a
+    /// group-by-`(layer_idx, module)` pass, silently producing an empty
+    /// result instead of an admission error. Split out from
+    /// [`blend_lora_layer_data`] so callers that mutate state before
+    /// blending (e.g. [`MetalQwen35State::generate_with_lora_mixture`], which
+    /// unloads the currently loaded adapter first) can run this check first
+    /// and reject the request before that mutation, not after.
+    fn reject_empty_inner_layers(
+        inputs: &[(&[LoraLayerData], f32)],
+    ) -> Result<(), crate::error::InferenceError> {
+        for (idx, (layers, _)) in inputs.iter().enumerate() {
+            if layers.is_empty() {
+                return Err(crate::error::InferenceError::InvalidInput(format!(
+                    "blend_lora_layer_data: inputs[{idx}] has an empty layer slice"
+                )));
+            }
+        }
+        Ok(())
+    }
 
     /// Blend multiple sets of [`LoraLayerData`] into one rank-Σr set for use with
     /// the single-slot [`MetalQwen35State::load_lora_adapter`] API.
@@ -1744,6 +1763,7 @@ mod inner {
     ///
     /// Returns an error if:
     /// - `inputs` is empty
+    /// - Any element of `inputs` has an empty inner layer slice
     /// - Any weight is not finite
     /// - Two adapters have conflicting `d_in` / `d_out` for the same `(layer_idx, module)`
     /// - The summed rank for a single projection exceeds `MAX_BLEND_RANK_TOTAL`
@@ -1762,12 +1782,18 @@ mod inner {
             ));
         }
 
+        // An empty inner layer slice passes the outer `inputs.is_empty()`
+        // guard above (the outer slice itself is non-empty) but contributes
+        // nothing to `grouped` below, silently producing `Ok(Vec::new())`
+        // instead of an admission error. Callers that unload the currently
+        // loaded adapter before blending (e.g. `generate_with_lora_mixture`)
+        // must reject this before that mutation, not after — see
+        // `reject_empty_inner_layers` and its call site there.
+        reject_empty_inner_layers(inputs)?;
+
         for (idx, (_, w)) in inputs.iter().enumerate() {
-            if !w.is_finite() {
-                return Err(InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: weight at index {idx} is not finite ({w})"
-                )));
-            }
+            lattice_fann::lora::check_finite_weight("blend_lora_layer_data", idx, *w)
+                .map_err(InferenceError::InvalidInput)?;
         }
 
         // Group by (layer_idx, module): collect refs to layer data and effective weights.
@@ -1789,38 +1815,33 @@ mod inner {
         let mut planned_elems: usize = 0;
         for ((layer_idx, module), entries) in &grouped {
             let (first, _) = entries[0]; // each key was inserted with >=1 entry
-            let dims = first.d_in.checked_add(first.d_out).ok_or_else(|| {
-                InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: layer {layer_idx} module '{module}' d_in+d_out overflowed usize"
-                ))
-            })?;
             let mut group_rank: usize = 0;
             for (entry, _) in entries {
-                group_rank = group_rank.checked_add(entry.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank_total overflowed usize".into(),
-                    )
-                })?;
+                group_rank = lattice_fann::lora::accumulate_rank(
+                    group_rank,
+                    entry.rank,
+                    "blend_lora_layer_data",
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
-            let group_elems = group_rank.checked_mul(dims).ok_or_else(|| {
-                InferenceError::InvalidInput(
-                    "blend_lora_layer_data: rank_total*(d_in+d_out) overflowed usize".into(),
-                )
-            })?;
-            planned_elems = planned_elems.checked_add(group_elems).ok_or_else(|| {
-                InferenceError::InvalidInput(
-                    "blend_lora_layer_data: aggregate blend element count overflowed usize".into(),
-                )
-            })?;
+            let group_elems = lattice_fann::lora::checked_group_elements(
+                "blend_lora_layer_data",
+                *layer_idx,
+                module,
+                group_rank,
+                first.d_in,
+                first.d_out,
+            )
+            .map_err(InferenceError::InvalidInput)?;
+            planned_elems = lattice_fann::lora::accumulate_planned_elements(
+                planned_elems,
+                group_elems,
+                "blend_lora_layer_data",
+            )
+            .map_err(InferenceError::InvalidInput)?;
         }
-        if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
-            return Err(InferenceError::InvalidInput(format!(
-                "blend_lora_layer_data: aggregate blend size {planned_elems} elements exceeds \
-                 MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{} GiB f32); reduce the \
-                 number of adapters, their rank, or the number of target projections",
-                (MAX_BLEND_TOTAL_ELEMENTS * 4) / (1024 * 1024 * 1024)
-            )));
-        }
+        lattice_fann::lora::check_aggregate_elements_cap(planned_elems, "blend_lora_layer_data")
+            .map_err(InferenceError::InvalidInput)?;
 
         let mut result: Vec<LoraLayerData> = Vec::with_capacity(grouped.len());
         for ((layer_idx, module), entries) in grouped {
@@ -1830,64 +1851,46 @@ mod inner {
 
             // Validate dimension consistency across adapters for this projection.
             for (idx, (entry, _)) in entries.iter().enumerate() {
-                if entry.d_in != d_in || entry.d_out != d_out {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: layer {layer_idx} module '{module}' has \
-                         mismatched dimensions (entry 0: d_in={d_in}, d_out={d_out}; \
-                         entry {idx}: d_in={}, d_out={})",
-                        entry.d_in, entry.d_out
-                    )));
-                }
+                lattice_fann::lora::check_dims_match(
+                    "blend_lora_layer_data",
+                    layer_idx,
+                    &module,
+                    d_in,
+                    d_out,
+                    idx,
+                    entry.d_in,
+                    entry.d_out,
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
 
             // Accumulate rank_total with overflow protection and a hard cap
             // (MAX_BLEND_RANK_TOTAL is defined at module scope above this function).
             let mut rank_total: usize = 0;
             for (layer, _) in &entries {
-                rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank_total overflowed usize".into(),
-                    )
-                })?;
+                rank_total = lattice_fann::lora::accumulate_rank(
+                    rank_total,
+                    layer.rank,
+                    "blend_lora_layer_data",
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
-            if rank_total > MAX_BLEND_RANK_TOTAL {
-                return Err(InferenceError::InvalidInput(format!(
-                    "blend_lora_layer_data: summed rank {rank_total} exceeds \
-                     MAX_BLEND_RANK_TOTAL={MAX_BLEND_RANK_TOTAL}"
-                )));
-            }
+            lattice_fann::lora::check_rank_total_cap(rank_total, "blend_lora_layer_data")
+                .map_err(InferenceError::InvalidInput)?;
 
             // Validate source slice lengths before any allocation: a malformed adapter
             // whose A or B buffer is the wrong size would cause out-of-bounds copies.
             for (idx, (entry, _)) in entries.iter().enumerate() {
-                let expected_a = entry.rank.checked_mul(d_in).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: rank*d_in overflowed usize".into(),
-                    )
-                })?;
-                let expected_b = d_out.checked_mul(entry.rank).ok_or_else(|| {
-                    InferenceError::InvalidInput(
-                        "blend_lora_layer_data: d_out*rank overflowed usize".into(),
-                    )
-                })?;
-                if entry.a.len() != expected_a {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: entry {idx} A slice length {} \
-                         does not match rank*d_in={}*{}={expected_a}",
-                        entry.a.len(),
-                        entry.rank,
-                        d_in,
-                    )));
-                }
-                if entry.b.len() != expected_b {
-                    return Err(InferenceError::InvalidInput(format!(
-                        "blend_lora_layer_data: entry {idx} B slice length {} \
-                         does not match d_out*rank={}*{}={expected_b}",
-                        entry.b.len(),
-                        d_out,
-                        entry.rank,
-                    )));
-                }
+                lattice_fann::lora::check_buffer_lengths(
+                    "blend_lora_layer_data",
+                    idx,
+                    entry.rank,
+                    d_in,
+                    d_out,
+                    entry.a.len(),
+                    entry.b.len(),
+                )
+                .map_err(InferenceError::InvalidInput)?;
             }
 
             let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
@@ -3756,6 +3759,17 @@ mod inner {
         /// (`in_proj_a`, `in_proj_b` not yet supported — consumed inside fused kernels).
         /// MLP modules (both layer types): `gate_proj`, `up_proj`, `down_proj`.
         ///
+        /// This is the deliberate low-level entry point: `scale` is applied
+        /// exactly as given, with no cross-check against any adapter
+        /// identity (no descriptor, no per-layer rank comparison, nothing
+        /// derived from `layers` itself). The caller owns the invariant that
+        /// `scale` is the correct `alpha / rank` for the adapter these
+        /// `layers` actually represent — this function has no way to verify
+        /// that on its own. Prefer [`Self::load_lora_adapter_with_descriptor`]
+        /// when `scale` should instead be derived from, and checked against,
+        /// a [`lattice_fann::lora::LoraDescriptor`]'s declared rank and
+        /// target modules.
+        ///
         /// # Errors
         ///
         /// Returns an error if:
@@ -3951,6 +3965,80 @@ mod inner {
             Ok(())
         }
 
+        /// Load a LoRA adapter using the shared cross-crate
+        /// [`lattice_fann::lora::LoraDescriptor`] as the source of the adapter's
+        /// scale and declared target modules, instead of a bare `scale: f32`
+        /// the caller must have derived correctly on its own.
+        ///
+        /// Validates `descriptor.alpha`/effective scale (finite),
+        /// `descriptor.target_modules` (recognized names), that every
+        /// nonempty `layers` entry's rank matches `descriptor.rank`, and that
+        /// the set of modules present in `layers` matches
+        /// `descriptor.target_modules` exactly — before delegating to
+        /// [`Self::load_lora_adapter`] with `descriptor.scale()`. Every
+        /// per-layer, per-architecture shape check `load_lora_adapter` already
+        /// performs still applies on top of this.
+        ///
+        /// `descriptor.rank` and `descriptor.target_modules` are the inputs
+        /// `descriptor.scale()` is computed from; without this check a caller
+        /// could pass `layers` built at one rank alongside a `descriptor` built
+        /// at another (or covering a different module set) and silently get
+        /// the wrong scale applied to correctly-shaped buffers.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if the descriptor's alpha/scale is not finite, if
+        /// `target_modules` contains an unrecognized name, if any layer's
+        /// rank disagrees with `descriptor.rank`, if the loaded module set
+        /// disagrees with `descriptor.target_modules`, or for any reason
+        /// [`Self::load_lora_adapter`] itself would reject the call.
+        pub fn load_lora_adapter_with_descriptor(
+            &mut self,
+            layers: Vec<LoraLayerData>,
+            descriptor: &lattice_fann::lora::LoraDescriptor,
+            quarot_seed: Option<u64>,
+        ) -> Result<(), crate::error::InferenceError> {
+            use crate::error::InferenceError;
+
+            descriptor
+                .validate()
+                .map_err(InferenceError::InvalidInput)?;
+            lattice_fann::lora::validate_target_modules(
+                &descriptor.target_modules,
+                lattice_fann::lora::KNOWN_LORA_TARGET_MODULES,
+            )
+            .map_err(InferenceError::InvalidInput)?;
+
+            for layer in &layers {
+                if layer.rank != descriptor.rank {
+                    return Err(InferenceError::InvalidInput(format!(
+                        "load_lora_adapter_with_descriptor: layer {} module '{}' has \
+                         rank={} but descriptor declares rank={}",
+                        layer.layer_idx, layer.module, layer.rank, descriptor.rank
+                    )));
+                }
+            }
+
+            let mut layer_modules: Vec<&str> = layers.iter().map(|l| l.module.as_str()).collect();
+            layer_modules.sort_unstable();
+            layer_modules.dedup();
+            let mut declared_modules: Vec<&str> = descriptor
+                .target_modules
+                .iter()
+                .map(String::as_str)
+                .collect();
+            declared_modules.sort_unstable();
+            declared_modules.dedup();
+            if layer_modules != declared_modules {
+                return Err(InferenceError::InvalidInput(format!(
+                    "load_lora_adapter_with_descriptor: loaded layer modules {layer_modules:?} \
+                     do not match descriptor.target_modules {declared_modules:?}"
+                )));
+            }
+
+            self.load_lora_adapter(layers, descriptor.scale(), quarot_seed)
+        }
+
         /// Unload the currently loaded LoRA adapter, freeing GPU buffers.
         pub fn unload_lora_adapter(&mut self) {
             self.lora = None;
@@ -4022,6 +4110,13 @@ mod inner {
                 GenerationPreparation::Complete(output) => return Ok(output),
                 GenerationPreparation::Ready(_) => {}
             }
+
+            // Reject an empty inner layer slice here, before the adapter unload
+            // below — `blend_lora_layer_data` also runs this check, but only
+            // after the unload has already destroyed the previously loaded
+            // adapter. Admission errors must be returned before any existing
+            // adapter or prefix cache is changed (see this method's doc comment).
+            reject_empty_inner_layers(adapter_weights)?;
 
             // Unload any previously loaded adapter so the slot is free.
             self.unload_lora_adapter();
@@ -22024,6 +22119,66 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(result.is_err(), "zero d_in must return Err");
         }
 
+        // -----------------------------------------------------------------
+        // `generate_with_lora_mixture` must reject an empty inner layer
+        // slice before it unloads the currently loaded adapter — otherwise
+        // the request errors out *after* destroying a previously loaded
+        // adapter, contradicting this method's own admission-error promise
+        // ("Admission errors are returned before the existing adapter or
+        // prefix cache is changed"). Loads a real adapter first so the
+        // destructive path (`unload_lora_adapter`) has something to destroy,
+        // then asserts it is untouched after the rejected call.
+        // -----------------------------------------------------------------
+        #[test]
+        fn generate_with_lora_mixture_rejects_empty_inner_slice_without_unloading() {
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+            use crate::model::qwen35_config::GenerateConfig;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+
+            state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 1)], 1.0, None)
+                .expect("valid LoRA adapter loads");
+            assert!(
+                state.has_lora_adapter(),
+                "precondition: an adapter must be loaded before the rejected call"
+            );
+
+            let gen_cfg = GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: (0..cfg.vocab_size as u32).collect(),
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            };
+
+            let empty: &[LoraLayerData] = &[];
+            let result =
+                state.generate_with_lora_mixture(&[(empty, 1.0)], "a", &tokenizer, &gen_cfg);
+            assert!(
+                result.is_err(),
+                "an empty inner layer slice must be rejected"
+            );
+            assert!(
+                state.has_lora_adapter(),
+                "the previously loaded adapter must survive a rejected request, \
+                 not be destroyed by the unconditional unload before blending"
+            );
+        }
+
         #[test]
         fn load_lora_adapter_rejects_out_of_range_layer_idx() {
             let _gpu_guard = gpu_test_lock();
@@ -34384,6 +34539,21 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         // -----------------------------------------------------------------
+        // An empty inner layer slice passes the outer `inputs.is_empty()`
+        // guard (the outer slice has one entry) but must still be rejected,
+        // not silently produce an empty `Ok(Vec::new())` blend.
+        // -----------------------------------------------------------------
+        #[test]
+        fn blend_lora_layer_data_rejects_empty_inner_layer_slice() {
+            let empty: &[LoraLayerData] = &[];
+            let result = blend_lora_layer_data(&[(empty, 1.0)]);
+            assert!(
+                result.is_err(),
+                "an empty inner layer slice must return an error, not Ok(Vec::new())"
+            );
+        }
+
+        // -----------------------------------------------------------------
         // Contract: a malformed huge dimension returns Err, never panics.
         //
         // rank=2, d_in=usize::MAX/2+1, d_out=1 with empty a and b=[0.0;2].
@@ -34427,7 +34597,6 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // -----------------------------------------------------------------
         #[test]
         fn blend_aggregate_budget_exceeded_returns_err() {
-            // MAX_BLEND_TOTAL_ELEMENTS is in scope via `use super::*` above.
             let rank = MAX_BLEND_RANK_TOTAL; // 4096 — exactly at per-group cap
             let d_in = 2048usize;
             let d_out = 2048usize;

@@ -248,6 +248,31 @@ jobs:
           cache-on-failure: true
       - name: tune — safetensors + inference-hook + serde (compile tests)
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --no-run
+      # `LoraConfig::validate` (the check `LoraAdapter::new` runs on every
+      # construction path) deliberately does not enforce a known-module-name
+      # allowlist — the adapter representation is model-neutral. The only
+      # remaining enforcement of unknown/wrong-architecture target-module
+      # names is `LoraAdapter::validate_against`/`validate_against_bert`,
+      # gated behind `inference-hook` like the rest of this step's compile
+      # target above, so the `--no-run` step only ever type-checks them.
+      # Build AND run this specific surface, same as the `mixture` and
+      # `simulated-teacher` steps below, so the fail-closed rejection tests
+      # cannot rot silently.
+      - name: tune — LoRA validate_against rejection tests (build + run)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/lora-validate-against-tests.log"
+          if cargo test -p lattice-tune --lib --features inference-hook \
+            validate_against >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -q 'test lora::tests::validate_against_tests::test_validate_against_unknown_module_errors ... ok' "$log"
+          grep -q 'test lora::tests::validate_against_bert_tests::test_validate_against_bert_unknown_module_rejected ... ok' "$log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: tune — train-backward (compile tests)
         run: cargo test -p lattice-tune --features train-backward --no-run
       # The `mixture` feature gates the experimental online router-refit module
