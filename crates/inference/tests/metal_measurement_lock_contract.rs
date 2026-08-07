@@ -249,8 +249,12 @@ const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
         "run safetensors branch is an exact deferred manually launched measurement construction tracked in #1274",
     ),
     (
-        "example:profile_metal:examples/profile_metal.rs=>examples/profile_metal.rs:29:39",
-        "main is an exact deferred manually launched measurement construction tracked in #1274",
+        "example:profile_metal:examples/profile_metal.rs=>examples/profile_metal.rs:30:43",
+        "main Q4 branch is an exact deferred manually launched measurement construction tracked in #1274",
+    ),
+    (
+        "example:profile_metal:examples/profile_metal.rs=>examples/profile_metal.rs:36:43",
+        "main safetensors branch is an exact deferred manually launched measurement construction tracked in #1274",
     ),
     (
         "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs:770:39",

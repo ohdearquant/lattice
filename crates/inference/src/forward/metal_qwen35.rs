@@ -16956,6 +16956,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let Some(_) = Device::system_default() else {
                 return;
             };
+            let _gpu = gpu_test_lock();
             let (cfg, weights) = tiny_metal_qwen35_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 16)
                 .expect("tiny MetalQwen35State fixture constructs");
@@ -17618,6 +17619,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 );
                 return;
             };
+            let _gpu = gpu_test_lock();
             let (cfg, weights) = tiny_hybrid_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 16)
                 .expect("tiny hybrid MetalQwen35State fixture constructs");
@@ -35468,7 +35470,7 @@ mod public_scheduling_entry_point_tests {
             ("pub fn forward_prefill(", "try_forward_prefill"),
             (
                 "pub fn forward_prefill_with_hidden(",
-                "validate_hidden_prefill_fresh_session",
+                "check_hidden_prefill_fresh_session",
             ),
             (
                 "pub fn forward_prefill_all_logits(",
