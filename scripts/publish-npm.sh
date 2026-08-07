@@ -22,6 +22,7 @@ set -e
 # gated behind an explicit NPM_PROVENANCE=1 opt-in rather than baked into
 # publishConfig (which would hard-fail a local publish).
 
+# selftest-extraction-marker: ARGV_GUARD_BEGIN
 case "${1:-}" in
     "")
         MODE="publish"
@@ -34,6 +35,7 @@ case "${1:-}" in
         exit 2
         ;;
 esac
+# selftest-extraction-marker: ARGV_GUARD_END
 
 PROV=""
 if [ "${NPM_PROVENANCE:-}" = "1" ]; then
@@ -92,6 +94,7 @@ PLATFORM_DIRS=""
 for platform in $EXPECTED_PLATFORMS; do
     pkgdir="$NATIVE_DIR/npm/$platform/"
     pkgjson="${pkgdir}package.json"
+    # selftest-extraction-marker: PLATFORM_PKGJSON_GUARD_BEGIN
     if [ ! -f "$pkgjson" ]; then
         echo "ERROR: missing native binary for platform '$platform' under $pkgdir" >&2
         echo "       the release must include every platform listed in" >&2
@@ -101,6 +104,7 @@ for platform in $EXPECTED_PLATFORMS; do
         echo "       the npm-native-prebuilds artifact first." >&2
         exit 1
     fi
+    # selftest-extraction-marker: PLATFORM_PKGJSON_GUARD_END
 
     node_rel=$(node -p "require('$pkgjson').main || ''")
     node_path="${pkgdir}${node_rel}"
@@ -247,11 +251,13 @@ echo "Preflight OK: no version collisions."
 # native main package (its prepublishOnly runs `napi artifacts && npm test`).
 # Any failure here aborts before a single package is published.
 echo "=== Preflight (dry-run: pack + gate the full release) ==="
+# selftest-extraction-marker: FULL_DRYRUN_GUARD_BEGIN
 ( cd "$WASM_DIR" && npm publish --dry-run )
 for pkgdir in $PLATFORM_DIRS; do
     ( cd "$pkgdir" && npm publish --dry-run )
 done
 ( cd "$NATIVE_DIR" && npm publish --dry-run )
+# selftest-extraction-marker: FULL_DRYRUN_GUARD_END
 
 # `npm publish --dry-run` above packs the main package but never examines
 # its contents -- it only proves the tarball builds, not that the tarball's

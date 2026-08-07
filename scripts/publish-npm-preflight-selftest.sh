@@ -92,8 +92,22 @@ else
   echo "  FAIL:   -> no distinguishing diagnostic in output"; fail=$((fail+1))
 fi
 
-# (c) a successful lookup: version exists, exit 0 -> already-published branch.
-run_case 'echo "9.9.9"
+# (c) a successful lookup: version exists, exit 0 -> already-published branch
+#     (G10, the `if view_out=$(npm view ...)` success arm). The stub body is
+#     valid JSON whose parsed error.code is E404 -- an otherwise-nonsensical
+#     pairing (a "successful" view call carrying a not-found body) chosen
+#     deliberately: if G10's own exit 1 is defeated, execution falls through
+#     unconditionally into the E404-parsing branch below it, which reads
+#     error_code == "E404" as the AVAILABLE outcome and does not itself
+#     reject, so a defeated G10 makes this arm go fully green (rc 0, no
+#     diagnostic) instead of holding rc 1 from the E404 guard's own
+#     rejection. Measured with the old plain-text "9.9.9" stub: disabling
+#     G10 still left this arm at rc 1 (invalid JSON -> empty error_code ->
+#     the E404 guard's own "did not return npm's not-found response"
+#     branch), with only the message assertion catching it -- not isolating.
+run_case 'cat <<J
+{"error":{"code":"E404","summary":"Not Found - GET https://registry.npmjs.org/x - Not found"}}
+J
 exit 0'
 check "(c) successful lookup is treated as already-published" 1 $?
 case "$OUT" in
@@ -243,12 +257,25 @@ else
   echo "  FAIL:   -> missing exact-path diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
 fi
 
-# (j) platform .node absent entirely -- must fail closed.
+# (j) platform .node absent under the exact name "main" declares -- must fail
+#     closed via the exact-path guard (G4, the `[ ! -f "$node_path" ]` check).
+#     The fixture ships a DIFFERENT .node file (not the main-named one),
+#     present on disk and listed in "files", so that once G4 is defeated the
+#     packlist guard (G9) accepts the tarball and this arm goes fully green
+#     instead of holding rc 1 from G9's own rejection. Measured with the
+#     original fixture (no .node file on disk at all): disabling G4 still
+#     left this arm at rc 1 via G9 (an assert-platform-packlist.mjs
+#     assertion failure over zero .node files), with only the
+#     "missing native binary" message assertion catching it -- not isolating.
+#     (i) already isolates the misnamed-but-present case; this arm now
+#     isolates the absent-under-the-declared-name case specifically.
 NATIVE="$MSB/j-absent"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3"
 d="$NATIVE/npm/darwin-arm64"; mkdir -p "$d"
-cat > "$d/package.json" <<'EOF'
-{"name": "@khive-ai/lattice-embed-darwin-arm64", "version": "1.2.3", "main": "lattice-embed-native.darwin-arm64.node", "files": ["lattice-embed-native.darwin-arm64.node"]}
+present="lattice-embed-native-alt.darwin-arm64.node"
+cat > "$d/package.json" <<EOF
+{"name": "@khive-ai/lattice-embed-darwin-arm64", "version": "1.2.3", "main": "lattice-embed-native.darwin-arm64.node", "files": ["$present"]}
 EOF
+printf 'fake-binary' > "$d/$present"
 run_matrix_case "$NATIVE"; rc=$?
 check "(j) absent .node fails closed" 1 $rc
 if printf '%s' "$OUT" | grep -qF "missing native binary"; then
@@ -471,22 +498,50 @@ fi
 
 echo
 echo "=== publish-npm.sh missing-platform-package.json guard self-test ==="
-# publish-npm.sh:95 rejects an advertised platform whose npm/<platform>/
-# package.json is absent entirely -- distinct from the exact-.node-path
-# guard at :107 (arm (j) above), which always writes a package.json and
-# omits only the .node file. Measured: mutating :95's condition to
-# `if false` left the suite fully green (46 passed, 0 failed); no existing
-# arm reddened.
+# publish-npm.sh:95-102 (G3) rejects an advertised platform whose
+# npm/<platform>/package.json is absent entirely -- distinct from the
+# exact-.node-path guard a few lines later (G4, arm (j) above), which always
+# writes a package.json and omits only the .node file. G3's own check sits
+# directly before an UNCONDITIONAL `node -p require($pkgjson)...` call later
+# in the same for-loop iteration, so running the whole platform-matrix body
+# (as arms (h)-(n) do via run_matrix_case) cannot isolate G3 alone: a
+# defeated G3 still crashes on that require() with Node's own
+# MODULE_NOT_FOUND (rc 1), which happens to match G3's own expected rc and
+# so leaves the exit-code assertion falsely green -- measured: mutating
+# :95's condition to `if false` gave 53 passed, 1 failed, with only the
+# diagnostic-message assertion catching it, not the exit code. Bounding the
+# extraction to JUST the pkgjson-existence check (its own
+# PLATFORM_PKGJSON_GUARD marker pair in publish-npm.sh, ending before the
+# require() call) keeps that crash out of the tested block entirely, so a
+# defeated G3 now falls straight through to the PASSED marker with rc 0 --
+# an unambiguous isolation instead of a coincidentally-matching rc.
+PLATFORM_PKGJSON_BODY="$(awk '/selftest-extraction-marker: PLATFORM_PKGJSON_GUARD_BEGIN/,/selftest-extraction-marker: PLATFORM_PKGJSON_GUARD_END/' "$SRC")"
+if [ -z "$PLATFORM_PKGJSON_BODY" ]; then
+  echo "FATAL: could not extract the platform package.json guard from $SRC -- have its" >&2
+  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
+  echo "  extraction below would otherwise silently test nothing." >&2
+  exit 1
+fi
+
+run_pkgjson_case() {  # $1=NATIVE_DIR $2=platform
+  RUNNER="$MSB/pkgjson-runner.sh"
+  {
+    printf 'NATIVE_DIR=%q\n' "$1"
+    printf 'platform=%q\n' "$2"
+    printf '%s\n' "$PLATFORM_PKGJSON_BODY"
+    printf 'echo PKGJSON_GUARD_PASSED\n'
+  } > "$RUNNER"
+  OUT="$(/bin/sh -c "set -e; . '$RUNNER'" 2>&1)"
+  return $?
+}
+
 NATIVE="$MSB/x-nopkgjson"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3"
 # Deliberately create no npm/darwin-arm64/ directory at all, so pkgjson can
 # never exist.
-run_matrix_case "$NATIVE"; rc=$?
+run_pkgjson_case "$NATIVE" "darwin-arm64"; rc=$?
 check "(x) missing platform package.json fails closed" 1 $rc
-# :95's own message says "... under $pkgdir"; :107's says "expected
-# $node_path" and never contains "under". This substring isolates :95 from
-# :107 even though both messages start "missing native binary for platform".
 if printf '%s' "$OUT" | grep -qF "missing native binary for platform 'darwin-arm64' under"; then
-  echo "  PASS:   -> missing-package.json diagnostic printed (isolates :95 from :107)"; pass=$((pass+1))
+  echo "  PASS:   -> missing-package.json diagnostic printed"; pass=$((pass+1))
 else
   echo "  FAIL:   -> missing distinguishing diagnostic (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
 fi
@@ -496,9 +551,13 @@ echo "=== publish-npm.sh npm-pack-command-failure guard self-test ==="
 # publish-npm.sh:168-170 fails closed when `npm pack --dry-run --json`
 # itself returns nonzero -- distinct from the packlist CONTENT guard at
 # :172-178 (arm (l) above), which requires a pack that succeeds but whose
-# contents are wrong. Measured: replacing :170's `exit 1` with `:` left the
-# suite fully green; every existing fixture's `npm pack` call succeeds, so
-# nothing exercised this branch.
+# contents are wrong. Measured before this arm existed: replacing :170's
+# `exit 1` with `:` left the suite fully green, because every fixture up to
+# that point had its `npm pack` call succeed, so nothing exercised this
+# branch. That baseline is what motivated adding the arm below, which
+# re-creates the same failure directly via a stub and now holds it (verified
+# by re-running the same mutation with this arm in place: it goes red on its
+# own exit-code assertion).
 #
 # Isolate by shimming a stub `npm` ahead of the real one on PATH that fails
 # only on `npm pack`; nothing else in the extracted matrix guard body
@@ -554,10 +613,13 @@ echo "=== publish-npm.sh check_version_available call-site coverage self-test ==
 # already-published) is exercised above by arms (a)-(g) against one
 # synthetic fixture, but nothing above proves the real script actually
 # CALLS it on the WASM package, every platform package, AND the native main
-# package -- publish-npm.sh:236,238,240. Measured: replacing :240's
-# `check_version_available "$NATIVE_DIR"` with `:` left the suite fully
-# green (46 passed, 0 failed); a native name@version collision would reach
-# the real publish loop undetected. A guard that works perfectly and is
+# package -- publish-npm.sh:236,238,240. Measured before this arm existed:
+# replacing :240's `check_version_available "$NATIVE_DIR"` with `:` left the
+# suite fully green; a native name@version collision would reach the real
+# publish loop undetected. That baseline motivated the arm below, which now
+# holds the same mutation (verified by re-running it with this arm in
+# place: it goes red on both of its own assertions). A guard that works
+# perfectly and is
 # never called is indistinguishable from a broken one at runtime, so this
 # needs a CALLER-level test: extract the three call sites verbatim and run
 # them with check_version_available replaced by a recording stub, then
@@ -606,14 +668,124 @@ else
 fi
 
 echo
+echo "=== publish-npm.sh full-release dry-run guard self-test ==="
+# publish-npm.sh:245-254 packs and gates the WHOLE release (wasm, every
+# platform, native main) via three `npm publish --dry-run` calls before any
+# real publish -- the immutability contract this script exists to protect
+# (npm name@version tuples cannot be republished, so a real publish that
+# fails partway is unrecoverable). This guard has no explicit `exit N`: it
+# relies entirely on the script's own top-level `set -e` to abort on the
+# first nonzero `npm publish --dry-run`, so `grep -nE 'exit[[:space:]]+[0-9]+'`
+# does not find it at all and it was covered by zero arms. Measured:
+# replacing the first dry-run call (:250) with `:` left the suite fully
+# green -- a dry-run failure on any package would previously reach the real
+# publish loop undetected.
+FULL_DRYRUN_BODY="$(awk '/selftest-extraction-marker: FULL_DRYRUN_GUARD_BEGIN/,/selftest-extraction-marker: FULL_DRYRUN_GUARD_END/' "$SRC")"
+if [ -z "$FULL_DRYRUN_BODY" ]; then
+  echo "FATAL: could not extract the full-release dry-run guard from $SRC -- have its" >&2
+  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
+  echo "  extraction below would otherwise silently test nothing." >&2
+  exit 1
+fi
+
+DSB="$SB/dryrun"
+mkdir -p "$DSB/wasm" "$DSB/native" "$DSB/stub-bin"
+
+# The stub keys its failure on $PWD (which package's dry-run is running),
+# not on the mere fact that `npm publish` was invoked. An unconditional
+# "always fail" stub cannot isolate the WASM call specifically: mutating the
+# WASM call away (as the measured defect above does) still leaves the
+# NATIVE_DIR call later in the same chained block, which an unconditional
+# stub would ALSO fail -- reddening the arm for the wrong reason and
+# masking the very mutation it exists to catch, the same overdetermination
+# shape as the (bb)/(c)/(j) fixes above.
+run_dryrun_case() {  # $1 = absolute dir the stub should fail in, or "" for none
+  fail_dir="$1"
+  cat > "$DSB/stub-bin/npm" <<EOF
+#!/usr/bin/env bash
+if [ "\$1" = "publish" ]; then
+  if [ "\$PWD" = "$fail_dir" ]; then
+    echo "npm error simulated dry-run failure for selftest arm (bb) in \$PWD" >&2
+    exit 1
+  fi
+  exit 0
+fi
+echo "unexpected npm invocation in dry-run guard stub: \$*" >&2
+exit 99
+EOF
+  chmod +x "$DSB/stub-bin/npm"
+  RUNNER="$DSB/runner.sh"
+  {
+    printf 'WASM_DIR=%q\n' "$DSB/wasm"
+    printf 'PLATFORM_DIRS=%q\n' ""
+    printf 'NATIVE_DIR=%q\n' "$DSB/native"
+    printf '%s\n' "$FULL_DRYRUN_BODY"
+    printf 'echo FULL_DRYRUN_GUARD_PASSED\n'
+  } > "$RUNNER"
+  OUT="$(PATH="$DSB/stub-bin:$PATH" /bin/sh -c "set -e; . '$RUNNER'" 2>&1)"
+  return $?
+}
+
+# (bb) the wasm package's dry-run fails specifically (stub fails only when
+#      $PWD is $WASM_DIR) -- must abort before reaching the native
+#      package's own dry-run or the PASSED marker.
+run_dryrun_case "$DSB/wasm"
+rc=$?
+check "(bb) wasm dry-run failure aborts the release" 1 $rc
+if printf '%s' "$OUT" | grep -qF "FULL_DRYRUN_GUARD_PASSED"; then
+  echo "  FAIL:   -> guard reached the end of the extracted block despite the failure"; fail=$((fail+1))
+else
+  echo "  PASS:   -> guard aborted before reaching the end of the extracted block"; pass=$((pass+1))
+fi
+
+# (cc) must-PASS control: every dry-run succeeds (no fail_dir) -- the guard
+#      must reach the end of the extracted block. Without this, (bb) alone
+#      cannot tell "the guard correctly rejects a failure" apart from "the
+#      fixture is broken and nothing ever reaches PASSED".
+run_dryrun_case ""
+rc=$?
+check "(cc) full-release dry-run success control reaches the end" 0 $rc
+if printf '%s' "$OUT" | grep -qF "FULL_DRYRUN_GUARD_PASSED"; then
+  echo "  PASS:   -> guard reached the end of the extracted block"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> did not reach end of block (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+echo
 echo "=== publish-npm.sh argv usage guard self-test ==="
-# publish-npm.sh:25-36's case statement rejects any argv other than "" or
-# "--dry-run" with `usage: ... ; exit 2` at :34 -- found during enumeration
-# (grep -n 'exit [0-9]' scripts/publish-npm.sh), covered by zero arms before
-# this one. Unlike the matrix/packlist guards this branch runs before any
-# other work, so it can be exercised by invoking the real script directly
-# with no fixture needed.
-OUT="$(/bin/sh "$SRC" --totally-bogus-flag 2>&1)"; rc=$?
+# publish-npm.sh:25-36's case statement (G1) rejects any argv other than ""
+# or "--dry-run" with `usage: ... ; exit 2` at :34 -- found during
+# enumeration (grep -n 'exit [0-9]' scripts/publish-npm.sh), covered by zero
+# arms before this one. Invoking the real script directly is not isolated
+# from the rest of the script, though: if :34's `exit 2` is defeated, the
+# case's `*)` branch falls through with $MODE unset and execution continues
+# into the platform-matrix guard against whatever repo state the test
+# happens to run in -- measured: replacing :34's `exit 2` with `:` gave
+# rc 1 (from the current checkout's own matrix guard) instead of rc 2, which
+# this arm's exit-code assertion does catch as a mismatch, but only because
+# a coincidentally-different rc came out of unrelated, environment-dependent
+# code; the usage-message assertion stays green regardless (the case's own
+# echo runs unconditionally before the mutated exit), and a fresh checkout
+# with a fully populated matrix could produce yet another rc, including a
+# false rc 2. Extracting just the case statement (its own ARGV_GUARD marker
+# pair in publish-npm.sh) and running it standalone -- with $0/$1 set via
+# `sh -c CMD name arg` so the extracted `$0`/`${1:-}` references still see
+# the real script path and the bogus flag -- bounds the test so it cannot
+# reach the matrix guard or anything else, regardless of checkout state.
+ARGV_BODY="$(awk '/selftest-extraction-marker: ARGV_GUARD_BEGIN/,/selftest-extraction-marker: ARGV_GUARD_END/' "$SRC")"
+if [ -z "$ARGV_BODY" ]; then
+  echo "FATAL: could not extract the argv usage guard from $SRC -- have its" >&2
+  echo "  selftest-extraction-marker comments been removed or reshaped? The" >&2
+  echo "  extraction below would otherwise silently test nothing." >&2
+  exit 1
+fi
+
+RUNNER="$MSB/argv-runner.sh"
+{
+  printf '%s\n' "$ARGV_BODY"
+  printf 'echo ARGV_GUARD_PASSED\n'
+} > "$RUNNER"
+OUT="$(/bin/sh -c "set -e; . '$RUNNER'" "$SRC" --totally-bogus-flag 2>&1)"; rc=$?
 check "(aa) unrecognized argv fails closed" 2 $rc
 if printf '%s' "$OUT" | grep -qF "usage: $SRC [--dry-run]"; then
   echo "  PASS:   -> usage diagnostic printed"; pass=$((pass+1))
