@@ -42,7 +42,7 @@ SRC="$REPO/scripts/publish-npm.sh"
 # PLATFORM_MATRIX_GUARD legitimately captures PLATFORM_PKGJSON_GUARD's
 # markers too. Callers that expect a nested pair list it in $3+; any marker
 # not on that list is still treated as foreign and rejected.
-extract_marker_block() {  # $1=NAME (e.g. PLATFORM_MATRIX_GUARD) $2=src-file $3+=allowed-nested-NAMEs
+extract_marker_block() {  # $1=NAME (e.g. PLATFORM_MATRIX_GUARD) $2=src-file $3+=allowed nested names
   name="$1"; src="$2"; shift 2
   begin="# selftest-extraction-marker: ${name}_BEGIN"
   end="# selftest-extraction-marker: ${name}_END"
