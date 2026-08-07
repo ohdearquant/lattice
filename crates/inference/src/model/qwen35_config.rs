@@ -2391,7 +2391,10 @@ pub struct GenerateConfig {
     pub stop_strings: Vec<String>,
     /// Reasoning-budget forcing (s1-style): after this many reasoning tokens are
     /// generated without a `</think>`, force-inject `</think>` to commit the model
-    /// to an answer. `None` or `Some(0)` = disabled (no behaviour change).
+    /// to an answer. `None`, `Some(0)`, or [`enable_thinking`](Self::enable_thinking)
+    /// `== false` = disabled (no behaviour change) -- with thinking disabled there is
+    /// no reasoning block for a forced `</think>` to close, so the budget is inert
+    /// regardless of its value. See [`GenerateConfig::effective_reasoning_budget`].
     pub reasoning_budget: Option<usize>,
     /// Capture per-token log-probabilities (OpenAI `logprobs`/`top_logprobs`).
     /// `None` (default) disables capture entirely -- no extra allocation or
@@ -2439,6 +2442,21 @@ impl Default for GenerateConfig {
             reasoning_budget: None,
             logprobs: None,
         }
+    }
+}
+
+impl GenerateConfig {
+    /// `reasoning_budget` as every decode-path consumer must see it: `None`
+    /// whenever `enable_thinking` is false, since a budget without a
+    /// reasoning block to close is inert (see the field's own doc).
+    ///
+    /// This is the single point where that contract is enforced. Every
+    /// `decode_cap` / `check_context_budget` / `DecodePolicy` call site reads
+    /// this instead of the raw `reasoning_budget` field, so a future
+    /// consumer that does the same is correct by construction instead of
+    /// having to re-derive the `enable_thinking` gate itself.
+    pub(crate) fn effective_reasoning_budget(&self) -> Option<usize> {
+        self.reasoning_budget.filter(|_| self.enable_thinking)
     }
 }
 

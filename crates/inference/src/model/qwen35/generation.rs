@@ -99,11 +99,12 @@ impl Qwen35Model {
         let max_context = self.max_context();
         check_context_budget(
             prompt_len,
-            gen_cfg.reasoning_budget,
+            gen_cfg.effective_reasoning_budget(),
             gen_cfg.max_new_tokens,
             max_context,
         )?;
-        let effective_new = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+        let effective_new =
+            decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
 
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
@@ -532,11 +533,12 @@ impl Qwen35Model {
         let max_context = self.max_context();
         check_context_budget(
             prompt_len,
-            gen_cfg.reasoning_budget,
+            gen_cfg.effective_reasoning_budget(),
             gen_cfg.max_new_tokens,
             max_context,
         )?;
-        let effective_new = decode_cap(gen_cfg.reasoning_budget, gen_cfg.max_new_tokens);
+        let effective_new =
+            decode_cap(gen_cfg.effective_reasoning_budget(), gen_cfg.max_new_tokens);
 
         let num_linear = cfg.num_linear_attention_layers();
         let num_full = cfg.num_full_attention_layers();
@@ -1461,7 +1463,7 @@ impl DecodePolicy {
             None
         };
         let policy = Self {
-            reasoning_budget: gen_cfg.reasoning_budget,
+            reasoning_budget: gen_cfg.effective_reasoning_budget(),
             enable_thinking: gen_cfg.enable_thinking,
             max_new_tokens: gen_cfg.max_new_tokens,
             logprobs: gen_cfg.logprobs,
@@ -3059,6 +3061,83 @@ mod tests {
             ),
             "reasoning-budget admission errors must report the effective cap and its inputs; \
              got {result:?}"
+        );
+    }
+
+    /// `reasoning_budget` is inert when `enable_thinking` is false: the decode
+    /// loop's actual iteration cap (`DecodePolicy::cap()`, what every CPU and
+    /// Metal generation loop bounds `for _ in 1..cap` against) must equal
+    /// `max_new_tokens`, not `decode_cap`'s budgeted `rb + max_new_tokens + 1`
+    /// -- there is no reasoning block to close, so reserving room for a forced
+    /// `</think>` that `force_close_think` can never emit is dead capacity at
+    /// best and an unenforceable overrun at worst.
+    ///
+    /// Mutation sensitivity: change `DecodePolicy::init` back to
+    /// `reasoning_budget: gen_cfg.reasoning_budget` (the raw field, no
+    /// `enable_thinking` gate) → `cap()` returns
+    /// `decode_cap(Some(1), 1) == 3` instead of `1`, and this assertion fails.
+    #[test]
+    fn decode_policy_cap_ignores_reasoning_budget_when_thinking_disabled() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(1),
+            enable_thinking: false,
+            max_new_tokens: 1,
+            ..GenerateConfig::default()
+        };
+        let mut token_logprobs = Vec::new();
+        let policy = DecodePolicy::init(
+            &gen_cfg,
+            /* think_close_id */ None,
+            &mut token_logprobs,
+            /* first_emitted_id */ 0,
+            /* first_logits */ &[],
+            /* temperature */ 0.0,
+            /* first_generated_len */ 1,
+            /* streaming */ false,
+        );
+        assert_eq!(
+            policy.cap(),
+            1,
+            "decode cap must equal max_new_tokens (1) when enable_thinking is false, \
+             not decode_cap(Some(1), 1) == 3"
+        );
+    }
+
+    /// Sibling outcome to [`decode_policy_cap_ignores_reasoning_budget_when_thinking_disabled`]:
+    /// total-context admission (`check_context_budget`, called with
+    /// `GenerateConfig::effective_reasoning_budget`) must also ignore a
+    /// positive `reasoning_budget` once thinking is disabled. A request whose
+    /// prompt plus `max_new_tokens` fits the window, but whose prompt plus the
+    /// *budgeted* cap would not, must be admitted rather than rejected for
+    /// exceeding a decode reach the loop will never attempt.
+    ///
+    /// Mutation sensitivity: change `effective_reasoning_budget` to return
+    /// `self.reasoning_budget` unconditionally (no `enable_thinking` filter)
+    /// → `check_context_budget(8, Some(3), 2, 10)` rejects (14 > 10) and this
+    /// assertion fails.
+    #[test]
+    fn context_admission_ignores_reasoning_budget_when_thinking_disabled() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(3),
+            enable_thinking: false,
+            max_new_tokens: 2,
+            ..GenerateConfig::default()
+        };
+        // Honouring the budget would compute decode_cap(Some(3), 2) = 6, and
+        // 8 + 6 = 14 > 10 would be rejected (see
+        // check_context_budget_accounts_for_reasoning_budget above, same
+        // inputs with enable_thinking's effect factored out). Ignoring it
+        // computes decode_cap(None, 2) = 2, and 8 + 2 = 10 <= 10 is admitted.
+        let result = check_context_budget(
+            8,
+            gen_cfg.effective_reasoning_budget(),
+            gen_cfg.max_new_tokens,
+            10,
+        );
+        assert!(
+            result.is_ok(),
+            "prompt (8) + max_new_tokens (2) == max_context (10) must be admitted when \
+             thinking is disabled, even with reasoning_budget=Some(3) set; got {result:?}"
         );
     }
 

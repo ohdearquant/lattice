@@ -8984,7 +8984,7 @@ mod inner {
 
             crate::model::qwen35::check_context_budget(
                 total_len,
-                gen_cfg.reasoning_budget,
+                gen_cfg.effective_reasoning_budget(),
                 gen_cfg.max_new_tokens,
                 self.max_context(),
             )?;
@@ -9415,7 +9415,7 @@ mod inner {
 
             crate::model::qwen35::check_context_budget(
                 prompt_len,
-                gen_cfg.reasoning_budget,
+                gen_cfg.effective_reasoning_budget(),
                 gen_cfg.max_new_tokens,
                 self.max_context(),
             )?;
