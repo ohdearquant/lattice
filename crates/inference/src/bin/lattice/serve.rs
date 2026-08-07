@@ -792,6 +792,23 @@ pub(super) fn finish_reason_for(
     lattice_inference::serve::finish_reason(output.stopped)
 }
 
+/// Decode-side token allowance for the post-generation length invariant
+/// (#1334).
+///
+/// Mirrors the decode term of admission's shared full-window formula
+/// (`crates/inference/src/serve/contract.rs::validate_context_window_with_budget`):
+/// `prompt + max_tokens + reasoning_budget + 1 <= max_context`. Admission's
+/// `+1` reserves the prompt/generation delimiter and has no counterpart
+/// here -- this only bounds tokens the engine actually generated, so the
+/// invariant is `generated_tokens > max_tokens + reasoning_budget`, not
+/// `> max_tokens + reasoning_budget + 1`. Using the same
+/// `max_tokens.saturating_add(reasoning_budget)` term as admission's
+/// `decode_budget` keeps the two checks from drifting apart the way the
+/// post-generation check drifted from admission before #1334.
+fn decode_token_budget(max_tokens: usize, reasoning_budget: Option<usize>) -> usize {
+    max_tokens.saturating_add(reasoning_budget.unwrap_or(0))
+}
+
 /// Resolve a token id back to its OpenAI `logprobs` text/bytes representation (#585).
 ///
 /// `token` uses the lossy UTF-8 rendering (matches OpenAI, which also shows
@@ -1200,15 +1217,17 @@ async fn chat_completions_with_request(
         let stream_model = state.model_id.clone();
 
         // Both backends funnel their result through this closure so the
-        // "generated_tokens > max_tokens invariant, then finish_reason_for"
-        // logic is written exactly once and shared by CPU and Metal.
+        // "generated_tokens > decode_token_budget invariant, then
+        // finish_reason_for" logic is written exactly once and shared by
+        // CPU and Metal.
         let finish_streaming = {
             let tx = tx.clone();
             move |output: GenerateOutput| {
-                if output.generated_tokens > max_tokens {
+                let budget = decode_token_budget(max_tokens, reasoning_budget);
+                if output.generated_tokens > budget {
                     eprintln!(
-                        "generation invariant violation: generated_tokens={} max_tokens={}",
-                        output.generated_tokens, max_tokens
+                        "generation invariant violation: generated_tokens={} max_tokens={} reasoning_budget={:?}",
+                        output.generated_tokens, max_tokens, reasoning_budget
                     );
                     let _ = tx.unbounded_send(StreamMsg::Failed);
                 } else {
@@ -1463,10 +1482,11 @@ async fn chat_completions_with_request(
         // Distinguish "hit token cap" from "natural stop" (EOS / stop token / stop string).
         // `GenerateOutput.stopped` carries the explicit stop reason set by the library.
         // Log and return 500 if the invariant is violated.
-        if output.generated_tokens > max_tokens {
+        let budget = decode_token_budget(max_tokens, reasoning_budget);
+        if output.generated_tokens > budget {
             eprintln!(
-                "generation invariant violation: generated_tokens={} max_tokens={}",
-                output.generated_tokens, max_tokens
+                "generation invariant violation: generated_tokens={} max_tokens={} reasoning_budget={:?}",
+                output.generated_tokens, max_tokens, reasoning_budget
             );
             return Err(ApiError::Internal {
                 message: "inference failed".to_string(),
@@ -4307,6 +4327,269 @@ mod tests {
                 Some(5),
                 "reasoning_budget from the request must reach the real GenerateConfig"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Completion-length invariant accounts for reasoning_budget (#1334)
+    //
+    // Admission (`serve::contract::validate_context_window_with_budget`)
+    // accepts `prompt + max_tokens + reasoning_budget + 1 <= max_context`,
+    // but the post-generation invariant checked only `generated_tokens >
+    // max_tokens` -- so a completion that legitimately spent its reasoning
+    // allowance passed preflight, generated correctly, and was then reported
+    // as an inference failure. These tests drive the real
+    // `chat_completions_with_request` cascade (through the real `router()`,
+    // for streaming's SSE framing) with an injected `CpuFakeGenerate`
+    // closure that reports a caller-chosen `generated_tokens`, so the
+    // engine's *reported* completion length can be placed exactly at or one
+    // token past the decode budget independent of what the tiny model would
+    // actually decode.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "test-utils")]
+    mod completion_length_invariant_1334 {
+        use super::*;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        /// `AppState` whose CPU generation is a canned `GenerateOutput`
+        /// reporting exactly `generated_tokens`, regardless of the request.
+        fn state_returning(max_tokens_cap: usize, generated_tokens: usize) -> AppState {
+            let model = lattice_inference::model::qwen35::test_support::tiny_zero_model();
+            AppState {
+                model: ModelBackend::CpuFakeGenerate {
+                    model: Arc::new(model),
+                    generate: Arc::new(move |_prompt, _cfg, _on_token, _should_cancel| {
+                        Ok(GenerateOutput {
+                            text: "x".repeat(generated_tokens),
+                            token_ids: vec![0; generated_tokens],
+                            prompt_tokens: 1,
+                            generated_tokens,
+                            stopped: true,
+                            stop_reason: Some(lattice_inference::StopReason::Length),
+                            token_logprobs: vec![],
+                        })
+                    }),
+                },
+                default_max_tokens: max_tokens_cap,
+                max_tokens_cap,
+                model_id: "test-model".to_string(),
+                request_counter: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        /// Builds the fixed `{"model":...,"messages":[...],"max_tokens":M[,
+        /// "reasoning_budget":R][,"stream":true]}` request body. Omitting
+        /// `reasoning_budget` (the "unset" half of the zero/unset cases)
+        /// exercises a different code path through `prepare_chat_request`
+        /// than sending an explicit `0` does, so callers choose which one a
+        /// given case needs.
+        fn request_body(
+            max_tokens: usize,
+            reasoning_budget: Option<usize>,
+            stream: bool,
+        ) -> String {
+            let mut body = format!(
+                r#"{{"model":"test-model","messages":[{{"role":"user","content":"hi"}}],"max_tokens":{max_tokens}"#
+            );
+            if let Some(budget) = reasoning_budget {
+                body.push_str(&format!(r#","reasoning_budget":{budget}"#));
+            }
+            if stream {
+                body.push_str(r#","stream":true"#);
+            }
+            body.push('}');
+            body
+        }
+
+        async fn post(state: AppState, body: String) -> axum::http::Response<axum::body::Body> {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(body))
+                .expect("fixture request must build");
+            router(state)
+                .oneshot(request)
+                .await
+                .expect("router must produce a response, not a transport error")
+        }
+
+        const MAX_TOKENS: usize = 10;
+        const REASONING_BUDGET: usize = 4;
+
+        // --- Non-streaming ---
+
+        async fn assert_non_streaming(
+            reasoning_budget: Option<usize>,
+            generated_tokens: usize,
+            expect_success: bool,
+            case: &str,
+        ) {
+            let state = state_returning(64, generated_tokens);
+            let body = request_body(MAX_TOKENS, reasoning_budget, false);
+            let response = post(state, body).await;
+            if expect_success {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{case}: generated_tokens={generated_tokens} at/under the decode budget \
+                     must be accepted, not reported as an inference failure"
+                );
+            } else {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "{case}: generated_tokens={generated_tokens}, one past the decode budget, \
+                     must still be rejected by the invariant"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn non_streaming_exact_acceptance_positive_budget() {
+            assert_non_streaming(
+                Some(REASONING_BUDGET),
+                MAX_TOKENS + REASONING_BUDGET,
+                true,
+                "non-streaming, positive reasoning_budget, exact budget",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn non_streaming_one_past_rejection_positive_budget() {
+            assert_non_streaming(
+                Some(REASONING_BUDGET),
+                MAX_TOKENS + REASONING_BUDGET + 1,
+                false,
+                "non-streaming, positive reasoning_budget, one past budget",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn non_streaming_exact_acceptance_unset_budget() {
+            assert_non_streaming(
+                None,
+                MAX_TOKENS,
+                true,
+                "non-streaming, unset reasoning_budget, exact budget",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn non_streaming_one_past_rejection_unset_budget() {
+            assert_non_streaming(
+                None,
+                MAX_TOKENS + 1,
+                false,
+                "non-streaming, unset reasoning_budget, one past budget",
+            )
+            .await;
+        }
+
+        // --- Streaming ---
+
+        async fn assert_streaming(
+            reasoning_budget: Option<usize>,
+            generated_tokens: usize,
+            expect_success: bool,
+            case: &str,
+        ) {
+            let state = state_returning(64, generated_tokens);
+            let body = request_body(MAX_TOKENS, reasoning_budget, true);
+            let response = post(state, body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{case}: an SSE response commits with 200 regardless of how generation \
+                 concludes -- failure surfaces as an in-stream error event"
+            );
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("SSE response body must be readable")
+                .to_bytes();
+            let text = String::from_utf8(bytes.to_vec()).expect("SSE body must be valid UTF-8");
+            let has_error_event = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .any(|payload| payload.contains("\"error\""));
+            // The fixture's `GenerateOutput.stopped` is `true` (`finish_reason_for`
+            // -> `lattice_inference::serve::finish_reason` maps `stopped: true` to
+            // `"stop"`, not `"length"` -- `stop_reason: Length` is set alongside it
+            // but `finish_reason_for` derives only from `stopped`).
+            let has_finish_reason = text.contains("\"finish_reason\":\"stop\"");
+            if expect_success {
+                assert!(
+                    !has_error_event,
+                    "{case}: generated_tokens={generated_tokens} at/under the decode budget \
+                     must not emit an SSE error event; got: {text}"
+                );
+                assert!(
+                    has_finish_reason,
+                    "{case}: a successful completion must emit finish_reason \"stop\"; \
+                     got: {text}"
+                );
+            } else {
+                assert!(
+                    has_error_event,
+                    "{case}: generated_tokens={generated_tokens}, one past the decode budget, \
+                     must still emit an SSE error event; got: {text}"
+                );
+                assert!(
+                    !has_finish_reason,
+                    "{case}: an invariant violation must not also emit a clean finish_reason; \
+                     got: {text}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn streaming_exact_acceptance_positive_budget() {
+            assert_streaming(
+                Some(REASONING_BUDGET),
+                MAX_TOKENS + REASONING_BUDGET,
+                true,
+                "streaming, positive reasoning_budget, exact budget",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn streaming_one_past_rejection_positive_budget() {
+            assert_streaming(
+                Some(REASONING_BUDGET),
+                MAX_TOKENS + REASONING_BUDGET + 1,
+                false,
+                "streaming, positive reasoning_budget, one past budget",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn streaming_exact_acceptance_unset_budget() {
+            assert_streaming(
+                None,
+                MAX_TOKENS,
+                true,
+                "streaming, unset reasoning_budget, exact budget",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn streaming_one_past_rejection_unset_budget() {
+            assert_streaming(
+                None,
+                MAX_TOKENS + 1,
+                false,
+                "streaming, unset reasoning_budget, one past budget",
+            )
+            .await;
         }
     }
 }
