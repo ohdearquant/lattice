@@ -503,6 +503,164 @@ jobs:
           fi
           cat "$log"
           grep -Eq '^test result: ok\. 5 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #1186 / PR #1219: this exact live-GPU regression dirties only GDN
+      # recurrent state while the KV cursor remains zero, then proves the
+      # hidden-returning prefill refuses to dispatch. The environment variable
+      # converts a missing Metal device from a green early return into failure;
+      # the exact test path and exact one-test count prevent filter skip-passes.
+      - name: inference — Metal hidden-prefill noninitial-GDN refusal (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-hidden-prefill-gdn-refusal.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference — Metal MTP cursor preflight (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-mtp-cursor-preflight.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::mtp_verifier_boundaries_reject_mismatched_live_cursor' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # MTP-loaded raw step regression: establish live KV/GDN/hidden state,
+      # then require an in-range stale position to fail before any state changes.
+      - name: inference — Metal raw-step cursor preflight (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-raw-step-cursor-preflight.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::raw_step_with_mtp_rejects_stale_live_cursor_without_mutation' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # MTP-loaded raw prefill regression: both fixed-zero public siblings must
+      # reject a live KV/GDN session before hidden readback or buffer mutation.
+      - name: inference — Metal raw-prefill fresh-session preflight (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-raw-prefill-fresh-session.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::raw_prefills_with_mtp_reject_live_session_without_mutation' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # The public bench-internals chunk helpers accept caller-supplied
+      # positions, so compile-only bench coverage is insufficient: execute the
+      # stale-cursor refusal against live KV/GDN state and fail when Metal is
+      # unavailable instead of allowing an early-returning test to pass.
+      - name: inference — Metal bench-prefill cursor preflight (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-bench-prefill-cursor-preflight.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu,bench-internals --lib \
+            'forward::metal_qwen35::inner::tests::bench_prefill_helpers_reject_stale_cursor_without_mutation' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # PR #1339's positive claim — hidden state is read back only when
+      # explicitly requested — was carried by these two tests, but both used
+      # a bare `let Some(_) = Device::system_default() else { return; }` with
+      # no LATTICE_METAL_TEST_ENFORCE guard, unlike every refusal test this PR
+      # added. A missing Metal device made them silent greens that executed
+      # nothing; this step forces the successful-readback path to run.
+      - name: inference — Metal explicit-hidden-readback step proof (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-step-proof.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference — Metal explicit-hidden-readback prefill proof (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-prefill-proof.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # tiny_metal_qwen35_fixture (used by the two proofs above) has zero GDN
+      # layers, so neither one exercises explicit hidden readback on a hybrid
+      # GDN+full-attention session. This closes that gap on tiny_hybrid_fixture.
+      - name: inference — Metal explicit-hidden-readback hybrid GDN proof (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-hybrid-gdn-proof.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a
       # grammar that blocked every token silently emitted token 0 instead of
