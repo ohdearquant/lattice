@@ -206,7 +206,7 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs::ModelBackend::spawn_metal::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice/serve.rs:400:81",
+        recorded_position: "src/bin/lattice/serve.rs:409:81",
         reason: "ModelBackend::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
