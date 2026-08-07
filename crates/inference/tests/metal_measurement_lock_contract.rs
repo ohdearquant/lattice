@@ -93,6 +93,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "src/bin/bench_gdn_prefill_ab.rs",
     "src/bin/bench_logit_dump.rs",
     "src/bin/bench_lora_mixture.rs",
+    "src/bin/bench_vision_prefill_ab.rs",
     "src/bin/chat_metal.rs",
     "src/bin/dump_quarot_q4_golden.rs",
     "src/bin/eval_perplexity.rs",
