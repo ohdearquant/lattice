@@ -4,7 +4,7 @@
 // pipes the output through the guard script as a child process -- exactly
 // how the prebuild workflow invokes it via `packlist:<suffix>`.
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { after } from 'node:test'
 import { execFileSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -12,6 +12,15 @@ import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'assert-platform-packlist.mjs')
+
+// A per-run cache this suite owns outright, so the real `npm pack` calls
+// below never depend on who owns (or whether anyone can write to) the
+// ambient ~/.npm cache -- e.g. a sandboxed process without permission to
+// touch ~/.npm/_cacache.
+const NPM_CACHE_DIR = mkdtempSync(join(tmpdir(), 'packlist-npm-cache-'))
+after(() => {
+  rmSync(NPM_CACHE_DIR, { recursive: true, force: true })
+})
 
 function makeFixture(files) {
   const dir = mkdtempSync(join(tmpdir(), 'packlist-fixture-'))
@@ -23,7 +32,11 @@ function makeFixture(files) {
 }
 
 function packAndAssert(dir) {
-  const packOutput = execFileSync('npm', ['pack', '--dry-run', '--json'], { cwd: dir, encoding: 'utf8' })
+  const packOutput = execFileSync('npm', ['pack', '--dry-run', '--json'], {
+    cwd: dir,
+    encoding: 'utf8',
+    env: { ...process.env, NPM_CONFIG_CACHE: NPM_CACHE_DIR },
+  })
   execFileSync('node', [SCRIPT], { input: packOutput, encoding: 'utf8' })
 }
 

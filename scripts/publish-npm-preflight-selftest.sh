@@ -181,6 +181,13 @@ fi
 MSB="$SB/matrix"
 mkdir -p "$MSB"
 
+# platform_matrix_guard's own `npm pack --dry-run --json` call (see
+# run_matrix_case below) is real, unstubbed npm -- give it a cache this
+# self-test owns outright, under its own sandbox, so the case never depends
+# on who owns (or whether anyone can write to) the ambient ~/.npm cache.
+MATRIX_NPM_CACHE="$MSB/npm-cache"
+mkdir -p "$MATRIX_NPM_CACHE"
+
 # Build a fixture NATIVE_DIR ($1) whose optionalDependencies match the
 # platform/version pairs given as "$2..." (each "platform:version"). Copies
 # the real assert-platform-packlist.mjs and assert-packlist.mjs alongside it
@@ -220,6 +227,7 @@ run_matrix_case() {  # $1 = fixture NATIVE_DIR
   RUNNER="$MSB/runner.sh"
   {
     echo 'PUBLISH_NPM_SH_LIB_ONLY=1'
+    printf 'export NPM_CONFIG_CACHE=%q\n' "$MATRIX_NPM_CACHE"
     printf '. %q\n' "$SRC"
     printf 'NATIVE_DIR=%q\n' "$1"
     printf 'platform_matrix_guard\n'
@@ -419,6 +427,13 @@ fi
 MPB="$SB/main-packlist"
 mkdir -p "$MPB"
 
+# main_packlist_guard's own `npm pack --dry-run --json` call (see
+# run_main_packlist_case below) is real, unstubbed npm too -- same reasoning
+# as MATRIX_NPM_CACHE above: a per-run cache this self-test owns, not the
+# ambient ~/.npm.
+MAIN_PACKLIST_NPM_CACHE="$MPB/npm-cache"
+mkdir -p "$MAIN_PACKLIST_NPM_CACHE"
+
 # Build a fixture NATIVE_DIR ($1) with the minimal file set assert-packlist.mjs
 # requires (package.json, README.md, binding.js, index.js, index.d.ts), plus
 # a "scripts.packlist" entry matching the real package.json's, plus a copy of
@@ -448,6 +463,7 @@ run_main_packlist_case() {  # $1 = fixture NATIVE_DIR
   RUNNER="$MPB/runner.sh"
   {
     echo 'PUBLISH_NPM_SH_LIB_ONLY=1'
+    printf 'export NPM_CONFIG_CACHE=%q\n' "$MAIN_PACKLIST_NPM_CACHE"
     printf '. %q\n' "$SRC"
     printf 'NATIVE_DIR=%q\n' "$1"
     printf 'main_packlist_guard\n'
@@ -631,7 +647,7 @@ echo "=== publish-npm.sh full-release dry-run guard self-test ==="
 # failing subshell inside it still triggers errexit exactly as it did at
 # top level.
 DSB="$SB/dryrun"
-mkdir -p "$DSB/wasm" "$DSB/native" "$DSB/stub-bin"
+mkdir -p "$DSB/wasm" "$DSB/native" "$DSB/platform-a" "$DSB/stub-bin"
 
 # The stub keys its failure on $PWD (which package's dry-run is running),
 # not on the mere fact that `npm publish` was invoked. An unconditional
@@ -639,18 +655,29 @@ mkdir -p "$DSB/wasm" "$DSB/native" "$DSB/stub-bin"
 # WASM call away still leaves the NATIVE_DIR call later in the same guard,
 # which an unconditional stub would ALSO fail -- reddening the arm for the
 # wrong reason and masking the very mutation it exists to catch.
-run_dryrun_case() {  # $1 = absolute dir the stub should fail in, or "" for none
+#
+# The stub also requires the EXACT argv "publish --dry-run" (both the
+# command word AND the flag, and nothing beyond them) -- not just "$1 is
+# publish and $2 is --dry-run", which would silently accept e.g. an extra
+# trailing flag no caller intends. $#=2 is checked alongside $2 so a
+# same-length-but-wrong-flag argv and a right-flag-but-extra-args argv are
+# both rejected the same way a real accidental non-dry-run publish is.
+run_dryrun_case() {  # $1=fail_dir (absolute dir the stub should fail in, or ""
+                      # for none)  $2=PLATFORM_DIRS (space-separated, or ""
+                      # for none, the default)
   fail_dir="$1"
+  platform_dirs="${2:-}"
+  : > "$DSB/calls.log"
   cat > "$DSB/stub-bin/npm" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$DSB/calls.log"
 if [ "\$1" = "publish" ]; then
-  if [ "\$2" != "--dry-run" ]; then
-    echo "REAL PUBLISH DETECTED in full-dryrun-guard stub: npm \$* in \$PWD (missing --dry-run)" >&2
+  if [ "\$#" -ne 2 ] || [ "\$2" != "--dry-run" ]; then
+    echo "UNEXPECTED PUBLISH ARGV in full-dryrun-guard stub: npm \$* in \$PWD (expected exactly: publish --dry-run)" >&2
     exit 98
   fi
   if [ "\$PWD" = "$fail_dir" ]; then
-    echo "npm error simulated dry-run failure for selftest arm (bb) in \$PWD" >&2
+    echo "npm error simulated dry-run failure for selftest arm in \$PWD" >&2
     exit 1
   fi
   exit 0
@@ -664,7 +691,7 @@ EOF
     echo 'PUBLISH_NPM_SH_LIB_ONLY=1'
     printf '. %q\n' "$SRC"
     printf 'WASM_DIR=%q\n' "$DSB/wasm"
-    printf 'PLATFORM_DIRS=%q\n' ""
+    printf 'PLATFORM_DIRS=%q\n' "$platform_dirs"
     printf 'NATIVE_DIR=%q\n' "$DSB/native"
     printf 'full_dryrun_guard\n'
     printf 'echo FULL_DRYRUN_GUARD_PASSED\n'
@@ -673,10 +700,14 @@ EOF
   return $?
 }
 
+publish_dryrun_call_count() {  # counts exact "publish --dry-run" lines logged by the last run_dryrun_case
+  cat "$DSB/calls.log" 2>/dev/null | grep -cxF -- "publish --dry-run"
+}
+
 # (bb) the wasm package's dry-run fails specifically (stub fails only when
 #      $PWD is $WASM_DIR) -- must abort before reaching the native
 #      package's own dry-run or the PASSED marker.
-run_dryrun_case "$DSB/wasm"
+run_dryrun_case "$DSB/wasm" ""
 rc=$?
 check "(bb) wasm dry-run failure aborts the release" 1 $rc
 if printf '%s' "$OUT" | grep -qF "FULL_DRYRUN_GUARD_PASSED"; then
@@ -685,17 +716,85 @@ else
   echo "  PASS:   -> guard aborted before reaching the end of the function"; pass=$((pass+1))
 fi
 
-# (cc) must-PASS control: every dry-run succeeds (no fail_dir) -- the guard
-#      must reach the end of the function. Without this, (bb) alone cannot
-#      tell "the guard correctly rejects a failure" apart from "the fixture
-#      is broken and nothing ever reaches PASSED".
-run_dryrun_case ""
+# (bb2) a platform package's dry-run fails specifically -- full_dryrun_guard
+#       runs wasm, then every PLATFORM_DIRS entry, then native, so this must
+#       abort after wasm's own (successful) dry-run but before native's ever
+#       runs. Neither (bb) (PLATFORM_DIRS empty) nor (cc) below exercises a
+#       PLATFORM_DIRS failure at all, so a broken platform-loop failure path
+#       would previously have gone completely uncaught.
+run_dryrun_case "$DSB/platform-a" "$DSB/platform-a"
+rc=$?
+check "(bb2) platform dry-run failure aborts the release" 1 $rc
+if printf '%s' "$OUT" | grep -qF "FULL_DRYRUN_GUARD_PASSED"; then
+  echo "  FAIL:   -> guard reached the end of the function despite the failure"; fail=$((fail+1))
+else
+  echo "  PASS:   -> guard aborted before reaching the end of the function"; pass=$((pass+1))
+fi
+call_count=$(publish_dryrun_call_count)
+if [ "$call_count" -eq 2 ]; then
+  echo "  PASS:   -> exactly wasm + platform-a were attempted (native's dry-run never ran)"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> expected exactly 2 publish --dry-run calls (wasm, platform-a), got $call_count"; fail=$((fail+1))
+fi
+
+# (bb3) the native package's dry-run fails specifically -- the LAST call in
+#       full_dryrun_guard's sequence. Runs with a nonempty PLATFORM_DIRS too,
+#       so a pass here also confirms wasm and the platform package were each
+#       attempted (and succeeded) before the native failure aborted the
+#       function -- an exit-code check alone cannot tell "aborted correctly
+#       at the last call" apart from "the fixture never ran the earlier
+#       calls at all".
+run_dryrun_case "$DSB/native" "$DSB/platform-a"
+rc=$?
+check "(bb3) native dry-run failure aborts the release" 1 $rc
+if printf '%s' "$OUT" | grep -qF "FULL_DRYRUN_GUARD_PASSED"; then
+  echo "  FAIL:   -> guard reached the end of the function despite the failure"; fail=$((fail+1))
+else
+  echo "  PASS:   -> guard aborted before reaching the end of the function"; pass=$((pass+1))
+fi
+call_count=$(publish_dryrun_call_count)
+if [ "$call_count" -eq 3 ]; then
+  echo "  PASS:   -> wasm, platform-a, and native were all attempted before the abort"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> expected exactly 3 publish --dry-run calls (wasm, platform-a, native), got $call_count"; fail=$((fail+1))
+fi
+
+# (cc) must-PASS control: every dry-run succeeds (no fail_dir), with a
+#      nonempty PLATFORM_DIRS too -- the guard must reach the end of the
+#      function. Without this, (bb)/(bb2)/(bb3) alone cannot tell "the guard
+#      correctly rejects a failure" apart from "the fixture is broken and
+#      nothing ever reaches PASSED".
+run_dryrun_case "" "$DSB/platform-a"
 rc=$?
 check "(cc) full-release dry-run success control reaches the end" 0 $rc
 if printf '%s' "$OUT" | grep -qF "FULL_DRYRUN_GUARD_PASSED"; then
   echo "  PASS:   -> guard reached the end of the function"; pass=$((pass+1))
 else
   echo "  FAIL:   -> did not reach end of function (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+call_count=$(publish_dryrun_call_count)
+if [ "$call_count" -eq 3 ]; then
+  echo "  PASS:   -> wasm, platform-a, and native were all attempted"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> expected exactly 3 publish --dry-run calls (wasm, platform-a, native), got $call_count"; fail=$((fail+1))
+fi
+
+# (cc2) must-fail control for the argv-exactness check itself: a stub call
+#       with a well-formed "publish --dry-run" PREFIX but an extra trailing
+#       argument must be rejected by the stub's own $#-eq-2 check, not
+#       silently accepted -- proving the exact-argv guard added above is
+#       actually load-bearing and not just cosmetic. Exercised directly
+#       against the stub binary (not through full_dryrun_guard, which never
+#       emits a third argument itself) so this arm isolates the stub's own
+#       argv-validation branch.
+run_dryrun_case "" ""
+OUT_EXTRA="$("$DSB/stub-bin/npm" publish --dry-run --unexpected-extra-flag 2>&1)"
+rc_extra=$?
+check "(cc2) stub rejects publish --dry-run with an extra trailing argument" 98 $rc_extra
+if printf '%s' "$OUT_EXTRA" | grep -qF "UNEXPECTED PUBLISH ARGV"; then
+  echo "  PASS:   -> stub's exact-argv diagnostic printed"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> missing exact-argv diagnostic (got: $(printf '%s' "$OUT_EXTRA" | tr '\n' '|'))"; fail=$((fail+1))
 fi
 
 echo
@@ -816,8 +915,8 @@ case "$1" in
     exit 0
     ;;
   publish)
-    if [ "$2" != "--dry-run" ]; then
-      echo "REAL PUBLISH DETECTED in e2e stub: npm $* in $PWD (missing --dry-run)" >&2
+    if [ "$#" -ne 2 ] || [ "$2" != "--dry-run" ]; then
+      echo "UNEXPECTED PUBLISH ARGV in e2e stub: npm $* in $PWD (expected exactly: publish --dry-run)" >&2
       exit 98
     fi
     exit 0
@@ -903,7 +1002,10 @@ mkdir -p "$HGENSTUB"
 : > "$HSB/calls.log"
 cat > "$HGENSTUB/npm" <<EOF
 #!/usr/bin/env bash
-echo "\$1 \$2 \$(basename "\$PWD")" >> "$HSB/calls.log"
+# Logs the COMPLETE argv (not just \$1/\$2, which would silently drop e.g. a
+# missing trailing --json) alongside the caller's cwd basename, separated by
+# " -- " so a call with zero arguments still parses back unambiguously.
+echo "\$* -- \$(basename "\$PWD")" >> "$HSB/calls.log"
 case "\$1" in
   run)
     exit 0
@@ -921,8 +1023,8 @@ case "\$1" in
     exit 0
     ;;
   publish)
-    if [ "\$2" != "--dry-run" ]; then
-      echo "REAL PUBLISH DETECTED in call-set stub: npm \$* in \$PWD (missing --dry-run)" >&2
+    if [ "\$#" -ne 2 ] || [ "\$2" != "--dry-run" ]; then
+      echo "UNEXPECTED PUBLISH ARGV in call-set stub: npm \$* in \$PWD (expected exactly: publish --dry-run)" >&2
       exit 98
     fi
     exit 0
@@ -940,20 +1042,29 @@ rc=$?
 check "(hh) full script dry-run with call-logging stub reaches completion" 0 $rc
 
 CALLS="$(cat "$HSB/calls.log" 2>/dev/null)"
-assert_call() {  # $1=label $2=needle
-  if printf '%s\n' "$CALLS" | /usr/bin/grep -qF -- "$2"; then
+# Exact whole-line match (grep -x) against the complete "argv -- cwd" record
+# logged above, not a substring search -- a substring needle like "view
+# name@1.2.3" would still match if the real call dropped its trailing
+# "version --json" arguments (or gained an unexpected extra one), so it
+# cannot actually prove the argv is what production sends.
+assert_call() {  # $1=label $2=exact expected "argv -- cwd" line
+  if printf '%s\n' "$CALLS" | /usr/bin/grep -qxF -- "$2"; then
     echo "  PASS:   -> (hh) saw $1: $2"; pass=$((pass+1))
   else
     echo "  FAIL:   -> (hh) missing $1: $2 (log: $(printf '%s' "$CALLS" | tr '\n' '|'))"; fail=$((fail+1))
   fi
 }
-assert_call "version check on the wasm package" "view @khive-ai/lattice-fixture-wasm@1.2.3"
-assert_call "version check on the platform package" "view @khive-ai/lattice-embed-darwin-arm64@1.2.3"
-assert_call "version check on the native package" "view @khive-ai/lattice-embed@1.2.3"
-assert_call "full dry run of the wasm package" "publish --dry-run lattice-embed-wasm"
-assert_call "full dry run of the platform package" "publish --dry-run darwin-arm64"
-assert_call "full dry run of the native package" "publish --dry-run lattice-embed-native"
-assert_call "main packlist run" "pack --dry-run lattice-embed-native"
+# check_version_available runs with no `cd` of its own, so every "view" call
+# happens from the top-level cwd the script was invoked from ("repo", per
+# `cd "$HSB/repo" && ... /bin/sh scripts/publish-npm.sh` above) -- NOT from
+# each package's own directory.
+assert_call "version check on the wasm package" "view @khive-ai/lattice-fixture-wasm@1.2.3 version --json -- repo"
+assert_call "version check on the platform package" "view @khive-ai/lattice-embed-darwin-arm64@1.2.3 version --json -- repo"
+assert_call "version check on the native package" "view @khive-ai/lattice-embed@1.2.3 version --json -- repo"
+assert_call "full dry run of the wasm package" "publish --dry-run -- lattice-embed-wasm"
+assert_call "full dry run of the platform package" "publish --dry-run -- darwin-arm64"
+assert_call "full dry run of the native package" "publish --dry-run -- lattice-embed-native"
+assert_call "main packlist run" "pack --dry-run --json -- lattice-embed-native"
 
 echo
 echo "=== marker-extraction mechanism removal self-test ==="
