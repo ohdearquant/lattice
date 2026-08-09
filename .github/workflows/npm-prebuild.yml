@@ -112,7 +112,7 @@ jobs:
         with:
           version: 0.15.2
 
-      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+      - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2
         if: contains(matrix.target, 'musl')
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -249,7 +249,7 @@ jobs:
         with:
           shared-key: npm-publish-preflight
 
-      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
+      - uses: taiki-e/install-action@91ddec75689c4c78665b598d188dc821c5a43e5c # v2
         with:
           tool: wasm-bindgen-cli@0.2.105
 
