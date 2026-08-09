@@ -19,11 +19,13 @@
 //! unvalidated — see [`crate::forward::cpu_f16::PoolingStrategy`]'s doc
 //! comment.
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use super::VisionError;
 use super::checkpoint::Qwen35VisionWeights;
 use super::multimodal::Qwen35VisionRequest;
 use super::qwen35_merger::qwen35_merger_forward;
 use super::qwen35_vit::{GridThw, preprocess_qwen35_image, qwen35_vit_forward};
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use super::qwen35_vit_metal::qwen35_vit_forward_metal;
 use crate::error::InferenceError;
 use crate::forward::cpu_f16::{PoolingStrategy, embed_image_f16};
@@ -32,6 +34,9 @@ use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
 use crate::weights::f16_weights::F16ModelWeights;
 
+/// **Unstable**: the pooled-embedding prompt scaffold and pooling contract
+/// may evolve before 1.0.
+///
 /// Encode `image_bytes` through the real Qwen3.5-0.8B vision pipeline
 /// (preprocess -> ViT -> merger), assemble a minimal vision-prompt scaffold
 /// around `prompt`, run decoder prefill, and return a pooled, L2-normalized
@@ -77,6 +82,9 @@ pub fn embed_image_from_bytes_f16(
     )
 }
 
+/// **Unstable**: the Metal-dispatch surface (this cfg-split shape, and the
+/// runtime-probe fail-closed error) may evolve before 1.0.
+///
 /// Metal-dispatching sibling of [`embed_image_from_bytes_f16`]: runs the ViT
 /// forward pass on the Metal GPU ([`qwen35_vit_forward_metal`]) instead of
 /// the CPU, mirroring the serving path's CPU/Metal split
@@ -85,15 +93,45 @@ pub fn embed_image_from_bytes_f16(
 /// `qwen35_merger_forward`). The merger and the decoder-side pooling both
 /// stay CPU here too — only the ViT block loop moves to the GPU.
 ///
+/// Three distinct "no GPU" regimes exist, and this function's contract only
+/// covers the first two — the third is not a failure at all:
+///
+/// 1. **Build-level unavailable** (non-macOS, or this crate's `metal-gpu`
+///    feature is off): the sibling definition of this function below (same
+///    name, opposite `cfg` gate) fails closed with
+///    [`InferenceError::UnsupportedModel`] before any work — Metal code
+///    simply is not compiled into that build.
+/// 2. **Runtime device unavailable** (macOS + `metal-gpu` compiled in, but no
+///    Metal device could be initialized on this machine, e.g. no GPU or
+///    `MTLCreateSystemDefaultDevice` returned null): this function probes
+///    [`crate::forward::metal_gemm::is_available`] up front and fails closed
+///    with the same [`InferenceError::UnsupportedModel`] before touching the
+///    ViT weights or doing any preprocessing.
+/// 3. **Per-GEMM below `GPU_DISPATCH_THRESHOLD`** (an individual matrix in
+///    the ViT forward is too small to be worth a GPU launch): this is NOT an
+///    availability failure. `crate::forward::metal_gemm::metal_matmul`/
+///    `metal_matmul_bt` silently run the equivalent CPU dot product for that
+///    one GEMM call, by design (a dispatch-threshold optimization internal
+///    to the Metal path, not a fallback this function's caller can observe
+///    or needs to handle) — the ViT forward as a whole still ran via this
+///    Metal entry point, it just used CPU math for its smallest matrices.
+///
 /// # Errors
 ///
-/// Returns [`InferenceError::UnsupportedModel`] when Metal is unavailable
-/// (non-macOS build, or the crate's `metal-gpu` feature is off) — this entry
-/// never falls back to the CPU ViT forward silently; a caller that wants a
-/// fallback must catch this variant itself and call
-/// [`embed_image_from_bytes_f16`]. See [`embed_image_from_bytes_f16`]'s docs
-/// for the remaining error conditions (missing vision config, undecodable or
+/// Returns [`InferenceError::UnsupportedModel`] for either "no GPU" regime
+/// above — this entry never falls back to the CPU ViT forward silently; a
+/// caller that wants a fallback must catch this variant itself and call
+/// [`embed_image_from_bytes_f16`]. Also maps a
+/// [`VisionError::InvalidConfig`] surfaced from the underlying
+/// [`qwen35_vit_forward_metal`] call to the same
+/// [`InferenceError::UnsupportedModel`], as defense in depth — this should
+/// not be reachable once the `is_available` probe above has already passed,
+/// but is kept in case a future change to `qwen35_vit_forward_metal`
+/// reintroduces an availability-shaped failure inside it; it is not itself
+/// the availability guard. See [`embed_image_from_bytes_f16`]'s docs for the
+/// remaining error conditions (missing vision config, undecodable or
 /// misaligned image, invalid assembled request), which are identical here.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub fn embed_image_from_bytes_f16_metal(
     weights: &F16ModelWeights,
     cfg: &Qwen35Config,
@@ -103,17 +141,22 @@ pub fn embed_image_from_bytes_f16_metal(
     prompt: &str,
     pooling: PoolingStrategy,
 ) -> Result<Vec<f32>, InferenceError> {
+    if !crate::forward::metal_gemm::is_available() {
+        return Err(InferenceError::UnsupportedModel(
+            "embed_image_from_bytes_f16_metal: this build supports metal-gpu, but no Metal \
+             device could be initialized on this machine"
+                .into(),
+        ));
+    }
+
     let (vision_cfg, image_token_id, vision_start, vision_end) = require_vision_ids(cfg)?;
 
     let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg)
         .map_err(|e| InferenceError::InvalidInput(format!("image preprocessing failed: {e}")))?;
     let pre_merger = qwen35_vit_forward_metal(vision_weights, vision_cfg, &pixel_values, grid)
         .map_err(|e| match e {
-            // `qwen35_vit_forward_metal` returns exactly this variant when
-            // Metal is unavailable at build time (see its non-`metal-gpu`
-            // stub) — map it to a distinct `InferenceError` so a caller can
-            // tell "no Metal on this build" apart from a bad request and
-            // choose to retry via `embed_image_from_bytes_f16` instead.
+            // Defense in depth, not the availability guard (see doc comment
+            // above) -- the `is_available` probe already ran before this call.
             VisionError::InvalidConfig(msg) => {
                 InferenceError::UnsupportedModel(format!("Metal ViT forward unavailable: {msg}"))
             }
@@ -134,6 +177,25 @@ pub fn embed_image_from_bytes_f16_metal(
         prompt,
         pooling,
     )
+}
+
+/// Build-level-unavailable sibling of the `metal-gpu` macOS definition above
+/// (see its doc comment for the full three-regime contract): this crate was
+/// built without Metal support at all (non-macOS, or the `metal-gpu` feature
+/// is off), so this fails closed immediately, before touching any argument.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+pub fn embed_image_from_bytes_f16_metal(
+    _weights: &F16ModelWeights,
+    _cfg: &Qwen35Config,
+    _vision_weights: &Qwen35VisionWeights,
+    _tokenizer: &BpeTokenizer,
+    _image_bytes: &[u8],
+    _prompt: &str,
+    _pooling: PoolingStrategy,
+) -> Result<Vec<f32>, InferenceError> {
+    Err(InferenceError::UnsupportedModel(
+        "embed_image_from_bytes_f16_metal requires the metal-gpu feature on macOS".into(),
+    ))
 }
 
 /// Shared `cfg.vision_config`/token-id extraction for both
@@ -536,15 +598,21 @@ mod tests {
     /// weights, same image, same prompt scaffold). This checks the wiring
     /// added in this change (merger + prompt-scaffold + decoder pooling
     /// reused identically by both entry points) rather than ViT-level
-    /// numerics — the ViT forward itself is already gated at cosine > 0.999
-    /// against the CPU reference in
-    /// `qwen35_vit_metal.rs`'s own `metal_forward_matches_cpu_reference_small_shapes`
-    /// test, which uses this same tiny geometry and therefore also exercises
-    /// the CPU-fallback branch (shapes here are far below the Metal
-    /// dispatch threshold), so this asserts the same tight
-    /// `metal_forward_matches_cpu_reference_small_shapes`-style tolerance
-    /// (`< 1e-4` max-abs-diff) rather than the looser real-geometry cosine
-    /// gate.
+    /// numerics. Two separate, differently-scoped artifacts already cover the
+    /// ViT forward itself, and neither is this test:
+    /// - `qwen35_vit_metal.rs`'s own `metal_forward_matches_cpu_reference_small_shapes`
+    ///   test uses this *same* tiny geometry (and therefore also exercises the
+    ///   CPU-fallback branch, since these shapes sit far below the Metal
+    ///   dispatch threshold) at a tight `< 1e-4` max-abs-diff tolerance — this
+    ///   test reuses that same tolerance for the same reason (tiny geometry,
+    ///   deterministic fixture, no GPU-rounding slack to budget for).
+    /// - `tests/vision_s3b_vit_metal_gate_test.rs` is the one gated at
+    ///   cosine > 0.999, on the *real* checkpoint geometry (depth 2,
+    ///   hidden 768, 12 heads) against the committed real-image golden
+    ///   fixture, where every GEMM clears the dispatch threshold and
+    ///   genuinely runs on the GPU — that test, not this one and not
+    ///   `metal_forward_matches_cpu_reference_small_shapes`, is what
+    ///   validates real Metal dispatch.
     ///
     /// Mutation-sensitivity: swapping the `vision_start`/`vision_end`
     /// arguments in `embed_image_from_bytes_f16_metal`'s call to
