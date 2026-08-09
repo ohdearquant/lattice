@@ -10,14 +10,14 @@
 
 Loading model weights is the dominant startup-latency operation for inference servers. For Qwen3-Embedding-0.6B (28 layers, 1024 hidden size), the checkpoint is distributed across multiple safetensors shards. The design must address:
 
-1. **Parse cost**: The safetensors format uses a JSON header to describe tensor locations within the binary blob. Parsing this header with a full JSON library (serde_json) would pull in a significant dependency chain.
+1. **Parse cost**: The safetensors format uses a JSON header to describe tensor locations within the binary blob. Deserializing that full header into a generic JSON tree would add allocation and obscure duplicate-member checks; the crate already carries `serde_json`, so bounded string-token decoding can still reuse its standards-compliant Unicode handling.
 2. **Copy cost**: F32 weights on a little-endian host can be used in-place from the memory-mapped file if alignment permits. Copying them defeats the point of safetensors.
 3. **Type conversion**: F16 and BF16 tensors cannot be used in-place by the f32 compute kernels. They must be converted and cached.
 4. **Sharding**: Multi-shard checkpoints must be served transparently, opening each shard lazily to avoid holding all file descriptors simultaneously.
 
 Relevant implementation: `src/weights/f32_weights.rs`.
 
-The file contains a hand-written `JsonParser` struct (no serde dependency), `memmap2::Mmap` for the binary data, `TensorMeta` with an `OnceLock<Box<[f32]>>` for lazy conversion cache, and `ShardedSafetensors` for multi-file checkpoints.
+The file contains a hand-written structural `JsonParser` (with `serde_json` used only for one bounded string token at a time), `memmap2::Mmap` for the binary data, `TensorMeta` with an `OnceLock<Box<[f32]>>` for lazy conversion cache, and `ShardedSafetensors` for multi-file checkpoints.
 
 Key code paths:
 
@@ -84,11 +84,48 @@ wins. Repeated access to an aligned zero-copy F32 tensor therefore does not resc
 memory-mapped pages, and a failed validation is cached as its error message (`validate_ingested_tensor`
 only ever returns `InferenceError::InvalidSafetensors`) and never as success.
 
+### Amendment — strict headers and bound single-file visual loads (2026-08-09)
+
+The bounded header parser enforces the SafeTensors framing and JSON contract before any tensor is
+materialized: an eight-byte little-endian header length capped at 4 MiB; a UTF-8 JSON object that
+begins with `{`; unique keys at the top level and in every parsed or skipped object; tensor objects
+with unambiguous `dtype`, `shape`, and `data_offsets`; an optional `__metadata__` string-to-string
+map; canonical JSON-string decoding (so raw and escaped-equivalent Unicode keys compare equal);
+strict RFC 8259 number grammar (including no leading-zero integers); and only ASCII-space padding
+after the one complete top-level object. Trailing commas, non-space trailing bytes, malformed
+surrogate pairs, duplicate names or members, malformed numbers, and arbitrary metadata values
+fail closed. Structural parsing remains hand-written and bounded; the already-present `serde_json`
+dependency is used only to decode one bounded JSON string token canonically, not to deserialize the
+header tree or collapse object members into maps.
+
+For Qwen3.5 vision checkpoints, an entry named `model.safetensors.index.json` is authoritative.
+Presence is checked with `symlink_metadata`, so a malformed, unreadable, or dangling index fails
+rather than falling back. Without an index, discovery accepts exactly one `*.safetensors`
+candidate whose resolved metadata is a file and requires its name to be `model.safetensors`;
+symlinks are followed consistently with the checkpoint mmap trust policy. Zero, multiple, or
+misnamed candidates fail closed. `quantize_index.json` retains precedence in the lower-level
+vision loader, but constructors with only an f16 decoder path reject it explicitly.
+
+`resolve_qwen35_single_decoder_safetensors` exposes this structural policy as an unstable public
+path-preflight surface. `open_qwen35_single_decoder_safetensors` resolves and opens the selected
+file once; for an indexed layout it also requires the authoritative `weight_map` to match the open
+shard's complete tensor-name inventory exactly. `load_qwen35_vision_weights_from_safetensors` is
+the corresponding unstable already-open reader surface. A pooled vision constructor materializes
+both visual and decoder tensors through that one reader. This binds the two components to one open
+file description even if the directory entry is atomically replaced during a multi-gigabyte load,
+and prevents direct-reader loading from bypassing indexed membership. These surfaces do not compute
+a content digest; identity-governing callers remain responsible for optional checkpoint attestation
+after structural preflight.
+
 ---
 
 ## Key Design Choices
 
-1. **Hand-written JSON parser**: The safetensors header is a constrained subset of JSON (no nested objects beyond the header map, no arrays of arbitrary depth). A custom parser avoids the `serde`, `serde_json`, and `serde_derive` dependency chain while being faster to compile and smaller in binary size.
+1. **Hand-written structural JSON parser**: The safetensors header is bounded and structurally
+   constrained. The parser retains explicit duplicate-key, depth, metadata-shape, padding, and
+   extent checks without allocating a generic JSON tree. The already-present `serde_json`
+   dependency decodes only individual bounded string tokens so Unicode and escape equivalence are
+   canonical before duplicate checks.
 2. **`OnceLock` conversion cache**: On first access to an F16/BF16 tensor, `get_or_init` performs the conversion and stores it. Subsequent accesses return the cached `Box<[f32]>` with no synchronization overhead (post-init reads are lock-free).
 3. **Zero-copy F32**: `bytes_to_f32_slice` returns `None` on misalignment and the caller falls back to a copy. In practice, safetensors aligns tensors to 8 bytes, which satisfies f32's 4-byte alignment requirement on all target platforms.
 4. **Eager QKV fusion**: Fusing at load time rather than inference time means the fusion cost is paid once and inference hot paths see a single contiguous weight matrix. The cost is ~30% higher peak memory during the load window (both original and fused forms exist briefly).
@@ -105,7 +142,7 @@ only ever returns `InferenceError::InvalidSafetensors`) and never as success.
 
 | Alternative                               | Pros                                | Cons                                                                                               | Why Not                                                               |
 | ----------------------------------------- | ----------------------------------- | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `serde_json` for header parsing           | No custom code; handles edge cases  | Adds ~400KB to binary; slower compile; overkill for this constrained format                        | Dependency budget; safetensors header JSON is well-constrained        |
+| Full-tree `serde_json` header parsing     | Less structural parser code         | Default maps collapse duplicate keys; a generic tree allocates more and obscures admission order   | Explicit bounded duplicate/metadata/layout checks stay reviewable     |
 | `candle` weight loading primitives        | Battle-tested; type-safe tensor API | Pulls in the entire `candle` ecosystem; incompatible with the crate's no-ONNX/no-Python constraint | Defeats the purpose of a pure Rust inference engine                   |
 | Copy all weights at load time             | Simpler memory model; no `unsafe`   | 1–4 GB of unnecessary allocations; slower startup; more GC pressure                                | Latency and memory budget                                             |
 | Load shards eagerly                       | Simpler code                        | All shard file descriptors held open simultaneously; larger virtual memory footprint               | Resource usage                                                        |
@@ -118,7 +155,7 @@ only ever returns `InferenceError::InvalidSafetensors`) and never as success.
 **Positive**:
 
 - F32 model startup is near-zero-copy: the OS maps pages on demand.
-- No serde dependency in the inference crate.
+- No generic JSON-tree allocation on the checkpoint header path.
 - F16/BF16 conversion cost is paid at most once per tensor per process lifetime.
 - Finite-value validation cost is paid at most once per successfully accessed tensor.
 - Single-GEMM QKV path reduces per-layer arithmetic from 5 matmuls to 3.

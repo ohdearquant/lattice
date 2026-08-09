@@ -259,3 +259,26 @@ real HTTP image request emits the production multimodal-dispatch marker, that ev
 for the 256-patch golden image actually dispatched to Metal instead of silently taking the CPU
 fallback, and that the request returns generated text, while a text-only control request does not
 emit that marker. The Studio composer portion of S6 remains separate UI work.
+
+## Amendment 3 — Unindexed single-file vision checkpoints (2026-08-09)
+
+Vision capability discovery and pooled-embedding construction also accept the standard
+HuggingFace layout with no weight index when the model directory contains exactly one
+`*.safetensors` candidate whose resolved metadata is a file, named `model.safetensors`. Symlinks
+are followed consistently with the checkpoint mmap trust policy. An existing
+`model.safetensors.index.json` remains authoritative, including malformed or dangling entries;
+the loader never falls back from that sentinel to the plain file. Multiple unindexed candidates
+are ambiguous and fail closed.
+
+The single-file path reuses the bounded `SafetensorsFile` parser and mmap trust boundary from
+ADR-003. Before materializing tensor payloads it validates the complete `model.visual.*` name and
+shape inventory implied by `vision_config`; corrupt JSON, duplicate object keys, invalid metadata,
+unsupported padding, missing tensors, and unexpected visual tensors are rejected. The pooled f16
+embedding constructor resolves and opens the selected safetensors file once, then materializes
+both visual and decoder weights through that same mmap-backed reader so an atomic path replacement
+during a multi-gigabyte load cannot compose components from different checkpoint versions. For an
+indexed one-shard layout, the authoritative `weight_map` must exactly match the opened shard's
+tensor-name inventory; direct-reader materialization cannot bypass indexed membership. Config,
+tokenizer, layout, and bounded header validation all precede tensor-payload materialization.
+`quantize_index.json` remains supported by the lower-level vision loader and serving preflight,
+but is rejected by the pooled f16 constructor because it has no coherent quantized decoder path.
