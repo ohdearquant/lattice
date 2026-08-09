@@ -19,13 +19,15 @@
 //! unvalidated — see [`crate::forward::cpu_f16::PoolingStrategy`]'s doc
 //! comment.
 
+use super::VisionError;
 use super::checkpoint::Qwen35VisionWeights;
 use super::multimodal::Qwen35VisionRequest;
 use super::qwen35_merger::qwen35_merger_forward;
-use super::qwen35_vit::{preprocess_qwen35_image, qwen35_vit_forward};
+use super::qwen35_vit::{GridThw, preprocess_qwen35_image, qwen35_vit_forward};
+use super::qwen35_vit_metal::qwen35_vit_forward_metal;
 use crate::error::InferenceError;
 use crate::forward::cpu_f16::{PoolingStrategy, embed_image_f16};
-use crate::model::qwen35_config::Qwen35Config;
+use crate::model::qwen35_config::{Qwen35Config, VisionModelConfig};
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
 use crate::weights::f16_weights::F16ModelWeights;
@@ -52,6 +54,93 @@ pub fn embed_image_from_bytes_f16(
     prompt: &str,
     pooling: PoolingStrategy,
 ) -> Result<Vec<f32>, InferenceError> {
+    let (vision_cfg, image_token_id, vision_start, vision_end) = require_vision_ids(cfg)?;
+
+    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg)
+        .map_err(|e| InferenceError::InvalidInput(format!("image preprocessing failed: {e}")))?;
+    let pre_merger = qwen35_vit_forward(vision_weights, vision_cfg, &pixel_values, grid)
+        .map_err(|e| InferenceError::InvalidInput(format!("ViT forward failed: {e}")))?;
+
+    pool_from_pre_merger_hidden_states(
+        weights,
+        cfg,
+        vision_weights,
+        vision_cfg,
+        tokenizer,
+        grid,
+        pre_merger,
+        image_token_id,
+        vision_start,
+        vision_end,
+        prompt,
+        pooling,
+    )
+}
+
+/// Metal-dispatching sibling of [`embed_image_from_bytes_f16`]: runs the ViT
+/// forward pass on the Metal GPU ([`qwen35_vit_forward_metal`]) instead of
+/// the CPU, mirroring the serving path's CPU/Metal split
+/// (`crate::serve::metal_worker::build_vision_request` dispatches
+/// `qwen35_vit_forward_metal_with_cancel` then the CPU
+/// `qwen35_merger_forward`). The merger and the decoder-side pooling both
+/// stay CPU here too — only the ViT block loop moves to the GPU.
+///
+/// # Errors
+///
+/// Returns [`InferenceError::UnsupportedModel`] when Metal is unavailable
+/// (non-macOS build, or the crate's `metal-gpu` feature is off) — this entry
+/// never falls back to the CPU ViT forward silently; a caller that wants a
+/// fallback must catch this variant itself and call
+/// [`embed_image_from_bytes_f16`]. See [`embed_image_from_bytes_f16`]'s docs
+/// for the remaining error conditions (missing vision config, undecodable or
+/// misaligned image, invalid assembled request), which are identical here.
+pub fn embed_image_from_bytes_f16_metal(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    vision_weights: &Qwen35VisionWeights,
+    tokenizer: &BpeTokenizer,
+    image_bytes: &[u8],
+    prompt: &str,
+    pooling: PoolingStrategy,
+) -> Result<Vec<f32>, InferenceError> {
+    let (vision_cfg, image_token_id, vision_start, vision_end) = require_vision_ids(cfg)?;
+
+    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg)
+        .map_err(|e| InferenceError::InvalidInput(format!("image preprocessing failed: {e}")))?;
+    let pre_merger = qwen35_vit_forward_metal(vision_weights, vision_cfg, &pixel_values, grid)
+        .map_err(|e| match e {
+            // `qwen35_vit_forward_metal` returns exactly this variant when
+            // Metal is unavailable at build time (see its non-`metal-gpu`
+            // stub) — map it to a distinct `InferenceError` so a caller can
+            // tell "no Metal on this build" apart from a bad request and
+            // choose to retry via `embed_image_from_bytes_f16` instead.
+            VisionError::InvalidConfig(msg) => {
+                InferenceError::UnsupportedModel(format!("Metal ViT forward unavailable: {msg}"))
+            }
+            other => InferenceError::InvalidInput(format!("Metal ViT forward failed: {other}")),
+        })?;
+
+    pool_from_pre_merger_hidden_states(
+        weights,
+        cfg,
+        vision_weights,
+        vision_cfg,
+        tokenizer,
+        grid,
+        pre_merger,
+        image_token_id,
+        vision_start,
+        vision_end,
+        prompt,
+        pooling,
+    )
+}
+
+/// Shared `cfg.vision_config`/token-id extraction for both
+/// [`embed_image_from_bytes_f16`] and [`embed_image_from_bytes_f16_metal`].
+fn require_vision_ids(
+    cfg: &Qwen35Config,
+) -> Result<(&VisionModelConfig, u32, u32, u32), InferenceError> {
     let vision_cfg = cfg.vision_config.as_ref().ok_or_else(|| {
         InferenceError::InvalidInput(
             "checkpoint has no vision_config; embed_image_from_bytes_f16 requires a \
@@ -68,11 +157,27 @@ pub fn embed_image_from_bytes_f16(
     let vision_end = cfg.vision_end_token_id.ok_or_else(|| {
         InferenceError::InvalidInput("checkpoint has no vision_end_token_id".into())
     })?;
+    Ok((vision_cfg, image_token_id, vision_start, vision_end))
+}
 
-    let (pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg)
-        .map_err(|e| InferenceError::InvalidInput(format!("image preprocessing failed: {e}")))?;
-    let pre_merger = qwen35_vit_forward(vision_weights, vision_cfg, &pixel_values, grid)
-        .map_err(|e| InferenceError::InvalidInput(format!("ViT forward failed: {e}")))?;
+/// Shared merger + decoder-prompt-scaffold + pooled-decoder-prefill tail,
+/// common to the CPU and Metal ViT entry points above — the only thing that
+/// differs between them is which forward produced `pre_merger`.
+#[allow(clippy::too_many_arguments)]
+fn pool_from_pre_merger_hidden_states(
+    weights: &F16ModelWeights,
+    cfg: &Qwen35Config,
+    vision_weights: &Qwen35VisionWeights,
+    vision_cfg: &VisionModelConfig,
+    tokenizer: &BpeTokenizer,
+    grid: GridThw,
+    pre_merger: Vec<f32>,
+    image_token_id: u32,
+    vision_start: u32,
+    vision_end: u32,
+    prompt: &str,
+    pooling: PoolingStrategy,
+) -> Result<Vec<f32>, InferenceError> {
     let post_merger = qwen35_merger_forward(&vision_weights.merger, vision_cfg, &pre_merger)
         .map_err(|e| InferenceError::InvalidInput(format!("merger forward failed: {e}")))?;
 
@@ -425,5 +530,92 @@ mod tests {
         )
         .expect_err("a misaligned image must be rejected, not panic");
         assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    /// Metal/CPU pooled-output parity for the tiny synthetic fixture (same
+    /// weights, same image, same prompt scaffold). This checks the wiring
+    /// added in this change (merger + prompt-scaffold + decoder pooling
+    /// reused identically by both entry points) rather than ViT-level
+    /// numerics — the ViT forward itself is already gated at cosine > 0.999
+    /// against the CPU reference in
+    /// `qwen35_vit_metal.rs`'s own `metal_forward_matches_cpu_reference_small_shapes`
+    /// test, which uses this same tiny geometry and therefore also exercises
+    /// the CPU-fallback branch (shapes here are far below the Metal
+    /// dispatch threshold), so this asserts the same tight
+    /// `metal_forward_matches_cpu_reference_small_shapes`-style tolerance
+    /// (`< 1e-4` max-abs-diff) rather than the looser real-geometry cosine
+    /// gate.
+    ///
+    /// Mutation-sensitivity: swapping the `vision_start`/`vision_end`
+    /// arguments in `embed_image_from_bytes_f16_metal`'s call to
+    /// `pool_from_pre_merger_hidden_states` (this file) reorders the
+    /// assembled `input_ids` scaffold on the Metal path only, changing which
+    /// decoder positions get pooled — the CPU path's output would stay
+    /// fixed, so `max_abs_diff` would jump well past `1e-4` and this test
+    /// would fail.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn embed_image_from_bytes_metal_matches_cpu_reference() {
+        let (cfg, weights, vision_weights) = tiny_vlm_fixture();
+        let tokenizer = tiny_tokenizer();
+        let png = make_test_png(8, 8, 0);
+
+        let cpu = embed_image_from_bytes_f16(
+            &weights,
+            &cfg,
+            &vision_weights,
+            &tokenizer,
+            &png,
+            "describe this image",
+            PoolingStrategy::MeanVisualTokens,
+        )
+        .expect("cpu embed succeeds");
+        let metal = embed_image_from_bytes_f16_metal(
+            &weights,
+            &cfg,
+            &vision_weights,
+            &tokenizer,
+            &png,
+            "describe this image",
+            PoolingStrategy::MeanVisualTokens,
+        )
+        .expect("metal embed succeeds");
+
+        assert_eq!(cpu.len(), metal.len());
+        let max_abs_diff = cpu
+            .iter()
+            .zip(metal.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-4,
+            "cpu vs metal pooled embedding diverged: max_abs_diff={max_abs_diff}"
+        );
+    }
+
+    /// Off this cfg gate (no macOS, or `metal-gpu` off), the Metal entry
+    /// must fail closed with a distinct error rather than silently running
+    /// the CPU ViT forward.
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    #[test]
+    fn embed_image_from_bytes_metal_fails_closed_without_metal_gpu() {
+        let (cfg, weights, vision_weights) = tiny_vlm_fixture();
+        let tokenizer = tiny_tokenizer();
+        let png = make_test_png(8, 8, 0);
+
+        let err = embed_image_from_bytes_f16_metal(
+            &weights,
+            &cfg,
+            &vision_weights,
+            &tokenizer,
+            &png,
+            "describe this image",
+            PoolingStrategy::MeanVisualTokens,
+        )
+        .expect_err("Metal entry must fail without the metal-gpu feature, not silently run CPU");
+        assert!(
+            matches!(err, InferenceError::UnsupportedModel(_)),
+            "expected a distinct UnsupportedModel error, got {err:?}"
+        );
     }
 }
