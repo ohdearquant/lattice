@@ -66,20 +66,27 @@ Listening on 127.0.0.1:8080  (model: qwen3.5-0.8b, max_tokens default: 64)
   GET  /health
 ```
 
-That printed route list is exhaustive — this is the complete router:
+That printed route list is a startup banner, not the full route table — it only echoes two of the
+routes below. This is the complete router:
 
 ```rust
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(root))
         .route("/health", get(health))
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
-        .layer(DefaultBodyLimit::max(1_048_576)) // 1 MiB request body cap
+        .route("/v1/embeddings", post(embeddings))
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 ```
 
-There is no `/v1/models`, `/v1/completions`, or any admin/metrics endpoint. If you need a model
-listing endpoint, that's `lattice_serve` (the other binary), not this one.
+`GET /` and `GET /v1/models` return an engine-identity document and a single-entry OpenAI model
+list, respectively. `POST /v1/embeddings` is always routed, but requires the server to have been
+started with `--model` pointed at a vision-language checkpoint; otherwise every request to it
+returns 400 `vision_unsupported` (see "`POST /v1/embeddings`" below). There is no `/v1/completions`
+or any admin/metrics endpoint.
 
 Shut down with Ctrl-C, or with SIGTERM on Unix:
 
@@ -100,8 +107,9 @@ these fixed shutdown intervals.
 None of this is implemented today — worth stating explicitly, since issue #601 asks for it:
 
 - **No authentication.** There is no API-key check, bearer-token check, or any other
-  `Authorization` handling anywhere in the router — it's exactly the two routes plus the
-  body-size layer shown above. Anyone who can reach the listening address can call it.
+  `Authorization` handling anywhere in the router — none of the five routes shown above (or the
+  body-size layer wrapping them) add one. Anyone who can reach the listening address can call
+  any of them.
 - **No rate limiting, no per-request admission control.** There is no request-count or
   concurrency-limiting middleware in front of the handlers. The only thing that rejects a request
   before it reaches model code is the 1 MiB body-size cap already shown above.
@@ -518,9 +526,9 @@ message content. There is no requirement to strip reasoning blocks between turns
 ## Summary
 
 - `lattice serve` (not the separate `lattice_serve` binary) is the OpenAI-compatible server this
-  document covers: `GET /health`, `POST /v1/chat/completions`, and `POST /v1/embeddings` (see
-  above) when started with a vision-language checkpoint. The standalone `lattice_serve` binary
-  does not carry the embeddings route.
+  document covers: `GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, and
+  `POST /v1/embeddings` (see above; the last requires a vision-language checkpoint at startup).
+  The standalone `lattice_serve` binary does not carry the embeddings route.
 - Non-streaming and streaming (SSE) both work today; the request struct's doc comment claiming
   streaming is unsupported is stale — verify against `reject_unsupported` and its tests, not that
   comment.
