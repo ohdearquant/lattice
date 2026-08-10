@@ -830,8 +830,17 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
 /// `special=false` added tokens (`<think>`/`</think>`, `<tool_call>`, FIM markers)
 /// are emitted verbatim. The base BPE vocab does not contain any added-token ids,
 /// so without this map their decode falls through to nothing and they are silently
-/// swallowed from the output stream. Returns `content -> id`.
-pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
+/// swallowed from the output stream. Returns `id -> content`.
+///
+/// Keyed by ID, not by content, and the direction is load-bearing rather than a
+/// convenience for the callers that used to invert it. `added_tokens` may declare
+/// the same content twice at two ids, and keying by content silently kept only
+/// whichever entry parsed last. Every consumer wants `id -> content` anyway
+/// (decode-side rendering, and the alias set behind reasoning-close-marker
+/// validation), so the content-keyed intermediate existed only to lose the
+/// duplicate on the way. An id can render exactly one spelling, so this direction
+/// collapses nothing.
+pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<u32, String> {
     let mut tokens = HashMap::new();
     let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
         return tokens;
@@ -859,7 +868,7 @@ pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<String, u
         else {
             continue;
         };
-        tokens.insert(content.to_string(), id);
+        tokens.insert(id, content.to_string());
     }
 
     tokens
@@ -1113,13 +1122,14 @@ mod tests {
         .unwrap();
 
         let rendered = parse_rendered_added_tokens(&json);
+        // Keyed by id, so the map answers "what does this id render as".
         // special=true is excluded (HF skip_special_tokens=True swallows it).
-        assert_eq!(rendered.get("<|im_start|>"), None);
+        assert!(!rendered.values().any(|c| c == "<|im_start|>"));
         // special=false renders verbatim.
-        assert_eq!(rendered.get("</think>").copied(), Some(2));
+        assert_eq!(rendered.get(&2).map(String::as_str), Some("</think>"));
         // absent special field defaults to false → renders.
-        assert_eq!(rendered.get("<think>").copied(), Some(3));
-        assert_eq!(rendered.get("<tool_call>").copied(), Some(4));
+        assert_eq!(rendered.get(&3).map(String::as_str), Some("<think>"));
+        assert_eq!(rendered.get(&4).map(String::as_str), Some("<tool_call>"));
         assert_eq!(rendered.len(), 3);
     }
 

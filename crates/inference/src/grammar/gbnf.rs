@@ -29,7 +29,7 @@
 //! - Character class negation `[^...]` generates alternatives for every
 //!   byte NOT in the set — correct but potentially many alternatives.
 
-use crate::grammar::pda::{Alt, CompiledGrammar, GrammarBuilder, Symbol};
+use crate::grammar::pda::{Alt, BuilderError, CompiledGrammar, GrammarBuilder, Symbol};
 use std::collections::HashSet;
 
 /// Error from parsing a GBNF string.
@@ -42,6 +42,12 @@ impl std::fmt::Display for GbnfError {
     }
 }
 impl std::error::Error for GbnfError {}
+
+impl From<BuilderError> for GbnfError {
+    fn from(e: BuilderError) -> Self {
+        GbnfError(e.0)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Lexer
@@ -372,7 +378,7 @@ impl<'a> Parser<'a> {
         self.expect(&Token::Assign)?;
         let alts = self.parse_expr()?;
         let id = self.builder.reserve(&name);
-        self.builder.set_alts(id, alts);
+        self.builder.set_alts(id, alts)?;
         // Consume optional trailing newline(s)
         self.skip_newlines()?;
         Ok(())
@@ -418,7 +424,7 @@ impl<'a> Parser<'a> {
                     .cloned()
                     .chain(std::iter::once(Symbol::NonTerminal(id)))
                     .collect();
-                self.builder.set_alts(id, vec![rep_alt, vec![]]);
+                self.builder.set_alts(id, vec![rep_alt, vec![]])?;
                 Ok(vec![Symbol::NonTerminal(id)])
             }
             Token::Plus => {
@@ -434,7 +440,7 @@ impl<'a> Parser<'a> {
                     .cloned()
                     .chain(std::iter::once(Symbol::NonTerminal(tail_id)))
                     .collect();
-                self.builder.set_alts(tail_id, vec![tail_rec, vec![]]);
+                self.builder.set_alts(tail_id, vec![tail_rec, vec![]])?;
                 // rep = x tail
                 let rep_name = self.anon_rule_name();
                 let rep_id = self.builder.reserve(&rep_name);
@@ -443,7 +449,7 @@ impl<'a> Parser<'a> {
                     .cloned()
                     .chain(std::iter::once(Symbol::NonTerminal(tail_id)))
                     .collect();
-                self.builder.set_alts(rep_id, vec![rep_alt]);
+                self.builder.set_alts(rep_id, vec![rep_alt])?;
                 Ok(vec![Symbol::NonTerminal(rep_id)])
             }
             Token::Question => {
@@ -451,7 +457,7 @@ impl<'a> Parser<'a> {
                 // Desugar `x?` → `opt = x | ε`
                 let rule_name = self.anon_rule_name();
                 let id = self.builder.reserve(&rule_name);
-                self.builder.set_alts(id, vec![base, vec![]]);
+                self.builder.set_alts(id, vec![base, vec![]])?;
                 Ok(vec![Symbol::NonTerminal(id)])
             }
             _ => Ok(base),
@@ -486,7 +492,7 @@ impl<'a> Parser<'a> {
                     // Wrap in anon rule.
                     let rule_name = self.anon_rule_name();
                     let id = self.builder.reserve(&rule_name);
-                    self.builder.set_alts(id, alts);
+                    self.builder.set_alts(id, alts)?;
                     Ok(vec![Symbol::NonTerminal(id)])
                 } else {
                     unreachable!()
@@ -507,7 +513,7 @@ impl<'a> Parser<'a> {
                 }
                 let rule_name = self.anon_rule_name();
                 let id = self.builder.reserve(&rule_name);
-                self.builder.set_alts(id, alts);
+                self.builder.set_alts(id, alts)?;
                 Ok(vec![Symbol::NonTerminal(id)])
             }
             tok => Err(GbnfError(format!("unexpected token in item: {tok:?}"))),

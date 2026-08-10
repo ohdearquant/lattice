@@ -5,6 +5,7 @@ use std::fmt::{Display, Formatter};
 /// code can match it exhaustively, adding, removing, or renaming variants is
 /// SemVer-breaking.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum InferenceError {
     ModelNotFound(String),
     UnsupportedModel(String),

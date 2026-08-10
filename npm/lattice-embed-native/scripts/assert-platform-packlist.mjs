@@ -1,11 +1,18 @@
 // Pack-list guard for a per-platform binary subpackage (e.g.
 // `npm/darwin-arm64/`): asserts the tarball (`npm pack --dry-run --json`,
-// piped in on stdin) contains `package.json` plus EXACTLY ONE `.node` file,
-// and nothing else. Run from the main package root via `npm run
-// packlist:darwin-arm64` (see package.json), which `cd`s into the
-// subpackage directory first. The `napi artifacts` step (`npm run
-// artifacts`) must have already copied the built `.node` binary into the
-// subpackage directory before this check is meaningful -- an empty
+// piped in on stdin) contains `package.json`, EXACTLY ONE `.node` file, and
+// nothing else besides an npm-auto-included README (npm always bundles the
+// root README file itself -- case- and extension-flexible, e.g. `README`,
+// `README.md`, `readme.custom` -- regardless of the package.json "files"
+// allowlist, so a two-file expectation is wrong whenever one is present).
+// This does NOT extend to arbitrary README-prefixed files: an allowlisted
+// `readme-not-a-readme.js` is not npm's special case and must still be
+// rejected.
+// Run from the main package root via `npm run packlist:darwin-arm64` (see
+// package.json), which `cd`s into the subpackage directory first, or from
+// the prebuild workflow's per-suffix loop. The `napi artifacts` step (`npm
+// run artifacts`) must have already copied the built `.node` binary into
+// the subpackage directory before this check is meaningful -- an empty
 // subpackage tarball (just `package.json`) is exactly the defect this
 // script exists to catch.
 import assert from 'node:assert/strict'
@@ -33,10 +40,33 @@ assert.equal(
     'run `npm run artifacts` to copy the built binary into this subpackage before packing'
 )
 
+const allowed = new Set(['package.json', nodeFiles[0]])
+// Mirrors npm-packlist's own root-README grammar (`!/readme{,.*[^~$]}`, case-insensitive
+// via ignore-walk's `nocase: true`, compiled by minimatch to
+// `/^(?:\/readme|\/readme\.[^/]*?[^~$])$/i`) as observed against npm-packlist@11.8.0's
+// published behavior. npm-packlist is a transitive dependency of npm itself, not a
+// direct or lockfile-pinned dependency here, so there is no in-tree source location to
+// cite -- re-derive this pattern from the installed npm's own npm-packlist if this
+// behavior ever needs re-confirming (`npm pack --dry-run --json` calls it directly):
+// bare `README`, or `README.` followed by a run of non-slash characters whose last
+// character is not `~` or `$` (npm excludes those from the tarball entirely, e.g.
+// `README.md~`, so they never reach this check). The suffix is scoped to a single path
+// segment -- it does not cross `/`, so a descendant of a directory named e.g.
+// `README.docs/` is not exempt. Line terminators (e.g. a literal newline) are allowed
+// inside the suffix since this is a segment matcher, not JavaScript's dot-based `.`.
+const readmePattern = /^README(\.[^/]*[^/~$])?$/i
+const readmeFiles = files.filter(path => !allowed.has(path) && readmePattern.test(path))
+assert.ok(
+  readmeFiles.length <= 1,
+  `platform package must contain at most one root README file, found ${readmeFiles.length} (${readmeFiles.join(', ')})`
+)
+
+const unexpected = files.filter(path => !allowed.has(path) && !readmePattern.test(path))
 assert.equal(
-  files.length,
-  2,
-  `platform package must contain only package.json and one .node file, found: ${files.join(', ')}`
+  unexpected.length,
+  0,
+  `platform package must contain only package.json, one .node file, and an optional README; ` +
+    `found unexpected entries: ${unexpected.join(', ')} (full list: ${files.join(', ')})`
 )
 
 console.log(JSON.stringify({

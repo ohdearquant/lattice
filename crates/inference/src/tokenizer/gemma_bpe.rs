@@ -155,12 +155,8 @@ impl GemmaBpeTokenizer {
 
         let mut added = parse_added_tokens(&root);
         added.retain(|name, _| !name.is_empty());
-        let rendered_added = parse_rendered_added_tokens(&root);
-        let added_render: HashMap<u32, String> = rendered_added
-            .iter()
-            .map(|(content, &id)| (id, content.clone()))
-            .collect();
-        let rendered_ids: HashSet<u32> = rendered_added.values().copied().collect();
+        let added_render: HashMap<u32, String> = parse_rendered_added_tokens(&root);
+        let rendered_ids: HashSet<u32> = added_render.keys().copied().collect();
         let special_skip_ids: HashSet<u32> = added
             .values()
             .copied()

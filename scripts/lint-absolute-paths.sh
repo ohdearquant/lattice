@@ -1,9 +1,6 @@
 #!/bin/sh
 # Reject developer-specific home paths from tracked documentation, Rust,
-# manifests, scripts, workflows, and JSON.
-#
-# Swift remains outside this check until its existing preview literals are
-# normalized under #1102.
+# manifests, scripts, workflows, JSON, and Swift.
 #
 # The historical benchmark evidence directory is intentionally excluded: those
 # immutable reports preserve the exact commands and paths used for their runs.
@@ -52,6 +49,7 @@ run_check() {
         '*.yml' \
         '*.yaml' \
         '*.json' \
+        '*.swift' \
         ':(exclude)scripts/bench_evidence/**' \
         >"$matches_file" 2>"$errors_file"
     grep_rc=$?
@@ -98,7 +96,8 @@ selftest() {
     esac
     trap 'rm -rf "$sandbox"' 0 1 2 3 15
 
-    mkdir -p "$sandbox/docs" "$sandbox/crates/demo/src" "$sandbox/scripts/bench_evidence/run"
+    mkdir -p "$sandbox/docs" "$sandbox/crates/demo/src" "$sandbox/apps/demo/Sources" \
+        "$sandbox/scripts/bench_evidence/run"
     printf 'Use $%s/model-name.\n' 'LATTICE_MODEL_CACHE' >"$sandbox/docs/clean.md"
     printf '%s\n' 'fn main() {}' >"$sandbox/crates/demo/src/main.rs"
     printf '/%s/%s/projects/archive/model\n' 'Users' 'archived-runner' \
@@ -118,7 +117,9 @@ selftest() {
     printf '/%s/%s/projects/demo\n' 'Users' 'developer' >"$sandbox/docs/dirty.md"
     printf '// /%s/%s/src/demo\n' 'home' 'developer' \
         >"$sandbox/crates/demo/src/dirty.rs"
-    git -C "$sandbox" add docs/dirty.md crates/demo/src/dirty.rs
+    printf '// "/%s/%s/data/train.jsonl"\n' 'Users' 'developer' \
+        >"$sandbox/apps/demo/Sources/Dirty.swift"
+    git -C "$sandbox" add docs/dirty.md crates/demo/src/dirty.rs apps/demo/Sources/Dirty.swift
     dirty_output="$sandbox/dirty.out"
     run_check "$sandbox" >"$dirty_output" 2>&1
     dirty_rc=$?
@@ -134,6 +135,11 @@ selftest() {
     fi
     if ! grep -F 'crates/demo/src/dirty.rs:1:' "$dirty_output" >/dev/null; then
         echo "lint-absolute-paths selftest: Linux-style dirty finding was not reported" >&2
+        cat "$dirty_output" >&2
+        return 1
+    fi
+    if ! grep -F 'apps/demo/Sources/Dirty.swift:1:' "$dirty_output" >/dev/null; then
+        echo "lint-absolute-paths selftest: Swift dirty finding was not reported" >&2
         cat "$dirty_output" >&2
         return 1
     fi

@@ -11,6 +11,7 @@ fn main() {
     use metal::*;
     use std::time::Instant;
 
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let device = Device::system_default().unwrap();
     let queue = device.new_command_queue();
 

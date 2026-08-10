@@ -143,6 +143,7 @@ struct LatticeNumericField: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("Field") {
     VStack(alignment: .leading, spacing: Theme.Space.md) {
         Text("TEXT FIELD")
@@ -150,7 +151,7 @@ struct LatticeNumericField: View {
 
         LatticeField(prompt: "Model name or path", text: .constant(""))
 
-        LatticeField(prompt: "Dataset path", text: .constant("/Users/lion/data/train.jsonl"))
+        LatticeField(prompt: "Dataset path", text: .constant("~/data/train.jsonl"))
 
         LatticeField(prompt: "With error", text: .constant("bad-path"), errorMessage: "File not found")
 
@@ -194,3 +195,4 @@ struct LatticeNumericField: View {
     .frame(width: 480)
     .background(Theme.Palette.canvas)
 }
+#endif

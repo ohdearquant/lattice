@@ -3,16 +3,20 @@ set -e
 
 echo "Running pre-commit checks..."
 
+# Tooling
+if ! cargo fmt --version >/dev/null 2>&1 || ! cargo clippy --version >/dev/null 2>&1; then
+    echo "rustfmt or clippy is unavailable. Run 'make setup' to install both."
+    exit 1
+fi
+
 # Format check
-cargo fmt --all -- --check
-if [ $? -ne 0 ]; then
+if ! cargo fmt --all -- --check; then
     echo "Format check failed. Run 'make fmt' to fix."
     exit 1
 fi
 
 # Clippy
-cargo clippy --workspace --all-targets -- -D warnings
-if [ $? -ne 0 ]; then
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
     echo "Clippy check failed. Fix warnings before committing."
     exit 1
 fi

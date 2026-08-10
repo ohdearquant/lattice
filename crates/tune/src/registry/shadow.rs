@@ -105,6 +105,7 @@ impl ShadowConfig {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum ShadowState {
     /// Shadow evaluation is in progress, collecting samples.
     Running {

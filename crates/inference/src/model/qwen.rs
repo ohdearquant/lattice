@@ -2298,6 +2298,8 @@ fn extract_json_f64(text: &str, key: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    use crate::measurement::gpu_test_lock;
 
     #[test]
     fn test_qwen_config_dimensions() {
@@ -2456,10 +2458,12 @@ mod tests {
 
     #[test]
     #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn test_qwen_long_text_bench() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
         };
+        let _gpu_lock = gpu_test_lock();
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
         // Warmup
         let _ = model.encode("warmup").unwrap();
@@ -2478,10 +2482,12 @@ mod tests {
 
     #[test]
     #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn test_qwen_multilingual() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
         };
+        let _gpu_lock = gpu_test_lock();
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
 
         let pairs = [
@@ -2522,11 +2528,13 @@ mod tests {
 
     #[test]
     #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn test_qwen_encode_real_model() {
         let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
             return;
         };
 
+        let _gpu_lock = gpu_test_lock();
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
         assert_eq!(model.config().hidden_size, 1024);
         assert_eq!(model.dimensions(), 1024);

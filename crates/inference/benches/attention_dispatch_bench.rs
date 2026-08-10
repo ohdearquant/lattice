@@ -29,6 +29,9 @@ fn dispatch_kind(kind: &AttentionKind) -> f32 {
         AttentionKind::Differential => 7.0f32,
         AttentionKind::NativeSparse => 8.0f32,
         AttentionKind::Decode => 9.0f32,
+        // Future variants aren't part of the measured dispatch set yet;
+        // any sentinel is fine since this bench only measures match cost.
+        _ => 10.0f32,
     }
 }
 

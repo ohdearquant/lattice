@@ -196,6 +196,7 @@ struct StripChart: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("StripChart") {
     @Previewable @State var scrubStep: Int? = nil
 
@@ -240,3 +241,4 @@ struct StripChart: View {
     .background(Theme.Palette.canvas)
     .frame(width: 520)
 }
+#endif

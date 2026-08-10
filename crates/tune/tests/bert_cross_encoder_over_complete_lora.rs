@@ -239,6 +239,7 @@ fn over_complete_query_adapter() -> LoraAdapter {
             rank,
             alpha: rank as f32,
             target_modules: vec!["query".to_string()],
+            dtype: "f32".into(),
         },
         layers,
     )
@@ -455,6 +456,7 @@ fn cross_encoder_applies_an_attention_only_adapter() {
             rank,
             alpha: rank as f32,
             target_modules: vec!["value".to_string()],
+            dtype: "f32".into(),
         },
         layers,
     )

@@ -57,6 +57,7 @@ fn run() {
     );
 
     let t_load = Instant::now();
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let mut state: MetalQwen35State = if is_q4 {
         let cfg = Qwen35Config::from_model_dir(dir).expect("load model config.json");
         let tokenizer_path = dir.join("tokenizer.json");
