@@ -15,7 +15,7 @@
 - Command:
 
   ```text
-  CARGO_TARGET_DIR=/Users/lion/khive-work/target \
+  CARGO_TARGET_DIR="$HOME/build-target" \
     python3 scripts/lib/bench-locks.py \
       --label codex-849-stage0 \
       --status-file /tmp/codex-849-bench-locks.txt \

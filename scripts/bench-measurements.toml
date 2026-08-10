@@ -32,6 +32,7 @@ paths = [
     "crates/fann/benches/router_online.rs",
     "crates/inference/benches/attention_dispatch_bench.rs",
     "crates/inference/benches/attn_opt_bench.rs",
+    "crates/inference/benches/backward_stage0.rs",
     "crates/inference/benches/cross_turn_prefix_cache_bench.rs",
     "crates/inference/benches/decode_attn_bench.rs",
     "crates/inference/benches/differential_attention_bench.rs",
