@@ -88,7 +88,7 @@ pub mod vit;
 
 pub use config::VisionConfig;
 pub use multimodal::MultimodalInput;
-pub use pooled_embed::embed_image_from_bytes_f16;
+pub use pooled_embed::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 
 use merger::{MlpMerger, MlpMergerWeights};
 use preprocess::PreprocessConfig;

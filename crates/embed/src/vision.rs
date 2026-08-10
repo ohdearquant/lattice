@@ -33,7 +33,7 @@ use lattice_inference::vision::checkpoint::{
     Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
     open_qwen35_single_decoder_safetensors,
 };
-use lattice_inference::vision::embed_image_from_bytes_f16;
+use lattice_inference::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 use lattice_inference::weights::f16_weights::{F16ModelWeights, load_f16_weights};
 use std::path::Path;
 
@@ -205,6 +205,38 @@ impl VisionEmbeddingModel {
         pooling: PoolingStrategy,
     ) -> Result<Vec<f32>> {
         embed_image_from_bytes_f16(
+            &self.weights,
+            &self.config,
+            &self.vision_weights,
+            &self.tokenizer,
+            image_bytes,
+            prompt,
+            pooling,
+        )
+        .map_err(map_inference_error)
+    }
+
+    /// Metal-dispatching sibling of [`Self::embed_image`]: runs the ViT
+    /// forward pass on the Metal GPU instead of the CPU (see
+    /// [`lattice_inference::vision::embed_image_from_bytes_f16_metal`]).
+    /// Same scaffold, pooling contract, and error semantics as
+    /// [`Self::embed_image`], with one addition: on a build/platform with no
+    /// Metal support, this returns [`EmbedError::InferenceFailed`] (Metal
+    /// unavailability is a runtime-backend failure, not caller-input
+    /// validation) rather than silently falling back to
+    /// [`Self::embed_image`]'s CPU path — callers that want a fallback must
+    /// call [`Self::embed_image`] themselves.
+    ///
+    /// # Errors
+    ///
+    /// See [`Self::embed_image`]'s docs.
+    pub fn embed_image_metal(
+        &self,
+        image_bytes: &[u8],
+        prompt: &str,
+        pooling: PoolingStrategy,
+    ) -> Result<Vec<f32>> {
+        embed_image_from_bytes_f16_metal(
             &self.weights,
             &self.config,
             &self.vision_weights,
@@ -734,6 +766,72 @@ mod tests {
             via_wrapper, via_raw,
             "embed-crate wrapper must return the identical vector to the raw primitive"
         );
+    }
+
+    /// Same wire-through claim as
+    /// `embed_image_matches_raw_inference_primitive`, for the Metal entry
+    /// point: the crate wrapper must add no numerical difference relative to
+    /// calling `embed_image_from_bytes_f16_metal` directly.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn embed_image_metal_matches_raw_inference_primitive() {
+        use lattice_inference::vision::embed_image_from_bytes_f16_metal;
+
+        let (cfg, weights, vision_weights) = tiny_vlm_fixture();
+        let tokenizer = tiny_tokenizer();
+        let png = make_test_png(8, 8, 0);
+
+        let model = VisionEmbeddingModel::new(
+            weights.clone(),
+            cfg.clone(),
+            vision_weights.clone(),
+            tokenizer.clone(),
+        );
+        let via_wrapper = model
+            .embed_image_metal(
+                &png,
+                "describe this image",
+                PoolingStrategy::MeanVisualTokens,
+            )
+            .expect("wrapper embed_image_metal succeeds");
+
+        let via_raw = embed_image_from_bytes_f16_metal(
+            &weights,
+            &cfg,
+            &vision_weights,
+            &tokenizer,
+            &png,
+            "describe this image",
+            PoolingStrategy::MeanVisualTokens,
+        )
+        .expect("raw metal primitive succeeds");
+
+        assert_eq!(
+            via_wrapper, via_raw,
+            "embed-crate Metal wrapper must return the identical vector to the raw primitive"
+        );
+    }
+
+    /// Off this cfg gate, the wrapper must surface the CPU/Metal
+    /// distinction the inference crate makes (`InferenceError::
+    /// UnsupportedModel`) as `EmbedError::InferenceFailed`, never silently
+    /// substituting `embed_image`'s CPU output.
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    #[test]
+    fn embed_image_metal_fails_closed_without_metal_gpu() {
+        let (cfg, weights, vision_weights) = tiny_vlm_fixture();
+        let tokenizer = tiny_tokenizer();
+        let png = make_test_png(8, 8, 0);
+        let model = VisionEmbeddingModel::new(weights, cfg, vision_weights, tokenizer);
+
+        let err = model
+            .embed_image_metal(
+                &png,
+                "describe this image",
+                PoolingStrategy::MeanVisualTokens,
+            )
+            .expect_err("Metal wrapper must fail without the metal-gpu feature");
+        assert!(matches!(err, EmbedError::InferenceFailed(_)));
     }
 
     #[test]
