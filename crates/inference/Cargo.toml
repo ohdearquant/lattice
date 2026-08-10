@@ -21,10 +21,22 @@ default = ["std", "download", "serve"]
 # keep including `lattice_serve` without needing an extra flag. Library
 # consumers building with `default-features = false` no longer pull an HTTP
 # server into their dependency tree (the lib itself never uses it).
-serve = ["dep:axum", "dep:tokio", "dep:futures", "dep:mime", "dep:http-body-util"]
+serve = [
+    "dep:axum",
+    "dep:tokio",
+    "dep:futures",
+    "dep:mime",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:tower",
+]
 std = []
 f16 = []
-metal-gpu = ["dep:metal", "dep:objc"]
+# lattice-fann supplies the shared LoRA descriptor/blend-validation module
+# (issue #615) that `blend_lora_layer_data` and `chat_metal` call, so it must
+# be present whenever this feature is — not just under `mixture`.
+metal-gpu = ["dep:metal", "dep:objc", "dep:lattice-fann"]
 wgpu-gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 bench-internals = []
 bench-ort = ["dep:ort", "dep:tokenizers", "f16"]
@@ -32,8 +44,10 @@ backfill = ["dep:rusqlite", "f16"]
 download = ["dep:ureq"]
 train-backward = []
 # AdapterRouter gate: enables the lattice-fann backed routing module.
-# blend_lora_layer_data and generate_with_lora_mixture do NOT require this
-# feature — they are always available.
+# generate_with_lora_mixture does NOT require this feature — it is always
+# available under `metal-gpu`. blend_lora_layer_data now depends on
+# lattice-fann too (issue #615), but that dep is already pulled in by
+# `metal-gpu` itself, so this feature only adds the routing module.
 mixture = ["dep:lattice-fann"]
 # GDN state-traffic byte counters (issue #422, measure-first for ADR-058).
 # Opt-in only: the default decode path stays byte-identical when this is off.
@@ -59,10 +73,13 @@ rustc-hash = "2"
 rayon = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
+base64.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 clap = { workspace = true }
 axum = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
 mime = { workspace = true, optional = true }
 # Distinguishes a request-body length-limit rejection (`LengthLimitError`)
 # from any other body-buffering failure in the `serve` HTTP handlers.
@@ -71,6 +88,7 @@ mime = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
 # `ureq` (the `download` feature's HTTP client) is declared in the non-wasm
 # `[target]` table below, not here -- see the rationale there.
 sha2.workspace = true
@@ -83,19 +101,22 @@ bytemuck = { version = "1", features = ["derive"], optional = true }
 ort = { version = "2.0.0-rc.12", optional = true }
 tokenizers = { version = "0.22", optional = true, default-features = false, features = ["progressbar", "onig"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-lattice-fann = { version = "0.7.1", path = "../fann", optional = true }
+lattice-fann = { version = "0.9.0", path = "../fann", optional = true }
 
-# `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s `real_path_of_open_file`, which reports the
-# real path of an already-open shard descriptor for diagnostics and error text. Containment is
-# lexical, in `contained_shard_path`; the check-then-reopen window is closed by
-# `open_manifest_entry_once` returning the opened `File` rather than a path to reopen. Nothing
-# security-relevant keys off the reported path. macOS-only: F_GETPATH is a Darwin/BSD `fcntl`.
-[target.'cfg(target_os = "macos")'.dependencies]
+# Two independent unix-only uses: (1) `fcntl(F_GETPATH)` for `weights/f32_weights.rs`'s
+# `real_path_of_open_file`, which reports the real path of an already-open shard descriptor
+# for diagnostics and error text (Containment is lexical, in `contained_shard_path`; the
+# check-then-reopen window is closed by `open_manifest_entry_once` returning the opened
+# `File` rather than a path to reopen. Nothing security-relevant keys off the reported path.
+# F_GETPATH itself is Darwin/BSD-only); (2) `weights/mmap_trust.rs`'s `O_NONBLOCK`/
+# `O_NOFOLLOW`/`ELOOP` values for the trust-boundary open guard, which are per-architecture
+# and gated to `unix` generally rather than `macos` specifically.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [[bin]]
 name = "lattice"
-path = "src/bin/lattice.rs"
+path = "src/bin/lattice/main.rs"
 required-features = ["serve"]
 
 [[bin]]
@@ -121,6 +142,10 @@ name = "lattice_serve"
 path = "src/bin/lattice_serve.rs"
 required-features = ["f16", "metal-gpu", "serve"]
 
+[[test]]
+name = "vision_serve_e2e_test"
+required-features = ["download", "f16", "metal-gpu", "serve"]
+
 [[bin]]
 name = "bench_decode_ab"
 path = "src/bin/bench_decode_ab.rs"
@@ -129,6 +154,11 @@ required-features = ["f16", "metal-gpu"]
 [[bin]]
 name = "bench_gdn_prefill_ab"
 path = "src/bin/bench_gdn_prefill_ab.rs"
+required-features = ["f16", "metal-gpu", "bench-internals"]
+
+[[bin]]
+name = "bench_vision_prefill_ab"
+path = "src/bin/bench_vision_prefill_ab.rs"
 required-features = ["f16", "metal-gpu", "bench-internals"]
 
 [[bin]]
@@ -243,14 +273,8 @@ proptest = { workspace = true }
 syn.workspace = true
 tempfile = { workspace = true }
 naga.workspace = true
-# Drives real HTTP requests (built from `CHAT_COMPLETIONS_PARITY_CASES`
-# fixture bodies) through each binary's `Router` via `ServiceExt::oneshot`
-# for the cross-binary parity table (ADR-080 C2).
-# Already an axum 0.8 transitive dependency (axum's `Router` implements
-# `tower::Service`); `util` is the feature gating `ServiceExt`/`oneshot`,
-# kept at this use site (the version itself moved
-# to `[workspace.dependencies]`, feature selection stays local).
-tower = { workspace = true, features = ["util"] }
+
+
 
 [[bench]]
 name = "differential_attention_bench"
@@ -319,6 +343,10 @@ harness = false
 
 [[bench]]
 name = "elementwise_cpu_bench"
+harness = false
+
+[[bench]]
+name = "grammar_mask_bench"
 harness = false
 
 [[bench]]

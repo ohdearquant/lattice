@@ -14,6 +14,7 @@ disposable git repo, copies the shipping script and its lib/ into it, and puts a
 stub `cargo` on PATH that exits 0 and prints no measurement lines — exactly the
 shape that used to pass.
 """
+import importlib.util
 import os
 import re
 import shutil
@@ -27,6 +28,12 @@ REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "bench-compare.sh"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
 LIB = REPO / "scripts" / "lib"
+
+_GATE_SPEC = importlib.util.spec_from_file_location("perf_bench_gate", GATE)
+assert _GATE_SPEC is not None and _GATE_SPEC.loader is not None
+gate = importlib.util.module_from_spec(_GATE_SPEC)
+sys.modules[_GATE_SPEC.name] = gate
+_GATE_SPEC.loader.exec_module(gate)
 
 # Exits 0 for every subcommand and prints nothing a measurement filter matches.
 STUB_CARGO = """#!/usr/bin/env bash
@@ -118,7 +125,7 @@ def _stub_machine_probe_with_first_failure(failure_statement):
         raise ValueError("machine-state fixture print marker is missing")
     return STUB_MACHINE_PROBE.replace(
         marker,
-        "if label == 'before base':\n"
+        "if label == 'before first arm':\n"
         f"    {failure_statement}\n"
         f"{marker}",
         1,
@@ -157,12 +164,13 @@ fi
 
 write_baseline() {
   local bench="$1"
-  mkdir -p "$CRITERION_HOME/$bench/compare-base"
+  local baseline_name="$2"
+  mkdir -p "$CRITERION_HOME/$bench/$baseline_name"
   printf '%s\n' '{"mean":{"point_estimate":90.0}}' \
-    > "$CRITERION_HOME/$bench/compare-base/estimates.json"
+    > "$CRITERION_HOME/$bench/$baseline_name/estimates.json"
   printf '%s\n' \
     '{"sampling_mode":"Linear","iters":[1.0,2.0],"times":[1.0,2.0]}' \
-    > "$CRITERION_HOME/$bench/compare-base/sample.json"
+    > "$CRITERION_HOME/$bench/$baseline_name/sample.json"
 }
 
 write_head() {
@@ -193,11 +201,13 @@ if [[ "$args" == *" --list "* ]]; then
 fi
 
 if [[ "$args" == *" --save-baseline "* ]]; then
+  baseline_name="${args#* --save-baseline }"
+  baseline_name="${baseline_name%% *}"
   if [[ "$args" == *" lattice-inference "* ]]; then
-    write_baseline "rms_norm/896"
-    write_baseline "rms_norm/4096"
+    write_baseline "rms_norm/896" "$baseline_name"
+    write_baseline "rms_norm/4096" "$baseline_name"
   else
-    write_baseline "simd_dot_product/scalar/384"
+    write_baseline "simd_dot_product/scalar/384" "$baseline_name"
   fi
 else
   if [[ "$args" == *" lattice-inference "* ]]; then
@@ -232,6 +242,120 @@ printf '%s\n' 'fixture rsync: partial baseline transfer' >&2
 exit 23
 """
 
+ORDER_BALANCE_CARGO = r"""#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf '%s\n' 'cargo 1.94.1 (fixture)'
+  exit 0
+fi
+
+args=" $* "
+if [[ "$args" == *" --no-run "* ]]; then
+  exit 0
+fi
+
+if [[ "$args" == *" lattice-inference "* ]]; then
+  bench="rms_norm/512"
+  target="inference"
+else
+  bench="simd_dot_product/scalar/384"
+  target="embed"
+fi
+
+if [[ "$PWD" == *"/.cache/bench-compare-base" ]]; then
+  arm="A"
+else
+  arm="B"
+fi
+printf '%s\n' "$target:$arm" >> "$STUB_ORDER_FILE"
+
+write_estimate() {
+  local artifact="$1"
+  local ns="$2"
+  mkdir -p "$CRITERION_HOME/$bench/$artifact"
+  printf '{"mean":{"point_estimate":%s}}\n' "$ns" \
+    > "$CRITERION_HOME/$bench/$artifact/estimates.json"
+  printf '%s\n' \
+    '{"sampling_mode":"Flat","iters":[1.0,2.0],"times":[1.0,2.0]}' \
+    > "$CRITERION_HOME/$bench/$artifact/sample.json"
+}
+
+write_change() {
+  local point="$1"
+  local low="$2"
+  local high="$3"
+  mkdir -p "$CRITERION_HOME/$bench/change"
+  printf '{"mean":{"point_estimate":%s,"confidence_interval":{"lower_bound":%s,"upper_bound":%s}}}\n' \
+    "$point" "$low" "$high" \
+    > "$CRITERION_HOME/$bench/change/estimates.json"
+}
+
+scenario="${STUB_SCENARIO:-directional-drift}"
+if [[ "$target" == "inference" && -n "${STUB_INFERENCE_SCENARIO:-}" ]]; then
+  scenario="$STUB_INFERENCE_SCENARIO"
+elif [[ "$target" == "embed" && -n "${STUB_EMBED_SCENARIO:-}" ]]; then
+  scenario="$STUB_EMBED_SCENARIO"
+fi
+if [[ "$scenario" == "directional-drift" ]]; then
+  a1="100.0"
+  b1="110.0"
+  b2="121.0"
+  a2="133.1"
+  forward_point="0.10"
+  forward_low="0.095"
+  forward_high="0.105"
+  reverse_point="0.10"
+  reverse_low="0.095"
+  reverse_high="0.105"
+elif [[ "$scenario" == "true-regression" ]]; then
+  a1="100.0"
+  b1="122.4"
+  b2="124.848"
+  a2="106.1208"
+  forward_point="0.224"
+  forward_low="0.222"
+  forward_high="0.226"
+  reverse_point="-0.15"
+  reverse_low="-0.152"
+  reverse_high="-0.148"
+else
+  printf 'unknown STUB_SCENARIO=%s\n' "$scenario" >&2
+  exit 9
+fi
+
+if [[ "$args" == *" --save-baseline "* ]]; then
+  baseline_name="${args#* --save-baseline }"
+  baseline_name="${baseline_name%% *}"
+  if [[ "$baseline_name" == "compare-base" ]]; then
+    write_estimate "$baseline_name" "$a1"
+  elif [[ "$baseline_name" == "compare-head" ]]; then
+    write_estimate "$baseline_name" "$b2"
+  else
+    printf 'unexpected save baseline %s\n' "$baseline_name" >&2
+    exit 9
+  fi
+else
+  baseline_name="${args#* --baseline }"
+  baseline_name="${baseline_name%% *}"
+  if [[ "$baseline_name" == "compare-base" && "$arm" == "B" ]]; then
+    write_estimate "new" "$b1"
+    write_change "$forward_point" "$forward_low" "$forward_high"
+  elif [[ "$baseline_name" == "compare-head" && "$arm" == "A" ]]; then
+    write_estimate "new" "$a2"
+    write_change "$reverse_point" "$reverse_low" "$reverse_high"
+  else
+    printf 'unexpected comparison baseline=%s arm=%s\n' "$baseline_name" "$arm" >&2
+    exit 9
+  fi
+fi
+
+printf '%s\n' 'time: [1.000 ns 1.010 ns 1.020 ns]'
+if [[ "$args" == *" --baseline "* ]]; then
+  printf '%s\n' 'change: [+0.0% +1.0% +2.0%] (p = 0.50 > 0.05)'
+fi
+"""
+
 
 def _run(
     extra_args,
@@ -242,6 +366,7 @@ def _run(
     extra_env=None,
     emit_criterion_home=False,
     stub_machine_state=None,
+    post_run=None,
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -279,7 +404,24 @@ def _run(
             'name = "criterion"\n'
             'version = "0.5.1"\n'
         )
-        subprocess.run([*GIT, "-C", str(root), "add", "-f", "Cargo.lock"], check=True)
+        # The default bench targets' declared-group derivation reads
+        # crates/<crate>/benches/<target>.rs from the checked-out worktree, so
+        # the fixture needs stub sources declaring the same groups the stub
+        # cargo fixtures above write results for (rms_norm, simd_dot_product).
+        # Every test defaults to BENCHES_INFERENCE=elementwise_cpu_bench and
+        # BENCHES_EMBED=simd (none override them), so one fixed pair covers
+        # the whole file.
+        inference_benches = root / "crates" / "inference" / "benches"
+        inference_benches.mkdir(parents=True)
+        (inference_benches / "elementwise_cpu_bench.rs").write_text(
+            'let mut group = c.benchmark_group("rms_norm");\n'
+        )
+        embed_benches = root / "crates" / "embed" / "benches"
+        embed_benches.mkdir(parents=True)
+        (embed_benches / "simd.rs").write_text(
+            'let mut group = c.benchmark_group("simd_dot_product");\n'
+        )
+        subprocess.run([*GIT, "-C", str(root), "add", "-f", "Cargo.lock", "crates"], check=True)
         for i in range(2):
             (root / f"f{i}.txt").write_text(str(i))
             subprocess.run([*GIT, "-C", str(root), "add", "-A"], check=True)
@@ -342,9 +484,54 @@ def _run(
             **(extra_env or {}),
             "STUB_EMIT_CRITERION_HOME": "1" if emit_criterion_home else "0",
         }
-        return subprocess.run(
+        result = subprocess.run(
             ["bash", str(root / "scripts" / SCRIPT.name), *extra_args, "HEAD~1", "HEAD"],
             capture_output=True, text=True, env=env, timeout=300)
+        if post_run is not None:
+            post_run(root)
+        return result
+
+
+class ClearSelectedBaselineArtifactsSiblingPrune(unittest.TestCase):
+    """Isolated repro for the round-4 fix: clear_selected_baseline_artifacts
+
+    must remove a pruned baseline dir's new/change siblings, and must not
+    touch a differently-named baseline tree sharing the same criterion root.
+    """
+
+    def _make_root(self, tmp):
+        root = Path(tmp) / "criterion"
+        pruned = root / "old_group" / "42"
+        (pruned / "compare-base").mkdir(parents=True)
+        (pruned / "new").mkdir()
+        (pruned / "change").mkdir()
+        (pruned / "compare-base" / "estimates.json").write_text(
+            '{"mean":{"point_estimate":90.0}}\n'
+        )
+        (pruned / "new" / "estimates.json").write_text(
+            '{"mean":{"point_estimate":100.0}}\n'
+        )
+        (pruned / "change" / "estimates.json").write_text(
+            '{"mean":{"point_estimate":0.01,'
+            '"confidence_interval":{"lower_bound":0.0,"upper_bound":0.02}}}\n'
+        )
+
+        unrelated = root / "other_group" / "7" / "manual-snapshot"
+        unrelated.mkdir(parents=True)
+        (unrelated / "estimates.json").write_text('{"mean":{"point_estimate":50.0}}\n')
+        return root, pruned, unrelated
+
+    def test_removes_pruned_siblings_and_spares_unrelated_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, pruned, unrelated = self._make_root(tmp)
+
+            removed = gate.clear_selected_baseline_artifacts(root, "compare-base")
+
+            self.assertEqual(removed, 1)
+            self.assertFalse((pruned / "compare-base").exists())
+            self.assertFalse((pruned / "new").exists())
+            self.assertFalse((pruned / "change").exists())
+            self.assertTrue((unrelated / "estimates.json").exists())
 
 
 class BenchCompareMeasurementGuard(unittest.TestCase):
@@ -472,10 +659,16 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             if re.search(r"\bcargo bench\b", line)
             and not line.lstrip().startswith("#")
         ]
-        self.assertEqual(len(commands), 6, commands)
+        self.assertTrue(commands, "found 0 cargo bench invocations")
+        self.assertEqual(
+            len(commands), 10,
+            f"found {len(commands)} cargo bench invocations:\n"
+            + "\n".join(commands),
+        )
         self.assertTrue(
             all(re.search(r"\bcargo bench --locked\b", line) for line in commands),
-            "every cargo bench command must pass --locked:\n" + "\n".join(commands),
+            f"found {len(commands)} cargo bench invocations; "
+            "every command must pass --locked:\n" + "\n".join(commands),
         )
 
         result = _run(
@@ -488,6 +681,271 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"locked benchmark harness failed\nstdout:\n{result.stdout}\n"
             f"stderr:\n{result.stderr}",
         )
+
+    def test_noindex_marker_failure_is_not_a_confirmed_regression(self):
+        """A pre-measurement integrity failure must not read as a regression.
+
+        scripts/lib/ensure-noindex-marker.sh runs under `set -e` in
+        bench-compare-impl.sh before either worktree or benchmark exists
+        (bench-compare-impl.sh:396-397). If that guard ever exits 1 again, the
+        raw status propagates unchanged through bench-locks.py's
+        subprocess.call and this script's exec, and
+        perf-postmerge-gate.yml:280-282 would report it as a confirmed
+        regression with revert advice -- although no benchmark ever ran.
+
+        Mutation-sensitive: revert the guard's normalization (exit 2 -> exit
+        1) in scripts/lib/ensure-noindex-marker.sh and this run's exit code
+        flips from 2 to 1, exactly the collision this test exists to catch.
+        """
+        def occupy_marker(root):
+            # Mirrors ensure-noindex-marker-selftest.sh case 7: a directory
+            # sitting at the marker path cannot become the marker file and
+            # cannot be silently removed, so the guard must refuse.
+            occupied = root / ".cache" / ".metadata_never_index" / "occupied"
+            occupied.mkdir(parents=True)
+
+        result = _run(["--fail-on-regression"], setup=occupy_marker)
+        self.assertEqual(
+            result.returncode, 2,
+            "a pre-measurement instrumentation failure must exit 2 (input/"
+            "instrumentation error), never 1 (confirmed regression); got "
+            f"{result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("[noindex] FATAL", result.stderr)
+        self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
+    def test_cache_mkdir_failure_is_not_a_confirmed_regression(self):
+        """The entry point's own `mkdir -p "$REPO/.cache"` must not leak raw exit 1.
+
+        scripts/bench-compare.sh runs this mkdir under `set -e` before it ever
+        execs bench-locks.py -- before any lock is taken, any worktree exists,
+        or any benchmark runs. If it ever regresses to a bare `mkdir -p`, a
+        regular file occupying `.cache` makes mkdir fail with an unnormalized
+        exit 1, and perf-postmerge-gate.yml would report it as a confirmed
+        regression with revert advice for a run that never measured anything.
+
+        Mutation-sensitive: revert the guard's normalization (exit 2 -> the
+        bare `mkdir -p "$REPO/.cache"`) in scripts/bench-compare.sh and this
+        run's exit code flips from 2 to 1, exactly the collision this test
+        exists to catch.
+        """
+        def occupy_cache(root):
+            (root / ".cache").write_text("occupied")
+
+        result = _run(["--fail-on-regression"], setup=occupy_cache)
+        self.assertEqual(
+            result.returncode, 2,
+            "a pre-measurement instrumentation failure must exit 2 (input/"
+            "instrumentation error), never 1 (confirmed regression); got "
+            f"{result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+        self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
+    def test_cache_mkdir_failure_with_closed_stderr_still_exits_2(self):
+        """A fatal diagnostic write must not itself preempt the exit status.
+
+        Every FATAL echo in scripts/bench-compare.sh writes to fd 2. Under
+        `set -e`, a write that fails (fd 2 closed by the caller) is itself a
+        failing command, and an unguarded `echo ... >&2` would abort the
+        script right there with the shell's own exit 1 -- the status this
+        contract reserves for a confirmed regression -- before the script
+        ever reaches its explicit `exit 2`.
+
+        Mutation-sensitive: drop the `|| :` from any FATAL echo in the
+        mkdir-failure branch and this closed-stderr run flips from 2 to 1.
+        """
+        def occupy_cache(root):
+            (root / ".cache").write_text("occupied")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            (root / "scripts").mkdir(parents=True)
+            shutil.copy2(SCRIPT, root / "scripts" / SCRIPT.name)
+            shutil.copytree(LIB, root / "scripts" / "lib")
+            occupy_cache(root)
+            result = subprocess.run(
+                ["bash", "-c",
+                 f'exec "{root / "scripts" / SCRIPT.name}" HEAD~1 HEAD 2>&-'],
+                capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            result.returncode, 2,
+            "a fatal diagnostic write failing under closed stderr must not "
+            f"leak the shell's raw exit 1; got {result.returncode}\n"
+            f"stdout:\n{result.stdout}")
+
+    def test_repo_root_resolution_failure_is_not_a_confirmed_regression(self):
+        """An unguarded `REPO="$(cd ... && pwd)"` must not leak raw exit 1.
+
+        scripts/bench-compare.sh:27 resolves its own repository root via a
+        command substitution before anything else runs. If that `cd` ever
+        fails -- e.g. the checkout's parent directory disappeared between
+        bash opening the script and this line executing -- the unguarded
+        form aborts under `set -e` with the shell's own exit 1, the status
+        this contract reserves for a confirmed regression.
+
+        The failure is reproduced deterministically (not via a real,
+        inherently racy delete-mid-exec) by handing bash the script's body
+        on the command line with $0 set to a path whose parent never
+        existed, so the `cd` fails for the same reason a raced deletion
+        would: the resolved directory is not there.
+
+        Mutation-sensitive: revert the guard around the REPO= assignment in
+        scripts/bench-compare.sh and this run's exit code flips from 2 to a
+        raw 1 (or an unhandled `set -e` abort), never a controlled refusal.
+        """
+        script_body = SCRIPT.read_text()
+        fake_path = "/tmp/lattice-repo-root-resolution-never-existed/scripts/bench-compare.sh"
+        result = subprocess.run(
+            ["bash", "-c", script_body, fake_path],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            result.returncode, 2,
+            "repository-root resolution failure must exit 2 (input/"
+            "instrumentation error), never a raw 1 (confirmed regression); "
+            f"got {result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+
+    def test_inner_root_resolution_failure_is_not_a_confirmed_regression(self):
+        """The measurement body's own root resolution must not leak raw exit 1.
+
+        scripts/lib/bench-compare-impl.sh resolves its own repository root via
+        an unguarded `REPO="$(cd "$(dirname "$0")/../.." && pwd)"` before doing
+        anything else. This is the merged entry route's own inner boundary,
+        distinct from scripts/bench-compare.sh's outer resolution already
+        covered above -- the outer script's own guard does not protect this
+        body when it (or a caller bypassing the entry point) invokes it with a
+        $0 whose parent has disappeared.
+
+        Reproduced deterministically the same way as the outer case: bash gets
+        the body's own source on the command line with $0 set to a path whose
+        parent never existed.
+
+        Mutation-sensitive: revert the guard around the REPO= assignment in
+        bench-compare-impl.sh and this run's exit code flips from 2 to a raw 1
+        (or an unhandled `set -e` abort), never a controlled refusal.
+        """
+        impl_body = (LIB / "bench-compare-impl.sh").read_text()
+        fake_path = (
+            "/tmp/lattice-inner-root-resolution-never-existed/"
+            "scripts/lib/bench-compare-impl.sh"
+        )
+        result = subprocess.run(
+            ["bash", "-c", impl_body, fake_path],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            result.returncode, 2,
+            "inner repository-root resolution failure must exit 2 (input/"
+            "instrumentation error), never a raw 1 (confirmed regression); "
+            f"got {result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+
+    def test_perf_postmerge_status_dir_regular_file_refuses_with_exit_2(self):
+        """The postmerge status-directory setup must not leak raw exit 1.
+
+        bench-compare-impl.sh creates $PERF_POSTMERGE_STATUS_DIR and truncates
+        an ambient-samples file inside it before any worktree or benchmark
+        exists. A regular file occupying that path makes `mkdir -p` fail with
+        an unnormalized exit 1 under `set -e`.
+
+        Mutation-sensitive: revert the `if ! mkdir -p ...; then ... fi` guard
+        around $PERF_POSTMERGE_STATUS_DIR and this run's exit code flips from
+        2 to 1.
+        """
+        with tempfile.TemporaryDirectory() as status_tmp:
+            status_dir = Path(status_tmp) / "postmerge-status"
+            status_dir.write_text("occupied")
+            result = _run(
+                ["--fail-on-regression"],
+                extra_env={"PERF_POSTMERGE_STATUS_DIR": str(status_dir)},
+            )
+        self.assertEqual(
+            result.returncode, 2,
+            "a pre-measurement instrumentation failure must exit 2 (input/"
+            "instrumentation error), never 1 (confirmed regression); got "
+            f"{result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+        self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
+    def test_perf_postmerge_status_dir_nonwritable_refuses_with_exit_2(self):
+        """A non-writable (but existing) status directory must also exit 2.
+
+        `mkdir -p` on an existing directory succeeds regardless of write
+        permission, so the ambient-samples file truncation is the operation
+        that actually fails here -- a second, independent failure point in
+        the same setup block.
+
+        Mutation-sensitive: revert the guard around the
+        `: > "$AMBIENT_SAMPLES_FILE"` truncation and this run's exit code
+        flips from 2 to 1.
+        """
+        with tempfile.TemporaryDirectory() as status_tmp:
+            status_dir = Path(status_tmp) / "postmerge-status"
+            status_dir.mkdir()
+            status_dir.chmod(0o555)
+            try:
+                result = _run(
+                    ["--fail-on-regression"],
+                    extra_env={"PERF_POSTMERGE_STATUS_DIR": str(status_dir)},
+                )
+            finally:
+                status_dir.chmod(0o755)
+        self.assertEqual(
+            result.returncode, 2,
+            "a pre-measurement instrumentation failure must exit 2 (input/"
+            "instrumentation error), never 1 (confirmed regression); got "
+            f"{result.returncode}\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}")
+        self.assertIn("FATAL", result.stderr)
+        self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
+    def test_perf_postmerge_status_filename_strips_colon_and_slash(self):
+        """The gate-status filename derived from a bench target must contain
+        neither ':' nor '/': actions/upload-artifact rejects both, and
+        uploading "lattice-embed:simd.json" fails the run with "Contains the
+        following character: Colon :".
+
+        A bracket expression bash never closes (`[:\\/]` -- `[:` opens a
+        POSIX character-class token with no matching `:]`) matches nothing,
+        so the substitution silently no-ops and the colon survives all the
+        way to the upload step. This asserts the OUTPUT the fix must
+        produce, not that the substitution merely ran: a no-op substitution
+        exits 0 and prints a string too, so only the produced characters
+        can tell the two apart.
+
+        Mutation-sensitive: revert the substitution to `[:\\/]` and this
+        fails because ':' (and, on the slash fixture, '/') survive in the
+        printed filename.
+        """
+        impl_source = (REPO / "scripts" / "lib" / "bench-compare-impl.sh").read_text()
+        sanitizer_line = next(
+            line.strip() for line in impl_source.splitlines()
+            if line.strip().startswith("local status_name=")
+        )
+        for target in ("lattice-embed:simd", "lattice-inference/elementwise"):
+            script = (
+                'set -euo pipefail\n'
+                f'target="{target}"\n'
+                f'f() {{ {sanitizer_line}; printf "%s" "$status_name"; }}\n'
+                'f\n'
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=10)
+            self.assertEqual(
+                result.returncode, 0,
+                f"sanitizer line failed for target {target!r}: {result.stderr}")
+            produced = result.stdout
+            self.assertNotIn(
+                ":", produced,
+                f"status filename retains a colon for target {target!r}: "
+                f"{produced!r} -- actions/upload-artifact rejects this path")
+            self.assertNotIn(
+                "/", produced,
+                f"status filename retains a slash for target {target!r}: "
+                f"{produced!r} -- this would be read as a subdirectory")
 
     def test_enforcing_mode_refuses_a_run_that_measured_nothing(self):
         """A bench that exits 0 having printed no measurement must not certify.
@@ -532,7 +990,7 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"expected exit 2 (not measurable), got {result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        self.assertIn("machine-state checkpoint 'before base' failed", result.stderr)
+        self.assertIn("machine-state checkpoint 'before first arm' failed", result.stderr)
         self.assertNotIn("--- Building + benching BASE", result.stdout)
 
     def test_default_mode_completes_a_healthy_measurement_fixture(self):
@@ -543,6 +1001,122 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stderr:\n{result.stderr}",
         )
         self.assertIn("Done.", result.stdout)
+
+    def test_report_only_mode_uses_balanced_order(self):
+        """Report-only evidence uses the same balanced ABBA measurement."""
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                [],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_SCENARIO": "true-regression",
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observations = order_file.read_text().splitlines()
+            for target in ("inference", "embed"):
+                self.assertEqual(
+                    [
+                        observation.split(":", 1)[1]
+                        for observation in observations
+                        if observation.startswith(f"{target}:")
+                    ],
+                    ["A", "B", "B", "A"],
+                    observations,
+                )
+            self.assertIn(
+                "arm order: ABBA (base₁ → head₁ → head₂ → base₂)",
+                result.stdout,
+            )
+            self.assertIn("ABBA bound", result.stdout)
+
+    def test_enforcing_abba_refuses_identical_source_directional_drift(self):
+        """A gate-sized second-arm drift is NOT_MEASURABLE, never regression.
+
+        Mutation-sensitive in two independent ways: remove the reverse-order
+        arms and the old forward +10% interval exits 1; combine the two ratios
+        without retaining the order-effect envelope and the run exits 0 instead
+        of failing closed with 3.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_SCENARIO": "directional-drift",
+                },
+            )
+            self.assertEqual(
+                result.returncode,
+                3,
+                f"expected NOT_MEASURABLE (3), got {result.returncode}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("order-bias bound above", result.stdout)
+            self.assertIn("**⏸ NOT MEASURABLE**", result.stdout)
+            self.assertNotIn("✅ All 1 gated benches", result.stdout)
+            observations = order_file.read_text().splitlines()
+            for target in ("inference", "embed"):
+                self.assertEqual(
+                    [
+                        observation.split(":", 1)[1]
+                        for observation in observations
+                        if observation.startswith(f"{target}:")
+                    ],
+                    ["A", "B", "B", "A"],
+                    observations,
+                )
+            self.assertIn(
+                "arm order: ABBA (base₁ → head₁ → head₂ → base₂)",
+                result.stdout,
+            )
+
+    def test_enforcing_abba_retains_distinguishable_regression(self):
+        """A true 20% source regression under 2% drift still exits 1."""
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_SCENARIO": "true-regression",
+                },
+            )
+            self.assertEqual(
+                result.returncode,
+                1,
+                f"expected regression (1), got {result.returncode}\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("gate reported a confirmed regression", result.stderr)
+
+    def test_confirmed_regression_outranks_unmeasurable_target(self):
+        """One target's exit 3 must not suppress another target's exit 1."""
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--full", "--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_INFERENCE_SCENARIO": "directional-drift",
+                    "STUB_EMBED_SCENARIO": "true-regression",
+                },
+            )
+            self.assertEqual(
+                result.returncode,
+                1,
+                "a confirmed regression was suppressed by an unmeasurable "
+                f"target\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("**⏸ NOT MEASURABLE**", result.stdout)
+            self.assertIn("**❌ 1 FAIL**", result.stdout)
+            self.assertIn("gate reported a confirmed regression", result.stderr)
 
     def test_stale_change_cannot_mask_a_benchmark_removed_on_head(self):
         """A stale same-path comparison must not satisfy head completeness.
@@ -556,9 +1130,13 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         enforcing run exits 0 instead of 2.
         """
         def seed_stale_change(root):
+            # Path is target-keyed (lattice#bench-criterion-root-per-target):
+            # BENCHES_INFERENCE defaults to elementwise_cpu_bench, so that is
+            # the segment between the crate and "criterion" here.
             bench = (
                 root / ".cache" / "bench-compare-criterion" / "head" /
-                "inference" / "criterion" / "rms_norm" / "4096"
+                "inference" / "elementwise_cpu_bench" / "criterion" /
+                "rms_norm" / "4096"
             )
             (bench / "new").mkdir(parents=True)
             (bench / "change").mkdir()
@@ -586,21 +1164,48 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             "  - lattice-inference:elementwise_cpu_bench: rms_norm/4096",
             result.stdout,
         )
-        self.assertIn("removed 2 stale head artifact directories", result.stdout)
+        # The per-target root is now wiped wholesale before the head phase
+        # (lattice#bench-criterion-root-per-target), so the selective
+        # clear_selected_head_artifacts prune this message reports on always
+        # finds the root already empty here — the seeded stale artifact
+        # never survives to be found. The invariant this test guards (a stale
+        # same-path comparison cannot satisfy head completeness) is proven by
+        # the exit-2 assertion above, which fires because the real head stub
+        # genuinely never measured rms_norm/4096 in this run, independent of
+        # whichever mechanism cleared any prior data.
+        self.assertIn("removed 0 stale head artifact directories", result.stdout)
 
     def test_stale_unrelated_selected_baseline_is_pruned_before_copy(self):
         """A prior alternate-target baseline must not join today's base set.
 
-        Mutation-sensitive: remove the --prepare-baseline-copy call and the
-        stale compare-base artifact remains selected. The later head cleanup
-        removes its old comparison, so completeness false-fails old_group/42
-        even though every benchmark in today's fresh base set ran on HEAD.
+        Pre-lattice#bench-criterion-root-per-target, this asserted that
+        clear_selected_baseline_artifacts selectively pruned only the exact
+        selected-baseline dir, leaving an unrelated differently-named
+        baseline snapshot in the same root untouched. That fix now wipes the
+        whole arm-and-target root before either phase writes into it
+        (bench-compare-impl.sh's clear_criterion_root), which is a stronger
+        guarantee: a bench-compare-owned per-target root holds nothing but
+        this run's own artifacts, so nothing sharing that root — selected
+        baseline or not — should outlive one invocation. Both stale seeds
+        below (old_group/42 and the differently-named manual-snapshot) are
+        gone by construction; this test now asserts that directly rather than
+        asserting the old selective-prune's "removed N" message, which always
+        reads 0 now that the wipe runs first.
         """
+        old_group_dir = None
+        unrelated_dir = None
+
         def seed_unrelated_run(root):
-            bench = (
+            nonlocal old_group_dir, unrelated_dir
+            # Path is target-keyed: BENCHES_INFERENCE defaults to
+            # elementwise_cpu_bench, the segment between crate and
+            # "criterion".
+            target_root = (
                 root / ".cache" / "bench-compare-criterion" / "head" /
-                "inference" / "criterion" / "old_group" / "42"
+                "inference" / "elementwise_cpu_bench" / "criterion"
             )
+            bench = target_root / "old_group" / "42"
+            old_group_dir = bench
             (bench / "compare-base").mkdir(parents=True)
             (bench / "new").mkdir()
             (bench / "change").mkdir()
@@ -615,10 +1220,32 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                 '"confidence_interval":{"lower_bound":0.0,"upper_bound":0.02}}}\n'
             )
 
+            # A different target's persistent, differently-named baseline
+            # snapshot sharing the same criterion root before this run wipes
+            # it. It has no new/change, so it cannot trip the head-ids
+            # coverage check either way; it is here to prove the wipe is
+            # total rather than scoped to the selected baseline name.
+            other = target_root / "other_group" / "7"
+            unrelated_dir = other / "manual-snapshot"
+            unrelated_dir.mkdir(parents=True)
+            (unrelated_dir / "estimates.json").write_text(
+                '{"mean":{"point_estimate":50.0}}\n'
+            )
+
+        snapshot = {}
+
+        def capture(root):
+            snapshot["old_group_new_exists"] = old_group_dir and (old_group_dir / "new").exists()
+            snapshot["old_group_change_exists"] = old_group_dir and (old_group_dir / "change").exists()
+            snapshot["unrelated_exists"] = (
+                unrelated_dir and (unrelated_dir / "estimates.json").exists()
+            )
+
         result = _run(
             ["--fail-on-regression"],
             stub_cargo=STALE_CHANGE_CARGO,
             setup=seed_unrelated_run,
+            post_run=capture,
         )
         self.assertEqual(
             result.returncode, 0,
@@ -626,10 +1253,23 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn(
-            "removed 1 stale selected-baseline artifact directory before fresh base copy",
+            "removed 0 stale selected-baseline artifact directories before fresh base copy",
             result.stdout,
         )
         self.assertNotIn("old_group/42", result.stdout)
+        self.assertFalse(
+            snapshot["old_group_new_exists"],
+            "stale old_group/42/new must not survive the arm-and-target root wipe",
+        )
+        self.assertFalse(
+            snapshot["old_group_change_exists"],
+            "stale old_group/42/change must not survive the arm-and-target root wipe",
+        )
+        self.assertFalse(
+            snapshot["unrelated_exists"],
+            "a differently-named baseline snapshot must not survive the arm-and-target "
+            "root wipe either — the wipe is total, not scoped to the selected baseline",
+        )
 
     def test_enforcing_mode_refuses_a_partial_baseline_copy(self):
         """A failed partial copy must not shrink the selected set and certify.
@@ -664,6 +1304,11 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         member or includes `<unset>`, reproducing the shared namespace behind
         #1090. The stub emits only its inherited CRITERION_HOME; no benchmark
         implementation is duplicated here.
+
+        Roots are keyed by bench TARGET as well as by crate (lattice#bench-
+        criterion-root-per-target): every root's path includes the exact
+        target name as its own path component, not just the crate name, so
+        two different targets under the same crate can never collide.
         """
         result = _run(
             [], stub_cargo=STALE_CHANGE_CARGO, emit_criterion_home=True
@@ -674,12 +1319,71 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"stderr:\n{result.stderr}")
         roots = set(re.findall(r"criterion-home=(\S+)", result.stdout))
         self.assertEqual(
-            len(roots), 4,
-            f"expected isolated base/head roots per target, saw {roots}\n"
+            len(roots), 8,
+            f"expected isolated ABBA roots per target, saw {roots}\n"
             f"stdout:\n{result.stdout}")
         self.assertNotIn("<unset>", roots)
-        self.assertTrue(any("/inference/criterion" in path for path in roots), roots)
-        self.assertTrue(any("/embed/criterion" in path for path in roots), roots)
+        self.assertTrue(
+            any("/inference/elementwise_cpu_bench/criterion" in path for path in roots),
+            roots,
+        )
+        self.assertTrue(
+            any("/embed/simd/criterion" in path for path in roots), roots
+        )
+
+    def test_different_bench_targets_get_different_criterion_roots(self):
+        """The actual defect: two runs choosing different BENCHES_INFERENCE
+        values must never write into the same Criterion root.
+
+        Mutation-sensitive: drop the target-name path segment (key the root by
+        crate alone, as the pre-fix script did) and both invocations report
+        the same criterion-home path.
+        """
+        def add_f16_convert_bench_source(root):
+            # STALE_CHANGE_CARGO picks its fabricated group name (rms_norm)
+            # from the CRATE in argv, not the --bench target, so the fixture
+            # source declares the same group name regardless of target — this
+            # test asserts path distinctness, not group-content reconciliation
+            # (that is covered separately by the reconciliation tests below).
+            # The file must be committed, not just written: bench-compare
+            # reads it from a `git worktree add --detach` checkout of HEAD,
+            # which only contains tracked, committed content.
+            path = root / "crates" / "inference" / "benches" / "f16_convert_bench.rs"
+            path.write_text('let mut group = c.benchmark_group("rms_norm");\n')
+            subprocess.run([*GIT, "-C", str(root), "add", "-f", str(path)], check=True)
+            subprocess.run(
+                [*GIT, "-C", str(root), "commit", "-qm", "add f16_convert_bench fixture"],
+                check=True,
+                env={
+                    **os.environ,
+                    "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+                },
+            )
+
+        first = _run(
+            [], stub_cargo=STALE_CHANGE_CARGO, emit_criterion_home=True
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            emit_criterion_home=True,
+            extra_env={"BENCHES_INFERENCE": "f16_convert_bench"},
+            setup=add_f16_convert_bench_source,
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        first_roots = set(re.findall(r"criterion-home=(\S+)", first.stdout))
+        second_roots = set(re.findall(r"criterion-home=(\S+)", second.stdout))
+        inference_first = {p for p in first_roots if "/inference/" in p}
+        inference_second = {p for p in second_roots if "/inference/" in p}
+        self.assertTrue(inference_first, first.stdout)
+        self.assertTrue(inference_second, second.stdout)
+        self.assertFalse(
+            inference_first & inference_second,
+            f"different BENCHES_INFERENCE values shared a root: "
+            f"{inference_first} vs {inference_second}",
+        )
 
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):

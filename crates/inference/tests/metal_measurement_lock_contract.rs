@@ -93,11 +93,12 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "src/bin/bench_gdn_prefill_ab.rs",
     "src/bin/bench_logit_dump.rs",
     "src/bin/bench_lora_mixture.rs",
+    "src/bin/bench_vision_prefill_ab.rs",
     "src/bin/chat_metal.rs",
     "src/bin/dump_quarot_q4_golden.rs",
     "src/bin/eval_perplexity.rs",
     "src/bin/gramperf_profile.rs",
-    "src/bin/lattice.rs",
+    "src/bin/lattice/main.rs",
     "src/bin/lattice_serve.rs",
     "src/bin/ppl_metal.rs",
 ];
@@ -110,6 +111,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "benches/elementwise_cpu_bench.rs",
     "benches/f16_convert_bench.rs",
     "benches/gated_attention_bench.rs",
+    "benches/grammar_mask_bench.rs",
     "benches/inference_bench.rs",
     "benches/inference_perf.rs",
     "benches/kv_cache_f16_bench.rs",
@@ -122,6 +124,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/bench_gdn.rs",
     "examples/diff_attn_layer23.rs",
     "examples/diff_gdn_layer.rs",
+    "src/bin/gramtime_profile.rs",
     "src/bin/moe_admission_sim.rs",
     "src/bin/quantize_q4.rs",
     "src/bin/quantize_quarot.rs",
@@ -139,141 +142,84 @@ const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
     "src/forward/metal_qwen35.rs::gemv_q3_decode_mutation_sensitive_high_plane_bit",
     "src/forward/metal_qwen35.rs::lora_gemv_kernel_matches_cpu_reference",
     "src/forward/metal_qwen35.rs::load_adapter_and_dispatch_lora_if_active",
+    "src/forward/metal_qwen35.rs::forced_non_apple7_q4_gemm_fallback_dispatches_and_matches_reference",
     "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
 ];
 const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
     CallSelector::Path(&["MetalQwen35State", "new"]),
     CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
+    // QwenModel::from_directory attempts MetalForwardPass::new internally
+    // (crates/inference/src/model/qwen.rs) whenever Metal is available, so
+    // every caller of it is a helper-mediated Metal construction site (#1274).
+    CallSelector::Path(&["QwenModel", "from_directory"]),
 ];
-const CONSTRUCTION_EXEMPTIONS: &[(&str, &str)] = &[
-    (
-        "bench:cross_turn_prefix_cache_bench:benches/cross_turn_prefix_cache_bench.rs=>benches/cross_turn_prefix_cache_bench.rs:63:35",
-        "load_state_and_tokenizer is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:lm_head_bench:benches/lm_head_bench.rs=>benches/lm_head_bench.rs:176:47",
-        "setup_lm_head_fixture Q8 initialization is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:lm_head_bench:benches/lm_head_bench.rs=>benches/lm_head_bench.rs:205:39",
-        "setup_lm_head_fixture Q4 initialization is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:metal_decode_bench:benches/metal_decode_bench.rs=>benches/metal_decode_bench.rs:53:35",
-        "load_q4_state is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:metal_decode_bench:benches/metal_decode_bench.rs=>benches/metal_decode_bench.rs:63:35",
-        "load_q8_state is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:mtp_decode:benches/mtp_decode.rs=>benches/mtp_decode.rs:103:49",
-        "bench_baseline is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "bench:mtp_decode:benches/mtp_decode.rs=>benches/mtp_decode.rs:199:49",
-        "bench_mtp is an exact deferred Criterion construction tracked in #1274",
-    ),
-    (
-        "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs:444:27",
-        "run state1 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
-    ),
-    (
-        "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs:474:27",
-        "run state2 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
-    ),
-    (
-        "example:bench_gdn_decode:examples/bench_gdn_decode.rs=>examples/bench_gdn_decode.rs:44:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_gdn_prefill_ab:examples/bench_gdn_prefill_ab.rs=>examples/bench_gdn_prefill_ab.rs:56:27",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_gdn_prefill_ab:examples/bench_gdn_prefill_ab.rs=>examples/bench_gdn_prefill_ab.rs:132:27",
-        "run_interleaved is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_gdn_state:examples/bench_gdn_state.rs=>examples/bench_gdn_state.rs:88:27",
-        "run Q4 branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_gdn_state:examples/bench_gdn_state.rs=>examples/bench_gdn_state.rs:92:27",
-        "run safetensors branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_persistent_state:examples/bench_persistent_state.rs=>examples/bench_persistent_state.rs:47:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_pruning:examples/bench_pruning.rs=>examples/bench_pruning.rs:98:49",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_q4_prefill:examples/bench_q4_prefill.rs=>examples/bench_q4_prefill.rs:38:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_q8_prefill:examples/bench_q8_prefill.rs=>examples/bench_q8_prefill.rs:47:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_quality:examples/bench_quality.rs=>examples/bench_quality.rs:121:39",
-        "run baseline is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_quality:examples/bench_quality.rs=>examples/bench_quality.rs:189:40",
-        "run pruned-8 branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_quality:examples/bench_quality.rs=>examples/bench_quality.rs:220:41",
-        "run pruned-12 branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_stability:examples/bench_stability.rs=>examples/bench_stability.rs:87:39",
-        "run is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:bench_suite:examples/bench_suite.rs=>examples/bench_suite.rs:540:27",
-        "bench_llm_metal is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:decode_profile:examples/decode_profile.rs=>examples/decode_profile.rs:63:27",
-        "run Q4 branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:decode_profile:examples/decode_profile.rs=>examples/decode_profile.rs:67:27",
-        "run safetensors branch is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "example:profile_metal:examples/profile_metal.rs=>examples/profile_metal.rs:29:39",
-        "main is an exact deferred manually launched measurement construction tracked in #1274",
-    ),
-    (
-        "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs:770:39",
-        "run Q4 initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
-    ),
-    (
-        "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs:795:39",
-        "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
-    ),
-    (
-        "bin:lattice:src/bin/lattice.rs=>src/bin/lattice.rs:2388:81",
-        "MetalChatBackend::load belongs to a long-running interactive process outside the bounded measurement-harness contract",
-    ),
-    (
-        "bin:lattice:src/bin/lattice.rs=>src/bin/lattice.rs:2897:85",
-        "MetalHandle::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
-    ),
-    (
-        "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs:1693:47",
-        "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
-    ),
-    (
-        "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs:1713:47",
-        "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
-    ),
+/// A construction site exempted from the live shared-lock requirement.
+///
+/// `site` is a stable key built from the enclosing `mod`/`impl`/`fn` path and
+/// the constructed selector (see `StructuredSource::stable_construction_key`),
+/// not from source line/column, so edits that shift line numbers without
+/// changing what is constructed or where it sits in the program structure do
+/// not invalidate the entry (#1357). `recorded_position` is a line:column
+/// snapshot taken when the entry was authored, kept only as a tripwire: if a
+/// site's current position no longer matches it, the site has moved and is
+/// worth a human look, even though its stable key still matches.
+struct ConstructionExemption {
+    site: &'static str,
+    recorded_position: &'static str,
+    reason: &'static str,
+}
+
+const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
+    ConstructionExemption {
+        site: "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs::run::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "examples/bench_concurrent.rs:444:27",
+        reason: "run state1 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
+    },
+    ConstructionExemption {
+        site: "example:bench_concurrent:examples/bench_concurrent.rs=>examples/bench_concurrent.rs::run::MetalQwen35State::from_q4_dir()#2",
+        recorded_position: "examples/bench_concurrent.rs:474:27",
+        reason: "run state2 construction is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
+    },
+    ConstructionExemption {
+        site: "example:bench_embed_quality:examples/bench_embed_quality.rs=>examples/bench_embed_quality.rs::run_bench::QwenModel::from_directory()#1",
+        recorded_position: "examples/bench_embed_quality.rs:136:52",
+        reason: "run_bench QwenModel::from_directory is reached only below main's checked live guard; arbitrary call-graph proof is outside this lexical contract",
+    },
+    ConstructionExemption {
+        site: "bin:backfill_qwen3:src/bin/backfill_qwen3.rs=>src/bin/backfill_qwen3.rs::main::QwenModel::from_directory()#1",
+        recorded_position: "src/bin/backfill_qwen3.rs:37:28",
+        reason: "one-time DB embedding migration over an unbounded row count belongs to a long-running batch process outside the bounded measurement-harness contract",
+    },
+    ConstructionExemption {
+        site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "src/bin/chat_metal.rs:800:39",
+        reason: "run Q4 initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
+    },
+    ConstructionExemption {
+        site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::new()#1",
+        recorded_position: "src/bin/chat_metal.rs:825:39",
+        reason: "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
+    },
+    ConstructionExemption {
+        site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/chat.rs::MetalChatBackend::load::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "src/bin/lattice/chat.rs:53:81",
+        reason: "MetalChatBackend::load belongs to a long-running interactive process outside the bounded measurement-harness contract",
+    },
+    ConstructionExemption {
+        site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs::ModelBackend::spawn_metal::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "src/bin/lattice/serve.rs:423:81",
+        reason: "ModelBackend::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
+    },
+    ConstructionExemption {
+        site: "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs::imp::load_model::MetalQwen35State::from_q4_dir()#1",
+        recorded_position: "src/bin/lattice_serve.rs:1693:47",
+        reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
+    },
+    ConstructionExemption {
+        site: "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs::imp::load_model::MetalQwen35State::new()#1",
+        recorded_position: "src/bin/lattice_serve.rs:1713:47",
+        reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
+    },
 ];
 
 fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
@@ -945,6 +891,11 @@ struct StructuredSource {
     parents: Vec<Option<usize>>,
     macro_ranges: Vec<Range<usize>>,
     functions: Vec<FunctionSpec>,
+    /// Token-index body range paired with a `mod::...::Type::method` path,
+    /// for every free function and `impl` method in the file (nested modules
+    /// and `impl` blocks included). Used to name a construction site by the
+    /// program structure enclosing it instead of by source position.
+    function_paths: Vec<(Range<usize>, String)>,
     scopes: Vec<ScopeSpec>,
     file_attributes: Vec<AttributeSpec>,
     test_cfg: bool,
@@ -963,6 +914,9 @@ fn path_label(path: &syn::Path) -> String {
 fn classify_test_meta(meta: &Meta) -> TestRegistration {
     let path = meta.path();
     if path.is_ident("test") {
+        return TestRegistration::Yes;
+    }
+    if path_label(path) == "tokio::test" {
         return TestRegistration::Yes;
     }
     if path.is_ident("cfg_attr") {
@@ -1221,6 +1175,18 @@ fn inline_modules<'ast>(items: &'ast [syn::Item], modules: &mut Vec<&'ast syn::I
             inline_modules(contents, modules);
         }
     }
+}
+
+/// The receiver type name for an `impl` block, used as a path segment so
+/// methods on different types with the same name (e.g. two `fn load`) do not
+/// collide in a construction site's stable key.
+fn impl_self_type_label(self_ty: &syn::Type) -> String {
+    if let syn::Type::Path(type_path) = self_ty
+        && let Some(segment) = type_path.path.segments.last()
+    {
+        return segment.ident.to_string();
+    }
+    "impl".to_string()
 }
 
 #[derive(Clone)]
@@ -1632,6 +1598,7 @@ impl StructuredSource {
             parents,
             macro_ranges: Vec::new(),
             functions: Vec::new(),
+            function_paths: Vec::new(),
             scopes: Vec::new(),
             file_attributes: Vec::new(),
             test_cfg,
@@ -1640,6 +1607,7 @@ impl StructuredSource {
         };
         parsed.macro_ranges = parsed.find_macro_ranges(&syntax)?;
         parsed.functions = parsed.find_functions(&syntax)?;
+        parsed.function_paths = parsed.find_function_paths(&syntax)?;
         parsed.scopes = parsed.find_scopes(&syntax)?;
         parsed.file_attributes = parsed.inner_attributes_at(0).0;
         parsed.unclassifiable_test_scope = unclassifiable_include(&syntax, test_cfg);
@@ -1834,6 +1802,100 @@ impl StructuredSource {
             });
         }
         Ok(functions)
+    }
+
+    /// Maps a `syn::Block`'s brace pair to the token-index range between
+    /// them, the same convention `FunctionSpec::body` uses.
+    fn token_range_for_block(
+        &self,
+        block: &syn::Block,
+        label: &str,
+    ) -> Result<Range<usize>, String> {
+        let opening_offset = block.brace_token.span.open().byte_range().start;
+        let opening = self
+            .tokens
+            .iter()
+            .position(|token| token.offset == opening_offset && token.is_punct('{'))
+            .ok_or_else(|| {
+                format!(
+                    "{}: function `{label}` body could not be mapped to parsed source",
+                    self.context
+                )
+            })?;
+        let closing = self.pairs[opening].ok_or_else(|| {
+            format!(
+                "{}: function `{label}` has no brace-balanced body",
+                self.context
+            )
+        })?;
+        Ok(opening + 1..closing)
+    }
+
+    fn collect_function_paths(
+        &self,
+        items: &[syn::Item],
+        path: &mut Vec<String>,
+        out: &mut Vec<(Range<usize>, String)>,
+    ) -> Result<(), String> {
+        for item in items {
+            match item {
+                syn::Item::Fn(function) => {
+                    path.push(function.sig.ident.to_string());
+                    let label = path.join("::");
+                    out.push((self.token_range_for_block(&function.block, &label)?, label));
+                    path.pop();
+                }
+                syn::Item::Mod(module) => {
+                    if let Some((_, contents)) = &module.content {
+                        path.push(module.ident.to_string());
+                        self.collect_function_paths(contents, path, out)?;
+                        path.pop();
+                    }
+                }
+                syn::Item::Impl(item_impl) => {
+                    path.push(impl_self_type_label(&item_impl.self_ty));
+                    for impl_item in &item_impl.items {
+                        if let syn::ImplItem::Fn(method) = impl_item {
+                            path.push(method.sig.ident.to_string());
+                            let label = path.join("::");
+                            out.push((self.token_range_for_block(&method.block, &label)?, label));
+                            path.pop();
+                        }
+                    }
+                    path.pop();
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Every free function and `impl` method in the file, keyed by its
+    /// token-index body range and named by the `mod`/`impl` path enclosing
+    /// it (e.g. `MetalChatBackend::load`). Construction sites are named by
+    /// looking up which of these ranges contains them, rather than by their
+    /// source line and column, so a site's identity survives edits that
+    /// shift line numbers without changing the program structure (#1357).
+    fn find_function_paths(
+        &self,
+        syntax: &syn::File,
+    ) -> Result<Vec<(Range<usize>, String)>, String> {
+        let mut out = Vec::new();
+        let mut path = Vec::new();
+        self.collect_function_paths(&syntax.items, &mut path, &mut out)?;
+        Ok(out)
+    }
+
+    /// The innermost `mod`/`impl`/`fn` path enclosing `token`, or
+    /// `"<module scope>"` when the token sits outside every recorded
+    /// function (e.g. in a `static` initializer).
+    fn enclosing_function_path(&self, token: usize) -> String {
+        self.function_paths
+            .iter()
+            .filter(|(range, _)| range.contains(&token))
+            .min_by_key(|(range, _)| range.end.saturating_sub(range.start))
+            .map(|(_, path)| path.clone())
+            .unwrap_or_else(|| "<module scope>".to_string())
     }
 
     fn find_scopes(&self, syntax: &syn::File) -> Result<Vec<ScopeSpec>, String> {
@@ -2511,16 +2573,42 @@ impl StructuredSource {
         self.validate_work_sites(&work_sites, lock_selector, requirement)
     }
 
-    fn construction_sites(&self, range: Range<usize>) -> Result<Vec<usize>, String> {
+    fn construction_sites(
+        &self,
+        range: Range<usize>,
+    ) -> Result<Vec<(usize, CallSelector)>, String> {
         if let Some(reason) = &self.unclassifiable_test_scope {
             return Err(format!("{}: {reason}", self.context));
         }
         let mut sites = Vec::new();
         for selector in CONSTRUCTION_SELECTORS {
-            sites.extend(self.call_sites(range.clone(), *selector, true)?);
+            for token in self.call_sites(range.clone(), *selector, true)? {
+                sites.push((token, *selector));
+            }
         }
-        sites.sort_unstable();
+        sites.sort_unstable_by_key(|(token, _)| *token);
         Ok(sites)
+    }
+
+    /// A key naming a construction site by the program structure enclosing
+    /// it (`mod`/`impl`/`fn` path + constructed selector + an ordinal
+    /// disambiguating repeated calls to the same selector in the same
+    /// function) instead of by source line and column, so an edit that
+    /// shifts line numbers without changing what is constructed or where it
+    /// sits in the call graph does not invalidate an exemption keyed on it
+    /// (#1357).
+    fn stable_construction_key(
+        &self,
+        token: usize,
+        selector: CallSelector,
+        ordinal: usize,
+    ) -> String {
+        format!(
+            "{}::{}::{}#{ordinal}",
+            self.context,
+            self.enclosing_function_path(token),
+            selector.label()
+        )
     }
 
     fn source_site_label(&self, token: usize) -> String {
@@ -2994,18 +3082,23 @@ path = "tools/explicit_example.rs"
 }
 
 #[test]
-fn cfg_attr_test_function_is_included_in_raw_dispatch_inventory() {
+fn cfg_attr_and_tokio_test_functions_are_included_in_raw_dispatch_inventory() {
     let source = r#"
 #[cfg_attr(test, test)]
 fn cfg_attr_registered_test() {
     let command_buffer = queue.new_command_buffer();
 }
+
+#[tokio::test]
+async fn tokio_registered_test() {
+    let command_buffer = queue.new_command_buffer();
+}
 "#;
-    let parsed = StructuredSource::parse("fixtures/cfg_attr_test.rs", source, true)
-        .expect("parse cfg_attr test fixture");
+    let parsed = StructuredSource::parse("fixtures/registered_tests.rs", source, true)
+        .expect("parse registered test fixture");
     let discovered = parsed
         .test_functions()
-        .expect("classify cfg_attr test functions")
+        .expect("classify registered test functions")
         .into_iter()
         .filter(|function| {
             !parsed
@@ -3016,7 +3109,10 @@ fn cfg_attr_registered_test() {
         .map(|function| function.name.as_str())
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(discovered, BTreeSet::from(["cfg_attr_registered_test"]));
+    assert_eq!(
+        discovered,
+        BTreeSet::from(["cfg_attr_registered_test", "tokio_registered_test"])
+    );
 }
 
 #[test]
@@ -3093,7 +3189,7 @@ fn raw_dispatch() {
 #[test]
 fn unknown_test_registration_attribute_fails_closed() {
     let source = r#"
-#[tokio::test]
+#[custom_runtime::test]
 async fn raw_dispatch() {
     let queue = Queue;
     let _command_buffer = queue.new_command_buffer();
@@ -3101,8 +3197,8 @@ async fn raw_dispatch() {
 "#;
     assert_command_buffer_fixture_rejected_with(
         source,
-        "tests/tokio_dispatch.rs",
-        "unclassifiable test function attribute `tokio::test`",
+        "tests/custom_runtime_dispatch.rs",
+        "unclassifiable test function attribute `custom_runtime::test`",
     );
 }
 
@@ -3584,17 +3680,73 @@ fn measurement() {
     assert_guard_fixture_rejected(source, "a match-derived guard binding");
 }
 
+/// Accumulates the construction-site inventory for
+/// `metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings`,
+/// keeping the exemption bookkeeping (discovered/classified/used/moved) in
+/// one place instead of duplicating it across the lib and non-lib scan
+/// branches.
+struct ConstructionTally<'a> {
+    exemptions: &'a BTreeMap<String, &'a ConstructionExemption>,
+    discovered: BTreeSet<String>,
+    classified: BTreeSet<String>,
+    used_exemptions: BTreeSet<String>,
+    moved_exemptions: Vec<String>,
+}
+
+impl<'a> ConstructionTally<'a> {
+    /// Records one discovered construction site under its stable key. When
+    /// the site matches a recorded exemption, classifies it, marks the
+    /// exemption used, checks the position tripwire, and returns `None` (the
+    /// caller must skip the live-lock check). Otherwise returns `Some(site)`
+    /// for the caller to run the live-lock check against.
+    fn record(
+        &mut self,
+        parsed: &StructuredSource,
+        site_prefix: &str,
+        construction: usize,
+        selector: CallSelector,
+        ordinals: &mut BTreeMap<(String, String), usize>,
+    ) -> Option<String> {
+        let function_path = parsed.enclosing_function_path(construction);
+        let counter = ordinals
+            .entry((function_path, selector.label()))
+            .or_insert(0);
+        *counter += 1;
+        let site = format!(
+            "{site_prefix}=>{}",
+            parsed.stable_construction_key(construction, selector, *counter)
+        );
+        self.discovered.insert(site.clone());
+        let Some(exemption) = self.exemptions.get(&site) else {
+            return Some(site);
+        };
+        self.classified.insert(site.clone());
+        self.used_exemptions.insert(site.clone());
+        let current_position = parsed.source_site_label(construction);
+        if current_position != exemption.recorded_position {
+            self.moved_exemptions.push(format!(
+                "{site}: recorded position `{}` no longer matches current position \
+                 `{current_position}`; confirm this exemption still describes the same work \
+                 (this is not a locking violation)",
+                exemption.recorded_position
+            ));
+        }
+        None
+    }
+}
+
 #[test]
 fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let exemptions = CONSTRUCTION_EXEMPTIONS
         .iter()
-        .map(|(path, reason)| {
+        .map(|exemption| {
             assert!(
-                !reason.trim().is_empty(),
-                "construction exemption {path} needs a justification"
+                !exemption.reason.trim().is_empty(),
+                "construction exemption {} needs a justification",
+                exemption.site
             );
-            ((*path).to_string(), *reason)
+            (exemption.site.to_string(), exemption)
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(
@@ -3603,9 +3755,13 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
         "construction exemptions must not contain duplicate sites"
     );
 
-    let mut discovered = BTreeSet::new();
-    let mut classified = BTreeSet::new();
-    let mut used_exemptions = BTreeSet::new();
+    let mut tally = ConstructionTally {
+        exemptions: &exemptions,
+        discovered: BTreeSet::new(),
+        classified: BTreeSet::new(),
+        used_exemptions: BTreeSet::new(),
+        moved_exemptions: Vec::new(),
+    };
     let mut violations = Vec::new();
     for target in cargo_targets(manifest_dir, &["bench", "example", "bin", "test", "lib"])
         .unwrap_or_else(|reason| panic!("{reason}"))
@@ -3623,28 +3779,29 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
         )
         .unwrap_or_else(|reason| panic!("{reason}"));
         for source in &sources {
+            let site_prefix = format!("{}:{}:{}", target.kind, target.name, target_relative);
+            let mut ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
+
             if target.kind == "lib" {
                 for function in source
                     .parsed
                     .test_functions()
                     .unwrap_or_else(|reason| panic!("{reason}"))
                 {
-                    for construction in source
+                    for (construction, selector) in source
                         .parsed
                         .construction_sites(function.body.clone())
                         .unwrap_or_else(|reason| panic!("{reason}"))
                     {
-                        let source_site = source.parsed.source_site_label(construction);
-                        let site = format!(
-                            "{}:{}:{}=>{}",
-                            target.kind, target.name, target_relative, source_site
-                        );
-                        discovered.insert(site.clone());
-                        if exemptions.contains_key(&site) {
-                            classified.insert(site.clone());
-                            used_exemptions.insert(site);
+                        let Some(site) = tally.record(
+                            &source.parsed,
+                            &site_prefix,
+                            construction,
+                            selector,
+                            &mut ordinals,
+                        ) else {
                             continue;
-                        }
+                        };
                         match source.parsed.validate_work_sites(
                             &[construction],
                             LOCAL_LOCK_SELECTOR,
@@ -3653,7 +3810,7 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
                             },
                         ) {
                             Ok(()) => {
-                                classified.insert(site);
+                                tally.classified.insert(site);
                             }
                             Err(reason) => violations.push(format!("{site}: {reason}")),
                         }
@@ -3662,29 +3819,27 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
                 continue;
             }
 
-            for construction in source
+            for (construction, selector) in source
                 .parsed
                 .construction_sites(0..source.parsed.tokens.len())
                 .unwrap_or_else(|reason| panic!("{reason}"))
             {
-                let source_site = source.parsed.source_site_label(construction);
-                let site = format!(
-                    "{}:{}:{}=>{}",
-                    target.kind, target.name, target_relative, source_site
-                );
-                discovered.insert(site.clone());
-                if exemptions.contains_key(&site) {
-                    classified.insert(site.clone());
-                    used_exemptions.insert(site);
+                let Some(site) = tally.record(
+                    &source.parsed,
+                    &site_prefix,
+                    construction,
+                    selector,
+                    &mut ordinals,
+                ) else {
                     continue;
-                }
+                };
                 match source.parsed.validate_work_sites(
                     &[construction],
                     SHARED_LOCK_SELECTOR,
                     GuardRequirement::Lexical,
                 ) {
                     Ok(()) => {
-                        classified.insert(site);
+                        tally.classified.insert(site);
                     }
                     Err(reason) => violations.push(format!("{site}: {reason}")),
                 }
@@ -3697,13 +3852,19 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
         "MetalQwen35State construction sites without a live shared-lock binding:\n{}",
         violations.join("\n")
     );
+    assert!(
+        tally.moved_exemptions.is_empty(),
+        "construction exemptions recorded a position that no longer matches (not a locking \
+         violation — update recorded_position once the move is confirmed intentional):\n{}",
+        tally.moved_exemptions.join("\n")
+    );
 
     let expected_exemptions = exemptions.keys().cloned().collect::<BTreeSet<_>>();
     assert_eq!(
-        used_exemptions, expected_exemptions,
+        tally.used_exemptions, expected_exemptions,
         "construction exemptions must identify current exact sites"
     );
-    assert_construction_inventory_classified(&discovered, &classified);
+    assert_construction_inventory_classified(&tally.discovered, &tally.classified);
 }
 
 #[test]

@@ -1152,6 +1152,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
                 rank,
                 alpha,
                 target_modules,
+                dtype: "f32".into(),
             };
             let adapter = LoraAdapter::new(config, adapter_layers)
                 .map_err(|e| format!("construct adapter: {e}"))?;

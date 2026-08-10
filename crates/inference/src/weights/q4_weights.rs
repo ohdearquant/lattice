@@ -686,6 +686,19 @@ fn checked_alloc_bytes(
     Ok(bytes)
 }
 
+/// Byte length of `stream`, leaving its cursor position unchanged. `Seek`'s
+/// own `stream_len` is not yet stable (`seek_stream_len`,
+/// rust-lang/rust#59359), and this is the only length a generic
+/// `Read + Seek` bound can observe -- there is no `.metadata()` to call once
+/// the caller is no longer necessarily a concrete `std::fs::File`.
+fn stream_len<S: std::io::Seek>(stream: &mut S) -> std::io::Result<u64> {
+    use std::io::SeekFrom;
+    let cur = stream.stream_position()?;
+    let len = stream.seek(SeekFrom::End(0))?;
+    stream.seek(SeekFrom::Start(cur))?;
+    Ok(len)
+}
+
 /// Parse the header of a `.q4` file without reading the block payload.
 ///
 /// On return the file cursor is positioned at the start of the block data.
@@ -693,11 +706,11 @@ fn checked_alloc_bytes(
 /// # Errors
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
-pub fn read_q4_header(
-    file: &mut std::fs::File,
+pub fn read_q4_header<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
 ) -> Result<Q4FileHeader, Box<dyn std::error::Error>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let file_len = file.metadata()?.len();
+    use std::io::{Read, SeekFrom};
+    let file_len = stream_len(file)?;
 
     let (shape, original_len, payload_offset) = {
         let mut f = std::io::BufReader::new(&mut *file);
@@ -821,15 +834,15 @@ pub(crate) fn validate_q4_header_payload_bounds(
 /// Returns an error on I/O failure, unrecognized magic bytes, unsupported
 /// version, a truncated/oversized payload, or a shape mismatch against
 /// `expected_shape`.
-pub(crate) fn validate_q4_file(
-    file: &mut std::fs::File,
+pub(crate) fn validate_q4_file<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
     path: &std::path::Path,
     expected_shape: Option<&[usize]>,
 ) -> Result<Q4FileHeader, Box<dyn std::error::Error>> {
-    use std::io::{Seek, SeekFrom};
+    use std::io::SeekFrom;
 
     let header = read_q4_header(file)?;
-    let file_len = file.metadata()?.len();
+    let file_len = stream_len(file)?;
     validate_q4_header_payload_bounds(&header, file_len, path)?;
 
     if let Some(expected_shape) = expected_shape {
@@ -966,16 +979,11 @@ pub(crate) fn open_and_mmap_q4_file(
     expected_shape: Option<&[usize]>,
     check: Q4BlockCheck<'_>,
 ) -> Result<(Q4FileHeader, memmap2::Mmap, Option<Q4BlocksChecked>), String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
-    let header = validate_q4_file(&mut file, path, expected_shape)
+    let mut handle = crate::weights::mmap_trust::open_trusted_mmap_file(path)?;
+    let header = validate_q4_file(&mut handle, path, expected_shape)
         .map_err(|e| format!("failed to validate Q4 payload {}: {e}", path.display()))?;
 
-    // SAFETY: read-only mapping of a file this process does not mutate while
-    // running; the caller upholds the "model files are immutable for the
-    // process lifetime" invariant documented above.
-    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) }
-        .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+    let mmap = crate::weights::mmap_trust::map_and_verify_trusted(&handle)?;
 
     let payload = mmap.get(header.payload_offset as usize..).ok_or_else(|| {
         format!(
@@ -1148,6 +1156,7 @@ fn read_f16_header(
 /// Why loading a `.f16` failed, when the caller needs to distinguish a shape
 /// disagreement from every other failure in order to report it well.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum F16LoadError {
     /// The header's declared shape disagreed with the shape the caller required.
     /// The payload was not read.

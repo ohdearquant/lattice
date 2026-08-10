@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+source "$REPO/scripts/lib/bench-python.sh"
 HELPER="$REPO/scripts/lib/bench_supervision.py"
 LABEL=""
 MODE="ordinary"
@@ -32,7 +33,8 @@ if [[ -z "$LABEL" || $# -eq 0 ]]; then
     exit 2
 fi
 
+PYTHON_BIN="$(bench_require_python3 "bench-command.sh")" || exit 1
 if [[ "$MODE" == "durable" ]]; then
-    exec python3 "$HELPER" run --label "$LABEL" --quiet -- "$@"
+    exec "$PYTHON_BIN" "$HELPER" run --label "$LABEL" --quiet -- "$@"
 fi
-exec python3 "$HELPER" run --label "$LABEL" -- "$@"
+exec "$PYTHON_BIN" "$HELPER" run --label "$LABEL" -- "$@"

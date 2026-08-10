@@ -53,6 +53,7 @@ pub fn validate_layer_dimensions(num_inputs: usize, num_outputs: usize) -> FannR
 
 /// Errors that can occur in neural network operations
 #[derive(Error, Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum FannError {
     /// Input size does not match network's expected input size
     #[error("Input size mismatch: expected {expected}, got {actual}")]

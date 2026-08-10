@@ -1,29 +1,74 @@
-//! Metal Qwen3.5 decode throughput benchmark.
+//! Metal Qwen3.5 decode and prefill throughput benchmarks.
 //!
-//! Measures single-token decode tok/s on M2 Max with both QuaRot Q4 and naive Q8 weights.
+//! Measures single-token decode tok/s on M2 Max with both QuaRot Q4 and naive Q8 weights, and
+//! Metal prefill latency directly (prompt-length parameterized) rather than diluted inside
+//! `metal_decode_q4`'s `forward_step` iterations, where the one-time prefill cost sits below
+//! the decode group's per-token noise floor (#1301).
 //! Requires:
 //! - Q4 model at `~/.lattice/models/qwen3.5-0.8b-q4-quarot/`
 //! - Q8/safetensors at `~/.lattice/models/qwen3.5-0.8b/`
 //! - tokenizer at `~/.lattice/models/qwen3.5-0.8b/tokenizer.json`
 //!
 //! Run: `cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_decode`
+//! Run (prefill only): `cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_prefill`
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::model::qwen35_config::Qwen35Config;
 
-fn q4_model_dir() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+#[derive(Debug)]
+enum Q4SetupError {
+    HomeUnset,
+    ModelDirectoryMissing(PathBuf),
+    TokenizerMissing(PathBuf),
+    Config(String),
+    State(String),
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+impl std::fmt::Display for Q4SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Q4SetupError::HomeUnset => write!(f, "HOME environment variable is not set"),
+            Q4SetupError::ModelDirectoryMissing(path) => {
+                write!(f, "Q4 model not found at {}", path.display())
+            }
+            Q4SetupError::TokenizerMissing(path) => {
+                write!(f, "tokenizer not found at {}", path.display())
+            }
+            Q4SetupError::Config(msg) => write!(f, "config load failed: {msg}"),
+            Q4SetupError::State(msg) => write!(f, "Q4 state construction failed: {msg}"),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn q4_model_dir_checked() -> Result<PathBuf, Q4SetupError> {
+    let home = std::env::var("HOME").map_err(|_| Q4SetupError::HomeUnset)?;
     let quarot = PathBuf::from(format!("{home}/.lattice/models/qwen3.5-0.8b-q4-quarot"));
     if quarot.join("config.json").exists() {
-        Some(quarot)
+        Ok(quarot)
     } else {
-        None
+        Err(Q4SetupError::ModelDirectoryMissing(quarot))
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn tokenizer_path_checked() -> Result<PathBuf, Q4SetupError> {
+    let home = std::env::var("HOME").map_err(|_| Q4SetupError::HomeUnset)?;
+    let p = PathBuf::from(format!(
+        "{home}/.lattice/models/qwen3.5-0.8b/tokenizer.json"
+    ));
+    if p.exists() {
+        Ok(p)
+    } else {
+        Err(Q4SetupError::TokenizerMissing(p))
     }
 }
 
@@ -37,21 +82,16 @@ fn safetensors_model_dir() -> Option<PathBuf> {
     }
 }
 
-fn tokenizer_path() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let p = PathBuf::from(format!(
-        "{home}/.lattice/models/qwen3.5-0.8b/tokenizer.json"
-    ));
-    if p.exists() { Some(p) } else { None }
-}
-
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-fn load_q4_state() -> Option<(MetalQwen35State, Qwen35Config)> {
-    let dir = q4_model_dir()?;
-    let tok = tokenizer_path()?;
-    let cfg = Qwen35Config::from_config_json(&dir.join("config.json")).ok()?;
-    let state = MetalQwen35State::from_q4_dir(&dir, &tok, &cfg, 4096).ok()?;
-    Some((state, cfg))
+fn load_q4_state() -> Result<(MetalQwen35State, Qwen35Config), Q4SetupError> {
+    let dir = q4_model_dir_checked()?;
+    let tok = tokenizer_path_checked()?;
+    let cfg = Qwen35Config::from_config_json(&dir.join("config.json"))
+        .map_err(|error| Q4SetupError::Config(error.to_string()))?;
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+    let state =
+        MetalQwen35State::from_q4_dir(&dir, &tok, &cfg, 4096).map_err(Q4SetupError::State)?;
+    Ok((state, cfg))
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -60,6 +100,7 @@ fn load_q8_state() -> Option<(MetalQwen35State, Qwen35Config)> {
     let dir = safetensors_model_dir()?;
     let model = Qwen35Model::from_safetensors(&dir).ok()?;
     let cfg = model.config().clone();
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let state = MetalQwen35State::new(model.weights(), &cfg, 4096).ok()?;
     Some((state, cfg))
 }
@@ -130,12 +171,27 @@ fn bench_metal_decode_q4(c: &mut Criterion) {
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
-        let Some((mut state, cfg)) = load_q4_state() else {
-            eprintln!(
-                "SKIP: Q4 model not found at ~/.lattice/models/qwen3.5-0.8b-q4-quarot\n\
-                 (tokenizer expected at ~/.lattice/models/qwen3.5-0.8b/tokenizer.json)"
-            );
-            return;
+        let (mut state, cfg) = match load_q4_state() {
+            Ok(loaded) => loaded,
+            Err(error @ Q4SetupError::ModelDirectoryMissing(_)) => {
+                eprintln!(
+                    "SKIP: {error}\n\
+                     (tokenizer expected at ~/.lattice/models/qwen3.5-0.8b/tokenizer.json)"
+                );
+                return;
+            }
+            // HomeUnset and TokenizerMissing indicate the environment or model
+            // is simply absent (same class as ModelDirectoryMissing above), so
+            // they skip too. Config and State mean a model IS present and
+            // rejected the load -- that is a real regression, not an absent
+            // fixture, so it must fail the bench loudly rather than exit 0.
+            Err(error @ (Q4SetupError::HomeUnset | Q4SetupError::TokenizerMissing(_))) => {
+                eprintln!("SKIP: {error}");
+                return;
+            }
+            Err(error @ (Q4SetupError::Config(_) | Q4SetupError::State(_))) => {
+                panic!("Q4 setup failed on a present model: {error}");
+            }
         };
 
         let mut group = c.benchmark_group("metal_decode_q4");
@@ -233,5 +289,87 @@ fn bench_metal_decode_q8(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_metal_decode_q4, bench_metal_decode_q8);
+/// Prompt lengths swept by `metal_prefill_q4`, matching issue #1301's suggestion.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+const PREFILL_PROMPT_LENGTHS: &[usize] = &[128, 512, 1024];
+
+/// Deterministic in-vocab token ids; content doesn't matter for a latency bench, only
+/// that every id is a valid embedding row (vocab_size is in the hundreds of thousands,
+/// so a small fixed range comfortably avoids the tokenizer's special-token ids near 0).
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn synthetic_prompt_tokens(len: usize) -> Vec<u32> {
+    (0..len as u32).map(|i| 1000 + (i % 4096)).collect()
+}
+
+fn bench_metal_prefill_q4(c: &mut Criterion) {
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        eprintln!("SKIP: metal_prefill bench requires macOS + metal-gpu feature");
+        let _ = c;
+        return;
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        let (mut state, _cfg) = match load_q4_state() {
+            Ok(loaded) => loaded,
+            Err(error @ Q4SetupError::ModelDirectoryMissing(_)) => {
+                eprintln!(
+                    "SKIP: {error}\n\
+                     (tokenizer expected at ~/.lattice/models/qwen3.5-0.8b/tokenizer.json)"
+                );
+                return;
+            }
+            // Same absent-vs-broken classification as bench_metal_decode_q4 above.
+            Err(error @ (Q4SetupError::HomeUnset | Q4SetupError::TokenizerMissing(_))) => {
+                eprintln!("SKIP: {error}");
+                return;
+            }
+            Err(error @ (Q4SetupError::Config(_) | Q4SetupError::State(_))) => {
+                panic!("Q4 setup failed on a present model: {error}");
+            }
+        };
+
+        let mut group = c.benchmark_group("metal_prefill_q4");
+        group.warm_up_time(Duration::from_secs(2));
+        group.measurement_time(Duration::from_secs(8));
+        group.sample_size(20);
+
+        for &prompt_len in PREFILL_PROMPT_LENGTHS {
+            let prompt_tokens = synthetic_prompt_tokens(prompt_len);
+            group.throughput(Throughput::Elements(prompt_len as u64));
+            group.bench_with_input(
+                BenchmarkId::new("forward_prefill", prompt_len),
+                &prompt_tokens,
+                |b, tokens| {
+                    // iter_custom keeps state.reset_state() (fresh KV cache + initial
+                    // GDN state) and Instant::now() bracketing outside the callback
+                    // Criterion measures: only forward_prefill itself is timed, so a
+                    // leaked cache/state from a prior iteration or from the one-time
+                    // model load above cannot show up in the reported duration.
+                    b.iter_custom(|iters| {
+                        let mut elapsed = Duration::ZERO;
+                        for _ in 0..iters {
+                            state.reset_state();
+                            let start = Instant::now();
+                            let logits = state.forward_prefill(std::hint::black_box(tokens));
+                            elapsed += start.elapsed();
+                            std::hint::black_box(logits);
+                        }
+                        elapsed
+                    });
+                },
+            );
+        }
+
+        group.finish();
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_metal_decode_q4,
+    bench_metal_decode_q8,
+    bench_metal_prefill_q4
+);
 criterion_main!(benches);

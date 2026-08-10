@@ -13,6 +13,7 @@ use super::math::sqrt;
 ///
 /// **Stable** (provisional): error type paired with the `Stable` cost API; changes only if the cost trait surface changes.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum CostError {
     /// Point set has no elements.
     EmptyPointSet,

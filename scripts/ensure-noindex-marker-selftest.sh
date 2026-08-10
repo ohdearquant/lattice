@@ -10,8 +10,9 @@
 #   bash scripts/ensure-noindex-marker-selftest.sh
 #
 # The invariant under test, stated once: WHEN THE GUARD EXITS 0, A REGULAR
-# MARKER FILE EXISTS. When one cannot be established, the guard exits nonzero
-# and the caller never measures. Both halves are asserted on every case.
+# MARKER FILE EXISTS. When one cannot be established, the guard exits 2 (the
+# input/instrumentation-error class, not a regression verdict) and the caller
+# never measures. Both halves are asserted on every case.
 set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -109,7 +110,7 @@ check_marker "  -> replaced by a regular file" "$D" file
 
 # 7. Marker path occupied by a directory: cannot become a file, must not proceed.
 D="$SB/isdir/.cache"; mkdir -p "$D/.metadata_never_index/occupied"
-run "$D"; check "non-empty dir at marker path fails closed" 1 $?
+run "$D"; check "non-empty dir at marker path fails closed" 2 $?
 
 # 8. FAIL-CLOSED PROOF. An unwritable .cache cannot hold a marker at all, so the
 #    guard must refuse rather than let an unprotected A/B proceed. This is the
@@ -118,7 +119,7 @@ if [ "$(id -u)" -eq 0 ]; then
   echo "  SKIP: unwritable-dir case (running as root bypasses permissions)"
 else
   D="$SB/readonly/.cache"; mkdir -p "$D"; chmod a-w "$D"
-  run "$D"; check "unwritable dir fails closed" 1 $?
+  run "$D"; check "unwritable dir fails closed" 2 $?
   check_marker "  -> no marker was created" "$D" absent
   case "$OUT" in
     *FATAL*) echo "  PASS:   -> diagnostic names the failure"; pass=$((pass+1)) ;;
@@ -127,7 +128,27 @@ else
   chmod u+w "$D"
 fi
 
-# 9. CALL-SITE ASSERTIONS. Testing the helper in isolation would still pass if
+# 9. NO ARGUMENT. The required-positional-argument expansion must not leak a
+#    raw exit 1 (the same code the gate reserves for a confirmed regression).
+OUT="$(bash "$SRC" 2>&1)"; rc=$?
+check "no argument fails closed" 2 "$rc"
+case "$OUT" in
+  *FATAL*) echo "  PASS:   -> diagnostic names the failure"; pass=$((pass+1)) ;;
+  *) echo "  FAIL:   -> no FATAL diagnostic in output"; fail=$((fail+1)) ;;
+esac
+
+# 10. UNWRITABLE PARENT (mkdir -p failure). A regular file occupying the
+#     target path makes `mkdir -p` fail with its own raw exit 1; that must be
+#     normalized too, not just the marker-creation failures below it.
+F="$SB/occupied-by-file"; : > "$F"
+OUT="$(bash "$SRC" "$F/sub" 2>&1)"; rc=$?
+check "mkdir -p failure (path occupied by a file) fails closed" 2 "$rc"
+case "$OUT" in
+  *FATAL*) echo "  PASS:   -> diagnostic names the failure"; pass=$((pass+1)) ;;
+  *) echo "  FAIL:   -> no FATAL diagnostic in output"; fail=$((fail+1)) ;;
+esac
+
+# 11. CALL-SITE ASSERTIONS. Testing the helper in isolation would still pass if
 #    a measurement body stopped calling it, so pin the exact protected trees.
 cache_call="\"\$REPO/scripts/lib/ensure-noindex-marker.sh\" \"\$REPO/.cache\""
 target_call="\"\$REPO/scripts/lib/ensure-noindex-marker.sh\" \"\$REPO/target\""
@@ -150,7 +171,7 @@ else
   echo "  FAIL: slopefit no longer protects its in-place target"; fail=$((fail+1))
 fi
 
-# 10. Each marker must exist before the operation that creates or builds the
+# 12. Each marker must exist before the operation that creates or builds the
 #     protected resource. These ordering checks fail if a call drifts too late.
 cache_guard_ln=$(grep -nF "$cache_call" "$COMPARE_CALLER" | head -1 | cut -d: -f1)
 wt_ln=$(grep -n 'worktree add' "$COMPARE_CALLER" | head -1 | cut -d: -f1)
@@ -175,6 +196,18 @@ if [ -n "$slopefit_guard_ln" ] && [ -n "$slopefit_build_ln" ] && [ "$slopefit_gu
 else
   echo "  FAIL: target guard does not precede slopefit build (guard=$slopefit_guard_ln build=$slopefit_build_ln)"; fail=$((fail+1))
 fi
+
+# 13. CLOSED STDERR. Every FATAL diagnostic writes to fd 2 under `set -e`
+#     (originally `set -euo pipefail`, self-test drops -e above but the
+#     guard script itself keeps it). If fd 2 is closed by the caller, an
+#     unguarded `echo ... >&2` is itself a failing command and would abort
+#     the guard with the shell's raw exit 1 -- the code this contract
+#     reserves for a confirmed regression -- before the guard's own
+#     explicit `exit 2` is reached. No argument is the cheapest way to
+#     force a FATAL diagnostic.
+OUT="(stderr closed; not captured)"
+rc=$(/bin/bash -c "\"$SRC\" 2>&-; echo \$?" | tail -1)
+check "no-argument FATAL survives closed stderr" 2 "$rc"
 
 echo "=== $pass passed, $fail failed ==="
 [ "$fail" -eq 0 ]

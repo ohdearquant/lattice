@@ -145,13 +145,34 @@ fn is_supported_lora_target(block: &str, module: &str) -> bool {
     }
 }
 
+/// Resolve the `(rank, alpha, scale)` a [`load_lora_safetensors`] call will
+/// use, given the rank inferred from the adapter's tensor shapes and the
+/// alpha parsed from `__metadata__` (if present).
+///
+/// Prefers `__metadata__.alpha` when available; falls back to `alpha = rank`
+/// (scale = 1.0), matching the tune crate's own default for adapters
+/// without embedded metadata. Scale itself is the shared
+/// `lattice-fann` helper (issue #615) — a rank of 0 (malformed metadata)
+/// resolves to scale = 0.0, matching `lattice_tune::lora::LoraConfig::scale`.
+/// This bin previously fell back to scale = 1.0 for that case; adopting the
+/// shared helper here resolves the drift to tune's value.
+fn resolve_lora_rank_alpha_scale(
+    rank_global: Option<usize>,
+    metadata_alpha: Option<f32>,
+) -> (usize, f32, f32) {
+    let rank = rank_global.unwrap_or(1);
+    let alpha = metadata_alpha.unwrap_or(rank as f32);
+    let scale = lattice_fann::lora::effective_scale(rank, alpha);
+    (rank, alpha, scale)
+}
+
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn load_lora_safetensors(
     path: &std::path::Path,
 ) -> Result<
     (
         Vec<lattice_inference::forward::metal_qwen35::LoraLayerData>,
-        f32,
+        lattice_fann::lora::LoraDescriptor,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -383,12 +404,21 @@ fn load_lora_safetensors(
     // Sort by layer_idx for deterministic load order.
     layers.sort_by_key(|l| (l.layer_idx, l.module.clone()));
 
-    // Compute scale = alpha / rank.
-    // Prefer __metadata__.alpha when available; fall back to alpha = rank (scale = 1.0),
-    // matching the tune crate's own default for adapters without embedded metadata.
-    let rank = rank_global.unwrap_or(1);
-    let alpha = metadata_alpha.unwrap_or(rank as f32);
-    let scale = if rank > 0 { alpha / rank as f32 } else { 1.0 };
+    let (rank, alpha, scale) = resolve_lora_rank_alpha_scale(rank_global, metadata_alpha);
+
+    let mut target_modules: Vec<String> = layers.iter().map(|l| l.module.clone()).collect();
+    target_modules.sort();
+    target_modules.dedup();
+
+    // In-memory representation is always f32 (`get_f32_tensor` above already
+    // converted any F16/BF16 source tensors), matching the `lattice-tune`
+    // safetensors loader's own convention for this field.
+    let descriptor = lattice_fann::lora::LoraDescriptor {
+        rank,
+        alpha,
+        target_modules,
+        dtype: "f32".into(),
+    };
 
     eprintln!(
         "[chat_metal] LoRA: {} layer×module pairs, rank={}, alpha={}, scale={:.2}",
@@ -398,7 +428,7 @@ fn load_lora_safetensors(
         scale
     );
 
-    Ok((layers, scale))
+    Ok((layers, descriptor))
 }
 
 // ─── JSON generation helper (shared by one-shot and serve paths) ────────────
@@ -803,6 +833,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ModelFormat::Unknown => {
             return Err(model_format::unrecognized_format_message(dir).into());
         }
+        // Any format this binary doesn't yet know how to load is handled
+        // the same way as `Unknown`: report it rather than silently
+        // guessing a loader.
+        _ => {
+            return Err(model_format::unrecognized_format_message(dir).into());
+        }
     }
 
     // ── Load LoRA adapter (if requested) ────────────────────────────────────
@@ -811,9 +847,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref lp) = lora_path {
         eprintln!("[chat_metal] Loading LoRA adapter from {}...", lp.display());
         let t_lora = std::time::Instant::now();
-        let (layers, scale) = load_lora_safetensors(lp)?;
+        let (layers, descriptor) = load_lora_safetensors(lp)?;
         metal
-            .load_lora_adapter(layers, scale, None)
+            .load_lora_adapter_with_descriptor(layers, &descriptor, None)
             .map_err(|e| format!("load_lora_adapter failed: {e}"))?;
         eprintln!(
             "[chat_metal] LoRA loaded in {:.1}s",
@@ -1325,5 +1361,73 @@ mod tests {
         let parsed =
             parse_serve_request_line(r#"{"prompt":"hi","stop":["\n"]}"#, defaults()).unwrap();
         assert_eq!(parsed.prompt, "hi");
+    }
+
+    // Pre-#615, this file's LoRA scale computation was `if rank > 0 { alpha /
+    // rank } else { 1.0 }` — a rank-0 adapter's scale silently resolved to
+    // 1.0 (full-strength passthrough of a degenerate zero-rank delta).
+    // `lattice_tune::lora::LoraConfig::scale` (crates/tune/src/lora/mod.rs)
+    // has always resolved the same input to 0.0 (an empty factorization
+    // contributes nothing). The two copies disagreed on this edge case;
+    // adopting the shared `lattice_fann::lora::effective_scale` here
+    // resolves it to tune's value.
+    //
+    // This pins that resolution through `load_lora_safetensors` itself — the
+    // production call site — via a fixture with a rank-0 A/B tensor pair
+    // (shape [0, d_in] / [d_out, 0]) and an explicit `__metadata__.alpha`,
+    // not by re-deriving the answer from `effective_scale` directly. A
+    // version calling `effective_scale` in isolation stays green even if the
+    // call site reverts to the old inline fallback; this one does not.
+    #[test]
+    fn cm_chat_metal_zero_rank_scale_matches_tune_not_the_old_local_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero_rank.safetensors");
+
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "__metadata__".to_string(),
+            serde_json::json!({"alpha": "5.0"}),
+        );
+        header.insert(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight".to_string(),
+            serde_json::json!({"dtype": "F32", "shape": [0, 4], "data_offsets": [0, 0]}),
+        );
+        header.insert(
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight".to_string(),
+            serde_json::json!({"dtype": "F32", "shape": [4, 0], "data_offsets": [0, 0]}),
+        );
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let mut bytes = (header_bytes.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&header_bytes);
+        std::fs::write(&path, bytes).unwrap();
+
+        let (layers, descriptor) =
+            load_lora_safetensors(&path).expect("zero-rank adapter must load");
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].rank, 0);
+        assert_eq!(
+            descriptor.scale(),
+            0.0,
+            "rank=0 with alpha=5.0 must resolve to scale=0.0 (matches \
+             lattice_tune::lora::LoraConfig::scale), not the old 1.0 fallback"
+        );
+    }
+
+    // `resolve_lora_rank_alpha_scale` is the pure decision extracted from
+    // `load_lora_safetensors`; covering its metadata-present/absent branches
+    // directly complements the fixture-driven test above, which only
+    // exercises the metadata-present path end to end.
+    #[test]
+    fn resolve_lora_rank_alpha_scale_falls_back_to_rank_as_alpha_without_metadata() {
+        let (rank, alpha, scale) = resolve_lora_rank_alpha_scale(Some(4), None);
+        assert_eq!(rank, 4);
+        assert_eq!(alpha, 4.0);
+        assert_eq!(scale, 1.0);
+    }
+
+    #[test]
+    fn resolve_lora_rank_alpha_scale_defaults_rank_to_one_when_absent() {
+        let (rank, _alpha, _scale) = resolve_lora_rank_alpha_scale(None, None);
+        assert_eq!(rank, 1);
     }
 }

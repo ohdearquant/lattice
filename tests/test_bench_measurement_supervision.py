@@ -131,20 +131,41 @@ def excluded_measurement_surfaces() -> set[str]:
     }
 
 
+def non_measurement_surfaces() -> set[str]:
+    data = tomllib.loads(MANIFEST.read_text())
+    return {surface["path"] for surface in data["non_measurement_surface"]}
+
+
 def discovered_declared_rust_inventory_paths() -> set[str]:
+    """Every Rust path the manifest's grammar must classify.
+
+    Broadened from a bench*-prefix filename match (issue #1273): every
+    example and every binary under the inference crate is discovered, not
+    just ones whose basename happens to start with `bench`. A path that
+    matches this glob and is not in excluded_surface or
+    non_measurement_surface fails the fail-closed test below.
+
+    Broadened again to descend into subdirectories of src/bin (multi-file
+    binaries such as lattice's chat/serve/doctor/prune-score split): a
+    `[[bin]]` target's `path` no longer has to be a single top-level file,
+    and a glob that only matched top-level files would let a split binary's
+    modules go both unclassified and unseen by this fail-closed discovery.
+    """
     paths = {
         str(path.relative_to(REPO))
         for path in (REPO / "crates").glob("*/benches/*.rs")
     }
     paths.update(
         str(path.relative_to(REPO))
-        for path in (REPO / "crates/inference/examples").glob("bench*.rs")
+        for path in (REPO / "crates/inference/examples").glob("*.rs")
     )
     paths.update(
         str(path.relative_to(REPO))
         for path in (REPO / "crates/inference/src/bin").glob("*.rs")
-        if path.stem.startswith("bench_")
-        or path.stem in {"eval_perplexity", "gramperf_profile", "ppl_metal"}
+    )
+    paths.update(
+        str(path.relative_to(REPO))
+        for path in (REPO / "crates/inference/src/bin").glob("*/*.rs")
     )
     paths.add("README.md")
     return paths
@@ -461,21 +482,14 @@ class InventoryContract(unittest.TestCase):
         )
         self.assertEqual(
             contract["rust_inventory_grammar"],
-            "crates/*/benches/*.rs; crates/inference/examples/bench*.rs; "
-            "crates/inference/src/bin/bench_*.rs plus eval_perplexity.rs, "
-            "gramperf_profile.rs, and ppl_metal.rs; README.md",
+            "crates/*/benches/*.rs; crates/inference/examples/*.rs; "
+            "crates/inference/src/bin/*.rs; README.md",
         )
         self.assertEqual(
             contract["rust_inventory_limitation"],
-            "does not discover other Rust examples, binaries, or tests",
+            "does not discover Rust tests, except the one tracked entry point below",
         )
-        confirmed_outside = {
-            "crates/inference/examples/profile_metal_decode.rs",
-            "crates/inference/examples/profile_metal.rs",
-            "crates/inference/examples/decode_profile.rs",
-            "crates/inference/examples/layer_sweep.rs",
-            "crates/tune/tests/bench_backward_737.rs",
-        }
+        confirmed_outside = {"crates/tune/tests/bench_backward_737.rs"}
         self.assertEqual(
             set(contract["confirmed_outside_rust_inventory"]), confirmed_outside
         )
@@ -493,9 +507,35 @@ class InventoryContract(unittest.TestCase):
                 self.assertTrue(surface["paths"])
                 for path in surface["paths"]:
                     self.assertTrue((REPO / path).is_file(), path)
+        non_measurement = data["non_measurement_surface"]
+        self.assertTrue(non_measurement)
+        for surface in non_measurement:
+            with self.subTest(path=surface["path"]):
+                self.assertTrue(surface["reason"])
+                self.assertTrue((REPO / surface["path"]).is_file(), surface["path"])
         excluded = excluded_measurement_surfaces()
+        non_measurement_paths = non_measurement_surfaces()
         self.assertEqual(len(excluded), sum(len(s["paths"]) for s in surfaces))
-        self.assertEqual(excluded, discovered_declared_rust_inventory_paths())
+        self.assertEqual(len(non_measurement_paths), len(non_measurement))
+        self.assertTrue(excluded.isdisjoint(non_measurement_paths))
+        self.assertEqual(
+            excluded | non_measurement_paths, discovered_declared_rust_inventory_paths()
+        )
+
+    def test_phase_event_binary_is_classified_as_measurement(self):
+        """qwen35_generate.rs's --emit-phase-events mode is a real timing
+        surface (the CPU flagship lane driven by
+        bench_cpu_flagship_supervisor.py), so classifying it as
+        non_measurement_surface is wrong regardless of how the manifest
+        entry is worded. Tied to source content, not just the manifest, so
+        reverting the classification without also removing the marker
+        still fails here."""
+
+        path = "crates/inference/src/bin/qwen35_generate.rs"
+        source = (REPO / path).read_text()
+        self.assertIn("--emit-phase-events", source)
+        self.assertIn(path, excluded_measurement_surfaces())
+        self.assertNotIn(path, non_measurement_surfaces())
 
     def test_every_benchmark_named_script_is_classified(self):
         """A new bench script cannot appear without an explicit classification."""
@@ -955,13 +995,24 @@ class InventoryContract(unittest.TestCase):
                 final_measurement = max(measurements)
                 self.assertGreater(final_probe, final_measurement)
                 if path == "scripts/bench-gate.sh":
-                    gate_calls = [
-                        line_number
+                    gate_invocations = [
+                        (line_number, _shell_command_argv(tokens))
                         for line_number, tokens in commands
-                        if _shell_command_argv(tokens)[:2]
-                        == ["python3", "scripts/perf-bench-gate.py"]
+                        if len(_shell_command_argv(tokens)) >= 2
+                        and _shell_command_argv(tokens)[1]
+                        == "scripts/perf-bench-gate.py"
                     ]
+                    gate_calls = [line_number for line_number, _ in gate_invocations]
                     self.assertTrue(gate_calls)
+                    # The interpreter is resolved by the harness, not taken from
+                    # PATH: a bare python3 here is the defect this asserts against.
+                    self.assertFalse(
+                        [
+                            line_number
+                            for line_number, argv in gate_invocations
+                            if argv[0].strip('"') == "python3"
+                        ]
+                    )
                     self.assertLess(
                         final_probe,
                         min(gate_calls),
@@ -994,8 +1045,17 @@ class InventoryContract(unittest.TestCase):
         ):
             with self.subTest(path=path):
                 source = (REPO / path).read_text()
+                # The interpreter may be a literal `python3` or a resolved
+                # interpreter variable (e.g. `"$python_bin"` from
+                # bench-python.sh's version-floor resolver) -- either way,
+                # the helper's `verify` subcommand must be re-invoked.
                 self.assertGreaterEqual(
-                    len(re.findall(r'python3 "[^"]+" verify', source)), 2
+                    len(
+                        re.findall(
+                            r'(?:python3|"\$[A-Za-z_]+") "[^"]+" verify', source
+                        )
+                    ),
+                    2,
                 )
                 self.assertNotIn("verify-retained", source)
 
@@ -1008,7 +1068,12 @@ class _SupervisorSandbox:
         self.root = Path(self.tmp.name) / "repo"
         lib = self.root / "scripts" / "lib"
         lib.mkdir(parents=True)
-        for name in ("bench_supervision.py", "bench-locks.py", "quiet-probe.py"):
+        for name in (
+            "bench_supervision.py",
+            "bench-locks.py",
+            "quiet-probe.py",
+            "bench-python.sh",
+        ):
             shutil.copy2(REPO / "scripts" / "lib" / name, lib / name)
         shutil.copy2(
             REPO / "scripts" / "lib" / "bench-supervision.sh",
@@ -2300,6 +2365,10 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
             REPO / "scripts" / "lib" / "bench_supervision.py",
             lib / "bench_supervision.py",
         )
+        shutil.copy2(
+            REPO / "scripts" / "lib" / "bench-python.sh",
+            lib / "bench-python.sh",
+        )
         self.bench_lock = Path(tmp) / "bench-window.lock"
         self.gpu_lock = Path(tmp) / "metal-gpu.lock"
         self.pending = Path(tmp) / "bench-window-pending"
@@ -2497,6 +2566,148 @@ class BenchCompareDirectInvocationRefusal(unittest.TestCase):
         # Refused before the run-conditions banner, i.e. before base/head
         # resolution and worktree setup ever started.
         self.assertNotIn("=== bench-compare:", result.stdout)
+
+
+class ImplBodyInheritsResolvedPythonInterpreter(unittest.TestCase):
+    """bench-compare.sh resolves an interpreter meeting the harness's 3.11
+    floor and exports it as PYTHON_BIN; bench-compare-impl.sh must consume
+    that inherited variable rather than a bare `python3` lookup, or a stock
+    macOS PATH (old /usr/bin/python3 ahead of a newer interpreter) makes the
+    body die on the floor check instead of using the interpreter its own
+    entry point already found (lattice#1333).
+
+    This drives the real scripts/lib/bench-compare-impl.sh, not a rewritten
+    copy: only scripts/lib/bench-host-id.py is needed alongside it, since the
+    very first thing the body does (before touching git, locks, or cargo) is
+    resolve a run host id through a Python interpreter.
+    """
+
+    def _build_fixture(self, tmp: str) -> Path:
+        root = Path(tmp) / "repo"
+        lib = root / "scripts" / "lib"
+        lib.mkdir(parents=True)
+        shutil.copy2(
+            REPO / "scripts" / "lib" / "bench-compare-impl.sh",
+            lib / "bench-compare-impl.sh",
+        )
+        (lib / "bench-compare-impl.sh").chmod(0o755)
+        shutil.copy2(
+            REPO / "scripts" / "lib" / "bench-host-id.py",
+            lib / "bench-host-id.py",
+        )
+        return root
+
+    def _run(self, tmp: str, root: Path) -> subprocess.CompletedProcess[str]:
+        bindir = Path(tmp) / "bin"
+        bindir.mkdir()
+        stub_python3 = bindir / "python3"
+        stub_python3.write_text(
+            "#!/usr/bin/env bash\n"
+            "echo 'STUB_PYTHON3_INVOKED: Python 3.9.6 (fixture, pre-floor)' >&2\n"
+            "exit 17\n"
+        )
+        stub_python3.chmod(0o755)
+
+        self.assertGreaterEqual(
+            sys.version_info[:2],
+            (3, 11),
+            "the interpreter running this test must itself satisfy the "
+            "harness's floor to stand in as the resolved PYTHON_BIN",
+        )
+        env = {
+            **os.environ,
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "PYTHON_BIN": sys.executable,
+            "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+        }
+        for name in (
+            "LATTICE_BENCH_LOCK_STATUS",
+            "LATTICE_BENCH_LOCK_FDS",
+            "LATTICE_BENCH_SUPERVISOR_FD",
+        ):
+            env.pop(name, None)
+        return subprocess.run(
+            ["bash", str(root / "scripts" / "lib" / "bench-compare-impl.sh")],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+
+    def test_impl_body_proceeds_past_host_id_handoff_instead_of_dying_on_stub(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build_fixture(tmp)
+            result = self._run(tmp, root)
+
+        # The stub is never reached: the body used the inherited PYTHON_BIN
+        # for the host-id resolution, so it proceeds to the next real
+        # checkpoint (the supervisor lock-status refusal) instead of dying
+        # inside the stub at exit 17.
+        self.assertNotIn("STUB_PYTHON3_INVOKED", result.stderr, result.stderr)
+        self.assertNotEqual(17, result.returncode, result.stderr)
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertIn("no lock status at", result.stderr)
+        self.assertIn(
+            "Run scripts/bench-compare.sh, not this file directly", result.stderr
+        )
+
+    def test_impl_body_direct_invocation_resolves_its_own_interpreter_when_unset(
+        self,
+    ):
+        """A direct invocation (no entry point, so PYTHON_BIN never arrived)
+        must still end up with a qualifying interpreter, resolved by the
+        body itself via scripts/lib/bench-python.sh -- not with bash's own
+        "unbound variable" error (lattice#1333's original failure mode) and
+        not with a silent fall back to an unqualified `python3`.
+
+        PATH here is a fixture-only directory that shadows every name
+        bench_resolve_python3 tries (python3.13, python3.12, python3.11,
+        python3) with a stub that always fails the version-floor probe, so
+        bench_require_python3 has no qualifying candidate regardless of
+        what real interpreters the host running this test happens to ship.
+        A bare /bin:/usr/bin PATH is not a portable way to get that: it
+        relies on the host's system python3 being pre-3.11, which is true
+        of macOS but not of Ubuntu 24.04 CI images, whose /usr/bin/python3
+        is 3.12 and would satisfy the floor -- letting resolution succeed
+        and fall through to the next real checkpoint (the lock-status
+        guard) instead of exercising this refusal.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._build_fixture(tmp)
+            shutil.copy2(
+                REPO / "scripts" / "lib" / "bench-python.sh",
+                root / "scripts" / "lib" / "bench-python.sh",
+            )
+            bindir = Path(tmp) / "bin"
+            bindir.mkdir()
+            for name in ("python3.13", "python3.12", "python3.11", "python3"):
+                stub = bindir / name
+                stub.write_text("#!/usr/bin/env bash\nexit 1\n")
+                stub.chmod(0o755)
+            env = {
+                "PATH": f"{bindir}:/usr/bin:/bin",
+                "LATTICE_BENCH_HOST_ID_FILE": f"{tmp}/bench-host-id",
+            }
+            for name in (
+                "LATTICE_BENCH_LOCK_STATUS",
+                "LATTICE_BENCH_LOCK_FDS",
+                "LATTICE_BENCH_SUPERVISOR_FD",
+                "PYTHON_BIN",
+            ):
+                env.pop(name, None)
+            result = subprocess.run(
+                ["bash", str(root / "scripts" / "lib" / "bench-compare-impl.sh")],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=30,
+            )
+
+        self.assertEqual(2, result.returncode, result.stderr)
+        self.assertNotIn("unbound variable", result.stderr, result.stderr)
+        self.assertIn(
+            "no Python >= 3.11 found on PATH", result.stderr, result.stderr
+        )
 
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):

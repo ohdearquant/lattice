@@ -9,6 +9,7 @@ use crate::error::{Result, TuneError};
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
 pub enum Optimizer {
     /// Stochastic Gradient Descent
     SGD,

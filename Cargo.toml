@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.1"
+version = "0.9.0"
 edition = "2024"
 # MSRV, verified end-to-end (workspace + deps) on 1.93.1 and guarded by the msrv CI
 # job (aarch64 macOS, f16,metal-gpu, --all-targets) so a newer-toolchain-only API
@@ -28,6 +28,7 @@ half = { version = "2", features = ["std"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
 
 # Error handling
 thiserror = "2.0"
@@ -43,7 +44,7 @@ rayon = "1.10"
 
 # Crypto / Hashing
 sha2 = "0.10"
-blake3 = "1.5"
+blake3 = { version = "1.5", default-features = false, features = ["std", "pure"] }
 
 # Database (optional, for caching)
 rusqlite = { version = "0.35", features = ["bundled"] }
@@ -72,6 +73,8 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 # CLI + HTTP server (used by lattice binary)
 clap = { version = "4", features = ["derive"] }
 axum = "0.8"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 # MIME parsing for the chat-completions Content-Type guard (mirrors axum's
 # own `Json` extractor rule) -- already a transitive axum 0.8 dependency,
 # pinned here (same 0.3.17 the lockfile already resolves) so the direct

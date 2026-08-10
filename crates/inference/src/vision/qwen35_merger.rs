@@ -27,7 +27,7 @@
 
 use super::VisionError;
 use super::checkpoint::VisualMergerWeights;
-use super::vit::{batch_matvec, layer_norm};
+use super::vit::layer_norm;
 use crate::model::qwen35_config::VisionModelConfig;
 
 /// Error-function approximation (Abramowitz & Stegun 7.1.26, max absolute
@@ -74,6 +74,68 @@ pub fn qwen35_merger_forward(
     cfg: &VisionModelConfig,
     pre_merger_hidden: &[f32],
 ) -> Result<Vec<f32>, VisionError> {
+    let mut never_cancel = || false;
+    match qwen35_merger_forward_with_cancel(weights, cfg, pre_merger_hidden, &mut never_cancel)? {
+        Some(output) => Ok(output),
+        None => Err(VisionError::InvalidConfig(
+            "non-cancellable vision merger was cancelled".to_string(),
+        )),
+    }
+}
+
+fn batch_matvec_with_cancel(
+    weights: &[f32],
+    input: &[f32],
+    batch: usize,
+    rows: usize,
+    cols: usize,
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Result<Option<Vec<f32>>, VisionError> {
+    let output_len = batch.checked_mul(rows).ok_or_else(|| {
+        VisionError::InvalidConfig(
+            "qwen35_merger_forward: matrix output shape overflow".to_string(),
+        )
+    })?;
+    let mut output = vec![0.0f32; output_len];
+    crate::forward::cpu::validate_gemm_bt(
+        input.len(),
+        weights.len(),
+        output.len(),
+        batch,
+        cols,
+        rows,
+        "qwen35_merger_forward",
+    );
+    for batch_index in 0..batch {
+        if should_cancel() {
+            return Ok(None);
+        }
+        let input_row = &input[batch_index * cols..(batch_index + 1) * cols];
+        let output_row = &mut output[batch_index * rows..(batch_index + 1) * rows];
+        for row in 0..rows {
+            if row.is_multiple_of(16) && should_cancel() {
+                return Ok(None);
+            }
+            let weight_row = &weights[row * cols..(row + 1) * cols];
+            let mut accumulator = 0.0f32;
+            for (weight, value) in weight_row.iter().zip(input_row) {
+                accumulator += weight * value;
+            }
+            output_row[row] = accumulator;
+        }
+    }
+    Ok(Some(output))
+}
+
+pub(crate) fn qwen35_merger_forward_with_cancel(
+    weights: &VisualMergerWeights,
+    cfg: &VisionModelConfig,
+    pre_merger_hidden: &[f32],
+    should_cancel: &mut dyn FnMut() -> bool,
+) -> Result<Option<Vec<f32>>, VisionError> {
+    if should_cancel() {
+        return Ok(None);
+    }
     let hidden = cfg.hidden_size;
     if hidden == 0 || !pre_merger_hidden.len().is_multiple_of(hidden) {
         return Err(VisionError::ShapeMismatch {
@@ -101,6 +163,9 @@ pub fn qwen35_merger_forward(
     // normalized_shape is hidden_size, not merge_in). ----
     let mut normed = pre_merger_hidden.to_vec();
     for i in 0..n {
+        if should_cancel() {
+            return Ok(None);
+        }
         layer_norm(
             &mut normed[i * hidden..(i + 1) * hidden],
             &weights.norm_weight,
@@ -118,14 +183,21 @@ pub fn qwen35_merger_forward(
 
     // ---- linear_fc1 (merge_in -> merge_in) + exact GELU + linear_fc2
     // (merge_in -> out_hidden_size). ----
-    let mut fc1_out = batch_matvec(
+    let Some(mut fc1_out) = batch_matvec_with_cancel(
         &weights.fc1_weight,
         &normed,
         num_visual_tokens,
         merge_in,
         merge_in,
-    );
+        should_cancel,
+    )?
+    else {
+        return Ok(None);
+    };
     for i in 0..num_visual_tokens {
+        if should_cancel() {
+            return Ok(None);
+        }
         for j in 0..merge_in {
             let idx = i * merge_in + j;
             fc1_out[idx] = gelu_exact(fc1_out[idx] + weights.fc1_bias[j]);
@@ -133,20 +205,30 @@ pub fn qwen35_merger_forward(
     }
 
     let out_hidden = cfg.out_hidden_size;
-    let mut out = batch_matvec(
+    let Some(mut out) = batch_matvec_with_cancel(
         &weights.fc2_weight,
         &fc1_out,
         num_visual_tokens,
         out_hidden,
         merge_in,
-    );
+        should_cancel,
+    )?
+    else {
+        return Ok(None);
+    };
     for i in 0..num_visual_tokens {
+        if should_cancel() {
+            return Ok(None);
+        }
         for j in 0..out_hidden {
             out[i * out_hidden + j] += weights.fc2_bias[j];
         }
     }
 
-    Ok(out)
+    if should_cancel() {
+        return Ok(None);
+    }
+    Ok(Some(out))
 }
 
 #[cfg(test)]
@@ -242,6 +324,30 @@ mod tests {
         let bad = vec![0.0f32; 3 * cfg.hidden_size];
         let err = qwen35_merger_forward(&weights, &cfg, &bad).unwrap_err();
         assert!(matches!(err, VisionError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn merger_forward_cancels_before_shape_validation() {
+        let cfg = tiny_cfg();
+        let weights = make_test_merger_weights(&cfg);
+        let result = qwen35_merger_forward_with_cancel(&weights, &cfg, &[0.0; 3], &mut || true)
+            .expect("cancellation is not a merger failure");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn merger_forward_cancels_after_work_started() {
+        let cfg = tiny_cfg();
+        let weights = make_test_merger_weights(&cfg);
+        let pre_merger = vec![0.1f32; 8 * cfg.hidden_size];
+        let mut polls = 0;
+        let result = qwen35_merger_forward_with_cancel(&weights, &cfg, &pre_merger, &mut || {
+            polls += 1;
+            polls == 12
+        })
+        .expect("cancellation is not a merger failure");
+        assert!(result.is_none());
+        assert_eq!(polls, 12);
     }
 
     #[test]

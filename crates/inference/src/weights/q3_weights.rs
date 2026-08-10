@@ -564,6 +564,19 @@ fn checked_alloc_bytes(
     Ok(bytes)
 }
 
+/// Byte length of `stream`, leaving its cursor position unchanged. `Seek`'s
+/// own `stream_len` is not yet stable (`seek_stream_len`,
+/// rust-lang/rust#59359), and this is the only length a generic
+/// `Read + Seek` bound can observe -- there is no `.metadata()` to call once
+/// the caller is no longer necessarily a concrete `std::fs::File`.
+fn stream_len<S: std::io::Seek>(stream: &mut S) -> std::io::Result<u64> {
+    use std::io::SeekFrom;
+    let cur = stream.stream_position()?;
+    let len = stream.seek(SeekFrom::End(0))?;
+    stream.seek(SeekFrom::Start(cur))?;
+    Ok(len)
+}
+
 /// Parse the header of a `.q3` file without reading the block payload.
 ///
 /// On return the file cursor is positioned at the start of the block data.
@@ -571,11 +584,11 @@ fn checked_alloc_bytes(
 /// # Errors
 ///
 /// Returns an error on I/O failure, unrecognized magic bytes, or unsupported version.
-pub fn read_q3_header(
-    file: &mut std::fs::File,
+pub fn read_q3_header<R: std::io::Read + std::io::Seek>(
+    file: &mut R,
 ) -> Result<Q3FileHeader, Box<dyn std::error::Error>> {
-    use std::io::{Read, Seek, SeekFrom};
-    let file_len = file.metadata()?.len();
+    use std::io::{Read, SeekFrom};
+    let file_len = stream_len(file)?;
 
     let (shape, original_len, payload_offset) = {
         let mut f = std::io::BufReader::new(&mut *file);

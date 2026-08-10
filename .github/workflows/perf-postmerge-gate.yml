@@ -31,12 +31,17 @@ name: perf post-merge detection (informational, PAUSED)
 # absence of a FAIL as evidence of a small change's absence.
 #
 # WHY AN A/B AGAINST THE LAST MEASURED COMMIT rather than perf-baselines:
-# bench-update.yml rewrites perf-baselines on every perf-path push to main, so a
-# regression can be absorbed before a scheduled comparison. This lane instead
-# advances one lightweight branch per architecture only after its own A/B
-# succeeds. If GitHub drops an intermediate pending run, the next run widens its
-# range back to that recorded commit instead of putting the skipped change in
-# both arms. The first run falls back to the event parent and says so.
+# bench-update.yml rewrites perf-baselines on nearly every perf-path push to
+# main -- 121 of its 123 recorded push-triggered runs (`gh run list
+# --workflow=bench-update.yml --json event,conclusion`); the other 2 failed the
+# bench step and their publish job was skipped, so perf-baselines was not
+# rewritten for those 2 pushes -- so a regression can usually be absorbed
+# before a scheduled comparison. This lane instead advances one lightweight
+# branch per architecture only after its own A/B succeeds. If GitHub drops an
+# intermediate pending run, the next run widens its range back to that
+# recorded commit instead of putting the skipped change in both arms. When
+# that state branch has no recorded commit yet, the run falls back to the
+# triggering push's event-before SHA instead.
 
 # PAUSED 2026-08-01, NOT FIXED. The automatic push trigger is removed; the lane
 # still runs on demand via workflow_dispatch, unchanged in every other respect.
@@ -44,31 +49,118 @@ name: perf post-merge detection (informational, PAUSED)
 # Why. Across its 15 verdict-producing runs this lane reported a confirmed
 # regression every single time, on 15 unrelated merges. The cause is its
 # decision rule, not its plumbing: the rule fails a run when a group's LOWER
-# confidence bound exceeds 7%, applied one-sidedly across 263 group comparisons
-# per run. Criterion's confidence intervals are tight WITHIN a run (median width
-# across the 82 FAIL rows: 0.280 percentage points) while the same groups swing
-# widely BETWEEN runs, and a within-run interval cannot bound between-run
-# variability. With 263 groups and that spread, at least one positive excursion
-# past 7% is close to certain, so the rule converts roughly half of a symmetric
-# noise distribution into "confirmed regressions". The recurrence signature
-# confirms the reading: the same groups flag across unrelated merges
-# (simd_throughput_384/normalize in 7 of 15 runs), and if those were genuine
-# per-merge regressions that group would by now be about twice as slow, which it
-# is not. Large deltas are symmetric overall (85 head-slower vs 119 head-faster
-# past 7%), so this is not an arm-ordering artifact.
+# confidence bound exceeds 7%, applied one-sidedly across the 263-264 group
+# comparisons a run declares, per architecture. Criterion's confidence intervals
+# are tight WITHIN a run while the same groups swing widely BETWEEN runs, and a
+# within-run interval cannot bound between-run variability. With that many
+# groups and that spread, at least one positive excursion past 7% is close to
+# certain, so the rule converts roughly half of a symmetric noise distribution
+# into "confirmed regressions".
 #
-# Cost of leaving it on: roughly 88 minutes of wall clock per run, on each of two
-# runner jobs, for every qualifying merge, producing a verdict that cannot be
-# acted on. Excursions to 169 minutes were observed.
+# Figures below are stated over a named population, because two earlier numerals
+# in this header were quoted over populations that were never their own. The
+# settled population is x86_64-linux alone: 15 reports declaring 263 comparisons
+# twelve times and 264 three times, 3948 in total. Over that: 220 FAIL rows,
+# 5.6%. Within-run intervals are tight — median CI width 0.4650 percentage
+# points across the 82 FAIL rows accumulated through run 7 of the 15 (derived
+# from the seven x86_64-linux job logs for those runs, `Delta point` table,
+# rows with CI-lower > 7%, sorted CI-upper minus CI-lower, middle pair
+# 0.46/0.47), which is the subset that median was computed on and not the
+# full set.
+#
+# The recurrence signature: simd_throughput_384/normalize flags a CI-lower
+# past 7% in 3 of the 15 x86_64-linux reports and 6 of the 14 available
+# aarch64-linux reports (the aarch64 report for run 29881462420 is absent);
+# the union across either architecture is 7 of 15 workflow runs. Read per
+# architecture, not pooled: if those were genuine per-merge regressions that
+# group would by now be about twice as slow, which it is not.
+#
+# Large deltas are not sign-aligned, which is what rules out an arm-ordering
+# artifact: for Delta point excursions above +7% or below -7%, the split is
+# 232 head-slower against 273 head-faster over the 15 x86_64-linux reports
+# (3948 rows), and 44 head-slower against 30 head-faster over the 14
+# completed aarch64-linux reports (3685 rows; the 15th report is absent, so
+# this is a 14-report denominator, not a matching 15). Read that per
+# architecture and never pooled. aarch64 leans slower while x86_64 leans
+# faster, so a pooled figure is partly cancellation and overstates how
+# symmetric the distribution is. The conclusion survives either way; the
+# pooled version of it does not survive scrutiny. Separately, the 5.6% FAIL
+# rate is 220 CI-lower > 7% rows out of the 3948 x86_64-linux comparison
+# rows; that one-sided 220-row subset is the rate's numerator, not a
+# population, and is not the population the signed Delta-point split is
+# drawn from.
+#
+# Cost of leaving it on, over the same 15 x86_64-linux / 14 aarch64-linux
+# reports named above. Enumeration: `gh run list --repo ohdearquant/lattice
+# --workflow=perf-postmerge-gate.yml --limit 100 --json
+# databaseId,headSha,event,createdAt,conclusion` returns 23 runs: 1
+# workflow_dispatch, 1 cancelled push, 21 completed push runs.
+#
+# Of those 21, every x86_64-linux leg's gate step exits either 1 (confirmed
+# regression) or 2 (refused to certify -- no comparison data, checked via
+# `AB_RC:` in each job's "Classify the gate outcome" log): 15 exit 1, 6 exit
+# 2. None exit 0 (clean pass) or 3 (not measurable). The 15-run population
+# used throughout this header is the 15 exit-1 runs.
+#
+# Correction: an earlier version of this text said the run excluded from the
+# 15 was the earliest, 29879966073, on the ground that its baseline fell back
+# to the event parent instead of a last-measured-commit branch the other 15
+# use.
+# That claim does not survive checking the run's own log. Its "Resolve the
+# A/B endpoints" step printed `A/B endpoints: 05291c5ddb02... ->
+# d7929307de...`, and `05291c5d` is `git rev-parse d7929307de^` -- its
+# ordinary immediate parent, reached via the same event-before code path
+# every one of the other 14 runs in this population also used (checked the
+# same log line in each; none differ). The `scripts/perf-postmerge-base.py` /
+# `perf-postmerge-measured-*` state-branch mechanism referenced two
+# paragraphs up postdates this entire 15-run population -- it first appears
+# in a run's log on 2026-07-31, after run 30489540763, the last of the 15.
+# 29879966073 belongs in the population on identical footing to the rest.
+#
+# The run actually excluded is 30472160128 (created 2026-07-29T16:44:53Z, a
+# member of neither the 15 nor the 14): its x86_64-linux gate step ran the
+# full ~87 minutes but exited 2, producing zero rows in its `Delta point`
+# table, so it cannot contribute to the row counts, FAIL rate, sign split, or
+# recurrence figures above -- those were in fact already computed over the
+# corrected 15-run population (reproduced independently: 12x263 + 3x264 =
+# 3948 total rows, 220 FAIL rows, 5.6%, sign split 232/273, recurrence 3/6/7,
+# all match this header's existing figures exactly), so only this paragraph's
+# prose needed correcting, not the numbers past it.
+#
+# Per-job on-runner duration of the "Full-mode A/B, failing on a confirmed
+# regression" step (`gh run view <id> --json jobs --jq '.jobs[] |
+# {name,steps}'`, startedAt/completedAt of that step): x86_64-linux median
+# 87m42s, range 86m04s-88m29s (n=15); aarch64-linux median 82m32s, range
+# 82m20s-83m04s (n=14). The aarch64 range previously read 77m30s-83m04s: the
+# low end was run 29881462420's aarch64 leg, the one CANCELLED leg the "14
+# completed" population is defined to exclude -- its 77m30s runtime is how
+# long it ran before cancellation, not a completed-leg data point.
+#
+# Separately: queue-inclusive workflow latency (workflow createdAt to the
+# later of the two jobs' completedAt, same 15 runs) is a different clock:
+# median 88m25s, range 86m40s-177m47s. The earlier-cited 168m39s (run
+# 30479549447) is not even the largest excursion in this population; run
+# 30452387834 queued to 177m47s. Checked what the two largest excursions
+# actually spend their time on, via each job's own startedAt: run
+# 30452387834's jobs did not start until 89m39s after workflow createdAt,
+# then ran their normal ~83-88m; run 30479549447's jobs waited 80m before
+# starting. Both tails are time before the job starts running, not slow
+# on-runner execution -- consistent with "queue-inclusive latency", though
+# this header does not establish WHY those two runs queued that long
+# (concurrent same-ref run, hosted-runner pool contention, or something
+# else).
 #
 # What must be true before the push trigger returns. The rule needs a
 # between-run variance estimate rather than a within-run confidence interval;
-# it needs multiple-comparison handling across its 263 groups; and the
+# it needs multiple-comparison handling across its 263-264 groups; and the
 # chronically unstable groups need identifying and either stabilising or
 # excluding. Any change to which groups are gated requires a repeated A/A on the
 # target machine class plus a re-derivation of the threshold FIRST. Restoring
-# the trigger without those changes would not restore a working detector, it
-# would resume a false alarm on every merge.
+# the trigger without those changes would not restore a working detector: of
+# the 21 historical push runs, 15 produced a confirmed-regression x86_64-linux
+# verdict and the other 6 refused to certify rather than passing cleanly (see
+# "Cost of leaving it on" above) -- on this record, resuming the trigger would
+# reproduce a false alarm on most merges, not a working signal on any of them.
 #
 # The paths list below is retained verbatim, commented, so that restoring the
 # trigger is a revert of this block rather than a re-derivation of coverage.
@@ -150,9 +242,7 @@ jobs:
           # no parent and the resolve step below would fail closed.
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: ./.github/actions/rust-setup
         with:
           cache-on-failure: true
           shared-key: perf-postmerge-${{ matrix.arch }}
@@ -186,7 +276,7 @@ jobs:
           {
             echo "### perf post-merge A/B (${{ matrix.arch }})"
             echo
-            echo "\`$BASE\` -> \`$HEAD\`, full-mode Criterion."
+            echo "\`$BASE\` -> \`$HEAD\`, full-mode order-balanced Criterion."
             echo "Base source: \`$BASE_SOURCE\`; commit span: \`$SPAN_COUNT\`."
             echo "Progression branch: \`$STATE_BRANCH\` (prior: \`$STATE_BEFORE\`)."
             echo
@@ -195,6 +285,12 @@ jobs:
             echo "gates: the quick-mode informational demotion does not apply in full"
             echo "mode, and this job sets no \`BENCH_GROUPS_*\` filter. The workspace's"
             echo "other bench targets are not run here."
+            echo
+            echo "**Order control.** Enforcement runs \`base₁ → head₁ → head₂ →"
+            echo "base₂\`. The gate combines both order strata in log space and"
+            echo "returns NOT_MEASURABLE if the observed order-bias envelope"
+            echo "alone exceeds the unchanged 7% FAIL margin. NOT_MEASURABLE"
+            echo "fails this job and does not advance the progression branch."
             echo
             echo "**Scope.** This lane DETECTS post-merge; it cannot gate the merge"
             echo "that introduced a regression, and it is not a required check."
@@ -245,6 +341,7 @@ jobs:
 
       - name: Classify the gate outcome
         if: always()
+        id: classify
         env:
           AB_RC: ${{ steps.ab.outputs.rc }}
           STATUS_DIR: ${{ runner.temp }}/perf-postmerge-status
@@ -269,16 +366,54 @@ jobs:
               for phase, idle in ambient["samples"].items()
               if idle < floor
           ]
-          detail = ", ".join(failing) or status["reason"]
+          detail = (
+              f"{', '.join(failing)}; floor={floor:.1f}%"
+              if failing
+              else status["reason"]
+          )
           print(
               "::warning title=Performance run not measurable::"
-              f"verdict=not_measurable; {detail}; floor={floor:.1f}%"
+              f"verdict=not_measurable; {detail}"
           )
           PY
-            exit 0
+            echo "effective_rc=3" >> "$GITHUB_OUTPUT"
+            exit 3
           fi
-          if [ "$AB_RC" != "0" ]; then
-            exit "${AB_RC:-2}"
+          # AB_RC=1 alone is not sufficient evidence of a confirmed regression:
+          # it is bench-compare.sh's own contract-normalized status (see
+          # scripts/lib/ensure-noindex-marker.sh and bench-compare-impl.sh), but
+          # a caller running any of that chain under `set -e` propagates an
+          # UN-normalized exit 1 (e.g. a raw mkdir/coreutils failure) verbatim
+          # too. Require the gate's own machine-readable status artifact
+          # (perf-bench-gate.py --status-out) to say verdict=regression,
+          # exit_code=1 before trusting AB_RC=1 as a real regression verdict.
+          effective_rc="$AB_RC"
+          if [ "$AB_RC" = "1" ]; then
+            if python3 - "$STATUS_DIR" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          statuses = [
+              json.loads(path.read_text())
+              for path in pathlib.Path(sys.argv[1]).glob("*.json")
+          ]
+          confirmed = any(
+              item.get("verdict") == "regression" and item.get("exit_code") == 1
+              for item in statuses
+          )
+          sys.exit(0 if confirmed else 1)
+          PY
+            then
+              echo "::notice title=Confirmed regression::a gate status artifact records verdict=regression"
+            else
+              echo "::warning title=Unconfirmed exit 1::AB_RC=1 with no matching verdict=regression status artifact; treating as a generic pre-measurement failure (exit 2)"
+              effective_rc=2
+            fi
+          fi
+          echo "effective_rc=$effective_rc" >> "$GITHUB_OUTPUT"
+          if [ "$effective_rc" != "0" ]; then
+            exit "${effective_rc:-2}"
           fi
 
       - name: Record the outcome honestly
@@ -286,13 +421,14 @@ jobs:
         env:
           JOB_STATUS: ${{ job.status }}
           AB_RC: ${{ steps.ab.outputs.rc }}
+          EFFECTIVE_RC: ${{ steps.classify.outputs.effective_rc }}
           EVENT_NAME: ${{ github.event_name }}
           STATE_BRANCH: ${{ steps.refs.outputs.state_branch }}
           HEAD: ${{ steps.refs.outputs.head }}
         run: |
           {
-            if [ "$AB_RC" = "3" ]; then
-              echo "GAP, exit 3 — verdict \`not_measurable\`. Ambient load"
+            if [ "$EFFECTIVE_RC" = "3" ]; then
+              echo "GAP, exit 3 — verdict \`not_measurable\`. Measurement conditions"
               echo "invalidated this run, so it produced no performance data point"
               echo "and did not advance \`$STATE_BRANCH\`. See the warning and"
               echo "\`perf-postmerge-status-${{ matrix.arch }}\` artifact."
@@ -308,9 +444,16 @@ jobs:
               echo "The A/B passed, but its successful-head record was not published."
               echo "This run is not progression evidence; the next run will retry from"
               echo "the prior recorded base. Inspect the state-publication step."
+            elif [ "$EFFECTIVE_RC" = "1" ]; then
+              echo "FAILED, exit 1 — a confirmed regression: a gate status artifact"
+              echo "records \`verdict=regression\`. Check the flagged groups are"
+              echo "reachable from the merged diff, then revert or justify."
             elif [ "$AB_RC" = "1" ]; then
-              echo "FAILED, exit 1 — a confirmed regression. Check the flagged groups"
-              echo "are reachable from the merged diff, then revert or justify."
+              echo "FAILED, exit 2 — bench-compare.sh exited 1 but no gate status"
+              echo "artifact records \`verdict=regression\`, so this is NOT a"
+              echo "confirmed regression: treated as a generic pre-measurement"
+              echo "failure. Inspect the failing step above; do NOT revert on this"
+              echo "alone."
             elif [ "$AB_RC" = "2" ]; then
               echo "FAILED, exit 2 — the gate refused to certify this run: no"
               echo "comparison data, a partial A/B, or nothing gating among the"

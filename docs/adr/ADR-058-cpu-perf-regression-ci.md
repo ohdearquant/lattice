@@ -287,3 +287,34 @@ environment-drift risk). Criterion micro-benchmarks are collected as trend data 
 (`bench-update.yml` / `perf-baselines`). Any future revival of a hard Criterion gate needs
 a cross-run variance model measured on the actual runner pool, not the escalation path in
 this document.
+
+## Post-acceptance note (2026-07-30): local/post-merge comparisons are order-balanced
+
+The later non-merge-blocking `perf-postmerge-gate.yml` lane reused the original single-pair
+Criterion rule through `bench-compare.sh --full --fail-on-regression`. Measurement on an isolated
+host showed that this still admitted the defect above: monotonic session drift made the second
+arm slower, and a byte-identical A/A comparison crossed the 7% FAIL margin with a narrow
+within-run interval. Ambient-idle and lock checks did not detect that machine-state mode.
+
+All `bench-compare` runs therefore use the balanced sequence
+`base₁ → head₁ → head₂ → base₂`. For every benchmark, `perf-bench-gate.py` combines the forward
+`head₁/base₁` and reverse `base₂/head₂` ratios in log space. Half their difference is the
+order-balanced source-effect estimate; half their sum is the observed order effect. The
+transformed Criterion endpoint envelope is widened by the full observed order-effect envelope
+before the unchanged 3%/7% rules are applied.
+
+This is deliberately not described as a calibrated cross-run 95% confidence interval. It assumes
+the forward and reverse within-stratum order increments are additive and stable in log space,
+which is a common multiplicative timing effect on the raw scale. Equal log drift cancels exactly;
+unequal same-sign drift and a disturbance confined to one stratum are conservatively bracketed.
+Opposite-sign or source-dependent drift is not identifiable from one ABBA block: it can cancel in
+the reported order term and appear as a source effect, and the host-state checkpoints do not test
+that stationarity assumption. Replication, interleaving, or randomized order blocks are needed to
+detect it. If the order-bias envelope (the bound derived from the forward/reverse pair, not a
+single raw term) alone exceeds the existing 7% FAIL margin, the run exits `3` (`NOT_MEASURABLE`)
+and every enforcing consumer remains red; it does not report a source regression. Missing or
+mismatched reverse evidence exits `2`. Report-only contributor runs collect the same balanced
+evidence and continue to print the gate status; a completed report-only measurement does not
+propagate gate classification into the process exit code, but a local prerequisite failure (for
+example the quiet-probe check) still exits `2` — "report-only" governs whether the verdict gates,
+not whether the run can fail operationally.

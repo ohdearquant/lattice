@@ -5,6 +5,21 @@ impl MetalQwen35State {
     // Dispatch helpers
     // ===================================================================
 
+    #[cfg(test)]
+    pub(super) fn force_q4_gemm_fallback_for_test(&mut self) -> bool {
+        self.engine.pipelines.gemm_q4_tiled.take().is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_q4_gemm_fallback_dispatches_for_test() {
+        Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST.with(|dispatches| dispatches.set(0));
+    }
+
+    #[cfg(test)]
+    pub(super) fn q4_gemm_fallback_dispatches_for_test() -> u64 {
+        Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST.with(std::cell::Cell::get)
+    }
+
     /// Dispatch f16-weight matmul: C[M,N] = A[M,K] @ B_half[N,K]^T.
     ///
     /// A is f32 (activations), B is f16 (weights), C is f32 (output).
@@ -152,7 +167,7 @@ impl MetalQwen35State {
         );
     }
 
-    fn dispatch_gemm_q4(
+    pub(super) fn dispatch_gemm_q4(
         &self,
         enc: &ComputeCommandEncoderRef,
         x: &Buffer,
@@ -196,6 +211,9 @@ impl MetalQwen35State {
                 MTLSize::new(32, 4, 1),
             );
         } else {
+            #[cfg(test)]
+            Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST
+                .with(|dispatches| dispatches.set(dispatches.get() + 1));
             enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q4);
             enc.set_buffer(0, Some(&qw.buffer), qw.payload_offset);
             enc.set_buffer(1, Some(x), x_offset);
@@ -1061,6 +1079,9 @@ impl MetalQwen35State {
                 MTLSize::new(32, 4, 1),
             );
         } else {
+            #[cfg(test)]
+            Q4_GEMM_FALLBACK_DISPATCHES_FOR_TEST
+                .with(|dispatches| dispatches.set(dispatches.get() + 1));
             enc.set_compute_pipeline_state(&self.engine.pipelines.gemm_q4);
             enc.set_buffer(0, Some(&qw.buffer), wq_offset);
             enc.set_buffer(1, Some(x), x_offset);

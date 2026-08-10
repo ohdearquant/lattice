@@ -16,11 +16,11 @@ concern); point `modelPath` at a directory you already have on disk.
 
 ## Status
 
-This is a `v0` cut. Built and tested on darwin-arm64 only. The other six
-napi-rs target triples (darwin-x64, linux-x64-gnu, linux-x64-musl,
-linux-arm64-gnu, linux-arm64-musl, win32-x64-msvc) are scaffolded in
-`package.json`'s `napi.targets` and `optionalDependencies` but not yet built
-or tested. Package manager support tested: npm and pnpm.
+This is a `v0` cut. CI produces Node-API 8 prebuilt packages for darwin-arm64,
+darwin-x64, linux-x64-gnu, linux-x64-musl, linux-arm64-gnu, linux-arm64-musl,
+and win32-x64-msvc. The prebuild workflow verifies every platform package before
+making the assembled package set available or running the manual publish path.
+Package manager support tested: npm and pnpm.
 
 ## Install
 
@@ -99,6 +99,7 @@ npm run smoke         # node smoke.mjs (requires local model directories)
 npm run packlist      # pack-list guard: main package must not ship a .node binary
 npm run artifacts     # copy the locally built .node into npm/<platform>/
 npm run packlist:darwin-arm64  # pack-list guard: darwin-arm64 subpackage ships exactly one .node
+npm run test:prebuild # assert CI targets, napi targets, and optional packages stay aligned
 ```
 
 ## License

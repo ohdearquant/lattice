@@ -282,6 +282,7 @@ impl<'a> IngestedTensor<'a> {
         }
     }
 
+    #[cfg(feature = "f16")]
     pub(super) fn decoded_f32_known_finite(
         source: &'a str,
         tensor_name: &'a str,
