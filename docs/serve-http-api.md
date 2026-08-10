@@ -399,13 +399,16 @@ curl http://127.0.0.1:8080/v1/embeddings \
 {
   "object": "list",
   "data": [
-    { "object": "embedding", "index": 0, "embedding": [0.01, -0.02, "..."] },
-    { "object": "embedding", "index": 1, "embedding": [0.03, 0.04, "..."] }
+    { "object": "embedding", "index": 0, "embedding": [0.0123, -0.0871, 0.0456, 0.0219] },
+    { "object": "embedding", "index": 1, "embedding": [0.0342, -0.0158, 0.0904, -0.0027] }
   ],
   "model": "the-served-model-id",
   "usage": { "prompt_tokens": 3, "total_tokens": 3 }
 }
 ```
+
+(Truncated to 4 floats for readability; the real `embedding` vector length equals the checkpoint's
+decoder hidden size.)
 
 `input` also accepts a single plain string instead of an array. Notes on the fields:
 
@@ -449,11 +452,15 @@ vision-language checkpoint directory to enable the route.
 
 ### Extra memory when embeddings are enabled
 
-Enabling `/v1/embeddings` loads a second, independent copy of the checkpoint's decoder weights in
-f16 (unquantized) alongside whatever the chat backend already holds in memory (typically Q4). f16
-storage costs roughly 2 bytes per checkpoint parameter, so expect resident memory to grow by
-roughly that much on top of the chat backend's own footprint. If the loaded model directory has no
-vision config, this extra load is skipped entirely and only the chat backend stays resident.
+The embeddings loader opens the same `--model` directory the chat backend loaded, but independently
+and in f16 (unquantized): it requires a non-quantized safetensors vision-language directory,
+rejecting any directory containing a `quantize_index.json` (a Q4 checkpoint) and requiring
+`config.json` to declare a `vision_config`. A Q4 chat directory cannot double as the embeddings
+model, so whenever embeddings is enabled the chat backend serving that same directory is not Q4
+either. This second f16 load of the separate embeddings weights sits on top of whatever the chat
+backend already holds in memory, at roughly 2 bytes per checkpoint parameter, so expect resident
+memory to grow by roughly that much. If the loaded model directory has no vision config, this extra
+load is skipped entirely and only the chat backend stays resident.
 
 ## Context window and token-budget limits
 
@@ -511,7 +518,9 @@ message content. There is no requirement to strip reasoning blocks between turns
 ## Summary
 
 - `lattice serve` (not the separate `lattice_serve` binary) is the OpenAI-compatible server this
-  document covers: `GET /health`, `POST /v1/chat/completions`, nothing else.
+  document covers: `GET /health`, `POST /v1/chat/completions`, and `POST /v1/embeddings` (see
+  above) when started with a vision-language checkpoint. The standalone `lattice_serve` binary
+  does not carry the embeddings route.
 - Non-streaming and streaming (SSE) both work today; the request struct's doc comment claiming
   streaming is unsupported is stale — verify against `reject_unsupported` and its tests, not that
   comment.

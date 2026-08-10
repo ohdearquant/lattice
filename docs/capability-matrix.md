@@ -130,7 +130,9 @@ Capabilities present in `lattice serve` (the CLI's HTTP subcommand) but missing 
 `lattice_serve`: `logprobs`/`top_logprobs` is still not implemented on `lattice_serve` (the field
 is now explicitly _rejected_ with 400 rather than silently ignored -- #656 -- but it doesn't run).
 As of #831, `stop` sequences are no longer in this list -- `ServeProfile::lattice_serve` now
-accepts and parses `stop` too (see the matrix row above).
+accepts and parses `stop` too (see the matrix row above). `/v1/embeddings` is also in this list --
+`lattice serve` exposes the route when started with a vision-language checkpoint, but the
+standalone `lattice_serve` binary does not carry it (see the matrix row above).
 
 Capabilities present in `lattice_serve` but missing from `lattice serve`: per-request
 `top_k`/`repetition_penalty` control, and (as of PR #662) cross-turn/prefix KV cache reuse over
@@ -169,10 +171,10 @@ structured-output, and logprobs policies are unchanged.
 
 Capabilities missing from **both**: cross-turn/prefix KV cache reuse over the `lattice serve` HTTP
 path specifically (#462, still open -- `chat_metal` and, as of #662, `lattice_serve` both have it),
-grammar/JSON-schema constrained output over HTTP (#588), a real `/metrics` endpoint (#583), an
-`/v1/embeddings` route (#584), adaptive/entropy-gated reasoning budget (#500), `min_p` sampling (no
-tracking issue yet -- engine-level gap, not serve-specific), and LoRA adapters over HTTP at all
-(CLI-only today via `chat_metal --lora` and `generate_lora --lora`).
+grammar/JSON-schema constrained output over HTTP (#588), a real `/metrics` endpoint (#583),
+adaptive/entropy-gated reasoning budget (#500), `min_p` sampling (no tracking issue yet --
+engine-level gap, not serve-specific), and LoRA adapters over HTTP at all (CLI-only today via
+`chat_metal --lora` and `generate_lora --lora`).
 
 Gaps tracked for this document: **#641** (closed by PR #656) -- `lattice_serve`
 silently coerced unknown roles to `"user"` and dropped non-text content parts, where `lattice serve`

@@ -827,6 +827,60 @@ mod tests {
     }
 
     #[test]
+    fn embed_items_image_usage_matches_scaffold_token_formula() {
+        let model = tiny_embedding_model();
+        let data_uri = tiny_png_data_uri(2);
+        let image_bytes = decode_inline_image(&data_uri).unwrap();
+        let vision_cfg = model.config.vision_config.as_ref().unwrap();
+        let (_pixels, grid) = preprocess_qwen35_image(&image_bytes, vision_cfg).unwrap();
+        let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
+        let expected_tokens = 2 + grid.num_patches() / merge_sq;
+
+        let items =
+            normalize_embedding_items(vec![EmbeddingInputItem::Image { url: data_uri }]).unwrap();
+        let (_data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
+        assert_eq!(usage.prompt_tokens, expected_tokens);
+    }
+
+    #[test]
+    fn embed_items_rejects_image_item_over_context_window() {
+        let base = tiny_embedding_model();
+        let mut config = base.config.clone();
+        config.max_position_embeddings = 4;
+        let model = EmbeddingModel::new(
+            base.weights.clone(),
+            config,
+            base.vision_weights.clone(),
+            base.tokenizer.clone(),
+        );
+        assert_eq!(model.max_context(), 4);
+
+        let data_uri = tiny_png_data_uri(3);
+        let image_bytes = decode_inline_image(&data_uri).unwrap();
+        let vision_cfg = model.config.vision_config.as_ref().unwrap();
+        let (_pixels, grid) = preprocess_qwen35_image(&image_bytes, vision_cfg).unwrap();
+        let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
+        let expected_tokens = 2 + grid.num_patches() / merge_sq;
+        assert!(
+            expected_tokens > model.max_context(),
+            "fixture must exceed the tiny context window: {expected_tokens} tokens vs {} \
+             context",
+            model.max_context()
+        );
+
+        let items =
+            normalize_embedding_items(vec![EmbeddingInputItem::Image { url: data_uri }]).unwrap();
+        let err = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(message.contains("input item 0"), "message: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn embed_items_mixed_batch_preserves_input_order() {
         let model = tiny_embedding_model();
         let items = normalize_embedding_items(vec![
