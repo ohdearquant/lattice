@@ -44,6 +44,7 @@
 //!   cargo test --release -p lattice-inference --test quarot_q4_composed_golden \
 //!       --features "f16,metal-gpu" -- --nocapture
 //!   ```
+#![allow(clippy::field_reassign_with_default)]
 
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -177,21 +178,20 @@ fn run_composed_gate(model_dir: &Path, q4_dir: &Path, golden: &Golden) {
     let mut metal = MetalQwen35State::from_q4_dir(q4_dir, &tokenizer_path, &cfg, 4096)
         .unwrap_or_else(|e| panic!("from_q4_dir({}): {e}", q4_dir.display()));
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: golden.max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = golden.max_new_tokens;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.top_p = 1.0;
+    gen_cfg.repetition_penalty = 1.0;
+    gen_cfg.seed = Some(1);
+    gen_cfg.stop_token_ids = vec![];
+    gen_cfg.enable_thinking = false;
+    gen_cfg.enable_mtp = Some(false);
+    gen_cfg.grammar = None;
+    gen_cfg.stop_strings = vec![];
+    gen_cfg.reasoning_budget = None;
+    gen_cfg.logprobs = None;
 
     let mut mismatches = 0;
     for case in &golden.cases {

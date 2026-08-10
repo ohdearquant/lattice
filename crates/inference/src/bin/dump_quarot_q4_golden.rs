@@ -24,6 +24,7 @@
 //!   --converter target/release/quantize_quarot \
 //!   --max-new-tokens 8 > golden.json
 //! ```
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -115,21 +116,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .map_err(|e| format!("from_q4_dir: {e}"))?;
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_new_tokens;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.top_p = 1.0;
+    gen_cfg.repetition_penalty = 1.0;
+    gen_cfg.seed = Some(1);
+    gen_cfg.stop_token_ids = vec![];
+    gen_cfg.enable_thinking = false;
+    gen_cfg.enable_mtp = Some(false);
+    gen_cfg.grammar = None;
+    gen_cfg.stop_strings = vec![];
+    gen_cfg.reasoning_budget = None;
+    gen_cfg.logprobs = None;
 
     let mut cases = Vec::with_capacity(PROMPTS.len());
     for (name, prompt) in PROMPTS {

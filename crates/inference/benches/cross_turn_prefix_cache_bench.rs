@@ -11,6 +11,7 @@
 //! (config.json + safetensors + tokenizer.json).
 //!
 //! Run: `cargo bench -p lattice-inference --features metal-gpu,f16 -- cross_turn_prefix_cache`
+#![allow(clippy::field_reassign_with_default)]
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use std::path::PathBuf;
@@ -68,21 +69,21 @@ fn load_state_and_tokenizer() -> Option<(MetalQwen35State, BpeTokenizer)> {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn bench_gen_cfg(max_new_tokens: usize) -> GenerateConfig {
-    GenerateConfig {
-        max_new_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(7),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    }
+    let mut cfg = GenerateConfig::default();
+    cfg.max_new_tokens = max_new_tokens;
+    cfg.temperature = 0.0;
+    cfg.top_k = 1;
+    cfg.top_p = 1.0;
+    cfg.repetition_penalty = 1.0;
+    cfg.seed = Some(7);
+    cfg.stop_token_ids = vec![];
+    cfg.enable_thinking = false;
+    cfg.enable_mtp = Some(false);
+    cfg.grammar = None;
+    cfg.stop_strings = vec![];
+    cfg.reasoning_budget = None;
+    cfg.logprobs = None;
+    cfg
 }
 
 /// Benchmarks one conversation depth: `prior_turns` completed user/assistant

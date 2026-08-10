@@ -30,6 +30,7 @@
 //! cargo test --release -p lattice-inference --features f16 \
 //!     --test vision_s5b_e2e_gate_test -- --nocapture
 //! ```
+#![allow(clippy::field_reassign_with_default)]
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -407,14 +408,12 @@ fn run_s5b_gate(model_dir: &Path) {
 
     // Pure greedy, matching the fixture's HF reference (manifest.json's `decode` section):
     // no repetition penalty, no top-k/top-p truncation before the temperature=0 argmax.
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 3,
-        temperature: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(1),
-        stop_token_ids: vec![],
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 3;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.repetition_penalty = 1.0;
+    gen_cfg.seed = Some(1);
+    gen_cfg.stop_token_ids = vec![];
 
     let out = generate_multimodal_f16(&weights, &cfg, &request, &gen_cfg)
         .expect("multimodal generate succeeds against the real checkpoint");
