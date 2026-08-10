@@ -78,6 +78,7 @@ pub struct CrossTurnPrefixEntry {
 
 /// How the next turn should build on (or discard) the cached entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PrefixReuseMode {
     /// No usable overlap: reset state and prefill the whole prompt.
     FullRefill,

@@ -149,6 +149,7 @@ mod tests {
             rank: 2,
             alpha: 2.0,
             target_modules: vec!["q_proj".into()],
+            dtype: "f32".into(),
         };
         let mut layers = HashMap::new();
         layers.insert(

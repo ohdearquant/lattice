@@ -66,57 +66,6 @@ fn main() {
     feature = "metal-gpu",
     feature = "bench-internals"
 ))]
-mod gpu_flock {
-    //! Mirrors `metal_qwen35::gpu_test_lock()` (same path, same timeout, same
-    //! panic-with-lsof hint) — that function is private to the lib crate (it lives
-    //! in a `#[cfg(test)]`-adjacent module), so a `src/bin` binary cannot call it
-    //! directly (bin targets are separate crates for privacy purposes; they only see
-    //! the lib's `pub` surface). This is a deliberate, minimal duplication of the
-    //! fleet-wide GPU serialization convention (the repo CLAUDE.md "Machine-Wide
-    //! GPU Test Lock"), not a divergent one: same lock file, same semantics.
-    const GPU_MACHINE_LOCK_PATH: &str = "/tmp/lion-metal-gpu-test.lock";
-    const GPU_MACHINE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
-
-    /// Acquires the exclusive flock and leaks it for the process lifetime
-    /// (this bin is a short-lived, single-shot measurement run — there is no other
-    /// Metal work in this process to serialize against once acquired).
-    pub fn acquire_for_process() {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(GPU_MACHINE_LOCK_PATH)
-            .unwrap_or_else(|e| panic!("gpu flock: cannot open {GPU_MACHINE_LOCK_PATH}: {e}"));
-        let deadline = std::time::Instant::now() + GPU_MACHINE_LOCK_TIMEOUT;
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    if std::time::Instant::now() >= deadline {
-                        panic!(
-                            "gpu flock: another process has held {GPU_MACHINE_LOCK_PATH} for \
-                             over {}s — a Metal run elsewhere on this machine is wedged or \
-                             genuinely that long; inspect `lsof {GPU_MACHINE_LOCK_PATH}`",
-                            GPU_MACHINE_LOCK_TIMEOUT.as_secs()
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                }
-                Err(std::fs::TryLockError::Error(e)) => {
-                    panic!("gpu flock: flock on {GPU_MACHINE_LOCK_PATH} failed: {e}")
-                }
-            }
-        }
-        // Leak: hold for the rest of the process. `file` intentionally never drops.
-        std::mem::forget(file);
-    }
-}
-
-#[cfg(all(
-    target_os = "macos",
-    feature = "metal-gpu",
-    feature = "bench-internals"
-))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::forward::metal_qwen35::bench_support::{self, GdnIsolatedChunkTiming};
@@ -136,9 +85,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- INVALIDATION GUARD: hold the fleet-wide Metal GPU flock BEFORE any Metal
     // work (model load below doesn't touch Metal, but MetalQwen35State::new does). ---
-    eprintln!("[bench] acquiring /tmp/lion-metal-gpu-test.lock ...");
+    eprintln!("[bench] acquiring shared Metal GPU lock ...");
     let flock_acquired_at = std::time::Instant::now();
-    gpu_flock::acquire_for_process();
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     eprintln!(
         "[bench] flock held ({:.1}s wait)",
         flock_acquired_at.elapsed().as_secs_f64()
@@ -294,15 +243,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Run `n` tokens through the isolated-timing chunk loop once; returns accumulated
     // GDN/non-GDN timing across all `max_prefill`-sized chunks. Caller must have
     // already called `state.set_gdn_chunked(..)` and `state.reset_state()`.
-    let run_once = |state: &mut MetalQwen35State, tokens: &[u32]| -> GdnIsolatedChunkTiming {
+    let run_once = |state: &mut MetalQwen35State,
+                    tokens: &[u32]|
+     -> Result<GdnIsolatedChunkTiming, lattice_inference::InferenceError> {
         let mut total = GdnIsolatedChunkTiming::default();
         let mut start = 0usize;
         for chunk in tokens.chunks(mp) {
-            let t = bench_support::forward_prefill_gdn_isolated_chunk(state, chunk, start);
+            let t = bench_support::forward_prefill_gdn_isolated_chunk(state, chunk, start)?;
             total.accumulate(&t);
             start += chunk.len();
         }
-        total
+        Ok(total)
     };
 
     #[derive(Clone, Copy)]
@@ -380,14 +331,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // above, no internal command-buffer-boundary timing is needed: production
     // dispatch already commits + waits synchronously per chunk, so a plain
     // `Instant` wrapped around the whole chunking loop is the real measurement.
-    let run_once_production = |state: &mut MetalQwen35State, tokens: &[u32]| -> f64 {
+    let run_once_production = |state: &mut MetalQwen35State,
+                               tokens: &[u32]|
+     -> Result<f64, lattice_inference::InferenceError> {
         let start = std::time::Instant::now();
         let mut pos = 0usize;
         for chunk in tokens.chunks(mp) {
-            bench_support::forward_prefill_production_chunk(state, chunk, pos);
+            bench_support::forward_prefill_production_chunk(state, chunk, pos)?;
             pos += chunk.len();
         }
-        start.elapsed().as_secs_f64() * 1000.0
+        Ok(start.elapsed().as_secs_f64() * 1000.0)
     };
 
     struct ProdRowResult {
@@ -430,7 +383,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.set_gdn_chunked(chunked);
                 for _ in 0..warmup {
                     state.reset_state();
-                    let _ = run_once_production(&mut state, &tokens);
+                    let _ = run_once_production(&mut state, &tokens)?;
                 }
             }
             let mut total_samples: [Vec<f64>; 2] =
@@ -439,7 +392,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for (i, &(chunked, _)) in prod_arms.iter().enumerate() {
                     state.set_gdn_chunked(chunked);
                     state.reset_state();
-                    total_samples[i].push(run_once_production(&mut state, &tokens));
+                    total_samples[i].push(run_once_production(&mut state, &tokens)?);
                 }
             }
             for (i, &(_, path_name)) in prod_arms.iter().enumerate() {
@@ -465,13 +418,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 for _ in 0..warmup {
                     state.reset_state();
-                    let _ = run_once_production(&mut state, &tokens);
+                    let _ = run_once_production(&mut state, &tokens)?;
                 }
 
                 let mut total_samples = Vec::with_capacity(repeats);
                 for _ in 0..repeats {
                     state.reset_state();
-                    total_samples.push(run_once_production(&mut state, &tokens));
+                    total_samples.push(run_once_production(&mut state, &tokens)?);
                 }
                 let total = stats(total_samples);
                 eprintln!(
@@ -512,7 +465,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.set_gdn_chunked(chunked);
                 for _ in 0..warmup {
                     state.reset_state();
-                    let _ = run_once(&mut state, &tokens);
+                    let _ = run_once(&mut state, &tokens)?;
                 }
             }
             let mut gdn_samples: [Vec<f64>; 2] =
@@ -525,7 +478,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for (i, &(chunked, _)) in isolated_arms.iter().enumerate() {
                     state.set_gdn_chunked(chunked);
                     state.reset_state();
-                    let t = run_once(&mut state, &tokens);
+                    let t = run_once(&mut state, &tokens)?;
                     gdn_samples[i].push(t.gdn_ms);
                     total_samples[i].push(t.total_ms());
                     non_gdn_samples[i].push(t.non_gdn_ms);
@@ -560,7 +513,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 for _ in 0..warmup {
                     state.reset_state();
-                    let _ = run_once(&mut state, &tokens);
+                    let _ = run_once(&mut state, &tokens)?;
                 }
 
                 let mut gdn_samples = Vec::with_capacity(repeats);
@@ -568,7 +521,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut non_gdn_samples = Vec::with_capacity(repeats);
                 for _ in 0..repeats {
                     state.reset_state();
-                    let t = run_once(&mut state, &tokens);
+                    let t = run_once(&mut state, &tokens)?;
                     gdn_samples.push(t.gdn_ms);
                     total_samples.push(t.total_ms());
                     non_gdn_samples.push(t.non_gdn_ms);

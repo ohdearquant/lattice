@@ -90,6 +90,16 @@ pub mod utils {
 
     /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
     ///
+    /// Computes Manhattan (L1) distance between two vectors through the SIMD dispatcher.
+    /// Returns `f32::MAX` for unequal-length vectors, matching [`euclidean_distance`].
+    /// See [`docs/design.md`](../docs/design.md#vector-utility-facade) for dispatch and examples.
+    #[inline]
+    pub fn manhattan_distance(a: &[f32], b: &[f32]) -> f32 {
+        simd::manhattan_distance(a, b)
+    }
+
+    /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
+    ///
     /// Computes cosine similarities for vector pairs in input order.
     /// See [`docs/design.md`](../docs/design.md#vector-utility-facade) for batch-dispatch behavior.
     #[inline]

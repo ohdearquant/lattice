@@ -75,8 +75,8 @@ pub(crate) fn compute_router_probs(
             *v /= denom;
         }
     } else {
-        // Fail closed on a non-finite denom, mirroring generate.rs
-        // compute_attention's `else { scores.fill(0.0) }` guard. The early
+        // Fail closed on a non-finite denom, mirroring the shared attention
+        // row-finalizer's zero-row contract. The early
         // `max_logit` check only catches an all-non-finite row; a row with a
         // FINITE max but a NaN/±inf in another lane keeps `max_logit` finite
         // (Rust `f32::max` ignores a single NaN), so the NaN propagates through

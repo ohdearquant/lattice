@@ -24,6 +24,7 @@ const META_SPACE: char = '\u{2581}';
 ///
 /// SentencePiece piece type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SentencePieceType {
     Unknown,
     Normal,

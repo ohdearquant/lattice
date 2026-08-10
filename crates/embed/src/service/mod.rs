@@ -55,6 +55,7 @@ pub const MAX_TEXT_CHARS: usize = MAX_TEXT_BYTES;
 /// Selects query, passage, or generic preparation and cache-key namespace.
 /// See [`docs/service.md`](../../docs/service.md#trait-api-details) for retrieval-role semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum EmbeddingRole {
     /// Query / question text — may receive a query-side prompt prefix.
     Query,

@@ -1,0 +1,84 @@
+name: 'Rust setup'
+description: >-
+  Installs the repository's pinned Rust toolchain (rust-toolchain.toml,
+  currently 1.94.1) and restores/saves the Cargo cache. Single source of
+  truth for the checkout -> toolchain -> cache sequence duplicated across
+  ci.yml and e2e-parity.yml. Callers keep their own checkout step and any
+  caller-specific components/targets/cache key. The MSRV job
+  (.github/workflows/ci.yml, `msrv`) installs 1.93.1 explicitly via
+  RUSTUP_TOOLCHAIN and does not use this action.
+inputs:
+  components:
+    description: 'Comma-separated rustup components to install (e.g. "rustfmt, clippy").'
+    required: false
+    default: ''
+  targets:
+    description: 'Comma-separated additional compilation targets (e.g. "wasm32-unknown-unknown").'
+    required: false
+    default: ''
+  shared-key:
+    description: 'Swatinem/rust-cache shared-key. Empty preserves automatic per-job cache-key behavior.'
+    required: false
+    default: ''
+  cache-on-failure:
+    description: 'Swatinem/rust-cache cache-on-failure passthrough.'
+    required: false
+    default: 'false'
+  pin-cargo-path:
+    description: >-
+      Some macos-latest runner images ship ~/.cargo/bin/cargo as a copy of
+      rustup-init rather than the rustup proxy, so `cargo fmt`/`cargo clippy`
+      fail with "error: unexpected argument". Set 'true' to resolve the real
+      toolchain bin dir through rustup and put it first on PATH. No-op on
+      healthy images and on Linux.
+    required: false
+    default: 'false'
+runs:
+  using: 'composite'
+  steps:
+    # #1275: ARM Linux (and macOS ARM) rustup component installs intermittently
+    # fail with a `bin/cargo-clippy` conflict when a preinstalled or partially
+    # installed toolchain already occupies a component path on the runner
+    # image. dtolnay/rust-toolchain has no --force/retry for this, and
+    # retrying the same install against the same dirty state just repeats the
+    # failure. Point RUSTUP_HOME at a fresh, job-scoped directory before
+    # installing so every run starts from a clean Rustup state instead of
+    # whatever the runner image happened to preinstall. The directory is
+    # deleted and recreated every run (isolation), but its path is a fixed
+    # location under $HOME rather than $RUNNER_TEMP: Swatinem/rust-cache
+    # hashes every non-empty RUST*-prefixed env var into its cache key
+    # (src/config.ts:107-117), and RUNNER_TEMP is a runner-provided absolute
+    # temp path that can differ across runners/runs, which fragmented the
+    # cache key and produced "No cache found" on an otherwise-unchanged repo.
+    # $HOME is stable across jobs on all runner images this action targets
+    # (ubuntu-latest, ubuntu-24.04-arm, macos-latest — no Windows runner uses
+    # this action), so the RUSTUP_HOME value stays constant and CARGO_HOME is
+    # left untouched so Swatinem/rust-cache's cache behavior is unaffected.
+    - name: Isolate Rustup state
+      shell: bash
+      run: |
+        rustup_home="${HOME}/.lattice-rustup"
+        rm -rf -- "$rustup_home"
+        mkdir -p "$rustup_home"
+        printf 'RUSTUP_HOME=%s\n' "$rustup_home" >> "$GITHUB_ENV"
+
+    - uses: dtolnay/rust-toolchain@e43eeffd51aefeea929f4ea14e09fd077153e788 # 1.94.1
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    - name: Pin the real toolchain bin on PATH
+      if: inputs.pin-cargo-path == 'true'
+      shell: bash
+      run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+    - name: Verify Rust setup
+      shell: bash
+      run: |
+        rustc --version | grep -F '1.94.1'
+        echo 'LATTICE_RUST_SETUP_OK rustc 1.94.1'
+
+    - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        shared-key: ${{ inputs.shared-key }}
+        cache-on-failure: ${{ inputs.cache-on-failure }}

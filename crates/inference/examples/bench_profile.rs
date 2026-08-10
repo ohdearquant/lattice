@@ -24,6 +24,8 @@ fn main() {
 
     println!("Loading model...");
     let t0 = Instant::now();
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let model = QwenModel::from_directory(dir).unwrap();
     println!("Loaded in {:.0}ms\n", t0.elapsed().as_millis());
 

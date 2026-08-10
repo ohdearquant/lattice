@@ -34,6 +34,18 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
+if __name__ == "__main__":
+    _governor_argv = (
+        sys.argv[1 : sys.argv.index("--")] if "--" in sys.argv else sys.argv[1:]
+    )
+    if "--run" in _governor_argv and not {"-h", "--help"}.intersection(
+        _governor_argv
+    ):
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+        from bench_supervision import ensure_python_entrypoint
+
+        ensure_python_entrypoint("perf-governor")
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------

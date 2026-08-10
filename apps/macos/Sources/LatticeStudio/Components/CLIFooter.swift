@@ -78,6 +78,7 @@ struct CLIFooter: View {
 
 // MARK: - Previews
 
+#if DEBUG && canImport(PreviewsMacros)
 #Preview("CLIFooter – chat") {
     VStack(spacing: 0) {
         Spacer()
@@ -94,10 +95,11 @@ struct CLIFooter: View {
     VStack(spacing: 0) {
         Spacer()
         CLIFooter(
-            command: "lattice_serve --model /Users/you/.lattice/models/qwen3.5-0.8b --port 11435",
+            command: "lattice_serve --model ~/.lattice/models/qwen3.5-0.8b --port 11435",
             caption: "http://127.0.0.1:11435/v1"
         )
     }
     .frame(width: 760, height: 160)
     .background(Theme.Palette.canvas)
 }
+#endif

@@ -58,6 +58,26 @@ adapted projection's input and output width. This is the point to reject a
 model/adapter shape mismatch before generation, rather than discovering it in
 a projection call.
 
+### Target-module name checking
+
+`LoraAdapter::new` — the chokepoint `from_safetensors`, `blend_lora_adapters`,
+and training all route through — accepts any non-empty target-module name.
+This keeps construction itself model-neutral and preserves loading for an
+externally produced adapter that targets a projection this crate does not yet
+recognize by name; an unrecognized name only becomes a problem once something
+tries to install the adapter against a specific model, and
+`validate_against`/`validate_against_bert` already reject that at the point
+where the architecture is known.
+
+`LoraAdapter::new_with_descriptor` is stricter: it checks every declared
+`target_modules` entry against
+[`lattice_fann::lora::KNOWN_LORA_TARGET_MODULES`], the flat name list
+`lattice-tune` and `lattice-inference` share, before accepting a descriptor —
+the same check the Metal `load_lora_adapter_with_descriptor` loader performs
+at its own entry point. Prefer this constructor over the bare one when a
+typo'd target module name should fail construction rather than surface later
+as a mismatched-projection error.
+
 ## Exact micro-LoRA training
 
 The `train-backward` feature exposes `train_micro_lora`, a compact CPU trainer
@@ -467,9 +487,29 @@ After preflight, the trainer captures the frozen prefix activation entering
 `first_layer` and the matching RoPE tables. It checks every allocation product
 before creating A/B buffers. A is deterministically initialized from
 `U(-1/sqrt(hidden), +1/sqrt(hidden))`; B starts at zero, so the initial adapter
-does not perturb frozen-model output. The public surface allocates slots only
+does not perturb frozen-model output. `train_micro_lora` allocates slots only
 for GQA `q_proj` and `v_proj`; GDN layers run the preserved no-LoRA path so
 their backward derivatives still reach preceding GQA layers.
+
+`train_micro_lora_with_gdn(model, pairs, config, train_gdn)` is the same
+trainer with one added switch. With `train_gdn: false` it reproduces
+`train_micro_lora` exactly, including RNG stream position — GDN LoRA slot
+initialization must not consume from the shared RNG in that mode, or GQA A
+factors would diverge between the two entry points for identical inputs.
+With `train_gdn: true`, every GDN layer inside the trainable window
+(`config.first_layer..=last_layer`) also gets a slot: the five
+[`GdnLoraParams`](#gdnloraparams) projections are initialized (A random, B
+zero, same rationale as the GQA slots), trained through the same forward/
+backward/Adam loop via `apply_gdn_adam_updates`, and surfaced in the
+returned adapter's `target_modules` and layers. `train_micro_lora` has no
+config field for this switch — a separate function avoids a breaking
+addition to the publicly, exhaustively constructible `MicroLoraConfig`
+(`cargo-semver-checks`'s `constructible_struct_adds_field` gate covers this
+crate). GDN and GQA slots share the trainer's single `learning_rate`; #884's
+held-out NLL run flagged this as a leading suspect for the GDN arm's
+regression against the untrained baseline and marked the shared-LR recipe
+unvalidated pending a rerun with revised hyperparameters — wiring alone does
+not certify training quality.
 
 The library loop intentionally mirrors the training binary's private CPU
 forward/backward and Adam sequence. Its library implementation uses the

@@ -1311,6 +1311,10 @@ pub trait MtpTargetVerifier {
 
     /// Forward `tokens` starting at `start_pos` through the target model.
     /// Returns per-token logits: `logits[i]` is target output after processing `tokens[i]`.
+    ///
+    /// `start_pos` must equal [`Self::cache_position`]. Implementations must reject a
+    /// mismatch before forwarding any token so KV placement and positional encoding
+    /// cannot observe different positions.
     fn verify_tokens(
         &mut self,
         tokens: &[u32],

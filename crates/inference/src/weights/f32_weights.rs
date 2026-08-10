@@ -5,7 +5,7 @@ use crate::weights::safetensors_layout::{
 };
 use memmap2::Mmap;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -15,6 +15,12 @@ enum DType {
     F32,
     F16,
     BF16,
+    /// OCP FP8 E4M3 ("FN": finite-only, no infinity), safetensors `F8_E4M3`.
+    /// Distinct from `F8_E4M3FNUZ`, which stays `Other` (lattice#684).
+    F8E4M3,
+    /// OCP FP8 E5M2, safetensors `F8_E5M2`. Distinct from `F8_E5M2FNUZ`,
+    /// which stays `Other` (lattice#684).
+    F8E5M2,
     /// A dtype safetensors defines but this crate does not materialize as
     /// f32 (I64, U8, BOOL, F64, ...). Tracked structurally (not silently
     /// dropped from `SafetensorsFile::tensors`) so extent validation still
@@ -31,6 +37,8 @@ impl DType {
             Self::F32 => "F32",
             Self::F16 => "F16",
             Self::BF16 => "BF16",
+            Self::F8E4M3 => "F8_E4M3",
+            Self::F8E5M2 => "F8_E5M2",
             Self::Other { label, .. } => label,
         }
     }
@@ -47,6 +55,8 @@ fn dtype_from_str(s: &str) -> Option<DType> {
         "F32" => DType::F32,
         "F16" => DType::F16,
         "BF16" => DType::BF16,
+        "F8_E4M3" => DType::F8E4M3,
+        "F8_E5M2" => DType::F8E5M2,
         _ => {
             let dtype = safetensors_dtype(s)?;
             DType::Other { label: dtype.name }
@@ -61,13 +71,13 @@ struct TensorMeta {
     start: usize,
     end: usize,
     converted_f32: OnceLock<Box<[f32]>>,
-    /// Populated once, via `get_or_init`, by this tensor's
-    /// `ingress::validate_ingested_tensor` outcome, so repeated access to the
-    /// same zero-copy F32 tensor does not rescan already-validated pages and
-    /// concurrent first access cannot run the scan twice (lattice#800 step
-    /// 4). `validate_ingested_tensor` only ever returns
-    /// `InferenceError::InvalidSafetensors`, so the cached error is carried
-    /// as its message and rewrapped on read.
+    /// Populated once, via `get_or_init`, by this tensor's ingress-validation
+    /// outcome. Zero-copy F32 uses the decoded-slice validator; F16/BF16
+    /// widening publishes its reduction here before the cached slice escapes.
+    /// Concurrent first access therefore cannot validate the same tensor
+    /// twice. Ingress validation only returns
+    /// `InferenceError::InvalidSafetensors` on this path, so the cached error
+    /// is carried as its message and rewrapped on read.
     validated: OnceLock<Result<(), String>>,
 }
 
@@ -157,9 +167,9 @@ impl CrossEncoderWeights {
 ///
 /// The owned variant exists for targets without real file-descriptor/mmap
 /// support (`wasm32-unknown-unknown`: `memmap2`'s wasm fallback compiles but
-/// every `Mmap::map` call returns `io::ErrorKind::Unsupported` at runtime) and
-/// for hosts that receive model weights as an in-memory buffer rather than a
-/// filesystem path (e.g. bytes handed in from JavaScript).
+/// every mmap construction call returns `io::ErrorKind::Unsupported` at
+/// runtime) and for hosts that receive model weights as an in-memory buffer
+/// rather than a filesystem path (e.g. bytes handed in from JavaScript).
 enum SafetensorsBacking {
     Mapped(Mmap),
     Owned(Vec<u8>),
@@ -208,21 +218,22 @@ impl SafetensorsFile {
         let file = File::open(path).map_err(|e| {
             InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
         })?;
-        Self::from_open_file(file, path.display().to_string())
+        Self::from_open_file(file, path)
     }
 
     /// Parse a safetensors file from an already-open [`File`].
     ///
     /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
-    /// validates the manifest string and opens the file exactly once. Mapping the fd the
-    /// caller already holds is what keeps that single open meaningful; reopening by path
-    /// here would reintroduce the window between the open and the read.
-    pub(crate) fn from_open_file(file: File, display_path: String) -> Result<Self, InferenceError> {
-        // SAFETY: The file descriptor remains alive until the mmap is created,
-        // and the returned Mmap owns the mapping independently of the File.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {display_path}: {e}"))
-        })?;
+    /// opens the file exactly once. Mapping the fd the caller already holds is what keeps
+    /// that single open meaningful; reopening by path here would reintroduce the window
+    /// between the open and the read. `path` is used both to run the mmap trust-boundary
+    /// guard (via [`crate::weights::mmap_trust::map_after_untrusted_open`]) and to name the
+    /// file in error messages -- it should be the resolved real path when the caller has
+    /// one, matching that guard's own `path` requirement.
+    pub(crate) fn from_open_file(file: File, path: &Path) -> Result<Self, InferenceError> {
+        let display_path = path.display().to_string();
+        let mmap = crate::weights::mmap_trust::map_after_untrusted_open(&file, path)
+            .map_err(InferenceError::InvalidSafetensors)?;
 
         Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
     }
@@ -254,6 +265,12 @@ impl SafetensorsFile {
                 .try_into()
                 .map_err(|_| InferenceError::InvalidSafetensors("invalid header length".into()))?,
         ) as usize;
+        if header_len > MAX_SAFETENSORS_HEADER_BYTES {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "header length {header_len} exceeds limit of {MAX_SAFETENSORS_HEADER_BYTES} bytes"
+            )));
+        }
+
         let data_offset = 8usize
             .checked_add(header_len)
             .ok_or_else(|| InferenceError::InvalidSafetensors("header length overflow".into()))?;
@@ -340,8 +357,11 @@ impl SafetensorsFile {
             .checked_add(meta.end)
             .ok_or_else(|| InferenceError::InvalidSafetensors("tensor end overflow".into()))?;
         let bytes = &self.data.as_slice()[start..end];
+        let source = self.source.as_str();
+        let shape = meta.shape.as_slice();
+        let dtype_name = meta.dtype.name();
 
-        let slice: &[f32] = match meta.dtype {
+        let (slice, validation_is_fused): (&[f32], bool) = match meta.dtype {
             DType::F32 => {
                 // SAFETY: `open()` validated that bytes.len() is exactly the declared
                 // F32 element count times 4. On little-endian targets, aligned mmap
@@ -349,25 +369,50 @@ impl SafetensorsFile {
                 // cache below.
                 #[cfg(target_endian = "little")]
                 if bytes.as_ptr().align_offset(std::mem::align_of::<f32>()) == 0 {
-                    bytes_to_f32_slice(bytes)
+                    (bytes_to_f32_slice(bytes), false)
                 } else {
-                    meta.converted_f32
-                        .get_or_init(|| copy_bytes_to_f32_owned(bytes).into_boxed_slice())
-                        .as_ref()
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| copy_bytes_to_f32_owned(bytes).into_boxed_slice())
+                            .as_ref(),
+                        false,
+                    )
                 }
                 #[cfg(not(target_endian = "little"))]
                 {
-                    meta.converted_f32
-                        .get_or_init(|| copy_bytes_to_f32_owned(bytes).into_boxed_slice())
-                        .as_ref()
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| copy_bytes_to_f32_owned(bytes).into_boxed_slice())
+                            .as_ref(),
+                        false,
+                    )
                 }
             }
             DType::F16 => {
                 #[cfg(feature = "f16")]
                 {
-                    meta.converted_f32
-                        .get_or_init(|| convert_f16_bytes_to_f32(bytes).into_boxed_slice())
-                        .as_ref()
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| {
+                                let (values, has_non_finite) = convert_f16_bytes_to_f32(bytes);
+                                let _ = meta.validated.get_or_init(|| {
+                                    let tensor = if has_non_finite {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    } else {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    };
+                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                        .map_err(|e| e.to_string())
+                                });
+                                values.into_boxed_slice()
+                            })
+                            .as_ref(),
+                        true,
+                    )
                 }
                 #[cfg(not(feature = "f16"))]
                 {
@@ -379,9 +424,28 @@ impl SafetensorsFile {
             DType::BF16 => {
                 #[cfg(feature = "f16")]
                 {
-                    meta.converted_f32
-                        .get_or_init(|| convert_bf16_bytes_to_f32(bytes).into_boxed_slice())
-                        .as_ref()
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| {
+                                let (values, has_non_finite) = convert_bf16_bytes_to_f32(bytes);
+                                let _ = meta.validated.get_or_init(|| {
+                                    let tensor = if has_non_finite {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    } else {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    };
+                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                        .map_err(|e| e.to_string())
+                                });
+                                values.into_boxed_slice()
+                            })
+                            .as_ref(),
+                        true,
+                    )
                 }
                 #[cfg(not(feature = "f16"))]
                 {
@@ -390,32 +454,101 @@ impl SafetensorsFile {
                     )));
                 }
             }
+            DType::F8E4M3 => {
+                #[cfg(feature = "f16")]
+                {
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| {
+                                let (values, has_non_finite) = convert_f8_e4m3_bytes_to_f32(bytes);
+                                let _ = meta.validated.get_or_init(|| {
+                                    let tensor = if has_non_finite {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    } else {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    };
+                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                        .map_err(|e| e.to_string())
+                                });
+                                values.into_boxed_slice()
+                            })
+                            .as_ref(),
+                        true,
+                    )
+                }
+                #[cfg(not(feature = "f16"))]
+                {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "tensor {name} is F8_E4M3 but lattice-inference was built without the f16 feature"
+                    )));
+                }
+            }
+            DType::F8E5M2 => {
+                #[cfg(feature = "f16")]
+                {
+                    (
+                        meta.converted_f32
+                            .get_or_init(|| {
+                                let (values, has_non_finite) = convert_f8_e5m2_bytes_to_f32(bytes);
+                                let _ = meta.validated.get_or_init(|| {
+                                    let tensor = if has_non_finite {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    } else {
+                                        crate::weights::ingress::IngestedTensor::decoded_f32_known_finite(
+                                            source, name, shape, dtype_name, &values,
+                                        )
+                                    };
+                                    crate::weights::ingress::validate_ingested_tensor(tensor)
+                                        .map_err(|e| e.to_string())
+                                });
+                                values.into_boxed_slice()
+                            })
+                            .as_ref(),
+                        true,
+                    )
+                }
+                #[cfg(not(feature = "f16"))]
+                {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "tensor {name} is F8_E5M2 but lattice-inference was built without the f16 feature"
+                    )));
+                }
+            }
             DType::Other { label, .. } => {
                 return Err(InferenceError::InvalidSafetensors(format!(
                     "tensor {name} has unsupported dtype {label} (source: {}); only F32, F16, \
-                     and BF16 tensors can be materialized as f32",
+                     BF16, F8_E4M3, and F8_E5M2 tensors can be materialized as f32",
                     self.source
                 )));
             }
         };
 
-        // `get_or_init` runs its closure at most once even under concurrent
-        // first access: every caller blocks on the same in-flight init
-        // rather than racing separate `get()`-then-`set()` scans of the same
-        // tensor (the previous pattern let multiple callers observe
-        // `get().is_none()` and each redo the O(n) finite scan before one
-        // `set()` won).
-        let source = &self.source;
-        let shape = meta.shape.as_slice();
-        let dtype_name = meta.dtype.name();
-        match meta.validated.get_or_init(|| {
-            crate::weights::ingress::validate_ingested_tensor(
-                crate::weights::ingress::IngestedTensor::decoded_f32(
-                    source, name, shape, dtype_name, slice,
-                ),
-            )
-            .map_err(|e| e.to_string())
-        }) {
+        let validation = if validation_is_fused {
+            meta.validated.get().ok_or_else(|| {
+                InferenceError::InvalidSafetensors(format!(
+                    "{source}: tensor {name} ({dtype_name}) widening completed without a \
+                     validation result"
+                ))
+            })?
+        } else {
+            // `get_or_init` runs its closure at most once even under concurrent
+            // first access, so zero-copy F32 pages are scanned by one caller.
+            meta.validated.get_or_init(|| {
+                crate::weights::ingress::validate_ingested_tensor(
+                    crate::weights::ingress::IngestedTensor::decoded_f32(
+                        source, name, shape, dtype_name, slice,
+                    ),
+                )
+                .map_err(|e| e.to_string())
+            })
+        };
+        match validation {
             Ok(()) => {}
             Err(msg) => return Err(InferenceError::InvalidSafetensors(msg.clone())),
         }
@@ -831,27 +964,55 @@ fn copy_bytes_to_f32_owned(bytes: &[u8]) -> Vec<f32> {
 }
 
 #[cfg(feature = "f16")]
-fn convert_f16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+fn convert_f16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut has_non_finite = false;
     for chunk in bytes.chunks_exact(2) {
-        out.push(crate::weights::half_bits::f16_bits_to_f32(
-            u16::from_le_bytes([chunk[0], chunk[1]]),
-        ));
+        let value =
+            crate::weights::half_bits::f16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        has_non_finite |= !value.is_finite();
+        out.push(value);
     }
-    out
+    (out, has_non_finite)
 }
 
 #[cfg(feature = "f16")]
-fn convert_bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+fn convert_bf16_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
     debug_assert_eq!(bytes.len() % 2, 0);
     let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut has_non_finite = false;
     for chunk in bytes.chunks_exact(2) {
-        out.push(crate::weights::half_bits::bf16_bits_to_f32(
-            u16::from_le_bytes([chunk[0], chunk[1]]),
-        ));
+        let value =
+            crate::weights::half_bits::bf16_bits_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        has_non_finite |= !value.is_finite();
+        out.push(value);
     }
-    out
+    (out, has_non_finite)
+}
+
+#[cfg(feature = "f16")]
+fn convert_f8_e4m3_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut has_non_finite = false;
+    for &byte in bytes {
+        let value = crate::weights::half_bits::f8_e4m3_bits_to_f32(byte);
+        has_non_finite |= !value.is_finite();
+        out.push(value);
+    }
+    (out, has_non_finite)
+}
+
+#[cfg(feature = "f16")]
+fn convert_f8_e5m2_bytes_to_f32(bytes: &[u8]) -> (Vec<f32>, bool) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut has_non_finite = false;
+    for &byte in bytes {
+        let value = crate::weights::half_bits::f8_e5m2_bits_to_f32(byte);
+        has_non_finite |= !value.is_finite();
+        out.push(value);
+    }
+    (out, has_non_finite)
 }
 
 /// Owned backing store for Qwen weights loaded from a sharded checkpoint.
@@ -902,6 +1063,48 @@ pub(crate) const MAX_SAFETENSORS_INDEX_BYTES: u64 = 67_108_864;
 /// 1,000,000 leaves well over an order of magnitude of headroom while rejecting an
 /// unbounded entry count.
 pub(crate) const MAX_WEIGHT_MAP_ENTRIES: usize = 1_000_000;
+
+/// Upper bound, in bytes, on the safetensors header (`header_len` at the start of a
+/// `.safetensors` file, checked in [`SafetensorsFile::from_backing`] before the header
+/// is parsed as JSON).
+///
+/// An unsharded checkpoint puts metadata for every tensor in this one header, so it can
+/// run larger than a single shard's slice of `model.safetensors.index.json`. Real dense
+/// and MoE checkpoints, including the largest single-file presets this crate loads,
+/// produce headers on the order of a few hundred KiB to low single-digit MiB, so
+/// compatibility alone would tolerate a much larger cap.
+///
+/// This value is set by a second, tighter bound: what the parser retains after
+/// `open()` returns, not what a real header looks like. Every tensor's `shape` is
+/// stored as a `Vec<usize>` (8 bytes/element on this crate's supported targets), and
+/// [`validate_safetensors_layout`]'s element-count product accepts a zero-length
+/// dimension (`checked_mul` by 0 is always in range), so a tensor entry needs no
+/// corresponding tensor-data bytes once any one of its `shape` entries is `0`. A
+/// header can therefore spend nearly its whole byte budget on a single tensor's
+/// `shape` array of 8-byte elements written as one-digit decimals (`"0,"` is 2 input
+/// bytes per retained element). Measured `Vec<usize>` growth under repeated `push`
+/// (this crate's `parse_usize_array` never calls `with_capacity`) lands on the next
+/// power of two at or above the element count, so at a power-of-two byte cap this
+/// construction retains almost exactly 4x the cap: 4 MiB of header bounds worst-case
+/// retained shape-array bytes to 16 MiB. (Tensor names, `TensorMeta`'s fixed fields,
+/// and the `HashMap` bucket overhead were checked too: at 120 bytes/entry plus a
+/// short name, spreading the same byte budget across many small tensor entries
+/// instead retains less per input byte than the single-oversized-shape
+/// construction, so they do not set the bound.)
+///
+/// This sizing assumes the ordinary Rust allocator contract: growing a `Vec` past
+/// available memory via plain `push` is not a `Result` calling code can recover
+/// from, so the input-side byte cap is what keeps retained parser state bounded,
+/// not error handling downstream of the allocation.
+const MAX_SAFETENSORS_HEADER_BYTES: usize = 4_194_304;
+
+/// Upper bound on JSON container nesting depth (`{` / `[`) while parsing a safetensors
+/// header, tracked by [`JsonParser::depth`] and enforced in [`JsonParser::skip_value`].
+///
+/// A real header is shallow: the top-level object holds per-tensor objects, each holding
+/// at most a `shape`/`data_offsets` array — three levels deep, four counting `__metadata__`
+/// values written by common tooling. 32 leaves an order of magnitude of headroom over that.
+const MAX_SAFETENSORS_HEADER_DEPTH: usize = 32;
 
 /// Parsed `model.safetensors.index.json` from a HuggingFace sharded checkpoint.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1112,6 +1315,12 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
 /// [`contained_shard_path`] before the join: absolute paths and parent-directory components
 /// are rejected, lexically, without consulting any filesystem state.
 ///
+/// The returned file has already passed
+/// [`crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted`] against its resolved
+/// real path -- every caller mmaps this file read-only no-copy, so the same write-boundary
+/// gate every other checkpoint mmap goes through applies here too, without `open_trusted_mmap_file`'s
+/// `O_NOFOLLOW` (see that function's doc comment for why a hub-cache symlink must still resolve).
+///
 /// # Why this opens the file instead of returning a path to reopen
 ///
 /// Resolving a path and handing it back leaves the caller to `open()` it separately, and a
@@ -1139,6 +1348,8 @@ pub(crate) fn open_manifest_entry_once(
         InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", candidate.display()))
     })?;
     let real_path = real_path_of_open_file(&file, &candidate)?;
+    crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted(&file, &real_path)
+        .map_err(InferenceError::InvalidSafetensors)?;
     Ok((file, real_path))
 }
 
@@ -1203,7 +1414,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
         let (file, real_path) = open_manifest_entry_once(model_dir, &shard_file)?;
-        let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
+        let shard = SafetensorsFile::from_open_file(file, &real_path)?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
             tensors.insert(
@@ -1261,7 +1472,7 @@ impl ShardedSafetensors {
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
             let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
-            let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
+            let shard = SafetensorsFile::from_open_file(file, &real_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
         self.shards.get(shard_file).ok_or_else(|| {
@@ -1588,10 +1799,10 @@ impl ShardedSafetensors {
 
 fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, InferenceError> {
     let mut parser = JsonParser::new(json);
-    parser.skip_ws();
     parser.expect(b'{')?;
 
     let mut tensors = HashMap::new();
+    let mut seen_keys = HashSet::new();
 
     loop {
         parser.skip_ws();
@@ -1609,12 +1820,22 @@ fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, I
         }
 
         let key = parser.parse_string()?;
+        if !seen_keys.insert(key.clone()) {
+            let kind = if key == "__metadata__" {
+                "metadata member"
+            } else {
+                "tensor name"
+            };
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "duplicate {kind} in safetensors header: {key}"
+            )));
+        }
         parser.skip_ws();
         parser.expect(b':')?;
         parser.skip_ws();
 
         if key == "__metadata__" {
-            parser.skip_value()?;
+            parser.parse_metadata()?;
         } else {
             let meta = parser.parse_tensor_meta(&key)?;
             tensors.insert(key, meta);
@@ -1624,6 +1845,12 @@ fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, I
         match parser.peek() {
             Some(b',') => {
                 parser.bump();
+                parser.skip_ws();
+                if matches!(parser.peek(), Some(b'}')) {
+                    return Err(InferenceError::InvalidSafetensors(
+                        "trailing comma in safetensors header object".into(),
+                    ));
+                }
             }
             Some(b'}') => {
                 parser.bump();
@@ -1642,12 +1869,24 @@ fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, I
         }
     }
 
+    while matches!(parser.peek(), Some(b' ')) {
+        parser.bump();
+    }
+    if let Some(other) = parser.peek() {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "non-space byte {other} after top-level safetensors header object"
+        )));
+    }
+
     Ok(tensors)
 }
 
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Current container nesting depth, checked against [`MAX_SAFETENSORS_HEADER_DEPTH`]
+    /// on entry to each `{`/`[` container in [`Self::skip_value`].
+    depth: usize,
 }
 
 impl<'a> JsonParser<'a> {
@@ -1655,6 +1894,7 @@ impl<'a> JsonParser<'a> {
         Self {
             bytes: s.as_bytes(),
             pos: 0,
+            depth: 0,
         }
     }
 
@@ -1691,77 +1931,51 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_string(&mut self) -> Result<String, InferenceError> {
+        let start = self.pos;
         self.expect(b'"')?;
-        let mut out = String::new();
+        let mut escaped = false;
         loop {
             let byte = self.bump().ok_or_else(|| {
                 InferenceError::InvalidSafetensors("unterminated string in header".into())
             })?;
-            match byte {
-                b'"' => break,
-                b'\\' => {
-                    let esc = self.bump().ok_or_else(|| {
-                        InferenceError::InvalidSafetensors(
-                            "unterminated escape sequence in header".into(),
-                        )
-                    })?;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hex = self.take_n(4)?;
-                            let hex_str = std::str::from_utf8(hex).map_err(|e| {
-                                InferenceError::InvalidSafetensors(format!(
-                                    "invalid unicode escape in header: {e}"
-                                ))
-                            })?;
-                            let value = u16::from_str_radix(hex_str, 16).map_err(|e| {
-                                InferenceError::InvalidSafetensors(format!(
-                                    "invalid unicode escape value {hex_str}: {e}"
-                                ))
-                            })?;
-                            let ch = char::from_u32(value as u32).ok_or_else(|| {
-                                InferenceError::InvalidSafetensors(format!(
-                                    "invalid unicode scalar value {value}"
-                                ))
-                            })?;
-                            out.push(ch);
-                        }
-                        other => {
-                            return Err(InferenceError::InvalidSafetensors(format!(
-                                "unsupported escape sequence \\{}",
-                                other as char
-                            )));
-                        }
-                    }
-                }
-                other => out.push(other as char),
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                break;
             }
         }
-        Ok(out)
-    }
-
-    fn take_n(&mut self, n: usize) -> Result<&'a [u8], InferenceError> {
-        if self.pos + n > self.bytes.len() {
-            return Err(InferenceError::InvalidSafetensors(
-                "unexpected end of input while reading header".into(),
-            ));
-        }
-        let slice = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(slice)
+        let raw = std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|err| {
+            InferenceError::InvalidSafetensors(format!(
+                "safetensors header string is not valid UTF-8: {err}"
+            ))
+        })?;
+        serde_json::from_str(raw).map_err(|err| {
+            InferenceError::InvalidSafetensors(format!(
+                "invalid JSON string in safetensors header: {err}"
+            ))
+        })
     }
 
     fn parse_usize(&mut self) -> Result<usize, InferenceError> {
         let start = self.pos;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "leading zero in unsigned integer at byte {start}"
+                    )));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => {}
         }
         if start == self.pos {
             return Err(InferenceError::InvalidSafetensors(format!(
@@ -1813,6 +2027,57 @@ impl<'a> JsonParser<'a> {
         Ok(values)
     }
 
+    /// Parse the optional safetensors `__metadata__` member. The wire format
+    /// requires a JSON object whose keys and values are strings; arbitrary
+    /// nested JSON is not a valid metadata payload.
+    fn parse_metadata(&mut self) -> Result<(), InferenceError> {
+        self.expect(b'{')?;
+        self.skip_ws();
+        let mut seen_keys = HashSet::new();
+        if matches!(self.peek(), Some(b'}')) {
+            self.bump();
+            return Ok(());
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_string()?;
+            if !seen_keys.insert(key.clone()) {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "duplicate __metadata__ key in safetensors header: {key}"
+                )));
+            }
+            self.skip_ws();
+            self.expect(b':')?;
+            self.skip_ws();
+            self.parse_string().map_err(|_| {
+                InferenceError::InvalidSafetensors(format!(
+                    "safetensors __metadata__ value for {key:?} must be a string"
+                ))
+            })?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.bump();
+                }
+                Some(b'}') => {
+                    self.bump();
+                    break;
+                }
+                Some(other) => {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "expected ',' or '}}' in safetensors __metadata__, found byte {other}"
+                    )));
+                }
+                None => {
+                    return Err(InferenceError::InvalidSafetensors(
+                        "unexpected end of safetensors __metadata__ object".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn skip_value(&mut self) -> Result<(), InferenceError> {
         self.skip_ws();
         match self.peek() {
@@ -1821,15 +2086,28 @@ impl<'a> JsonParser<'a> {
                 Ok(())
             }
             Some(b'{') => {
+                self.depth += 1;
+                if self.depth > MAX_SAFETENSORS_HEADER_DEPTH {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "header nesting exceeds depth limit of {MAX_SAFETENSORS_HEADER_DEPTH}"
+                    )));
+                }
                 self.bump();
                 self.skip_ws();
                 if matches!(self.peek(), Some(b'}')) {
                     self.bump();
+                    self.depth -= 1;
                     return Ok(());
                 }
+                let mut seen_keys = HashSet::new();
                 loop {
                     self.skip_ws();
-                    self.parse_string()?;
+                    let key = self.parse_string()?;
+                    if !seen_keys.insert(key.clone()) {
+                        return Err(InferenceError::InvalidSafetensors(format!(
+                            "duplicate key in safetensors header object: {key}"
+                        )));
+                    }
                     self.skip_ws();
                     self.expect(b':')?;
                     self.skip_ws();
@@ -1855,13 +2133,21 @@ impl<'a> JsonParser<'a> {
                         }
                     }
                 }
+                self.depth -= 1;
                 Ok(())
             }
             Some(b'[') => {
+                self.depth += 1;
+                if self.depth > MAX_SAFETENSORS_HEADER_DEPTH {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "header nesting exceeds depth limit of {MAX_SAFETENSORS_HEADER_DEPTH}"
+                    )));
+                }
                 self.bump();
                 self.skip_ws();
                 if matches!(self.peek(), Some(b']')) {
                     self.bump();
+                    self.depth -= 1;
                     return Ok(());
                 }
                 loop {
@@ -1888,15 +2174,13 @@ impl<'a> JsonParser<'a> {
                         }
                     }
                 }
+                self.depth -= 1;
                 Ok(())
             }
             Some(b't') => self.skip_literal(b"true"),
             Some(b'f') => self.skip_literal(b"false"),
             Some(b'n') => self.skip_literal(b"null"),
-            Some(b'-' | b'0'..=b'9') => {
-                self.skip_number();
-                Ok(())
-            }
+            Some(b'-' | b'0'..=b'9') => self.skip_number(),
             Some(other) => Err(InferenceError::InvalidSafetensors(format!(
                 "unsupported JSON value starting with byte {other}"
             ))),
@@ -1919,13 +2203,68 @@ impl<'a> JsonParser<'a> {
         Ok(())
     }
 
-    fn skip_number(&mut self) {
-        while matches!(
-            self.peek(),
-            Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-        ) {
+    /// Consume one RFC 8259 JSON number. This is used only for unknown
+    /// extension values, but accepting a loose run of number-like bytes here
+    /// would make the entire safetensors header non-JSON while still passing
+    /// structural preflight.
+    fn skip_number(&mut self) -> Result<(), InferenceError> {
+        let start = self.pos;
+        if matches!(self.peek(), Some(b'-')) {
             self.pos += 1;
         }
+
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "leading zero in JSON number at byte {start}"
+                    )));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "invalid JSON number at byte {start}: expected an integer digit"
+                )));
+            }
+        }
+
+        if matches!(self.peek(), Some(b'.')) {
+            self.pos += 1;
+            let fraction_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == fraction_start {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "invalid JSON number at byte {start}: fraction has no digits"
+                )));
+            }
+        }
+
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            let exponent_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == exponent_start {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "invalid JSON number at byte {start}: exponent has no digits"
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Parse one tensor's header entry. `tensor_name` is the key this entry
@@ -1945,6 +2284,7 @@ impl<'a> JsonParser<'a> {
         let mut dtype_str: Option<String> = None;
         let mut shape = None;
         let mut data_offsets = None;
+        let mut seen_keys = HashSet::new();
 
         if matches!(self.peek(), Some(b'}')) {
             self.bump();
@@ -1952,6 +2292,11 @@ impl<'a> JsonParser<'a> {
             loop {
                 self.skip_ws();
                 let key = self.parse_string()?;
+                if !seen_keys.insert(key.clone()) {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "duplicate member in tensor {tensor_name} header object: {key}"
+                    )));
+                }
                 self.skip_ws();
                 self.expect(b':')?;
                 self.skip_ws();
@@ -2040,17 +2385,171 @@ mod tests {
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_path(name: &str) -> std::path::PathBuf {
+    /// RAII guard for a scratch file under the OS temp directory: removes the
+    /// file when dropped, including when the drop runs during an unwinding
+    /// panic. Derefs to `Path` so call sites read like they hold a `PathBuf`.
+    ///
+    /// Call [`TempFileGuard::into_path`] when a test genuinely needs the file
+    /// to outlive the guard (e.g. for manual post-mortem inspection).
+    struct TempFileGuard(std::path::PathBuf);
+
+    impl TempFileGuard {
+        fn into_path(self) -> std::path::PathBuf {
+            let path = self.0.clone();
+            std::mem::forget(self);
+            path
+        }
+    }
+
+    impl std::ops::Deref for TempFileGuard {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempFileGuard {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    /// RAII guard for a scratch directory under the OS temp directory: removes
+    /// the directory tree when dropped, including when the drop runs during an
+    /// unwinding panic. Derefs to `Path` so call sites read like they hold a
+    /// `PathBuf`.
+    ///
+    /// Call [`TempDirGuard::into_path`] when a test genuinely needs the
+    /// directory to outlive the guard (e.g. for manual post-mortem inspection).
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl TempDirGuard {
+        fn into_path(self) -> std::path::PathBuf {
+            let path = self.0.clone();
+            std::mem::forget(self);
+            path
+        }
+    }
+
+    impl std::ops::Deref for TempDirGuard {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempDirGuard {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_path(name: &str) -> TempFileGuard {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("invariant: system time is after UNIX_EPOCH")
             .as_nanos();
-        std::env::temp_dir().join(format!(
+        TempFileGuard(std::env::temp_dir().join(format!(
             "{}_{}_{}.safetensors",
             name,
             std::process::id(),
             nanos
-        ))
+        )))
+    }
+
+    #[test]
+    fn temp_dir_guard_removes_directory_on_normal_drop() {
+        let dir = temp_dir("lattice_guard_drop_test");
+        let path = dir.to_path_buf();
+        assert!(path.is_dir(), "temp_dir must create the directory eagerly");
+
+        drop(dir);
+
+        assert!(
+            !path.exists(),
+            "TempDirGuard must remove its directory when dropped normally"
+        );
+    }
+
+    #[test]
+    fn temp_dir_guard_removes_directory_on_unwind() {
+        let dir = temp_dir("lattice_guard_unwind_test");
+        let path = dir.to_path_buf();
+        assert!(path.is_dir(), "temp_dir must create the directory eagerly");
+
+        // Rust runs destructors while a panic unwinds the stack, so moving the
+        // guard into a closure that panics -- then catching that panic --
+        // exercises exactly the cleanup path a failing/panicking test relies
+        // on. This assumes the default `panic = "unwind"` strategy; under
+        // `panic = "abort"` this test would abort the whole binary instead of
+        // failing quietly, which is the intended, visible failure mode for
+        // that profile misconfiguration.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _dir = dir;
+            panic!("intentional panic to exercise TempDirGuard unwind cleanup");
+        }));
+
+        assert!(result.is_err(), "the inner closure must have panicked");
+        assert!(
+            !path.exists(),
+            "TempDirGuard must remove its directory when its owning frame unwinds"
+        );
+    }
+
+    #[test]
+    fn temp_dir_guard_into_path_opts_out_of_cleanup() {
+        let dir = temp_dir("lattice_guard_leak_opt_out_test");
+        let path = dir.into_path();
+
+        assert!(
+            path.is_dir(),
+            "into_path must hand back the still-existing directory without removing it"
+        );
+
+        fs::remove_dir_all(&path).ok();
+    }
+
+    #[test]
+    fn temp_file_guard_removes_file_on_normal_drop() {
+        let guard = temp_path("lattice_guard_file_drop_test");
+        write_raw_safetensors(&guard, r#"{"__metadata__":{"format":"pt"}}"#, &[]);
+        let path = guard.to_path_buf();
+        assert!(path.is_file(), "test setup must have created the file");
+
+        drop(guard);
+
+        assert!(
+            !path.exists(),
+            "TempFileGuard must remove its file when dropped normally"
+        );
+    }
+
+    #[test]
+    fn temp_file_guard_into_path_opts_out_of_cleanup() {
+        let guard = temp_path("lattice_guard_file_leak_opt_out_test");
+        write_raw_safetensors(&guard, r#"{"__metadata__":{"format":"pt"}}"#, &[]);
+        let path = guard.into_path();
+
+        assert!(
+            path.is_file(),
+            "into_path must hand back the still-existing file without removing it"
+        );
+
+        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2087,8 +2586,227 @@ mod tests {
         assert_eq!(mat_shape, &[2, 2]);
         assert_eq!(vec_data, &[1.0, 2.0]);
         assert_eq!(mat_data, &[3.0, 4.0, 5.0, 6.0]);
+    }
 
-        fs::remove_file(&path).ok();
+    #[test]
+    fn duplicate_tensor_name_in_safetensors_header_is_rejected() {
+        let header = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let err = SafetensorsFile::from_bytes(bytes)
+            .expect_err("duplicate tensor names must not collapse into the header map");
+        assert!(
+            err.to_string().contains("duplicate tensor name"),
+            "error must identify the duplicate header member: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_tensor_object_members_are_rejected() {
+        let duplicate_members = [
+            r#""dtype":"F32","dtype":"F32","shape":[1],"data_offsets":[0,4]"#,
+            r#""dtype":"F32","shape":[1],"shape":[1],"data_offsets":[0,4]"#,
+            r#""dtype":"F32","shape":[1],"data_offsets":[0,4],"data_offsets":[0,4]"#,
+            r#""dtype":"F32","shape":[1],"data_offsets":[0,4],"extra":1,"extra":2"#,
+            r#""dtype":"F32","shape":[1],"data_offsets":[0,4],"extra":{"nested":1,"nested":2}"#,
+        ];
+
+        for members in duplicate_members {
+            let header = format!(r#"{{"tensor":{{{members}}}}}"#);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+            let err = SafetensorsFile::from_bytes(bytes)
+                .expect_err("duplicate keys anywhere in a tensor object must be rejected");
+            assert!(
+                err.to_string().contains("duplicate"),
+                "error must identify the duplicate object member: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_must_be_a_unique_string_map() {
+        let invalid_headers = [
+            r#"{"__metadata__":{"source":"a","source":"b"},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            r#"{"__metadata__":{"source":1},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            r#"{"__metadata__":[],"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            r#"{"__metadata__":{},"__metadata__":{},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        ];
+
+        for header in invalid_headers {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            SafetensorsFile::from_bytes(bytes)
+                .expect_err("safetensors metadata must be one unique string-to-string map");
+        }
+    }
+
+    #[test]
+    fn utf8_strings_decode_canonically_before_duplicate_checks() {
+        let header = r#"{"__metadata__":{"作者":"café 🚀"},"t\u00e9nsor\ud83d\ude80":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        let parsed = SafetensorsFile::from_bytes(bytes)
+            .expect("valid UTF-8 and a valid escaped surrogate pair must parse");
+        assert!(
+            parsed.has_tensor("ténsor🚀"),
+            "raw UTF-8 and escaped surrogate pairs must decode to canonical scalar values"
+        );
+
+        let duplicate = r#"{"__metadata__":{"é":"raw","\u00e9":"escaped"},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(duplicate.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(duplicate.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        SafetensorsFile::from_bytes(bytes)
+            .expect_err("raw and escaped forms of the same metadata key are duplicates");
+    }
+
+    #[test]
+    fn malformed_json_numbers_are_rejected() {
+        let invalid_members = [
+            r#""extra":-"#,
+            r#""extra":1+2"#,
+            r#""extra":01"#,
+            r#""extra":-01"#,
+            r#""extra":1."#,
+            r#""extra":1e"#,
+            r#""extra":1e+"#,
+            r#""shape":[01]"#,
+            r#""data_offsets":[00,4]"#,
+        ];
+
+        for invalid in invalid_members {
+            let members = match invalid.split_once(':').map(|(key, _)| key) {
+                Some(r#""shape""#) => {
+                    format!(r#""dtype":"F32",{invalid},"data_offsets":[0,4]"#)
+                }
+                Some(r#""data_offsets""#) => {
+                    format!(r#""dtype":"F32","shape":[1],{invalid}"#)
+                }
+                _ => format!(r#""dtype":"F32","shape":[1],"data_offsets":[0,4],{invalid}"#),
+            };
+            let header = format!(r#"{{"tensor":{{{members}}}}}"#);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+            assert!(
+                SafetensorsFile::from_bytes(bytes).is_err(),
+                "invalid JSON number must fail closed: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_json_numbers_in_unknown_values_are_accepted() {
+        let header = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"extra":[0,-1,1.5,1e2,-0.25E+2]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        SafetensorsFile::from_bytes(bytes)
+            .expect("RFC 8259 numbers in an unknown extension value must remain valid");
+    }
+
+    #[test]
+    fn malformed_unicode_surrogates_are_rejected() {
+        for escaped in [r#"\ud83d"#, r#"\ude80"#, r#"\ud83dX"#] {
+            let header = format!(
+                r#"{{"__metadata__":{{"value":"{escaped}"}},"tensor":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#
+            );
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            SafetensorsFile::from_bytes(bytes)
+                .expect_err("a malformed JSON Unicode surrogate must fail closed");
+        }
+    }
+
+    #[test]
+    fn trailing_comma_in_header_object_is_rejected() {
+        let header = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        SafetensorsFile::from_bytes(bytes)
+            .expect_err("the safetensors header must be valid JSON without a trailing comma");
+    }
+
+    #[test]
+    fn non_space_bytes_after_top_level_header_are_rejected() {
+        let tensor = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let header = format!("{tensor}THIS_IS_NOT_JSON");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        SafetensorsFile::from_bytes(bytes)
+            .expect_err("the declared header may contain only space padding after its JSON object");
+    }
+
+    #[test]
+    fn space_padding_after_top_level_header_is_accepted() {
+        let tensor = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let header = format!("{tensor}   ");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        SafetensorsFile::from_bytes(bytes)
+            .expect("ASCII space is valid safetensors header padding");
+    }
+
+    // #1368: `SafetensorsFile::open` is a raw-open entry point (used directly
+    // by the runtime model loaders, not just via `open_manifest_entry_once`)
+    // that must route through the mmap trust boundary the same as every
+    // other checkpoint mmap site in this crate. This proves the wiring, not
+    // just the underlying `reject_if_open_mmap_file_untrusted` predicate
+    // (already covered directly in `mmap_trust`'s own tests).
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_a_group_or_other_writable_checkpoint_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("lattice_weights_writable_checkpoint");
+        let header = r#"{"vec":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let mut file = File::create(&path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+        drop(file);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod 0o666");
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("a group/other-writable checkpoint file must be refused");
+        assert!(
+            matches!(&err, InferenceError::InvalidSafetensors(msg) if msg.contains("refusing to load")),
+            "expected a trust-boundary refusal, got: {err:?}"
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod 0o600");
+        SafetensorsFile::open(&path).expect("an owner-only checkpoint file must still be accepted");
     }
 
     #[test]
@@ -2117,8 +2835,6 @@ mod tests {
             err.to_string().contains("byte length mismatch"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2149,8 +2865,6 @@ mod tests {
             err.to_string().contains("byte length mismatch"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2178,8 +2892,6 @@ mod tests {
             err.to_string().contains("non-contiguous"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2194,8 +2906,6 @@ mod tests {
             err.to_string().contains("non-contiguous"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2214,8 +2924,6 @@ mod tests {
             err.to_string().contains("non-contiguous"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2230,8 +2938,6 @@ mod tests {
             err.to_string().contains("trailing or missing payload"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2246,8 +2952,86 @@ mod tests {
             err.to_string().contains("invalid data_offsets"),
             "unexpected error: {err}"
         );
+    }
 
-        fs::remove_file(&path).ok();
+    #[test]
+    fn test_rejects_header_exceeding_depth_limit() {
+        // Nested well past MAX_SAFETENSORS_HEADER_DEPTH, but the whole header is a
+        // couple hundred bytes -- far under MAX_SAFETENSORS_HEADER_BYTES, so only
+        // the depth bound can be what rejects this fixture.
+        let depth = MAX_SAFETENSORS_HEADER_DEPTH + 8;
+        let mut header =
+            String::from(r#"{"tensor":{"dtype":"F32","shape":[0],"data_offsets":[0,0],"extra":"#);
+        header.push_str(&"[".repeat(depth));
+        header.push_str(&"]".repeat(depth));
+        header.push_str("}}");
+        assert!(header.len() < MAX_SAFETENSORS_HEADER_BYTES);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+
+        let err = SafetensorsFile::from_bytes(bytes)
+            .expect_err("header nesting past the depth limit must be rejected");
+        assert!(
+            err.to_string().contains("depth limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rejects_header_exceeding_size_limit() {
+        // A single valid JSON string value padded past MAX_SAFETENSORS_HEADER_BYTES,
+        // with the full declared header actually present in the buffer (so the
+        // separate "header extends past end of file" check can't be what rejects
+        // this instead). A bare string value never recurses through skip_value, so
+        // this fixture stays at depth 0 -- only the size bound can reject it.
+        let prefix = r#"{"__metadata__":""#;
+        let suffix = r#""}"#;
+        let pad_len = MAX_SAFETENSORS_HEADER_BYTES + 1024 - prefix.len() - suffix.len();
+        let header_len = prefix.len() + pad_len + suffix.len();
+        assert!(header_len > MAX_SAFETENSORS_HEADER_BYTES);
+
+        let mut bytes = Vec::with_capacity(8 + header_len);
+        bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
+        bytes.extend_from_slice(prefix.as_bytes());
+        bytes.extend_from_slice(&vec![b'a'; pad_len]);
+        bytes.extend_from_slice(suffix.as_bytes());
+
+        let err = SafetensorsFile::from_bytes(bytes)
+            .expect_err("a header past the size limit must be rejected");
+        assert!(
+            err.to_string().contains("exceeds limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parses_header_within_depth_and_size_bounds() {
+        // A legitimate small header: under both the depth limit and the size
+        // limit. Must still parse, so neither bound above can be read as
+        // "reject everything" and still pass the suite.
+        let header = r#"{
+            "__metadata__": {"format": "pt"},
+            "t": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]}
+        }"#
+        .replace(['\n', ' '], "");
+        assert!(header.len() < MAX_SAFETENSORS_HEADER_BYTES);
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        for value in [1.0f32, 2.0] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let sf = SafetensorsFile::from_bytes(bytes)
+            .expect("a header within both bounds must still parse");
+        let (data, shape) = sf
+            .get_f32_tensor("t")
+            .expect("tensor within a bounded header must still load");
+        assert_eq!(shape, &[2]);
+        assert_eq!(data, &[1.0, 2.0]);
     }
 
     fn write_raw_safetensors(path: &std::path::Path, header: &str, raw: &[u8]) {
@@ -2301,8 +3085,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2321,8 +3103,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2341,8 +3121,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2385,8 +3163,6 @@ mod tests {
         // Second access must not panic or error — it should skip re-scanning.
         sf.get_f32_tensor("t")
             .expect("second access reuses cached validation");
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2414,8 +3190,6 @@ mod tests {
             !matches!(err, InferenceError::MissingTensor(_)),
             "must not be reported as a missing tensor: {err:?}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2443,8 +3217,6 @@ mod tests {
                 err.to_string().contains("unsupported dtype"),
                 "unexpected {dtype} materialization error: {err}"
             );
-
-            fs::remove_file(&path).ok();
         }
     }
 
@@ -2459,8 +3231,6 @@ mod tests {
             err.to_string().contains("not byte-aligned"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2474,8 +3244,6 @@ mod tests {
             err.to_string().contains("byte length mismatch"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2498,8 +3266,6 @@ mod tests {
             err.to_string().contains("unrecognized dtype"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2510,8 +3276,8 @@ mod tests {
         let nan_bits: u16 = 0x7E00;
         let one_bits: u16 = 0x3C00; // f16 1.0
         let mut raw = Vec::new();
-        raw.extend_from_slice(&nan_bits.to_le_bytes());
         raw.extend_from_slice(&one_bits.to_le_bytes());
+        raw.extend_from_slice(&nan_bits.to_le_bytes());
         write_raw_tensor(&path, "t", "F16", &[2], &raw);
 
         let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
@@ -2522,8 +3288,10 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
+        assert!(
+            err.to_string().contains("element index 1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "f16")]
@@ -2546,8 +3314,6 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
     #[cfg(feature = "f16")]
@@ -2558,8 +3324,8 @@ mod tests {
         let nan_bits: u16 = 0x7FC0;
         let one_bits: u16 = 0x3F80; // bf16 1.0
         let mut raw = Vec::new();
-        raw.extend_from_slice(&nan_bits.to_le_bytes());
         raw.extend_from_slice(&one_bits.to_le_bytes());
+        raw.extend_from_slice(&nan_bits.to_le_bytes());
         write_raw_tensor(&path, "t", "BF16", &[2], &raw);
 
         let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
@@ -2570,8 +3336,10 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
+        assert!(
+            err.to_string().contains("element index 1"),
+            "unexpected error: {err}"
+        );
     }
 
     #[cfg(feature = "f16")]
@@ -2594,18 +3362,210 @@ mod tests {
             err.to_string().contains("non-finite"),
             "unexpected error: {err}"
         );
-
-        fs::remove_file(&path).ok();
     }
 
-    fn temp_dir(name: &str) -> std::path::PathBuf {
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f8_e4m3_tensor_decodes_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f8_e4m3_decode");
+        // 0x00 = +0.0, 0x38 = 1.0, 0xb8 = -1.0, 0x7e = 448.0 (largest finite E4M3).
+        let raw: [u8; 4] = [0x00, 0x38, 0xb8, 0x7e];
+        write_raw_tensor(&path, "t", "F8_E4M3", &[raw.len()], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let (values, shape) = sf
+            .get_f32_tensor("t")
+            .expect("finite F8_E4M3 values must decode");
+        assert_eq!(shape, &[raw.len()]);
+        assert_eq!(values, &[0.0f32, 1.0, -1.0, 448.0]);
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f8_e4m3_tensor_rejects_nan_bit_pattern_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f8_e4m3_nan");
+        // E4M3FN's sole NaN encoding: exponent and mantissa both all-ones.
+        let one_bits: u8 = 0x38;
+        let nan_bits: u8 = 0x7f;
+        write_raw_tensor(&path, "t", "F8_E4M3", &[2], &[one_bits, nan_bits]);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("F8_E4M3 NaN bit pattern must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("element index 1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f8_e5m2_tensor_decodes_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f8_e5m2_decode");
+        // 0x00 = +0.0, 0x3c = 1.0, 0xbc = -1.0, 0x7b = 57344.0 (largest finite E5M2).
+        let raw: [u8; 4] = [0x00, 0x3c, 0xbc, 0x7b];
+        write_raw_tensor(&path, "t", "F8_E5M2", &[raw.len()], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let (values, shape) = sf
+            .get_f32_tensor("t")
+            .expect("finite F8_E5M2 values must decode");
+        assert_eq!(shape, &[raw.len()]);
+        assert_eq!(values, &[0.0f32, 1.0, -1.0, 57344.0]);
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f8_e5m2_tensor_rejects_infinity_bit_pattern_through_safetensors_path() {
+        let path = temp_path("lattice_weights_f8_e5m2_inf");
+        // E5M2 +infinity: exponent all-ones, mantissa zero.
+        let inf_bits: u8 = 0x7c;
+        let one_bits: u8 = 0x3c;
+        write_raw_tensor(&path, "t", "F8_E5M2", &[2], &[inf_bits, one_bits]);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let err = sf
+            .get_f32_tensor("t")
+            .expect_err("F8_E5M2 +inf bit pattern must be rejected");
+        assert!(
+            err.to_string().contains("non-finite"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f16_widening_preserves_finite_edge_values() {
+        let path = temp_path("lattice_weights_f16_fused_finite");
+        let bits = [0x0000u16, 0x8000, 0x0001, 0x3c00];
+        let raw = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_raw_tensor(&path, "t", "F16", &[bits.len()], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let (values, shape) = sf
+            .get_f32_tensor("t")
+            .expect("finite F16 values must widen");
+        let expected = bits.map(crate::weights::half_bits::f16_bits_to_f32);
+        assert_eq!(shape, &[bits.len()]);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            sf.tensors
+                .get("t")
+                .expect("tensor tracked")
+                .validated
+                .get()
+                .is_some(),
+            "widening must publish its fused validation result"
+        );
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_f16_widening_skips_second_finite_scan() {
+        let path = temp_path("lattice_weights_f16_fused_scan");
+        let bits = [0x0000u16, 0x8000, 0x0001, 0x3c00];
+        let raw = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_raw_tensor(&path, "t", "F16", &[bits.len()], &raw);
+
+        crate::weights::ingress::reset_decoded_f32_finite_check_count();
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        sf.get_f32_tensor("t")
+            .expect("finite F16 values must widen");
+        assert_eq!(
+            crate::weights::ingress::decoded_f32_finite_check_count(),
+            0,
+            "fused F16 validation must not rescan widened values"
+        );
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_bf16_widening_preserves_finite_edge_values() {
+        let path = temp_path("lattice_weights_bf16_fused_finite");
+        let bits = [0x0000u16, 0x8000, 0x0001, 0x3f80];
+        let raw = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_raw_tensor(&path, "t", "BF16", &[bits.len()], &raw);
+
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        let (values, shape) = sf
+            .get_f32_tensor("t")
+            .expect("finite BF16 values must widen");
+        let expected = bits.map(crate::weights::half_bits::bf16_bits_to_f32);
+        assert_eq!(shape, &[bits.len()]);
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            sf.tensors
+                .get("t")
+                .expect("tensor tracked")
+                .validated
+                .get()
+                .is_some(),
+            "widening must publish its fused validation result"
+        );
+    }
+
+    #[cfg(feature = "f16")]
+    #[test]
+    fn test_bf16_widening_skips_second_finite_scan() {
+        let path = temp_path("lattice_weights_bf16_fused_scan");
+        let bits = [0x0000u16, 0x8000, 0x0001, 0x3f80];
+        let raw = bits
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect::<Vec<_>>();
+        write_raw_tensor(&path, "t", "BF16", &[bits.len()], &raw);
+
+        crate::weights::ingress::reset_decoded_f32_finite_check_count();
+        let sf = SafetensorsFile::open(&path).expect("open: header/extent are valid");
+        sf.get_f32_tensor("t")
+            .expect("finite BF16 values must widen");
+        assert_eq!(
+            crate::weights::ingress::decoded_f32_finite_check_count(),
+            0,
+            "fused BF16 validation must not rescan widened values"
+        );
+    }
+
+    fn temp_dir(name: &str) -> TempDirGuard {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("invariant: system time is after UNIX_EPOCH")
             .as_nanos();
         let path = std::env::temp_dir().join(format!("{}_{}_{}", name, std::process::id(), nanos));
         fs::create_dir_all(&path).expect("test setup: create temp dir");
-        path
+        TempDirGuard(path)
     }
 
     fn write_single_f32_tensor(path: &std::path::Path, name: &str, values: &[f32]) {
@@ -2684,8 +3644,6 @@ mod tests {
         assert_eq!(ta.shape, vec![2]);
         assert_eq!(tb.data, vec![3.0_f32, 4.0, 5.0]);
         assert_eq!(tb.shape, vec![3]);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// #1069: index-declared shard names are untrusted checkpoint content.
@@ -2705,8 +3663,6 @@ mod tests {
         );
         contained_shard_path(&dir, "sub/nested.safetensors")
             .expect("subdirectory entry beneath the model dir resolves");
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     /// #1069: an absolute index entry replaces the model directory entirely
@@ -2730,9 +3686,6 @@ mod tests {
                 || msg.contains("escapes model root"),
             "unexpected error: {err}"
         );
-
-        fs::remove_dir_all(&dir).ok();
-        fs::remove_dir_all(&outside).ok();
     }
 
     /// #1069: `..` components must not address files outside the model
@@ -2756,8 +3709,6 @@ mod tests {
             contained_shard_path(&dir, "../nonexistent.bin").is_err(),
             "traversal to a missing target must also fail"
         );
-
-        fs::remove_dir_all(&outer).ok();
     }
 
     /// The HuggingFace hub cache stores snapshots as symlink farms:
@@ -2791,8 +3742,6 @@ mod tests {
         let tensors =
             load_sharded(&dir).expect("hub-cache snapshot layout must load through the symlink");
         assert_eq!(tensors["tensor.a"].data, vec![1.0, 2.0]);
-
-        fs::remove_dir_all(&outer).ok();
     }
 
     /// #1069 end-to-end: a sharded index whose weight_map entry escapes the
@@ -2840,8 +3789,6 @@ mod tests {
                 || msg.contains("escapes model root"),
             "unexpected error: {err}"
         );
-
-        fs::remove_dir_all(&outer).ok();
     }
 
     #[test]
@@ -2882,8 +3829,6 @@ mod tests {
         assert_eq!(tx.shape, vec![2]);
         assert_eq!(ty.data, vec![3.0_f32, 4.0, 5.0]);
         assert_eq!(ty.shape, vec![3]);
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2903,8 +3848,6 @@ mod tests {
             result.is_err(),
             "load_sharded must return Err when indexed shard file is absent"
         );
-
-        fs::remove_dir_all(&dir).ok();
     }
 
     // --- CrossEncoderWeights tests ---
@@ -2966,7 +3909,6 @@ mod tests {
             "bias mismatch: {}",
             weights.classifier_bias
         );
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2988,7 +3930,6 @@ mod tests {
             "bias mismatch: {}",
             weights.classifier_bias
         );
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -3010,7 +3951,6 @@ mod tests {
             matches!(err, InferenceError::ShapeMismatch { .. }),
             "expected ShapeMismatch, got {err:?}"
         );
-        fs::remove_file(&path).ok();
     }
 
     #[test]
