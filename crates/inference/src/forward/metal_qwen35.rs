@@ -6779,7 +6779,7 @@ mod inner {
         /// check this before asking [`Self::gdn_state_is_initial`], never conflate
         /// the two by treating an empty population as if it were a clean one.
         fn has_gdn_layers(&self) -> bool {
-            !self.session.gdn_gpu_conv_bufs.is_empty()
+            self.session.gdn_gpu_state.len() != 0
         }
 
         /// True when every GDN recurrent-state buffer (S matrices and conv1d
@@ -6800,15 +6800,16 @@ mod inner {
         /// self.gdn_state_is_initial()`, as [`Self::prefill_session_freshness`]
         /// does.
         fn gdn_state_is_initial(&self) -> bool {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             assert!(
                 num_layers > 0,
                 "gdn_state_is_initial: session has no GDN layers; check has_gdn_layers() \
                  first — an empty population and a clean population are not the same fact"
             );
             for i in 0..num_layers {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let layer = self.session.gdn_gpu_state.layer(i);
+                let conv_buf = layer.conv_buffer();
+                let s_buf = layer.s_matrix();
                 let conv_floats = (conv_buf.length() / 4) as usize;
                 let s_floats = (s_buf.length() / 4) as usize;
                 // SAFETY: GPU buffers are StorageModeShared (allocated with
@@ -18038,9 +18039,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         fn snapshot_gdn_bytes(state: &MetalQwen35State) -> Vec<Vec<u8>> {
             state
                 .session
-                .gdn_gpu_s_matrices
-                .iter()
-                .chain(state.session.gdn_gpu_conv_bufs.iter())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.s_matrix())
+                .chain(
+                    state
+                        .session
+                        .gdn_gpu_state
+                        .layers()
+                        .map(|layer| layer.conv_buffer()),
+                )
                 .map(|buf| {
                     // SAFETY: StorageModeShared, and the verifier preflight runs
                     // before creating a command buffer, so no GPU write is in flight.
