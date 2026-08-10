@@ -250,12 +250,39 @@ async fn main() {
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
 
+            // `/v1/embeddings` needs its own f16-packed vision-language
+            // checkpoint load, independent of `model_backend` above (see
+            // `lattice_inference::serve::embeddings`'s module doc comment
+            // for why the two loaders can't share weights). Best-effort,
+            // same policy as `--preload-vision` failing: warn and continue
+            // with embeddings disabled rather than aborting startup, since a
+            // checkpoint that isn't vision-language-shaped is an expected,
+            // common case (most `lattice serve` deployments serve chat
+            // only).
+            let embedding_model =
+                match lattice_inference::serve::embeddings::EmbeddingModel::from_directory(
+                    model_path,
+                ) {
+                    Ok(embedding_model) => {
+                        eprintln!(
+                            "Embeddings enabled: pooled {}-dim vectors from {model}.",
+                            embedding_model.dimensions()
+                        );
+                        Some(Arc::new(embedding_model))
+                    }
+                    Err(err) => {
+                        eprintln!("Embeddings disabled ({model}): {err}");
+                        None
+                    }
+                };
+
             let state = serve::AppState {
                 model: model_backend,
                 default_max_tokens: max_tokens,
                 max_tokens_cap: 4096,
                 model_id: served_model_id.clone(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model,
             };
 
             let app = serve::router(state);
