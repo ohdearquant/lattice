@@ -142,7 +142,7 @@ All three can be used on their own.
 
 ```toml
 [dependencies]
-lattice-embed = "0.5"
+lattice-embed = "0.9"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -181,13 +181,13 @@ Model weights are downloaded from HuggingFace on first use and cached at `~/.lat
 ### GPU acceleration (macOS)
 
 ```toml
-lattice-embed = { version = "0.5", features = ["metal-gpu"] }
+lattice-embed = { version = "0.9", features = ["metal-gpu"] }
 ```
 
 ### Cross-platform GPU
 
 ```toml
-lattice-embed = { version = "0.5", features = ["wgpu-gpu"] }
+lattice-embed = { version = "0.9", features = ["wgpu-gpu"] }
 ```
 
 ---
