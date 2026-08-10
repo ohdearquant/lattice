@@ -1046,7 +1046,21 @@ fn normalize_message_content(
     }
 }
 
-fn decode_inline_image(url: &str) -> Result<Vec<u8>, ApiError> {
+/// Decodes an inline `data:image/png;base64,...` or
+/// `data:image/jpeg;base64,...` URI to raw file bytes, enforcing
+/// [`MAX_ENCODED_IMAGE_BYTES`] / [`MAX_DECODED_IMAGE_BYTES`] and that the
+/// decoded payload actually is the declared format. Shared with
+/// [`super::embeddings`]'s `/v1/embeddings` image items so both entry points
+/// that accept an inline data URI validate it identically.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`unsupported_image_url_scheme`) for a
+/// non-`data:` URL (remote `http(s)` URLs are not accepted), or
+/// [`ApiError::BadRequest`] (`invalid_image`, via [`invalid_image`]) for a
+/// malformed data URI, an oversized payload, invalid base64, or a payload
+/// whose sniffed format does not match its declared media type.
+pub fn decode_inline_image(url: &str) -> Result<Vec<u8>, ApiError> {
     let Some(data) = url.strip_prefix("data:") else {
         return Err(ApiError::BadRequest {
             message: "image_url.url must be an inline data URI; remote URLs are not accepted"

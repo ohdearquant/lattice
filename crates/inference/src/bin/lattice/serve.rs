@@ -505,6 +505,13 @@ pub struct AppState {
     /// Monotonically increasing counter used to make response IDs unique
     /// across concurrent requests within the same second.
     pub request_counter: Arc<AtomicU64>,
+    /// Pooled text/image embedding model for `/v1/embeddings`, loaded
+    /// independently of `model` (a separate f16-packed checkpoint format --
+    /// see `lattice_inference::serve::embeddings`'s module doc comment).
+    /// `None` when no vision-language checkpoint was found at the served
+    /// model directory; every `/v1/embeddings` request then fails closed
+    /// with `vision_unsupported`.
+    pub embedding_model: Option<Arc<lattice_inference::serve::embeddings::EmbeddingModel>>,
 }
 
 // -----------------------------------------------------------------------
@@ -910,8 +917,19 @@ pub async fn health() -> Json<HealthResponse> {
 /// had no equivalent route at all, an undocumented route-set divergence
 /// between the two binaries -- the routes did not actually match 1:1
 /// until this route landed.
+///
+/// Built locally rather than returning the shared
+/// [`lattice_inference::serve::root_body`] verbatim: this binary's
+/// `/v1/embeddings` route (unlike `/v1/chat/completions`, `/v1/models`, and
+/// `/health`) does not exist on `lattice_serve.rs` yet, so advertising it
+/// through the byte-identical shared body would falsely claim the daemon
+/// has it too.
 pub async fn root() -> Json<Value> {
-    Json(lattice_inference::serve::root_body())
+    let mut body = lattice_inference::serve::root_body();
+    if let Some(endpoints) = body.get_mut("endpoints").and_then(Value::as_array_mut) {
+        endpoints.push(Value::String("/v1/embeddings".to_string()));
+    }
+    Json(body)
 }
 
 /// `GET /v1/models` (ADR-080 C2, #746's sibling gap): advertises the
@@ -1558,6 +1576,84 @@ async fn chat_completions_with_request(
 }
 
 // -----------------------------------------------------------------------
+// Embeddings
+// -----------------------------------------------------------------------
+
+/// `POST /v1/embeddings`: pooled text and image embeddings, OpenAI
+/// `embeddings`-shaped request/response. See
+/// `lattice_inference::serve::embeddings` for the wire contract and pooled
+/// execution this handler wires into axum.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<Response, ApiError> {
+    use lattice_inference::serve::embeddings::{
+        EmbeddingsRequest, embed_items, normalize_embedding_items, parse_pooling,
+    };
+
+    lattice_inference::serve::require_json_content_type(&headers)?;
+
+    let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
+        .await
+        .map_err(|err| {
+            let is_length_limit = std::error::Error::source(&err)
+                .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+            if is_length_limit {
+                return ApiError::PayloadTooLarge {
+                    message: "request body exceeds 1 MiB limit".to_string(),
+                };
+            }
+            eprintln!("invalid request body: {err}");
+            ApiError::BadRequest {
+                message: "invalid JSON request body".to_string(),
+                code: "invalid_request_body",
+            }
+        })?;
+
+    let req: EmbeddingsRequest = serde_json::from_slice(&bytes).map_err(|err| {
+        eprintln!("invalid request body: {err}");
+        ApiError::BadRequest {
+            message: "invalid JSON request body".to_string(),
+            code: "invalid_request_body",
+        }
+    })?;
+
+    let pooling = parse_pooling(req.pooling.as_deref())?;
+    let items = normalize_embedding_items(req.input.into_items())?;
+
+    let Some(embedder) = state.embedding_model.clone() else {
+        return Err(ApiError::BadRequest {
+            message: "embeddings require a loaded vision-language checkpoint; restart this \
+                      server with `--model` pointed at a vision-language checkpoint directory \
+                      to enable this route"
+                .to_string(),
+            code: "vision_unsupported",
+        });
+    };
+    let model_id = state.model_id.clone();
+
+    let (data, usage) = tokio::task::spawn_blocking(move || embed_items(&embedder, items, pooling))
+        .await
+        .map_err(|e| {
+            eprintln!("task join error: {e}");
+            ApiError::Internal {
+                message: "inference failed".to_string(),
+            }
+        })??;
+
+    Ok(
+        Json(lattice_inference::serve::embeddings::EmbeddingsResponse {
+            object: "list",
+            data,
+            model: model_id,
+            usage,
+        })
+        .into_response(),
+    )
+}
+
+// -----------------------------------------------------------------------
 // Router
 // -----------------------------------------------------------------------
 
@@ -1567,6 +1663,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
@@ -1691,6 +1788,7 @@ mod tests {
                 max_tokens_cap: 4096,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             };
             (state, unblock_tx, started_rx)
         }
@@ -3137,6 +3235,7 @@ mod tests {
             max_tokens_cap,
             model_id: "test-model".to_string(),
             request_counter: Arc::new(AtomicU64::new(0)),
+            embedding_model: None,
         }
     }
 
@@ -3240,6 +3339,7 @@ mod tests {
                 max_tokens_cap: 64,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             };
 
             let response = router(state)
@@ -3266,6 +3366,176 @@ mod tests {
             assert_eq!(
                 value["error"]["message"],
                 "image input requires a vision-capable model"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /v1/embeddings router-level contract tests.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "test-utils")]
+    mod embeddings_route {
+        use super::*;
+        use axum::body::Body;
+        use lattice_inference::serve::embeddings::test_support::{
+            tiny_embedding_model, tiny_png_data_uri,
+        };
+        use tower::ServiceExt as _;
+
+        fn post_embeddings(body: serde_json::Value) -> axum::http::Request<Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request fixture must build")
+        }
+
+        fn state_with_embedder() -> AppState {
+            let mut state = tiny_state(64);
+            state.embedding_model = Some(Arc::new(tiny_embedding_model()));
+            state
+        }
+
+        async fn json_body(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            serde_json::from_slice(&bytes).expect("response body must be JSON")
+        }
+
+        #[tokio::test]
+        async fn no_embedding_model_loaded_fails_closed() {
+            let response = router(tiny_state(64))
+                .oneshot(post_embeddings(serde_json::json!({"input": "a"})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "vision_unsupported");
+        }
+
+        #[tokio::test]
+        async fn happy_path_text_only() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({"input": "a"})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            assert_eq!(value["object"], "list");
+            assert_eq!(value["data"][0]["object"], "embedding");
+            assert_eq!(value["data"][0]["index"], 0);
+            assert_eq!(value["data"][0]["embedding"].as_array().unwrap().len(), 8);
+        }
+
+        #[tokio::test]
+        async fn happy_path_image() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({
+                    "input": {"type": "image_url", "image_url": {"url": tiny_png_data_uri(0)}},
+                })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            let embedding = value["data"][0]["embedding"].as_array().unwrap();
+            let norm: f64 = embedding
+                .iter()
+                .map(|x| x.as_f64().unwrap().powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+        }
+
+        #[tokio::test]
+        async fn mixed_batch_preserves_input_order() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({
+                    "input": [
+                        "a",
+                        {"type": "image_url", "image_url": {"url": tiny_png_data_uri(1)}},
+                        "b",
+                    ],
+                })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            let data = value["data"].as_array().unwrap();
+            assert_eq!(data.len(), 3);
+            assert_eq!(data[0]["index"], 0);
+            assert_eq!(data[1]["index"], 1);
+            assert_eq!(data[2]["index"], 2);
+        }
+
+        #[tokio::test]
+        async fn remote_url_rejected() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({
+                    "input": {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "unsupported_image_url_scheme");
+        }
+
+        #[tokio::test]
+        async fn malformed_data_uri_rejected() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({
+                    "input": {"type": "image_url", "image_url": {"url": "data:image/png,not-base64-marked"}},
+                })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn invalid_pooling_rejected() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(
+                    serde_json::json!({"input": "a", "pooling": "max"}),
+                ))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "invalid_pooling");
+        }
+
+        #[tokio::test]
+        async fn empty_input_rejected() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({"input": []})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "invalid_input");
+        }
+
+        #[tokio::test]
+        async fn embeddings_route_advertised_at_root() {
+            let response = router(tiny_state(64))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("router must return a response");
+            let value = json_body(response).await;
+            assert!(
+                value["endpoints"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e == "/v1/embeddings")
             );
         }
     }
@@ -3609,6 +3879,7 @@ mod tests {
                 max_tokens_cap,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             }
         }
 
@@ -4063,6 +4334,7 @@ mod tests {
                 max_tokens_cap,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             }
         }
 
@@ -4264,6 +4536,7 @@ mod tests {
                 max_tokens_cap: 64,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             };
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -4406,6 +4679,7 @@ mod tests {
                 max_tokens_cap,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             }
         }
 

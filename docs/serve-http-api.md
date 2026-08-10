@@ -66,20 +66,27 @@ Listening on 127.0.0.1:8080  (model: qwen3.5-0.8b, max_tokens default: 64)
   GET  /health
 ```
 
-That printed route list is exhaustive — this is the complete router:
+That printed route list is a startup banner, not the full route table — it only echoes two of the
+routes below. This is the complete router:
 
 ```rust
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(root))
         .route("/health", get(health))
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
-        .layer(DefaultBodyLimit::max(1_048_576)) // 1 MiB request body cap
+        .route("/v1/embeddings", post(embeddings))
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 ```
 
-There is no `/v1/models`, `/v1/completions`, or any admin/metrics endpoint. If you need a model
-listing endpoint, that's `lattice_serve` (the other binary), not this one.
+`GET /` and `GET /v1/models` return an engine-identity document and a single-entry OpenAI model
+list, respectively. `POST /v1/embeddings` is always routed, but requires the server to have been
+started with `--model` pointed at a vision-language checkpoint; otherwise every request to it
+returns 400 `vision_unsupported` (see "`POST /v1/embeddings`" below). There is no `/v1/completions`
+or any admin/metrics endpoint.
 
 Shut down with Ctrl-C, or with SIGTERM on Unix:
 
@@ -100,8 +107,9 @@ these fixed shutdown intervals.
 None of this is implemented today — worth stating explicitly, since issue #601 asks for it:
 
 - **No authentication.** There is no API-key check, bearer-token check, or any other
-  `Authorization` handling anywhere in the router — it's exactly the two routes plus the
-  body-size layer shown above. Anyone who can reach the listening address can call it.
+  `Authorization` handling anywhere in the router — none of the five routes shown above (or the
+  body-size layer wrapping them) add one. Anyone who can reach the listening address can call
+  any of them.
 - **No rate limiting, no per-request admission control.** There is no request-count or
   concurrency-limiting middleware in front of the handlers. The only thing that rejects a request
   before it reaches model code is the 1 MiB body-size cap already shown above.
@@ -380,6 +388,88 @@ Two caveats worth knowing before you build on this:
   not emit a finish chunk, so `finish_reason: "stop"` remains reserved for genuine stop conditions.
   The specific engine error is logged server-side and is not exposed to the client.
 
+## `POST /v1/embeddings`
+
+Requires the server to have been started with `--model` pointed at a vision-language checkpoint
+(see "Extra memory when embeddings are enabled" below). Text items, inline-image items, or a mixed
+batch of both in one request:
+
+```bash
+curl http://127.0.0.1:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": ["a plain string", {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}],
+    "pooling": "mean_visual"
+  }'
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "object": "embedding", "index": 0, "embedding": [0.0123, -0.0871, 0.0456, 0.0219] },
+    { "object": "embedding", "index": 1, "embedding": [0.0342, -0.0158, 0.0904, -0.0027] }
+  ],
+  "model": "the-served-model-id",
+  "usage": { "prompt_tokens": 3, "total_tokens": 3 }
+}
+```
+
+(Truncated to 4 floats for readability; the real `embedding` vector length equals the checkpoint's
+decoder hidden size.)
+
+`input` also accepts a single plain string instead of an array. Notes on the fields:
+
+- `pooling`: `"mean_visual"` (default) or `"last_token"`. Any other value is 400
+  `invalid_pooling`.
+- Image items use the exact same `{"type":"image_url","image_url":{"url":...}}` shape and inline
+  data-URI parser chat's vision path uses — **remote `http(s)` image URLs are rejected** (400
+  `unsupported_image_url_scheme`); only `data:image/...;base64,...` is accepted. Malformed,
+  oversized, or wrong-format data URIs are 400 `invalid_image`.
+- `embedding` vectors are already L2-normalized server-side; no client-side normalization is
+  needed.
+- `data[].index` matches the item's position in the request's `input` array regardless of
+  processing order, so a mixed batch's response is caller-verifiable by index.
+- `usage.prompt_tokens` counts the real decoder-scaffold token count each item processes: a text
+  item's tokenized length, or — for an image item — the `vision_start` token, the checkpoint's
+  per-image pad-token count (derived from the image's patch grid), the `vision_end` token, and the
+  prompt text's tokenized length. Image cost is billed in tokens of the same scaffold the pooled
+  vision path actually runs through, not a flat placeholder.
+- Every item (text or image) whose scaffold token count would exceed the loaded checkpoint's
+  context window is rejected before it reaches pooled prefill, with 400
+  `context_length_exceeded` naming the item's index, its token count, and the limit — the same
+  preflight chat's own context-window check performs, applied here per input item instead of per
+  whole request.
+
+Caps, all enforced before an item is processed:
+
+| Cap                      | Value       |
+| ------------------------ | ----------- |
+| Per-image decoded bytes  | 48,000      |
+| Per-image base64 payload | 64,000      |
+| `input` array length     | 4,096 items |
+| Request body             | 1 MiB       |
+
+Unlike chat, `/v1/embeddings` does not limit a request to one image — each `input` item is
+embedded independently, so a batch of many images in one request is the expected use, bounded by
+the 4,096-item cap above rather than a single-image rule.
+
+If no vision-language checkpoint is loaded, every request to this route is rejected with 400
+`vision_unsupported`, naming `--model` as the remedy — restart the server pointed at a
+vision-language checkpoint directory to enable the route.
+
+### Extra memory when embeddings are enabled
+
+The embeddings loader opens the same `--model` directory the chat backend loaded, but independently
+and in f16 (unquantized): it requires a non-quantized safetensors vision-language directory,
+rejecting any directory containing a `quantize_index.json` (a Q4 checkpoint) and requiring
+`config.json` to declare a `vision_config`. A Q4 chat directory cannot double as the embeddings
+model, so whenever embeddings is enabled the chat backend serving that same directory is not Q4
+either. This second f16 load of the separate embeddings weights sits on top of whatever the chat
+backend already holds in memory, at roughly 2 bytes per checkpoint parameter, so expect resident
+memory to grow by roughly that much. If the loaded model directory has no vision config, this extra
+load is skipped entirely and only the chat backend stays resident.
+
 ## Context window and token-budget limits
 
 `lattice serve` enforces a **hardcoded `max_tokens_cap` of 4096** — this is not a CLI flag; it's a
@@ -436,7 +526,9 @@ message content. There is no requirement to strip reasoning blocks between turns
 ## Summary
 
 - `lattice serve` (not the separate `lattice_serve` binary) is the OpenAI-compatible server this
-  document covers: `GET /health`, `POST /v1/chat/completions`, nothing else.
+  document covers: `GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, and
+  `POST /v1/embeddings` (see above; the last requires a vision-language checkpoint at startup).
+  The standalone `lattice_serve` binary does not carry the embeddings route.
 - Non-streaming and streaming (SSE) both work today; the request struct's doc comment claiming
   streaming is unsupported is stale — verify against `reject_unsupported` and its tests, not that
   comment.
