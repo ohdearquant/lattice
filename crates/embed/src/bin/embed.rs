@@ -147,6 +147,9 @@ common options:
         if !images.is_empty() && vision_model_dir.is_none() {
             return usage("--vision-model-dir is required with --image");
         }
+        if images.is_empty() && vision_model_dir.is_some() {
+            return usage("--vision-model-dir requires --image");
+        }
         let pooling = match pooling_arg.as_deref() {
             None | Some("mean_visual") => PoolingStrategy::MeanVisualTokens,
             Some("last_token") => PoolingStrategy::LastToken,

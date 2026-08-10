@@ -380,6 +380,81 @@ Two caveats worth knowing before you build on this:
   not emit a finish chunk, so `finish_reason: "stop"` remains reserved for genuine stop conditions.
   The specific engine error is logged server-side and is not exposed to the client.
 
+## `POST /v1/embeddings`
+
+Requires the server to have been started with `--model` pointed at a vision-language checkpoint
+(see "Extra memory when embeddings are enabled" below). Text items, inline-image items, or a mixed
+batch of both in one request:
+
+```bash
+curl http://127.0.0.1:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": ["a plain string", {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}],
+    "pooling": "mean_visual"
+  }'
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "object": "embedding", "index": 0, "embedding": [0.01, -0.02, "..."] },
+    { "object": "embedding", "index": 1, "embedding": [0.03, 0.04, "..."] }
+  ],
+  "model": "the-served-model-id",
+  "usage": { "prompt_tokens": 3, "total_tokens": 3 }
+}
+```
+
+`input` also accepts a single plain string instead of an array. Notes on the fields:
+
+- `pooling`: `"mean_visual"` (default) or `"last_token"`. Any other value is 400
+  `invalid_pooling`.
+- Image items use the exact same `{"type":"image_url","image_url":{"url":...}}` shape and inline
+  data-URI parser chat's vision path uses — **remote `http(s)` image URLs are rejected** (400
+  `unsupported_image_url_scheme`); only `data:image/...;base64,...` is accepted. Malformed,
+  oversized, or wrong-format data URIs are 400 `invalid_image`.
+- `embedding` vectors are already L2-normalized server-side; no client-side normalization is
+  needed.
+- `data[].index` matches the item's position in the request's `input` array regardless of
+  processing order, so a mixed batch's response is caller-verifiable by index.
+- `usage.prompt_tokens` counts the real decoder-scaffold token count each item processes: a text
+  item's tokenized length, or — for an image item — the `vision_start` token, the checkpoint's
+  per-image pad-token count (derived from the image's patch grid), the `vision_end` token, and the
+  prompt text's tokenized length. Image cost is billed in tokens of the same scaffold the pooled
+  vision path actually runs through, not a flat placeholder.
+- Every item (text or image) whose scaffold token count would exceed the loaded checkpoint's
+  context window is rejected before it reaches pooled prefill, with 400
+  `context_length_exceeded` naming the item's index, its token count, and the limit — the same
+  preflight chat's own context-window check performs, applied here per input item instead of per
+  whole request.
+
+Caps, all enforced before an item is processed:
+
+| Cap                      | Value       |
+| ------------------------ | ----------- |
+| Per-image decoded bytes  | 48,000      |
+| Per-image base64 payload | 64,000      |
+| `input` array length     | 4,096 items |
+| Request body             | 1 MiB       |
+
+Unlike chat, `/v1/embeddings` does not limit a request to one image — each `input` item is
+embedded independently, so a batch of many images in one request is the expected use, bounded by
+the 4,096-item cap above rather than a single-image rule.
+
+If no vision-language checkpoint is loaded, every request to this route is rejected with 400
+`vision_unsupported`, naming `--model` as the remedy — restart the server pointed at a
+vision-language checkpoint directory to enable the route.
+
+### Extra memory when embeddings are enabled
+
+Enabling `/v1/embeddings` loads a second, independent copy of the checkpoint's decoder weights in
+f16 (unquantized) alongside whatever the chat backend already holds in memory (typically Q4). f16
+storage costs roughly 2 bytes per checkpoint parameter, so expect resident memory to grow by
+roughly that much on top of the chat backend's own footprint. If the loaded model directory has no
+vision config, this extra load is skipped entirely and only the chat backend stays resident.
+
 ## Context window and token-budget limits
 
 `lattice serve` enforces a **hardcoded `max_tokens_cap` of 4096** — this is not a CLI flag; it's a

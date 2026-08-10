@@ -1624,7 +1624,10 @@ pub async fn embeddings(
 
     let Some(embedder) = state.embedding_model.clone() else {
         return Err(ApiError::BadRequest {
-            message: "embeddings require a loaded vision-language checkpoint".to_string(),
+            message: "embeddings require a loaded vision-language checkpoint; restart this \
+                      server with `--model` pointed at a vision-language checkpoint directory \
+                      to enable this route"
+                .to_string(),
             code: "vision_unsupported",
         });
     };

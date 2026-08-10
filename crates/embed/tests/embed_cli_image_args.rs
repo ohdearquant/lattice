@@ -22,6 +22,20 @@ fn image_and_text_are_mutually_exclusive() {
 }
 
 #[test]
+fn vision_model_dir_without_image_is_a_usage_error() {
+    let output = embed_cmd()
+        .args(["--vision-model-dir", "/some/dir", "--text", "hello"])
+        .output()
+        .expect("embed binary must run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--vision-model-dir requires --image"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn image_requires_vision_model_dir() {
     let output = embed_cmd()
         .args(["--image", "x.png"])

@@ -25,6 +25,7 @@ use crate::vision::checkpoint::{
     Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
     open_qwen35_single_decoder_safetensors,
 };
+use crate::vision::qwen35_vit::preprocess_qwen35_image;
 use crate::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 use crate::weights::f16_weights::{F16ModelWeights, load_f16_weights};
 
@@ -121,6 +122,54 @@ impl EmbeddingModel {
     /// Real tokenized length of `text`, used for `usage.prompt_tokens`.
     pub fn tokenize_len(&self, text: &str) -> usize {
         self.tokenizer.tokenize(text).real_length
+    }
+
+    /// Maximum decoder scaffold length this checkpoint can process in one
+    /// pooled prefill, mirroring the exact cap the chat serving path derives
+    /// from the same field for its RoPE table (`Qwen35Model::from_safetensors`:
+    /// `config.max_position_embeddings.min(8192)`). Used as the source of
+    /// truth for [`check_item_fits_window`].
+    pub fn max_context(&self) -> usize {
+        self.config.max_position_embeddings.min(8192)
+    }
+
+    /// Real scaffold token count an image item consumes: one
+    /// `vision_start_token_id`, one `vision_end_token_id`, the checkpoint's
+    /// per-image pad-token count derived from the patch grid (mirroring
+    /// `pooled_embed.rs`'s own `image_pad_positions`/`num_pads` arithmetic,
+    /// via a separate, cheap preprocessing call rather than by reaching into
+    /// that module's internals), and `prompt`'s tokenized length. Used both
+    /// for `usage.prompt_tokens` accounting and (via the returned count) can
+    /// be compared against [`Self::max_context`] the same way a text item is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InferenceError::InvalidInput`] if the checkpoint has no
+    /// `vision_config`, or if the image cannot be decoded/preprocessed (see
+    /// [`preprocess_qwen35_image`]'s error conditions).
+    pub fn image_scaffold_token_count(
+        &self,
+        image_bytes: &[u8],
+        prompt: &str,
+    ) -> Result<usize, InferenceError> {
+        let vision_cfg = self.config.vision_config.as_ref().ok_or_else(|| {
+            InferenceError::InvalidInput(
+                "checkpoint has no vision_config; cannot count image scaffold tokens".to_string(),
+            )
+        })?;
+        let (_pixel_values, grid) =
+            preprocess_qwen35_image(image_bytes, vision_cfg).map_err(|e| {
+                InferenceError::InvalidInput(format!("image preprocessing failed: {e}"))
+            })?;
+        let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
+        if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
+            return Err(InferenceError::InvalidInput(format!(
+                "image grid {grid:?} patch count is not a multiple of spatial_merge_size^2"
+            )));
+        }
+        let pads = grid.num_patches() / merge_sq;
+        // vision_start + pads + vision_end + prompt tokens.
+        Ok(2 + pads + self.tokenize_len(prompt))
     }
 
     /// Pool a text-only prompt through the same decoder + pooling path used
@@ -385,23 +434,53 @@ pub struct EmbeddingsResponse {
     pub usage: EmbeddingsUsage,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct EmbeddingDatum {
     pub object: &'static str,
     pub index: usize,
     pub embedding: Vec<f32>,
 }
 
-/// Token accounting for the request. Only text items are tokenized on this
-/// path (`prompt_tokens` counts text items' real tokenized length); image
-/// items contribute 0 rather than a fabricated token count, since the
-/// checkpoint's image-pad-token count is an implementation detail of the
-/// pooling scaffold, not a caller-meaningful "token" the way chat's
-/// `usage.prompt_tokens` is.
-#[derive(Serialize)]
+/// Token accounting for the request. `prompt_tokens` counts the real
+/// decoder-scaffold token count each item processes: a text item's real
+/// tokenized length, or an image item's `vision_start` + pad tokens +
+/// `vision_end` + prompt tokens (see
+/// [`EmbeddingModel::image_scaffold_token_count`]) -- image cost is billed
+/// in tokens of the decoder scaffold the pooled path actually runs through,
+/// not a fabricated zero.
+#[derive(Debug, Serialize)]
 pub struct EmbeddingsUsage {
     pub prompt_tokens: usize,
     pub total_tokens: usize,
+}
+
+/// Rejects an item whose scaffold token count exceeds `max_context`, before
+/// it reaches full-attention pooled prefill -- mirrors the chat serving
+/// path's own context-window preflight
+/// (`contract::validate_context_window_with_budget`), which runs before any
+/// generation call for the same reason: an unbounded prompt is O(n^2)
+/// attention work with no cap otherwise, since the 1 MiB request-body limit
+/// alone permits roughly 250K characters of text.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`context_length_exceeded`) naming the
+/// item's index, its token count, and the limit.
+fn check_item_fits_window(
+    index: usize,
+    token_count: usize,
+    max_context: usize,
+) -> Result<(), ApiError> {
+    if token_count > max_context {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "input item {index} has {token_count} scaffold tokens, exceeding the model's \
+                 context window of {max_context} tokens"
+            ),
+            code: "context_length_exceeded",
+        });
+    }
+    Ok(())
 }
 
 /// Runs every normalized item through `embedder`, in order, building the
@@ -410,23 +489,34 @@ pub struct EmbeddingsUsage {
 ///
 /// # Errors
 ///
-/// Returns the first item's mapped [`ApiError`] (via [`map_embedding_error`])
-/// on failure; earlier items' work is discarded rather than partially
-/// returned; there is no partial-batch response shape in this contract.
+/// Returns [`ApiError::BadRequest`] (`context_length_exceeded`, via
+/// [`check_item_fits_window`]) for the first item whose scaffold token count
+/// exceeds the loaded model's context window. Otherwise returns the first
+/// item's mapped [`ApiError`] (via [`map_embedding_error`]) on failure;
+/// earlier items' work is discarded rather than partially returned; there is
+/// no partial-batch response shape in this contract.
 pub fn embed_items(
     embedder: &EmbeddingModel,
     items: Vec<NormalizedEmbeddingItem>,
     pooling: PoolingStrategy,
 ) -> Result<(Vec<EmbeddingDatum>, EmbeddingsUsage), ApiError> {
+    let max_context = embedder.max_context();
     let mut data = Vec::with_capacity(items.len());
     let mut prompt_tokens = 0usize;
     for (index, item) in items.into_iter().enumerate() {
         let embedding = match &item {
             NormalizedEmbeddingItem::Text(text) => {
-                prompt_tokens += embedder.tokenize_len(text);
+                let token_count = embedder.tokenize_len(text);
+                check_item_fits_window(index, token_count, max_context)?;
+                prompt_tokens += token_count;
                 embedder.embed_text(text, pooling)
             }
             NormalizedEmbeddingItem::Image(bytes) => {
+                let token_count = embedder
+                    .image_scaffold_token_count(bytes, "")
+                    .map_err(map_embedding_error)?;
+                check_item_fits_window(index, token_count, max_context)?;
+                prompt_tokens += token_count;
                 embedder.embed_image_best_effort(bytes, "", pooling)
             }
         }
@@ -689,6 +779,38 @@ mod tests {
         assert_eq!(data[0].index, 0);
         assert_eq!(data[0].embedding.len(), model.dimensions());
         assert!(usage.prompt_tokens > 0);
+    }
+
+    #[test]
+    fn embed_items_rejects_text_item_over_context_window() {
+        let model = tiny_embedding_model();
+        assert_eq!(model.max_context(), 512);
+        // Single-character vocab, no merges: each "a" is its own token, so
+        // this tokenizes to 600 tokens, above the tiny fixture's 512-token
+        // context window.
+        let over_limit_text = "a".repeat(600);
+        let items =
+            normalize_embedding_items(vec![EmbeddingInputItem::Text(over_limit_text)]).unwrap();
+        let err = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(message.contains("input item 0"), "message: {message}");
+                assert!(message.contains("600"), "message: {message}");
+                assert!(message.contains("512"), "message: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embed_items_accepts_text_item_within_context_window() {
+        let model = tiny_embedding_model();
+        let items =
+            normalize_embedding_items(vec![EmbeddingInputItem::Text("a".repeat(10))]).unwrap();
+        let (data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(usage.prompt_tokens, 10);
     }
 
     #[test]

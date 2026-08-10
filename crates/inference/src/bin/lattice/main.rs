@@ -48,7 +48,13 @@ enum Command {
     /// Start HTTP server with OpenAI-compatible API
     Serve {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
-        /// directory produced by `quantize_q4`)
+        /// directory produced by `quantize_q4`). If this directory is a
+        /// vision-language checkpoint, /v1/embeddings additionally loads its
+        /// own independent f16-packed copy of the decoder alongside the chat
+        /// backend, costing roughly 2 extra resident bytes per checkpoint
+        /// parameter (f16 storage); a checkpoint without vision support
+        /// skips that extra load entirely, so only the chat backend stays
+        /// resident.
         #[arg(long)]
         model: String,
         /// Host address to bind (default: 127.0.0.1; use 0.0.0.0 for LAN)
