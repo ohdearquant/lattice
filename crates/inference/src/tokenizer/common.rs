@@ -28,6 +28,14 @@ pub struct TokenizedInput {
     pub token_type_ids: Vec<u32>,
     /// Number of real tokens before padding.
     pub real_length: usize,
+    /// Number of tokens produced before any max-sequence-length truncation
+    /// was applied. Equal to `real_length` when the tokenizer did not
+    /// truncate; larger than `real_length` (and than `input_ids.len()`) when
+    /// it did. Context-window admission checks must compare against this
+    /// field, not `real_length`, since `real_length` can never exceed the
+    /// tokenizer's own `max_seq_len` and so cannot signal an over-limit
+    /// input when `max_seq_len <= max_position_embeddings`.
+    pub pre_truncation_len: usize,
 }
 
 /// **Stable**: object-safe tokenizer trait; concrete impls (`WordPieceTokenizer`,
@@ -117,6 +125,7 @@ pub(crate) fn pad_ids_with_token_types(
         attention_mask,
         token_type_ids,
         real_length,
+        pre_truncation_len: real_length,
     }
 }
 
@@ -133,6 +142,7 @@ pub(crate) fn pad_ids(mut ids: Vec<u32>, pad_to: usize, pad_id: u32) -> Tokenize
         attention_mask,
         token_type_ids,
         real_length,
+        pre_truncation_len: real_length,
     }
 }
 

@@ -2899,15 +2899,15 @@ mod imp {
         }
 
         let embedding_model_id = embedding.model_id.clone();
-        let item_token_counts: Vec<usize> = {
+        let (item_token_counts, item_pre_truncation_counts): (Vec<usize>, Vec<usize>) = {
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             embedding
                 .model
                 .tokenizer()
                 .tokenize_batch(&refs)
                 .iter()
-                .map(|t| t.real_length)
-                .collect()
+                .map(|t| (t.real_length, t.pre_truncation_len))
+                .unzip()
         };
         let prompt_tokens: usize = item_token_counts.iter().sum();
         // Checked per item, before either `BertModel::encode_batch` path
@@ -2915,9 +2915,12 @@ mod imp {
         // `max_position_embeddings` and would otherwise answer 200 for a
         // silently truncated embedding, and the single-item `encode` path
         // does not clamp at all. See `check_embeddings_item_fits_window`'s
-        // doc comment.
+        // doc comment. The guard tests `pre_truncation_len`, not
+        // `real_length`: the tokenizer's own `max_seq_len` truncation runs
+        // first, so `real_length` can never exceed it and the guard would be
+        // unsatisfiable whenever `max_seq_len <= max_position_embeddings`.
         let max_position_embeddings = embedding.model.config().max_position_embeddings;
-        if let Some((index, &token_count)) = item_token_counts
+        if let Some((index, &token_count)) = item_pre_truncation_counts
             .iter()
             .enumerate()
             .find(|&(_, &count)| count > max_position_embeddings)
@@ -4276,6 +4279,46 @@ mod imp {
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(code, "model_not_found");
+        }
+
+        // Regression: the context-window guard used to measure each item's
+        // *post-truncation* token count (`WordPieceTokenizer` truncates to
+        // its own `max_seq_len` during tokenization), and `BertModel::
+        // from_directory` sets `max_seq_len = max_position_embeddings.min(
+        // 2048)`, so for every real BERT checkpoint loaded that way the two
+        // are equal by construction. A post-truncation count can never
+        // exceed `max_seq_len`, so the old `count > max_position_embeddings`
+        // test was unsatisfiable and an over-limit input was silently
+        // truncated and embedded instead of rejected. This fixture (a real
+        // `bge-small-en-v1.5` checkpoint, `max_position_embeddings: 512`,
+        // no `tokenizer_config.json` to set a different `model_max_length`)
+        // sits exactly in that collision case -- see the `assert_eq!` below.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
+        async fn embeddings_item_over_context_window_400() {
+            let Some(embedding) = test_embedding_state() else {
+                return;
+            };
+            assert_eq!(
+                embedding.model.tokenizer().max_seq_len(),
+                embedding.model.config().max_position_embeddings,
+                "fixture must sit in the collision case (tokenizer max_seq_len == \
+                 model max_position_embeddings) or this regression guards nothing"
+            );
+            // Comfortably above the 512-token window regardless of the
+            // loaded checkpoint's exact vocabulary.
+            let over_limit_text = "hello ".repeat(600);
+            let body = Body::from(serde_json::json!({ "input": over_limit_text }).to_string());
+            let response = embeddings(
+                State(test_app_state_with_embedding(embedding)),
+                test_json_headers(),
+                body,
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "context_length_exceeded");
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

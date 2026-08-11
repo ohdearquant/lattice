@@ -40,12 +40,23 @@ pub enum BertPooling {
 ///
 /// This mirrors `lattice-embed`'s `EmbeddingModel::bert_pooling` table
 /// (`crates/embed/src/model.rs`), duplicated rather than called: that
-/// function dispatches on `lattice-embed`'s own closed `EmbeddingModel`
-/// enum, not a name string, and `lattice-embed` already depends on this
-/// crate, so a call the other way would be a cyclic package dependency. See
-/// `lattice-embed`'s own test suite (`crates/embed/src/model.rs`) for the
-/// agreement check between the two tables -- it is the only crate that sees
-/// both `EmbeddingModel` and this function as the same compiled unit.
+/// function dispatches on `lattice-embed`'s own `#[non_exhaustive]`
+/// `EmbeddingModel` enum, not a name string, and `lattice-embed` already
+/// depends on this crate, so a call the other way would be a cyclic package
+/// dependency. See `lattice-embed`'s own test suite (`crates/embed/src/
+/// model.rs`) for the agreement check between the two tables -- it is the
+/// only crate that sees both `EmbeddingModel` and this function as the same
+/// compiled unit.
+///
+/// A name this function does not recognize (does not contain `"bge"`,
+/// case-insensitively) falls back to [`BertPooling::default`] (mean
+/// pooling) rather than erroring, matching the E5/MiniLM families' own
+/// pooling strategy.
+///
+/// `#[doc(hidden)]`: exported only so `lattice_serve` and `lattice-embed`'s
+/// test suite can call it across the crate boundary; not part of this
+/// crate's public API.
+#[doc(hidden)]
 pub fn default_bert_pooling_for_model_name(name: &str) -> BertPooling {
     if name.to_ascii_lowercase().contains("bge") {
         BertPooling::CLS
