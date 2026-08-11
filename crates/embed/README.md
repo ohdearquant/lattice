@@ -12,7 +12,7 @@ similarity matching.
 
 ## Models
 
-| Model                               | Dimensions | Use Case                                    | HuggingFace ID                                              |
+| Model                               | Dimensions | Use Case                                    | Model ID                                                    |
 | ----------------------------------- | ---------- | ------------------------------------------- | ----------------------------------------------------------- |
 | `BgeSmallEnV15`                     | 384        | Fast, general purpose (default)             | BAAI/bge-small-en-v1.5                                      |
 | `BgeBaseEnV15`                      | 768        | Balanced quality/speed                      | BAAI/bge-base-en-v1.5                                       |
@@ -23,7 +23,11 @@ similarity matching.
 | `ParaphraseMultilingualMiniLmL12V2` | 384        | Multilingual, XLM-R base                    | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 |
 | `Qwen3Embedding0_6B`                | 1024       | Multilingual, decoder-only, GPU-accelerated | Qwen/Qwen3-Embedding-0.6B                                   |
 | `Qwen3Embedding4B`                  | 2560       | Multilingual, decoder-only, MRL-capable     | Qwen/Qwen3-Embedding-4B                                     |
-| `TextEmbedding3Small`               | 1536       | Remote API (OpenAI)                         | text-embedding-3-small                                      |
+| `TextEmbedding3Small`               | 1536       | Remote API (OpenAI, scaffold-only)          | text-embedding-3-small                                      |
+
+`TextEmbedding3Small`'s ID is an OpenAI model id, not a HuggingFace one; `EmbeddingModel::is_remote()`
+returns `true` for it and the native embedding service rejects it (see
+[supported-model reference](../../docs/models.md)).
 
 Dimensions and input-token limits vary per model. See the
 [supported-model reference](../../docs/models.md) for every variant's limit, pooling strategy,

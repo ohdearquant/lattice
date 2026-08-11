@@ -116,8 +116,11 @@ client or per unit time.
   body-size layer wrapping them) add one. Anyone who can reach the listening address can call
   any of them.
 - **No rate limiting.** There is no request-count or IP-based throttling middleware in front of the
-  handlers. The only things that reject a request before it reaches model code are the 1 MiB
-  body-size cap already shown above and the Metal-backend admission cap described next.
+  handlers. The only overload/admission controls that reject a request before it reaches model
+  code are the 1 MiB body-size cap already shown above and the Metal-backend admission cap
+  described next; request validation (shape, bounds, sampling parameters, unsupported fields —
+  see `crates/inference/src/serve/contract.rs`) also rejects requests before generation, but is a
+  separate class of check from overload/rate control.
 - **CPU backend: not serialized by the server, but not free either.** Each CPU request's
   `generate` call runs as blocking work on a Tokio blocking-pool task
   (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice.rs`), so multiple CPU requests
@@ -130,9 +133,11 @@ client or per unit time.
   — a deliberate design choice matching how one local GPU device actually works, not an oversight.
   Two concurrent requests against a Q4-backed `lattice serve` run back-to-back, not in parallel;
   the later request's connection simply stays open until its turn in the channel comes up, up to
-  a hard cap of `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once (issue #932). A
-  request submitted while the cap is already full is rejected before any tokenization or model
-  work happens, with:
+  `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). Both
+  `lattice serve` and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
+  default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
+  `crates/inference/src/bin/lattice_serve.rs`). A request submitted while the cap is already full
+  is rejected before any tokenization or model work happens, with:
 
   ```json
   {
@@ -361,7 +366,9 @@ This support has a real gap worth knowing about: it is wired into the plain CPU 
 but **not** into the cross-turn prefix-cache-aware Metal path
 (`generate_streaming_with_prefix_cache_and_cancel`, see
 [`docs/cross-turn-cache.md`](cross-turn-cache.md)) — and that cache-aware path is what the shared
-Metal worker now uses for every Metal-backed request, streaming or not
+Metal worker now uses for every text Metal-backed request, streaming or not — vision requests take
+a separate `generate_multimodal_vision_with_cancel` path that never reaches it, see
+[`docs/cross-turn-cache.md`](cross-turn-cache.md)
 (`check_logprobs_not_set` in `crates/inference/src/model/qwen35/generation.rs` fails closed on it).
 In practice: `logprobs: true` against a CPU (safetensors) server works as documented above; the
 same request against a Metal/Q4-backed server currently fails with a generic HTTP 500
@@ -575,5 +582,6 @@ message content. There is no requirement to strip reasoning blocks between turns
 - `max_tokens` is hard-capped at 4096 server-wide; the Metal/Q4 backend additionally caps total
   context at 4096 regardless of the model's own configured maximum.
 - The Metal/Q4 backend has cross-turn KV/GDN prefix caching and a bounded pending-job admission
-  cap (`server_busy`, HTTP 503, at 32 outstanding jobs); both binaries now support
-  client-disconnect cancellation on the streaming path.
+  cap (`server_busy`, HTTP 503, at 32 outstanding jobs by default, configurable via
+  `--max-pending`); both binaries now support client-disconnect cancellation on the streaming
+  path.

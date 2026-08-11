@@ -147,11 +147,11 @@ and must be stored in separate namespaces.
 
 ## Feature Flags
 
-| Feature     | Default | Description                                             |
-| ----------- | ------- | ------------------------------------------------------- |
-| `native`    | yes     | Enable `NativeEmbeddingService` via `lattice-inference` |
-| `metal-gpu` | no      | Metal GPU backend for Apple Silicon                     |
-| `avx512`    | no      | AVX-512 kernels (requires nightly Rust)                 |
+| Feature     | Default | Description                                                                                                |
+| ----------- | ------- | ---------------------------------------------------------------------------------------------------------- |
+| `native`    | yes     | Enable `NativeEmbeddingService` via `lattice-inference`                                                    |
+| `metal-gpu` | no      | Metal GPU backend for Apple Silicon                                                                        |
+| `avx512`    | no      | Deprecated no-op — the AVX-512 VNNI int8 kernel runs unconditionally, runtime-dispatched, on stable x86_64 |
 
 ```toml
 # Apple Silicon with GPU acceleration
@@ -168,9 +168,12 @@ Models are cached at `~/.lattice/models/<model-name>/`. Each model directory con
     vocab.txt           # WordPiece vocabulary (BGE/MiniLM models)
 ```
 
-The tokenizer file is one or the other, never both, depending on the model family: BGE/MiniLM
-models fetch `vocab.txt` (WordPiece); E5 and multilingual models fetch `tokenizer.json`
-(SentencePiece) instead.
+On first download, the downloader fetches one tokenizer file per model family — BGE/MiniLM models
+fetch `vocab.txt`; E5 and multilingual models fetch `tokenizer.json` — but nothing prevents both
+files from being present in a model directory (e.g. if placed there manually). When both exist,
+the loader gives `tokenizer.json` priority (`crates/inference/src/tokenizer/common.rs`). Tokenizer
+kind is auto-detected from the file's contents, not hard-coded by model family — see
+[`docs/models.md`](models.md) §4 for the precedence order and per-family notes.
 
 The `download` feature in `lattice-inference` (enabled by default) fetches from
 `https://huggingface.co/{model_id}/resolve/main/` on first use. Subsequent calls
