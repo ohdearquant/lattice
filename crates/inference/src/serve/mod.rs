@@ -292,15 +292,20 @@ pub enum ApiError {
     /// or unvalidated JSON as a 200 is prohibited, so this is still a 500,
     /// just with a code the caller can branch on instead of a generic one.
     ServerError { message: String, code: &'static str },
-    /// Admission rejected: the shared Metal worker's outstanding-job cap
-    /// (queued + in-flight) is already full — HTTP 503 (issue #932). This is
-    /// the ONE place `MetalWorkerClient::submit` is allowed to fail
-    /// outwardly (see that method's doc comment): every other failure mode
-    /// on that path still closes the returned receiver with zero events
-    /// instead. Deliberately 503 ("server busy, try again"), not 429: this
-    /// is a shared, single-GPU capacity limit on the server as a whole, not
-    /// a per-caller rate limit — the request itself was perfectly fine.
-    ServiceUnavailable { message: String },
+    /// Server-side unavailability — HTTP 503. Covers two distinct causes,
+    /// distinguished by `code`: an admission-capacity rejection (the shared
+    /// Metal worker's outstanding-job cap, queued + in-flight, is already
+    /// full — issue #932 — or an embedding-worker concurrency cap, `code:
+    /// "server_busy"`), and a route whose backing model was never loaded at
+    /// startup (`code: "embedding_model_not_loaded"` for `POST
+    /// /v1/embeddings` with no `--embedding-model`). For the admission-cap
+    /// case, this is the ONE place `MetalWorkerClient::submit` is allowed to
+    /// fail outwardly (see that method's doc comment): every other failure
+    /// mode on that path still closes the returned receiver with zero
+    /// events instead. Deliberately 503 ("server busy, try again"), not
+    /// 429: capacity limits are shared server-wide state, not a per-caller
+    /// rate limit — the request itself was perfectly fine.
+    ServiceUnavailable { message: String, code: &'static str },
     /// `Content-Type` missing or not JSON — HTTP 415. Mirrors axum's own
     /// `Json` extractor rejection (`json_content_type` in axum 0.8's
     /// `src/json.rs`): accepts iff the header parses as a MIME type with
@@ -321,7 +326,7 @@ impl ApiError {
             ApiError::PayloadTooLarge { message } => message,
             ApiError::Internal { message } => message,
             ApiError::ServerError { message, .. } => message,
-            ApiError::ServiceUnavailable { message } => message,
+            ApiError::ServiceUnavailable { message, .. } => message,
             ApiError::UnsupportedMediaType { message } => message,
         }
     }
@@ -337,7 +342,7 @@ impl ApiError {
             ApiError::PayloadTooLarge { .. } => "request_body_too_large",
             ApiError::Internal { .. } => "internal_error",
             ApiError::ServerError { code, .. } => code,
-            ApiError::ServiceUnavailable { .. } => "server_busy",
+            ApiError::ServiceUnavailable { code, .. } => code,
             ApiError::UnsupportedMediaType { .. } => "unsupported_media_type",
         }
     }
@@ -392,12 +397,12 @@ impl IntoResponse for ApiError {
                 });
                 (StatusCode::INTERNAL_SERVER_ERROR, body).into_response()
             }
-            ApiError::ServiceUnavailable { message } => {
+            ApiError::ServiceUnavailable { message, code } => {
                 let body = Json(ErrorBody {
                     error: ErrorDetail {
                         message,
                         r#type: "server_error",
-                        code: "server_busy".to_string(),
+                        code: code.to_string(),
                         param: None,
                     },
                 });

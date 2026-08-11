@@ -111,7 +111,7 @@ mod imp {
     };
     use lattice_inference::serve::embeddings::{
         TextEmbeddingsRequest, build_embeddings_response, check_embeddings_model,
-        parse_embeddings_input,
+        check_embeddings_total_tokens, parse_embeddings_input,
     };
     use lattice_inference::serve::into_engine_chat_messages;
     use lattice_inference::serve::metal_worker::{
@@ -125,6 +125,7 @@ mod imp {
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use tokio::sync::Semaphore;
     /// Only used by the test module's raw job-channel helpers
     /// (`mpsc::UnboundedReceiver<WorkerJob>` etc. -- see
     /// `lattice_inference::serve::metal_worker`'s `test-utils`-gated
@@ -219,6 +220,45 @@ mod imp {
     pub struct EmbeddingState {
         model: BertModel,
         model_id: Arc<str>,
+        /// Bounded concurrent-job admission for `encode_batch`'s
+        /// `spawn_blocking` calls (issue #584 hardening), mirroring
+        /// `MetalWorkerClient`'s admission `Semaphore` (`AppState::max_pending`,
+        /// issue #932): each outstanding job can already allocate up to
+        /// [`lattice_inference::serve::embeddings::MAX_EMBEDDINGS_TOTAL_TOKENS`]
+        /// worth of activation buffers, so total memory pressure across
+        /// concurrent requests is bounded by (this cap) x (that per-request
+        /// budget) rather than growing with however many requests arrive at
+        /// once. Fixed at [`EMBEDDING_MAX_CONCURRENT_JOBS`] rather than a
+        /// CLI flag like `--max-pending`: CPU-bound batched matmuls have no
+        /// hardware queue depth to model, this cap exists purely to bound
+        /// aggregate memory.
+        admission: Arc<Semaphore>,
+    }
+
+    /// See [`EmbeddingState::admission`].
+    const EMBEDDING_MAX_CONCURRENT_JOBS: usize = 4;
+
+    /// Acquires one embedding-job admission slot, mirroring
+    /// `MetalWorkerClient::submit`'s admission check (issue #932) for
+    /// [`EmbeddingState::admission`]. Synchronous and non-blocking: a full
+    /// admission cap is rejected immediately, before any tokenization or
+    /// `encode_batch` work runs, exactly like the chat path's admission
+    /// check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`lattice_inference::serve::ApiError::ServiceUnavailable`]
+    /// (`server_busy`) when [`EMBEDDING_MAX_CONCURRENT_JOBS`] jobs are
+    /// already outstanding.
+    fn try_acquire_embedding_slot(
+        admission: &Arc<Semaphore>,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, lattice_inference::serve::ApiError> {
+        admission.clone().try_acquire_owned().map_err(|_| {
+            lattice_inference::serve::ApiError::ServiceUnavailable {
+                message: "too many outstanding /v1/embeddings requests; retry shortly".to_string(),
+                code: "server_busy",
+            }
+        })
     }
 
     // ─── OpenAI request shapes ───────────────────────────────────────────────
@@ -2805,6 +2845,7 @@ mod imp {
                 message: "no embedding model is loaded; start lattice_serve with \
                           --embedding-model <dir>"
                     .to_string(),
+                code: "embedding_model_not_loaded",
             }
             .into_response();
         };
@@ -2834,6 +2875,37 @@ mod imp {
                 .iter()
                 .map(|t| t.real_length)
                 .sum()
+        };
+        if let Err(err) = check_embeddings_total_tokens(prompt_tokens) {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                400,
+                Some(prompt_tokens),
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
+        let _admission_permit = match try_acquire_embedding_slot(&embedding.admission) {
+            Ok(permit) => permit,
+            Err(err) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    ROUTE,
+                    503,
+                    Some(prompt_tokens),
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some(err.code()),
+                );
+                return err.into_response();
+            }
         };
 
         let encode_result = tokio::task::spawn_blocking(move || {
@@ -3331,6 +3403,7 @@ mod imp {
                 Some(Arc::new(EmbeddingState {
                     model,
                     model_id: embedding_model_id,
+                    admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
                 }))
             }
         };
@@ -3775,7 +3848,7 @@ mod imp {
         /// model, and hand-building a synthetic safetensors byte buffer with
         /// every tensor `BertWeights::load` requires (~16 tensors per layer)
         /// is exactly the kind of unverifiable-in-this-environment risk this
-        /// route's tests are already carrying (see REPORT.md) -- better to
+        /// route's tests are already carrying -- better to
         /// reuse the repo's own established real-model convention than add a
         /// second, novel, equally-unrun fixture-construction path.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -3787,6 +3860,7 @@ mod imp {
             Some(Arc::new(EmbeddingState {
                 model,
                 model_id: Arc::from("test-embedding-model"),
+                admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
             }))
         }
 
@@ -3914,11 +3988,68 @@ mod imp {
             let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            // `ApiError::ServiceUnavailable`'s fixed OpenAI-style code
-            // (shared with the Metal worker's admission-cap rejection, issue
-            // #932) -- see REPORT.md for why this route reuses it rather
-            // than adding a new `ApiError` variant.
-            assert_eq!(code, "server_busy");
+            // Documented contract (docs/capability-matrix.md): a request
+            // reaching this route with no `--embedding-model` loaded gets
+            // `embedding_model_not_loaded`, distinct from the Metal
+            // worker's admission-cap `server_busy` (issue #932) -- both are
+            // 503s, but only one names a route the operator forgot to
+            // enable.
+            assert_eq!(code, "embedding_model_not_loaded");
+        }
+
+        /// Unit-level coverage for the embedding-concurrency admission cap
+        /// ([`EmbeddingState::admission`] / [`try_acquire_embedding_slot`]):
+        /// a real end-to-end version of this test (two concurrent
+        /// `/v1/embeddings` requests, the first held open until the second
+        /// is rejected) would need the same "block a real worker thread
+        /// until signaled" rig `single_slot_blocking_state`/
+        /// `chat_completions_returns_503_json_envelope_when_admission_cap_reached`
+        /// use for the Metal chat path -- disproportionate here since the
+        /// admission check itself is a plain `Semaphore::try_acquire_owned`
+        /// call with no embedding-specific logic between "cap reached" and
+        /// "rejected", so exercising the semaphore directly covers the same
+        /// behavior the handler relies on.
+        #[test]
+        fn try_acquire_embedding_slot_rejects_once_cap_reached() {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit1 =
+                try_acquire_embedding_slot(&admission).expect("first slot must be admitted");
+            let err = try_acquire_embedding_slot(&admission)
+                .expect_err("second slot must be rejected: cap=1, 1 outstanding");
+            match err {
+                lattice_inference::serve::ApiError::ServiceUnavailable { code, .. } => {
+                    assert_eq!(code, "server_busy");
+                }
+                other => panic!("expected ServiceUnavailable, got {other:?}"),
+            }
+            drop(permit1);
+            let _permit2 = try_acquire_embedding_slot(&admission)
+                .expect("slot must be admitted again once the first is released");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
+        async fn embeddings_total_token_budget_exceeded_400() {
+            use lattice_inference::serve::embeddings::MAX_EMBEDDINGS_TOTAL_TOKENS;
+            let Some(embedding) = test_embedding_state() else {
+                return;
+            };
+            // Repeated single-character words tokenize to roughly one real
+            // token each for a typical BPE vocabulary; comfortably above
+            // the budget regardless of the loaded checkpoint's exact
+            // tokenization, without needing to know its vocabulary.
+            let over_budget_text = "a ".repeat(MAX_EMBEDDINGS_TOTAL_TOKENS + 1000);
+            let body = Body::from(serde_json::json!({ "input": over_budget_text }).to_string());
+            let response = embeddings(
+                State(test_app_state_with_embedding(embedding)),
+                test_json_headers(),
+                body,
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "batch_token_budget_exceeded");
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

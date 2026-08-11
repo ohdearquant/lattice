@@ -448,6 +448,7 @@ impl MetalWorkerClient {
                 message: "too many outstanding requests; the inference worker's pending-job \
                           queue is full, retry shortly"
                     .to_string(),
+                code: "server_busy",
             }
         })?;
         let (tx, rx) = mpsc::unbounded_channel();
@@ -3154,7 +3155,8 @@ mod tests {
             )
             .expect_err("job 3 must be rejected once the cap is reached");
         match err {
-            ApiError::ServiceUnavailable { message } => {
+            ApiError::ServiceUnavailable { message, code } => {
+                assert_eq!(code, "server_busy");
                 assert!(
                     message.contains("outstanding") || message.contains("pending"),
                     "rejection message should explain admission capacity: {message}"

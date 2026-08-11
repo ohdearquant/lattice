@@ -798,6 +798,47 @@ pub mod test_support {
 /// any inference happens.
 pub const MAX_EMBEDDINGS_BATCH_SIZE: usize = 2048;
 
+/// Maximum sum of real token counts across every item in a single
+/// `/v1/embeddings` request, independent of [`MAX_EMBEDDINGS_BATCH_SIZE`]'s
+/// per-request item-count cap. `BertModel`'s packed batched-encode pipeline
+/// (`encode_batch_packed` / `forward_batch` in
+/// `crates/inference/src/model/bert.rs`) allocates its per-call activation
+/// buffers (`hidden`, `q`, `k`, `v`, `qkv`, `concat`, `attn_out`, `temp`,
+/// each sized `total_tokens * hidden_size`, plus `ffn_intermediate` sized
+/// `total_tokens * intermediate_size`) proportional to the *sum* of every
+/// item's real token count, not the item count -- so `MAX_EMBEDDINGS_BATCH_SIZE`
+/// alone does not bound this allocation: a request at the 2048-item cap
+/// with long inputs can reach roughly a million aggregate tokens (2048
+/// items times a representative 512-token context window), which at a
+/// representative embedding-BERT scale (`hidden_size=768`,
+/// `intermediate_size=3072`: `9 * hidden_size + intermediate_size = 9,984`
+/// f32s of buffer per aggregate token) is tens of gigabytes of activation
+/// memory for one request. `32,768` keeps that same calculation to roughly
+/// 1.3 GB (`32,768 * 9,984 * 4` bytes) at that representative scale, while
+/// still admitting large batches of short texts.
+pub const MAX_EMBEDDINGS_TOTAL_TOKENS: usize = 32_768;
+
+/// Rejects a request whose aggregate token count (summed across every
+/// `input` item) exceeds [`MAX_EMBEDDINGS_TOTAL_TOKENS`]. See that
+/// constant's doc comment for the memory-allocation rationale.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`batch_token_budget_exceeded`) naming
+/// the request's total token count and the limit.
+pub fn check_embeddings_total_tokens(total_tokens: usize) -> Result<(), ApiError> {
+    if total_tokens > MAX_EMBEDDINGS_TOTAL_TOKENS {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "input has {total_tokens} total tokens across all items; maximum is \
+                 {MAX_EMBEDDINGS_TOTAL_TOKENS}"
+            ),
+            code: "batch_token_budget_exceeded",
+        });
+    }
+    Ok(())
+}
+
 /// OpenAI `input` field: a single string, or an array of strings.
 ///
 /// `#[serde(untagged)]` tries each variant in order, matching how OpenAI
@@ -1280,6 +1321,30 @@ mod tests {
     }
 
     #[test]
+    fn check_embeddings_total_tokens_accepts_at_limit() {
+        check_embeddings_total_tokens(MAX_EMBEDDINGS_TOTAL_TOKENS).unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_total_tokens_rejects_over_limit() {
+        let err = check_embeddings_total_tokens(MAX_EMBEDDINGS_TOTAL_TOKENS + 1).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "batch_token_budget_exceeded");
+                assert!(
+                    message.contains(&(MAX_EMBEDDINGS_TOTAL_TOKENS + 1).to_string()),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains(&MAX_EMBEDDINGS_TOTAL_TOKENS.to_string()),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn check_embeddings_model_accepts_omitted() {
         check_embeddings_model(None, "served-model").unwrap();
     }
@@ -1331,7 +1396,7 @@ mod tests {
 
     #[test]
     fn build_embeddings_response_indices_reflect_input_order() {
-        // Mutation-proven (see REPORT.md): hardcoding `"index": 0` for every
+        // Mutation-proven: hardcoding `"index": 0` for every
         // element in `build_embeddings_response` leaves this test red while
         // `build_embeddings_response_single_string_case_gets_index_zero`
         // above stays green (its only correct index already is 0) --
