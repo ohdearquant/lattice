@@ -1,4 +1,9 @@
 #!/bin/sh
+# Prints the newline-separated list of files changed by a GitHub Actions
+# pull_request/merge_group/push event (CI_BASE_SHA..CI_HEAD_SHA), validating
+# the SHAs and the checked-out HEAD before diffing. Used to scope
+# change-detection in CI jobs.
+# Env: GITHUB_EVENT_NAME, CI_BASE_SHA, CI_HEAD_SHA (all required)
 set -eu
 
 case "${GITHUB_EVENT_NAME:-}" in

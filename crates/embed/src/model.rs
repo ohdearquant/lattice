@@ -6,6 +6,7 @@
 //! See docs/model.md for the model and cache design.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 
 /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
@@ -19,7 +20,7 @@ pub struct ModelProvenance {
     pub model: EmbeddingModel,
     /// **Stable**: source identifier (HuggingFace ID, URL, or file path).
     pub model_id: String,
-    /// **Stable**: metadata-derived BLAKE3 identifier for this load event, not a weight checksum.
+    /// **Stable**: metadata-derived SHA-256 identifier for this load event, not a weight checksum.
     pub hash: String,
     /// **Stable**: when the model was loaded.
     pub loaded_at: SystemTime,
@@ -37,7 +38,7 @@ impl ModelProvenance {
         };
 
         let hash_input = format!("{model_id}:{loaded_at_iso}:{model:?}");
-        let hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
+        let hash = format!("{:x}", Sha256::digest(hash_input.as_bytes()));
 
         Self {
             model,
@@ -470,8 +471,27 @@ mod tests {
         assert_eq!(provenance.model, EmbeddingModel::BgeSmallEnV15);
         assert_eq!(provenance.model_id, "BAAI/bge-small-en-v1.5");
         assert!(!provenance.hash.is_empty());
-        assert_eq!(provenance.hash.len(), 64); // blake3 hex is 64 chars
+        assert_eq!(provenance.hash.len(), 64); // sha256 hex is 64 chars
         assert!(!provenance.loaded_at_iso.is_empty());
+    }
+
+    /// Pins the hash to the documented formula and a named digest, so an
+    /// algorithm swap (e.g. to another 32-byte digest) fails this test even
+    /// though it would still produce a 64-char hex string.
+    #[test]
+    fn test_model_provenance_hash_matches_documented_sha256_formula() {
+        let provenance = ModelProvenance::new(
+            EmbeddingModel::BgeSmallEnV15,
+            "BAAI/bge-small-en-v1.5".into(),
+        );
+
+        let expected_input = format!(
+            "{}:{}:{:?}",
+            provenance.model_id, provenance.loaded_at_iso, provenance.model
+        );
+        let expected_hash = format!("{:x}", sha2::Sha256::digest(expected_input.as_bytes()));
+
+        assert_eq!(provenance.hash, expected_hash);
     }
 
     #[test]

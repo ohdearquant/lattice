@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Compares local Criterion bench runs against the stored `perf-baselines`
+# branch for this machine's architecture, then runs scripts/perf-bench-gate.py
+# to fail on a regression. Local runs carry no CI provenance, so the gate's
+# verdict here is for iteration only, not release evidence.
+# Usage: scripts/bench-gate.sh
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
