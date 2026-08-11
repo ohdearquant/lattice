@@ -30,6 +30,12 @@ and this project adheres to
   is a function of the role and model configuration already present in the key.
 - `TextTooLong` now reports the bound that actually rejected the input, so the
   reported maximum is one the caller can relate to their own input.
+- The in-memory embedding cache key and `ModelProvenance::hash` are now derived
+  with SHA-256 rather than BLAKE3, and the `blake3` dependency is dropped from
+  the workspace. Both values keep their existing shape: a 32-byte cache key and
+  a 64-character lowercase hex string. The cache lives in memory for the life of
+  the process, and the provenance hash already covered the load timestamp, so
+  neither value was reproducible across runs before this change either.
 
 #### Compatibility note for external implementors
 
