@@ -12,14 +12,22 @@ similarity matching.
 
 ## Models
 
-| Model           | Dimensions | Use Case                        | HuggingFace ID         |
-| --------------- | ---------- | ------------------------------- | ---------------------- |
-| `BgeSmallEnV15` | 384        | Fast, general purpose (default) | BAAI/bge-small-en-v1.5 |
-| `BgeBaseEnV15`  | 768        | Balanced quality/speed          | BAAI/bge-base-en-v1.5  |
-| `BgeLargeEnV15` | 1024       | Highest quality                 | BAAI/bge-large-en-v1.5 |
+| Model                               | Dimensions | Use Case                                    | HuggingFace ID                                              |
+| ----------------------------------- | ---------- | ------------------------------------------- | ----------------------------------------------------------- |
+| `BgeSmallEnV15`                     | 384        | Fast, general purpose (default)             | BAAI/bge-small-en-v1.5                                      |
+| `BgeBaseEnV15`                      | 768        | Balanced quality/speed                      | BAAI/bge-base-en-v1.5                                       |
+| `BgeLargeEnV15`                     | 1024       | Highest quality local                       | BAAI/bge-large-en-v1.5                                      |
+| `MultilingualE5Small`               | 384        | Multilingual, same arch as BGE              | intfloat/multilingual-e5-small                              |
+| `MultilingualE5Base`                | 768        | Best multilingual quality/speed             | intfloat/multilingual-e5-base                               |
+| `AllMiniLmL6V2`                     | 384        | BERT-class, WordPiece tokenizer             | sentence-transformers/all-MiniLM-L6-v2                      |
+| `ParaphraseMultilingualMiniLmL12V2` | 384        | Multilingual, XLM-R base                    | sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 |
+| `Qwen3Embedding0_6B`                | 1024       | Multilingual, decoder-only, GPU-accelerated | Qwen/Qwen3-Embedding-0.6B                                   |
+| `Qwen3Embedding4B`                  | 2560       | Multilingual, decoder-only, MRL-capable     | Qwen/Qwen3-Embedding-4B                                     |
+| `TextEmbedding3Small`               | 1536       | Remote API (OpenAI)                         | text-embedding-3-small                                      |
 
-The BGE models listed above have a 512-token input limit. See the
-[supported-model reference](../../docs/models.md) for every variant's limit and availability.
+Dimensions and input-token limits vary per model. See the
+[supported-model reference](../../docs/models.md) for every variant's limit, pooling strategy,
+and shipped/partial/scaffold-only availability.
 
 ## Services
 
@@ -61,7 +69,7 @@ the SIMD choice is fixed at compile time and covers the f32 kernels only (see be
 | Platform       | Instructions                                      |
 | -------------- | ------------------------------------------------- |
 | x86_64 (f32)   | AVX-512F > AVX2 + FMA > scalar                    |
-| x86_64 (int8)  | AVX-512 VNNI (`avx512` feature) > AVX2 > scalar   |
+| x86_64 (int8)  | AVX-512 VNNI (runtime-detected) > AVX2 > scalar   |
 | aarch64 (f32)  | ARM NEON (mandatory, always on)                   |
 | aarch64 (int8) | NEON SDOT (runtime-detected) > scalar             |
 | wasm32         | SIMD128 (compile-time, f32 kernels only) > scalar |
@@ -83,6 +91,9 @@ build without the `simd128` target feature; there is no runtime override for a b
 has it.
 
 ### Performance (384-dim vectors)
+
+Measured by `crates/embed/benches/simd_bench.rs`; run `cargo bench -p lattice-embed` to
+reproduce on your own hardware — these are illustrative, not a portability guarantee.
 
 | Operation         | Scalar | SIMD  | Speedup |
 | ----------------- | ------ | ----- | ------- |
@@ -129,7 +140,7 @@ vectors).
 ```rust
 use lattice_embed::{EmbeddingCache, EmbeddingModel, EmbeddingRole, ModelConfig};
 
-let cache = EmbeddingCache::new(1000);
+let cache = EmbeddingCache::new(1000); // custom capacity; use `with_default_capacity()` for 4000
 
 let key = cache.compute_key(
     "text",
@@ -144,9 +155,14 @@ println!("Hit rate: {:.1}%", stats.hit_rate() * 100.0);
 
 ## Feature Flags
 
-| Feature  | Default | Description                                    |
-| -------- | ------- | ---------------------------------------------- |
-| `native` | Yes     | Enable local embedding via pure Rust inference |
+| Feature     | Default | Description                                                                                                                          |
+| ----------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `native`    | Yes     | Enable local embedding via pure Rust inference                                                                                       |
+| `download`  | Yes     | First-use model downloads (implies `native`)                                                                                         |
+| `wasm`      | No      | wasm-bindgen JS bindings for a browser-loadable `.wasm` module                                                                       |
+| `metal-gpu` | No      | Enables `lattice-inference/metal-gpu`                                                                                                |
+| `avx512`    | No      | Deprecated no-op — the AVX-512 VNNI int8 kernel is now runtime-dispatched unconditionally on x86_64; kept for manifest compatibility |
+| `local`     | No      | Deprecated no-op — gated a bench module for a service removed long ago; kept for manifest compatibility                              |
 
 ```toml
 [dependencies]

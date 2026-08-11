@@ -1,7 +1,10 @@
 //! **Stability tier**: Experimental
 //!
-//! This is a pure ML inference kernel with high churn, 153 `unsafe` blocks, and 22
-//! `dead_code_allows`. It is NOT intended for direct use by platform or feature crates.
+//! This is a pure ML inference kernel with high churn, 295 `unsafe` blocks and 59
+//! `dead_code_allows` as of this commit. Both counts exclude comment lines, so the
+//! sentence you are reading does not count itself; recompute with
+//! `grep -rn 'unsafe {' crates/inference/src --include='*.rs' | grep -vE ':\s*//' | wc -l`
+//! and the same pipeline over `allow(dead_code` rather than trusting these numbers verbatim. It is NOT intended for direct use by platform or feature crates.
 //! Consumers should go through `lattice-embed`. The unsafe blocks are documented in
 //! `foundation/STABILITY.md §Tech Debt`. Tracking issue: #1306.
 //! See `foundation/STABILITY.md` for the full policy.

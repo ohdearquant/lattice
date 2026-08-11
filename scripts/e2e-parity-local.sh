@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Builds the release qwen35_generate binary, then runs scripts/e2e_parity_check.py
+# under scripts/lib/bench-supervision.sh's machine-state supervision to
+# compare local generation output against the recorded parity reference.
+# Usage: scripts/e2e-parity-local.sh
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

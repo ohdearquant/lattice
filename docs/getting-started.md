@@ -69,13 +69,13 @@ available.
 
 ```rust
 let texts = vec![
-    "first document",
-    "second document",
-    "third document",
+    "first document".to_string(),
+    "second document".to_string(),
+    "third document".to_string(),
 ];
 
 let embeddings = service
-    .embed_batch(&texts, EmbeddingModel::default())
+    .embed(&texts, EmbeddingModel::default())
     .await?;
 
 assert_eq!(embeddings.len(), 3);
@@ -165,9 +165,12 @@ Models are cached at `~/.lattice/models/<model-name>/`. Each model directory con
 ```
 ~/.lattice/models/bge-small-en-v1.5/
     model.safetensors   # weight file (mmap'd at inference time)
-    vocab.txt           # WordPiece vocabulary (BGE/MiniLM)
-    tokenizer.json      # SentencePiece config (E5/Qwen3)
+    vocab.txt           # WordPiece vocabulary (BGE/MiniLM models)
 ```
+
+The tokenizer file is one or the other, never both, depending on the model family: BGE/MiniLM
+models fetch `vocab.txt` (WordPiece); E5 and multilingual models fetch `tokenizer.json`
+(SentencePiece) instead.
 
 The `download` feature in `lattice-inference` (enabled by default) fetches from
 `https://huggingface.co/{model_id}/resolve/main/` on first use. Subsequent calls
