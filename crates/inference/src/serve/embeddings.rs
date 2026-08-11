@@ -1,5 +1,17 @@
 //! `POST /v1/embeddings`: pooled text and image embeddings from a loaded
-//! Qwen3.5 vision-language checkpoint, shared by both HTTP binaries.
+//! Qwen3.5 vision-language checkpoint (used by the `lattice` binary's
+//! `--embeddings-model`), plus a separate, GPU-independent OpenAI-compatible
+//! `/v1/embeddings` wire contract for the standalone `lattice_serve` daemon's
+//! own `--embedding-model` (issue #584), which serves through
+//! `crate::model::bert::BertModel` rather than the vision-language loader
+//! below.
+//!
+//! The two are intentionally independent code paths sharing only this file
+//! and the `ApiError` envelope: `lattice_serve`'s text-only route predates
+//! and is unrelated in scope to the vision-language loader, and reuses
+//! neither its model type nor its wire DTOs (`TextEmbeddingsRequest`/
+//! `TextEmbeddingsInput` below, vs. `EmbeddingsRequest`/`EmbeddingsInput` for
+//! the vision-language route).
 //!
 //! The model type here ([`EmbeddingModel`]) loads the same way
 //! `lattice-embed`'s `VisionEmbeddingModel` does -- an f16-packed decoder plus
@@ -11,6 +23,15 @@
 //! [`crate::vision::checkpoint`] / [`crate::weights::f16_weights`] functions
 //! `VisionEmbeddingModel::from_directory` wraps; no pooling or checkpoint
 //! math is duplicated, only the small amount of loading glue.
+//!
+//! `TextEmbeddingsRequest`/`TextEmbeddingsInput`/`parse_embeddings_input`/
+//! `check_embeddings_model`/`build_embeddings_response` below are
+//! deliberately independent of `lattice-embed`'s `EmbeddingService` trait for
+//! the same dependency-cycle reason (`lattice-embed` already depends on
+//! `lattice-inference` for `BertModel`/`QwenModel`); they normalize the wire
+//! request and build the wire response, while the actual embedding compute
+//! is `crate::model::bert::BertModel`, called directly by
+//! `lattice_serve.rs`'s own handler.
 
 use std::path::Path;
 
@@ -31,6 +52,7 @@ use crate::weights::f16_weights::{F16ModelWeights, load_f16_weights};
 
 use super::ApiError;
 use super::contract::decode_inline_image;
+use serde_json::{Value, json};
 
 /// Maximum number of items accepted in one `/v1/embeddings` request's
 /// `input` array, mirroring [`super::contract::MAX_MESSAGE_COUNT`]'s role for
@@ -764,6 +786,299 @@ pub mod test_support {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `lattice_serve` text-only embeddings (issue #584)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of input texts accepted in a single `/v1/embeddings`
+/// request. Mirrors OpenAI's own documented cap ("any array must be 2048
+/// dimensions or less") so a client that already respects the real API's
+/// limit never trips this one; it also bounds the CPU time and memory a
+/// single request can force onto this server's `encode_batch` call before
+/// any inference happens.
+pub const MAX_EMBEDDINGS_BATCH_SIZE: usize = 2048;
+
+/// Maximum sum of real token counts across every item in a single
+/// `/v1/embeddings` request, independent of [`MAX_EMBEDDINGS_BATCH_SIZE`]'s
+/// per-request item-count cap. `BertModel`'s packed batched-encode pipeline
+/// (`encode_batch_packed` / `forward_batch` in
+/// `crates/inference/src/model/bert.rs`) allocates its per-call activation
+/// buffers (`hidden`, `q`, `k`, `v`, `qkv`, `concat`, `attn_out`, `temp`,
+/// each sized `total_tokens * hidden_size`, plus `ffn_intermediate` sized
+/// `total_tokens * intermediate_size`) proportional to the *sum* of every
+/// item's real token count, not the item count -- so `MAX_EMBEDDINGS_BATCH_SIZE`
+/// alone does not bound this allocation: a request at the 2048-item cap
+/// with long inputs can reach roughly a million aggregate tokens (2048
+/// items times a representative 512-token context window), which at a
+/// representative embedding-BERT scale (`hidden_size=768`,
+/// `intermediate_size=3072`: `9 * hidden_size + intermediate_size = 9,984`
+/// f32s of buffer per aggregate token) is tens of gigabytes of activation
+/// memory for one request. `32,768` keeps that same calculation to roughly
+/// 1.3 GB (`32,768 * 9,984 * 4` bytes) at that representative scale, while
+/// still admitting large batches of short texts.
+pub const MAX_EMBEDDINGS_TOTAL_TOKENS: usize = 32_768;
+
+/// Rejects a request whose aggregate token count (summed across every
+/// `input` item) exceeds [`MAX_EMBEDDINGS_TOTAL_TOKENS`]. See that
+/// constant's doc comment for the memory-allocation rationale.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`batch_token_budget_exceeded`) naming
+/// the request's total token count and the limit.
+pub fn check_embeddings_total_tokens(total_tokens: usize) -> Result<(), ApiError> {
+    if total_tokens > MAX_EMBEDDINGS_TOTAL_TOKENS {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "input has {total_tokens} total tokens across all items; maximum is \
+                 {MAX_EMBEDDINGS_TOTAL_TOKENS}"
+            ),
+            code: "batch_token_budget_exceeded",
+        });
+    }
+    Ok(())
+}
+
+/// Rejects a single `input` item whose pre-truncation (original) token count
+/// exceeds the loaded BERT model's `max_position_embeddings`, before the
+/// request reaches `BertModel::encode`/`encode_batch`.
+///
+/// Both `BertModel` encode paths silently diverge on an over-length item
+/// instead of raising a caller-visible error: the batched path
+/// (`encode_batch_packed`, `crates/inference/src/model/bert.rs`) clamps each
+/// item's length to `max_position_embeddings`, returning HTTP 200 for a
+/// vector computed from silently truncated text; the single-item path
+/// (`encode`) does not clamp before slicing its tokenizer output, and can
+/// panic in the `spawn_blocking` task instead. Calling this for every item
+/// before either path runs makes both cases the same caller-visible error
+/// instead of two different failure modes for the same oversized input.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`context_length_exceeded`) naming the
+/// item's index, its token count, and the limit.
+pub fn check_embeddings_item_fits_window(
+    index: usize,
+    token_count: usize,
+    max_position_embeddings: usize,
+) -> Result<(), ApiError> {
+    if token_count > max_position_embeddings {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "input item {index} has {token_count} tokens, exceeding the loaded model's \
+                 context window of {max_position_embeddings} tokens"
+            ),
+            code: "context_length_exceeded",
+        });
+    }
+    Ok(())
+}
+
+/// OpenAI `input` field: a single string, or an array of strings.
+///
+/// `#[serde(untagged)]` tries each variant in order, matching how OpenAI
+/// clients actually serialize this field (a bare JSON string or a bare JSON
+/// array, never a wrapper object).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TextEmbeddingsInput {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// Wire request body for `POST /v1/embeddings`.
+///
+/// `deny_unknown_fields`: a field this route does not implement must be
+/// rejected, not silently dropped -- see [`check_embeddings_unsupported_fields`]'s
+/// doc comment for the caller-visible-contract reasoning. `dimensions`,
+/// `encoding_format`, and `user` are declared explicitly (rather than left to
+/// fall through to the unknown-field rejection) so each gets its own
+/// specific error message instead of a generic "unknown field" one; `user`
+/// is caller-side metadata this route accepts and ignores, matching OpenAI's
+/// own semantics for it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextEmbeddingsRequest {
+    /// Text(s) to embed. `None` when the field is omitted or explicitly
+    /// `null` — validated by [`parse_embeddings_input`].
+    #[serde(default)]
+    pub input: Option<TextEmbeddingsInput>,
+    /// Requested model identifier. `None` when omitted; `Some("")` when the
+    /// client sends an explicit empty string — both are validated by
+    /// [`check_embeddings_model`], matching `contract::validate_model_name`'s
+    /// `OptionalExact` policy (an explicit empty string is NOT treated as
+    /// absent).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// OpenAI's Matryoshka output-dimension override. Not implemented by
+    /// `BertModel` (fixed-width output) -- captured as a raw
+    /// [`serde_json::Value`] (rather than e.g. `Option<u32>`) purely to
+    /// detect presence; any non-`null` value is rejected by
+    /// [`check_embeddings_unsupported_fields`] regardless of its shape.
+    #[serde(default)]
+    pub dimensions: Option<Value>,
+    /// OpenAI's output encoding selector. This route always returns JSON
+    /// floats, so only an absent field or the literal `"float"` is a
+    /// genuine no-op; anything else (starting with `"base64"`) is rejected
+    /// by [`check_embeddings_unsupported_fields`].
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    /// OpenAI's caller-side tracing identifier. Never read by this route;
+    /// declared so it deserializes instead of tripping `deny_unknown_fields`.
+    #[serde(default)]
+    pub user: Option<Value>,
+}
+
+/// Rejects a request that sets a field this route does not implement, so
+/// the caller learns its requested output shape was not honored instead of
+/// silently receiving a response that does not match what it asked for
+/// (Matryoshka `dimensions`, or a `base64` `encoding_format`). Genuinely
+/// unrecognized fields are already rejected by
+/// [`TextEmbeddingsRequest`]'s `deny_unknown_fields`, at parse time, before
+/// this runs; this covers the two fields the wire type accepts syntactically
+/// but this route cannot actually honor.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`unsupported_parameter`) naming the
+/// offending field.
+pub fn check_embeddings_unsupported_fields(req: &TextEmbeddingsRequest) -> Result<(), ApiError> {
+    if req.dimensions.as_ref().is_some_and(|v| !v.is_null()) {
+        return Err(ApiError::BadRequest {
+            message: "dimensions is not supported by this server; the loaded model's full \
+                      output width is always returned"
+                .to_string(),
+            code: "unsupported_parameter",
+        });
+    }
+    if let Some(format) = req.encoding_format.as_deref()
+        && format != "float"
+    {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "encoding_format '{format}' is not supported by this server; only 'float' is \
+                 implemented"
+            ),
+            code: "unsupported_parameter",
+        });
+    }
+    Ok(())
+}
+
+/// Extracts and validates the input texts from a parsed [`TextEmbeddingsRequest`].
+///
+/// Order is preserved exactly: index `i` of the returned `Vec` is index `i`
+/// of the caller's array (or the sole element for a single string).
+///
+/// # Errors
+///
+/// - `input` missing or `null` — [`ApiError::BadRequest`] `invalid_request`.
+/// - `input` is an empty string, or an empty array — `invalid_input`.
+/// - any element is an empty string (including the single-string case) —
+///   `invalid_input`, naming the offending index.
+/// - the array has more than [`MAX_EMBEDDINGS_BATCH_SIZE`] elements —
+///   `batch_size_exceeds_limit`.
+pub fn parse_embeddings_input(
+    input: &Option<TextEmbeddingsInput>,
+) -> Result<Vec<String>, ApiError> {
+    let texts = match input {
+        None => {
+            return Err(ApiError::BadRequest {
+                message: "input is required".to_string(),
+                code: "invalid_request",
+            });
+        }
+        Some(TextEmbeddingsInput::One(text)) => vec![text.clone()],
+        Some(TextEmbeddingsInput::Many(texts)) => texts.clone(),
+    };
+    if texts.is_empty() {
+        return Err(ApiError::BadRequest {
+            message: "input must not be empty".to_string(),
+            code: "invalid_input",
+        });
+    }
+    if texts.len() > MAX_EMBEDDINGS_BATCH_SIZE {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "input has {} elements; maximum is {MAX_EMBEDDINGS_BATCH_SIZE}",
+                texts.len()
+            ),
+            code: "batch_size_exceeds_limit",
+        });
+    }
+    if let Some(index) = texts.iter().position(String::is_empty) {
+        return Err(ApiError::BadRequest {
+            message: format!("input[{index}] must not be empty"),
+            code: "invalid_input",
+        });
+    }
+    Ok(texts)
+}
+
+/// Validates a requested `model` against the single model this server has
+/// loaded, using the same `OptionalExact` policy
+/// `contract::ServeProfile::lattice_serve` applies to chat completions: an
+/// omitted `model` is accepted; a present `model` (including an explicit
+/// empty string) must equal `served`.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] `model_not_found` on a mismatch.
+pub fn check_embeddings_model(requested: Option<&str>, served: &str) -> Result<(), ApiError> {
+    match requested {
+        None => Ok(()),
+        Some(requested) if requested == served => Ok(()),
+        Some(requested) => Err(ApiError::BadRequest {
+            message: format!("model '{requested}' is not loaded; this server serves '{served}'"),
+            code: "model_not_found",
+        }),
+    }
+}
+
+/// Builds the `POST /v1/embeddings` success response body, OpenAI's
+/// `CreateEmbeddingResponse` shape (verified against the `openai-python` SDK's
+/// `src/openai/types/create_embedding_response.py` and
+/// `src/openai/types/embedding.py`, since `platform.openai.com`'s own API
+/// reference is not fetchable from this environment):
+///
+/// ```text
+/// { object: "list", data: [{ object: "embedding", embedding: [f32], index }],
+///   model, usage: { prompt_tokens, total_tokens } }
+/// ```
+///
+/// `index` is assigned from each embedding's position in `embeddings`, which
+/// must already be in the caller's original input order — this function
+/// does not reorder anything.
+///
+/// `prompt_tokens` and `total_tokens` are equal: an embeddings request has no
+/// completion tokens, matching OpenAI's own `Usage` shape for this endpoint.
+pub fn build_embeddings_response(
+    model: &str,
+    embeddings: &[Vec<f32>],
+    prompt_tokens: u64,
+) -> Value {
+    let data: Vec<Value> = embeddings
+        .iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            json!({
+                "object": "embedding",
+                "embedding": embedding,
+                "index": index,
+            })
+        })
+        .collect();
+    json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1017,5 +1332,254 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn one(s: &str) -> Option<TextEmbeddingsInput> {
+        Some(TextEmbeddingsInput::One(s.to_string()))
+    }
+
+    fn many(items: &[&str]) -> Option<TextEmbeddingsInput> {
+        Some(TextEmbeddingsInput::Many(
+            items.iter().map(ToString::to_string).collect(),
+        ))
+    }
+
+    #[test]
+    fn parse_embeddings_input_missing_is_invalid_request() {
+        let err = parse_embeddings_input(&None).unwrap_err();
+        assert_eq!(err.code(), "invalid_request");
+    }
+
+    #[test]
+    fn parse_embeddings_input_null_is_invalid_request() {
+        // `#[serde(default)]` maps an explicit JSON `null` to `None` before
+        // this function ever runs, same as an omitted field; this pins that
+        // the two are indistinguishable by the time validation sees them.
+        let req: TextEmbeddingsRequest = serde_json::from_str(r#"{"input":null}"#).unwrap();
+        let err = parse_embeddings_input(&req.input).unwrap_err();
+        assert_eq!(err.code(), "invalid_request");
+    }
+
+    #[test]
+    fn parse_embeddings_input_single_string_is_one_element_at_index_zero() {
+        let texts = parse_embeddings_input(&one("hello")).unwrap();
+        assert_eq!(texts, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn parse_embeddings_input_array_preserves_order() {
+        let texts = parse_embeddings_input(&many(&["a", "b", "c"])).unwrap();
+        assert_eq!(
+            texts,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_embeddings_input_empty_string_is_invalid_input() {
+        let err = parse_embeddings_input(&one("")).unwrap_err();
+        assert_eq!(err.code(), "invalid_input");
+    }
+
+    #[test]
+    fn parse_embeddings_input_empty_array_is_invalid_input() {
+        let err = parse_embeddings_input(&many(&[])).unwrap_err();
+        assert_eq!(err.code(), "invalid_input");
+    }
+
+    #[test]
+    fn parse_embeddings_input_empty_string_inside_array_names_its_index() {
+        let err = parse_embeddings_input(&many(&["a", "", "c"])).unwrap_err();
+        assert_eq!(err.code(), "invalid_input");
+        assert!(
+            err.message().contains("input[1]"),
+            "message must name the offending index: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn parse_embeddings_input_over_batch_limit_is_rejected() {
+        let items: Vec<String> = (0..MAX_EMBEDDINGS_BATCH_SIZE + 1)
+            .map(|i| i.to_string())
+            .collect();
+        let input = Some(TextEmbeddingsInput::Many(items));
+        let err = parse_embeddings_input(&input).unwrap_err();
+        assert_eq!(err.code(), "batch_size_exceeds_limit");
+    }
+
+    #[test]
+    fn parse_embeddings_input_at_batch_limit_is_accepted() {
+        let items: Vec<String> = (0..MAX_EMBEDDINGS_BATCH_SIZE)
+            .map(|i| i.to_string())
+            .collect();
+        let input = Some(TextEmbeddingsInput::Many(items));
+        let texts = parse_embeddings_input(&input).unwrap();
+        assert_eq!(texts.len(), MAX_EMBEDDINGS_BATCH_SIZE);
+    }
+
+    #[test]
+    fn check_embeddings_total_tokens_accepts_at_limit() {
+        check_embeddings_total_tokens(MAX_EMBEDDINGS_TOTAL_TOKENS).unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_total_tokens_rejects_over_limit() {
+        let err = check_embeddings_total_tokens(MAX_EMBEDDINGS_TOTAL_TOKENS + 1).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "batch_token_budget_exceeded");
+                assert!(
+                    message.contains(&(MAX_EMBEDDINGS_TOTAL_TOKENS + 1).to_string()),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains(&MAX_EMBEDDINGS_TOTAL_TOKENS.to_string()),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_embeddings_item_fits_window_accepts_at_limit() {
+        check_embeddings_item_fits_window(0, 512, 512).unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_item_fits_window_rejects_over_limit() {
+        let err = check_embeddings_item_fits_window(2, 513, 512).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(message.contains("item 2"), "message: {message}");
+                assert!(message.contains("513"), "message: {message}");
+                assert!(message.contains("512"), "message: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_embeddings_unsupported_fields_accepts_absent() {
+        let req: TextEmbeddingsRequest = serde_json::from_str(r#"{"input":"hi"}"#).unwrap();
+        check_embeddings_unsupported_fields(&req).unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_unsupported_fields_accepts_user_and_float_encoding() {
+        let req: TextEmbeddingsRequest =
+            serde_json::from_str(r#"{"input":"hi","user":"trace-123","encoding_format":"float"}"#)
+                .unwrap();
+        check_embeddings_unsupported_fields(&req).unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_unsupported_fields_rejects_dimensions() {
+        let req: TextEmbeddingsRequest =
+            serde_json::from_str(r#"{"input":"hi","dimensions":3}"#).unwrap();
+        let err = check_embeddings_unsupported_fields(&req).unwrap_err();
+        assert_eq!(err.code(), "unsupported_parameter");
+        assert!(err.message().contains("dimensions"), "{}", err.message());
+    }
+
+    #[test]
+    fn check_embeddings_unsupported_fields_rejects_non_float_encoding_format() {
+        let req: TextEmbeddingsRequest =
+            serde_json::from_str(r#"{"input":"hi","encoding_format":"base64"}"#).unwrap();
+        let err = check_embeddings_unsupported_fields(&req).unwrap_err();
+        assert_eq!(err.code(), "unsupported_parameter");
+        assert!(
+            err.message().contains("encoding_format"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn text_embeddings_request_rejects_unknown_field() {
+        // `pooling` is not a field of this wire type (unlike the sibling
+        // vision-language `/v1/embeddings` route's `EmbeddingsRequest`,
+        // which does accept one) -- `deny_unknown_fields` must reject it
+        // rather than silently drop it.
+        let err =
+            serde_json::from_str::<TextEmbeddingsRequest>(r#"{"input":"hi","pooling":"cls"}"#)
+                .unwrap_err();
+        let _ = err; // presence of an Err is the assertion; message shape is serde's own.
+    }
+
+    #[test]
+    fn check_embeddings_model_accepts_omitted() {
+        check_embeddings_model(None, "served-model").unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_model_accepts_exact_match() {
+        check_embeddings_model(Some("served-model"), "served-model").unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_model_rejects_mismatch() {
+        let err = check_embeddings_model(Some("other-model"), "served-model").unwrap_err();
+        assert_eq!(err.code(), "model_not_found");
+    }
+
+    #[test]
+    fn check_embeddings_model_rejects_explicit_empty_string() {
+        // Matches contract::validate_model_name's OptionalExact policy: an
+        // explicit empty string is a present-but-wrong model, not absence.
+        let err = check_embeddings_model(Some(""), "served-model").unwrap_err();
+        assert_eq!(err.code(), "model_not_found");
+    }
+
+    #[test]
+    fn build_embeddings_response_shape() {
+        // 0.5/0.25 (not 0.1/0.2/0.3): exactly representable in both f32 and
+        // f64, so the f32 -> serde_json::Value (f64) widening this function
+        // performs can't introduce a false mismatch against the literal
+        // JSON array below.
+        let body = build_embeddings_response("served-model", &[vec![0.5, 0.25, 1.0]], 4);
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["model"], "served-model");
+        assert_eq!(body["usage"]["prompt_tokens"], 4);
+        assert_eq!(body["usage"]["total_tokens"], 4);
+        assert_eq!(body["data"][0]["object"], "embedding");
+        assert_eq!(body["data"][0]["index"], 0);
+        assert_eq!(
+            body["data"][0]["embedding"],
+            serde_json::json!([0.5, 0.25, 1.0])
+        );
+    }
+
+    #[test]
+    fn build_embeddings_response_single_string_case_gets_index_zero() {
+        let body = build_embeddings_response("served-model", &[vec![1.0]], 1);
+        assert_eq!(body["data"].as_array().unwrap().len(), 1);
+        assert_eq!(body["data"][0]["index"], 0);
+    }
+
+    #[test]
+    fn build_embeddings_response_indices_reflect_input_order() {
+        // Mutation-proven: hardcoding `"index": 0` for every
+        // element in `build_embeddings_response` leaves this test red while
+        // `build_embeddings_response_single_string_case_gets_index_zero`
+        // above stays green (its only correct index already is 0) --
+        // exactly the reason this test uses three distinct vectors instead
+        // of one.
+        let body = build_embeddings_response("served-model", &[vec![0.0], vec![1.0], vec![2.0]], 3);
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), 3);
+        for (expected_index, item) in data.iter().enumerate() {
+            assert_eq!(
+                item["index"], expected_index,
+                "data[{expected_index}] must carry index {expected_index}"
+            );
+            assert_eq!(
+                item["embedding"],
+                serde_json::json!([expected_index as f32]),
+                "data[{expected_index}] must carry the embedding at that input position"
+            );
+        }
     }
 }
