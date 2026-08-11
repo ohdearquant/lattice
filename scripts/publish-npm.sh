@@ -71,6 +71,49 @@ check_platform_pkgjson() {  # $1=platform $2=pkgdir $3=pkgjson
     fi
 }
 
+# Guard: print the exact .node filename platform pkgjson's "main" field
+# names, or nothing if it names none. Shared by platform_matrix_guard's
+# fail-closed check below and platform_binaries_present's yes/no probe, so
+# the "exact filename from main, not a *.node glob" resolution rule lives in
+# exactly one place.
+platform_node_rel() {  # $1=pkgjson
+    node -p "require('$1').main || ''"
+}
+
+# Probe: report via exit status alone (never a hard error) whether every
+# platform in $NATIVE_DIR/package.json optionalDependencies already has the
+# exact .node file its own npm/<platform>/package.json "main" field names --
+# the same per-platform resolution platform_matrix_guard enforces below, run
+# here as a plain yes/no check instead of a fail-closed exit.
+#
+# This exists because "napi artifacts --output-dir . --npm-dir npm"
+# reconciles --npm-dir against --output-dir: when CI has already downloaded
+# every platform's binary straight into npm/<platform>/ (the publish job's
+# "Download validated platform packages" step) and --output-dir holds no
+# freshly built .node files, the reconciliation deletes the binaries already
+# in place and then exits nonzero with "Missing artifacts for configured
+# targets" -- there is nothing for it to place. Only when a platform's
+# binary is genuinely absent (the local-build fill-in path this step exists
+# for) does running it do anything useful.
+platform_binaries_present() {
+    expected=$(node -p "Object.keys(require('$NATIVE_DIR/package.json').optionalDependencies || {}).map(n => n.replace('@khive-ai/lattice-embed-', '')).join(' ')" 2>/dev/null) || return 1
+    if [ -z "$expected" ]; then
+        return 1
+    fi
+    for platform in $expected; do
+        pkgdir="$NATIVE_DIR/npm/$platform/"
+        pkgjson="${pkgdir}package.json"
+        if [ ! -f "$pkgjson" ]; then
+            return 1
+        fi
+        node_rel=$(platform_node_rel "$pkgjson") || return 1
+        if [ -z "$node_rel" ] || [ ! -f "${pkgdir}${node_rel}" ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+
 # Guard: require every platform advertised in the main package's
 # optionalDependencies to carry its native binary -- not any nonempty subset,
 # and not a zero-length set either (an empty optionalDependencies object is
@@ -126,7 +169,7 @@ platform_matrix_guard() {
         pkgjson="${pkgdir}package.json"
         check_platform_pkgjson "$platform" "$pkgdir" "$pkgjson"
 
-        node_rel=$(node -p "require('$pkgjson').main || ''")
+        node_rel=$(platform_node_rel "$pkgjson")
         node_path="${pkgdir}${node_rel}"
         if [ -z "$node_rel" ] || [ ! -f "$node_path" ]; then
             echo "ERROR: missing native binary for platform '$platform': expected $node_path" >&2
@@ -273,8 +316,8 @@ run_version_checks() {
 
 # Guard: dry-run the ENTIRE release before any real publish. This packs wasm
 # (prepack rebuild), every present platform subpackage, and the native main
-# package (its prepublishOnly runs `napi artifacts && npm test`). Any
-# failure here aborts before a single package is published.
+# package (its prepublishOnly runs the artifacts guard script, then `npm
+# test`). Any failure here aborts before a single package is published.
 #
 # No explicit `exit N` here -- this relies entirely on the script's own
 # top-level `set -e` to abort on the first nonzero `npm publish --dry-run`.
@@ -349,9 +392,17 @@ main() {
     # subpackages have their binary. Cross-platform binaries come from the napi
     # build matrix in CI (npm-prebuild.yml's `publish` job downloads the
     # collector-validated `npm-native-prebuilds` artifact before this script
-    # runs), so this is a no-op in that path and only fills in the current
-    # platform for a local run.
-    ( cd "$NATIVE_DIR" && npm run artifacts >/dev/null 2>&1 || true )
+    # runs), so when every platform is already populated this step has
+    # nothing to do -- and running it anyway would delete those downloaded
+    # binaries instead of leaving them alone (see platform_binaries_present
+    # above). Skip it in that case; otherwise run it unsuppressed so a real
+    # failure aborts here instead of surfacing later as a misleadingly
+    # generic "missing binaries" report from platform_matrix_guard.
+    if platform_binaries_present; then
+        echo "Platform prebuilds already present for every configured target; skipping 'npm run artifacts'."
+    else
+        ( cd "$NATIVE_DIR" && npm run artifacts )
+    fi
 
     platform_matrix_guard
 
