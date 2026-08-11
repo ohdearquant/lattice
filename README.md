@@ -184,11 +184,9 @@ Model weights are downloaded from HuggingFace on first use and cached at `~/.lat
 lattice-embed = { version = "0.9", features = ["metal-gpu"] }
 ```
 
-### Cross-platform GPU
-
-```toml
-lattice-embed = { version = "0.9", features = ["wgpu-gpu"] }
-```
+`lattice-embed` does not have a `wgpu-gpu` feature; cross-platform WGPU acceleration is a
+`lattice-inference`-level feature (see the Feature Flags table below) and is not currently
+forwarded through `lattice-embed`.
 
 ---
 
@@ -505,21 +503,23 @@ Measured performance on normalized vectors (internal benchmarks, subject to hard
 
 ### lattice-embed
 
-| Feature     | Default | Description                                 |
-| ----------- | ------- | ------------------------------------------- |
-| `native`    | yes     | Pure Rust inference via `lattice-inference` |
-| `metal-gpu` | no      | Metal GPU acceleration (macOS)              |
-| `avx512`    | no      | AVX-512 SIMD kernels (requires nightly)     |
+| Feature     | Default | Description                                                                                                                                                                                        |
+| ----------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `native`    | yes     | Pure Rust inference via `lattice-inference`                                                                                                                                                        |
+| `download`  | yes     | First-use model downloads (implies `native`)                                                                                                                                                       |
+| `metal-gpu` | no      | Metal GPU acceleration (macOS)                                                                                                                                                                     |
+| `avx512`    | no      | Deprecated no-op — the AVX-512 VNNI int8 kernel is compiled unconditionally on stable x86_64 and is selected at runtime only when AVX-512F/BW/VNNI are all detected; otherwise AVX2 or scalar runs |
 
 ### lattice-inference
 
-| Feature     | Default | Description                                            |
-| ----------- | ------- | ------------------------------------------------------ |
-| `f16`       | no      | Half-precision weights                                 |
-| `metal-gpu` | no      | Metal compute backend                                  |
-| `wgpu-gpu`  | no      | WGPU cross-platform GPU backend                        |
-| `download`  | yes     | HuggingFace weight download with checksum verification |
-| `backfill`  | no      | Re-embedding coordinator (requires `rusqlite`)         |
+| Feature     | Default | Description                                                             |
+| ----------- | ------- | ----------------------------------------------------------------------- |
+| `f16`       | no      | Half-precision weights                                                  |
+| `metal-gpu` | no      | Metal compute backend                                                   |
+| `wgpu-gpu`  | no      | WGPU cross-platform GPU backend                                         |
+| `download`  | yes     | HuggingFace weight download with checksum verification                  |
+| `serve`     | yes     | HTTP serving stack (axum/tokio) for `lattice serve` and `lattice_serve` |
+| `backfill`  | no      | Re-embedding coordinator (requires `rusqlite`)                          |
 
 ---
 

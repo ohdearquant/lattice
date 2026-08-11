@@ -108,7 +108,9 @@ fn ensure_model_files_inner_with_checksums(
             download_file(&url, &safetensors_path)?;
         }
 
-        // E5 and multilingual models use tokenizer.json (sentencepiece); BGE/MiniLM use vocab.txt (WordPiece)
+        // Selected by substring match on the model name, not by family: any
+        // name containing "e5-" or "multilingual" fetches tokenizer.json,
+        // everything else fetches vocab.txt.
         let uses_tokenizer_json = model_name.contains("e5-") || model_name.contains("multilingual");
         if uses_tokenizer_json {
             if !tokenizer_json_path.exists() {

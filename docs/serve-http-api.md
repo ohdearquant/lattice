@@ -20,9 +20,11 @@ This codebase has **two** separately built HTTP servers with confusingly similar
   (`crates/inference/src/bin/lattice_serve.rs`), purpose-built as the internal HTTP daemon the
   macOS Lattice Studio app spawns and talks to (introduced in PR #435). It has its own, narrower
   route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `GET /metrics`)
-  and its own disconnect-cancellation behavior (PR #552/#606) that `lattice serve` does not have
-  (see "Streaming" below). It is not what the README's HTTP API section documents, and it is out
-  of scope for this document -- with one exception worth flagging here: `lattice_serve`'s
+  and its own disconnect-cancellation behavior (PR #552/#606); `lattice serve` gained an
+  equivalent mechanism later (ADR-080 C2, issue #744 — see "Streaming" below), so this is no
+  longer a difference between the two binaries. It is not what the README's HTTP API section
+  documents, and it is out of scope for this document -- with one exception worth flagging here:
+  `lattice_serve`'s
   `GET /metrics` (issue #583) carries the same "no authentication" posture described below for
   `lattice serve`'s routes, and it is bound by the same `--host`/loopback-default rule. Do not
   point `--host` at a non-loopback address for either binary without an external auth layer
@@ -61,7 +63,7 @@ Startup output:
 ```
 Loading model from ~/.lattice/models/qwen3.5-0.8b...
 Model loaded. Serving as 'qwen3.5-0.8b'.
-Listening on 127.0.0.1:8080  (model: qwen3.5-0.8b, max_tokens default: 64)
+Listening on 127.0.0.1:8080  (model: qwen3.5-0.8b, max_tokens default: 256)
   POST /v1/chat/completions
   GET  /health
 ```
@@ -104,30 +106,62 @@ these fixed shutdown intervals.
 
 ## Auth, rate limiting, and concurrency
 
-None of this is implemented today — worth stating explicitly, since issue #601 asks for it:
+Auth and rate limiting are not implemented today — worth stating explicitly, since issue #601
+asks for it. The Metal backend does have a per-request admission cap (see below), which is a
+different thing from rate limiting: it bounds outstanding work on one worker, not requests per
+client or per unit time.
 
 - **No authentication.** There is no API-key check, bearer-token check, or any other
   `Authorization` handling anywhere in the router — none of the five routes shown above (or the
   body-size layer wrapping them) add one. Anyone who can reach the listening address can call
   any of them.
-- **No rate limiting, no per-request admission control.** There is no request-count or
-  concurrency-limiting middleware in front of the handlers. The only thing that rejects a request
-  before it reaches model code is the 1 MiB body-size cap already shown above.
+- **No rate limiting.** There is no request-count or IP-based throttling middleware in front of the
+  handlers. The only overload/admission controls are the 1 MiB body-size cap already shown above
+  and the Metal-backend admission cap described next. Request validation (shape, bounds, sampling
+  parameters, unsupported fields — see `crates/inference/src/serve/contract.rs`) also rejects
+  requests before generation, but is a separate class of check from overload/rate control.
 - **CPU backend: not serialized by the server, but not free either.** Each CPU request's
   `generate` call runs as blocking work on a Tokio blocking-pool task
   (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice.rs`), so multiple CPU requests
   can execute concurrently up to Tokio's blocking-pool size — this is not a hard concurrency-1
-  limit, but concurrent CPU requests still contend for the same CPU cores and memory.
-- **Metal/Q4 backend: effectively concurrency-1.** All Metal generation is funneled through one
-  dedicated worker thread (an `mpsc` channel into a single OS thread holding the `!Send` Metal
-  state, `crates/inference/src/bin/lattice.rs`) — a deliberate design choice matching how one local
-  GPU device actually works, not an oversight. Two concurrent requests against a Q4-backed
-  `lattice serve` run back-to-back, not in parallel; the later request's connection simply stays
-  open until its turn in the channel comes up.
+  limit, but concurrent CPU requests still contend for the same CPU cores and memory. There is no
+  per-request admission cap on this path.
+- **Metal/Q4 backend: effectively concurrency-1, with a bounded pending-job admission cap.** All
+  Metal generation is funneled through one dedicated worker thread (an `mpsc` channel into a
+  single OS thread holding the `!Send` Metal state, `crates/inference/src/serve/metal_worker.rs`)
+  — a deliberate design choice matching how one local GPU device actually works, not an oversight.
+  Two concurrent requests against a Q4-backed `lattice serve` run back-to-back, not in parallel;
+  the later request's connection simply stays open until its turn in the channel comes up, up to
+  `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). Both
+  `lattice serve` and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
+  default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
+  `crates/inference/src/bin/lattice_serve.rs`). A request submitted while the cap is already full
+  is rejected at the worker's admission boundary (`MetalWorkerClient::submit`'s
+  `try_acquire_owned`, `crates/inference/src/serve/metal_worker.rs:446`) before any Metal
+  generation work happens — the HTTP handler has already tokenized the rendered prompt during
+  request preparation ahead of that point (`prepare_chat_request`'s `tokenize_len` call,
+  `crates/inference/src/bin/lattice/serve.rs:1204`, versus the `submit` call at line 1329), so this
+  is not an end-to-end pre-tokenization guarantee, with:
+
+  ```json
+  {
+    "error": {
+      "message": "too many outstanding requests; the inference worker's pending-job queue is full, retry shortly",
+      "type": "server_error",
+      "code": "server_busy",
+      "param": null
+    }
+  }
+  ```
+
+  HTTP 503. This applies to both the streaming and non-streaming paths, and the rejection happens
+  before an SSE stream is ever committed to on the streaming path, so a client always gets a clean
+  JSON error body rather than a stream that starts and then fails.
 
 None of this makes `lattice serve` unsafe to run locally or behind your own reverse proxy that adds
-auth and rate limiting — it just means `lattice serve` itself provides neither, so don't expose it
-directly to an untrusted network.
+auth and rate limiting — it just means `lattice serve` itself provides neither (the Metal admission
+cap is an overload guard, not an auth or rate-limiting mechanism), so don't expose it directly to
+an untrusted network.
 
 ## `GET /health`
 
@@ -202,7 +236,8 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<ResponseFormat>,     // only {"type": "text"} accepted
     pub tools: Option<Value>,                        // rejected if present
     pub tool_choice: Option<Value>,                  // rejected if present
-    pub logprobs: Option<bool>,                      // rejected if true (see "logprobs" below)
+    pub logprobs: Option<bool>,                      // see "logprobs" below
+    pub top_logprobs: Option<usize>,                 // 0-20; requires logprobs: true (see "logprobs" below)
     pub n: Option<usize>,                            // rejected if > 1
 }
 ```
@@ -252,13 +287,15 @@ Requests are validated in a fixed sequence; the first failure wins. Useful to kn
 predict which error you'll get when more than one thing is wrong with a request:
 
 1. JSON body parses and is under the 1 MiB limit.
-2. `reject_unsupported`: `tools`/`tool_choice` present, `logprobs: true`, `n > 1`,
-   `response_format.type != "text"`.
+2. `reject_unsupported`: `tools`/`tool_choice` present, `n > 1`, `response_format.type != "text"`,
+   and `stream: true` combined with `logprobs: true` (bare `logprobs: true` without streaming is
+   no longer rejected here — see "logprobs" below).
 3. `model` matches the server's loaded model ID.
 4. `messages` is non-empty.
 5. The **last** message has role `"user"` (a Qwen ChatML constraint — the conversation must end on
    a user turn for the model to have something to respond to).
-6. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` are all in range.
+6. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` are all in range, then
+   `top_logprobs` is checked against `logprobs` (0-20, requires `logprobs: true`).
 7. Every message renders into ChatML (role + content-part checks).
 8. The rendered prompt's token count plus `max_tokens` plus `reasoning_budget` (plus one reserved
    delimiter token) fits the model's context window (#831:
@@ -278,8 +315,8 @@ Every error response uses this envelope, live-verified for all three status code
 
 ```
 $ curl -s -w '\n%{http_code}\n' http://127.0.0.1:8080/v1/chat/completions \
-    -d '{"model":"qwen3.5-0.8b","messages":[{"role":"user","content":"hi"}],"logprobs":true}'
-{"error":{"message":"logprobs is not supported by this server","type":"invalid_request_error","code":"unsupported_feature","param":null}}
+    -d '{"model":"qwen3.5-0.8b","messages":[{"role":"user","content":"hi"}],"stream":true,"logprobs":true}'
+{"error":{"message":"logprobs is not supported together with stream: true","type":"invalid_request_error","code":"unsupported_feature","param":null}}
 400
 ```
 
@@ -320,25 +357,29 @@ $ curl -s -w '\n%{http_code}\n' http://127.0.0.1:8080/v1/chat/completions \
 413
 ```
 
-### `logprobs` — rejected today, in review for support
+### `logprobs` — supported on the non-streaming path, CPU backend only
 
-As of this writing, `"logprobs": true` is unconditionally rejected
-(`"logprobs is not supported by this server"`, code `unsupported_feature`) — confirmed both by
-source and by a live request above. **PR #620** (issue #585, still open/draft as of this writing)
-adds real OpenAI-compatible `logprobs`/`top_logprobs` support to this exact endpoint's
-non-streaming path, with `top_logprobs` range-checked to `0..=20` and required to pair with
-`logprobs: true`. Two things worth knowing if you're reading this close to when that PR lands:
+`"logprobs": true` is accepted on the non-streaming path (PR #620, issue #585): the response's
+`choices[].logprobs` carries an OpenAI-shaped envelope (`content[].token`/`logprob`/`bytes` plus
+`top_logprobs`), and `top_logprobs` is range-checked to `0..=20` and requires `logprobs: true` to
+be set alongside it. `stream: true` combined with `logprobs: true` is still rejected with 400
+`unsupported_feature` — streaming logprobs is out of scope.
 
-- Per that PR's own description, `stream: true` combined with `logprobs: true` will still be
-  rejected with 400 even after it merges — streaming logprobs is explicitly out of scope for that
-  change.
-- That PR's own description also notes that the cross-turn prefix-cache generation path (see
-  [`docs/cross-turn-cache.md`](cross-turn-cache.md)) doesn't populate logprobs and isn't reachable
-  from this HTTP server anyway — not a regression from that change, just a documented gap.
-
-If you're reading this after #620 has merged, verify the current behavior against
-`reject_unsupported` in `lattice.rs` directly rather than trusting this paragraph — it will be
-stale at that point.
+This support has a real gap worth knowing about: it is wired into the plain CPU `generate()` /
+`generate_streaming()` decode loop and the plain (non-cache-aware) Metal `generate_streaming()`,
+but **not** into the cross-turn prefix-cache-aware Metal path
+(`generate_streaming_with_prefix_cache_and_cancel`, see
+[`docs/cross-turn-cache.md`](cross-turn-cache.md)) — and that cache-aware path is what the shared
+Metal worker now uses for every text Metal-backed request, streaming or not — vision requests take
+a separate `generate_multimodal_vision_with_cancel` path that never reaches it, see
+[`docs/cross-turn-cache.md`](cross-turn-cache.md)
+(`check_logprobs_not_set` in `crates/inference/src/model/qwen35/generation.rs` fails closed on it).
+In practice: `logprobs: true` against a CPU (safetensors) server works as documented above; the
+same request against a Metal/Q4-backed server currently fails with a generic HTTP 500
+`internal_error` (`"inference failed"`) rather than either a clean result or a specific
+`unsupported_feature` rejection — the request is accepted by validation and only fails once
+generation starts. Verify current behavior against `reject_unsupported` and `check_logprobs_not_set`
+directly rather than trusting this paragraph if it looks like it's changed.
 
 ## `POST /v1/chat/completions` — streaming (SSE)
 
@@ -374,14 +415,17 @@ data: [DONE]
 ping if 15 seconds pass with no event), so a slow prefill before the first token won't look like a
 dead connection to an intermediate proxy.
 
-Two caveats worth knowing before you build on this:
+One caveat worth knowing before you build on this:
 
-- **No disconnect-cancellation.** If the client disconnects mid-stream, generation keeps running
-  to the `max_tokens` cap on the server — the dropped send errors are silently ignored, but nothing
-  stops the underlying generation early. This is called out directly in the handler's own comment:
-  "per-token backpressure / disconnect-cancellation is a future refinement." The separate
-  `lattice_serve` daemon binary _does_ have this (a `CancelOnDrop`/`watch::channel` mechanism added
-  in PR #552/#606) — `lattice serve` does not, as of this writing.
+- **Disconnect-cancellation is implemented.** If the client disconnects mid-stream, generation
+  stops early instead of running to the `max_tokens` cap (ADR-080 C2, issue #744): the handler
+  builds a `cancel_pair()` (`lattice_inference::serve::cancel_pair`) whose receiver both backends
+  poll before prefill, immediately after prefill, and at the top of every decode iteration; a
+  `cancel_guard` is tied to the SSE stream's own lifetime, so the instant axum drops the response
+  stream (client disconnect), the guard drops with it, flipping the receiver and stopping
+  generation. This mirrors the `lattice_serve` daemon binary's own
+  `CancelOnDrop`/`watch::channel` mechanism (PR #552/#606) — the two binaries no longer differ
+  here.
 - **Mid-stream generation failures are explicit.** If generation errors after emitting content,
   the server preserves those partial content chunks, then emits an OpenAI error envelope as an SSE
   `data:` payload (`type: "server_error"`, `code: "internal_error"`) followed by `[DONE]`. It does
@@ -498,10 +542,15 @@ the model's own config — but the 4096 `max_tokens_cap` still applies to both b
 
 ## A realistic multi-turn example
 
-The server is stateless per request — there is no session/conversation ID, and (as covered in
-[`docs/cross-turn-cache.md`](cross-turn-cache.md)) no cross-turn KV cache reuse either. Every
-request must carry the full conversation history in `messages`, and every request re-prefills that
-entire history from scratch:
+The server is stateless per request — there is no session/conversation ID — so every request must
+carry the full conversation history in `messages`. That doesn't mean every request re-prefills that
+history from scratch: on a Metal/Q4-backed server, a text request that safely extends the previous
+turn reuses the retained KV/GDN prefix via `generate_streaming_with_prefix_cache_and_cancel`
+(`crates/inference/src/serve/metal_worker.rs:1218`) instead of a full re-prefill; a
+vision-classified request always takes the separate `generate_multimodal_vision_with_cancel` path
+(`crates/inference/src/serve/metal_worker.rs:1166`) and never participates in that cache. The CPU
+(safetensors) backend has no such cache and always re-prefills the full history. See
+[`docs/cross-turn-cache.md`](cross-turn-cache.md) for what counts as a safe extension:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -535,7 +584,13 @@ message content. There is no requirement to strip reasoning blocks between turns
 - Every error is the OpenAI error envelope shape (`error.message`/`type`/`code`/`param`), with
   `code` distinguishing specific failure reasons; malformed-JSON parser detail and internal
   generation failures are logged server-side only, never returned to the client.
-- `logprobs` is rejected today; PR #620 (in review) adds it non-streaming-only.
+- `logprobs` is supported non-streaming-only (PR #620); on the CPU backend it returns real
+  per-token log probabilities, but on the Metal/Q4 backend it currently fails with a generic 500
+  because the shared cross-turn-cache-aware generation path doesn't implement it — see "logprobs"
+  above.
 - `max_tokens` is hard-capped at 4096 server-wide; the Metal/Q4 backend additionally caps total
   context at 4096 regardless of the model's own configured maximum.
-- No cross-turn caching or disconnect-cancellation on the streaming path.
+- The Metal/Q4 backend has cross-turn KV/GDN prefix caching and a bounded pending-job admission
+  cap (`server_busy`, HTTP 503, at 32 outstanding jobs by default, configurable via
+  `--max-pending`); both binaries now support client-disconnect cancellation on the streaming
+  path.

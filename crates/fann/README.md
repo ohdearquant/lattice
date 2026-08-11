@@ -171,7 +171,11 @@ println!("Hidden layer output: {:?}", hidden_activations);
 
 ### Async API
 
-Unified async interface for CPU/GPU switching.
+`Network::forward_async` is an async-signature wrapper around the synchronous CPU `forward`
+(`self.forward(input).map(<[f32]>::to_vec)`, `crates/fann/src/network/mod.rs`) — it does not
+itself dispatch to GPU or perform any async work; it exists so callers on an async runtime can
+call it without wrapping `forward` themselves. See "GPU Acceleration" below for the actual
+GPU-backed path.
 
 ```rust
 use lattice_fann::{NetworkBuilder, Activation};
@@ -266,6 +270,10 @@ Average inference time <5ms for networks up to 128->256->128->64->10.
 | 4->8->2          | 50         | ~10us          |
 | 128->256->64->10 | 50K        | ~500us         |
 | 784->128->64->10 | 109K       | ~1ms           |
+
+No committed benchmark target currently produces these numbers (`crates/fann/benches/` has only
+`router_online.rs`, which measures online-learning convergence, not raw forward-pass latency) —
+treat this table as illustrative rather than reproducible until a forward-pass bench lands.
 
 ## GPU Acceleration
 
