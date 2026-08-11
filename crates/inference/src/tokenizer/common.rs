@@ -104,11 +104,18 @@ pub trait Tokenizer: Send + Sync {
 }
 
 /// Pad an ID sequence and explicit token type IDs to a fixed target length.
+///
+/// `pre_truncation_len` is the token count before any max-sequence-length
+/// truncation the caller applied; it must be `>= ids.len()` before padding.
+/// Required rather than defaulted so a construction site cannot silently omit
+/// it and make the context-window admission guard unreachable (see
+/// `TokenizedInput::pre_truncation_len`'s doc for why the guard depends on it).
 pub(crate) fn pad_ids_with_token_types(
     mut ids: Vec<u32>,
     mut token_type_ids: Vec<u32>,
     pad_to: usize,
     pad_id: u32,
+    pre_truncation_len: usize,
 ) -> TokenizedInput {
     let real_length = ids.len();
     assert_eq!(
@@ -125,12 +132,23 @@ pub(crate) fn pad_ids_with_token_types(
         attention_mask,
         token_type_ids,
         real_length,
-        pre_truncation_len: real_length,
+        pre_truncation_len,
     }
 }
 
 /// Pad an ID sequence to a fixed target length.
-pub(crate) fn pad_ids(mut ids: Vec<u32>, pad_to: usize, pad_id: u32) -> TokenizedInput {
+///
+/// `pre_truncation_len` is the token count before any max-sequence-length
+/// truncation the caller applied; it must be `>= ids.len()` before padding.
+/// Required rather than defaulted so a construction site cannot silently omit
+/// it and make the context-window admission guard unreachable (see
+/// `TokenizedInput::pre_truncation_len`'s doc for why the guard depends on it).
+pub(crate) fn pad_ids(
+    mut ids: Vec<u32>,
+    pad_to: usize,
+    pad_id: u32,
+    pre_truncation_len: usize,
+) -> TokenizedInput {
     let real_length = ids.len();
     let mut attention_mask = vec![1u32; real_length];
     ids.resize(pad_to, pad_id);
@@ -142,7 +160,7 @@ pub(crate) fn pad_ids(mut ids: Vec<u32>, pad_to: usize, pad_id: u32) -> Tokenize
         attention_mask,
         token_type_ids,
         real_length,
-        pre_truncation_len: real_length,
+        pre_truncation_len,
     }
 }
 

@@ -839,9 +839,9 @@ pub fn check_embeddings_total_tokens(total_tokens: usize) -> Result<(), ApiError
     Ok(())
 }
 
-/// Rejects a single `input` item whose real token count exceeds the loaded
-/// BERT model's `max_position_embeddings`, before the request reaches
-/// `BertModel::encode`/`encode_batch`.
+/// Rejects a single `input` item whose pre-truncation (original) token count
+/// exceeds the loaded BERT model's `max_position_embeddings`, before the
+/// request reaches `BertModel::encode`/`encode_batch`.
 ///
 /// Both `BertModel` encode paths silently diverge on an over-length item
 /// instead of raising a caller-visible error: the batched path

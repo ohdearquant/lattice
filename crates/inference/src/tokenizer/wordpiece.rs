@@ -604,9 +604,7 @@ impl WordPieceTokenizer {
         id_batches
             .into_iter()
             .map(|(ids, pre_truncation_len)| {
-                let mut result = pad_ids(ids, pad_to, self.inner.pad_id);
-                result.pre_truncation_len = pre_truncation_len;
-                result
+                pad_ids(ids, pad_to, self.inner.pad_id, pre_truncation_len)
             })
             .collect()
     }
@@ -629,9 +627,12 @@ impl WordPieceTokenizer {
 impl Tokenizer for WordPieceTokenizer {
     fn tokenize(&self, text: &str) -> TokenizedInput {
         let (ids, pre_truncation_len) = self.tokenize_to_ids(text);
-        let mut result = pad_ids(ids, self.inner.max_seq_len, self.inner.pad_id);
-        result.pre_truncation_len = pre_truncation_len;
-        result
+        pad_ids(
+            ids,
+            self.inner.max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 
     fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput> {
@@ -726,6 +727,10 @@ impl Tokenizer for WordPieceTokenizer {
         self.tokenize_wordpiece_payload_into(query, &mut scratch, &mut query_ids);
         self.tokenize_wordpiece_payload_into(document, &mut scratch, &mut doc_ids);
 
+        // 3 special tokens ([CLS] + 2x [SEP]) plus both untruncated payloads,
+        // before the budget truncation below runs.
+        let pre_truncation_len = 3 + query_ids.len() + doc_ids.len();
+
         // 3 slots reserved for [CLS], first [SEP], final [SEP].
         let payload_budget = max_seq_len.saturating_sub(3);
         if query_ids.len() > payload_budget {
@@ -765,7 +770,13 @@ impl Tokenizer for WordPieceTokenizer {
         ids.truncate(max_seq_len);
         token_type_ids.truncate(max_seq_len);
 
-        pad_ids_with_token_types(ids, token_type_ids, max_seq_len, self.inner.pad_id)
+        pad_ids_with_token_types(
+            ids,
+            token_type_ids,
+            max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 }
 

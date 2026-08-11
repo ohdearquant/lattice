@@ -53,9 +53,10 @@ pub enum BertPooling {
 /// pooling) rather than erroring, matching the E5/MiniLM families' own
 /// pooling strategy.
 ///
-/// `#[doc(hidden)]`: exported only so `lattice_serve` and `lattice-embed`'s
-/// test suite can call it across the crate boundary; not part of this
-/// crate's public API.
+/// `#[doc(hidden)]`: exported so `lattice_serve` and `lattice-embed`'s test
+/// suite can call it across the crate boundary. This hides it from rustdoc
+/// output only -- the item is still `pub` and reachable, and carries no
+/// stability guarantee.
 #[doc(hidden)]
 pub fn default_bert_pooling_for_model_name(name: &str) -> BertPooling {
     if name.to_ascii_lowercase().contains("bge") {
