@@ -261,21 +261,6 @@ mod imp {
         })
     }
 
-    /// Default BERT pooling for a `--embedding-model` directory, keyed on
-    /// its name the same way `embedding_model_id` (the directory's file
-    /// name) already identifies the model elsewhere in this file. BGE-family
-    /// checkpoint names all contain "bge" (matching every name
-    /// `lattice-embed`'s `EmbeddingModel::model_id` uses for its BGE
-    /// variants, e.g. `"BAAI/bge-small-en-v1.5"`); every other served family
-    /// (E5, MiniLM) keeps `BertModel`'s own mean-pooling default.
-    fn default_bert_pooling_for_model_name(name: &str) -> BertPooling {
-        if name.to_ascii_lowercase().contains("bge") {
-            BertPooling::CLS
-        } else {
-            BertPooling::default()
-        }
-    }
-
     /// Runs one `encode_batch` job on the blocking thread pool with `permit`
     /// moved into the closure, so the admission slot releases when the job
     /// finishes rather than when the caller's `.await` is dropped. A
@@ -3456,18 +3441,15 @@ mod imp {
                     .unwrap_or("embedding")
                     .into();
                 // Auto-select the same default `--embedding-pooling` would
-                // otherwise force the operator to pass explicitly: BGE-family
-                // checkpoints need CLS pooling, everything else `BertModel`
-                // serves (E5, MiniLM) uses its own mean-pooling default. This
-                // mirrors `lattice-embed`'s `EmbeddingModel::bert_pooling`
-                // (crates/embed/src/model.rs) rule table, duplicated rather
-                // than called: that function dispatches on
-                // `lattice-embed`'s own closed `EmbeddingModel` enum, not a
-                // directory, and `lattice-embed` already depends on this
-                // crate for `BertModel`, so a call the other way is a cyclic
-                // package dependency (see this file's module doc comment).
-                // Keep the two BGE-detection rules in sync by hand.
-                model.set_pooling(default_bert_pooling_for_model_name(&embedding_model_id));
+                // otherwise force the operator to pass explicitly. See
+                // `lattice_inference::pool::default_bert_pooling_for_model_name`
+                // for the rule and its agreement test against
+                // `lattice-embed`'s `EmbeddingModel::bert_pooling` table.
+                model.set_pooling(
+                    lattice_inference::pool::default_bert_pooling_for_model_name(
+                        &embedding_model_id,
+                    ),
+                );
                 match parse_arg(&args, "--embedding-pooling").as_deref() {
                     None => {}
                     Some("mean") => model.set_pooling(BertPooling::Mean),

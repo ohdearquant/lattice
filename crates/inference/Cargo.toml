@@ -265,6 +265,7 @@ required-features = ["f16", "metal-gpu", "gdn-state-counters"]
 ureq = { version = "2", features = ["tls"], optional = true }
 
 [dev-dependencies]
+lattice-embed = { path = "../embed", default-features = false, features = ["native"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 approx = "0.5"
 criterion = { version = "0.5", features = ["html_reports"] }

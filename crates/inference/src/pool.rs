@@ -31,6 +31,27 @@ pub enum BertPooling {
     CLS,
 }
 
+/// Default BERT pooling for a served embedding model, keyed on its directory
+/// or model name the same way `lattice_serve --embedding-model` identifies
+/// the model it loads. BGE-family checkpoint names all contain "bge"
+/// (matching every name `lattice-embed`'s `EmbeddingModel::model_id` uses for
+/// its BGE variants, e.g. `"BAAI/bge-small-en-v1.5"`); every other served
+/// family (E5, MiniLM) keeps [`BertPooling`]'s own mean-pooling default.
+///
+/// This mirrors `lattice-embed`'s `EmbeddingModel::bert_pooling` table
+/// (`crates/embed/src/model.rs`), duplicated rather than called: that
+/// function dispatches on `lattice-embed`'s own closed `EmbeddingModel`
+/// enum, not a name string, and `lattice-embed` already depends on this
+/// crate, so a call the other way would be a cyclic package dependency. See
+/// this module's tests for the agreement check between the two tables.
+pub fn default_bert_pooling_for_model_name(name: &str) -> BertPooling {
+    if name.to_ascii_lowercase().contains("bge") {
+        BertPooling::CLS
+    } else {
+        BertPooling::default()
+    }
+}
+
 /// **Unstable**: internal pooling kernel; SIMD dispatch details may change.
 ///
 /// Dispatches to SIMD (NEON/AVX2) when available, falls back to scalar.
@@ -762,5 +783,85 @@ mod tests {
     #[should_panic(expected = "seq_len must be non-zero")]
     fn last_token_pool_rejects_zero_seq_len() {
         let _ = last_token_pool(&[], &[], 0, 4);
+    }
+
+    /// Guards `default_bert_pooling_for_model_name` against drifting from
+    /// `lattice_embed::EmbeddingModel::bert_pooling`, the table it mirrors.
+    /// The expectation comes from calling `bert_pooling()` itself, never
+    /// from retyping its rule, so a wrong mirror cannot agree with a wrong
+    /// expectation.
+    ///
+    /// Enumeration: `EmbeddingModel` (crates/embed/src/model.rs:70-110) has
+    /// no `EnumIter`/`VariantArray`/`ALL_MODELS` constant (checked via
+    /// `grep -n "strum\|EnumIter\|VariantArray\|ALL_MODELS" crates/embed/src/model.rs`,
+    /// no hits) and is itself `#[non_exhaustive]`, which additionally means
+    /// a match on it from this crate cannot omit a wildcard arm -- so
+    /// there is no compiler-enforced completeness check available from
+    /// outside `lattice-embed`. The list below is hand-transcribed as the
+    /// full current variant set (all 10 variants, same order as the enum
+    /// definition); a variant added to the enum without a matching addition
+    /// here is silently skipped, not caught, and that gap is not closeable
+    /// from this side of the crate boundary.
+    ///
+    /// Comparison: `EmbeddingModel::bert_pooling()` returns
+    /// `lattice_inference::BertPooling`, but this test lives inside
+    /// `lattice-inference`'s own `cfg(test)` build, which is a distinct
+    /// compiled unit of this same crate from the one `lattice-embed` (a
+    /// `[dev-dependencies]` path back-edge) links against -- comparing the
+    /// two `BertPooling` values with `==` fails to typecheck ("multiple
+    /// different versions of crate `lattice_inference` in the dependency
+    /// graph"). Comparing their `{:?}` text sidesteps that without weakening
+    /// the check: `BertPooling`'s `Debug` is `#[derive]`d, so `"Mean"` /
+    /// `"CLS"` uniquely identifies the variant either way.
+    #[test]
+    fn default_bert_pooling_for_model_name_matches_embedding_model_bert_pooling_table() {
+        use lattice_embed::EmbeddingModel;
+
+        let variants = [
+            EmbeddingModel::BgeSmallEnV15,
+            EmbeddingModel::BgeBaseEnV15,
+            EmbeddingModel::BgeLargeEnV15,
+            EmbeddingModel::MultilingualE5Small,
+            EmbeddingModel::MultilingualE5Base,
+            EmbeddingModel::AllMiniLmL6V2,
+            EmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+            EmbeddingModel::Qwen3Embedding0_6B,
+            EmbeddingModel::Qwen3Embedding4B,
+            EmbeddingModel::TextEmbedding3Small,
+        ];
+
+        let mut bert_family_checked = 0usize;
+        for variant in variants {
+            let Some(expected) = variant.bert_pooling() else {
+                continue;
+            };
+            bert_family_checked += 1;
+            // Same shape of value production reaches
+            // `default_bert_pooling_for_model_name` in production:
+            // `lattice_serve` passes it the served directory's last path
+            // component (`resolve_model_dir(...).file_name()`), not the
+            // model's full HF id. Simulate that here by taking the last
+            // path component of the model's own `model_id()`.
+            let dir_name = std::path::Path::new(variant.model_id())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("model_id() yields a valid path component");
+            let actual = default_bert_pooling_for_model_name(dir_name);
+            assert_eq!(
+                format!("{actual:?}"),
+                format!("{expected:?}"),
+                "pooling mismatch for {variant:?} (derived dir name {dir_name:?})"
+            );
+        }
+        // BGE small/base/large + E5 small/base + MiniLM + paraphrase-MiniLM:
+        // the 7 variants whose `bert_pooling()` returns `Some(_)` as of this
+        // writing. Qwen3 x2 and TextEmbedding3Small return `None` and are
+        // skipped above. This catches a variant's `bert_pooling()` gate
+        // moving, but -- per the enumeration note above -- not a wholly new
+        // variant absent from the hand-transcribed list.
+        assert_eq!(
+            bert_family_checked, 7,
+            "EmbeddingModel's BERT-family (Some(_) from bert_pooling()) variant count changed"
+        );
     }
 }
