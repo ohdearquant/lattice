@@ -475,6 +475,25 @@ mod tests {
         assert!(!provenance.loaded_at_iso.is_empty());
     }
 
+    /// Pins the hash to the documented formula and a named digest, so an
+    /// algorithm swap (e.g. to another 32-byte digest) fails this test even
+    /// though it would still produce a 64-char hex string.
+    #[test]
+    fn test_model_provenance_hash_matches_documented_sha256_formula() {
+        let provenance = ModelProvenance::new(
+            EmbeddingModel::BgeSmallEnV15,
+            "BAAI/bge-small-en-v1.5".into(),
+        );
+
+        let expected_input = format!(
+            "{}:{}:{:?}",
+            provenance.model_id, provenance.loaded_at_iso, provenance.model
+        );
+        let expected_hash = format!("{:x}", sha2::Sha256::digest(expected_input.as_bytes()));
+
+        assert_eq!(provenance.hash, expected_hash);
+    }
+
     #[test]
     fn test_model_provenance_unique_hash() {
         let p1 = ModelProvenance::new(EmbeddingModel::BgeSmallEnV15, "model1".into());

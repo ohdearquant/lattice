@@ -1546,7 +1546,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "lattice-embed"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1571,7 +1571,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-fann"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "approx",
  "bytemuck",
@@ -1591,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-inference"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "approx",
  "axum",
@@ -1636,7 +1636,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-transport"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -1647,7 +1647,7 @@ dependencies = [
 
 [[package]]
 name = "lattice-tune"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "arc-swap",
  "bytemuck",

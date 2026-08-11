@@ -141,9 +141,9 @@ LATTICE_EMBED_DIM=1024  # truncate 4B's 2560-dim output to 1024
 
 ## Embedding Cache
 
-**Source**: `foundation/embed/src/cache.rs:131`
+**Source**: `crates/embed/src/cache.rs:131`
 
-Sharded LRU cache for computed embeddings. Keys are SHA-256 hashes of (model + input text). Avoids redundant inference for repeated inputs.
+Sharded LRU cache for computed embeddings. Keys are SHA-256 hashes of the input text followed by the model, its key version, its dimensions, and the embedding role (`compute_key`, `cache.rs:149-167`). Avoids redundant inference for repeated inputs.
 
 ### Configuration
 

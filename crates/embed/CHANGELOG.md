@@ -33,9 +33,20 @@ and this project adheres to
 - The in-memory embedding cache key and `ModelProvenance::hash` are now derived
   with SHA-256 rather than BLAKE3, and the `blake3` dependency is dropped from
   the workspace. Both values keep their existing shape: a 32-byte cache key and
-  a 64-character lowercase hex string. The cache lives in memory for the life of
-  the process, and the provenance hash already covered the load timestamp, so
-  neither value was reproducible across runs before this change either.
+  a 64-character lowercase hex string.
+  **This is a breaking change for `ModelProvenance::hash`.** `ModelProvenance`
+  is documented as stable and is `Serialize`/`Deserialize`, and its `hash` is
+  computed from its own persisted `model_id`, `loaded_at_iso`, and `model`
+  fields via a published formula, so a consumer holding a serialized record
+  can recompute the digest independently and compare it against `hash`. A
+  consumer doing that recomputation with BLAKE3 will no longer get a match;
+  it must switch its recomputation to SHA-256 to keep verifying existing and
+  newly produced records.
+  The embedding cache key is not affected by that compatibility concern: the
+  cache is in-memory for the life of the process, and its key scheme is
+  explicitly documented as unstable and not to be persisted across sessions,
+  so there is no published formula for external consumers to recompute
+  against in the first place.
 
 #### Compatibility note for external implementors
 
