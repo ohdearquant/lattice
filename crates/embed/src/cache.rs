@@ -11,6 +11,7 @@ use crate::model::ModelConfig;
 use crate::service::EmbeddingRole;
 use lru::LruCache;
 use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,7 +101,7 @@ pub struct EmbeddingCache {
 }
 
 /// Select shard index from a cache key. Uses first byte masked to shard count.
-/// Blake3 output is uniformly distributed, so this gives balanced load.
+/// SHA-256 output is uniformly distributed, so this gives balanced load.
 #[inline(always)]
 fn shard_index(key: &CacheKey) -> usize {
     key[0] as usize & SHARD_MASK
@@ -151,7 +152,7 @@ impl EmbeddingCache {
         model_config: ModelConfig,
         role: EmbeddingRole,
     ) -> CacheKey {
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = Sha256::new();
         hasher.update(text.as_bytes());
         // Deterministic model/role namespace for this cache key.
         let model_key = format!(
@@ -162,7 +163,7 @@ impl EmbeddingCache {
             role.cache_tag(),
         );
         hasher.update(model_key.as_bytes());
-        *hasher.finalize().as_bytes()
+        hasher.finalize().into()
     }
 
     /// **Unstable**: return type (`Arc<[f32]>`) may change to a newtype; internal cache API.
