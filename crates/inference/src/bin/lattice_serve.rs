@@ -260,6 +260,26 @@ mod imp {
         })
     }
 
+    /// Runs one `encode_batch` job on the blocking thread pool with `permit`
+    /// moved into the closure, so the admission slot releases when the job
+    /// finishes rather than when the caller's `.await` is dropped. A
+    /// `spawn_blocking` task already under way is not cancelled by dropping
+    /// its `JoinHandle` (e.g. a disconnected client dropping the request
+    /// future), so a permit held only in the caller's stack frame would
+    /// release on disconnect while the job kept running -- letting repeated
+    /// disconnects admit unbounded concurrent jobs past the cap.
+    async fn run_embedding_encode(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        work: impl FnOnce() -> Result<Vec<Vec<f32>>, lattice_inference::InferenceError> + Send + 'static,
+    ) -> Result<Result<Vec<Vec<f32>>, lattice_inference::InferenceError>, tokio::task::JoinError>
+    {
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
+    }
+
     // ─── OpenAI request shapes ───────────────────────────────────────────────
 
     /// Request body cap applied before any JSON parsing (serve DoS-hardening
@@ -2888,7 +2908,7 @@ mod imp {
             );
             return err.into_response();
         }
-        let _admission_permit = match try_acquire_embedding_slot(&embedding.admission) {
+        let admission_permit = match try_acquire_embedding_slot(&embedding.admission) {
             Ok(permit) => permit,
             Err(err) => {
                 emit_serve_event(
@@ -2906,7 +2926,7 @@ mod imp {
             }
         };
 
-        let encode_result = tokio::task::spawn_blocking(move || {
+        let encode_result = run_embedding_encode(admission_permit, move || {
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             embedding.model.encode_batch(&refs)
         })
@@ -4021,6 +4041,91 @@ mod imp {
             drop(permit1);
             let _permit2 = try_acquire_embedding_slot(&admission)
                 .expect("slot must be admitted again once the first is released");
+        }
+
+        /// Regression test for the admission-control hole where a client
+        /// disconnecting mid-request released the admission permit
+        /// immediately (the request future dropping at its `.await`) while
+        /// the already-started `spawn_blocking` `encode_batch` job kept
+        /// running to completion -- repeated disconnects could accumulate
+        /// unbounded concurrent jobs past [`EMBEDDING_MAX_CONCURRENT_JOBS`].
+        /// Exercises [`run_embedding_encode`] directly (the same helper
+        /// [`embeddings`] calls) rather than the full HTTP handler:
+        /// `BertModel` has no synthetic/mock constructor (see
+        /// `test_embedding_state`'s doc comment above), so there is no way
+        /// to give the real handler an artificially slow `encode_batch`
+        /// without a downloaded model directory. `run_embedding_encode` is
+        /// generic over the blocking closure, so a deterministic
+        /// channel-gated closure exercises the exact permit-lifetime
+        /// mechanics the fix changed.
+        ///
+        /// `tokio::spawn` + `JoinHandle::abort()` simulates axum dropping a
+        /// disconnected client's handler future mid-`.await`: at the point
+        /// of `abort()` the task is suspended awaiting the inner
+        /// `spawn_blocking` `JoinHandle` (not actively running), so tokio
+        /// drops the task's future there -- the same event a dropped
+        /// request future produces.
+        #[tokio::test]
+        async fn embedding_permit_survives_dropped_request_future() {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = admission
+                .clone()
+                .try_acquire_owned()
+                .expect("single slot must be admitted");
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let mut started_tx = Some(started_tx);
+
+            let task = tokio::spawn(run_embedding_encode(permit, move || {
+                started_tx
+                    .take()
+                    .expect("closure runs exactly once")
+                    .send(())
+                    .expect("test task must still be waiting on started_rx");
+                // Deterministic handshake, not a sleep: blocks until the
+                // test explicitly lets the "encode_batch" job finish.
+                release_rx
+                    .recv()
+                    .expect("release_tx must not be dropped before sending");
+                Ok(Vec::new())
+            }));
+
+            started_rx
+                .await
+                .expect("job must signal that it started running");
+
+            // Simulate the client disconnecting: cancel the outstanding
+            // request future while the blocking job is still in flight.
+            task.abort();
+            let join_result = task.await;
+            assert!(
+                join_result.is_err() && join_result.unwrap_err().is_cancelled(),
+                "aborted task must resolve as cancelled"
+            );
+
+            assert_eq!(
+                admission.available_permits(),
+                0,
+                "admission slot must stay held while the encode_batch job is still running, \
+                 not release just because the request future was dropped"
+            );
+
+            // Let the blocking job finish and confirm the slot frees up.
+            release_tx
+                .send(())
+                .expect("blocking closure must still be waiting on release_rx");
+            for _ in 0..200 {
+                if admission.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                admission.available_permits(),
+                1,
+                "admission slot must free once the encode_batch job actually completes"
+            );
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
