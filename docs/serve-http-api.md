@@ -137,7 +137,12 @@ client or per unit time.
   `lattice serve` and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
   default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
   `crates/inference/src/bin/lattice_serve.rs`). A request submitted while the cap is already full
-  is rejected before any tokenization or model work happens, with:
+  is rejected at the worker's admission boundary (`MetalWorkerClient::submit`'s
+  `try_acquire_owned`, `crates/inference/src/serve/metal_worker.rs:446`) before any Metal
+  generation work happens — the HTTP handler has already tokenized the rendered prompt during
+  request preparation ahead of that point (`prepare_chat_request`'s `tokenize_len` call,
+  `crates/inference/src/bin/lattice/serve.rs:1204`, versus the `submit` call at line 1329), so this
+  is not an end-to-end pre-tokenization guarantee, with:
 
   ```json
   {
@@ -538,10 +543,15 @@ the model's own config — but the 4096 `max_tokens_cap` still applies to both b
 
 ## A realistic multi-turn example
 
-The server is stateless per request — there is no session/conversation ID, and (as covered in
-[`docs/cross-turn-cache.md`](cross-turn-cache.md)) no cross-turn KV cache reuse either. Every
-request must carry the full conversation history in `messages`, and every request re-prefills that
-entire history from scratch:
+The server is stateless per request — there is no session/conversation ID — so every request must
+carry the full conversation history in `messages`. That doesn't mean every request re-prefills that
+history from scratch: on a Metal/Q4-backed server, a text request that safely extends the previous
+turn reuses the retained KV/GDN prefix via `generate_streaming_with_prefix_cache_and_cancel`
+(`crates/inference/src/serve/metal_worker.rs:1218`) instead of a full re-prefill; a
+vision-classified request always takes the separate `generate_multimodal_vision_with_cancel` path
+(`crates/inference/src/serve/metal_worker.rs:1166`) and never participates in that cache. The CPU
+(safetensors) backend has no such cache and always re-prefills the full history. See
+[`docs/cross-turn-cache.md`](cross-turn-cache.md) for what counts as a safe extension:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \

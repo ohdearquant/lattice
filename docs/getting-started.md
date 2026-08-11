@@ -147,11 +147,11 @@ and must be stored in separate namespaces.
 
 ## Feature Flags
 
-| Feature     | Default | Description                                                                                                |
-| ----------- | ------- | ---------------------------------------------------------------------------------------------------------- |
-| `native`    | yes     | Enable `NativeEmbeddingService` via `lattice-inference`                                                    |
-| `metal-gpu` | no      | Metal GPU backend for Apple Silicon                                                                        |
-| `avx512`    | no      | Deprecated no-op — the AVX-512 VNNI int8 kernel runs unconditionally, runtime-dispatched, on stable x86_64 |
+| Feature     | Default | Description                                                                                                                                                                                                                                 |
+| ----------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `native`    | yes     | Enable `NativeEmbeddingService` via `lattice-inference`                                                                                                                                                                                     |
+| `metal-gpu` | no      | Metal GPU backend for Apple Silicon                                                                                                                                                                                                         |
+| `avx512`    | no      | Deprecated no-op — the AVX-512 VNNI int8 kernel is compiled unconditionally on stable x86_64 (no Cargo feature, no nightly toolchain) and is selected at runtime only when AVX-512F/BW/VNNI are all detected; otherwise AVX2 or scalar runs |
 
 ```toml
 # Apple Silicon with GPU acceleration
@@ -168,12 +168,18 @@ Models are cached at `~/.lattice/models/<model-name>/`. Each model directory con
     vocab.txt           # WordPiece vocabulary (BGE/MiniLM models)
 ```
 
-On first download, the downloader fetches one tokenizer file per model family — BGE/MiniLM models
-fetch `vocab.txt`; E5 and multilingual models fetch `tokenizer.json` — but nothing prevents both
-files from being present in a model directory (e.g. if placed there manually). When both exist,
-the loader gives `tokenizer.json` priority (`crates/inference/src/tokenizer/common.rs`). Tokenizer
-kind is auto-detected from the file's contents, not hard-coded by model family — see
-[`docs/models.md`](models.md) §4 for the precedence order and per-family notes.
+On first download, the tokenizer file is chosen by a substring match on the model name
+(`crates/inference/src/download.rs`), not by model family: names containing `e5-` or `multilingual`
+fetch `tokenizer.json`, everything else fetches `vocab.txt` — so `paraphrase-multilingual-minilm-l12-v2`,
+a MiniLM model, fetches `tokenizer.json` rather than `vocab.txt`. Nothing prevents both files from
+being present in a model directory (e.g. if placed there manually). When both exist, the loader
+probes `tokenizer.json` first and returns as soon as the JSON declares a recognized tokenizer model
+type, falling through to `vocab.txt`/legacy files only when the JSON declares no model type
+(`crates/inference/src/tokenizer/common.rs`). Tokenizer kind is auto-detected from the file's
+contents when `tokenizer.json` is used; when the loader falls through to legacy files, kind is
+selected by which files are present instead (`vocab.txt` → WordPiece, `tokenizer.model` →
+SentencePiece) — see [`docs/models.md`](models.md) §4 for the precedence order and per-family
+notes.
 
 The `download` feature in `lattice-inference` (enabled by default) fetches from
 `https://huggingface.co/{model_id}/resolve/main/` on first use. Subsequent calls
