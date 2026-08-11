@@ -159,14 +159,14 @@ println!("Hit rate: {:.1}%", stats.hit_rate() * 100.0);
 
 ## Feature Flags
 
-| Feature     | Default | Description                                                                                                                          |
-| ----------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `native`    | Yes     | Enable local embedding via pure Rust inference                                                                                       |
-| `download`  | Yes     | First-use model downloads (implies `native`)                                                                                         |
-| `wasm`      | No      | wasm-bindgen JS bindings for a browser-loadable `.wasm` module                                                                       |
-| `metal-gpu` | No      | Enables `lattice-inference/metal-gpu`                                                                                                |
-| `avx512`    | No      | Deprecated no-op — the AVX-512 VNNI int8 kernel is now runtime-dispatched unconditionally on x86_64; kept for manifest compatibility |
-| `local`     | No      | Deprecated no-op — gated a bench module for a service removed long ago; kept for manifest compatibility                              |
+| Feature     | Default | Description                                                                                                                                                                                                                         |
+| ----------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `native`    | Yes     | Enable local embedding via pure Rust inference                                                                                                                                                                                      |
+| `download`  | Yes     | First-use model downloads (implies `native`)                                                                                                                                                                                        |
+| `wasm`      | No      | wasm-bindgen JS bindings for a browser-loadable `.wasm` module                                                                                                                                                                      |
+| `metal-gpu` | No      | Enables `lattice-inference/metal-gpu`                                                                                                                                                                                               |
+| `avx512`    | No      | Deprecated no-op — the AVX-512 VNNI int8 kernel is compiled unconditionally on stable x86_64 and is selected at runtime only when AVX-512F/BW/VNNI are all detected; otherwise AVX2 or scalar runs; kept for manifest compatibility |
+| `local`     | No      | Deprecated no-op — gated a bench module for a service removed long ago; kept for manifest compatibility                                                                                                                             |
 
 ```toml
 [dependencies]

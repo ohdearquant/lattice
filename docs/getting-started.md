@@ -177,8 +177,9 @@ probes `tokenizer.json` first and returns as soon as the JSON declares a recogni
 type, falling through to `vocab.txt`/legacy files only when the JSON declares no model type
 (`crates/inference/src/tokenizer/common.rs`). Tokenizer kind is auto-detected from the file's
 contents when `tokenizer.json` is used; when the loader falls through to legacy files, kind is
-selected by which files are present instead (`vocab.txt` → WordPiece, `tokenizer.model` →
-SentencePiece) — see [`docs/models.md`](models.md) §4 for the precedence order and per-family
+selected by which files are present instead, checked in this order: `vocab.json` + `merges.txt`
+or `vocab.txt` + `merges.txt` → BPE, a lone `vocab.txt` → WordPiece, `tokenizer.model` →
+SentencePiece — see [`docs/models.md`](models.md) §4 for the precedence order and per-family
 notes.
 
 The `download` feature in `lattice-inference` (enabled by default) fetches from

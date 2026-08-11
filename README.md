@@ -503,12 +503,12 @@ Measured performance on normalized vectors (internal benchmarks, subject to hard
 
 ### lattice-embed
 
-| Feature     | Default | Description                                                                                                    |
-| ----------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| `native`    | yes     | Pure Rust inference via `lattice-inference`                                                                    |
-| `download`  | yes     | First-use model downloads (implies `native`)                                                                   |
-| `metal-gpu` | no      | Metal GPU acceleration (macOS)                                                                                 |
-| `avx512`    | no      | Deprecated no-op — the AVX-512 VNNI int8 kernel now runs unconditionally, runtime-dispatched, on stable x86_64 |
+| Feature     | Default | Description                                                                                                                                                                                        |
+| ----------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `native`    | yes     | Pure Rust inference via `lattice-inference`                                                                                                                                                        |
+| `download`  | yes     | First-use model downloads (implies `native`)                                                                                                                                                       |
+| `metal-gpu` | no      | Metal GPU acceleration (macOS)                                                                                                                                                                     |
+| `avx512`    | no      | Deprecated no-op — the AVX-512 VNNI int8 kernel is compiled unconditionally on stable x86_64 and is selected at runtime only when AVX-512F/BW/VNNI are all detected; otherwise AVX2 or scalar runs |
 
 ### lattice-inference
 
