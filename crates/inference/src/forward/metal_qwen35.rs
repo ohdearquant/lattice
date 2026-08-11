@@ -9082,6 +9082,67 @@ mod inner {
             }
         }
 
+        /// **Unstable**: greedy n-gram speculative generation over raw token ids.
+        ///
+        /// Owns the complete Metal lifecycle: validates the request before
+        /// mutation, resets recurrent state, prefills the prompt once, then
+        /// forwards every emitted non-EOS token at its absolute position. On
+        /// success with a non-zero generation budget, the live KV/GDN state
+        /// therefore represents `prompt_tokens.len() + generated.len()` tokens.
+        /// For a valid prompt, a zero generation budget returns an empty vector
+        /// without resetting existing state.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::Inference`] for an empty
+        /// prompt or, for a non-zero generation budget, when the prompt plus
+        /// budget exceeds [`Self::max_context`]. Returns
+        /// [`crate::error::InferenceError::InvalidInput`] when a prompt token
+        /// cannot index the configured embedding table. Admission errors occur
+        /// before reset, prefill, allocation of generation history, or GPU work.
+        ///
+        /// # Panics
+        ///
+        /// Like [`Self::generate`] and [`Self::generate_streaming`], multi-token
+        /// prompts on a model with MoE layers inherit the existing Metal batched
+        /// prefill limitation and panic before dispatch. Dense models and the
+        /// existing sequential LoRA prefill fallback are supported.
+        pub fn generate_with_speculation(
+            &mut self,
+            prompt_tokens: &[u32],
+            max_new_tokens: usize,
+            eos_token: u32,
+            max_ngram: usize,
+            max_draft: usize,
+        ) -> Result<Vec<u32>, crate::error::InferenceError> {
+            crate::model::qwen35::check_prompt_not_empty(prompt_tokens.len())?;
+            crate::model::qwen35::check_prompt_ids_in_vocab(
+                prompt_tokens,
+                self.engine.config.vocab_size,
+            )?;
+            if max_new_tokens == 0 {
+                return Ok(Vec::new());
+            }
+            crate::model::qwen35::check_context_budget(
+                prompt_tokens.len(),
+                None,
+                max_new_tokens,
+                self.max_context(),
+            )?;
+
+            self.reset_state();
+            let prefill_logits = self.forward_prefill(prompt_tokens);
+            crate::speculative::generate_with_speculation_from_prefill(
+                prompt_tokens,
+                max_new_tokens,
+                eos_token,
+                prefill_logits,
+                |token, position| self.try_forward_step(token, position),
+                max_ngram,
+                max_draft,
+            )
+        }
+
         fn prepare_direct_generation(
             &self,
             prompt: &str,
@@ -29213,6 +29274,106 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn metal_speculative_generation_owns_prefill_and_context_admission() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32)
+                .expect("tiny hybrid fixture must construct");
+
+            state.reset_state();
+            let _ = state.forward_prefill(&[1]);
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+
+            let mut warm_gdn = state.snapshot_gdn_states();
+            for (layer, (s_matrix, conv)) in warm_gdn.iter_mut().enumerate() {
+                for (index, value) in s_matrix.iter_mut().enumerate() {
+                    *value = 0.5 + layer as f32 * 0.01 + index as f32 * 1e-4;
+                }
+                for (index, value) in conv.iter_mut().enumerate() {
+                    *value = -0.7 - layer as f32 * 0.01 - index as f32 * 1e-4;
+                }
+            }
+            state.restore_gdn_states(&warm_gdn);
+            assert!(
+                warm_gdn
+                    .iter()
+                    .flat_map(|(s, conv)| s.iter().chain(conv))
+                    .any(|&value| value != 0.0),
+                "the warmed state must be observably non-zero before admission"
+            );
+
+            let over_budget_prompt = vec![0u32; 32];
+            let rejected = state.generate_with_speculation(&over_budget_prompt, 1, u32::MAX, 5, 4);
+            assert_context_budget_error(&rejected, 32, 1, 32);
+            assert_eq!(
+                state.session.kv_cache.seq_len, 1,
+                "context rejection must precede reset, prefill, and decode"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                warm_gdn,
+                "context rejection must preserve recurrent state before reset"
+            );
+
+            let mut exact_prompt = vec![0u32; 31];
+            exact_prompt[30] = 1;
+            let generated = state
+                .generate_with_speculation(&exact_prompt, 1, u32::MAX, 5, 4)
+                .expect("31 prompt tokens plus one generated token exactly fit");
+            assert_eq!(
+                generated,
+                vec![1],
+                "the first token must come from the completed prompt prefill"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len,
+                exact_prompt.len() + generated.len(),
+                "the final budget token must be forwarded into live state"
+            );
+            assert!(
+                state
+                    .snapshot_gdn_states()
+                    .iter()
+                    .flat_map(|(s, conv)| s.iter().chain(conv))
+                    .all(|&value| value == 0.0),
+                "state-owned generation must reset the planted recurrent state before prefill"
+            );
+
+            let invalid_prompt =
+                state.generate_with_speculation(&[cfg.vocab_size as u32], 1, u32::MAX, 5, 4);
+            assert!(matches!(
+                invalid_prompt,
+                Err(crate::error::InferenceError::InvalidInput(ref message))
+                    if message
+                        == "prompt contains out-of-vocabulary token id 32 (vocab_size=32)"
+            ));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 32,
+                "token-id rejection must precede reset and GPU work"
+            );
+
+            let zero_budget = state
+                .generate_with_speculation(&[0], 0, u32::MAX, 5, 4)
+                .expect("zero budget must be a successful no-op");
+            assert!(zero_budget.is_empty());
+            assert_eq!(
+                state.session.kv_cache.seq_len, 32,
+                "zero budget must not reset an existing session"
+            );
+        }
+
+        #[test]
         fn lora_mixture_context_rejection_preserves_adapter_and_cache() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
@@ -38410,6 +38571,22 @@ impl MetalQwen35State {
         ))
     }
 
+    /// **Unstable**: Metal n-gram speculative generation stub.
+    ///
+    /// Always returns a typed capability error without macOS + `metal-gpu`.
+    pub fn generate_with_speculation(
+        &mut self,
+        _prompt_tokens: &[u32],
+        _max_new_tokens: usize,
+        _eos_token: u32,
+        _max_ngram: usize,
+        _max_draft: usize,
+    ) -> Result<Vec<u32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
     /// **Unstable**: Metal generate stub; always errors without metal-gpu feature.
     ///
     /// #856 follow-up: this used to
@@ -38604,6 +38781,19 @@ mod non_metal_stub_tests {
             }
             other => panic!("expected Err(InferenceError::Inference(..)), got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_metal_stub_speculative_generation_returns_capability_error() {
+        let mut state = MetalQwen35State;
+
+        let result = state.generate_with_speculation(&[0], 1, u32::MAX, 5, 4);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(ref message))
+                if message
+                    == "Metal GPU not available (requires macOS + metal-gpu feature)"
+        ));
     }
 }
 

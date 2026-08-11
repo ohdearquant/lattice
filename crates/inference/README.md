@@ -43,7 +43,7 @@ These modules contain submodules (directories with their own `mod.rs`).
 | `quant`       | Quantization pre-transforms: `quarot` (Walsh-Hadamard rotation primitives, ADR-044). Not yet wired into the Q4 weight path.                                                                                  |
 | `rope`        | Rotary position embeddings: `RopeTable` precomputes sin/cos tables and applies them in-place to Q and K slices before attention.                                                                             |
 | `sampling`    | Token sampling for generation: `Sampler`, `SamplingConfig` (temperature, top-k, top-p, repetition penalty).                                                                                                  |
-| `speculative` | N-gram prompt-lookup speculative decoding: `NgramSpeculator::speculate` + `verify_draft` (low-level) and `generate_with_speculation` (high-level wrapper).                                                   |
+| `speculative` | N-gram prompt lookup: low-level `NgramSpeculator::speculate` + `verify_draft`, the model-agnostic `generate_with_speculation`, and a state-owned Metal method of the same name.                              |
 
 ### Feature-gated modules
 
