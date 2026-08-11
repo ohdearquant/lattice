@@ -256,7 +256,6 @@ mod imp {
         admission.clone().try_acquire_owned().map_err(|_| {
             lattice_inference::serve::ApiError::ServiceUnavailable {
                 message: "too many outstanding /v1/embeddings requests; retry shortly".to_string(),
-                code: "server_busy",
             }
         })
     }
@@ -2841,11 +2840,10 @@ mod imp {
                 false,
                 Some("embedding_model_not_loaded"),
             );
-            return lattice_inference::serve::ApiError::ServiceUnavailable {
+            return lattice_inference::serve::ApiError::EmbeddingModelNotLoaded {
                 message: "no embedding model is loaded; start lattice_serve with \
                           --embedding-model <dir>"
                     .to_string(),
-                code: "embedding_model_not_loaded",
             }
             .into_response();
         };
@@ -4017,9 +4015,7 @@ mod imp {
             let err = try_acquire_embedding_slot(&admission)
                 .expect_err("second slot must be rejected: cap=1, 1 outstanding");
             match err {
-                lattice_inference::serve::ApiError::ServiceUnavailable { code, .. } => {
-                    assert_eq!(code, "server_busy");
-                }
+                lattice_inference::serve::ApiError::ServiceUnavailable { .. } => {}
                 other => panic!("expected ServiceUnavailable, got {other:?}"),
             }
             drop(permit1);
