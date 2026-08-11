@@ -38,15 +38,21 @@ and this project adheres to
   is documented as stable and is `Serialize`/`Deserialize`, and its `hash` is
   computed from its own persisted `model_id`, `loaded_at_iso`, and `model`
   fields via a published formula, so a consumer holding a serialized record
-  can recompute the digest independently and compare it against `hash`. A
-  consumer doing that recomputation with BLAKE3 will no longer get a match;
-  it must switch its recomputation to SHA-256 to keep verifying existing and
-  newly produced records.
-  The embedding cache key is not affected by that compatibility concern: the
-  cache is in-memory for the life of the process, and its key scheme is
-  explicitly documented as unstable and not to be persisted across sessions,
-  so there is no published formula for external consumers to recompute
-  against in the first place.
+  can recompute the digest independently and compare it against `hash`.
+  Recomputing with SHA-256 verifies records produced from this release
+  onward. A record produced by an earlier release carries a BLAKE3 digest
+  that SHA-256 recomputation will never match, and the serialized struct
+  carries no algorithm or version field, so a consumer cannot tell the two
+  kinds of record apart from the record alone. A consumer that must verify
+  both has to track which release produced each record out of band,
+  re-derive the affected records, or stop verifying the older ones.
+  The embedding cache key is not affected by that compatibility concern.
+  Its construction is published (see "Key construction" in
+  `crates/embed/docs/model.md`, repeated in `crates/embed/docs/design.md`),
+  but the cache itself lives in memory for the life of the process, and its
+  key scheme is explicitly documented as unstable and not to be persisted
+  across sessions or process versions. A changed key therefore invalidates
+  no stored data and breaks no cross-version contract.
 
 #### Compatibility note for external implementors
 
