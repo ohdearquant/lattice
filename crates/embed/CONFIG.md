@@ -159,7 +159,7 @@ Sharded LRU cache for computed embeddings. Keys are SHA-256 hashes of the input 
 
 ### CacheStats
 
-**Source**: `cache.rs:342`
+**Source**: `cache.rs:310`
 
 | Field      | Type    | Notes                               |
 | ---------- | ------- | ----------------------------------- |

@@ -42,17 +42,24 @@ and this project adheres to
   Recomputing with SHA-256 verifies records produced from this release
   onward. A record produced by an earlier release carries a BLAKE3 digest
   that SHA-256 recomputation will never match, and the serialized struct
-  carries no algorithm or version field, so a consumer cannot tell the two
-  kinds of record apart from the record alone. A consumer that must verify
-  both has to track which release produced each record out of band,
-  re-derive the affected records, or stop verifying the older ones.
+  carries no explicit algorithm or version field.
+  A consumer that keeps both formulas is not blocked by that: because all
+  three inputs are themselves persisted fields, it can recompute both
+  digests over the documented input and see which one matches `hash`,
+  which classifies the record without any external release metadata. A
+  consumer that supports SHA-256 alone cannot verify older records, and
+  has to track which release produced each record out of band, re-derive
+  the affected records, or stop verifying the older ones.
   The embedding cache key is not affected by that compatibility concern.
   Its construction is published (see "Key construction" in
   `crates/embed/docs/model.md`, repeated in `crates/embed/docs/design.md`),
   but the cache itself lives in memory for the life of the process, and its
   key scheme is explicitly documented as unstable and not to be persisted
   across sessions or process versions. A changed key therefore invalidates
-  no stored data and breaks no cross-version contract.
+  no cache-owned data and breaks no supported cross-version contract.
+  Nothing stops an external caller from storing the public 32-byte key
+  itself, but such a key is outside the documented contract and a stored
+  one may simply miss after an upgrade.
 
 #### Compatibility note for external implementors
 
