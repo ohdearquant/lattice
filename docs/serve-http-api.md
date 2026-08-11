@@ -116,11 +116,12 @@ client or per unit time.
   body-size layer wrapping them) add one. Anyone who can reach the listening address can call
   any of them.
 - **No rate limiting.** There is no request-count or IP-based throttling middleware in front of the
-  handlers. The only overload/admission controls that reject a request before it reaches model
-  code are the 1 MiB body-size cap already shown above and the Metal-backend admission cap
-  described next; request validation (shape, bounds, sampling parameters, unsupported fields —
-  see `crates/inference/src/serve/contract.rs`) also rejects requests before generation, but is a
-  separate class of check from overload/rate control.
+  handlers. The only overload/admission controls are the 1 MiB body-size cap already shown above,
+  which rejects at the body-size layer before the handler runs, and the Metal-backend admission cap
+  described next, which rejects after request preparation has already tokenized the prompt but
+  before any Metal generation; request validation (shape, bounds, sampling parameters, unsupported
+  fields — see `crates/inference/src/serve/contract.rs`) also rejects requests before generation,
+  but is a separate class of check from overload/rate control.
 - **CPU backend: not serialized by the server, but not free either.** Each CPU request's
   `generate` call runs as blocking work on a Tokio blocking-pool task
   (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice.rs`), so multiple CPU requests
@@ -148,7 +149,7 @@ client or per unit time.
   {
     "error": {
       "message": "too many outstanding requests; the inference worker's pending-job queue is full, retry shortly",
-      "type": "invalid_request_error",
+      "type": "server_error",
       "code": "server_busy",
       "param": null
     }

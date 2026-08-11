@@ -165,7 +165,7 @@ Models are cached at `~/.lattice/models/<model-name>/`. Each model directory con
 ```
 ~/.lattice/models/bge-small-en-v1.5/
     model.safetensors   # weight file (mmap'd at inference time)
-    vocab.txt           # WordPiece vocabulary (BGE/MiniLM models)
+    vocab.txt           # WordPiece vocabulary for this model
 ```
 
 On first download, the tokenizer file is chosen by a substring match on the model name
@@ -178,9 +178,9 @@ type, falling through to `vocab.txt`/legacy files only when the JSON declares no
 (`crates/inference/src/tokenizer/common.rs`). Tokenizer kind is auto-detected from the file's
 contents when `tokenizer.json` is used; when the loader falls through to legacy files, kind is
 selected by which files are present instead, checked in this order: `vocab.json` + `merges.txt`
-or `vocab.txt` + `merges.txt` → BPE, a lone `vocab.txt` → WordPiece, `tokenizer.model` →
-SentencePiece — see [`docs/models.md`](models.md) §4 for the precedence order and per-family
-notes.
+or `vocab.txt` + `merges.txt` → BPE, `vocab.txt` when neither merge-file BPE condition matched →
+WordPiece, `tokenizer.model` → SentencePiece — see [`docs/models.md`](models.md) §4 for the
+precedence order and per-family notes.
 
 The `download` feature in `lattice-inference` (enabled by default) fetches from
 `https://huggingface.co/{model_id}/resolve/main/` on first use. Subsequent calls
