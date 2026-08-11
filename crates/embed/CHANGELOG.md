@@ -40,14 +40,17 @@ and this project adheres to
   fields via a published formula, so a consumer holding a serialized record
   can recompute the digest independently and compare it against `hash`.
   Recomputing with SHA-256 verifies records produced from this release
-  onward. A record produced by an earlier release carries a BLAKE3 digest
-  that SHA-256 recomputation will never match, and the serialized struct
+  onward. A record produced by an earlier release carries a BLAKE3 digest,
+  which SHA-256 recomputation does not reproduce, and the serialized struct
   carries no explicit algorithm or version field.
   A consumer that keeps both formulas is not blocked by that: because all
   three inputs are themselves persisted fields, it can recompute both
-  digests over the documented input and see which one matches `hash`,
-  which classifies the record without any external release metadata. A
-  consumer that supports SHA-256 alone cannot verify older records, and
+  digests over the documented input and compare each against `hash`. For an
+  intact record the matching formula is the one that produced it, so the
+  record is classified without any external release metadata. If neither
+  matches, the record was altered or came from some formula other than
+  these two, which is a verification failure rather than a classification.
+  A consumer that supports SHA-256 alone cannot verify older records, and
   has to track which release produced each record out of band, re-derive
   the affected records, or stop verifying the older ones.
   The embedding cache key is not affected by that compatibility concern.
