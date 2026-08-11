@@ -1641,7 +1641,6 @@ dependencies = [
  "hyper-util",
  "image",
  "indexmap",
- "lattice-embed",
  "lattice-fann",
  "libc",
  "memmap2",
