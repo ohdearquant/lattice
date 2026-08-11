@@ -18041,13 +18041,13 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .session
                 .gdn_gpu_state
                 .layers()
-                .map(|layer| layer.s_matrix())
+                .map(super::gdn_state::MetalGdnLayerState::s_matrix)
                 .chain(
                     state
                         .session
                         .gdn_gpu_state
                         .layers()
-                        .map(|layer| layer.conv_buffer()),
+                        .map(super::gdn_state::MetalGdnLayerState::conv_buffer),
                 )
                 .map(|buf| {
                     // SAFETY: StorageModeShared, and the verifier preflight runs
