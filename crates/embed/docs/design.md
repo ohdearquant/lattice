@@ -246,13 +246,13 @@ specific request identity. Values are stored as `Arc<[f32]>`, so a hit returns a
 count increment rather than copying a vector. Batch lookup returns one optional value per supplied
 key in the same order.
 
-The cache computes a session-local 32-byte BLAKE3 key from the raw text followed by the formatted
+The cache computes a session-local 32-byte SHA-256 key from the raw text followed by the formatted
 model identity `model_name:key_version:active_dimension:role_tag`. Model key version and active
 dimension prevent revision and MRL truncation collisions. The role tag isolates query, passage,
 and backwards-compatible generic calls even if their raw text is identical. The key scheme is an
 internal implementation detail and must not be stored for use across process versions or sessions.
 
-There are 16 independent LRU shards. The first BLAKE3 output byte selects a shard with
+There are 16 independent LRU shards. The first SHA-256 output byte selects a shard with
 `key[0] & 15`; this mask is valid only because the shard count is a power of two, which is checked
 at compile time. Each shard owns an `RwLock<LruCache<...>>`; a lookup takes the write lock because
 an LRU hit promotes its entry. Hit and miss counters are shard-local relaxed atomics and aggregate

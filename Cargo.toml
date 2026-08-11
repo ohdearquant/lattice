@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 # MSRV, verified end-to-end (workspace + deps) on 1.93.1 and guarded by the msrv CI
 # job (aarch64 macOS, f16,metal-gpu, --all-targets) so a newer-toolchain-only API
@@ -44,7 +44,6 @@ rayon = "1.10"
 
 # Crypto / Hashing
 sha2 = "0.10"
-blake3 = { version = "1.5", default-features = false, features = ["std", "pure"] }
 
 # Database (optional, for caching)
 rusqlite = { version = "0.35", features = ["bundled"] }

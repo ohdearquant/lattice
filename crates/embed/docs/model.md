@@ -144,7 +144,7 @@ in every key.
 
 `ModelProvenance` records which registry variant was loaded, the source
 identifier, the loading time, and a convenience RFC 3339 timestamp. Its `hash`
-is a 64-character BLAKE3 hexadecimal digest of:
+is a 64-character SHA-256 hexadecimal digest of:
 
 ```text
 {model_id}:{loaded_at_iso}:{model_debug_representation}
@@ -203,7 +203,7 @@ norm                          1 byte
 Length prefixes make the variable-length strings unambiguous. The resulting
 bytes are suitable as the input to a deterministic hash for deduplication.
 They should not be confused with `CacheKey`: the latter is a 32-byte in-memory
-BLAKE3 digest with a cache-specific construction described below.
+SHA-256 digest with a cache-specific construction described below.
 
 ## Embedding cache
 
@@ -219,7 +219,7 @@ assume they remain valid between process versions or sessions.
 
 ### Key construction
 
-`CacheKey` is a 32-byte array: the BLAKE3 digest of the following byte stream:
+`CacheKey` is a 32-byte array: the SHA-256 digest of the following byte stream:
 
 ```text
 UTF-8 bytes of text
@@ -248,13 +248,13 @@ storage, not explicit key construction by its caller.
 ### Sharding and locking
 
 The cache has 16 fixed shards. The shard is selected from the first byte of a
-BLAKE3 key:
+SHA-256 key:
 
 ```text
 shard = key[0] & 15
 ```
 
-BLAKE3 output is uniformly distributed for this purpose, so the mask spreads
+SHA-256 output is uniformly distributed for this purpose, so the mask spreads
 keys across the shards. The shard count must remain a power of two because the
 implementation uses a bit mask rather than a general modulo operation.
 
@@ -378,7 +378,7 @@ separate vector-index namespace and cache key, even when the underlying Qwen mod
 ## ModelProvenance source behavior
 
 `ModelProvenance::new` records the selected model, caller-provided source identifier, current
-load time, and an RFC 3339 rendering of that time. Its 64-character BLAKE3 hexadecimal `hash`
+load time, and an RFC 3339 rendering of that time. Its 64-character SHA-256 hexadecimal `hash`
 is calculated from `{model_id}:{loaded_at_iso}:{model_debug_representation}`. It identifies a
 metadata load event, not the contents or integrity of model weights; weight verification belongs
 to the inference layer's checksum facilities. `dimensions()` reports the model's native width and

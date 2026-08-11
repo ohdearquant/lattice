@@ -7,7 +7,7 @@ similarity matching.
 
 - **Native Embeddings**: Generate embeddings locally using pure Rust inference (no ONNX, no Python)
 - **SIMD Acceleration**: AVX2/AVX-512/NEON optimized vector operations (7x speedup)
-- **LRU Cache**: Blake3-based caching to avoid recomputation
+- **LRU Cache**: SHA-256-based caching to avoid recomputation
 - **Async API**: Full async/await support with tokio
 
 ## Models
@@ -123,7 +123,7 @@ let sim = q.cosine_similarity(&other_quantized);
 
 ## Cache
 
-Blake3-based hashing with LRU eviction. Default capacity: 4000 entries (~6MB for 384-dim
+SHA-256-based hashing with LRU eviction. Default capacity: 4000 entries (~6MB for 384-dim
 vectors).
 
 ```rust
