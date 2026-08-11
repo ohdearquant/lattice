@@ -533,7 +533,9 @@ message content. There is no requirement to strip reasoning blocks between turns
 - `lattice serve` (not the separate `lattice_serve` binary) is the OpenAI-compatible server this
   document covers: `GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, and
   `POST /v1/embeddings` (see above; the last requires a vision-language checkpoint at startup).
-  The standalone `lattice_serve` binary does not carry the embeddings route.
+  The standalone `lattice_serve` binary also carries a `POST /v1/embeddings` route (issue #584),
+  through a separately loaded `--embedding-model` `BertModel` -- see the "Both binaries also have
+  a `POST /v1/embeddings` route" note above and [`docs/capability-matrix.md`](capability-matrix.md).
 - Non-streaming and streaming (SSE) both work today; the request struct's doc comment claiming
   streaming is unsupported is stale — verify against `reject_unsupported` and its tests, not that
   comment.

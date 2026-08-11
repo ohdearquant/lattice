@@ -94,8 +94,12 @@ value, different enforcement path) -- see the cross-binary parity table in `serv
 
 `POST /v1/embeddings` (issue #584) is always registered, but only answers requests when the
 binary was started with `--embedding-model <dir>` (or `LATTICE_SERVE_EMBEDDING_MODEL`): without
-it, every request gets HTTP 503 `embedding_model_not_loaded` rather than the route not existing
-at all, so its absence is a discoverable server state rather than a bare 404. The route computes
+it, a request that otherwise passes content-type, body-size, JSON, and input validation gets
+HTTP 503 `embedding_model_not_loaded` rather than the route not existing at all, so its absence
+is a discoverable server state rather than a bare 404. Content-type/body-size/parse/field
+validation run first and take precedence -- a request with a non-JSON `Content-Type`, an
+oversized body, malformed JSON, or an invalid/unsupported field still gets its own 415, 413, or
+400 even with no embedding model loaded. The route computes
 embeddings via `lattice_inference::model::bert::BertModel` directly (CPU-only), not through
 `lattice-embed`'s `EmbeddingService` trait -- `lattice-embed` already depends on
 `lattice-inference` for `BertModel`/`QwenModel`, so a reverse edge from this crate back onto

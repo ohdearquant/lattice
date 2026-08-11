@@ -839,6 +839,41 @@ pub fn check_embeddings_total_tokens(total_tokens: usize) -> Result<(), ApiError
     Ok(())
 }
 
+/// Rejects a single `input` item whose real token count exceeds the loaded
+/// BERT model's `max_position_embeddings`, before the request reaches
+/// `BertModel::encode`/`encode_batch`.
+///
+/// Both `BertModel` encode paths silently diverge on an over-length item
+/// instead of raising a caller-visible error: the batched path
+/// (`encode_batch_packed`, `crates/inference/src/model/bert.rs`) clamps each
+/// item's length to `max_position_embeddings`, returning HTTP 200 for a
+/// vector computed from silently truncated text; the single-item path
+/// (`encode`) does not clamp before slicing its tokenizer output, and can
+/// panic in the `spawn_blocking` task instead. Calling this for every item
+/// before either path runs makes both cases the same caller-visible error
+/// instead of two different failure modes for the same oversized input.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`context_length_exceeded`) naming the
+/// item's index, its token count, and the limit.
+pub fn check_embeddings_item_fits_window(
+    index: usize,
+    token_count: usize,
+    max_position_embeddings: usize,
+) -> Result<(), ApiError> {
+    if token_count > max_position_embeddings {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "input item {index} has {token_count} tokens, exceeding the loaded model's \
+                 context window of {max_position_embeddings} tokens"
+            ),
+            code: "context_length_exceeded",
+        });
+    }
+    Ok(())
+}
+
 /// OpenAI `input` field: a single string, or an array of strings.
 ///
 /// `#[serde(untagged)]` tries each variant in order, matching how OpenAI
@@ -852,7 +887,17 @@ pub enum TextEmbeddingsInput {
 }
 
 /// Wire request body for `POST /v1/embeddings`.
+///
+/// `deny_unknown_fields`: a field this route does not implement must be
+/// rejected, not silently dropped -- see [`check_embeddings_unsupported_fields`]'s
+/// doc comment for the caller-visible-contract reasoning. `dimensions`,
+/// `encoding_format`, and `user` are declared explicitly (rather than left to
+/// fall through to the unknown-field rejection) so each gets its own
+/// specific error message instead of a generic "unknown field" one; `user`
+/// is caller-side metadata this route accepts and ignores, matching OpenAI's
+/// own semantics for it.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TextEmbeddingsRequest {
     /// Text(s) to embed. `None` when the field is omitted or explicitly
     /// `null` — validated by [`parse_embeddings_input`].
@@ -865,6 +910,59 @@ pub struct TextEmbeddingsRequest {
     /// absent).
     #[serde(default)]
     pub model: Option<String>,
+    /// OpenAI's Matryoshka output-dimension override. Not implemented by
+    /// `BertModel` (fixed-width output) -- captured as a raw
+    /// [`serde_json::Value`] (rather than e.g. `Option<u32>`) purely to
+    /// detect presence; any non-`null` value is rejected by
+    /// [`check_embeddings_unsupported_fields`] regardless of its shape.
+    #[serde(default)]
+    pub dimensions: Option<Value>,
+    /// OpenAI's output encoding selector. This route always returns JSON
+    /// floats, so only an absent field or the literal `"float"` is a
+    /// genuine no-op; anything else (starting with `"base64"`) is rejected
+    /// by [`check_embeddings_unsupported_fields`].
+    #[serde(default)]
+    pub encoding_format: Option<String>,
+    /// OpenAI's caller-side tracing identifier. Never read by this route;
+    /// declared so it deserializes instead of tripping `deny_unknown_fields`.
+    #[serde(default)]
+    pub user: Option<Value>,
+}
+
+/// Rejects a request that sets a field this route does not implement, so
+/// the caller learns its requested output shape was not honored instead of
+/// silently receiving a response that does not match what it asked for
+/// (Matryoshka `dimensions`, or a `base64` `encoding_format`). Genuinely
+/// unrecognized fields are already rejected by
+/// [`TextEmbeddingsRequest`]'s `deny_unknown_fields`, at parse time, before
+/// this runs; this covers the two fields the wire type accepts syntactically
+/// but this route cannot actually honor.
+///
+/// # Errors
+///
+/// Returns [`ApiError::BadRequest`] (`unsupported_parameter`) naming the
+/// offending field.
+pub fn check_embeddings_unsupported_fields(req: &TextEmbeddingsRequest) -> Result<(), ApiError> {
+    if req.dimensions.as_ref().is_some_and(|v| !v.is_null()) {
+        return Err(ApiError::BadRequest {
+            message: "dimensions is not supported by this server; the loaded model's full \
+                      output width is always returned"
+                .to_string(),
+            code: "unsupported_parameter",
+        });
+    }
+    if let Some(format) = req.encoding_format.as_deref()
+        && format != "float"
+    {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "encoding_format '{format}' is not supported by this server; only 'float' is \
+                 implemented"
+            ),
+            code: "unsupported_parameter",
+        });
+    }
+    Ok(())
 }
 
 /// Extracts and validates the input texts from a parsed [`TextEmbeddingsRequest`].
@@ -1342,6 +1440,73 @@ mod tests {
             }
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_embeddings_item_fits_window_accepts_at_limit() {
+        check_embeddings_item_fits_window(0, 512, 512).unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_item_fits_window_rejects_over_limit() {
+        let err = check_embeddings_item_fits_window(2, 513, 512).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(message.contains("item 2"), "message: {message}");
+                assert!(message.contains("513"), "message: {message}");
+                assert!(message.contains("512"), "message: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_embeddings_unsupported_fields_accepts_absent() {
+        let req: TextEmbeddingsRequest = serde_json::from_str(r#"{"input":"hi"}"#).unwrap();
+        check_embeddings_unsupported_fields(&req).unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_unsupported_fields_accepts_user_and_float_encoding() {
+        let req: TextEmbeddingsRequest =
+            serde_json::from_str(r#"{"input":"hi","user":"trace-123","encoding_format":"float"}"#)
+                .unwrap();
+        check_embeddings_unsupported_fields(&req).unwrap();
+    }
+
+    #[test]
+    fn check_embeddings_unsupported_fields_rejects_dimensions() {
+        let req: TextEmbeddingsRequest =
+            serde_json::from_str(r#"{"input":"hi","dimensions":3}"#).unwrap();
+        let err = check_embeddings_unsupported_fields(&req).unwrap_err();
+        assert_eq!(err.code(), "unsupported_parameter");
+        assert!(err.message().contains("dimensions"), "{}", err.message());
+    }
+
+    #[test]
+    fn check_embeddings_unsupported_fields_rejects_non_float_encoding_format() {
+        let req: TextEmbeddingsRequest =
+            serde_json::from_str(r#"{"input":"hi","encoding_format":"base64"}"#).unwrap();
+        let err = check_embeddings_unsupported_fields(&req).unwrap_err();
+        assert_eq!(err.code(), "unsupported_parameter");
+        assert!(
+            err.message().contains("encoding_format"),
+            "{}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn text_embeddings_request_rejects_unknown_field() {
+        // `pooling` is not a field of this wire type (unlike the sibling
+        // vision-language `/v1/embeddings` route's `EmbeddingsRequest`,
+        // which does accept one) -- `deny_unknown_fields` must reject it
+        // rather than silently drop it.
+        let err =
+            serde_json::from_str::<TextEmbeddingsRequest>(r#"{"input":"hi","pooling":"cls"}"#)
+                .unwrap_err();
+        let _ = err; // presence of an Err is the assertion; message shape is serde's own.
     }
 
     #[test]

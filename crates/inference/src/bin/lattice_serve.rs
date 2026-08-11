@@ -110,8 +110,9 @@ mod imp {
         ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, normalize_messages,
     };
     use lattice_inference::serve::embeddings::{
-        TextEmbeddingsRequest, build_embeddings_response, check_embeddings_model,
-        check_embeddings_total_tokens, parse_embeddings_input,
+        TextEmbeddingsRequest, build_embeddings_response, check_embeddings_item_fits_window,
+        check_embeddings_model, check_embeddings_total_tokens, check_embeddings_unsupported_fields,
+        parse_embeddings_input,
     };
     use lattice_inference::serve::into_engine_chat_messages;
     use lattice_inference::serve::metal_worker::{
@@ -258,6 +259,21 @@ mod imp {
                 message: "too many outstanding /v1/embeddings requests; retry shortly".to_string(),
             }
         })
+    }
+
+    /// Default BERT pooling for a `--embedding-model` directory, keyed on
+    /// its name the same way `embedding_model_id` (the directory's file
+    /// name) already identifies the model elsewhere in this file. BGE-family
+    /// checkpoint names all contain "bge" (matching every name
+    /// `lattice-embed`'s `EmbeddingModel::model_id` uses for its BGE
+    /// variants, e.g. `"BAAI/bge-small-en-v1.5"`); every other served family
+    /// (E5, MiniLM) keeps `BertModel`'s own mean-pooling default.
+    fn default_bert_pooling_for_model_name(name: &str) -> BertPooling {
+        if name.to_ascii_lowercase().contains("bge") {
+            BertPooling::CLS
+        } else {
+            BertPooling::default()
+        }
     }
 
     /// Runs one `encode_batch` job on the blocking thread pool with `permit`
@@ -2831,6 +2847,20 @@ mod imp {
                 );
             }
         };
+        if let Err(err) = check_embeddings_unsupported_fields(&req) {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                400,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
         let texts = match parse_embeddings_input(&req.input) {
             Ok(texts) => texts,
             Err(err) => {
@@ -2884,7 +2914,7 @@ mod imp {
         }
 
         let embedding_model_id = embedding.model_id.clone();
-        let prompt_tokens: usize = {
+        let item_token_counts: Vec<usize> = {
             let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
             embedding
                 .model
@@ -2892,8 +2922,37 @@ mod imp {
                 .tokenize_batch(&refs)
                 .iter()
                 .map(|t| t.real_length)
-                .sum()
+                .collect()
         };
+        let prompt_tokens: usize = item_token_counts.iter().sum();
+        // Checked per item, before either `BertModel::encode_batch` path
+        // runs: `encode_batch_packed` clamps an over-length item to
+        // `max_position_embeddings` and would otherwise answer 200 for a
+        // silently truncated embedding, and the single-item `encode` path
+        // does not clamp at all. See `check_embeddings_item_fits_window`'s
+        // doc comment.
+        let max_position_embeddings = embedding.model.config().max_position_embeddings;
+        if let Some((index, &token_count)) = item_token_counts
+            .iter()
+            .enumerate()
+            .find(|&(_, &count)| count > max_position_embeddings)
+        {
+            let err =
+                check_embeddings_item_fits_window(index, token_count, max_position_embeddings)
+                    .unwrap_err();
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                400,
+                Some(prompt_tokens),
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
         if let Err(err) = check_embeddings_total_tokens(prompt_tokens) {
             emit_serve_event(
                 &s.metrics,
@@ -3391,15 +3450,27 @@ mod imp {
                         embedding_model_dir.display()
                     )
                 })?;
-                // `BertModel` defaults to mean pooling; BGE-family
-                // checkpoints (a common local embedding choice) are trained
-                // with CLS pooling instead. `BertModel::from_directory` has
-                // no per-model pooling table to consult (that mapping lives
-                // in `lattice-embed`'s `EmbeddingModel::bert_pooling`, not
-                // reachable here -- see this file's module doc comment), so
-                // this is operator-supplied rather than auto-detected.
+                let embedding_model_id: Arc<str> = embedding_model_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("embedding")
+                    .into();
+                // Auto-select the same default `--embedding-pooling` would
+                // otherwise force the operator to pass explicitly: BGE-family
+                // checkpoints need CLS pooling, everything else `BertModel`
+                // serves (E5, MiniLM) uses its own mean-pooling default. This
+                // mirrors `lattice-embed`'s `EmbeddingModel::bert_pooling`
+                // (crates/embed/src/model.rs) rule table, duplicated rather
+                // than called: that function dispatches on
+                // `lattice-embed`'s own closed `EmbeddingModel` enum, not a
+                // directory, and `lattice-embed` already depends on this
+                // crate for `BertModel`, so a call the other way is a cyclic
+                // package dependency (see this file's module doc comment).
+                // Keep the two BGE-detection rules in sync by hand.
+                model.set_pooling(default_bert_pooling_for_model_name(&embedding_model_id));
                 match parse_arg(&args, "--embedding-pooling").as_deref() {
-                    None | Some("mean") => {}
+                    None => {}
+                    Some("mean") => model.set_pooling(BertPooling::Mean),
                     Some("cls") => model.set_pooling(BertPooling::CLS),
                     Some(other) => {
                         return Err(format!(
@@ -3408,11 +3479,6 @@ mod imp {
                         .into());
                     }
                 }
-                let embedding_model_id: Arc<str> = embedding_model_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("embedding")
-                    .into();
                 eprintln!(
                     "[lattice_serve] embedding model '{embedding_model_id}' ready \
                      (dimensions={})",
@@ -4012,6 +4078,63 @@ mod imp {
             // worker's admission-cap `server_busy` (issue #932) -- both are
             // 503s, but only one names a route the operator forgot to
             // enable.
+            assert_eq!(code, "embedding_model_not_loaded");
+        }
+
+        // ── `POST /v1/embeddings` unsupported-field rejection (contract
+        // fix: an OpenAI field this route cannot honor must be rejected,
+        // not silently ignored) -- like the tests above, these return
+        // before `s.embedding` is dereferenced for anything but its
+        // `is_some()`-equivalent check, so `test_app_state()` (no loaded
+        // model) is a faithful stand-in.
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_dimensions_field_400() {
+            let body = Body::from(r#"{"input":"hello","dimensions":3}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "unsupported_parameter");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_base64_encoding_format_400() {
+            let body = Body::from(r#"{"input":"hello","encoding_format":"base64"}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "unsupported_parameter");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_unknown_field_rejected_not_dropped() {
+            // `pooling` is not a declared field of `TextEmbeddingsRequest`;
+            // `deny_unknown_fields` must fail the parse rather than
+            // silently ignore it (the pre-fix behavior).
+            let body = Body::from(r#"{"input":"hello","pooling":"cls"}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request_body");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_accepted_noop_fields_pass_validation() {
+            // `user` (caller metadata) and `encoding_format: "float"` (this
+            // route's only output shape) are genuine no-ops: a request
+            // carrying them must clear field validation and reach the next
+            // stage (here, the no-model-loaded 503) rather than being
+            // rejected as `unsupported_parameter`.
+            let body = Body::from(
+                r#"{"input":"hello","user":"trace-123","encoding_format":"float"}"#.to_string(),
+            );
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(code, "embedding_model_not_loaded");
         }
 
