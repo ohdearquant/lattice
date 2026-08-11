@@ -839,7 +839,9 @@ pub struct TextEmbeddingsRequest {
 ///   `invalid_input`, naming the offending index.
 /// - the array has more than [`MAX_EMBEDDINGS_BATCH_SIZE`] elements —
 ///   `batch_size_exceeds_limit`.
-pub fn parse_embeddings_input(input: &Option<TextEmbeddingsInput>) -> Result<Vec<String>, ApiError> {
+pub fn parse_embeddings_input(
+    input: &Option<TextEmbeddingsInput>,
+) -> Result<Vec<String>, ApiError> {
     let texts = match input {
         None => {
             return Err(ApiError::BadRequest {
