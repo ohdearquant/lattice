@@ -6286,6 +6286,7 @@ mod imp {
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod production_adapter_observation {
             use super::*;
+            use lattice_inference::Tokenizer;
             use lattice_inference::serve::{
                 ExpectedObservation, GenerateConfigSnapshot,
                 OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, ProductionAdapterObservation,
