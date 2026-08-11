@@ -8,6 +8,7 @@
 //!     --prompt "Write a Rust function that checks if a number is prime" \
 //!     --max-tokens 64
 //!     [--json]   Emit @@lattice gen_token events for the Lattice Studio app.
+#![allow(clippy::field_reassign_with_default)]
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -142,11 +143,9 @@ fn main() {
     }
 
     // Configure generation
-    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-        max_new_tokens: max_tokens,
-        seed,
-        ..lattice_inference::model::qwen35_config::GenerateConfig::default()
-    };
+    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_tokens;
+    gen_cfg.seed = seed;
     if let Some(t) = temperature {
         gen_cfg.temperature = t;
     }

@@ -43,6 +43,7 @@
 //! (the same default ollama uses). The ChatML template and `<|im_end|>` stop
 //! handling are reused verbatim from the engine; this binary only translates the
 //! OpenAI wire format on either side.
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -1638,21 +1639,21 @@ mod imp {
     }
 
     fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
-        GenerateConfig {
-            max_new_tokens: req.max_tokens,
-            temperature: req.temperature,
-            top_k: req.top_k,
-            top_p: req.top_p,
-            repetition_penalty: req.repetition_penalty,
-            seed: req.seed,
-            stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
-            enable_thinking: true,
-            enable_mtp: None,
-            grammar: None,
-            stop_strings: req.stop_strings.clone(),
-            reasoning_budget: req.reasoning_budget,
-            logprobs: req.logprobs,
-        }
+        let mut cfg = GenerateConfig::default();
+        cfg.max_new_tokens = req.max_tokens;
+        cfg.temperature = req.temperature;
+        cfg.top_k = req.top_k;
+        cfg.top_p = req.top_p;
+        cfg.repetition_penalty = req.repetition_penalty;
+        cfg.seed = req.seed;
+        cfg.stop_token_ids = vec![QWEN_CHAT_IM_END_TOKEN_ID];
+        cfg.enable_thinking = true;
+        cfg.enable_mtp = None;
+        cfg.grammar = None;
+        cfg.stop_strings = req.stop_strings.clone();
+        cfg.reasoning_budget = req.reasoning_budget;
+        cfg.logprobs = req.logprobs;
+        cfg
     }
 
     // ─── GPU worker thread ───────────────────────────────────────────────────
@@ -5869,15 +5870,12 @@ mod imp {
             /// `grammar`, `reasoning_budget`, `logprobs`, `stop_strings`) to
             /// the exact same values `GenerateConfig::default()` carries.
             fn expected_gen_cfg() -> GenerateConfigSnapshot {
-                GenerateConfigSnapshot::from(
-                    &lattice_inference::model::qwen35_config::GenerateConfig {
-                        max_new_tokens: 9,
-                        temperature: 1.3,
-                        top_p: 0.55,
-                        seed: Some(7),
-                        ..Default::default()
-                    },
-                )
+                let mut cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+                cfg.max_new_tokens = 9;
+                cfg.temperature = 1.3;
+                cfg.top_p = 0.55;
+                cfg.seed = Some(7);
+                GenerateConfigSnapshot::from(&cfg)
             }
 
             #[tokio::test]

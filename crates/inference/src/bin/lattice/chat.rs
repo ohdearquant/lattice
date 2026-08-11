@@ -80,6 +80,7 @@ pub(crate) fn chat_max_cache_len() -> usize {
     MetalChatBackend::MAX_CACHE_LEN
 }
 
+#[allow(clippy::field_reassign_with_default)]
 pub(crate) fn run_chat(
     model_path: &str,
     max_tokens: usize,
@@ -145,11 +146,9 @@ pub(crate) fn run_chat(
     };
     eprintln!("Model loaded. Type 'exit' or 'quit' to stop.\n");
 
-    let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-        max_new_tokens: max_tokens,
-        temperature,
-        ..Default::default()
-    };
+    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_tokens;
+    gen_cfg.temperature = temperature;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
