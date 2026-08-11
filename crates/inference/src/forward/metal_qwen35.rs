@@ -294,7 +294,7 @@ mod route_predicate_tests {
             ..greedy_gen_cfg(vec![])
         };
         let mut rng = 7u64;
-        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng);
+        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng, 0.0);
         assert_eq!(
             canonical, 1,
             "sample_token must penalize the previously-seen argmax enough to \
@@ -10695,6 +10695,21 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
+        // `GenerateConfig` cannot carry `min_p` (it is exhaustively
+        // constructible through the public API at published `0.7.1`; adding
+        // any field is a major break -- see
+        // `crate::sampling::Sampler::with_min_p`), and no production entry
+        // point sets it yet, so this path is always disabled.
+        sample_from_candidates_impl(candidates, cfg, previous_ids, rng_state, 0.0)
+    }
+
+    fn sample_from_candidates_impl(
+        candidates: &[crate::sampling::Candidate],
+        cfg: &GenerateConfig,
+        previous_ids: &[u32],
+        rng_state: &mut u64,
+        min_p: f32,
+    ) -> u32 {
         use crate::sampling::CandidateSet;
         let mut cs = CandidateSet::from_candidates(candidates.to_vec());
 
@@ -10714,7 +10729,59 @@ mod inner {
         // worst-probability token. Route through the canonical [0, 1) helper
         // (provably < 1.0), matching the CPU sampling path.
         let r = crate::sampling::uniform_f32_from_u64(raw);
-        cs.sample_top_p(cfg.top_p, r)
+        cs.sample_min_p_top_p(min_p, cfg.top_p, r)
+    }
+
+    #[cfg(test)]
+    mod min_p_compact_sampling_tests {
+        use super::{GenerateConfig, sample_from_candidates_impl};
+        use crate::sampling::Candidate;
+
+        #[test]
+        fn compact_metal_candidate_path_applies_min_p() {
+            let candidates = [
+                Candidate {
+                    token_id: 7,
+                    logit: 0.0,
+                },
+                Candidate {
+                    token_id: 8,
+                    logit: 0.49_f32.ln(),
+                },
+            ];
+            let disabled = GenerateConfig {
+                temperature: 1.0,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                ..Default::default()
+            };
+            let mut saw_tail_without_min_p = false;
+
+            for seed in [0x1234_5678_9abc_def0, 0xabad_1dea_dead_beef] {
+                let mut control_rng = seed;
+                saw_tail_without_min_p |=
+                    sample_from_candidates_impl(&candidates, &disabled, &[], &mut control_rng, 0.0)
+                        == 8;
+
+                let mut filtered_rng = seed;
+                assert_eq!(
+                    sample_from_candidates_impl(
+                        &candidates,
+                        &disabled,
+                        &[],
+                        &mut filtered_rng,
+                        0.5,
+                    ),
+                    7,
+                    "compact Metal candidates below min_p * max_probability must be removed"
+                );
+            }
+
+            assert!(
+                saw_tail_without_min_p,
+                "control seeds must exercise the tail candidate or the min-p assertion is vacuous"
+            );
+        }
     }
 
     fn xorshift64(state: &mut u64) -> u64 {
@@ -10735,8 +10802,8 @@ mod inner {
     /// old per-call `CandidateSet::from_full_logits` implementation: repetition
     /// penalty over the unique-id set from `previous_ids` (not a per-candidate
     /// `.contains()` scan over the full vocabulary), a streaming min-heap
-    /// partial top-k select feeding the top-p softmax draw (so softmax only
-    /// ever runs over the surviving k candidates), and thread-local scratch
+    /// partial top-k select feeding the min-p/top-p softmax draw (so softmax
+    /// only ever runs over the surviving k candidates), and thread-local scratch
     /// buffers reused across decode steps instead of a fresh vocab-sized
     /// `CandidateSet` per token.
     fn sample_token(
@@ -10745,7 +10812,7 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
+        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0)
     }
 
     /// Signpost-traced sampling shared by every autoregressive decode loop's
