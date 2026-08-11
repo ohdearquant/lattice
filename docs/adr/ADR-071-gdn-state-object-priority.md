@@ -21,7 +21,7 @@ Gated-DeltaNet (GDN) layers carry a **recurrent state** (a per-layer causal-conv
 S-matrix) that, unlike the KV cache, is a fixed-size function of model config rather than of
 sequence position. That state is the object a serving stack must observe, snapshot, persist,
 quantize, and roll back to support cross-turn caching, agentic branch/rollback, and failure
-detection. Issue #481 tracks turning it into a first-class serveable object; a family of child
+detection. Issue #481 introduces a first-class typed Metal owner; a family of child
 issues (#462, #486, #491, and the compression proposals) hangs off it.
 
 The purpose of this ADR is to **sequence that family against what the codebase already
@@ -50,7 +50,7 @@ profiling with no merged artifact says so.
 | S2  | Per **decode step**, logical state traffic = **40,402,944 B (read+write, 20.2 MB each)** and is **context-invariant** — fixed by config, does not grow with context (unlike KV bytes/token).                                                                                                                                                                                                                                                      | unit-test-pinned + source-documented   | `metal_qwen35.rs:28190-28191`; `examples/bench_gdn_state.rs:9-15`                                                                                     |
 | S3  | **Cross-turn GDN checkpoint replay is SHIPPED**: `ReplayFromCheckpoint` fully implemented via a `MetalGdnCheckpoint` ring (`CROSS_TURN_GDN_CHECKPOINT_CAP=3`), used by the CLI chat path.                                                                                                                                                                                                                                                         | source-verified (merged)               | issue #590 / PR #635, commit `53a726b14` (on `main` 2026-07-04); `chat_metal.rs:426,:995` (call sites), `:488-496` (stats)                            |
 | S4  | **Cross-turn prefix caching is SHIPPED into both serve binaries**: `lattice_serve` (HTTP) via #662 and the `lattice serve` Metal worker via #666 (both merged 2026-07-05). `lattice_serve.rs:989` calls `chat_completion_streaming_with_prefix_cache_and_cancel` on `CrossTurnSlotId::DEFAULT`. #462 remains open only for its greedy-parity / bit-exact acceptance test (the renderer unification asked for by #661 is already merged via #667). | source-verified (merged)               | #662, #666 (merged); `bin/lattice_serve.rs:989-990`; #462 (open, residual only)                                                                       |
-| S5  | GPU state is **not a first-class type** — two parallel `Vec<Buffer>` (`gdn_gpu_conv_bufs`, `gdn_gpu_s_matrices`) held by index discipline, no wrapping object/metadata.                                                                                                                                                                                                                                                                           | source-read                            | #481 (tracking, open); `metal_qwen35.rs:1496-1497`                                                                                                    |
+| S5  | GPU state is a **first-class typed owner** — `MetalGdnState` pairs each layer's conv-history and recurrent-matrix buffers and carries architectural, active, allocated, shape, and precision metadata.                                                                                                                                                                                                                                            | source-read                            | #481; `metal_qwen35/inner/gdn_state.rs`                                                                                                               |
 | S6  | **State-traffic observability is partially built** behind the `gdn-state-counters` feature: `GdnStateTrafficShape/Bucket/Report/Counters`, with the counter helpers **wired on the production decode path**, and `examples/bench_gdn_state.rs` documented as "the #491 bandwidth-share decision gate" harness.                                                                                                                                    | source-verified                        | `Cargo.toml:36,188`; `metal_qwen35.rs:3579,3586` (helpers), `:5401,:5873,:5951` (decode-path attribution); `examples/bench_gdn_state.rs:9-15,196-203` |
 | S7  | **#491 is UNRUN**: the per-step state _numerator_ (S2) is pinned, but the _fraction_ f = state ÷ (state + KV + weight) has **no committed measurement** — it needs the bench run on real hardware to supply the denominator.                                                                                                                                                                                                                      | source-verified (issue open)           | #491 (open)                                                                                                                                           |
 | S8  | C32 chunked-scan = five scan-algebra MSL stages (materialize / solve / residual-output / state-update / norm-silu) **plus a separate `gdn_chunk_conv_buf_update_c32` conv-buffer-update dispatch** (six kernels), `GDN_CHUNK_SIZE=32`; already meets ≥5×@4K and is structurally ~5× capped.                                                                                                                                                       | source-read                            | `metal_qwen35.rs:902` (chunk size), `:1205-1210` (C32 pipelines)                                                                                      |
@@ -93,8 +93,8 @@ where it rests on an unmeasured fraction.
 
 Rank the #481 family by _shipped-ness × user-visible value_. Cross-turn caching (S3, S4) is
 already shipped in both the CLI and serve paths, so the largest serving regression is closed; the
-lead is now the one near-free measurement that gates all compression work, then the typing and
-observability work that is genuinely open.
+lead is now the one near-free measurement that gates all compression work, followed by the
+observability lifecycle on the typed owner.
 
 1. **P1 — Run #491 and record the state-bandwidth fraction (early, near-free).** The harness
    (`bench_gdn_state.rs`) and production counters already exist (S6), and it needs nothing from
@@ -103,11 +103,11 @@ observability work that is genuinely open.
    state-compression proposal**. The measured f is attached to this ADR as a new S-row the same day
    it runs. Expected outcome: f single-digit and shrinking with context → all decode-speed
    compression closed; only storage/branch compression survives to experiment. _Measure, ready today._
-2. **P2 — Promote the GPU state to a first-class typed object (#481 core).** Replace the
-   index-disciplined parallel `Vec<Buffer>` (S5) with a typed state object carrying dims, layer
-   count, byte size, and precision tag; fold in the traffic-accounting shape that already models
-   the byte layout (S6). This is the confirmed prerequisite for observability lifecycle, precision
-   experiments, snapshot APIs, and correctness checks. _Build._
+2. **P2 — SHIPPED: promote the GPU state to a first-class typed object (#481 core).**
+   `MetalGdnState` replaces the index-disciplined parallel `Vec<Buffer>` (S5), pairing each
+   layer's buffers and carrying architectural, active, allocated, shape, and precision metadata.
+   This is the confirmed prerequisite for observability lifecycle, precision experiments,
+   snapshot APIs, and correctness checks.
 3. **P3 — Formalize observability modes (Off / Canary / Debug) on the P2 object.** The counters
    exist (S6); the API contract that must be added is Off-mode-is-a-compile-time-no-op (kill: if
    Off cannot compile to a no-op, redesign the API; if Canary needs full state CPU readback per
@@ -120,7 +120,7 @@ must ship as a test, not a prose claim, and that confirmation is a required part
 not optional. The renderer unification #661 asked for is already merged (#667); only a minor
 CPU-path renderer cleanup remains separately open (#668), unrelated to cross-turn correctness.
 
-**Deferred — NEEDS-EXPERIMENT (gated on the P2 object + the P1 measurement):** snapshot-only int8
+**Deferred — NEEDS-EXPERIMENT (P2 satisfied; gated on the P1 measurement):** snapshot-only int8
 for **storage/branch artifacts** (the only compression thesis with a plausible payoff, and it is a
 storage lever not a speed lever); state-as-GQA-router; observer-derived confidence. **Agentic
 snapshot/branch/rollback (#486)** is a deferred _feature_ that consumes the P2 object and
@@ -139,11 +139,11 @@ the top prefill lever (tied to ADR-081's deferred FA2 track).
 
 - **Positive.** More is shipped than the research brief assumed (serve wiring #662/#666, checkpoint
   replay #635, traffic counters behind a flag), so the ADR leads with the near-free #491 measurement
-  that settles the long-running compression question with data instead of an external estimate, then
-  the typed object (P2) that unlocks the rest of the #481 family behind one clean refactor. The
-  observability contract (P3) is a formalization of code that already runs.
-- **Cost.** P2 is real Metal-adjacent work: a type refactor across the buffer allocation and
-  checkpoint-blit sites. Bit-exact restore must stay preserved and **guarded by an explicit parity
+  that settles the long-running compression question with data instead of an external estimate.
+  The typed object (P2) now unlocks the rest of the #481 family behind one ownership boundary, and
+  the observability contract (P3) is a formalization of code that already runs.
+- **Cost.** P2 touched Metal-adjacent buffer allocation and checkpoint-blit sites. Bit-exact
+  restore must stay preserved and **guarded by an explicit parity
   test** — for the already-shipped serve path (the serve residual above) and for any new
   snapshot/restore surface P2 exposes (kill: restored logits not bit-identical at a deterministic
   boundary under identical kernels/accumulation order).
@@ -156,8 +156,8 @@ the top prefill lever (tied to ADR-081's deferred FA2 track).
 
 - #491 (state-vs-KV-vs-weight bandwidth share) → **P1**, run `bench_gdn_state.rs` early, record f,
   and attach it to this ADR as a new S-row the same day.
-- #481 (first-class serveable state object, tracking) → **P2**, typed object; tick the cross-turn
-  sub-items as delivered (GDN replay #590/#635; serve wiring #662/#666).
+- #481 (first-class serveable state object, tracking) → **P2 delivered** by `MetalGdnState`;
+  cross-turn sub-items are also delivered (GDN replay #590/#635; serve wiring #662/#666).
 - #462 (serve re-prefills each turn) → **serve cross-turn wiring shipped** (#662/#666); remaining =
   confirming/adding the greedy-parity restore test (required to close #462, per the R2 gate).
   Renderer unification already merged (#667); only a separate minor CPU-path cleanup stays open (#668).
