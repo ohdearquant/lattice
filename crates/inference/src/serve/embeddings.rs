@@ -155,16 +155,22 @@ impl EmbeddingModel {
     /// Real (possibly truncated) tokenized length of `text`, used for
     /// `usage.prompt_tokens` -- this must report what the pooled forward
     /// pass actually consumes, not what the caller sent. Never use this for
-    /// a context-window admission check: see
-    /// [`Self::tokenize_pre_truncation_len`].
+    /// a context-window admission check: see [`Self::tokenize_lengths`].
     pub fn tokenize_len(&self, text: &str) -> usize {
         self.tokenizer.tokenize(text).real_length
     }
 
-    /// Pre-truncation tokenized length of `text`, i.e. the count before the
-    /// tokenizer's own `max_seq_len` truncation is applied. The
-    /// context-window admission guard ([`check_item_fits_window`]) must
-    /// compare against this, not [`Self::tokenize_len`]'s real length:
+    /// Tokenizes `text` once, returning `(pre_truncation_len, real_length)`
+    /// -- the count the context-window admission guard
+    /// ([`check_item_fits_window`]) must compare against, and the count the
+    /// forward pass actually consumes for `usage.prompt_tokens`,
+    /// respectively. Exists so a caller that needs both counts (the
+    /// [`embed_items`] text branch) tokenizes once instead of twice;
+    /// [`Self::tokenize_len`] above remains the single-value accessor for a
+    /// caller (e.g. [`Self::image_scaffold_token_count`]) that only needs
+    /// the real, post-truncation count.
+    ///
+    /// `pre_truncation_len` must be used for admission, never `real_length`:
     /// `real_length` can never exceed the tokenizer's `max_seq_len`, so
     /// comparing it against `max_context()` can never observe an
     /// over-window input once `max_seq_len <= max_context()` -- the
@@ -172,8 +178,9 @@ impl EmbeddingModel {
     /// embedded from a truncated prefix instead. See
     /// `TokenizedInput::pre_truncation_len`'s doc for the same reasoning
     /// applied to the sibling `lattice_serve` text-embeddings route.
-    pub fn tokenize_pre_truncation_len(&self, text: &str) -> usize {
-        self.tokenizer.tokenize(text).pre_truncation_len
+    fn tokenize_lengths(&self, text: &str) -> (usize, usize) {
+        let tokenized = self.tokenizer.tokenize(text);
+        (tokenized.pre_truncation_len, tokenized.real_length)
     }
 
     /// Maximum decoder scaffold length this checkpoint can process in one
@@ -195,8 +202,9 @@ impl EmbeddingModel {
     /// be compared against [`Self::max_context`] the same way a text item is.
     ///
     /// Uses [`Self::tokenize_len`] (the real, possibly-truncated count), not
-    /// [`Self::tokenize_pre_truncation_len`], for the `prompt` component --
-    /// unlike the text item guard, this is not a live gap today: this
+    /// the pre-truncation count [`Self::tokenize_lengths`] also exposes, for
+    /// the `prompt` component -- unlike the text item guard, this is not a
+    /// live gap today: this
     /// method's one production call site ([`embed_items`]'s image branch)
     /// always passes `prompt = ""`, whose tokenized length is `0` either
     /// way, so no input can currently exercise the truncation-vs-window
@@ -570,15 +578,14 @@ pub fn embed_items(
     for (index, item) in items.into_iter().enumerate() {
         let embedding = match &item {
             NormalizedEmbeddingItem::Text(text) => {
-                // Admission uses the pre-truncation count so an input the
-                // tokenizer would truncate is rejected instead of silently
-                // embedded from a truncated prefix; `usage.prompt_tokens`
-                // still reports the real (possibly truncated) count the
-                // forward pass actually consumes -- see both accessors'
-                // doc comments.
-                let admission_count = embedder.tokenize_pre_truncation_len(text);
+                // Single tokenize() call: admission uses the pre-truncation
+                // count so an input the tokenizer would truncate is rejected
+                // instead of silently embedded from a truncated prefix;
+                // `usage.prompt_tokens` still reports the real (possibly
+                // truncated) count the forward pass actually consumes --
+                // see `tokenize_lengths`'s doc comment.
+                let (admission_count, token_count) = embedder.tokenize_lengths(text);
                 check_item_fits_window(index, admission_count, max_context)?;
-                let token_count = embedder.tokenize_len(text);
                 prompt_tokens += token_count;
                 embedder.embed_text(text, pooling)
             }
