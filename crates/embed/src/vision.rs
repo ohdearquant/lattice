@@ -39,6 +39,30 @@ use std::path::Path;
 
 pub use lattice_inference::forward::cpu_f16::PoolingStrategy;
 
+/// Raises `tokenizer`'s own truncation cap to `config`'s
+/// `max_position_embeddings.min(8192)` decode window when it sits below it,
+/// otherwise returns `tokenizer` unchanged. Only ever raises the cap, never
+/// lowers it.
+///
+/// Mirrors `lattice_inference::serve::embeddings`'s identically-named
+/// guard (issue #1408): without it, a caller-supplied `BpeTokenizer` left at
+/// its constructor default (4096) truncates any prompt between 4097 tokens
+/// and this checkpoint's real window before [`embed_text_vlm_f16`] or
+/// [`embed_image_from_bytes_f16`] ever see it, silently discarding content
+/// the model could otherwise process. Unlike the `lattice_inference` sibling,
+/// this crate has no admission guard ahead of the forward pass to reject an
+/// over-window input outright -- the tokenizer's own cap is the only thing
+/// standing between "process it" and "silently shorten it", so it must never
+/// sit below the checkpoint's window.
+fn capped_tokenizer(tokenizer: BpeTokenizer, config: &Qwen35Config) -> BpeTokenizer {
+    let max_context = config.max_position_embeddings.min(8192);
+    if tokenizer.max_seq_len() < max_context {
+        tokenizer.with_max_seq_len(max_context)
+    } else {
+        tokenizer
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static AFTER_VISUAL_LOAD_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
@@ -100,12 +124,21 @@ impl VisionEmbeddingModel {
     /// Use this when the checkpoint spans multiple safetensors shards (not
     /// supported by [`Self::from_directory`]) or when components are shared
     /// across other in-process model instances.
+    ///
+    /// Raises `tokenizer`'s own truncation cap to `config`'s context window
+    /// when it sits below it (see [`capped_tokenizer`]) -- see that
+    /// function's docs for why: without this, a caller-supplied tokenizer
+    /// left at its default cap silently truncates any prompt between 4097
+    /// tokens and the checkpoint's real window before it ever reaches the
+    /// forward pass. [`Self::from_directory`] goes through this constructor
+    /// too, so it gets the same guarantee.
     pub fn new(
         weights: F16ModelWeights,
         config: Qwen35Config,
         vision_weights: Qwen35VisionWeights,
         tokenizer: BpeTokenizer,
     ) -> Self {
+        let tokenizer = capped_tokenizer(tokenizer, &config);
         Self {
             weights,
             config,
@@ -656,8 +689,17 @@ mod tests {
     }
 
     fn write_tiny_vlm_checkpoint(dir: &Path, indexed: bool) {
-        let config = r#"{
-            "text_config": {
+        write_tiny_vlm_checkpoint_with_max_position_embeddings(dir, indexed, 512);
+    }
+
+    fn write_tiny_vlm_checkpoint_with_max_position_embeddings(
+        dir: &Path,
+        indexed: bool,
+        max_position_embeddings: usize,
+    ) {
+        let config = format!(
+            r#"{{
+            "text_config": {{
                 "hidden_size": 8,
                 "num_hidden_layers": 1,
                 "vocab_size": 16,
@@ -668,12 +710,12 @@ mod tests {
                 "head_dim": 8,
                 "rope_theta": 10000000.0,
                 "partial_rotary_factor": 1.0,
-                "rope_parameters": {
+                "rope_parameters": {{
                     "rope_theta": 10000000.0,
                     "partial_rotary_factor": 1.0,
                     "mrope_section": [2, 1, 1],
                     "mrope_interleaved": true
-                },
+                }},
                 "linear_num_key_heads": 2,
                 "linear_num_value_heads": 2,
                 "linear_key_head_dim": 32,
@@ -684,9 +726,9 @@ mod tests {
                 "layer_types": ["full_attention"],
                 "layer_mask": [true],
                 "eos_token_id": 15,
-                "max_position_embeddings": 512
-            },
-            "vision_config": {
+                "max_position_embeddings": {max_position_embeddings}
+            }},
+            "vision_config": {{
                 "depth": 1,
                 "hidden_size": 8,
                 "num_heads": 2,
@@ -697,13 +739,14 @@ mod tests {
                 "num_position_embeddings": 16,
                 "in_channels": 3,
                 "deepstack_visual_indexes": []
-            },
+            }},
             "image_token_id": 9,
             "vision_start_token_id": 10,
             "vision_end_token_id": 11,
             "tie_word_embeddings": true
-        }"#;
-        std::fs::write(dir.join("config.json"), config).expect("write config.json");
+        }}"#
+        );
+        std::fs::write(dir.join("config.json"), &config).expect("write config.json");
         write_tiny_tokenizer_json(dir);
 
         let shapes = tiny_vlm_checkpoint_shapes();
@@ -1050,6 +1093,33 @@ mod tests {
         let model = VisionEmbeddingModel::from_directory(tmp.path())
             .expect("single-file VLM checkpoint must load without a synthetic index");
         assert_eq!(model.dimensions(), 8);
+    }
+
+    /// Issue #1408, sibling-crate half: a `tokenizer.json` with no explicit
+    /// cap parses through `BpeTokenizer::from_tokenizer_json` at its
+    /// constructor default (4096, `DEFAULT_BPE_MAX_SEQ_LEN` in
+    /// `lattice_inference::tokenizer::bpe`). A checkpoint whose
+    /// `max_position_embeddings` sits above that default (here 5000, still
+    /// under the 8192 ceiling `capped_tokenizer` applies) must come out of
+    /// `from_directory` with its tokenizer cap raised to match -- otherwise
+    /// prompts between 4097 and 5000 tokens are silently truncated before
+    /// the forward pass ever sees them, even though the checkpoint can
+    /// process them. Reverting `VisionEmbeddingModel::new`'s call to
+    /// `capped_tokenizer` reddens this (cap stays at the tokenizer's own
+    /// default, 4096, strictly below `max_position_embeddings`, 5000).
+    #[test]
+    fn from_directory_raises_tokenizer_cap_to_context_window_above_tokenizer_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_tiny_vlm_checkpoint_with_max_position_embeddings(tmp.path(), false, 5000);
+
+        let model = VisionEmbeddingModel::from_directory(tmp.path())
+            .expect("VLM checkpoint with a wide context window must load");
+        assert_eq!(
+            model.tokenizer.max_seq_len(),
+            5000,
+            "tokenizer cap must be raised to max_position_embeddings, not left at the \
+             tokenizer's own 4096 default"
+        );
     }
 
     #[test]
