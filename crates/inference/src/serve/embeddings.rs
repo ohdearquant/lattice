@@ -117,8 +117,19 @@ impl EmbeddingModel {
         })?;
 
         let tokenizer_path = dir.join("tokenizer.json");
+        // Cap the tokenizer's own truncation point at this checkpoint's
+        // context window (mirroring `max_context()` exactly) rather than
+        // leaving it at `BpeTokenizer`'s `DEFAULT_BPE_MAX_SEQ_LEN` (4096):
+        // otherwise, whenever `max_position_embeddings.min(8192)` exceeds
+        // 4096, the tokenizer can silently truncate an input to 4096 tokens
+        // while `check_item_fits_window` admits it (its pre-truncation count
+        // is still under the wider window), embedding a truncated prefix
+        // instead of rejecting it. Capping here makes truncation and
+        // rejection coincide: anything the tokenizer would truncate is
+        // exactly what the guard now rejects.
         let tokenizer = BpeTokenizer::from_tokenizer_json(&tokenizer_path)
-            .map_err(|e| format!("{}: {e}", tokenizer_path.display()))?;
+            .map_err(|e| format!("{}: {e}", tokenizer_path.display()))?
+            .with_max_seq_len(config.max_position_embeddings.min(8192));
 
         let (mut sf, shard_path) = open_qwen35_single_decoder_safetensors(dir)
             .map_err(|e| format!("decoder checkpoint: {e}"))?;
@@ -141,9 +152,28 @@ impl EmbeddingModel {
         self.config.hidden_size
     }
 
-    /// Real tokenized length of `text`, used for `usage.prompt_tokens`.
+    /// Real (possibly truncated) tokenized length of `text`, used for
+    /// `usage.prompt_tokens` -- this must report what the pooled forward
+    /// pass actually consumes, not what the caller sent. Never use this for
+    /// a context-window admission check: see
+    /// [`Self::tokenize_pre_truncation_len`].
     pub fn tokenize_len(&self, text: &str) -> usize {
         self.tokenizer.tokenize(text).real_length
+    }
+
+    /// Pre-truncation tokenized length of `text`, i.e. the count before the
+    /// tokenizer's own `max_seq_len` truncation is applied. The
+    /// context-window admission guard ([`check_item_fits_window`]) must
+    /// compare against this, not [`Self::tokenize_len`]'s real length:
+    /// `real_length` can never exceed the tokenizer's `max_seq_len`, so
+    /// comparing it against `max_context()` can never observe an
+    /// over-window input once `max_seq_len <= max_context()` -- the
+    /// rejection becomes unreachable and an over-long input is silently
+    /// embedded from a truncated prefix instead. See
+    /// `TokenizedInput::pre_truncation_len`'s doc for the same reasoning
+    /// applied to the sibling `lattice_serve` text-embeddings route.
+    pub fn tokenize_pre_truncation_len(&self, text: &str) -> usize {
+        self.tokenizer.tokenize(text).pre_truncation_len
     }
 
     /// Maximum decoder scaffold length this checkpoint can process in one
@@ -163,6 +193,18 @@ impl EmbeddingModel {
     /// that module's internals), and `prompt`'s tokenized length. Used both
     /// for `usage.prompt_tokens` accounting and (via the returned count) can
     /// be compared against [`Self::max_context`] the same way a text item is.
+    ///
+    /// Uses [`Self::tokenize_len`] (the real, possibly-truncated count), not
+    /// [`Self::tokenize_pre_truncation_len`], for the `prompt` component --
+    /// unlike the text item guard, this is not a live gap today: this
+    /// method's one production call site ([`embed_items`]'s image branch)
+    /// always passes `prompt = ""`, whose tokenized length is `0` either
+    /// way, so no input can currently exercise the truncation-vs-window
+    /// mismatch through this path. A future caller that passes a real
+    /// `prompt` here would need the same admission/usage split the text
+    /// branch got; left as real-length-only for now rather than adding an
+    /// unexercised second accessor for a code path with no non-empty-prompt
+    /// caller.
     ///
     /// # Errors
     ///
@@ -528,8 +570,15 @@ pub fn embed_items(
     for (index, item) in items.into_iter().enumerate() {
         let embedding = match &item {
             NormalizedEmbeddingItem::Text(text) => {
+                // Admission uses the pre-truncation count so an input the
+                // tokenizer would truncate is rejected instead of silently
+                // embedded from a truncated prefix; `usage.prompt_tokens`
+                // still reports the real (possibly truncated) count the
+                // forward pass actually consumes -- see both accessors'
+                // doc comments.
+                let admission_count = embedder.tokenize_pre_truncation_len(text);
+                check_item_fits_window(index, admission_count, max_context)?;
                 let token_count = embedder.tokenize_len(text);
-                check_item_fits_window(index, token_count, max_context)?;
                 prompt_tokens += token_count;
                 embedder.embed_text(text, pooling)
             }
@@ -1126,6 +1175,78 @@ mod tests {
         let (data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(usage.prompt_tokens, 10);
+    }
+
+    /// Builds a fixture with the OPPOSITE ordering of
+    /// `embed_items_rejects_text_item_over_context_window` above: that
+    /// test's `max_context() == 512` sits BELOW the tokenizer's default
+    /// (4096) truncation cap, so a long input survives tokenization intact
+    /// and trips the guard whether the guard reads the real or the
+    /// pre-truncation count -- it cannot distinguish the fix from a no-op.
+    /// This fixture pins a tokenizer cap (5) BELOW the context window
+    /// (1000), which is the ordering issue #1408 actually needs: a
+    /// comparison against `tokenize_len`'s real (post-truncation) count
+    /// would clamp to 5 tokens for any input and could never exceed the
+    /// 1000-token window, making the rejection unreachable.
+    fn context_window_above_tokenizer_cap_model() -> EmbeddingModel {
+        let base = tiny_embedding_model();
+        let mut config = base.config.clone();
+        config.max_position_embeddings = 1000;
+        let tokenizer = base.tokenizer.clone().with_max_seq_len(5);
+        EmbeddingModel::new(
+            base.weights.clone(),
+            config,
+            base.vision_weights.clone(),
+            tokenizer,
+        )
+    }
+
+    #[test]
+    fn embed_items_rejects_text_item_whose_pre_truncation_length_exceeds_a_window_above_the_tokenizer_cap()
+     {
+        let model = context_window_above_tokenizer_cap_model();
+        assert_eq!(model.max_context(), 1000);
+        assert_eq!(model.tokenizer.max_seq_len(), 5);
+
+        // Pre-truncation length 1200 (above the 1000-token window), which
+        // the tokenizer would truncate to 5 real tokens before the forward
+        // pass. Under the pre-#1408 comparison (real length 5 vs. window
+        // 1000) this would be silently ACCEPTED and embedded from a
+        // 5-token truncated prefix. The admission guard must reject it.
+        let over_limit_text = "a".repeat(1200);
+        let items =
+            normalize_embedding_items(vec![EmbeddingInputItem::Text(over_limit_text)]).unwrap();
+        let err = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(message.contains("input item 0"), "message: {message}");
+                assert!(message.contains("1200"), "message: {message}");
+                assert!(message.contains("1000"), "message: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embed_items_accepted_prompt_tokens_matches_the_count_actually_embedded_when_truncated() {
+        // Same inverted fixture, but with an input whose pre-truncation
+        // length (12) still fits the window (1000) -- ACCEPTED -- while the
+        // tokenizer truncates it to 5 tokens before the forward pass.
+        // `usage.prompt_tokens` must report 5 (what was actually embedded),
+        // not 12: the naive one-liner fix (swap `tokenize_len` to always
+        // return the pre-truncation count) would report 12 here, billing
+        // tokens that were never embedded -- see `usage.prompt_tokens`'s own
+        // doc comment on `EmbeddingsUsage`.
+        let model = context_window_above_tokenizer_cap_model();
+        let text = "a".repeat(12);
+        let items = normalize_embedding_items(vec![EmbeddingInputItem::Text(text)]).unwrap();
+        let (data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(
+            usage.prompt_tokens, 5,
+            "usage must report the real embedded count, not the pre-truncation count"
+        );
     }
 
     #[test]
