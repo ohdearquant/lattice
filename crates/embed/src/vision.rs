@@ -29,10 +29,12 @@ use crate::error::{EmbedError, Result};
 use lattice_inference::InferenceError;
 use lattice_inference::model::qwen35_config::Qwen35Config;
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
+use lattice_inference::tokenizer::common::Tokenizer as _;
 use lattice_inference::vision::checkpoint::{
     Qwen35VisionWeights, load_qwen35_vision_weights_from_safetensors,
     open_qwen35_single_decoder_safetensors,
 };
+use lattice_inference::vision::qwen35_vit::preprocess_qwen35_image;
 use lattice_inference::vision::{embed_image_from_bytes_f16, embed_image_from_bytes_f16_metal};
 use lattice_inference::weights::f16_weights::{F16ModelWeights, load_f16_weights};
 use std::path::Path;
@@ -55,12 +57,82 @@ pub use lattice_inference::forward::cpu_f16::PoolingStrategy;
 /// standing between "process it" and "silently shorten it", so it must never
 /// sit below the checkpoint's window.
 fn capped_tokenizer(tokenizer: BpeTokenizer, config: &Qwen35Config) -> BpeTokenizer {
-    let max_context = config.max_position_embeddings.min(8192);
+    let max_context = max_context(config);
     if tokenizer.max_seq_len() < max_context {
         tokenizer.with_max_seq_len(max_context)
     } else {
         tokenizer
     }
+}
+
+/// This checkpoint's usable decoder window: `max_position_embeddings.min(8192)`,
+/// the same value [`capped_tokenizer`] raises the tokenizer cap to. Shared
+/// source of truth for the admission checks below.
+fn max_context(config: &Qwen35Config) -> usize {
+    config.max_position_embeddings.min(8192)
+}
+
+/// Rejects `prompt` whose PRE-truncation token count, plus `reserved`
+/// non-text scaffold tokens (image delimiters + pad tokens; `0` for a
+/// text-only call), exceeds `max_context` -- i.e. would otherwise be
+/// silently shortened by the tokenizer's own truncation before the forward
+/// pass ever sees it (issue #1408). Mirrors
+/// `lattice_inference::serve::embeddings::check_item_fits_window`'s
+/// pre-truncation-count admission for the sibling wire route: `real_length`
+/// can never exceed the tokenizer's own cap, so comparing against it (as
+/// opposed to `pre_truncation_len`) can never observe an over-window input
+/// once the cap sits at or above `max_context` -- the rejection would become
+/// unreachable and the input silently embedded from a truncated prefix.
+///
+/// # Errors
+///
+/// Returns [`EmbedError::InvalidInput`] naming the pre-truncation count, the
+/// reserved scaffold count, and `max_context`.
+fn check_prompt_admission(
+    tokenizer: &BpeTokenizer,
+    prompt: &str,
+    reserved: usize,
+    max_context: usize,
+) -> Result<()> {
+    let pre_truncation_len = tokenizer.tokenize(prompt).pre_truncation_len;
+    let total = pre_truncation_len.saturating_add(reserved);
+    if total > max_context {
+        return Err(EmbedError::InvalidInput(format!(
+            "prompt tokenizes to {pre_truncation_len} tokens before truncation ({total} \
+             including {reserved} scaffold tokens), exceeding the model's context window of \
+             {max_context} tokens"
+        )));
+    }
+    Ok(())
+}
+
+/// Real (pre-decode) scaffold token count an image consumes:
+/// `vision_start_token_id` + `vision_end_token_id` + the checkpoint's
+/// per-image pad-token count derived from the patch grid, mirroring
+/// `lattice_inference::serve::embeddings::EmbeddingModel::image_scaffold_token_count`'s
+/// identical arithmetic. Computed via a separate, cheap preprocessing call
+/// (not the caller's own forward pass) so the admission check below can run
+/// before the (expensive) ViT forward.
+///
+/// # Errors
+///
+/// Returns [`EmbedError::InvalidInput`] if the checkpoint has no
+/// `vision_config`, or if the image cannot be decoded/preprocessed.
+fn image_scaffold_reserve(config: &Qwen35Config, image_bytes: &[u8]) -> Result<usize> {
+    let vision_cfg = config.vision_config.as_ref().ok_or_else(|| {
+        EmbedError::InvalidInput(
+            "checkpoint has no vision_config; not a vision-language checkpoint".to_string(),
+        )
+    })?;
+    let (_pixel_values, grid) = preprocess_qwen35_image(image_bytes, vision_cfg)
+        .map_err(|e| EmbedError::InvalidInput(format!("image preprocessing failed: {e}")))?;
+    let merge_sq = vision_cfg.spatial_merge_size * vision_cfg.spatial_merge_size;
+    if merge_sq == 0 || !grid.num_patches().is_multiple_of(merge_sq) {
+        return Err(EmbedError::InvalidInput(format!(
+            "image grid {grid:?} patch count is not a multiple of spatial_merge_size^2"
+        )));
+    }
+    Ok(2 + grid.num_patches() / merge_sq)
 }
 
 #[cfg(test)]
@@ -226,17 +298,21 @@ impl VisionEmbeddingModel {
     ///
     /// Returns [`EmbedError::InvalidInput`] if `image_bytes` cannot be
     /// decoded, its dimensions are not compatible with the checkpoint's
-    /// patch/merge geometry, or the assembled request otherwise fails
-    /// validation (the error message names the offending field). Returns
-    /// [`EmbedError::InferenceFailed`] for every other underlying failure —
-    /// e.g. the prompt plus image tokens exceeding the checkpoint's context
-    /// window.
+    /// patch/merge geometry, the assembled request otherwise fails
+    /// validation (the error message names the offending field), or the
+    /// image's scaffold tokens plus `prompt`'s pre-truncation token count
+    /// exceed the checkpoint's context window (issue #1408: rejected before
+    /// the tokenizer's own truncation could silently shorten `prompt`).
+    /// Returns [`EmbedError::InferenceFailed`] for every other underlying
+    /// failure.
     pub fn embed_image(
         &self,
         image_bytes: &[u8],
         prompt: &str,
         pooling: PoolingStrategy,
     ) -> Result<Vec<f32>> {
+        let reserved = image_scaffold_reserve(&self.config, image_bytes)?;
+        check_prompt_admission(&self.tokenizer, prompt, reserved, max_context(&self.config))?;
         embed_image_from_bytes_f16(
             &self.weights,
             &self.config,
@@ -269,6 +345,8 @@ impl VisionEmbeddingModel {
         prompt: &str,
         pooling: PoolingStrategy,
     ) -> Result<Vec<f32>> {
+        let reserved = image_scaffold_reserve(&self.config, image_bytes)?;
+        check_prompt_admission(&self.tokenizer, prompt, reserved, max_context(&self.config))?;
         embed_image_from_bytes_f16_metal(
             &self.weights,
             &self.config,
@@ -286,11 +364,13 @@ impl VisionEmbeddingModel {
     ///
     /// # Errors
     ///
-    /// Returns [`EmbedError::InvalidInput`] if the prompt is empty or
-    /// tokenizes to an out-of-vocabulary id. Returns
-    /// [`EmbedError::InferenceFailed`] for every other underlying failure —
-    /// e.g. the prompt exceeding the checkpoint's context window.
+    /// Returns [`EmbedError::InvalidInput`] if the prompt is empty, tokenizes
+    /// to an out-of-vocabulary id, or its pre-truncation token count exceeds
+    /// the checkpoint's context window (issue #1408: rejected before the
+    /// tokenizer's own truncation could silently shorten it). Returns
+    /// [`EmbedError::InferenceFailed`] for every other underlying failure.
     pub fn embed_text(&self, prompt: &str, pooling: PoolingStrategy) -> Result<Vec<f32>> {
+        check_prompt_admission(&self.tokenizer, prompt, 0, max_context(&self.config))?;
         lattice_inference::forward::cpu_f16::embed_text_vlm_f16(
             &self.weights,
             &self.config,
@@ -950,6 +1030,78 @@ mod tests {
         assert!(matches!(err, EmbedError::InvalidInput(_)));
     }
 
+    /// Issue #1408 sibling hole (`embed_image`): unlike the sibling
+    /// `lattice_inference::serve::embeddings::EmbeddingModel::
+    /// image_scaffold_token_count`, whose one production caller always
+    /// passes an empty `prompt` (so its own doc comment notes the
+    /// truncation-vs-window mismatch is not live there), `embed_image` is a
+    /// general public entry point where a caller can pass any `prompt`. An
+    /// 8x8 test image against this fixture's tiny vision config produces 4
+    /// merged patch pads, so its scaffold (`vision_start` + 4 pads +
+    /// `vision_end`) is 6 tokens -- already over a 5-token window with an
+    /// empty prompt, so this exercises the scaffold-only side of the
+    /// admission check without needing any text tokens at all.
+    #[test]
+    fn embed_image_rejects_when_scaffold_exceeds_context_window() {
+        let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
+        cfg.max_position_embeddings = 5;
+        let tokenizer = tiny_tokenizer();
+        let model = VisionEmbeddingModel::new(weights, cfg, vision_weights, tokenizer);
+        let png = make_test_png(8, 8, 0);
+
+        let err = model
+            .embed_image(&png, "", PoolingStrategy::MeanVisualTokens)
+            .expect_err("scaffold tokens alone exceeding the context window must be rejected");
+        assert!(matches!(err, EmbedError::InvalidInput(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains('6'),
+            "error must name the scaffold token total (6), got: {msg}"
+        );
+        assert!(
+            msg.contains('5'),
+            "error must name the context window (5), got: {msg}"
+        );
+    }
+
+    /// Sibling boundary case: scaffold tokens landing exactly at the context
+    /// window (empty prompt, so no text tokens add to the total) must still
+    /// embed successfully.
+    #[test]
+    fn embed_image_accepts_when_scaffold_exactly_fits_context_window() {
+        let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
+        cfg.max_position_embeddings = 6;
+        let tokenizer = tiny_tokenizer();
+        let model = VisionEmbeddingModel::new(weights, cfg, vision_weights, tokenizer);
+        let png = make_test_png(8, 8, 0);
+
+        model
+            .embed_image(&png, "", PoolingStrategy::MeanVisualTokens)
+            .expect("scaffold tokens exactly at the context window boundary must still embed");
+    }
+
+    /// Same property as `embed_image_rejects_when_scaffold_exceeds_context_window`,
+    /// for the Metal-dispatching sibling: the admission check must run (and
+    /// reject) before `embed_image_metal` ever attempts a Metal dispatch, so
+    /// this must reject identically on a build/platform with no Metal
+    /// support at all -- no GPU is touched by this test.
+    #[test]
+    fn embed_image_metal_rejects_when_scaffold_exceeds_context_window() {
+        let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
+        cfg.max_position_embeddings = 5;
+        let tokenizer = tiny_tokenizer();
+        let model = VisionEmbeddingModel::new(weights, cfg, vision_weights, tokenizer);
+        let png = make_test_png(8, 8, 0);
+
+        let err = model
+            .embed_image_metal(&png, "", PoolingStrategy::MeanVisualTokens)
+            .expect_err(
+                "scaffold tokens alone exceeding the context window must be rejected \
+                         before any Metal dispatch is attempted",
+            );
+        assert!(matches!(err, EmbedError::InvalidInput(_)), "got: {err:?}");
+    }
+
     #[test]
     fn embed_text_matches_raw_inference_primitive() {
         let (cfg, weights, vision_weights) = tiny_vlm_fixture();
@@ -976,13 +1128,23 @@ mod tests {
         assert_eq!(via_wrapper, via_raw);
     }
 
-    /// A runtime (non-input) failure -- the prompt exceeding the checkpoint's
-    /// context window, surfaced as `InferenceError::Inference` from the
-    /// shared prefill path (cpu_f16.rs) -- must map to
-    /// `EmbedError::InferenceFailed`, not `EmbedError::InvalidInput`: the
-    /// prompt itself is well-formed, the checkpoint just can't fit it.
+    /// Issue #1408 (library-path admission guard, `embed_text`): a prompt
+    /// whose PRE-truncation token count exceeds the checkpoint's context
+    /// window must be rejected as caller input, before the forward pass ever
+    /// runs. This fixture's tokenizer cap (4096, `capped_tokenizer` never
+    /// lowers it) sits well above the 1-token window, so before this guard
+    /// existed "abc" tokenized to its full 3 real ids and only failed
+    /// downstream, as `EmbedError::InferenceFailed`, once the assembled
+    /// request's length was compared against `max_position_embeddings` deep
+    /// inside the forward pass -- a caller-input problem misreported as a
+    /// runtime one. A checkpoint whose window instead sits between the
+    /// tokenizer's default and a wider `max_position_embeddings` (the
+    /// scenario `capped_tokenizer` exists for) would raise the tokenizer's
+    /// own cap to match, so the same over-window prompt would truncate
+    /// silently there and never reach any error at all. Reverting the
+    /// `check_prompt_admission` call in `embed_text` reddens this.
     #[test]
-    fn embed_text_maps_context_overflow_to_inference_failed() {
+    fn embed_text_rejects_prompt_exceeding_context_window_before_truncation() {
         let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
         cfg.max_position_embeddings = 1;
         let tokenizer = single_char_tokenizer();
@@ -990,15 +1152,38 @@ mod tests {
 
         let err = model
             .embed_text("abc", PoolingStrategy::LastToken)
-            .expect_err("a prompt longer than max_position_embeddings must fail");
+            .expect_err(
+                "a prompt whose pre-truncation length exceeds the context window must be rejected",
+            );
         assert!(
-            matches!(err, EmbedError::InferenceFailed(_)),
-            "context-window overflow is a runtime failure, not caller-input validation, got: {err:?}"
+            matches!(err, EmbedError::InvalidInput(_)),
+            "over-window prompt must be rejected as caller input, not embedded from a \
+             truncated prefix, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains('3'),
+            "error must name the pre-truncation token count (3), got: {msg}"
         );
         assert!(
-            err.to_string().contains("context window"),
-            "error should retain the underlying context-window detail, got: {err}"
+            msg.contains('1'),
+            "error must name the context window (1), got: {msg}"
         );
+    }
+
+    /// Sibling boundary case: a prompt whose pre-truncation length lands
+    /// exactly at the context window must still embed successfully -- the
+    /// admission guard must not reject an at-or-below-window prompt.
+    #[test]
+    fn embed_text_accepts_prompt_exactly_at_context_window() {
+        let (mut cfg, weights, vision_weights) = tiny_vlm_fixture();
+        cfg.max_position_embeddings = 1;
+        let tokenizer = single_char_tokenizer();
+        let model = VisionEmbeddingModel::new(weights, cfg, vision_weights, tokenizer);
+
+        model
+            .embed_text("a", PoolingStrategy::LastToken)
+            .expect("a prompt exactly at the context window boundary must still embed");
     }
 
     #[test]
