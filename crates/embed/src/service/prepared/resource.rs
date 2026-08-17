@@ -5,6 +5,7 @@
 //! cleanup errors remain outside this substrate and must land before prepared services use it.
 
 use super::NativeResourceBudget;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -25,6 +26,15 @@ pub(super) enum ResourceLifecycleError {
 enum AdmissionClass {
     Preparation,
     Encode,
+}
+
+impl AdmissionClass {
+    fn other(self) -> Self {
+        match self {
+            Self::Preparation => Self::Encode,
+            Self::Encode => Self::Preparation,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,10 +62,10 @@ struct AdmissionWaiter {
     waker: Waker,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AdmissionWaiterSlot {
     class: AdmissionClass,
-    index: usize,
+    ticket: u64,
 }
 
 struct ReleaseWaiter {
@@ -83,8 +93,12 @@ struct ResourceState {
     retained_bytes: u64,
     work_bytes: u64,
     closed: bool,
-    preparation_waiters: Vec<Option<AdmissionWaiter>>,
-    encode_waiters: Vec<Option<AdmissionWaiter>>,
+    admission_close_notified: bool,
+    next_admission_class: AdmissionClass,
+    next_waiter_ticket: u64,
+    entitled_waiter: Option<AdmissionWaiterSlot>,
+    preparation_waiters: BTreeMap<u64, AdmissionWaiter>,
+    encode_waiters: BTreeMap<u64, AdmissionWaiter>,
     release_waiters: Vec<Option<ReleaseWaiter>>,
 }
 
@@ -100,8 +114,12 @@ impl ResourceState {
             retained_bytes: 0,
             work_bytes: 0,
             closed: false,
-            preparation_waiters: Vec::new(),
-            encode_waiters: Vec::new(),
+            admission_close_notified: false,
+            next_admission_class: AdmissionClass::Preparation,
+            next_waiter_ticket: 0,
+            entitled_waiter: None,
+            preparation_waiters: BTreeMap::new(),
+            encode_waiters: BTreeMap::new(),
             release_waiters: Vec::new(),
         }
     }
@@ -231,14 +249,25 @@ impl ResourceState {
             && self.work_bytes == 0
     }
 
+    fn admission_waiters(&self, class: AdmissionClass) -> &BTreeMap<u64, AdmissionWaiter> {
+        match class {
+            AdmissionClass::Preparation => &self.preparation_waiters,
+            AdmissionClass::Encode => &self.encode_waiters,
+        }
+    }
+
     fn admission_waiters_mut(
         &mut self,
         class: AdmissionClass,
-    ) -> &mut Vec<Option<AdmissionWaiter>> {
+    ) -> &mut BTreeMap<u64, AdmissionWaiter> {
         match class {
             AdmissionClass::Preparation => &mut self.preparation_waiters,
             AdmissionClass::Encode => &mut self.encode_waiters,
         }
+    }
+
+    fn admission_waiters_empty(&self) -> bool {
+        self.preparation_waiters.is_empty() && self.encode_waiters.is_empty()
     }
 
     fn register_admission_waiter(
@@ -246,71 +275,78 @@ impl ResourceState {
         slot: &mut Option<AdmissionWaiterSlot>,
         charge: AdmissionCharge,
         waker: &Waker,
-    ) {
+    ) -> bool {
         let class = charge.class();
         if let Some(existing) = *slot {
             let queue = self.admission_waiters_mut(existing.class);
-            if let Some(Some(waiter)) = queue.get_mut(existing.index) {
+            if let Some(waiter) = queue.get_mut(&existing.ticket) {
                 waiter.charge = charge;
                 if !waiter.waker.will_wake(waker) {
                     waiter.waker = waker.clone();
                 }
-                return;
+                return true;
             }
         }
 
-        let queue = self.admission_waiters_mut(class);
-        if let Some((index, vacant)) = queue
-            .iter_mut()
-            .enumerate()
-            .find(|(_, entry)| entry.is_none())
-        {
-            *vacant = Some(AdmissionWaiter {
+        let ticket = self.next_waiter_ticket;
+        let Some(next_ticket) = ticket.checked_add(1) else {
+            return false;
+        };
+        self.next_waiter_ticket = next_ticket;
+        self.admission_waiters_mut(class).insert(
+            ticket,
+            AdmissionWaiter {
                 charge,
                 waker: waker.clone(),
-            });
-            *slot = Some(AdmissionWaiterSlot { class, index });
-            return;
-        }
-
-        let index = queue.len();
-        queue.push(Some(AdmissionWaiter {
-            charge,
-            waker: waker.clone(),
-        }));
-        *slot = Some(AdmissionWaiterSlot { class, index });
+            },
+        );
+        *slot = Some(AdmissionWaiterSlot { class, ticket });
+        true
     }
 
     fn remove_admission_waiter(&mut self, slot: Option<AdmissionWaiterSlot>) {
         let Some(slot) = slot else {
             return;
         };
-        let queue = self.admission_waiters_mut(slot.class);
-        if let Some(entry) = queue.get_mut(slot.index) {
-            *entry = None;
+        self.admission_waiters_mut(slot.class).remove(&slot.ticket);
+        if self.entitled_waiter == Some(slot) {
+            self.entitled_waiter = None;
         }
-        trim_vacant_tail(queue);
+        if self.admission_waiters_empty() {
+            self.next_waiter_ticket = 0;
+        }
     }
 
-    fn eligible_admission_wakers(&self) -> Vec<Waker> {
-        if self.closed {
+    fn eligible_class_head(&self, class: AdmissionClass) -> Option<(AdmissionWaiterSlot, Waker)> {
+        let (&ticket, waiter) = self.admission_waiters(class).first_key_value()?;
+        self.can_admit(waiter.charge)
+            .then(|| (AdmissionWaiterSlot { class, ticket }, waiter.waker.clone()))
+    }
+
+    fn select_admission(&mut self) -> Option<(AdmissionWaiterSlot, Waker)> {
+        if self.closed || self.entitled_waiter.is_some() {
+            return None;
+        }
+
+        let preferred = self.next_admission_class;
+        let selected = self
+            .eligible_class_head(preferred)
+            .or_else(|| self.eligible_class_head(preferred.other()))?;
+        self.entitled_waiter = Some(selected.0);
+        self.next_admission_class = selected.0.class.other();
+        Some(selected)
+    }
+
+    fn close_admission(&mut self) -> Vec<Waker> {
+        self.closed = true;
+        self.entitled_waiter = None;
+        if self.admission_close_notified {
             return Vec::new();
         }
-
+        self.admission_close_notified = true;
         self.preparation_waiters
-            .iter()
-            .chain(&self.encode_waiters)
-            .filter_map(Option::as_ref)
-            .filter(|waiter| self.can_admit(waiter.charge))
-            .map(|waiter| waiter.waker.clone())
-            .collect()
-    }
-
-    fn all_admission_wakers(&self) -> Vec<Waker> {
-        self.preparation_waiters
-            .iter()
-            .chain(&self.encode_waiters)
-            .filter_map(Option::as_ref)
+            .values()
+            .chain(self.encode_waiters.values())
             .map(|waiter| waiter.waker.clone())
             .collect()
     }
@@ -382,17 +418,16 @@ impl ResourceSupervisorInner {
     fn release(&self, charge: AdmissionCharge) {
         let (admission_wakers, release_wakers) = {
             let mut state = self.lock_state();
-            if !state.release(charge) {
-                state.closed = true;
-            }
-            (
-                if state.closed {
-                    state.all_admission_wakers()
-                } else {
-                    state.eligible_admission_wakers()
-                },
-                state.completed_release_wakers(),
-            )
+            let admission_wakers = if state.release(charge) {
+                state
+                    .select_admission()
+                    .map(|(_, waker)| waker)
+                    .into_iter()
+                    .collect()
+            } else {
+                state.close_admission()
+            };
+            (admission_wakers, state.completed_release_wakers())
         };
         wake_all(admission_wakers);
         wake_all(release_wakers);
@@ -473,34 +508,18 @@ impl Future for ResourceAdmissionFuture {
             "resource admission future polled after completion"
         );
         let inner = Arc::clone(&this.inner);
-        let mut state = inner.lock_state();
 
-        if state.closed {
-            state.remove_admission_waiter(this.waiter.take());
-            this.complete = true;
-            return Poll::Ready(Err(ResourceAdmissionError::Closed));
-        }
-        if !state.accounting_valid() {
-            state.closed = true;
-            state.remove_admission_waiter(this.waiter.take());
-            let admission_wakers = state.all_admission_wakers();
-            let release_wakers = state.completed_release_wakers();
-            this.complete = true;
-            drop(state);
-            wake_all(admission_wakers);
-            wake_all(release_wakers);
-            return Poll::Ready(Err(ResourceAdmissionError::Closed));
-        }
-        if state.request_exceeds_budget(this.charge) {
-            state.remove_admission_waiter(this.waiter.take());
-            this.complete = true;
-            return Poll::Ready(Err(ResourceAdmissionError::RequestExceedsBudget));
-        }
-        if state.can_admit(this.charge) {
-            state.remove_admission_waiter(this.waiter.take());
-            if !state.reserve(this.charge) {
-                state.closed = true;
-                let admission_wakers = state.all_admission_wakers();
+        loop {
+            let mut state = inner.lock_state();
+
+            if state.closed {
+                state.remove_admission_waiter(this.waiter.take());
+                this.complete = true;
+                return Poll::Ready(Err(ResourceAdmissionError::Closed));
+            }
+            if !state.accounting_valid() {
+                state.remove_admission_waiter(this.waiter.take());
+                let admission_wakers = state.close_admission();
                 let release_wakers = state.completed_release_wakers();
                 this.complete = true;
                 drop(state);
@@ -508,16 +527,67 @@ impl Future for ResourceAdmissionFuture {
                 wake_all(release_wakers);
                 return Poll::Ready(Err(ResourceAdmissionError::Closed));
             }
-            this.complete = true;
-            drop(state);
-            return Poll::Ready(Ok(ResourceAdmissionGuard {
-                inner,
-                charge: this.charge,
-            }));
-        }
+            if state.request_exceeds_budget(this.charge) {
+                state.remove_admission_waiter(this.waiter.take());
+                let next_waker = state.select_admission().map(|(_, waker)| waker);
+                this.complete = true;
+                drop(state);
+                if let Some(waker) = next_waker {
+                    waker.wake();
+                }
+                return Poll::Ready(Err(ResourceAdmissionError::RequestExceedsBudget));
+            }
 
-        state.register_admission_waiter(&mut this.waiter, this.charge, context.waker());
-        Poll::Pending
+            let owns_entitlement = this.waiter.is_some() && state.entitled_waiter == this.waiter;
+            let uncontended = this.waiter.is_none()
+                && state.entitled_waiter.is_none()
+                && state.admission_waiters_empty();
+            if (owns_entitlement || uncontended) && state.can_admit(this.charge) {
+                state.remove_admission_waiter(this.waiter.take());
+                if !state.reserve(this.charge) {
+                    let admission_wakers = state.close_admission();
+                    let release_wakers = state.completed_release_wakers();
+                    this.complete = true;
+                    drop(state);
+                    wake_all(admission_wakers);
+                    wake_all(release_wakers);
+                    return Poll::Ready(Err(ResourceAdmissionError::Closed));
+                }
+                let next_waker = state.select_admission().map(|(_, waker)| waker);
+                this.complete = true;
+                drop(state);
+                if let Some(waker) = next_waker {
+                    waker.wake();
+                }
+                return Poll::Ready(Ok(ResourceAdmissionGuard {
+                    inner,
+                    charge: this.charge,
+                }));
+            }
+
+            if !state.register_admission_waiter(&mut this.waiter, this.charge, context.waker()) {
+                let admission_wakers = state.close_admission();
+                let release_wakers = state.completed_release_wakers();
+                this.complete = true;
+                drop(state);
+                wake_all(admission_wakers);
+                wake_all(release_wakers);
+                return Poll::Ready(Err(ResourceAdmissionError::Closed));
+            }
+
+            let selected = state.select_admission();
+            if selected
+                .as_ref()
+                .is_some_and(|(slot, _)| Some(*slot) == this.waiter)
+            {
+                continue;
+            }
+            drop(state);
+            if let Some((_, waker)) = selected {
+                waker.wake();
+            }
+            return Poll::Pending;
+        }
     }
 }
 
@@ -526,9 +596,14 @@ impl Drop for ResourceAdmissionFuture {
         let Some(waiter) = self.waiter.take() else {
             return;
         };
-        self.inner
-            .lock_state()
-            .remove_admission_waiter(Some(waiter));
+        let next_waker = {
+            let mut state = self.inner.lock_state();
+            state.remove_admission_waiter(Some(waiter));
+            state.select_admission().map(|(_, waker)| waker)
+        };
+        if let Some(waker) = next_waker {
+            waker.wake();
+        }
     }
 }
 
@@ -552,11 +627,7 @@ impl ResourceDrain {
     pub(super) fn begin_drain(&self) {
         let (admission_wakers, release_wakers) = {
             let mut state = self.inner.lock_state();
-            state.closed = true;
-            (
-                state.all_admission_wakers(),
-                state.completed_release_wakers(),
-            )
+            (state.close_admission(), state.completed_release_wakers())
         };
         wake_all(admission_wakers);
         wake_all(release_wakers);
@@ -675,6 +746,220 @@ mod tests {
         fn count(&self) -> usize {
             self.0.load(Ordering::SeqCst)
         }
+    }
+
+    #[test]
+    fn one_capacity_release_wakes_only_the_fifo_entitled_waiter() {
+        let (supervisor, _drain) = ResourceSupervisor::from_budget(budget(1, 1, 10, 10));
+        let held = expect_immediate(supervisor.admit_preparation(1, 1))
+            .expect("first preparation is within budget");
+        let mut queued = (0..3)
+            .map(|_| Box::pin(supervisor.admit_preparation(1, 1)))
+            .collect::<Vec<_>>();
+        let wake_counters = (0..3)
+            .map(|_| Arc::new(WakeCounter::default()))
+            .collect::<Vec<_>>();
+        let wakers = wake_counters
+            .iter()
+            .map(|counter| Waker::from(Arc::clone(counter)))
+            .collect::<Vec<_>>();
+
+        for (future, waker) in queued.iter_mut().zip(&wakers) {
+            assert!(matches!(
+                poll_with_waker(future.as_mut(), waker),
+                Poll::Pending
+            ));
+        }
+
+        drop(held);
+        assert_eq!(
+            wake_counters
+                .iter()
+                .map(|counter| counter.count())
+                .collect::<Vec<_>>(),
+            vec![1, 0, 0],
+            "one released preparation slot must grant one FIFO wake entitlement"
+        );
+    }
+
+    #[test]
+    fn an_entitled_waiter_cannot_be_overtaken_by_a_same_class_newcomer() {
+        let (supervisor, _drain) = ResourceSupervisor::from_budget(budget(1, 1, 10, 10));
+        let held = expect_immediate(supervisor.admit_preparation(1, 1))
+            .expect("first preparation is within budget");
+        let mut older = Box::pin(supervisor.admit_preparation(1, 1));
+        let older_wakes = Arc::new(WakeCounter::default());
+        let older_waker = Waker::from(Arc::clone(&older_wakes));
+
+        assert!(matches!(
+            poll_with_waker(older.as_mut(), &older_waker),
+            Poll::Pending
+        ));
+        drop(held);
+        assert_eq!(older_wakes.count(), 1);
+
+        let mut newcomer = Box::pin(supervisor.admit_preparation(1, 1));
+        let newcomer_wakes = Arc::new(WakeCounter::default());
+        let newcomer_waker = Waker::from(Arc::clone(&newcomer_wakes));
+        assert!(matches!(
+            poll_with_waker(newcomer.as_mut(), &newcomer_waker),
+            Poll::Pending
+        ));
+
+        let Poll::Ready(Ok(older_guard)) = poll_with_waker(older.as_mut(), &older_waker) else {
+            panic!("the FIFO-entitled older waiter must make progress");
+        };
+        drop(older_guard);
+        assert_eq!(
+            newcomer_wakes.count(),
+            1,
+            "the newcomer must wake only after the older guard releases"
+        );
+        assert!(matches!(
+            poll_with_waker(newcomer.as_mut(), &newcomer_waker),
+            Poll::Ready(Ok(_))
+        ));
+    }
+
+    #[test]
+    fn successful_reservation_hands_off_already_free_capacity() {
+        let (supervisor, _drain) = ResourceSupervisor::from_budget(budget(2, 1, 10, 10));
+        let first_held = expect_immediate(supervisor.admit_preparation(1, 1))
+            .expect("first preparation is within budget");
+        let second_held = expect_immediate(supervisor.admit_preparation(1, 1))
+            .expect("second preparation is within budget");
+        let mut first_waiter = Box::pin(supervisor.admit_preparation(1, 1));
+        let mut second_waiter = Box::pin(supervisor.admit_preparation(1, 1));
+        let first_wakes = Arc::new(WakeCounter::default());
+        let second_wakes = Arc::new(WakeCounter::default());
+        let first_waker = Waker::from(Arc::clone(&first_wakes));
+        let second_waker = Waker::from(Arc::clone(&second_wakes));
+
+        assert!(matches!(
+            poll_with_waker(first_waiter.as_mut(), &first_waker),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            poll_with_waker(second_waiter.as_mut(), &second_waker),
+            Poll::Pending
+        ));
+
+        drop(first_held);
+        assert_eq!(first_wakes.count(), 1);
+        assert_eq!(second_wakes.count(), 0);
+
+        drop(second_held);
+        assert_eq!(second_wakes.count(), 0);
+
+        let Poll::Ready(Ok(first_guard)) = poll_with_waker(first_waiter.as_mut(), &first_waker)
+        else {
+            panic!("the first waiter must consume its entitlement");
+        };
+        assert_eq!(
+            second_wakes.count(),
+            1,
+            "the successful reservation must hand off the second free slot"
+        );
+
+        let Poll::Ready(Ok(_second_guard)) = poll_with_waker(second_waiter.as_mut(), &second_waker)
+        else {
+            panic!("the second waiter must progress before the first guard drops");
+        };
+        drop(first_guard);
+    }
+
+    #[test]
+    fn shared_capacity_release_alternates_progress_across_admission_classes() {
+        let (supervisor, _drain) = ResourceSupervisor::from_budget(budget(1, 1, 10, 1));
+        let held = expect_immediate(supervisor.admit_preparation(1, 1))
+            .expect("first preparation is within budget");
+        let mut first_preparation = Box::pin(supervisor.admit_preparation(1, 1));
+        let mut second_preparation = Box::pin(supervisor.admit_preparation(1, 1));
+        let mut encode = Box::pin(supervisor.admit_encode(1));
+        let first_preparation_wakes = Arc::new(WakeCounter::default());
+        let second_preparation_wakes = Arc::new(WakeCounter::default());
+        let encode_wakes = Arc::new(WakeCounter::default());
+        let first_preparation_waker = Waker::from(Arc::clone(&first_preparation_wakes));
+        let second_preparation_waker = Waker::from(Arc::clone(&second_preparation_wakes));
+        let encode_waker = Waker::from(Arc::clone(&encode_wakes));
+
+        assert!(matches!(
+            poll_with_waker(first_preparation.as_mut(), &first_preparation_waker),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            poll_with_waker(second_preparation.as_mut(), &second_preparation_waker),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            poll_with_waker(encode.as_mut(), &encode_waker),
+            Poll::Pending
+        ));
+
+        drop(held);
+        assert_eq!(first_preparation_wakes.count(), 1);
+        assert_eq!(second_preparation_wakes.count(), 0);
+        assert_eq!(encode_wakes.count(), 0);
+
+        let Poll::Ready(Ok(first_guard)) =
+            poll_with_waker(first_preparation.as_mut(), &first_preparation_waker)
+        else {
+            panic!("the first preparation must own the first entitlement");
+        };
+        drop(first_guard);
+        assert_eq!(second_preparation_wakes.count(), 0);
+        assert_eq!(
+            encode_wakes.count(),
+            1,
+            "the next shared-capacity release must advance the other class"
+        );
+
+        let Poll::Ready(Ok(encode_guard)) = poll_with_waker(encode.as_mut(), &encode_waker) else {
+            panic!("the encode waiter must own the alternating entitlement");
+        };
+        drop(encode_guard);
+        assert_eq!(second_preparation_wakes.count(), 1);
+    }
+
+    #[test]
+    fn drain_notifies_each_queued_admission_only_once() {
+        let (supervisor, drain) = ResourceSupervisor::from_budget(budget(1, 1, 10, 10));
+        let preparation = expect_immediate(supervisor.admit_preparation(1, 4))
+            .expect("preparation is within budget");
+        let encode = expect_immediate(supervisor.admit_encode(6)).expect("encode is within budget");
+        let mut queued_preparation = Box::pin(supervisor.admit_preparation(1, 1));
+        let mut queued_encode = Box::pin(supervisor.admit_encode(1));
+        let preparation_wakes = Arc::new(WakeCounter::default());
+        let encode_wakes = Arc::new(WakeCounter::default());
+        let preparation_waker = Waker::from(Arc::clone(&preparation_wakes));
+        let encode_waker = Waker::from(Arc::clone(&encode_wakes));
+
+        assert!(matches!(
+            poll_with_waker(queued_preparation.as_mut(), &preparation_waker),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            poll_with_waker(queued_encode.as_mut(), &encode_waker),
+            Poll::Pending
+        ));
+
+        drain.begin_drain();
+        assert_eq!(preparation_wakes.count(), 1);
+        assert_eq!(encode_wakes.count(), 1);
+
+        drain.begin_drain();
+        drop(preparation);
+        drop(encode);
+        assert_eq!(
+            preparation_wakes.count(),
+            1,
+            "idempotent drain and post-drain releases must not re-wake admissions"
+        );
+        assert_eq!(
+            encode_wakes.count(),
+            1,
+            "idempotent drain and post-drain releases must not re-wake admissions"
+        );
     }
 
     #[test]
@@ -851,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_admission_high_water_releases_storage_and_reuses_slot_zero() {
+    fn cancelled_admission_high_water_releases_storage_and_accepts_a_new_waiter() {
         let (supervisor, _drain) = ResourceSupervisor::from_budget(budget(1, 1, 10, 10));
         let held = expect_immediate(supervisor.admit_preparation(1, 1))
             .expect("first preparation is within budget");
@@ -865,27 +1150,20 @@ mod tests {
         {
             let state = supervisor.inner.lock_state();
             assert_eq!(state.preparation_waiters.len(), 64);
-            assert!(state.preparation_waiters.capacity() >= 64);
         }
 
         drop(queued);
         {
             let state = supervisor.inner.lock_state();
-            assert_eq!(state.preparation_waiters.len(), 0);
-            assert_eq!(state.preparation_waiters.capacity(), 0);
+            assert!(state.preparation_waiters.is_empty());
         }
 
         let mut reused = Box::pin(supervisor.admit_preparation(1, 1));
         assert!(matches!(poll_once(reused.as_mut()), Poll::Pending));
         {
             let state = supervisor.inner.lock_state();
-            assert!(
-                state
-                    .preparation_waiters
-                    .first()
-                    .is_some_and(Option::is_some)
-            );
             assert_eq!(state.preparation_waiters.len(), 1);
+            assert!(state.preparation_waiters.contains_key(&0));
         }
         drop(reused);
         drop(held);
