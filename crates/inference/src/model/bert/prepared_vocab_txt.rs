@@ -2,7 +2,10 @@
 //!
 //! This module mirrors only the line-to-ID substrate shared by the legacy
 //! WordPiece `vocab.txt` and BPE `vocab.txt` + `merges.txt` loaders. It does
-//! not validate special tokens, merges, emitted IDs, or any live file.
+//! not require special tokens. It records optional exact known-token IDs, and
+//! a separate validator enforces the legacy WordPiece specials only after the
+//! caller has selected `VocabTxt`. It does not validate merges, emitted-ID or
+//! config ranges, or any live file.
 
 use std::cmp::Ordering;
 use std::mem::size_of;
@@ -130,12 +133,44 @@ impl PreparedBertVocabTxtLimits {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PreparedBertVocabTxtKnownTokenIds {
+    cls: Option<u32>,
+    sep: Option<u32>,
+    pad: Option<u32>,
+    unk: Option<u32>,
+    mask: Option<u32>,
+}
+
+impl PreparedBertVocabTxtKnownTokenIds {
+    pub(super) fn cls(self) -> Option<u32> {
+        self.cls
+    }
+
+    pub(super) fn sep(self) -> Option<u32> {
+        self.sep
+    }
+
+    pub(super) fn pad(self) -> Option<u32> {
+        self.pad
+    }
+
+    pub(super) fn unk(self) -> Option<u32> {
+        self.unk
+    }
+
+    pub(super) fn mask(self) -> Option<u32> {
+        self.mask
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PreparedBertVocabTxtFacts {
     vocab_txt_bytes: u64,
     vocabulary_cardinality: NonZeroU64,
     max_token_id: u32,
     span_scratch_bytes: u64,
     logical_parse_work_bytes: u64,
+    known_token_ids: PreparedBertVocabTxtKnownTokenIds,
 }
 
 impl PreparedBertVocabTxtFacts {
@@ -158,6 +193,99 @@ impl PreparedBertVocabTxtFacts {
     pub(super) fn logical_parse_work_bytes(self) -> u64 {
         self.logical_parse_work_bytes
     }
+
+    pub(super) fn known_token_ids(self) -> PreparedBertVocabTxtKnownTokenIds {
+        self.known_token_ids
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreparedBertWordPieceSpecialToken {
+    Cls,
+    Sep,
+    Pad,
+    Unk,
+    Mask,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreparedBertWordPieceVocabTxtError {
+    MissingSpecialToken(PreparedBertWordPieceSpecialToken),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PreparedBertWordPieceVocabTxtFacts {
+    vocab_txt: PreparedBertVocabTxtFacts,
+    cls_id: u32,
+    sep_id: u32,
+    pad_id: u32,
+    unk_id: u32,
+    mask_id: u32,
+}
+
+impl PreparedBertWordPieceVocabTxtFacts {
+    pub(super) fn vocab_txt(self) -> PreparedBertVocabTxtFacts {
+        self.vocab_txt
+    }
+
+    pub(super) fn cls_id(self) -> u32 {
+        self.cls_id
+    }
+
+    pub(super) fn sep_id(self) -> u32 {
+        self.sep_id
+    }
+
+    pub(super) fn pad_id(self) -> u32 {
+        self.pad_id
+    }
+
+    pub(super) fn unk_id(self) -> u32 {
+        self.unk_id
+    }
+
+    pub(super) fn mask_id(self) -> u32 {
+        self.mask_id
+    }
+}
+
+pub(super) fn validate_prepared_bert_wordpiece_vocab_txt(
+    vocab_txt: PreparedBertVocabTxtFacts,
+) -> Result<PreparedBertWordPieceVocabTxtFacts, PreparedBertWordPieceVocabTxtError> {
+    let known = vocab_txt.known_token_ids;
+    let cls_id = known
+        .cls
+        .ok_or(PreparedBertWordPieceVocabTxtError::MissingSpecialToken(
+            PreparedBertWordPieceSpecialToken::Cls,
+        ))?;
+    let sep_id = known
+        .sep
+        .ok_or(PreparedBertWordPieceVocabTxtError::MissingSpecialToken(
+            PreparedBertWordPieceSpecialToken::Sep,
+        ))?;
+    let pad_id = known
+        .pad
+        .ok_or(PreparedBertWordPieceVocabTxtError::MissingSpecialToken(
+            PreparedBertWordPieceSpecialToken::Pad,
+        ))?;
+    let unk_id = known
+        .unk
+        .ok_or(PreparedBertWordPieceVocabTxtError::MissingSpecialToken(
+            PreparedBertWordPieceSpecialToken::Unk,
+        ))?;
+    let mask_id = known
+        .mask
+        .ok_or(PreparedBertWordPieceVocabTxtError::MissingSpecialToken(
+            PreparedBertWordPieceSpecialToken::Mask,
+        ))?;
+    Ok(PreparedBertWordPieceVocabTxtFacts {
+        vocab_txt,
+        cls_id,
+        sep_id,
+        pad_id,
+        unk_id,
+        mask_id,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -339,6 +467,7 @@ fn parse_prepared_bert_vocab_txt_with_reserve(
             });
         }
     }
+    let known_token_ids = observe_known_token_ids(&spans, &mut work)?;
 
     Ok(PreparedBertVocabTxtFacts {
         vocab_txt_bytes,
@@ -346,7 +475,60 @@ fn parse_prepared_bert_vocab_txt_with_reserve(
         max_token_id,
         span_scratch_bytes,
         logical_parse_work_bytes: work.used,
+        known_token_ids,
     })
+}
+
+fn observe_known_token_ids(
+    spans: &[TokenSpan<'_>],
+    work: &mut WorkMeter,
+) -> Result<PreparedBertVocabTxtKnownTokenIds, PreparedBertVocabTxtError> {
+    #[derive(Clone, Copy)]
+    enum Slot {
+        Cls,
+        Mask,
+        Pad,
+        Sep,
+        Unk,
+    }
+
+    const KNOWN: [(&[u8], Slot); 5] = [
+        (b"[CLS]", Slot::Cls),
+        (b"[MASK]", Slot::Mask),
+        (b"[PAD]", Slot::Pad),
+        (b"[SEP]", Slot::Sep),
+        (b"[UNK]", Slot::Unk),
+    ];
+
+    let mut result = PreparedBertVocabTxtKnownTokenIds {
+        cls: None,
+        sep: None,
+        pad: None,
+        unk: None,
+        mask: None,
+    };
+    let mut span_index = 0;
+    let mut known_index = 0;
+    while span_index < spans.len() && known_index < KNOWN.len() {
+        let span = spans[span_index];
+        let (known, slot) = KNOWN[known_index];
+        match compare_token_bytes(span.token, known, work)? {
+            Ordering::Less => span_index += 1,
+            Ordering::Greater => known_index += 1,
+            Ordering::Equal => {
+                match slot {
+                    Slot::Cls => result.cls = Some(span.id),
+                    Slot::Mask => result.mask = Some(span.id),
+                    Slot::Pad => result.pad = Some(span.id),
+                    Slot::Sep => result.sep = Some(span.id),
+                    Slot::Unk => result.unk = Some(span.id),
+                }
+                span_index += 1;
+                known_index += 1;
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn enforce_limit(
@@ -582,5 +764,109 @@ mod tests {
                 value: 9,
             })
         );
+    }
+
+    #[test]
+    fn exact_known_token_ids_are_observed_without_constraining_generic_vocabularies() {
+        let input = b"ordinary\n[MASK]\r\n[CLS]\n[UNK]\n[SEP]\n[PAD]";
+        let broad = limits(128, 16, 1024, 8192);
+        let facts = match parse_prepared_bert_vocab_txt(input, &broad) {
+            Ok(facts) => facts,
+            Err(error) => panic!("valid WordPiece vocab: {error:?}"),
+        };
+        assert_eq!(facts.known_token_ids().cls(), Some(2));
+        assert_eq!(facts.known_token_ids().sep(), Some(4));
+        assert_eq!(facts.known_token_ids().pad(), Some(5));
+        assert_eq!(facts.known_token_ids().unk(), Some(3));
+        assert_eq!(facts.known_token_ids().mask(), Some(1));
+
+        let exact_work = facts.logical_parse_work_bytes();
+        assert!(parse_prepared_bert_vocab_txt(input, &limits(128, 16, 1024, exact_work)).is_ok());
+        assert!(matches!(
+            parse_prepared_bert_vocab_txt(input, &limits(128, 16, 1024, exact_work - 1),),
+            Err(PreparedBertVocabTxtError::Exceeded {
+                axis: PreparedBertVocabTxtLimitAxis::ParseWorkBytes,
+                ..
+            })
+        ));
+
+        let generic = match parse_prepared_bert_vocab_txt(b"a\nb", &broad) {
+            Ok(facts) => facts,
+            Err(error) => panic!("valid generic BPE vocab: {error:?}"),
+        };
+        assert_eq!(
+            generic.known_token_ids(),
+            PreparedBertVocabTxtKnownTokenIds {
+                cls: None,
+                sep: None,
+                pad: None,
+                unk: None,
+                mask: None,
+            }
+        );
+
+        let near_miss = match parse_prepared_bert_vocab_txt(
+            b"[CLS]\n[SEP]\n[PAD]\n[UNK] \n[unk]\n[MASK]",
+            &broad,
+        ) {
+            Ok(facts) => facts,
+            Err(error) => panic!("valid generic near-miss vocab: {error:?}"),
+        };
+        assert_eq!(near_miss.known_token_ids().unk(), None);
+        assert_eq!(
+            validate_prepared_bert_wordpiece_vocab_txt(near_miss),
+            Err(PreparedBertWordPieceVocabTxtError::MissingSpecialToken(
+                PreparedBertWordPieceSpecialToken::Unk,
+            ))
+        );
+    }
+
+    #[test]
+    fn wordpiece_validation_requires_specials_in_legacy_order() {
+        let names = ["[CLS]", "[SEP]", "[PAD]", "[UNK]", "[MASK]"];
+        let tokens = [
+            PreparedBertWordPieceSpecialToken::Cls,
+            PreparedBertWordPieceSpecialToken::Sep,
+            PreparedBertWordPieceSpecialToken::Pad,
+            PreparedBertWordPieceSpecialToken::Unk,
+            PreparedBertWordPieceSpecialToken::Mask,
+        ];
+        let complete = match parse_prepared_bert_vocab_txt(
+            names.join("\n").as_bytes(),
+            &limits(128, 8, 512, 8192),
+        ) {
+            Ok(facts) => facts,
+            Err(error) => panic!("valid complete vocab: {error:?}"),
+        };
+        let validated = match validate_prepared_bert_wordpiece_vocab_txt(complete) {
+            Ok(facts) => facts,
+            Err(error) => panic!("complete specials: {error:?}"),
+        };
+        assert_eq!(validated.cls_id(), 0);
+        assert_eq!(validated.sep_id(), 1);
+        assert_eq!(validated.pad_id(), 2);
+        assert_eq!(validated.unk_id(), 3);
+        assert_eq!(validated.mask_id(), 4);
+        assert_eq!(validated.vocab_txt(), complete);
+
+        for (missing_index, expected) in tokens.into_iter().enumerate() {
+            let input = names
+                .iter()
+                .enumerate()
+                .filter_map(|(index, name)| (index != missing_index).then_some(*name))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let facts =
+                match parse_prepared_bert_vocab_txt(input.as_bytes(), &limits(128, 8, 512, 8192)) {
+                    Ok(facts) => facts,
+                    Err(error) => panic!("valid incomplete vocab: {error:?}"),
+                };
+            assert_eq!(
+                validate_prepared_bert_wordpiece_vocab_txt(facts),
+                Err(PreparedBertWordPieceVocabTxtError::MissingSpecialToken(
+                    expected,
+                ))
+            );
+        }
     }
 }
