@@ -7,6 +7,8 @@ pub(crate) mod ingress;
 pub(crate) mod mmap_trust;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod prepared_safetensors;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod prepared_safetensors_inventory;
 pub mod q3_weights;
 pub mod q4_weights;
 pub mod q8_weights;
