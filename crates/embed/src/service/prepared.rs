@@ -130,3 +130,6 @@ mod resource;
 
 #[cfg_attr(not(test), allow(dead_code))]
 mod limits;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod tensor_inventory;
