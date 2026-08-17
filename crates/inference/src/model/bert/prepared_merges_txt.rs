@@ -1,11 +1,14 @@
 //! Dormant prepared-BERT BPE `merges.txt` lexical census.
 //!
 //! This module mirrors the legacy text-level acceptance and occurrence-rank
-//! rules without retaining operands or constructing an effective merge table.
-//! It performs no filesystem access or allocation and has no live caller.
-//! Unique-pair proof, first-wins effective ranks, vocabulary membership, and
-//! tokenizer construction remain deliberately out of scope.
+//! rules without constructing an effective merge table. The lexical census is
+//! allocation-free; a separate transient capability can fallibly retain only
+//! borrowed operand spans under explicit scratch and two-pass-work limits. The
+//! module performs no filesystem access and has no live caller. Unique-pair
+//! proof, first-wins effective ranks, vocabulary membership, and tokenizer
+//! construction remain deliberately out of scope.
 
+use std::mem::size_of;
 use std::num::NonZeroU64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,12 +16,21 @@ pub(super) enum PreparedBertBpeMergesTxtLimitAxis {
     MergesTxtBytes,
     MergeEntries,
     ParseWorkBytes,
+    RetainedPairSpanBytes,
+    TotalParseWorkBytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreparedBertBpeMergesTxtExpression {
     BaseParseWorkBytes,
     MergeEntryCount,
+    RetainedPairSpanBytes,
+    TotalParseWorkBytes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreparedBertBpeMergesTxtAllocationArena {
+    MergePairSpans,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +47,14 @@ pub(super) enum PreparedBertBpeMergesTxtError {
     ArithmeticOverflow(PreparedBertBpeMergesTxtExpression),
     InvalidUtf8 {
         valid_up_to: usize,
+    },
+    AllocationFailed {
+        arena: PreparedBertBpeMergesTxtAllocationArena,
+        requested_bytes: u64,
+    },
+    SecondPassCensusMismatch {
+        expected: u64,
+        actual: u64,
     },
 }
 
@@ -93,6 +113,56 @@ impl PreparedBertBpeMergesTxtLimits {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PreparedBertBpeRetainedMergePairLimits {
+    lexical: PreparedBertBpeMergesTxtLimits,
+    max_retained_pair_span_bytes: NonZeroU64,
+    max_total_parse_work_bytes: NonZeroU64,
+}
+
+impl PreparedBertBpeRetainedMergePairLimits {
+    pub(super) fn try_new(
+        lexical: PreparedBertBpeMergesTxtLimits,
+        max_retained_pair_span_bytes: NonZeroU64,
+        max_total_parse_work_bytes: NonZeroU64,
+    ) -> Result<Self, PreparedBertBpeMergesTxtError> {
+        let platform_span_max = (usize::MAX as u64).min(isize::MAX as u64);
+        Self::try_new_with_platform_max(
+            lexical,
+            max_retained_pair_span_bytes,
+            max_total_parse_work_bytes,
+            platform_span_max,
+        )
+    }
+
+    fn try_new_with_platform_max(
+        lexical: PreparedBertBpeMergesTxtLimits,
+        max_retained_pair_span_bytes: NonZeroU64,
+        max_total_parse_work_bytes: NonZeroU64,
+        platform_span_max: u64,
+    ) -> Result<Self, PreparedBertBpeMergesTxtError> {
+        for (axis, value) in [
+            (
+                PreparedBertBpeMergesTxtLimitAxis::RetainedPairSpanBytes,
+                max_retained_pair_span_bytes.get(),
+            ),
+            (
+                PreparedBertBpeMergesTxtLimitAxis::TotalParseWorkBytes,
+                max_total_parse_work_bytes.get(),
+            ),
+        ] {
+            if value > platform_span_max {
+                return Err(PreparedBertBpeMergesTxtError::PlatformUnrepresentable { axis, value });
+            }
+        }
+        Ok(Self {
+            lexical,
+            max_retained_pair_span_bytes,
+            max_total_parse_work_bytes,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct PreparedBertBpeMergesTxtLexicalFacts {
     merges_txt_bytes: u64,
     merge_entry_count: u64,
@@ -118,10 +188,205 @@ impl PreparedBertBpeMergesTxtLexicalFacts {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PreparedBertBpeMergePairSpan<'a> {
+    left: &'a str,
+    right: &'a str,
+    source_rank: usize,
+}
+
+impl<'a> PreparedBertBpeMergePairSpan<'a> {
+    pub(super) fn left(self) -> &'a str {
+        self.left
+    }
+
+    pub(super) fn right(self) -> &'a str {
+        self.right
+    }
+
+    pub(super) fn source_rank(self) -> usize {
+        self.source_rank
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct PreparedBertBpeRetainedMergePairFacts<'a> {
+    lexical: PreparedBertBpeMergesTxtLexicalFacts,
+    pairs: Vec<PreparedBertBpeMergePairSpan<'a>>,
+    retained_pair_span_bytes: u64,
+    total_logical_parse_work_bytes: u64,
+}
+
+impl<'a> PreparedBertBpeRetainedMergePairFacts<'a> {
+    pub(super) fn lexical(&self) -> PreparedBertBpeMergesTxtLexicalFacts {
+        self.lexical
+    }
+
+    pub(super) fn pairs(&self) -> &[PreparedBertBpeMergePairSpan<'a>] {
+        &self.pairs
+    }
+
+    pub(super) fn retained_pair_span_bytes(&self) -> u64 {
+        self.retained_pair_span_bytes
+    }
+
+    pub(super) fn total_logical_parse_work_bytes(&self) -> u64 {
+        self.total_logical_parse_work_bytes
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MergePairReserveMode {
+    Actual,
+    #[cfg(test)]
+    Fail,
+}
+
 pub(super) fn census_prepared_bert_bpe_merges_txt(
     bytes: &[u8],
     limits: &PreparedBertBpeMergesTxtLimits,
 ) -> Result<PreparedBertBpeMergesTxtLexicalFacts, PreparedBertBpeMergesTxtError> {
+    let preflight = preflight_merges_txt(bytes, limits)?;
+    census_prepared_bert_bpe_merges_txt_after_preflight(bytes, limits, preflight)
+}
+
+pub(super) fn retain_prepared_bert_bpe_merges_txt_pairs<'a>(
+    bytes: &'a [u8],
+    limits: &PreparedBertBpeRetainedMergePairLimits,
+) -> Result<PreparedBertBpeRetainedMergePairFacts<'a>, PreparedBertBpeMergesTxtError> {
+    retain_prepared_bert_bpe_merges_txt_pairs_with_reserve(
+        bytes,
+        limits,
+        MergePairReserveMode::Actual,
+    )
+}
+
+fn retain_prepared_bert_bpe_merges_txt_pairs_with_reserve<'a>(
+    bytes: &'a [u8],
+    limits: &PreparedBertBpeRetainedMergePairLimits,
+    reserve_mode: MergePairReserveMode,
+) -> Result<PreparedBertBpeRetainedMergePairFacts<'a>, PreparedBertBpeMergesTxtError> {
+    let preflight = preflight_merges_txt(bytes, &limits.lexical)?;
+    let total_logical_parse_work_bytes = preflight.logical_parse_work_bytes.checked_mul(2).ok_or(
+        PreparedBertBpeMergesTxtError::ArithmeticOverflow(
+            PreparedBertBpeMergesTxtExpression::TotalParseWorkBytes,
+        ),
+    )?;
+    enforce_limit(
+        PreparedBertBpeMergesTxtLimitAxis::TotalParseWorkBytes,
+        total_logical_parse_work_bytes,
+        limits.max_total_parse_work_bytes.get(),
+    )?;
+
+    let lexical =
+        census_prepared_bert_bpe_merges_txt_after_preflight(bytes, &limits.lexical, preflight)?;
+    let expected_count = usize::try_from(lexical.merge_entry_count).map_err(|_| {
+        PreparedBertBpeMergesTxtError::PlatformUnrepresentable {
+            axis: PreparedBertBpeMergesTxtLimitAxis::MergeEntries,
+            value: lexical.merge_entry_count,
+        }
+    })?;
+    let span_size = u64::try_from(size_of::<PreparedBertBpeMergePairSpan<'_>>()).map_err(|_| {
+        PreparedBertBpeMergesTxtError::ArithmeticOverflow(
+            PreparedBertBpeMergesTxtExpression::RetainedPairSpanBytes,
+        )
+    })?;
+    let requested_bytes = lexical.merge_entry_count.checked_mul(span_size).ok_or(
+        PreparedBertBpeMergesTxtError::ArithmeticOverflow(
+            PreparedBertBpeMergesTxtExpression::RetainedPairSpanBytes,
+        ),
+    )?;
+    enforce_limit(
+        PreparedBertBpeMergesTxtLimitAxis::RetainedPairSpanBytes,
+        requested_bytes,
+        limits.max_retained_pair_span_bytes.get(),
+    )?;
+
+    let mut pairs = Vec::new();
+    match reserve_mode {
+        MergePairReserveMode::Actual => pairs.try_reserve_exact(expected_count).map_err(|_| {
+            PreparedBertBpeMergesTxtError::AllocationFailed {
+                arena: PreparedBertBpeMergesTxtAllocationArena::MergePairSpans,
+                requested_bytes,
+            }
+        })?,
+        #[cfg(test)]
+        MergePairReserveMode::Fail => {
+            return Err(PreparedBertBpeMergesTxtError::AllocationFailed {
+                arena: PreparedBertBpeMergesTxtAllocationArena::MergePairSpans,
+                requested_bytes,
+            });
+        }
+    }
+    let retained_pair_span_bytes = u64::try_from(pairs.capacity())
+        .ok()
+        .and_then(|capacity| capacity.checked_mul(span_size))
+        .ok_or(PreparedBertBpeMergesTxtError::ArithmeticOverflow(
+            PreparedBertBpeMergesTxtExpression::RetainedPairSpanBytes,
+        ))?;
+    enforce_limit(
+        PreparedBertBpeMergesTxtLimitAxis::RetainedPairSpanBytes,
+        retained_pair_span_bytes,
+        limits.max_retained_pair_span_bytes.get(),
+    )?;
+
+    let text =
+        std::str::from_utf8(bytes).map_err(|error| PreparedBertBpeMergesTxtError::InvalidUtf8 {
+            valid_up_to: error.valid_up_to(),
+        })?;
+    for line in text.lines() {
+        let Some((left, right)) = legacy_merge_pair(line) else {
+            continue;
+        };
+        let actual = u64::try_from(pairs.len())
+            .ok()
+            .and_then(|count| count.checked_add(1))
+            .ok_or(PreparedBertBpeMergesTxtError::ArithmeticOverflow(
+                PreparedBertBpeMergesTxtExpression::MergeEntryCount,
+            ))?;
+        if actual > lexical.merge_entry_count || pairs.len() >= pairs.capacity() {
+            return Err(PreparedBertBpeMergesTxtError::SecondPassCensusMismatch {
+                expected: lexical.merge_entry_count,
+                actual,
+            });
+        }
+        let source_rank = pairs.len();
+        pairs.push(PreparedBertBpeMergePairSpan {
+            left,
+            right,
+            source_rank,
+        });
+    }
+    let actual = u64::try_from(pairs.len()).map_err(|_| {
+        PreparedBertBpeMergesTxtError::ArithmeticOverflow(
+            PreparedBertBpeMergesTxtExpression::MergeEntryCount,
+        )
+    })?;
+    if actual != lexical.merge_entry_count {
+        return Err(PreparedBertBpeMergesTxtError::SecondPassCensusMismatch {
+            expected: lexical.merge_entry_count,
+            actual,
+        });
+    }
+
+    Ok(PreparedBertBpeRetainedMergePairFacts {
+        lexical,
+        pairs,
+        retained_pair_span_bytes,
+        total_logical_parse_work_bytes,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct MergesTxtPreflight {
+    merges_txt_bytes: u64,
+    logical_parse_work_bytes: u64,
+}
+
+fn preflight_merges_txt(
+    bytes: &[u8],
+    limits: &PreparedBertBpeMergesTxtLimits,
+) -> Result<MergesTxtPreflight, PreparedBertBpeMergesTxtError> {
     let merges_txt_bytes = u64::try_from(bytes.len()).map_err(|_| {
         PreparedBertBpeMergesTxtError::PlatformUnrepresentable {
             axis: PreparedBertBpeMergesTxtLimitAxis::MergesTxtBytes,
@@ -144,6 +409,17 @@ pub(super) fn census_prepared_bert_bpe_merges_txt(
         limits.max_parse_work_bytes.get(),
     )?;
 
+    Ok(MergesTxtPreflight {
+        merges_txt_bytes,
+        logical_parse_work_bytes,
+    })
+}
+
+fn census_prepared_bert_bpe_merges_txt_after_preflight(
+    bytes: &[u8],
+    limits: &PreparedBertBpeMergesTxtLimits,
+    preflight: MergesTxtPreflight,
+) -> Result<PreparedBertBpeMergesTxtLexicalFacts, PreparedBertBpeMergesTxtError> {
     let text =
         std::str::from_utf8(bytes).map_err(|error| PreparedBertBpeMergesTxtError::InvalidUtf8 {
             valid_up_to: error.valid_up_to(),
@@ -151,15 +427,7 @@ pub(super) fn census_prepared_bert_bpe_merges_txt(
 
     let mut merge_entry_count = 0_u64;
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut operands = line.split_whitespace();
-        let Some(_left) = operands.next() else {
-            continue;
-        };
-        let Some(_right) = operands.next() else {
+        let Some((_left, _right)) = legacy_merge_pair(line) else {
             continue;
         };
         // Duplicate pairs deliberately remain separate occurrences. The live
@@ -178,11 +446,20 @@ pub(super) fn census_prepared_bert_bpe_merges_txt(
     }
 
     Ok(PreparedBertBpeMergesTxtLexicalFacts {
-        merges_txt_bytes,
+        merges_txt_bytes: preflight.merges_txt_bytes,
         merge_entry_count,
         max_merge_rank: merge_entry_count.checked_sub(1),
-        logical_parse_work_bytes,
+        logical_parse_work_bytes: preflight.logical_parse_work_bytes,
     })
+}
+
+fn legacy_merge_pair(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut operands = line.split_whitespace();
+    Some((operands.next()?, operands.next()?))
 }
 
 fn checked_base_parse_work(merges_txt_bytes: u64) -> Result<u64, PreparedBertBpeMergesTxtError> {
@@ -331,5 +608,130 @@ mod tests {
                 PreparedBertBpeMergesTxtExpression::BaseParseWorkBytes,
             ))
         );
+    }
+
+    fn retained_limits(
+        bytes: u64,
+        entries: u64,
+        span_bytes: u64,
+        total_work: u64,
+    ) -> PreparedBertBpeRetainedMergePairLimits {
+        let lexical = limits(bytes.max(1), entries.max(1), bytes.saturating_mul(8).max(1));
+        PreparedBertBpeRetainedMergePairLimits::try_new(
+            lexical,
+            nz(span_bytes.max(1)),
+            nz(total_work.max(1)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retained_pairs_preserve_exact_operands_occurrence_ranks_and_source_borrows() {
+        let source = concat!(
+            "\u{2003}# header\r\n",
+            "a\u{00a0}b ignored\n",
+            "single\n",
+            "a b\n",
+            "c\u{2028}d\n",
+        );
+        let bytes = u64::try_from(source.len()).unwrap();
+        let retained = retain_prepared_bert_bpe_merges_txt_pairs(
+            source.as_bytes(),
+            &retained_limits(bytes, 3, 1024, bytes * 16),
+        )
+        .unwrap();
+        let observed: Vec<_> = retained
+            .pairs()
+            .iter()
+            .copied()
+            .map(|pair| (pair.left(), pair.right(), pair.source_rank()))
+            .collect();
+        assert_eq!(observed, [("a", "b", 0), ("a", "b", 1), ("c", "d", 2)]);
+        assert_eq!(retained.lexical().merge_entry_count(), 3);
+        assert_eq!(retained.total_logical_parse_work_bytes(), bytes * 16);
+
+        let source_start = source.as_ptr() as usize;
+        let source_end = source_start + source.len();
+        for pair in retained.pairs() {
+            for operand in [pair.left(), pair.right()] {
+                let operand_start = operand.as_ptr() as usize;
+                assert!(operand_start >= source_start);
+                assert!(operand_start + operand.len() <= source_end);
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_pairs_remain_distinct_for_later_first_wins_materialization() {
+        let source = b"a b\nc d\na b";
+        let bytes = u64::try_from(source.len()).unwrap();
+        let retained = retain_prepared_bert_bpe_merges_txt_pairs(
+            source,
+            &retained_limits(bytes, 3, 1024, bytes * 16),
+        )
+        .unwrap();
+        assert_eq!(retained.pairs().len(), 3);
+        assert_eq!(retained.pairs()[0].source_rank(), 0);
+        assert_eq!(retained.pairs()[2].source_rank(), 2);
+        assert_eq!(retained.pairs()[0].left(), retained.pairs()[2].left());
+        assert_eq!(retained.pairs()[0].right(), retained.pairs()[2].right());
+    }
+
+    #[test]
+    fn total_work_actual_span_capacity_empty_and_reserve_failures_are_bounded() {
+        let source = b"a b\nc d";
+        let bytes = u64::try_from(source.len()).unwrap();
+        let broad = retain_prepared_bert_bpe_merges_txt_pairs(
+            source,
+            &retained_limits(bytes, 2, 1024, bytes * 16),
+        )
+        .unwrap();
+        let actual_span_bytes = broad.retained_pair_span_bytes();
+        assert!(actual_span_bytes > 0);
+
+        let exact = retained_limits(bytes, 2, actual_span_bytes, bytes * 16);
+        assert!(retain_prepared_bert_bpe_merges_txt_pairs(source, &exact).is_ok());
+        assert_eq!(
+            retain_prepared_bert_bpe_merges_txt_pairs(
+                source,
+                &retained_limits(bytes, 2, actual_span_bytes, bytes * 16 - 1),
+            ),
+            Err(PreparedBertBpeMergesTxtError::Exceeded {
+                axis: PreparedBertBpeMergesTxtLimitAxis::TotalParseWorkBytes,
+                actual: bytes * 16,
+                limit: bytes * 16 - 1,
+            })
+        );
+        assert_eq!(
+            retain_prepared_bert_bpe_merges_txt_pairs(
+                source,
+                &retained_limits(bytes, 2, actual_span_bytes - 1, bytes * 16),
+            ),
+            Err(PreparedBertBpeMergesTxtError::Exceeded {
+                axis: PreparedBertBpeMergesTxtLimitAxis::RetainedPairSpanBytes,
+                actual: actual_span_bytes,
+                limit: actual_span_bytes - 1,
+            })
+        );
+
+        let requested_bytes =
+            2 * u64::try_from(std::mem::size_of::<PreparedBertBpeMergePairSpan<'_>>()).unwrap();
+        assert_eq!(
+            retain_prepared_bert_bpe_merges_txt_pairs_with_reserve(
+                source,
+                &exact,
+                MergePairReserveMode::Fail,
+            ),
+            Err(PreparedBertBpeMergesTxtError::AllocationFailed {
+                arena: PreparedBertBpeMergesTxtAllocationArena::MergePairSpans,
+                requested_bytes,
+            })
+        );
+
+        let empty =
+            retain_prepared_bert_bpe_merges_txt_pairs(b"", &retained_limits(1, 1, 1, 1)).unwrap();
+        assert!(empty.pairs().is_empty());
+        assert_eq!(empty.retained_pair_span_bytes(), 0);
+        assert_eq!(empty.total_logical_parse_work_bytes(), 0);
     }
 }
