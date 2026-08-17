@@ -3,6 +3,9 @@
 **Status**: Accepted
 **Date**: 2026-05-13
 **Crate**: lattice-embed
+**Proposed amendment**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would add an
+eager, sealed, cache-disabled prepared service for identity-governing consumers while retaining
+this lazy compatibility service.
 
 ## Context
 

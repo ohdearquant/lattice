@@ -6,6 +6,10 @@
 `attention/standard.rs`, `forward/cpu/*`, `pool.rs`); `crates/embed` `encode_batch`
 consumers; embedding benchmarks
 **Depends on**: ADR-058 (measure-first performance workflow)
+**Related constraint**: Proposed ADR-088's prepared `CpuPinned` path uses descriptor-bound canonical
+per-item execution. This ADR's fused `encode_batch` decision applies to legacy/`Auto` consumers and
+must not be routed into an attested prepared service without an ADR-088 amendment and downstream
+identity migration.
 
 ---
 
