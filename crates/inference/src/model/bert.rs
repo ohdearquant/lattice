@@ -56,6 +56,9 @@ mod prepared_vocab_txt;
 #[cfg_attr(not(test), allow(dead_code))]
 mod prepared_wordpiece_vocab_match;
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_merges_txt;
+
 /// Per-layer fused Q/K/V weight+bias, built once at model-load time from a
 /// `TransformerLayerWeights` layer's separate `query`/`key`/`value` tensors.
 ///
