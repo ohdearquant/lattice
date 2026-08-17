@@ -4,8 +4,10 @@
 //! WordPiece `vocab.txt` and BPE `vocab.txt` + `merges.txt` loaders. It does
 //! not require special tokens. It records optional exact known-token IDs, and
 //! a separate validator enforces the legacy WordPiece specials only after the
-//! caller has selected `VocabTxt`. It does not validate merges, emitted-ID or
-//! config ranges, or any live file.
+//! caller has selected `VocabTxt`. A separate resolver derives the raw
+//! `VocabTxtMerges` BPE control IDs without inspecting `merges.txt`. This
+//! module does not validate merges, emitted-ID or config ranges, or any live
+//! file.
 
 use std::cmp::Ordering;
 use std::mem::size_of;
@@ -141,6 +143,52 @@ pub(super) struct PreparedBertVocabTxtKnownTokenIds {
     mask: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PreparedBertBpeVocabTxtKnownTokenIds {
+    pipe_pad: Option<u32>,
+    pad: Option<u32>,
+    endoftext: Option<u32>,
+    slash_s: Option<u32>,
+    unk: Option<u32>,
+    bos: Option<u32>,
+    s: Option<u32>,
+    eos: Option<u32>,
+}
+
+impl PreparedBertBpeVocabTxtKnownTokenIds {
+    pub(super) fn pipe_pad(self) -> Option<u32> {
+        self.pipe_pad
+    }
+
+    pub(super) fn pad(self) -> Option<u32> {
+        self.pad
+    }
+
+    pub(super) fn endoftext(self) -> Option<u32> {
+        self.endoftext
+    }
+
+    pub(super) fn slash_s(self) -> Option<u32> {
+        self.slash_s
+    }
+
+    pub(super) fn unk(self) -> Option<u32> {
+        self.unk
+    }
+
+    pub(super) fn bos(self) -> Option<u32> {
+        self.bos
+    }
+
+    pub(super) fn s(self) -> Option<u32> {
+        self.s
+    }
+
+    pub(super) fn eos(self) -> Option<u32> {
+        self.eos
+    }
+}
+
 impl PreparedBertVocabTxtKnownTokenIds {
     pub(super) fn cls(self) -> Option<u32> {
         self.cls
@@ -171,6 +219,7 @@ pub(super) struct PreparedBertVocabTxtFacts {
     span_scratch_bytes: u64,
     logical_parse_work_bytes: u64,
     known_token_ids: PreparedBertVocabTxtKnownTokenIds,
+    bpe_known_token_ids: PreparedBertBpeVocabTxtKnownTokenIds,
 }
 
 impl PreparedBertVocabTxtFacts {
@@ -196,6 +245,10 @@ impl PreparedBertVocabTxtFacts {
 
     pub(super) fn known_token_ids(self) -> PreparedBertVocabTxtKnownTokenIds {
         self.known_token_ids
+    }
+
+    pub(super) fn bpe_known_token_ids(self) -> PreparedBertBpeVocabTxtKnownTokenIds {
+        self.bpe_known_token_ids
     }
 }
 
@@ -288,11 +341,102 @@ pub(super) fn validate_prepared_bert_wordpiece_vocab_txt(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct PreparedBertBpeVocabTxtFacts {
+    vocab_txt: PreparedBertVocabTxtFacts,
+    pad_id: u32,
+    unk_id: Option<u32>,
+    bos_id: Option<u32>,
+    eos_id: Option<u32>,
+}
+
+impl PreparedBertBpeVocabTxtFacts {
+    pub(super) fn vocab_txt(self) -> PreparedBertVocabTxtFacts {
+        self.vocab_txt
+    }
+
+    pub(super) fn pad_id(self) -> u32 {
+        self.pad_id
+    }
+
+    pub(super) fn unk_id(self) -> Option<u32> {
+        self.unk_id
+    }
+
+    pub(super) fn bos_id(self) -> Option<u32> {
+        self.bos_id
+    }
+
+    pub(super) fn eos_id(self) -> Option<u32> {
+        self.eos_id
+    }
+}
+
+/// Resolve the raw `vocab.txt` + `merges.txt` BPE constructor's control IDs.
+///
+/// The selected `merges.txt` is deliberately not inspected by this function.
+pub(super) fn resolve_prepared_bert_bpe_vocab_txt(
+    vocab_txt: PreparedBertVocabTxtFacts,
+) -> PreparedBertBpeVocabTxtFacts {
+    let wordpiece = vocab_txt.known_token_ids;
+    let bpe = vocab_txt.bpe_known_token_ids;
+    let pad_id = bpe
+        .pipe_pad
+        .or(bpe.pad)
+        .or(wordpiece.pad)
+        .or(bpe.endoftext)
+        .or(bpe.slash_s)
+        .unwrap_or(0);
+    let unk_id = bpe.unk.or(wordpiece.unk);
+    let bos_id = bpe.bos.or(bpe.s);
+    let eos_id = bpe.eos.or(bpe.slash_s).or(bpe.endoftext);
+    PreparedBertBpeVocabTxtFacts {
+        vocab_txt,
+        pad_id,
+        unk_id,
+        bos_id,
+        eos_id,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TokenSpan<'a> {
     token: &'a [u8],
     id: u32,
 }
+
+#[derive(Clone, Copy)]
+enum KnownTokenSlot {
+    SlashS,
+    Bos,
+    Eos,
+    Pad,
+    S,
+    Unk,
+    Endoftext,
+    PipePad,
+    Cls,
+    Mask,
+    BracketPad,
+    Sep,
+    BracketUnk,
+}
+
+const KNOWN_TOKEN_TARGETS: [(&[u8], KnownTokenSlot); 13] = [
+    (b"</s>", KnownTokenSlot::SlashS),
+    (b"<bos>", KnownTokenSlot::Bos),
+    (b"<eos>", KnownTokenSlot::Eos),
+    (b"<pad>", KnownTokenSlot::Pad),
+    (b"<s>", KnownTokenSlot::S),
+    (b"<unk>", KnownTokenSlot::Unk),
+    (b"<|endoftext|>", KnownTokenSlot::Endoftext),
+    (b"<|pad|>", KnownTokenSlot::PipePad),
+    (b"[CLS]", KnownTokenSlot::Cls),
+    (b"[MASK]", KnownTokenSlot::Mask),
+    (b"[PAD]", KnownTokenSlot::BracketPad),
+    (b"[SEP]", KnownTokenSlot::Sep),
+    (b"[UNK]", KnownTokenSlot::BracketUnk),
+];
 
 struct WorkMeter {
     used: u64,
@@ -467,7 +611,7 @@ fn parse_prepared_bert_vocab_txt_with_reserve(
             });
         }
     }
-    let known_token_ids = observe_known_token_ids(&spans, &mut work)?;
+    let (known_token_ids, bpe_known_token_ids) = observe_known_token_ids(&spans, &mut work)?;
 
     Ok(PreparedBertVocabTxtFacts {
         vocab_txt_bytes,
@@ -476,59 +620,67 @@ fn parse_prepared_bert_vocab_txt_with_reserve(
         span_scratch_bytes,
         logical_parse_work_bytes: work.used,
         known_token_ids,
+        bpe_known_token_ids,
     })
 }
 
 fn observe_known_token_ids(
     spans: &[TokenSpan<'_>],
     work: &mut WorkMeter,
-) -> Result<PreparedBertVocabTxtKnownTokenIds, PreparedBertVocabTxtError> {
-    #[derive(Clone, Copy)]
-    enum Slot {
-        Cls,
-        Mask,
-        Pad,
-        Sep,
-        Unk,
-    }
-
-    const KNOWN: [(&[u8], Slot); 5] = [
-        (b"[CLS]", Slot::Cls),
-        (b"[MASK]", Slot::Mask),
-        (b"[PAD]", Slot::Pad),
-        (b"[SEP]", Slot::Sep),
-        (b"[UNK]", Slot::Unk),
-    ];
-
-    let mut result = PreparedBertVocabTxtKnownTokenIds {
+) -> Result<
+    (
+        PreparedBertVocabTxtKnownTokenIds,
+        PreparedBertBpeVocabTxtKnownTokenIds,
+    ),
+    PreparedBertVocabTxtError,
+> {
+    let mut wordpiece = PreparedBertVocabTxtKnownTokenIds {
         cls: None,
         sep: None,
         pad: None,
         unk: None,
         mask: None,
     };
+    let mut bpe = PreparedBertBpeVocabTxtKnownTokenIds {
+        pipe_pad: None,
+        pad: None,
+        endoftext: None,
+        slash_s: None,
+        unk: None,
+        bos: None,
+        s: None,
+        eos: None,
+    };
     let mut span_index = 0;
     let mut known_index = 0;
-    while span_index < spans.len() && known_index < KNOWN.len() {
+    while span_index < spans.len() && known_index < KNOWN_TOKEN_TARGETS.len() {
         let span = spans[span_index];
-        let (known, slot) = KNOWN[known_index];
+        let (known, slot) = KNOWN_TOKEN_TARGETS[known_index];
         match compare_token_bytes(span.token, known, work)? {
             Ordering::Less => span_index += 1,
             Ordering::Greater => known_index += 1,
             Ordering::Equal => {
                 match slot {
-                    Slot::Cls => result.cls = Some(span.id),
-                    Slot::Mask => result.mask = Some(span.id),
-                    Slot::Pad => result.pad = Some(span.id),
-                    Slot::Sep => result.sep = Some(span.id),
-                    Slot::Unk => result.unk = Some(span.id),
+                    KnownTokenSlot::SlashS => bpe.slash_s = Some(span.id),
+                    KnownTokenSlot::Bos => bpe.bos = Some(span.id),
+                    KnownTokenSlot::Eos => bpe.eos = Some(span.id),
+                    KnownTokenSlot::Pad => bpe.pad = Some(span.id),
+                    KnownTokenSlot::S => bpe.s = Some(span.id),
+                    KnownTokenSlot::Unk => bpe.unk = Some(span.id),
+                    KnownTokenSlot::Endoftext => bpe.endoftext = Some(span.id),
+                    KnownTokenSlot::PipePad => bpe.pipe_pad = Some(span.id),
+                    KnownTokenSlot::Cls => wordpiece.cls = Some(span.id),
+                    KnownTokenSlot::Mask => wordpiece.mask = Some(span.id),
+                    KnownTokenSlot::BracketPad => wordpiece.pad = Some(span.id),
+                    KnownTokenSlot::Sep => wordpiece.sep = Some(span.id),
+                    KnownTokenSlot::BracketUnk => wordpiece.unk = Some(span.id),
                 }
                 span_index += 1;
                 known_index += 1;
             }
         }
     }
-    Ok(result)
+    Ok((wordpiece, bpe))
 }
 
 fn enforce_limit(
@@ -867,6 +1019,76 @@ mod tests {
                     expected,
                 ))
             );
+        }
+    }
+
+    #[test]
+    fn bpe_control_ids_follow_raw_vocab_txt_constructor_precedence() {
+        let input = b"ordinary\r\n<|pad|>\n<pad>\r\n[PAD]\n<|endoftext|>\r\n</s>\n<unk>\r\n[UNK]\n<bos>\r\n<s>\n<eos>";
+        let generic = match parse_prepared_bert_vocab_txt(input, &limits(256, 16, 2048, 32_768)) {
+            Ok(facts) => facts,
+            Err(error) => panic!("valid BPE vocab: {error:?}"),
+        };
+        let known = generic.bpe_known_token_ids();
+        assert_eq!(known.pipe_pad(), Some(1));
+        assert_eq!(known.pad(), Some(2));
+        assert_eq!(known.endoftext(), Some(4));
+        assert_eq!(known.slash_s(), Some(5));
+        assert_eq!(known.unk(), Some(6));
+        assert_eq!(known.bos(), Some(8));
+        assert_eq!(known.s(), Some(9));
+        assert_eq!(known.eos(), Some(10));
+        assert_eq!(generic.known_token_ids().pad(), Some(3));
+        assert_eq!(generic.known_token_ids().unk(), Some(7));
+        let resolved = resolve_prepared_bert_bpe_vocab_txt(generic);
+        assert_eq!(resolved.pad_id(), 1);
+        assert_eq!(resolved.unk_id(), Some(6));
+        assert_eq!(resolved.bos_id(), Some(8));
+        assert_eq!(resolved.eos_id(), Some(10));
+        assert_eq!(resolved.vocab_txt(), generic);
+
+        let exact_work = generic.logical_parse_work_bytes();
+        assert!(parse_prepared_bert_vocab_txt(input, &limits(256, 16, 2048, exact_work),).is_ok());
+        assert!(matches!(
+            parse_prepared_bert_vocab_txt(input, &limits(256, 16, 2048, exact_work - 1),),
+            Err(PreparedBertVocabTxtError::Exceeded {
+                axis: PreparedBertVocabTxtLimitAxis::ParseWorkBytes,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn bpe_control_fallbacks_and_near_misses_are_exact() {
+        for pair in KNOWN_TOKEN_TARGETS.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "known-token table must be sorted");
+        }
+        for (input, pad, unk, bos, eos) in [
+            (
+                "<pad>\n[PAD]\n<|endoftext|>\n</s>\n[UNK]\n<s>",
+                0,
+                Some(4),
+                Some(5),
+                Some(3),
+            ),
+            ("[PAD]\n<|endoftext|>\n</s>", 0, None, None, Some(2)),
+            ("<|endoftext|>\n</s>", 0, None, None, Some(1)),
+            ("</s>", 0, None, None, Some(0)),
+            ("ordinary", 0, None, None, None),
+            ("<PAD>\n<unk> \n<BOS>\n<eos> ", 0, None, None, None),
+        ] {
+            let generic = match parse_prepared_bert_vocab_txt(
+                input.as_bytes(),
+                &limits(256, 16, 2048, 32_768),
+            ) {
+                Ok(facts) => facts,
+                Err(error) => panic!("valid fallback vocab: {error:?}"),
+            };
+            let resolved = resolve_prepared_bert_bpe_vocab_txt(generic);
+            assert_eq!(resolved.pad_id(), pad, "input={input:?}");
+            assert_eq!(resolved.unk_id(), unk, "input={input:?}");
+            assert_eq!(resolved.bos_id(), bos, "input={input:?}");
+            assert_eq!(resolved.eos_id(), eos, "input={input:?}");
         }
     }
 }
