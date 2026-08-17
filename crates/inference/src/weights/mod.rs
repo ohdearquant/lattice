@@ -5,6 +5,8 @@ pub mod f32_weights;
 pub(crate) mod half_bits;
 pub(crate) mod ingress;
 pub(crate) mod mmap_trust;
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod prepared_safetensors;
 pub mod q3_weights;
 pub mod q4_weights;
 pub mod q8_weights;

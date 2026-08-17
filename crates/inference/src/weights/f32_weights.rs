@@ -1098,6 +1098,11 @@ pub(crate) const MAX_WEIGHT_MAP_ENTRIES: usize = 1_000_000;
 /// not error handling downstream of the allocation.
 const MAX_SAFETENSORS_HEADER_BYTES: usize = 4_194_304;
 
+/// Crate-private compatibility ceiling for dormant prepared framing checks.
+pub(crate) const fn max_safetensors_header_bytes() -> usize {
+    MAX_SAFETENSORS_HEADER_BYTES
+}
+
 /// Upper bound on JSON container nesting depth (`{` / `[`) while parsing a safetensors
 /// header, tracked by [`JsonParser::depth`] and enforced in [`JsonParser::skip_value`].
 ///
