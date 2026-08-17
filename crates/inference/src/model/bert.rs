@@ -29,6 +29,9 @@ mod prepared_config;
 #[cfg_attr(not(test), allow(dead_code))]
 mod prepared_tensor_inventory;
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_tokenizer_selection;
+
 /// Per-layer fused Q/K/V weight+bias, built once at model-load time from a
 /// `TransformerLayerWeights` layer's separate `query`/`key`/`value` tensors.
 ///
