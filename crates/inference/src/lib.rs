@@ -139,6 +139,12 @@ pub(crate) fn default_cache_dir() -> Result<PathBuf, error::InferenceError> {
 // Re-exports for public API backward compatibility
 /// Root error type for inference, tokenizer, model loading, and runtime failures. See [`error`].
 pub use crate::error::InferenceError;
+/// Dormant BERT CPU policy contract for sealed native preparation.
+#[doc(hidden)]
+pub use crate::forward::cpu::BertCpuKernelPolicy;
+/// Frozen CPU capability facts for the dormant BERT pinned-policy contract.
+#[doc(hidden)]
+pub use crate::forward::cpu::BertCpuKernelProfile;
 /// BERT encoder configuration. See [`BertModel`] and [`model`].
 pub use crate::model::BertConfig;
 /// BERT/BGE encoder model. See [`BertConfig`], [`Tokenizer`], and [`BertPooling`].
