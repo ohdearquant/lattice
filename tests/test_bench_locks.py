@@ -475,7 +475,7 @@ class RunProvenanceHandoff(unittest.TestCase):
             lines = provenance.read_text().splitlines()
 
             for prefix in (
-                "schema=lattice-bench-provenance-v1",
+                "schema=lattice-bench-provenance-v2",
                 "started_utc=",
                 "finished_utc=",
                 "host_id=local-random:",
@@ -495,6 +495,7 @@ class RunProvenanceHandoff(unittest.TestCase):
                 "baseline_name=compare-base",
                 "targets=lattice-inference:elementwise_cpu_bench, lattice-embed:simd",
                 "inference_features=<none>",
+                "embed_features=<none>",
                 "filters=inference='<all>' embed='<all>'",
                 "enforcement=report-only",
                 "lock=",
