@@ -1,6 +1,9 @@
 //! Dormant checked parsing contract for prepared BERT `config.json` bytes.
 
 use super::prepared_facts::RawBertConfigFacts;
+use super::prepared_sequence_cap::{
+    PreparedBertSequenceCapKey, RawPreparedBertSequenceCapCandidate,
+};
 use std::num::NonZeroU64;
 use std::ops::Range;
 
@@ -16,10 +19,23 @@ pub(super) enum PreparedBertConfigField {
     MaxPositionEmbeddings,
     TypeVocabSize,
     LayerNormEps,
+    ModelMaxLength,
 }
 
 impl PreparedBertConfigField {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 9] = [
+        Self::VocabSize,
+        Self::HiddenSize,
+        Self::NumHiddenLayers,
+        Self::NumAttentionHeads,
+        Self::IntermediateSize,
+        Self::MaxPositionEmbeddings,
+        Self::TypeVocabSize,
+        Self::LayerNormEps,
+        Self::ModelMaxLength,
+    ];
+
+    const REQUIRED: [Self; 8] = [
         Self::VocabSize,
         Self::HiddenSize,
         Self::NumHiddenLayers,
@@ -40,6 +56,7 @@ impl PreparedBertConfigField {
             Self::MaxPositionEmbeddings => 5,
             Self::TypeVocabSize => 6,
             Self::LayerNormEps => 7,
+            Self::ModelMaxLength => 8,
         }
     }
 
@@ -53,6 +70,7 @@ impl PreparedBertConfigField {
             Self::MaxPositionEmbeddings => b"max_position_embeddings",
             Self::TypeVocabSize => b"type_vocab_size",
             Self::LayerNormEps => b"layer_norm_eps",
+            Self::ModelMaxLength => b"model_max_length",
         }
     }
 
@@ -94,10 +112,25 @@ pub(super) enum PreparedBertConfigExpectedType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PreparedBertConfigUnsignedFault {
+    Zero,
     Negative,
     Fractional,
     Exponent,
     Overflow,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PreparedBertConfigSequenceCandidateError {
+    InvalidType {
+        key: PreparedBertSequenceCapKey,
+        actual: PreparedBertConfigValueKind,
+        at: usize,
+    },
+    InvalidPositiveInteger {
+        key: PreparedBertSequenceCapKey,
+        fault: PreparedBertConfigUnsignedFault,
+        at: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,6 +245,8 @@ impl PreparedBertConfigLimits {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct ParsedBertConfigFacts {
     raw: RawBertConfigFacts,
+    sequence_cap_candidate:
+        Result<RawPreparedBertSequenceCapCandidate, PreparedBertConfigSequenceCandidateError>,
     config_bytes: u64,
     logical_config_parse_work_bytes: u64,
 }
@@ -219,6 +254,12 @@ pub(super) struct ParsedBertConfigFacts {
 impl ParsedBertConfigFacts {
     pub(super) fn raw(self) -> RawBertConfigFacts {
         self.raw
+    }
+
+    pub(super) fn sequence_cap_candidate(
+        self,
+    ) -> Result<RawPreparedBertSequenceCapCandidate, PreparedBertConfigSequenceCandidateError> {
+        self.sequence_cap_candidate
     }
 
     pub(super) fn config_bytes(self) -> u64 {
@@ -261,9 +302,10 @@ pub(super) fn parse_prepared_bert_config_json(
     }
 
     JsonCursor::new(bytes).validate_document()?;
-    let raw = SemanticParser::new(bytes).parse()?;
+    let (raw, sequence_cap_candidate) = SemanticParser::new(bytes).parse()?;
     Ok(ParsedBertConfigFacts {
         raw,
+        sequence_cap_candidate,
         config_bytes,
         logical_config_parse_work_bytes,
     })
@@ -725,22 +767,31 @@ impl<'a> JsonCursor<'a> {
 
 struct SemanticParser<'a> {
     cursor: JsonCursor<'a>,
-    seen_at: [Option<usize>; 8],
+    seen_at: [Option<usize>; 9],
     unsigned: [u64; 7],
     epsilon: f64,
+    model_max_length_candidate: Option<
+        Result<RawPreparedBertSequenceCapCandidate, PreparedBertConfigSequenceCandidateError>,
+    >,
 }
 
 impl<'a> SemanticParser<'a> {
     fn new(bytes: &'a [u8]) -> Self {
         Self {
             cursor: JsonCursor::new(bytes),
-            seen_at: [None; 8],
+            seen_at: [None; 9],
             unsigned: [0; 7],
             epsilon: 0.0,
+            model_max_length_candidate: None,
         }
     }
 
-    fn parse(mut self) -> ConfigResult<RawBertConfigFacts> {
+    fn parse(
+        mut self,
+    ) -> ConfigResult<(
+        RawBertConfigFacts,
+        Result<RawPreparedBertSequenceCapCandidate, PreparedBertConfigSequenceCandidateError>,
+    )> {
         self.cursor.skip_whitespace();
         self.cursor.pos += 1;
         self.cursor.skip_whitespace();
@@ -768,21 +819,41 @@ impl<'a> SemanticParser<'a> {
                     }
                     self.seen_at[index] = Some(key_at);
                     let actual = self.cursor.peek_value_kind()?;
-                    if actual != PreparedBertConfigValueKind::Number {
-                        return Err(PreparedBertConfigError::InvalidFieldType {
-                            field,
-                            expected: field.expected_type(),
-                            actual,
-                            at: value_at,
-                        });
-                    }
-                    let token = self.cursor.scan_number()?;
-                    if field == PreparedBertConfigField::LayerNormEps {
-                        self.epsilon =
-                            parse_float(self.cursor.bytes, token.range, field, value_at)?;
+                    if field == PreparedBertConfigField::ModelMaxLength {
+                        if actual == PreparedBertConfigValueKind::Number {
+                            let token = self.cursor.scan_number()?;
+                            self.model_max_length_candidate =
+                                Some(parse_model_max_length_candidate(
+                                    self.cursor.bytes,
+                                    &token,
+                                    value_at,
+                                ));
+                        } else {
+                            self.cursor.skip_value()?;
+                            self.model_max_length_candidate =
+                                Some(Err(PreparedBertConfigSequenceCandidateError::InvalidType {
+                                    key: PreparedBertSequenceCapKey::ModelMaxLength,
+                                    actual,
+                                    at: value_at,
+                                }));
+                        }
                     } else {
-                        self.unsigned[index] =
-                            parse_unsigned(self.cursor.bytes, token, field, value_at)?;
+                        if actual != PreparedBertConfigValueKind::Number {
+                            return Err(PreparedBertConfigError::InvalidFieldType {
+                                field,
+                                expected: field.expected_type(),
+                                actual,
+                                at: value_at,
+                            });
+                        }
+                        let token = self.cursor.scan_number()?;
+                        if field == PreparedBertConfigField::LayerNormEps {
+                            self.epsilon =
+                                parse_float(self.cursor.bytes, token.range, field, value_at)?;
+                        } else {
+                            let value = parse_unsigned(self.cursor.bytes, &token, field, value_at)?;
+                            self.unsigned[index] = value;
+                        }
                     }
                 } else {
                     self.cursor.skip_value()?;
@@ -805,20 +876,30 @@ impl<'a> SemanticParser<'a> {
             }
         }
 
-        for field in PreparedBertConfigField::ALL {
+        for field in PreparedBertConfigField::REQUIRED {
             if self.seen_at[field.index()].is_none() {
                 return Err(PreparedBertConfigError::MissingField { field });
             }
         }
-        Ok(RawBertConfigFacts::new(
-            self.unsigned[0],
-            self.unsigned[1],
-            self.unsigned[2],
-            self.unsigned[3],
-            self.unsigned[4],
-            self.unsigned[5],
-            self.unsigned[6],
-            self.epsilon,
+        let sequence_cap_candidate = match self.model_max_length_candidate {
+            Some(candidate) => candidate,
+            None => Ok(RawPreparedBertSequenceCapCandidate::new(
+                PreparedBertSequenceCapKey::MaxPositionEmbeddings,
+                self.unsigned[PreparedBertConfigField::MaxPositionEmbeddings.index()],
+            )),
+        };
+        Ok((
+            RawBertConfigFacts::new(
+                self.unsigned[0],
+                self.unsigned[1],
+                self.unsigned[2],
+                self.unsigned[3],
+                self.unsigned[4],
+                self.unsigned[5],
+                self.unsigned[6],
+                self.epsilon,
+            ),
+            sequence_cap_candidate,
         ))
     }
 }
@@ -849,41 +930,54 @@ impl JsonCursor<'_> {
 
 fn parse_unsigned(
     bytes: &[u8],
-    token: NumberToken,
+    token: &NumberToken,
     field: PreparedBertConfigField,
     at: usize,
 ) -> ConfigResult<u64> {
+    parse_unsigned_value(bytes, token)
+        .map_err(|fault| PreparedBertConfigError::InvalidUnsignedInteger { field, fault, at })
+}
+
+fn parse_model_max_length_candidate(
+    bytes: &[u8],
+    token: &NumberToken,
+    at: usize,
+) -> Result<RawPreparedBertSequenceCapCandidate, PreparedBertConfigSequenceCandidateError> {
+    let key = PreparedBertSequenceCapKey::ModelMaxLength;
+    let value = parse_unsigned_value(bytes, token).map_err(|fault| {
+        PreparedBertConfigSequenceCandidateError::InvalidPositiveInteger { key, fault, at }
+    })?;
+    if value == 0 {
+        return Err(
+            PreparedBertConfigSequenceCandidateError::InvalidPositiveInteger {
+                key,
+                fault: PreparedBertConfigUnsignedFault::Zero,
+                at,
+            },
+        );
+    }
+    Ok(RawPreparedBertSequenceCapCandidate::new(key, value))
+}
+
+fn parse_unsigned_value(
+    bytes: &[u8],
+    token: &NumberToken,
+) -> Result<u64, PreparedBertConfigUnsignedFault> {
     if token.negative {
-        return Err(PreparedBertConfigError::InvalidUnsignedInteger {
-            field,
-            fault: PreparedBertConfigUnsignedFault::Negative,
-            at,
-        });
+        return Err(PreparedBertConfigUnsignedFault::Negative);
     }
     if token.fractional {
-        return Err(PreparedBertConfigError::InvalidUnsignedInteger {
-            field,
-            fault: PreparedBertConfigUnsignedFault::Fractional,
-            at,
-        });
+        return Err(PreparedBertConfigUnsignedFault::Fractional);
     }
     if token.exponent {
-        return Err(PreparedBertConfigError::InvalidUnsignedInteger {
-            field,
-            fault: PreparedBertConfigUnsignedFault::Exponent,
-            at,
-        });
+        return Err(PreparedBertConfigUnsignedFault::Exponent);
     }
     let mut value = 0_u64;
-    for digit in &bytes[token.range] {
+    for digit in &bytes[token.range.clone()] {
         value = value
             .checked_mul(10)
             .and_then(|value| value.checked_add(u64::from(*digit - b'0')))
-            .ok_or(PreparedBertConfigError::InvalidUnsignedInteger {
-                field,
-                fault: PreparedBertConfigUnsignedFault::Overflow,
-                at,
-            })?;
+            .ok_or(PreparedBertConfigUnsignedFault::Overflow)?;
     }
     Ok(value)
 }
@@ -985,6 +1079,9 @@ mod tests {
     use crate::model::bert::prepared_facts::{
         BertGeometryLimits, BertPoolerMembers, PreparedBertFactError, RawBertConfigFacts,
         analyze_prepared_geometry,
+    };
+    use crate::model::bert::prepared_sequence_cap::{
+        PreparedBertSequenceCapKey, RawPreparedBertSequenceCapCandidate,
     };
     use std::num::NonZeroU64;
 
@@ -1526,5 +1623,85 @@ mod tests {
             parse(&bytes).unwrap()
         };
         assert_eq!(parsed.raw(), expected_raw(1e-12));
+    }
+
+    #[test]
+    fn model_max_length_wins_and_absence_falls_back_to_position_embeddings() {
+        assert_eq!(
+            parse(CANONICAL.as_bytes())
+                .unwrap()
+                .sequence_cap_candidate(),
+            Ok(RawPreparedBertSequenceCapCandidate::new(
+                PreparedBertSequenceCapKey::MaxPositionEmbeddings,
+                19,
+            ))
+        );
+
+        let present = document_with(None, None, &[("model_max_length", "128")]);
+        assert_eq!(
+            parse(present.as_bytes()).unwrap().sequence_cap_candidate(),
+            Ok(RawPreparedBertSequenceCapCandidate::new(
+                PreparedBertSequenceCapKey::ModelMaxLength,
+                128,
+            ))
+        );
+    }
+
+    #[test]
+    fn present_model_max_length_rejects_non_positive_or_inexact_u64_without_fallback() {
+        let string = document_with(None, None, &[("model_max_length", "\"128\"")]);
+        assert!(matches!(
+            parse(string.as_bytes()).unwrap().sequence_cap_candidate(),
+            Err(PreparedBertConfigSequenceCandidateError::InvalidType {
+                key: PreparedBertSequenceCapKey::ModelMaxLength,
+                actual: PreparedBertConfigValueKind::String,
+                ..
+            })
+        ));
+
+        for (value, fault) in [
+            ("0", PreparedBertConfigUnsignedFault::Zero),
+            ("-1", PreparedBertConfigUnsignedFault::Negative),
+            ("1.0", PreparedBertConfigUnsignedFault::Fractional),
+            ("1e0", PreparedBertConfigUnsignedFault::Exponent),
+            (
+                "18446744073709551616",
+                PreparedBertConfigUnsignedFault::Overflow,
+            ),
+        ] {
+            let document = document_with(None, None, &[("model_max_length", value)]);
+            assert!(matches!(
+                parse(document.as_bytes())
+                    .unwrap()
+                    .sequence_cap_candidate(),
+                Err(PreparedBertConfigSequenceCandidateError::InvalidPositiveInteger {
+                    key: PreparedBertSequenceCapKey::ModelMaxLength,
+                    fault: actual,
+                    ..
+                }) if actual == fault
+            ));
+        }
+    }
+
+    #[test]
+    fn decoded_model_max_length_duplicates_are_rejected() {
+        let duplicate = document_with(
+            None,
+            None,
+            &[
+                ("model_max_length", "128"),
+                ("model_max_\\u006cength", "64"),
+            ],
+        );
+        let first_at = duplicate.find("\"model_max_length\"").unwrap();
+        let duplicate_at = duplicate.rfind("\"model_max_\\u006cength\"").unwrap();
+        assert_eq!(
+            parse(duplicate.as_bytes()),
+            Err(PreparedBertConfigError::DuplicateField {
+                field: PreparedBertConfigField::ModelMaxLength,
+                first_at,
+                duplicate_at,
+            })
+        );
     }
 }
