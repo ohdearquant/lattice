@@ -9,7 +9,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 const ATTESTATION_CHUNK_BYTES: u64 = 1_048_576;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LimitAxis {
+pub(super) enum LimitAxis {
     Files,
     PathBytes,
     TotalPathBytes,
@@ -45,7 +45,7 @@ enum LimitAxis {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ChargeExpression {
+pub(super) enum ChargeExpression {
     AttestationReportBytes,
     HeaderFrame,
     RequiredTensorCount,
@@ -59,14 +59,14 @@ enum ChargeExpression {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BertGeometryFault {
+pub(super) enum BertGeometryFault {
     Zero(LimitAxis),
     AttentionHeadRemainder,
     InvalidLayerNormEpsilon,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreparationLimitError {
+pub(super) enum PreparationLimitError {
     Exceeded {
         axis: LimitAxis,
         actual: u64,
@@ -88,7 +88,7 @@ enum PreparationLimitError {
     },
 }
 
-type LimitResult<T> = Result<T, PreparationLimitError>;
+pub(super) type LimitResult<T> = Result<T, PreparationLimitError>;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct InventoryCeilings {
@@ -657,7 +657,7 @@ fn fused_qkv_elements(h: u64, l: u64) -> LimitResult<u64> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TensorDtype {
+pub(super) enum TensorDtype {
     F32,
     F16,
     Bf16,
@@ -670,14 +670,38 @@ impl TensorDtype {
             Self::F16 | Self::Bf16 => 2,
         }
     }
+
+    pub(super) fn digest_tag(self) -> u8 {
+        match self {
+            Self::F32 => 1,
+            Self::F16 => 2,
+            Self::Bf16 => 3,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
-struct TensorFact<'a> {
+pub(super) struct TensorFact<'a> {
     name_bytes: u64,
     metadata_bytes: u64,
     dimensions: &'a [u64],
     dtype: TensorDtype,
+}
+
+impl<'a> TensorFact<'a> {
+    pub(super) fn new(
+        name_bytes: u64,
+        metadata_bytes: u64,
+        dimensions: &'a [u64],
+        dtype: TensorDtype,
+    ) -> Self {
+        Self {
+            name_bytes,
+            metadata_bytes,
+            dimensions,
+            dtype,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -690,11 +714,15 @@ pub(super) struct TensorCensus {
 }
 
 impl TensorCensus {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::default()
     }
 
-    fn push(&mut self, fact: TensorFact<'_>, ceilings: &PreparationCeilings) -> LimitResult<()> {
+    pub(super) fn push(
+        &mut self,
+        fact: TensorFact<'_>,
+        ceilings: &PreparationCeilings,
+    ) -> LimitResult<()> {
         ceilings.validate(LimitAxis::TensorNameBytes, fact.name_bytes)?;
         ceilings.validate(
             LimitAxis::Rank,
@@ -837,6 +865,46 @@ fn checked_sum(values: &[u64], expression: ChargeExpression) -> LimitResult<u64>
     values.iter().try_fold(0_u64, |sum, value| {
         sum.checked_add(*value).ok_or_else(|| overflow(expression))
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn test_tensor_inventory_ceilings(
+    max_tensors: usize,
+    max_name_bytes: usize,
+    max_rank: usize,
+    max_dimension: usize,
+    max_elements: u64,
+    max_metadata: u64,
+) -> PreparationCeilings {
+    let nz = |value| NonZeroUsize::new(value).expect("test ceiling must be non-zero");
+    let nz64 = |value| NonZeroU64::new(value).expect("test ceiling must be non-zero");
+    PreparationCeilings::try_new(
+        InventoryCeilings::new(
+            nz(1),
+            nz(1),
+            nz64(1),
+            nz64(9),
+            nz64(9),
+            nz64(9),
+            nz64(9),
+            nz64(1),
+            nz(1),
+        ),
+        TensorCeilings::new(
+            nz64(1),
+            nz(max_tensors),
+            nz(max_name_bytes),
+            nz(max_rank),
+            nz(max_dimension),
+            nz64(max_elements),
+            nz64(max_metadata),
+        ),
+        BertCeilings::all(nz(1)),
+        ParseCeilings::all(nz64(1)),
+        ResourceCeilings::all(nz64(1)),
+    )
+    .expect("test tensor inventory ceilings must be internally valid")
 }
 
 #[cfg(test)]
