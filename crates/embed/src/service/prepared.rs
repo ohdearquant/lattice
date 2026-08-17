@@ -127,3 +127,6 @@ pub trait CheckpointAttestor: Send + 'static {
 
 #[cfg_attr(not(test), allow(dead_code))]
 mod resource;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod limits;
