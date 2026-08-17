@@ -24,6 +24,9 @@ use tracing::warn;
 mod prepared_facts;
 
 #[cfg_attr(not(test), allow(dead_code))]
+mod prepared_config;
+
+#[cfg_attr(not(test), allow(dead_code))]
 mod prepared_tensor_inventory;
 
 /// Per-layer fused Q/K/V weight+bias, built once at model-load time from a
