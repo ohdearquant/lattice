@@ -124,3 +124,6 @@ pub trait CheckpointAttestor: Send + 'static {
     /// Finalizes this fresh pass and transfers its immutable report bytes.
     fn finish(self) -> Result<OpaqueAttestationReport>;
 }
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod resource;
