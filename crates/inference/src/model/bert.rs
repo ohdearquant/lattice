@@ -41,6 +41,9 @@ mod prepared_tokenizer_config;
 #[cfg_attr(not(test), allow(dead_code))]
 mod prepared_sequence_cap;
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_tokenizer_json_model;
+
 /// Per-layer fused Q/K/V weight+bias, built once at model-load time from a
 /// `TransformerLayerWeights` layer's separate `query`/`key`/`value` tensors.
 ///
