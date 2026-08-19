@@ -2,7 +2,10 @@
 
 **Status**: Accepted\
 **Date**: 2026-05-13\
-**Crate**: `lattice-inference`
+**Crate**: `lattice-inference`\
+**Proposed amendment**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would disable
+tokenizer caches for its bounded prepared-service subset while leaving legacy tokenizer behavior
+unchanged.
 
 ---
 

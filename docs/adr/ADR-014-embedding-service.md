@@ -3,6 +3,9 @@
 **Status**: Accepted
 **Date**: 2026-05-13
 **Crate**: lattice-embed
+**Proposed amendment**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would add a
+separate prepared-and-attested native capability while leaving the compatibility
+`EmbeddingService` trait identity-free.
 
 ## Context
 
