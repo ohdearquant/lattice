@@ -619,47 +619,81 @@ pub(crate) fn multi_head_attention_batched(
         // [num_heads, seq_len, seq_len]): reuse the single-sequence overflow
         // guard, since this is exactly that shape check applied per segment.
         assert_standard_no_overflow(seq_len, hidden_size, num_heads, head_dim);
+        // Head-batching (#702) additionally needs `(num_heads*seq_len)^2`, a
+        // strictly larger product than `assert_standard_no_overflow`'s own
+        // `num_heads * seq_len * seq_len` check (missing one `num_heads`
+        // factor), so a shape that clears the guard above could still wrap
+        // here for a pathologically large `num_heads * seq_len`.
+        let stacked_rows = num_heads
+            .checked_mul(seq_len)
+            .expect("standard: num_heads * seq_len overflow");
+        assert!(
+            stacked_rows.checked_mul(stacked_rows).is_some(),
+            "standard shape overflow: (num_heads * seq_len)^2"
+        );
 
         let row_start = start * hidden_size;
         let concat_b = &mut concat[row_start..row_start + seq_len * hidden_size];
 
-        let mut q_head = vec![0.0f32; seq_len * head_dim];
-        let mut k_head = vec![0.0f32; seq_len * head_dim];
         let mut v_all_t = vec![0.0f32; hidden_size * seq_len];
-        let mut scores_head = vec![0.0f32; seq_len * seq_len];
         let mut scores = vec![0.0f32; num_heads * seq_len * seq_len];
-        let mut context_head = vec![0.0f32; seq_len * head_dim];
 
-        // Q*K^T via SIMD matmul_bt, one head at a time (mirrors
-        // multi_head_attention_in_place's single-sequence loop exactly).
+        // Head-batched Q*K^T (#702): instead of `num_heads` separate tiny
+        // `matmul_bt` dispatches (M=seq_len, K=head_dim, N=seq_len each), stack
+        // every head's Q/K rows into one [stacked_rows, head_dim] pair and issue
+        // ONE larger `matmul_bt` call (M=N=stacked_rows, K=head_dim). This
+        // reclaims the per-call Accelerate/AMX dispatch tax (#688) that
+        // dominates at this shape, at the cost of also computing the
+        // off-diagonal cross-head blocks (Q of head h against K of head h'
+        // != h), which are simply discarded below when only the diagonal
+        // block is copied into `scores`. That extra compute is `num_heads`x
+        // the original tiny-GEMM FLOPs (negligible in absolute terms at these
+        // shapes -- see .khive/artifacts/w3-embed/attribution_*.txt -- but it
+        // does mean this trades a fixed dispatch cost for O(num_heads) more
+        // compute AND O(num_heads) more scratch memory per sequence; long
+        // `seq_len` shapes should be re-measured before assuming this wins
+        // uniformly, per the issue's own "measure first" mandate).
+        let mut q_stacked = vec![0.0f32; stacked_rows * head_dim];
+        let mut k_stacked = vec![0.0f32; stacked_rows * head_dim];
         for h in 0..num_heads {
             let head_offset = h * head_dim;
-
+            let dst_row_start = h * seq_len;
             for i in 0..seq_len {
                 let src_start = row_start + i * hidden_size + head_offset;
-                let dst_start = i * head_dim;
-                q_head[dst_start..dst_start + head_dim]
+                let dst_start = (dst_row_start + i) * head_dim;
+                q_stacked[dst_start..dst_start + head_dim]
                     .copy_from_slice(&q[src_start..src_start + head_dim]);
             }
             for i in 0..seq_len {
                 let src_start = row_start + i * hidden_size + head_offset;
-                let dst_start = i * head_dim;
-                k_head[dst_start..dst_start + head_dim]
+                let dst_start = (dst_row_start + i) * head_dim;
+                k_stacked[dst_start..dst_start + head_dim]
                     .copy_from_slice(&k[src_start..src_start + head_dim]);
             }
+        }
 
-            matmul_bt(
-                &q_head[..seq_len * head_dim],
-                &k_head[..seq_len * head_dim],
-                &mut scores_head[..seq_len * seq_len],
-                seq_len,
-                head_dim,
-                seq_len,
-            );
-
+        let mut scores_stacked = vec![0.0f32; stacked_rows * stacked_rows];
+        matmul_bt(
+            &q_stacked,
+            &k_stacked,
+            &mut scores_stacked,
+            stacked_rows,
+            head_dim,
+            stacked_rows,
+        );
+        // Extract the diagonal (h, h) block of the stacked output into this
+        // head's row-range of `scores`; every off-diagonal (h, h') block
+        // computed by the call above is unused and dropped here.
+        for h in 0..num_heads {
+            let block_row_start = h * seq_len;
+            let block_col_start = h * seq_len;
             let scores_offset = h * seq_len * seq_len;
-            for (idx, &score) in scores_head.iter().enumerate() {
-                scores[scores_offset + idx] = score * scale;
+            for i in 0..seq_len {
+                let src_start = (block_row_start + i) * stacked_rows + block_col_start;
+                let dst_start = scores_offset + i * seq_len;
+                for j in 0..seq_len {
+                    scores[dst_start + j] = scores_stacked[src_start + j] * scale;
+                }
             }
         }
 
@@ -679,28 +713,31 @@ pub(crate) fn multi_head_attention_batched(
             }
         }
 
-        // scores*V context aggregation, writing directly into this
-        // sequence's `concat_b` region (#673): removes the intermediate
-        // `context` buffer and its extra full-hidden-size copy pass.
+        // Head-batched scores*V (#702): `scores` is already laid out as
+        // [num_heads * seq_len, seq_len] (the post-softmax buffer above), and
+        // `v_all_t` is already [hidden_size, seq_len] -- exactly the two
+        // operands a single stacked `matmul_bt` needs, with no additional
+        // reshape. One call replaces the `num_heads` separate tiny dispatches;
+        // as with the Q*K^T step, off-diagonal (h, h') blocks of the result
+        // are computed and discarded (same O(num_heads) compute/memory
+        // tradeoff noted above).
+        let mut context_stacked = vec![0.0f32; stacked_rows * hidden_size];
+        matmul_bt(
+            &scores,
+            &v_all_t,
+            &mut context_stacked,
+            stacked_rows,
+            seq_len,
+            hidden_size,
+        );
         for h in 0..num_heads {
             let head_offset = h * head_dim;
-
-            let scores_offset = h * seq_len * seq_len;
-            let scores_head = &scores[scores_offset..scores_offset + seq_len * seq_len];
-            let v_head_t = &v_all_t[head_offset * seq_len..(head_offset + head_dim) * seq_len];
-            matmul_bt(
-                scores_head,
-                v_head_t,
-                &mut context_head[..seq_len * head_dim],
-                seq_len,
-                seq_len,
-                head_dim,
-            );
-
+            let block_row_start = h * seq_len;
             for i in 0..seq_len {
+                let src_start = (block_row_start + i) * hidden_size + head_offset;
                 let dst = i * hidden_size + head_offset;
                 concat_b[dst..dst + head_dim]
-                    .copy_from_slice(&context_head[i * head_dim..(i + 1) * head_dim]);
+                    .copy_from_slice(&context_stacked[src_start..src_start + head_dim]);
             }
         }
     }
@@ -959,6 +996,60 @@ pub(crate) fn multi_head_attention_batched_padded_reference(
         hidden_size,
         hidden_size,
     );
+}
+
+// -----------------------------------------------------------------------
+// Bench-only support module
+// -----------------------------------------------------------------------
+
+/// Bench-only re-export of [`multi_head_attention_batched`], which stays
+/// `pub(crate)` outside `bench-internals` builds. Same visibility discipline
+/// as `weights::bench_support` and `forward::neon_forward::bench_support`:
+/// the default public API is unchanged, and only a `--features
+/// bench-internals` build can reach the packed-batch attention path directly
+/// from a Criterion bench.
+#[cfg(feature = "bench-internals")]
+pub mod bench_support {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn multi_head_attention_batched(
+        hidden_states: &[f32],
+        layer_weights: &TransformerLayerWeights<'_>,
+        fused_qkv_weight: &[f32],
+        fused_qkv_bias: &[f32],
+        cu_seqlens: &[usize],
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+        qkv: &mut [f32],
+        concat: &mut [f32],
+        output: &mut [f32],
+        lora: &dyn LoraHook,
+        layer_idx: usize,
+    ) {
+        super::multi_head_attention_batched(
+            hidden_states,
+            layer_weights,
+            fused_qkv_weight,
+            fused_qkv_bias,
+            cu_seqlens,
+            hidden_size,
+            num_heads,
+            head_dim,
+            q,
+            k,
+            v,
+            qkv,
+            concat,
+            output,
+            lora,
+            layer_idx,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1723,5 +1814,436 @@ mod tests {
                 "seq1 row element {i} mismatch: batched={g} single={e}"
             );
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Head-batched Q*K^T / scores*V parity (#702, mutation-sensitive)
+    //
+    // `multi_head_attention_batched_per_head_reference` is the pre-#702
+    // per-sequence score/context formulation preserved verbatim (one
+    // `matmul_bt` dispatch per head, exactly as `multi_head_attention_batched`
+    // computed it before head-batching), so this test compares the
+    // head-batched production path against an independently-computed
+    // ground truth for the SAME per-sequence step #702 changed, rather than
+    // relying only on `batched_attention_matches_single_sequence_per_row_packed`
+    // (which already passes because both sides of that comparison route
+    // through whichever formulation is currently live).
+    // -------------------------------------------------------------------------
+
+    /// Pre-#702 per-head reference: identical to `multi_head_attention_batched`
+    /// except the per-sequence Q*K^T and scores*V steps use the original
+    /// `num_heads` separate `matmul_bt` dispatches instead of the stacked/
+    /// head-batched formulation. Exists solely so the parity test below can
+    /// compare the head-batched production path against ground truth without
+    /// reimplementing the old kernel inline in the test body.
+    #[allow(clippy::too_many_arguments)]
+    fn multi_head_attention_batched_per_head_reference(
+        hidden_states: &[f32],
+        layer_weights: &TransformerLayerWeights<'_>,
+        fused_qkv_weight: &[f32],
+        fused_qkv_bias: &[f32],
+        cu_seqlens: &[usize],
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+        qkv: &mut [f32],
+        concat: &mut [f32],
+        output: &mut [f32],
+        lora: &dyn LoraHook,
+        layer_idx: usize,
+    ) {
+        assert!(cu_seqlens.len() >= 2);
+        assert_eq!(cu_seqlens[0], 0);
+        let batch = cu_seqlens.len() - 1;
+        let total = cu_seqlens[batch];
+        assert_eq!(hidden_size, num_heads * head_dim);
+        let used_hidden = total * hidden_size;
+        assert_eq!(hidden_states.len(), used_hidden);
+
+        {
+            let qkv = &mut qkv[..used_hidden * 3];
+            matmul_bt(
+                hidden_states,
+                fused_qkv_weight,
+                qkv,
+                total,
+                hidden_size,
+                3 * hidden_size,
+            );
+            add_bias(qkv, fused_qkv_bias, 3 * hidden_size);
+            for r in 0..total {
+                let src = r * 3 * hidden_size;
+                q[r * hidden_size..(r + 1) * hidden_size]
+                    .copy_from_slice(&qkv[src..src + hidden_size]);
+                k[r * hidden_size..(r + 1) * hidden_size]
+                    .copy_from_slice(&qkv[src + hidden_size..src + 2 * hidden_size]);
+                v[r * hidden_size..(r + 1) * hidden_size]
+                    .copy_from_slice(&qkv[src + 2 * hidden_size..src + 3 * hidden_size]);
+            }
+        }
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "query",
+            hidden_states,
+            &mut q[..used_hidden],
+            hidden_size,
+            hidden_size,
+        );
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "key",
+            hidden_states,
+            &mut k[..used_hidden],
+            hidden_size,
+            hidden_size,
+        );
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "value",
+            hidden_states,
+            &mut v[..used_hidden],
+            hidden_size,
+            hidden_size,
+        );
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q = &q[..used_hidden];
+        let k = &k[..used_hidden];
+        let v = &v[..used_hidden];
+        let concat = &mut concat[..used_hidden];
+
+        for b in 0..batch {
+            let start = cu_seqlens[b];
+            let end = cu_seqlens[b + 1];
+            let seq_len = end - start;
+            if seq_len == 0 {
+                continue;
+            }
+            let row_start = start * hidden_size;
+            let concat_b = &mut concat[row_start..row_start + seq_len * hidden_size];
+
+            let mut q_head = vec![0.0f32; seq_len * head_dim];
+            let mut k_head = vec![0.0f32; seq_len * head_dim];
+            let mut v_all_t = vec![0.0f32; hidden_size * seq_len];
+            let mut scores_head = vec![0.0f32; seq_len * seq_len];
+            let mut scores = vec![0.0f32; num_heads * seq_len * seq_len];
+            let mut context_head = vec![0.0f32; seq_len * head_dim];
+
+            for h in 0..num_heads {
+                let head_offset = h * head_dim;
+                for i in 0..seq_len {
+                    let src_start = row_start + i * hidden_size + head_offset;
+                    let dst_start = i * head_dim;
+                    q_head[dst_start..dst_start + head_dim]
+                        .copy_from_slice(&q[src_start..src_start + head_dim]);
+                }
+                for i in 0..seq_len {
+                    let src_start = row_start + i * hidden_size + head_offset;
+                    let dst_start = i * head_dim;
+                    k_head[dst_start..dst_start + head_dim]
+                        .copy_from_slice(&k[src_start..src_start + head_dim]);
+                }
+                matmul_bt(
+                    &q_head[..seq_len * head_dim],
+                    &k_head[..seq_len * head_dim],
+                    &mut scores_head[..seq_len * seq_len],
+                    seq_len,
+                    head_dim,
+                    seq_len,
+                );
+                let scores_offset = h * seq_len * seq_len;
+                for (idx, &score) in scores_head.iter().enumerate() {
+                    scores[scores_offset + idx] = score * scale;
+                }
+            }
+
+            softmax_attention(&mut scores, seq_len, num_heads);
+
+            for i in 0..seq_len {
+                let v_row_start = row_start + i * hidden_size;
+                for d in 0..hidden_size {
+                    v_all_t[d * seq_len + i] = v[v_row_start + d];
+                }
+            }
+
+            for h in 0..num_heads {
+                let head_offset = h * head_dim;
+                let scores_offset = h * seq_len * seq_len;
+                let scores_head = &scores[scores_offset..scores_offset + seq_len * seq_len];
+                let v_head_t = &v_all_t[head_offset * seq_len..(head_offset + head_dim) * seq_len];
+                matmul_bt(
+                    scores_head,
+                    v_head_t,
+                    &mut context_head[..seq_len * head_dim],
+                    seq_len,
+                    seq_len,
+                    head_dim,
+                );
+                for i in 0..seq_len {
+                    let dst = i * hidden_size + head_offset;
+                    concat_b[dst..dst + head_dim]
+                        .copy_from_slice(&context_head[i * head_dim..(i + 1) * head_dim]);
+                }
+            }
+        }
+
+        let concat = &concat[..used_hidden];
+        let output = &mut output[..used_hidden];
+        matmul_bt(
+            concat,
+            layer_weights.attn_output_weight.data,
+            output,
+            total,
+            hidden_size,
+            hidden_size,
+        );
+        add_bias(output, layer_weights.attn_output_bias.data, hidden_size);
+        apply_lora_rows(
+            lora,
+            layer_idx,
+            "attn_output",
+            concat,
+            output,
+            hidden_size,
+            hidden_size,
+        );
+    }
+
+    /// #702 parity: the live head-batched `multi_head_attention_batched` must
+    /// match the preserved pre-#702 per-head reference within a tight,
+    /// empirically-derived tolerance (accepted f32 reassociation from
+    /// batching the per-head GEMMs into fewer, larger `matmul_bt` calls --
+    /// same convention as `encode_batch_packed_matches_padded` in
+    /// `crate::model::bert`: TOLERANCE is a hard-coded constant, not derived
+    /// from this same run, so a genuine indexing regression (which produces
+    /// an O(1)-scale divergence, not a rounding-scale one) still fails loudly).
+    ///
+    /// Two sequences of different length (4 and 6 tokens) packed with no
+    /// padding, 3 heads of head_dim 8 (hidden_size 24): large enough that the
+    /// stacked/discarded-off-diagonal formulation actually reassociates sums
+    /// differently than the per-head loop, small enough to stay a fast
+    /// default (non-`#[ignore]`) unit test.
+    ///
+    /// Mutation-sensitive: this test was run against a deliberately broken
+    /// head-batched implementation (the scores*V diagonal-block extraction
+    /// offset by one head, i.e. reading block `(h+1) % num_heads` instead of
+    /// `h`) and failed with max_abs_diff = 2.5768063 (five orders of
+    /// magnitude above TOLERANCE), then passed again (max_abs_diff = 0.0)
+    /// after reverting; see `.khive/artifacts/w3-embed/mutation_FAIL_run.txt`
+    /// and `mutation_PASS_run.txt` for both captured runs.
+    #[test]
+    fn head_batched_attention_matches_per_head_reference() {
+        let hidden_size = 24;
+        let num_heads = 3;
+        let head_dim = 8;
+
+        let scaled_identity = |scale: f32| -> Vec<f32> {
+            let mut m = vec![0.0f32; hidden_size * hidden_size];
+            for i in 0..hidden_size {
+                m[i * hidden_size + i] = scale;
+            }
+            m
+        };
+        let identity_hxh = scaled_identity(1.0);
+        let zero_bias_h: Vec<f32> = vec![0.0; hidden_size];
+        let ones_h: Vec<f32> = vec![1.0; hidden_size];
+
+        // Distinct, non-identity Q/K/V projections with distinct per-dim
+        // biases: with Q == K == V a swapped head-block index would still
+        // read numerically-consistent (if wrongly-attributed) values, since
+        // every head shares the same projection. Distinct scale/bias per
+        // tensor makes a wrong head-block index produce a detectably
+        // different (not just reassociated) value.
+        let query_w = scaled_identity(1.0);
+        let key_w = scaled_identity(0.7);
+        let value_w = scaled_identity(1.3);
+        let query_bias_v: Vec<f32> = (0..hidden_size).map(|i| 0.02 * (i as f32 + 1.0)).collect();
+        let key_bias_v: Vec<f32> = (0..hidden_size).map(|i| -0.01 * (i as f32 + 1.0)).collect();
+        let value_bias_v: Vec<f32> = (0..hidden_size).map(|i| 0.03 * (i as f32 + 1.0)).collect();
+
+        let mut fused_qkv_weight: Vec<f32> = Vec::with_capacity(3 * hidden_size * hidden_size);
+        fused_qkv_weight.extend_from_slice(&query_w);
+        fused_qkv_weight.extend_from_slice(&key_w);
+        fused_qkv_weight.extend_from_slice(&value_w);
+        let mut fused_qkv_bias: Vec<f32> = Vec::with_capacity(3 * hidden_size);
+        fused_qkv_bias.extend_from_slice(&query_bias_v);
+        fused_qkv_bias.extend_from_slice(&key_bias_v);
+        fused_qkv_bias.extend_from_slice(&value_bias_v);
+
+        let layer = TransformerLayerWeights {
+            query_weight: Tensor2D {
+                data: &query_w,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            query_bias: Tensor1D {
+                data: &query_bias_v,
+                len: hidden_size,
+            },
+            key_weight: Tensor2D {
+                data: &key_w,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            key_bias: Tensor1D {
+                data: &key_bias_v,
+                len: hidden_size,
+            },
+            value_weight: Tensor2D {
+                data: &value_w,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            value_bias: Tensor1D {
+                data: &value_bias_v,
+                len: hidden_size,
+            },
+            attn_output_weight: Tensor2D {
+                data: &identity_hxh,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            attn_output_bias: Tensor1D {
+                data: &zero_bias_h,
+                len: hidden_size,
+            },
+            attn_layer_norm_weight: Tensor1D {
+                data: &ones_h,
+                len: hidden_size,
+            },
+            attn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_h,
+                len: hidden_size,
+            },
+            ffn_intermediate_weight: Tensor2D {
+                data: &identity_hxh,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            ffn_intermediate_bias: Tensor1D {
+                data: &zero_bias_h,
+                len: hidden_size,
+            },
+            ffn_output_weight: Tensor2D {
+                data: &identity_hxh,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            ffn_output_bias: Tensor1D {
+                data: &zero_bias_h,
+                len: hidden_size,
+            },
+            ffn_layer_norm_weight: Tensor1D {
+                data: &ones_h,
+                len: hidden_size,
+            },
+            ffn_layer_norm_bias: Tensor1D {
+                data: &zero_bias_h,
+                len: hidden_size,
+            },
+        };
+
+        // Sequence 0: 4 tokens; sequence 1: 6 tokens. Non-trivial, distinct
+        // per-token values (not a repeated/uniform row) so every head's
+        // scores/context differ token-to-token.
+        let seq0: Vec<f32> = (0..4 * hidden_size)
+            .map(|i| 1.0 + i as f32 * 0.05)
+            .collect();
+        let seq1: Vec<f32> = (0..6 * hidden_size)
+            .map(|i| -2.0 + i as f32 * 0.03)
+            .collect();
+        let mut hidden_states_packed = Vec::with_capacity(10 * hidden_size);
+        hidden_states_packed.extend_from_slice(&seq0);
+        hidden_states_packed.extend_from_slice(&seq1);
+        let cu_seqlens = vec![0usize, 4, 10];
+        let total = 10;
+        let used_hidden = total * hidden_size;
+
+        let run = |lora: &dyn LoraHook, batched: bool| -> Vec<f32> {
+            let mut q = vec![0.0f32; used_hidden];
+            let mut k = vec![0.0f32; used_hidden];
+            let mut v = vec![0.0f32; used_hidden];
+            let mut qkv = vec![0.0f32; 3 * used_hidden];
+            let mut concat = vec![0.0f32; used_hidden];
+            let mut output = vec![0.0f32; used_hidden];
+            if batched {
+                multi_head_attention_batched(
+                    &hidden_states_packed,
+                    &layer,
+                    &fused_qkv_weight,
+                    &fused_qkv_bias,
+                    &cu_seqlens,
+                    hidden_size,
+                    num_heads,
+                    head_dim,
+                    &mut q,
+                    &mut k,
+                    &mut v,
+                    &mut qkv,
+                    &mut concat,
+                    &mut output,
+                    lora,
+                    0,
+                );
+            } else {
+                multi_head_attention_batched_per_head_reference(
+                    &hidden_states_packed,
+                    &layer,
+                    &fused_qkv_weight,
+                    &fused_qkv_bias,
+                    &cu_seqlens,
+                    hidden_size,
+                    num_heads,
+                    head_dim,
+                    &mut q,
+                    &mut k,
+                    &mut v,
+                    &mut qkv,
+                    &mut concat,
+                    &mut output,
+                    lora,
+                    0,
+                );
+            }
+            output
+        };
+
+        let actual = run(&NoopLoraHook, true);
+        let reference = run(&NoopLoraHook, false);
+
+        let max_abs_diff = actual
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        // Measured directly on this shape/hardware: max_abs_diff == 0.0 (this
+        // aarch64 macOS build's `matmul_bt` dispatches every one of these
+        // sizes -- both the num_heads separate per-head calls and the single
+        // stacked call -- to Apple Accelerate's `cblas_sgemm`, which returns
+        // bit-identical per-element dot products regardless of the
+        // surrounding matrix's extra discarded rows/columns at this M/N/K).
+        // TOLERANCE is NOT derived as N x 0; it is pinned to 1e-5, the same
+        // order of magnitude as the crate's other head/batch reassociation
+        // checks (`batched_attention_matches_single_sequence_per_row_packed`
+        // above, `encode_batch_packed_matches_padded` in `crate::model::bert`),
+        // so a legitimate future backend change that DOES reassociate sums at
+        // this shape (a different BLAS microkernel, a non-macOS SIMD fallback)
+        // does not spuriously fail this test -- while a genuine head-block
+        // indexing bug, which misattributes an entire head's projection (a
+        // different scale/bias, not a rounding difference), still blows
+        // through it by orders of magnitude. See the mutation evidence below
+        // and in `.khive/artifacts/w3-embed/`.
+        const TOLERANCE: f32 = 1e-5;
+        assert!(
+            max_abs_diff <= TOLERANCE,
+            "head-batched vs per-head reference max_abs_diff {max_abs_diff} exceeds {TOLERANCE}"
+        );
     }
 }
