@@ -64,6 +64,29 @@ pub const MAX_EMBEDDING_INPUT_COUNT: usize = 4096;
 // Model loading and execution
 // ---------------------------------------------------------------------------
 
+/// Raises `tokenizer`'s own truncation cap to `max_context` when it sits
+/// below it, otherwise returns `tokenizer` unchanged.
+///
+/// This is the shared enforcement point for the invariant issue #1408
+/// requires: no constructed [`EmbeddingModel`] may have a tokenizer cap
+/// below its own [`EmbeddingModel::max_context`]. If it did,
+/// `check_item_fits_window`'s pre-truncation-count admission check (see
+/// [`embed_items`]) would still admit an over-window item -- its
+/// pre-truncation count is compared against `max_context`, which the
+/// tokenizer cap sits below -- but the tokenizer would then silently
+/// truncate it before the forward pass, embedding a truncated prefix
+/// instead of rejecting the input. Only ever raises the cap, never lowers
+/// it: a caller-supplied tokenizer already capped at or above
+/// `max_context` (e.g. a fixture deliberately testing a *narrower* cap
+/// than its own window) is left untouched.
+fn capped_tokenizer(tokenizer: BpeTokenizer, max_context: usize) -> BpeTokenizer {
+    if tokenizer.max_seq_len() < max_context {
+        tokenizer.with_max_seq_len(max_context)
+    } else {
+        tokenizer
+    }
+}
+
 /// A loaded Qwen3.5 vision-language checkpoint used to serve pooled text and
 /// image embeddings. See the module doc comment for why this loader lives
 /// here instead of reusing `lattice-embed::vision::VisionEmbeddingModel`.
@@ -78,12 +101,24 @@ impl EmbeddingModel {
     /// Compose a model from already-loaded components (no I/O). Used by
     /// tests and by callers that share components with another in-process
     /// model instance.
+    ///
+    /// Raises `tokenizer`'s own truncation cap to this checkpoint's
+    /// [`Self::max_context`] window when it sits below it (see
+    /// [`capped_tokenizer`]), so this constructor gives the same guarantee
+    /// [`Self::from_directory`] does: no `EmbeddingModel`, however
+    /// constructed, can have a tokenizer cap below its own `max_context()`.
+    /// Without this, a caller passing a default `BpeTokenizer` (whose
+    /// constructors cap at 4096) alongside a checkpoint config whose
+    /// `max_position_embeddings.min(8192)` exceeds 4096 would reproduce
+    /// exactly the #1408 bug through this constructor instead of the loader.
     pub fn new(
         weights: F16ModelWeights,
         config: Qwen35Config,
         vision_weights: Qwen35VisionWeights,
         tokenizer: BpeTokenizer,
     ) -> Self {
+        let max_context = config.max_position_embeddings.min(8192);
+        let tokenizer = capped_tokenizer(tokenizer, max_context);
         Self {
             weights,
             config,
@@ -128,12 +163,17 @@ impl EmbeddingModel {
         let weights =
             load_f16_weights(&sf, &config).map_err(|e| format!("decoder weights: {e}"))?;
 
-        Ok(Self {
-            weights,
-            config,
-            vision_weights,
-            tokenizer,
-        })
+        // Routed through `Self::new` (not a bare struct literal) so the
+        // tokenizer's truncation cap is raised to this checkpoint's context
+        // window exactly as any other construction path would be -- see
+        // `Self::new`'s and `capped_tokenizer`'s docs for why: otherwise,
+        // whenever `max_position_embeddings.min(8192)` exceeds
+        // `BpeTokenizer`'s `DEFAULT_BPE_MAX_SEQ_LEN` (4096), the tokenizer
+        // can silently truncate an input to 4096 tokens while
+        // `check_item_fits_window` admits it (its pre-truncation count is
+        // still under the wider window), embedding a truncated prefix
+        // instead of rejecting it.
+        Ok(Self::new(weights, config, vision_weights, tokenizer))
     }
 
     /// Output embedding dimension (the checkpoint's decoder hidden size).
@@ -141,9 +181,35 @@ impl EmbeddingModel {
         self.config.hidden_size
     }
 
-    /// Real tokenized length of `text`, used for `usage.prompt_tokens`.
+    /// Real (possibly truncated) tokenized length of `text`, used for
+    /// `usage.prompt_tokens` -- this must report what the pooled forward
+    /// pass actually consumes, not what the caller sent. Never use this for
+    /// a context-window admission check: see [`Self::tokenize_lengths`].
     pub fn tokenize_len(&self, text: &str) -> usize {
         self.tokenizer.tokenize(text).real_length
+    }
+
+    /// Tokenizes `text` once, returning `(pre_truncation_len, real_length)`
+    /// -- the count the context-window admission guard
+    /// ([`check_item_fits_window`]) must compare against, and the count the
+    /// forward pass actually consumes for `usage.prompt_tokens`,
+    /// respectively. Exists so a caller that needs both counts (the
+    /// [`embed_items`] text branch) tokenizes once instead of twice;
+    /// [`Self::tokenize_len`] above remains the single-value accessor for a
+    /// caller (e.g. [`Self::image_scaffold_token_count`]) that only needs
+    /// the real, post-truncation count.
+    ///
+    /// `pre_truncation_len` must be used for admission, never `real_length`:
+    /// `real_length` can never exceed the tokenizer's `max_seq_len`, so
+    /// comparing it against `max_context()` can never observe an
+    /// over-window input once `max_seq_len <= max_context()` -- the
+    /// rejection becomes unreachable and an over-long input is silently
+    /// embedded from a truncated prefix instead. See
+    /// `TokenizedInput::pre_truncation_len`'s doc for the same reasoning
+    /// applied to the sibling `lattice_serve` text-embeddings route.
+    fn tokenize_lengths(&self, text: &str) -> (usize, usize) {
+        let tokenized = self.tokenizer.tokenize(text);
+        (tokenized.pre_truncation_len, tokenized.real_length)
     }
 
     /// Maximum decoder scaffold length this checkpoint can process in one
@@ -163,6 +229,19 @@ impl EmbeddingModel {
     /// that module's internals), and `prompt`'s tokenized length. Used both
     /// for `usage.prompt_tokens` accounting and (via the returned count) can
     /// be compared against [`Self::max_context`] the same way a text item is.
+    ///
+    /// Uses [`Self::tokenize_len`] (the real, possibly-truncated count), not
+    /// the pre-truncation count [`Self::tokenize_lengths`] also exposes, for
+    /// the `prompt` component -- unlike the text item guard, this is not a
+    /// live gap today: this
+    /// method's one production call site ([`embed_items`]'s image branch)
+    /// always passes `prompt = ""`, whose tokenized length is `0` either
+    /// way, so no input can currently exercise the truncation-vs-window
+    /// mismatch through this path. A future caller that passes a real
+    /// `prompt` here would need the same admission/usage split the text
+    /// branch got; left as real-length-only for now rather than adding an
+    /// unexercised second accessor for a code path with no non-empty-prompt
+    /// caller.
     ///
     /// # Errors
     ///
@@ -528,8 +607,14 @@ pub fn embed_items(
     for (index, item) in items.into_iter().enumerate() {
         let embedding = match &item {
             NormalizedEmbeddingItem::Text(text) => {
-                let token_count = embedder.tokenize_len(text);
-                check_item_fits_window(index, token_count, max_context)?;
+                // Single tokenize() call: admission uses the pre-truncation
+                // count so an input the tokenizer would truncate is rejected
+                // instead of silently embedded from a truncated prefix;
+                // `usage.prompt_tokens` still reports the real (possibly
+                // truncated) count the forward pass actually consumes --
+                // see `tokenize_lengths`'s doc comment.
+                let (admission_count, token_count) = embedder.tokenize_lengths(text);
+                check_item_fits_window(index, admission_count, max_context)?;
                 prompt_tokens += token_count;
                 embedder.embed_text(text, pooling)
             }
@@ -1082,7 +1167,284 @@ pub fn build_embeddings_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use test_support::{tiny_embedding_model, tiny_png_data_uri};
+
+    /// Tensor inventory a tiny f16-decoder + vision checkpoint must carry
+    /// for [`open_qwen35_single_decoder_safetensors`],
+    /// [`load_qwen35_vision_weights_from_safetensors`], and
+    /// [`load_f16_weights`] to all succeed. Mirrors
+    /// `lattice-embed::vision::tests::tiny_vlm_checkpoint_shapes` exactly:
+    /// both crates load through the same checkpoint-reading functions, so
+    /// the same on-disk shape works for either loader.
+    fn tiny_vlm_checkpoint_shapes() -> Vec<(String, Vec<usize>)> {
+        let hidden = 8usize;
+        let mut shapes = vec![
+            (
+                "model.language_model.embed_tokens.weight".to_string(),
+                vec![16, hidden],
+            ),
+            ("model.language_model.norm.weight".to_string(), vec![hidden]),
+            (
+                "model.language_model.layers.0.input_layernorm.weight".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.language_model.layers.0.post_attention_layernorm.weight".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.language_model.layers.0.mlp.gate_proj.weight".to_string(),
+                vec![4, hidden],
+            ),
+            (
+                "model.language_model.layers.0.mlp.up_proj.weight".to_string(),
+                vec![4, hidden],
+            ),
+            (
+                "model.language_model.layers.0.mlp.down_proj.weight".to_string(),
+                vec![hidden, 4],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.q_proj.weight".to_string(),
+                vec![16, hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.k_proj.weight".to_string(),
+                vec![hidden, hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.v_proj.weight".to_string(),
+                vec![hidden, hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.o_proj.weight".to_string(),
+                vec![hidden, hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.q_norm.weight".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.language_model.layers.0.self_attn.k_norm.weight".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.visual.patch_embed.proj.weight".to_string(),
+                vec![hidden, 3, 1, 2, 2],
+            ),
+            (
+                "model.visual.patch_embed.proj.bias".to_string(),
+                vec![hidden],
+            ),
+            (
+                "model.visual.pos_embed.weight".to_string(),
+                vec![16, hidden],
+            ),
+            (
+                "model.visual.merger.linear_fc1.weight".to_string(),
+                vec![32, 32],
+            ),
+            ("model.visual.merger.linear_fc1.bias".to_string(), vec![32]),
+            (
+                "model.visual.merger.linear_fc2.weight".to_string(),
+                vec![hidden, 32],
+            ),
+            (
+                "model.visual.merger.linear_fc2.bias".to_string(),
+                vec![hidden],
+            ),
+            ("model.visual.merger.norm.weight".to_string(), vec![hidden]),
+            ("model.visual.merger.norm.bias".to_string(), vec![hidden]),
+        ];
+        for (suffix, shape) in [
+            ("attn.qkv.weight", vec![24, hidden]),
+            ("attn.qkv.bias", vec![24]),
+            ("attn.proj.weight", vec![hidden, hidden]),
+            ("attn.proj.bias", vec![hidden]),
+            ("mlp.linear_fc1.weight", vec![32, hidden]),
+            ("mlp.linear_fc1.bias", vec![32]),
+            ("mlp.linear_fc2.weight", vec![hidden, 32]),
+            ("mlp.linear_fc2.bias", vec![hidden]),
+            ("norm1.weight", vec![hidden]),
+            ("norm1.bias", vec![hidden]),
+            ("norm2.weight", vec![hidden]),
+            ("norm2.bias", vec![hidden]),
+        ] {
+            shapes.push((format!("model.visual.blocks.0.{suffix}"), shape));
+        }
+        shapes
+    }
+
+    fn write_f32_safetensors(path: &Path, shapes: &[(String, Vec<usize>)]) {
+        let mut header_parts = Vec::with_capacity(shapes.len());
+        let mut data = Vec::new();
+        for (i, (name, shape)) in shapes.iter().enumerate() {
+            let start = data.len();
+            let numel: usize = shape.iter().product();
+            for _ in 0..numel {
+                data.extend_from_slice(&((i + 1) as f32 / 100.0).to_le_bytes());
+            }
+            let end = data.len();
+            let shape = shape
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            header_parts.push(format!(
+                r#""{name}":{{"dtype":"F32","shape":[{shape}],"data_offsets":[{start},{end}]}}"#
+            ));
+        }
+        let header = format!("{{{}}}", header_parts.join(","));
+        let mut bytes = Vec::with_capacity(8 + header.len() + data.len());
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&data);
+        std::fs::write(path, bytes).expect("write safetensors fixture");
+    }
+
+    fn write_tiny_tokenizer_json(dir: &Path) {
+        let tokenizer = r#"{
+            "model": {
+                "type": "BPE",
+                "vocab": {
+                    "a": 0, "b": 1, "c": 2, "d": 3,
+                    "e": 4, "f": 5, "g": 6, "h": 7,
+                    "i": 8, "j": 9, "k": 10, "l": 11,
+                    "m": 12, "n": 13, "o": 14, "p": 15
+                },
+                "merges": []
+            }
+        }"#;
+        std::fs::write(dir.join("tokenizer.json"), tokenizer).expect("write tokenizer.json");
+    }
+
+    /// Writes a tiny on-disk VLM checkpoint (`config.json`,
+    /// `tokenizer.json`, single-file `model.safetensors`) with a
+    /// caller-chosen `max_position_embeddings`, so a test can pin it above
+    /// `BpeTokenizer`'s 4096 constructor default and exercise
+    /// [`EmbeddingModel::from_directory`]'s tokenizer-capping behavior end
+    /// to end.
+    fn write_tiny_vlm_checkpoint(dir: &Path, max_position_embeddings: usize) {
+        let config = format!(
+            r#"{{
+            "text_config": {{
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "vocab_size": 16,
+                "intermediate_size": 4,
+                "rms_norm_eps": 0.000001,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 8,
+                "rope_theta": 10000000.0,
+                "partial_rotary_factor": 1.0,
+                "rope_parameters": {{
+                    "rope_theta": 10000000.0,
+                    "partial_rotary_factor": 1.0,
+                    "mrope_section": [2, 1, 1],
+                    "mrope_interleaved": true
+                }},
+                "linear_num_key_heads": 2,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 4,
+                "tie_word_embeddings": true,
+                "full_attention_interval": 1,
+                "layer_types": ["full_attention"],
+                "layer_mask": [true],
+                "eos_token_id": 15,
+                "max_position_embeddings": {max_position_embeddings}
+            }},
+            "vision_config": {{
+                "depth": 1,
+                "hidden_size": 8,
+                "num_heads": 2,
+                "patch_size": 2,
+                "spatial_merge_size": 2,
+                "out_hidden_size": 8,
+                "temporal_patch_size": 1,
+                "num_position_embeddings": 16,
+                "in_channels": 3,
+                "deepstack_visual_indexes": []
+            }},
+            "image_token_id": 9,
+            "vision_start_token_id": 10,
+            "vision_end_token_id": 11,
+            "tie_word_embeddings": true
+        }}"#
+        );
+        std::fs::write(dir.join("config.json"), &config).expect("write config.json");
+        write_tiny_tokenizer_json(dir);
+        write_f32_safetensors(
+            &dir.join("model.safetensors"),
+            &tiny_vlm_checkpoint_shapes(),
+        );
+    }
+
+    /// Issue #1408, loader half: a `tokenizer.json` with no explicit cap
+    /// parses through `BpeTokenizer::from_tokenizer_json` at its
+    /// constructor default (4096). A checkpoint whose
+    /// `max_position_embeddings` sits above that default (here 5000, still
+    /// under the 8192 ceiling `capped_tokenizer` applies) must come out of
+    /// `from_directory` with its tokenizer cap raised to match. This is a
+    /// different property from
+    /// `embedding_model_new_raises_a_tokenizer_cap_below_max_context` below:
+    /// that test calls `EmbeddingModel::new` directly and would still pass
+    /// if `from_directory` stopped routing through `new` (e.g. reverted to
+    /// building `Self { .. }` directly); this test exercises
+    /// `from_directory`'s own path end to end and reddens on that revert.
+    #[test]
+    fn from_directory_raises_tokenizer_cap_to_context_window_above_tokenizer_default() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_tiny_vlm_checkpoint(tmp.path(), 5000);
+
+        let model = EmbeddingModel::from_directory(tmp.path())
+            .expect("VLM checkpoint with a wide context window must load");
+        assert_eq!(
+            model.tokenizer.max_seq_len(),
+            5000,
+            "tokenizer cap must be raised to max_position_embeddings, not left at the \
+             tokenizer's own 4096 default"
+        );
+    }
+
+    /// Issue #1408, constructor half: `EmbeddingModel::new` itself -- not
+    /// just the `from_directory` loader -- must raise a caller-supplied
+    /// tokenizer's cap to at least `max_context()`. Without this, a caller
+    /// passing a default `BpeTokenizer` (cap 4096) alongside a config whose
+    /// `max_position_embeddings.min(8192)` exceeds 4096 reproduces the
+    /// #1408 bug through this constructor instead of the loader.
+    #[test]
+    fn embedding_model_new_raises_a_tokenizer_cap_below_max_context() {
+        let base = tiny_embedding_model();
+        let mut config = base.config.clone();
+        config.max_position_embeddings = 5000;
+        // `BpeTokenizer::from_vocab_and_merges` defaults to
+        // `DEFAULT_BPE_MAX_SEQ_LEN` (4096), strictly below the 5000-token
+        // window just configured -- exactly the mismatch `new` must close.
+        let mut vocab_map = std::collections::HashMap::new();
+        for (i, c) in ["a", "b", "c"].iter().enumerate() {
+            vocab_map.insert((*c).to_string(), i as u32);
+        }
+        let tokenizer =
+            BpeTokenizer::from_vocab_and_merges(vocab_map, vec![]).expect("tokenizer constructs");
+        assert!(tokenizer.max_seq_len() < 5000, "fixture precondition");
+
+        let model = EmbeddingModel::new(
+            base.weights.clone(),
+            config,
+            base.vision_weights.clone(),
+            tokenizer,
+        );
+        assert_eq!(model.max_context(), 5000);
+        assert_eq!(
+            model.tokenizer.max_seq_len(),
+            5000,
+            "new() must raise a below-window tokenizer cap to max_context()"
+        );
+    }
 
     #[test]
     fn embed_items_happy_path_text_only() {
@@ -1126,6 +1488,90 @@ mod tests {
         let (data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(usage.prompt_tokens, 10);
+    }
+
+    /// Builds a fixture with the OPPOSITE ordering of
+    /// `embed_items_rejects_text_item_over_context_window` above: that
+    /// test's `max_context() == 512` sits BELOW the tokenizer's default
+    /// (4096) truncation cap, so a long input survives tokenization intact
+    /// and trips the guard whether the guard reads the real or the
+    /// pre-truncation count -- it cannot distinguish the fix from a no-op.
+    /// This fixture pins a tokenizer cap (5) BELOW the context window
+    /// (1000), which is the ordering issue #1408 actually needs: a
+    /// comparison against `tokenize_len`'s real (post-truncation) count
+    /// would clamp to 5 tokens for any input and could never exceed the
+    /// 1000-token window, making the rejection unreachable.
+    ///
+    /// Built via a direct struct literal, not `EmbeddingModel::new`:
+    /// `new` now enforces the #1408 constructor invariant (tokenizer cap at
+    /// or above `max_context()`, see `capped_tokenizer`) and would silently
+    /// raise this fixture's deliberately-below-window cap back to 1000,
+    /// destroying the exact mismatch this fixture exists to construct.
+    /// This is a different property from the constructor invariant test
+    /// (`embedding_model_new_raises_a_tokenizer_cap_below_max_context`
+    /// below) -- that test asserts `new` closes this gap for real callers;
+    /// this fixture must keep it open to exercise the admission-count
+    /// semantics on their own. Same-crate private-field access from this
+    /// child `mod tests` is what makes the bypass possible.
+    fn context_window_above_tokenizer_cap_model() -> EmbeddingModel {
+        let base = tiny_embedding_model();
+        let mut config = base.config.clone();
+        config.max_position_embeddings = 1000;
+        let tokenizer = base.tokenizer.clone().with_max_seq_len(5);
+        EmbeddingModel {
+            weights: base.weights.clone(),
+            config,
+            vision_weights: base.vision_weights.clone(),
+            tokenizer,
+        }
+    }
+
+    #[test]
+    fn embed_items_rejects_text_item_whose_pre_truncation_length_exceeds_a_window_above_the_tokenizer_cap()
+     {
+        let model = context_window_above_tokenizer_cap_model();
+        assert_eq!(model.max_context(), 1000);
+        assert_eq!(model.tokenizer.max_seq_len(), 5);
+
+        // Pre-truncation length 1200 (above the 1000-token window), which
+        // the tokenizer would truncate to 5 real tokens before the forward
+        // pass. Under the pre-#1408 comparison (real length 5 vs. window
+        // 1000) this would be silently ACCEPTED and embedded from a
+        // 5-token truncated prefix. The admission guard must reject it.
+        let over_limit_text = "a".repeat(1200);
+        let items =
+            normalize_embedding_items(vec![EmbeddingInputItem::Text(over_limit_text)]).unwrap();
+        let err = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap_err();
+        match err {
+            ApiError::BadRequest { message, code } => {
+                assert_eq!(code, "context_length_exceeded");
+                assert!(message.contains("input item 0"), "message: {message}");
+                assert!(message.contains("1200"), "message: {message}");
+                assert!(message.contains("1000"), "message: {message}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embed_items_accepted_prompt_tokens_matches_the_count_actually_embedded_when_truncated() {
+        // Same inverted fixture, but with an input whose pre-truncation
+        // length (12) still fits the window (1000) -- ACCEPTED -- while the
+        // tokenizer truncates it to 5 tokens before the forward pass.
+        // `usage.prompt_tokens` must report 5 (what was actually embedded),
+        // not 12: the naive one-liner fix (swap `tokenize_len` to always
+        // return the pre-truncation count) would report 12 here, billing
+        // tokens that were never embedded -- see `usage.prompt_tokens`'s own
+        // doc comment on `EmbeddingsUsage`.
+        let model = context_window_above_tokenizer_cap_model();
+        let text = "a".repeat(12);
+        let items = normalize_embedding_items(vec![EmbeddingInputItem::Text(text)]).unwrap();
+        let (data, usage) = embed_items(&model, items, PoolingStrategy::MeanVisualTokens).unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(
+            usage.prompt_tokens, 5,
+            "usage must report the real embedded count, not the pre-truncation count"
+        );
     }
 
     #[test]
