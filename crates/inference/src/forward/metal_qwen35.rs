@@ -6709,6 +6709,36 @@ mod inner {
             Ok(())
         }
 
+        /// Batched (M>1) prefill has no MoE schedule: `assert_batched_prefill_dense_only`
+        /// panics on it. `forward_prefill_impl` reaches that path for any prompt longer
+        /// than one token with no active LoRA adapter, so the condition is reachable from
+        /// every fallible prefill entry point with an ordinary valid prompt. Reported here
+        /// as a typed error so a request-facing caller sees a rejection instead of the
+        /// process aborting; the assert stays as the internal invariant for direct callers
+        /// of the batched chunk schedulers.
+        fn check_prefill_moe_batched_unsupported(
+            &self,
+            entry_point: &str,
+            token_count: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            if token_count <= 1 || self.lora.is_some() {
+                return Ok(());
+            }
+            let has_moe_layer = self
+                .engine
+                .layer_weights
+                .iter()
+                .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)));
+            if has_moe_layer {
+                return Err(crate::error::InferenceError::UnsupportedModel(format!(
+                    "{entry_point}: batched prefill (M>1 GEMM path) does not support MoE \
+                     layers; prompt has {token_count} tokens. Prefill one token at a time \
+                     via forward_step for MoE models."
+                )));
+            }
+            Ok(())
+        }
+
         /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
         /// starting at `start_pos` — every position `start_pos..start_pos + token_count` must
         /// land inside the RoPE table / KV cache, and (when `gdn_pool_capacity` is `Some`)
@@ -7145,6 +7175,7 @@ mod inner {
             self.check_raw_prefill_fresh_session("try_forward_prefill")?;
             self.check_forward_token_ids("try_forward_prefill", token_ids)?;
             self.check_forward_range_capacity(0, token_ids.len(), false)?;
+            self.check_prefill_moe_batched_unsupported("try_forward_prefill", token_ids.len())?;
             self.cross_turn_prefix_cache.clear();
             Ok(self.forward_prefill_impl(token_ids, false))
         }
@@ -9131,7 +9162,10 @@ mod inner {
             )?;
 
             self.reset_state();
-            let prefill_logits = self.forward_prefill(prompt_tokens);
+            // `forward_prefill` panics on any prefill error; the batched path
+            // rejects MoE layers for M>1, so a valid multi-token prompt on an MoE
+            // model would abort the host through this request-facing entry point.
+            let prefill_logits = self.try_forward_prefill(prompt_tokens)?;
             crate::speculative::generate_with_speculation_from_prefill(
                 prompt_tokens,
                 max_new_tokens,
@@ -24524,6 +24558,35 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 layers: vec![(full, common)],
             };
             (cfg, weights)
+        }
+
+        /// Regression test: `generate_with_speculation` must REPORT an unsupported
+        /// (MoE) multi-token prefill as an error, not abort the process. It is a
+        /// request-facing entry point, so reaching the batched path's MoE rejection
+        /// through the panicking `forward_prefill` wrapper turns an ordinary valid
+        /// prompt into a host crash. Two tokens is the smallest prompt that takes
+        /// the batched (M>1) path.
+        #[test]
+        fn generate_with_speculation_reports_moe_prefill_rejection_without_panicking() {
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("moe prefill fixture must construct");
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.generate_with_speculation(&[1u32, 3, 5], 4, 0, 2, 2)
+            }));
+
+            let returned = outcome.expect(
+                "unsupported-MoE prefill must be returned as Err, never unwound as a panic",
+            );
+            assert!(
+                returned.is_err(),
+                "unsupported-MoE prefill must not silently produce tokens"
+            );
         }
 
         /// Regression test: batched prefill on an unsupported (MoE) config must
