@@ -1180,6 +1180,7 @@ pub async fn chat_completions(
 /// generation/streaming behavior, not the raw-bytes preflight, which is
 /// covered separately in `serve::contract`'s own tests and this
 /// binary's router-level tests.
+#[allow(clippy::field_reassign_with_default)]
 async fn chat_completions_with_request(
     State(state): State<AppState>,
     req: ChatCompletionRequest,
@@ -1205,16 +1206,14 @@ async fn chat_completions_with_request(
         || state.model.max_context(),
     )?;
 
-    let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-        max_new_tokens: max_tokens,
-        temperature,
-        top_p,
-        seed,
-        stop_strings,
-        reasoning_budget,
-        logprobs,
-        ..Default::default()
-    };
+    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_tokens;
+    gen_cfg.temperature = temperature;
+    gen_cfg.top_p = top_p;
+    gen_cfg.seed = seed;
+    gen_cfg.stop_strings = stop_strings;
+    gen_cfg.reasoning_budget = reasoning_budget;
+    gen_cfg.logprobs = logprobs;
 
     // Metal-only: reuse the exact messages normalized alongside the CPU
     // prompt, so role/content validation and allocation happen once.
@@ -4564,16 +4563,16 @@ mod tests {
         /// field mirrors the request, every other field is
         /// `GenerateConfig::default()` -- exactly like production's own
         /// `..Default::default()` tail.
+        #[allow(clippy::field_reassign_with_default)]
         fn expected_gen_cfg() -> GenerateConfigSnapshot {
-            GenerateConfigSnapshot::from(&lattice_inference::model::qwen35_config::GenerateConfig {
-                max_new_tokens: 9,
-                temperature: 1.3,
-                top_p: 0.55,
-                seed: Some(7),
-                stop_strings: vec![],
-                logprobs: None,
-                ..Default::default()
-            })
+            let mut cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+            cfg.max_new_tokens = 9;
+            cfg.temperature = 1.3;
+            cfg.top_p = 0.55;
+            cfg.seed = Some(7);
+            cfg.stop_strings = vec![];
+            cfg.logprobs = None;
+            GenerateConfigSnapshot::from(&cfg)
         }
 
         #[tokio::test]

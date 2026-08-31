@@ -2365,6 +2365,7 @@ pub(crate) fn checked_double(value: usize, what: &str) -> Result<usize, Inferenc
 
 /// **Unstable**: sampling configuration for text generation; fields may expand.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct GenerateConfig {
     pub max_new_tokens: usize,
     pub temperature: f32,

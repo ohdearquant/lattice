@@ -36,6 +36,7 @@
 //! The `lattice-tune` crate is not a dependency of `lattice-inference`; we replicate the
 //! minimal key-parsing logic here. Alpha defaults to `rank` (scale = 1.0), matching the
 //! tune crate's own default when no `__metadata__` alpha field is present.
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -859,21 +860,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── GenerateConfig ───────────────────────────────────────────────────────
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: max_tokens,
-        temperature,
-        top_k,
-        top_p,
-        repetition_penalty,
-        seed,
-        stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
-        enable_thinking: true,
-        enable_mtp: None,
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget,
-        logprobs: None,
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_tokens;
+    gen_cfg.temperature = temperature;
+    gen_cfg.top_k = top_k;
+    gen_cfg.top_p = top_p;
+    gen_cfg.repetition_penalty = repetition_penalty;
+    gen_cfg.seed = seed;
+    gen_cfg.stop_token_ids = vec![QWEN_CHAT_IM_END_TOKEN_ID];
+    gen_cfg.enable_thinking = true;
+    gen_cfg.enable_mtp = None;
+    gen_cfg.grammar = None;
+    gen_cfg.stop_strings = vec![];
+    gen_cfg.reasoning_budget = reasoning_budget;
+    gen_cfg.logprobs = None;
 
     // ── JSON modes (used by Lattice Studio app) ─────────────────────────────
 
@@ -948,21 +948,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let prompt = parsed.prompt;
 
-                let req_cfg = GenerateConfig {
-                    max_new_tokens: parsed.max_tokens,
-                    temperature: parsed.temperature,
-                    top_k: parsed.top_k,
-                    top_p: parsed.top_p,
-                    repetition_penalty: parsed.repetition_penalty,
-                    seed: parsed.seed,
-                    stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
-                    enable_thinking: true,
-                    enable_mtp: None,
-                    grammar: None,
-                    stop_strings: vec![],
-                    reasoning_budget: parsed.reasoning_budget,
-                    logprobs: None,
-                };
+                let mut req_cfg = GenerateConfig::default();
+                req_cfg.max_new_tokens = parsed.max_tokens;
+                req_cfg.temperature = parsed.temperature;
+                req_cfg.top_k = parsed.top_k;
+                req_cfg.top_p = parsed.top_p;
+                req_cfg.repetition_penalty = parsed.repetition_penalty;
+                req_cfg.seed = parsed.seed;
+                req_cfg.stop_token_ids = vec![QWEN_CHAT_IM_END_TOKEN_ID];
+                req_cfg.enable_thinking = true;
+                req_cfg.enable_mtp = None;
+                req_cfg.grammar = None;
+                req_cfg.stop_strings = vec![];
+                req_cfg.reasoning_budget = parsed.reasoning_budget;
+                req_cfg.logprobs = None;
 
                 // Each request's full ChatML history is re-sent in `prompt` (the
                 // client is stateless), but the engine itself now reuses the KV

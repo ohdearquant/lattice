@@ -41,9 +41,10 @@ longer exists fails that check closed (#654).
 | `doctor`   | `--model` (required), `--context` (optional target length), `--tokenizer-dir`                                                                                   | `lattice.rs:64-80` |
 
 No `--lora`, `--reasoning-budget`, `--top-k`, or `--repetition-penalty` flags exist on any
-subcommand -- `chat` only ever runs with `GenerateConfig { max_new_tokens, temperature,
-..Default::default() }` (`lattice.rs:2301-2305`), so top_k/repetition_penalty/seed/grammar/MTP/
-reasoning-budget are all fixed at their `Default` values (`qwen35_config.rs:710-728`: `top_k: 50,
+subcommand -- `chat` only ever builds a `GenerateConfig::default()` and then assigns
+`max_new_tokens` and `temperature`, nothing else (`bin/lattice/chat.rs:149-151`), so
+top_k/repetition_penalty/seed/grammar/MTP/
+reasoning-budget are all fixed at their `Default` values (`qwen35_config.rs:2429-2447`: `top_k: 50,
 top_p: 0.9, repetition_penalty: 1.1, enable_mtp: None, grammar: None, reasoning_budget: None`)
 for the whole interactive session -- there is no way to change them without editing source.
 

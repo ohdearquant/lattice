@@ -1027,6 +1027,7 @@ impl ParityCase {
 /// no `PartialEq`/`Eq` -- through assertion machinery. `has_grammar`
 /// records only whether a grammar engine was attached, not its identity.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct GenerateConfigSnapshot {
     pub max_new_tokens: usize,
     pub temperature: f32,
