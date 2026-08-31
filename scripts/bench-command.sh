@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Runs an arbitrary COMMAND under scripts/lib/bench_supervision.py's
+# machine-state supervision (GPU-lock/thermal/power checks), tagging the run
+# with LABEL for its logs.
+# Usage: scripts/bench-command.sh --label LABEL [--durable] -- COMMAND [ARG...]
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

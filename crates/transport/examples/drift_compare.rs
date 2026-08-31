@@ -4,12 +4,8 @@
 //!   cargo run -p lattice-transport --example drift_compare --release -- \
 //!       /tmp/emb_v030.json /tmp/emb_main.json
 //!
-//! For each model present in both files the tool reports:
-//!   - Wasserstein distance (OT scalar)
-//!   - max_displacement from the transport summary
-//!   - mean_displacement from the transport summary
-//!   - max pairwise (1 - cosine) across the 5 index-aligned vector pairs
-//!     (ground-truth per-vector drift; OT is the distribution-level measure)
+//! For each model present in both files the tool reports debiased Sinkhorn
+//! divergence and max pairwise `1 - cosine` across index-aligned vectors.
 
 use std::collections::HashMap;
 
@@ -25,18 +21,54 @@ fn load_dump(path: &str) -> HashMap<String, Vec<Vec<f32>>> {
 
 /// Cosine similarity between two equal-length f32 slices.
 ///
-/// Returns the dot product divided by the product of L2 norms.  Returns 1.0
-/// when both vectors are zero (identical degenerate case).
+/// Returns the dot product divided by the product of L2 norms. Returns 1.0
+/// only when BOTH vectors collapse (L2 norm below the noise floor or
+/// non-finite) — an identical degenerate case. Returns -1.0 (maximum "1 -
+/// cosine" drift) when exactly ONE side collapses, matching the fail-closed
+/// convention in `crates/embed/src/drift.rs`'s `cosine_f32`: a one-sided
+/// collapse (e.g. a broken forward pass zeroing out the current embedding
+/// while the baseline is non-degenerate) must read as maximal drift, not as
+/// an identity match.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "dimension mismatch in cosine");
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let denom = norm_a * norm_b;
-    if denom < 1e-12 {
-        1.0
-    } else {
-        (dot / denom).clamp(-1.0, 1.0)
+    let a_degenerate = !norm_a.is_finite() || norm_a < 1e-12;
+    let b_degenerate = !norm_b.is_finite() || norm_b < 1e-12;
+    match (a_degenerate, b_degenerate) {
+        (true, true) => 1.0,
+        (true, false) | (false, true) => -1.0,
+        (false, false) => (dot / (norm_a * norm_b)).clamp(-1.0, 1.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn both_zero_reads_as_identity() {
+        assert_eq!(cosine(&[0.0, 0.0], &[0.0, 0.0]), 1.0);
+    }
+
+    #[test]
+    fn one_sided_collapse_reads_as_maximal_drift_a_then_b() {
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), -1.0);
+    }
+
+    #[test]
+    fn one_sided_collapse_reads_as_maximal_drift_b_then_a() {
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 0.0]), -1.0);
+    }
+
+    #[test]
+    fn normal_pair_computes_true_cosine() {
+        let value = cosine(&[1.0, 0.0], &[1.0, 0.0]);
+        assert!((value - 1.0).abs() < 1e-6, "expected ~1.0, got {value}");
+
+        let value = cosine(&[1.0, 0.0], &[0.0, 1.0]);
+        assert!(value.abs() < 1e-6, "expected ~0.0, got {value}");
     }
 }
 
@@ -62,11 +94,15 @@ fn main() {
     models.sort();
 
     println!("\nDrift comparison: {baseline_path} (baseline) vs {current_path} (current)");
+    println!("Sinkhorn divergence is debiased, so identical inputs read as zero.");
     println!(
-        "{:<45} {:>12} {:>16} {:>16} {:>16}",
-        "model", "wasserstein", "max_displacement", "mean_displacement", "max_1-cos"
+        "max 1-cos uses f32 and saturates near 1.0; it cannot resolve below roughly 1e-7 and is not proof of identity."
     );
-    println!("{}", "-".repeat(111));
+    println!(
+        "{:<45} {:>20} {:>16}",
+        "model", "sinkhorn_divergence", "max_1-cos"
+    );
+    println!("{}", "-".repeat(85));
 
     for model_name in &models {
         let base_vecs = &baseline[*model_name];
@@ -87,6 +123,9 @@ fn main() {
 
         let report = detect_drift_records(&base_records, &curr_records, &config)
             .unwrap_or_else(|e| panic!("drift detection failed for {model_name}: {e}"));
+        let sinkhorn_divergence = report.sinkhorn_divergence.unwrap_or_else(|| {
+            panic!("drift detection did not compute Sinkhorn divergence for {model_name}")
+        });
 
         // Pairwise (index-aligned) cosine drift: 1.0 - cosine(base_i, curr_i).
         let max_cos_drift: f32 = base_vecs
@@ -95,14 +134,7 @@ fn main() {
             .map(|(a, b)| 1.0 - cosine(a.as_slice(), b.as_slice()))
             .fold(0.0f32, f32::max);
 
-        println!(
-            "{:<45} {:>12.6e} {:>16.6e} {:>16.6e} {:>16.6e}",
-            model_name,
-            report.wasserstein_distance,
-            report.summary.max_displacement,
-            report.summary.mean_displacement,
-            max_cos_drift,
-        );
+        println!("{model_name:<45} {sinkhorn_divergence:>20.6e} {max_cos_drift:>16.6e}");
     }
 
     println!();

@@ -6,6 +6,7 @@
 //! See docs/model.md for the model and cache design.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::SystemTime;
 
 /// **Stable**: external consumers may depend on this; breaking changes require a SemVer bump.
@@ -19,7 +20,7 @@ pub struct ModelProvenance {
     pub model: EmbeddingModel,
     /// **Stable**: source identifier (HuggingFace ID, URL, or file path).
     pub model_id: String,
-    /// **Stable**: metadata-derived BLAKE3 identifier for this load event, not a weight checksum.
+    /// **Stable**: metadata-derived SHA-256 identifier for this load event, not a weight checksum.
     pub hash: String,
     /// **Stable**: when the model was loaded.
     pub loaded_at: SystemTime,
@@ -37,7 +38,7 @@ impl ModelProvenance {
         };
 
         let hash_input = format!("{model_id}:{loaded_at_iso}:{model:?}");
-        let hash = blake3::hash(hash_input.as_bytes()).to_hex().to_string();
+        let hash = format!("{:x}", Sha256::digest(hash_input.as_bytes()));
 
         Self {
             model,
@@ -470,8 +471,27 @@ mod tests {
         assert_eq!(provenance.model, EmbeddingModel::BgeSmallEnV15);
         assert_eq!(provenance.model_id, "BAAI/bge-small-en-v1.5");
         assert!(!provenance.hash.is_empty());
-        assert_eq!(provenance.hash.len(), 64); // blake3 hex is 64 chars
+        assert_eq!(provenance.hash.len(), 64); // sha256 hex is 64 chars
         assert!(!provenance.loaded_at_iso.is_empty());
+    }
+
+    /// Pins the hash to the documented formula and a named digest, so an
+    /// algorithm swap (e.g. to another 32-byte digest) fails this test even
+    /// though it would still produce a 64-char hex string.
+    #[test]
+    fn test_model_provenance_hash_matches_documented_sha256_formula() {
+        let provenance = ModelProvenance::new(
+            EmbeddingModel::BgeSmallEnV15,
+            "BAAI/bge-small-en-v1.5".into(),
+        );
+
+        let expected_input = format!(
+            "{}:{}:{:?}",
+            provenance.model_id, provenance.loaded_at_iso, provenance.model
+        );
+        let expected_hash = format!("{:x}", sha2::Sha256::digest(expected_input.as_bytes()));
+
+        assert_eq!(provenance.hash, expected_hash);
     }
 
     #[test]
@@ -753,6 +773,104 @@ mod tests {
             EmbeddingModel::BgeSmallEnV15.bert_pooling(),
             EmbeddingModel::MultilingualE5Small.bert_pooling(),
             "BGE and E5 must use different pooling strategies"
+        );
+    }
+
+    /// Guards `lattice_inference::pool::default_bert_pooling_for_model_name`
+    /// (the served-directory-name lookup `lattice_serve` uses) against
+    /// drifting from `EmbeddingModel::bert_pooling` (this table). The
+    /// expectation comes from calling `bert_pooling()` itself, never from
+    /// retyping its rule, so a wrong mirror cannot agree with a wrong
+    /// expectation.
+    ///
+    /// This lives in `lattice-embed`, not `lattice-inference`, so both sides
+    /// of the comparison are the same compiled unit: `lattice-embed` already
+    /// depends on `lattice-inference` (this crate's own `[dependencies]`,
+    /// gated by the `native` feature), so `EmbeddingModel::bert_pooling()`'s
+    /// return type and `default_bert_pooling_for_model_name`'s return type
+    /// are literally the same `lattice_inference::BertPooling`, comparable
+    /// with `==` directly -- no `format!("{:?}")` string workaround needed.
+    ///
+    /// Enumeration: `EmbeddingModel` has no `EnumIter`/`VariantArray`/
+    /// `ALL_MODELS` constant (checked via `grep -n
+    /// "strum\|EnumIter\|VariantArray\|ALL_MODELS" crates/embed/src/model.rs`,
+    /// no hits), so `variants` below is still a hand-transcribed list of all
+    /// 10 current variants. But `#[non_exhaustive]` only forces a wildcard
+    /// arm in matches written *outside* the declaring crate -- this test
+    /// lives inside `lattice-embed` itself, where `EmbeddingModel` is
+    /// declared, so a wildcard-free match over it type-checks here. The
+    /// `assert_variants_exhaustively_covered` match below has no wildcard
+    /// arm; it is checked against the enum's full current variant set
+    /// regardless of which values are actually passed to it, so a variant
+    /// added to `EmbeddingModel` without a matching arm here is a compile
+    /// error ("non-exhaustive patterns"), not a silent gap in `variants`.
+    #[cfg(feature = "native")]
+    #[test]
+    fn default_bert_pooling_for_model_name_matches_embedding_model_bert_pooling_table() {
+        use lattice_inference::pool::default_bert_pooling_for_model_name;
+
+        fn assert_variants_exhaustively_covered(m: &EmbeddingModel) {
+            match m {
+                EmbeddingModel::BgeSmallEnV15
+                | EmbeddingModel::BgeBaseEnV15
+                | EmbeddingModel::BgeLargeEnV15
+                | EmbeddingModel::MultilingualE5Small
+                | EmbeddingModel::MultilingualE5Base
+                | EmbeddingModel::AllMiniLmL6V2
+                | EmbeddingModel::ParaphraseMultilingualMiniLmL12V2
+                | EmbeddingModel::Qwen3Embedding0_6B
+                | EmbeddingModel::Qwen3Embedding4B
+                | EmbeddingModel::TextEmbedding3Small => {}
+            }
+        }
+
+        let variants = [
+            EmbeddingModel::BgeSmallEnV15,
+            EmbeddingModel::BgeBaseEnV15,
+            EmbeddingModel::BgeLargeEnV15,
+            EmbeddingModel::MultilingualE5Small,
+            EmbeddingModel::MultilingualE5Base,
+            EmbeddingModel::AllMiniLmL6V2,
+            EmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+            EmbeddingModel::Qwen3Embedding0_6B,
+            EmbeddingModel::Qwen3Embedding4B,
+            EmbeddingModel::TextEmbedding3Small,
+        ];
+
+        let mut bert_family_checked = 0usize;
+        for variant in variants {
+            assert_variants_exhaustively_covered(&variant);
+
+            let Some(expected) = variant.bert_pooling() else {
+                continue;
+            };
+            bert_family_checked += 1;
+            // Same shape of value production reaches
+            // `default_bert_pooling_for_model_name` in production:
+            // `lattice_serve` passes it the served directory's last path
+            // component (`resolve_model_dir(...).file_name()`), not the
+            // model's full HF id. Simulate that here by taking the last
+            // path component of the model's own `model_id()`.
+            let dir_name = std::path::Path::new(variant.model_id())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("model_id() yields a valid path component");
+            let actual = default_bert_pooling_for_model_name(dir_name);
+            assert_eq!(
+                actual, expected,
+                "pooling mismatch for {variant:?} (derived dir name {dir_name:?})"
+            );
+        }
+        // BGE small/base/large + E5 small/base + MiniLM + paraphrase-MiniLM:
+        // the 7 variants whose `bert_pooling()` returns `Some(_)` as of this
+        // writing. Qwen3 x2 and TextEmbedding3Small return `None` and are
+        // skipped above. This catches a variant's `bert_pooling()` gate
+        // moving, but -- per the enumeration note above -- a wholly new
+        // variant absent from `variants` only surfaces as the compile error
+        // from `assert_variants_exhaustively_covered`, not from this count.
+        assert_eq!(
+            bert_family_checked, 7,
+            "EmbeddingModel's BERT-family (Some(_) from bert_pooling()) variant count changed"
         );
     }
 }

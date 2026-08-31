@@ -1,23 +1,13 @@
 name: embed-parity-release
-# Release-cadence embedding parity gate. NOT a per-PR / per-commit check — the
-# per-PR coverage is the BGE-small `embed-drift` job in e2e-parity.yml. This one
-# runs the heavier full HF-reference parity suite across the production embedding
-# models (the ones khive actually serves: all-minilm-l6-v2 and
-# paraphrase-multilingual-minilm-l12-v2) plus bge-small and multilingual-e5-small,
-# on the release branch / tag, where the cost of provisioning every model's
-# weights is justified.
+# Release-cadence embedding verification across the four BERT-class production
+# models. The per-PR drift job checks lattice against frozen release baselines;
+# this workflow also checks lattice against the Hugging Face reference. Both run
+# here because they detect different failure classes.
 #
-# Why release-cadence and not per-PR: provisioning four model checkpoints (~600 MB
-# total) on every PR is wasteful, and the forward path that produces these vectors
-# is stable (only #232 NEON normalize + #214 f16 conversion touched it since
-# v0.3.0). Drift is caught per-PR for BGE; this gate is the broader release
-# backstop so a production-model geometry regression cannot ship un-noticed.
-#
-# Anti-silent-skip: the parity tests skip when weights are absent. This workflow
-# sets LATTICE_PARITY_GATE_ENFORCE=1 so a missing checkpoint (provisioning
-# regression) FAILS the job instead of passing a gate that verified nothing.
-# (qwen3-embedding-0.6b is #[ignore]'d for lattice#103 and is intentionally not
-# covered here.)
+# The parity tests ordinarily skip absent weights, so the workflow sets
+# LATTICE_PARITY_GATE_ENFORCE=1. The drift command uses --enforce for the same
+# fail-closed provisioning guarantee. Qwen3-embedding-0.6b remains excluded
+# because its reference forward path is not yet within the parity tolerance.
 
 on:
   push:
@@ -96,3 +86,6 @@ jobs:
         run: |
           cargo test --release -p lattice-embed --test embed_parity_vs_hf \
             -- --nocapture
+
+      - name: Run embedding drift gate
+        run: cargo run --release -p lattice-embed --bin embed-drift -- --enforce --json

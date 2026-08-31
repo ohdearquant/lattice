@@ -200,7 +200,8 @@ impl GemmaBpeTokenizer {
         }
     }
 
-    fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
+    /// Returns the tokenized IDs and the pre-truncation token count.
+    fn tokenize_to_ids(&self, text: &str) -> (Vec<u32>, usize) {
         let mut ids = Vec::new();
         let mut segment_start = 0usize;
         let mut pos = 0usize;
@@ -223,10 +224,11 @@ impl GemmaBpeTokenizer {
         if segment_start < text.len() {
             self.encode_segment(&text[segment_start..], &mut ids);
         }
+        let pre_truncation_len = ids.len();
         if ids.len() > self.inner.max_seq_len {
             ids.truncate(self.inner.max_seq_len);
         }
-        ids
+        (ids, pre_truncation_len)
     }
 
     fn match_special(&self, text: &str, pos: usize) -> Option<(usize, u32)> {
@@ -446,8 +448,13 @@ fn flush_byte_fallback_run(pending: &mut Vec<u8>, out: &mut String) {
 
 impl Tokenizer for GemmaBpeTokenizer {
     fn tokenize(&self, text: &str) -> TokenizedInput {
-        let ids = self.tokenize_to_ids(text);
-        pad_ids(ids, self.inner.max_seq_len, self.inner.pad_id)
+        let (ids, pre_truncation_len) = self.tokenize_to_ids(text);
+        pad_ids(
+            ids,
+            self.inner.max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 
     fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput> {
@@ -457,12 +464,14 @@ impl Tokenizer for GemmaBpeTokenizer {
         let mut max_len = 0usize;
         let mut all = Vec::with_capacity(texts.len());
         for text in texts {
-            let ids = self.tokenize_to_ids(text);
+            let (ids, pre_truncation_len) = self.tokenize_to_ids(text);
             max_len = max_len.max(ids.len());
-            all.push(ids);
+            all.push((ids, pre_truncation_len));
         }
         all.into_iter()
-            .map(|ids| pad_ids(ids, max_len, self.inner.pad_id))
+            .map(|(ids, pre_truncation_len)| {
+                pad_ids(ids, max_len, self.inner.pad_id, pre_truncation_len)
+            })
             .collect()
     }
 

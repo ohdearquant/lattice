@@ -590,9 +590,10 @@ impl BpeTokenizer {
         true
     }
 
+    #[cfg(test)]
     fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
         let mut scratch = TokenizeScratch::default();
-        self.tokenize_to_ids_into(text, &mut scratch)
+        self.tokenize_to_ids_into(text, &mut scratch).0
     }
 
     #[cfg(all(feature = "metal-gpu", feature = "serve"))]
@@ -620,7 +621,11 @@ impl BpeTokenizer {
         scratch.ids
     }
 
-    fn tokenize_to_ids_into(&self, text: &str, scratch: &mut TokenizeScratch) -> Vec<u32> {
+    /// Tokenizes into `scratch.ids`, returning the resulting ids and the
+    /// pre-truncation token count (equal to `ids.len()` unless truncation to
+    /// `max_seq_len` was applied, in which case it reports the larger,
+    /// pre-truncation count -- including the EOS token when `add_eos` adds one).
+    fn tokenize_to_ids_into(&self, text: &str, scratch: &mut TokenizeScratch) -> (Vec<u32>, usize) {
         scratch.ids.clear();
         if self.inner.add_bos
             && let Some(bos_id) = self.inner.bos_id
@@ -629,6 +634,12 @@ impl BpeTokenizer {
         }
 
         self.tokenize_text_into(text, scratch);
+
+        let pre_truncation_len = if self.inner.add_eos && self.inner.eos_id.is_some() {
+            scratch.ids.len() + 1
+        } else {
+            scratch.ids.len()
+        };
 
         if self.inner.add_eos {
             if let Some(eos_id) = self.inner.eos_id {
@@ -657,7 +668,7 @@ impl BpeTokenizer {
             scratch.ids.truncate(self.inner.max_seq_len);
         }
 
-        scratch.ids.clone()
+        (scratch.ids.clone(), pre_truncation_len)
     }
 
     fn tokenize_text_into(&self, text: &str, scratch: &mut TokenizeScratch) {
@@ -869,8 +880,14 @@ impl BpeTokenizer {
 
 impl Tokenizer for BpeTokenizer {
     fn tokenize(&self, text: &str) -> TokenizedInput {
-        let ids = self.tokenize_to_ids(text);
-        pad_ids(ids, self.inner.max_seq_len, self.inner.pad_id)
+        let mut scratch = TokenizeScratch::default();
+        let (ids, pre_truncation_len) = self.tokenize_to_ids_into(text, &mut scratch);
+        pad_ids(
+            ids,
+            self.inner.max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 
     fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput> {
@@ -881,12 +898,14 @@ impl Tokenizer for BpeTokenizer {
         let mut max_len = 0usize;
         let mut all = Vec::with_capacity(texts.len());
         for text in texts {
-            let ids = self.tokenize_to_ids_into(text, &mut scratch);
+            let (ids, pre_truncation_len) = self.tokenize_to_ids_into(text, &mut scratch);
             max_len = max_len.max(ids.len());
-            all.push(ids);
+            all.push((ids, pre_truncation_len));
         }
         all.into_iter()
-            .map(|ids| pad_ids(ids, max_len, self.inner.pad_id))
+            .map(|(ids, pre_truncation_len)| {
+                pad_ids(ids, max_len, self.inner.pad_id, pre_truncation_len)
+            })
             .collect()
     }
 
@@ -1628,6 +1647,24 @@ mod tests {
         let tokenizer = synthetic_bpe().with_add_eos().with_max_seq_len(2);
         let ids = tokenizer.tokenize_to_ids("hello world");
         assert_eq!(ids, vec![11, 17]);
+    }
+
+    #[test]
+    fn test_bpe_pre_truncation_len_exceeds_real_length_when_truncated() {
+        // "hello world" -> [hello(11), Ġworld(16)] untruncated (2 tokens).
+        // With max_seq_len=1, the tokenizer truncates to 1 token but must
+        // still report the untruncated count via pre_truncation_len -- the
+        // context-window admission guard in serve/embeddings.rs compares
+        // against this field, not real_length, and this is the collision
+        // case where the tokenizer's own cap coincides with the model limit.
+        let tokenizer = synthetic_bpe().with_max_seq_len(1);
+        let input = tokenizer.tokenize("hello world");
+        assert_eq!(input.real_length, 1);
+        assert_eq!(
+            input.pre_truncation_len, 2,
+            "pre_truncation_len must report the untruncated token count"
+        );
+        assert!(input.pre_truncation_len > input.real_length);
     }
 
     #[test]

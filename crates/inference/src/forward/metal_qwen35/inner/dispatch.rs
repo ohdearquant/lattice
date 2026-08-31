@@ -357,7 +357,11 @@ impl MetalQwen35State {
         let sc = &self.session.activations.gdn_chunk;
         let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
         enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_materialize_c32);
-        enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+        enc.set_buffer(
+            0,
+            Some(self.session.gdn_gpu_state.layer(linear_idx).conv_buffer()),
+            0,
+        );
         enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), 0);
         enc.set_buffer(2, Some(weights.conv1d_weight), 0);
         enc.set_buffer(3, Some(&self.session.activations.hidden), 0);
@@ -384,7 +388,11 @@ impl MetalQwen35State {
     ) {
         let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
         enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_conv_buf_update_c32);
-        enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+        enc.set_buffer(
+            0,
+            Some(self.session.gdn_gpu_state.layer(linear_idx).conv_buffer()),
+            0,
+        );
         enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), 0);
         enc.set_bytes(2, p_bytes, &params as *const GdnChunkParams as *const _);
         // Grid: (1, num_value_heads, 1) — single threadgroup for the serial conv-buf update.
@@ -427,7 +435,11 @@ impl MetalQwen35State {
         let num_v_tiles = vd.div_ceil(8);
         let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
         enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_residual_output_c32);
-        enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
+        enc.set_buffer(
+            0,
+            Some(self.session.gdn_gpu_state.layer(linear_idx).s_matrix()),
+            0,
+        );
         enc.set_buffer(1, Some(&sc.q), 0);
         enc.set_buffer(2, Some(&sc.w), 0);
         enc.set_buffer(3, Some(&sc.u), 0);
@@ -453,7 +465,11 @@ impl MetalQwen35State {
         let vd = params.value_dim as u64;
         let p_bytes = std::mem::size_of::<GdnChunkParams>() as u64;
         enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_chunk_state_update_c32);
-        enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
+        enc.set_buffer(
+            0,
+            Some(self.session.gdn_gpu_state.layer(linear_idx).s_matrix()),
+            0,
+        );
         enc.set_buffer(1, Some(&sc.r), 0);
         enc.set_buffer(2, Some(&sc.k_right), 0);
         enc.set_buffer(3, Some(&sc.gamma_end), 0);
