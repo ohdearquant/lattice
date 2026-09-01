@@ -78,6 +78,7 @@ pub mod checkpoint;
 pub mod config;
 pub mod merger;
 pub mod multimodal;
+pub mod paddleocr_preprocess;
 pub mod pooled_embed;
 pub mod preprocess;
 pub mod qwen35_merger;
