@@ -39,6 +39,11 @@ After a successful non-zero-budget call, the live KV/GDN state represents
 forwarded. The method inherits the existing Metal prefill boundary used by
 `generate` and `generate_streaming`: multi-token MoE prompts are unsupported by
 the batched prefill path; no speculative-only sequential MoE path is introduced.
+The boundary is reported differently on this method than on the two it inherits
+from. It prefills through the fallible entry point, so an unsupported prompt
+comes back as `InferenceError::UnsupportedModel` before any GPU work. `generate`
+and `generate_streaming` prefill through the unwrapping wrapper and still abort
+on the same input.
 
 This amendment does not replace the free closure API and does not change the
 native Metal MTP or GDN self-speculative routes.
