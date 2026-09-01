@@ -570,7 +570,7 @@ pub fn qwen35_vit_forward(
 /// the entire `[n, ...]` sequence is one attention segment).
 /// `qkv`: `[n, 3 * hidden]` with per-row layout `[Q(hidden) | K(hidden) | V(hidden)]`,
 /// each of Q/K/V split into `n_heads` contiguous `head_dim`-wide chunks.
-fn multihead_attention_full(
+pub(crate) fn multihead_attention_full(
     qkv: &[f32],
     n: usize,
     hidden: usize,
