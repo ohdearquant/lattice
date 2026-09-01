@@ -9157,6 +9157,11 @@ mod inner {
         /// cannot index the configured embedding table. Admission errors occur
         /// before reset, prefill, allocation of generation history, or GPU work.
         ///
+        /// `max_ngram` is clamped to
+        /// [`crate::speculative::MAX_NGRAM_LIMIT`]; the n-gram search scans the
+        /// prompt once per attempted length, so an unbounded value would let a
+        /// caller spend arbitrary CPU before the first token.
+        ///
         /// Returns [`crate::error::InferenceError::UnsupportedModel`] for a
         /// multi-token prompt on a model with MoE layers and no active LoRA
         /// adapter: that prompt would take the Metal batched prefill path, which
@@ -9193,9 +9198,10 @@ mod inner {
             )?;
 
             self.reset_state();
-            // `forward_prefill` panics on any prefill error; the batched path
-            // rejects MoE layers for M>1, so a valid multi-token prompt on an MoE
-            // model would abort the host through this request-facing entry point.
+            // Prefill through the fallible entry point, not the unwrapping
+            // wrapper: the batched path has no MoE schedule, so an ordinary
+            // multi-token prompt on an MoE model must come back as
+            // `UnsupportedModel` rather than aborting this request-facing call.
             let prefill_logits = self.try_forward_prefill(prompt_tokens)?;
             crate::speculative::generate_with_speculation_from_prefill(
                 prompt_tokens,
@@ -24599,7 +24605,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// the batched (M>1) path.
         #[test]
         fn generate_with_speculation_reports_moe_prefill_rejection_without_panicking() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
                 return;
             };
             let _guard = gpu_test_lock();
@@ -24614,9 +24625,20 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let returned = outcome.expect(
                 "unsupported-MoE prefill must be returned as Err, never unwound as a panic",
             );
+            let error = returned.expect_err("unsupported-MoE prefill must not produce tokens");
+            let message = match &error {
+                crate::error::InferenceError::UnsupportedModel(message) => message.clone(),
+                other => panic!(
+                    "the documented contract for an unsupported-MoE prefill is \
+                     InferenceError::UnsupportedModel; got {other:?}. Any other variant \
+                     means a different rejection fired and this test would pass without \
+                     the guard under test having run at all"
+                ),
+            };
             assert!(
-                returned.is_err(),
-                "unsupported-MoE prefill must not silently produce tokens"
+                message.contains("MoE"),
+                "the rejection must name the MoE batched-prefill limitation so a caller \
+                 can act on it; got {message:?}"
             );
         }
 
@@ -24629,7 +24651,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// must stay untouched across repeated failed attempts.
         #[test]
         fn forward_prefill_batched_chunk_rejects_moe_before_any_state_mutation() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
                 return;
             };
             let _guard = gpu_test_lock();
