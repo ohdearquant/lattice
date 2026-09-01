@@ -6710,12 +6710,20 @@ mod inner {
         }
 
         /// Batched (M>1) prefill has no MoE schedule: `assert_batched_prefill_dense_only`
-        /// panics on it. `forward_prefill_impl` reaches that path for any prompt longer
-        /// than one token with no active LoRA adapter, so the condition is reachable from
-        /// every fallible prefill entry point with an ordinary valid prompt. Reported here
-        /// as a typed error so a request-facing caller sees a rejection instead of the
-        /// process aborting; the assert stays as the internal invariant for direct callers
-        /// of the batched chunk schedulers.
+        /// panics on it, and `forward_prefill_impl` reaches that path for any prompt
+        /// longer than one token with no active LoRA adapter. Reported here as a typed
+        /// error so a request-facing caller sees a rejection instead of the process
+        /// aborting; the assert stays as the internal invariant for direct callers of
+        /// the batched chunk schedulers.
+        ///
+        /// Wired into [`Self::try_forward_prefill`], which is the entry point every
+        /// request-facing generation path prefills through.
+        /// [`Self::forward_prefill_with_hidden`] and
+        /// [`Self::forward_prefill_all_logits`] enter the batched schedulers without
+        /// this check and still abort on an MoE model; their callers are the
+        /// perplexity/profiling paths rather than request handling. Extending the check
+        /// to them would change those paths from abort to `Err`, which is a separate
+        /// behaviour change from this rejection.
         fn check_prefill_moe_batched_unsupported(
             &self,
             entry_point: &str,
@@ -7166,8 +7174,10 @@ mod inner {
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
         /// dispatch for a non-fresh session, an out-of-vocabulary token, or a token
-        /// range beyond the session capacity. Rejection leaves session state
-        /// unchanged.
+        /// range beyond the session capacity, and
+        /// [`crate::error::InferenceError::UnsupportedModel`] for a multi-token
+        /// prompt on an MoE model with no active LoRA adapter. Rejection leaves
+        /// session state unchanged.
         pub fn try_forward_prefill(
             &mut self,
             token_ids: &[u32],
@@ -7250,6 +7260,13 @@ mod inner {
         /// whose token range exceeds the session capacity, or a session that is
         /// not fresh (see above). On rejection, session state (KV cache, GDN
         /// state, hidden-readback counters) is left unchanged.
+        ///
+        /// # Panics
+        ///
+        /// Aborts before dispatch on a multi-token prompt against a model with MoE
+        /// layers and no active LoRA adapter, which takes the batched schedulers.
+        /// Unlike [`Self::try_forward_prefill`], this entry point does not convert
+        /// that case into an error.
         pub fn forward_prefill_with_hidden(
             &mut self,
             token_ids: &[u32],
@@ -7320,6 +7337,14 @@ mod inner {
         /// dispatch when the session is not fresh (see above). Returns an error
         /// when more than one position is requested while a LoRA adapter is active,
         /// because the batched all-position path does not apply LoRA projections.
+        ///
+        /// # Panics
+        ///
+        /// Aborts before dispatch on a multi-token prompt against a model with MoE
+        /// layers: the all-position path is batched by construction and the batched
+        /// schedulers have no MoE schedule. Unlike
+        /// [`Self::try_forward_prefill`], this entry point does not convert that
+        /// case into an error.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -9132,12 +9157,18 @@ mod inner {
         /// cannot index the configured embedding table. Admission errors occur
         /// before reset, prefill, allocation of generation history, or GPU work.
         ///
-        /// # Panics
+        /// Returns [`crate::error::InferenceError::UnsupportedModel`] for a
+        /// multi-token prompt on a model with MoE layers and no active LoRA
+        /// adapter: that prompt would take the Metal batched prefill path, which
+        /// has no MoE schedule. The rejection happens before GPU dispatch, in
+        /// place of the process abort this entry point produced previously.
+        /// Dense models and the sequential LoRA prefill fallback are unaffected.
         ///
-        /// Like [`Self::generate`] and [`Self::generate_streaming`], multi-token
-        /// prompts on a model with MoE layers inherit the existing Metal batched
-        /// prefill limitation and panic before dispatch. Dense models and the
-        /// existing sequential LoRA prefill fallback are supported.
+        /// [`Self::generate`] and [`Self::generate_streaming`] reach the same
+        /// check but through [`Self::forward_prefill`], which unwraps its result,
+        /// so on those entry points the case still aborts — with the rejection
+        /// message rather than the batched-schedule assertion. Converting them is
+        /// a separate change to their signatures.
         pub fn generate_with_speculation(
             &mut self,
             prompt_tokens: &[u32],
