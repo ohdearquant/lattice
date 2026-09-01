@@ -2603,9 +2603,9 @@ mod tests {
         );
 
         // The assertions above constrain the pieces. These constrain their PLACEMENT,
-        // which is what the tests actually rest on, and which a layout edit walks
-        // straight through: both of the mutations below left every assertion above and
-        // all 12 `speculate_` tests passing.
+        // which is what the tests actually rest on: a layout edit that swaps or moves
+        // a piece can leave every piece-level assertion and every `speculate_` test
+        // passing while the fixture no longer exercises a distinct shorter match.
         let c_short_at = b.len();
         let hb_first_at = c_short_at + c_short.len();
         let c_long_at = hb_first_at + hb.len();
