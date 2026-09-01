@@ -14,6 +14,7 @@
 //!
 //! Output (one line per run, stderr-free for easy parsing):
 //!   RESULT n_req=<N> completion=<actual> total_ms=<f>
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -98,23 +99,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Greedy, deterministic, no thinking — closest to raw continuation that
     // MLX/Ollama generate. Decode cost per token is what we measure; the
     // slope cancels prompt-format / prefill differences vs the other engines.
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: n,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        min_p: 0.0,
-        top_n_sigma: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: None,
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = n;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.top_p = 1.0;
+    gen_cfg.repetition_penalty = 1.0;
+    gen_cfg.seed = Some(42);
+    gen_cfg.stop_token_ids = vec![];
+    gen_cfg.enable_thinking = false;
+    gen_cfg.enable_mtp = None;
+    gen_cfg.grammar = None;
+    gen_cfg.stop_strings = vec![];
+    gen_cfg.reasoning_budget = None;
+    gen_cfg.logprobs = None;
 
     // Same continuation prompt as the original bench, single user turn.
     // Optionally pad to a target context length (BENCH_PROMPT_TOKENS) by

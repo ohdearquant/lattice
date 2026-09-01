@@ -7,9 +7,18 @@
 //! the process itself (or root, for shared root-deployed model directories)
 //! for as long as the mmap is alive, because a mutation after validation but
 //! before -- or during -- GPU reads bypasses every shape/bounds check this
-//! crate performs. [`open_trusted_mmap_file`] is the single chokepoint all
-//! five load sites route through so that guarantee holds identically for
-//! each of them.
+//! crate performs. [`open_trusted_mmap_file`] and
+//! [`reject_if_open_mmap_file_untrusted`] are the two chokepoints every load
+//! site routes through: the former opens the path itself under
+//! `O_NOFOLLOW`+`O_NONBLOCK` (Q4, Q3 -- lattice-produced quantized files that
+//! are never a HuggingFace hub-cache symlink), the latter takes a `File` the
+//! caller already opened by a path that must be allowed to resolve a
+//! final-component symlink (the F32/BF16 safetensors loader and the QuaRot
+//! reader both load HuggingFace hub-cache checkpoints, which symlink
+//! `model.safetensors` itself to blob storage -- `O_NOFOLLOW` would reject
+//! every such checkpoint outright). Both apply the identical mode/uid/ACL
+//! and parent-directory checks, so the trust guarantee holds the same way
+//! regardless of which open path a loader needs.
 //!
 //! POSIX mode bits + uid alone are not sufficient on macOS: an extended ACL
 //! (`chmod +a "someuser allow write" <path>`) can grant another principal
@@ -130,7 +139,9 @@
 //! regardless of what the path later resolves to.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use memmap2::Mmap;
 
 /// Pure predicate: does this `(mode, file_uid, process_uid)` triple fall
 /// outside lattice's mode/uid trust boundary for a mmap'd model file? Split
@@ -400,6 +411,32 @@ pub(crate) fn reject_if_mmap_file_trust_boundary_weak(
     Ok(())
 }
 
+/// Run the same mode/uid/ACL and parent-directory trust checks
+/// [`open_trusted_mmap_file`] applies, against a `File` the caller already
+/// opened itself -- without that function's `O_NOFOLLOW`/`O_NONBLOCK`
+/// open-time guards.
+///
+/// Some loaders cannot use [`open_trusted_mmap_file`] because they must
+/// follow a symlink at the checkpoint's final path component: a
+/// HuggingFace-hub-cache checkpoint directory is a symlink farm
+/// (`snapshots/<rev>/model.safetensors -> ../../blobs/<sha>`), so
+/// `O_NOFOLLOW` would reject every hub-cache checkpoint outright, not just an
+/// attacker-planted one. Those loaders open the path with a plain, symlink-
+/// following `File::open` themselves (accepting the narrower TOCTOU window
+/// that implies, same as before this gate existed) and pass the resulting
+/// file here for the write-boundary checks this module exists to add:
+/// group/other-writable, foreign non-root ownership, a writable ancestor
+/// directory, or -- macOS only -- a permission-granting extended ACL. `file`
+/// must be the descriptor the caller is about to mmap (the fd-binding
+/// invariant applies here identically -- see the module doc comment), and
+/// `path` should be the resolved real path when the caller has one (so the
+/// parent-directory walk inspects the directories the mapped file actually
+/// lives under, not a symlink's location).
+pub(crate) fn reject_if_open_mmap_file_untrusted(file: &File, path: &Path) -> Result<(), String> {
+    reject_if_mmap_parent_directory_chain_weak(path)?;
+    reject_if_mmap_file_trust_boundary_weak(file, path)
+}
+
 /// `O_NONBLOCK`, `O_NOFOLLOW`, and `ELOOP` come from `libc` rather than a
 /// per-platform hand transcription. `O_NOFOLLOW` in particular is not a
 /// single Linux-wide value: glibc/musl `x86_64` uses `0x20000`, while
@@ -426,10 +463,78 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
 }
 
-/// Open `path` for a trusted, no-copy mmap and return the still-open
-/// `(File, Metadata)` pair every one of this crate's five mmap loaders needs
-/// -- callers never re-open or re-stat `path` afterward (see this module's
-/// fd-binding invariant).
+/// An already-open checkpoint `File`, together with the pre-map `Metadata`
+/// [`open_trusted_mmap_file`] captured and the resolved `Path` it came from,
+/// bundled behind private fields so the only way to obtain one is
+/// [`open_trusted_mmap_file`] itself.
+///
+/// This exists to close a defeat the previous `(File, Metadata)` tuple
+/// return shape permitted: [`map_and_verify_trusted`] took `file`, `prior`,
+/// and `path` as three independent parameters with no type-level
+/// relationship between them, so nothing stopped a caller from invoking it
+/// directly with a `file` that was never opened through
+/// [`open_trusted_mmap_file`] at all, paired with that same file's own
+/// metadata as `prior` -- [`verify_mmap_target_unchanged`] then saw no
+/// drift (the file had not changed since a stat taken from itself) and
+/// accepted an ungated, group/other-writable file. Bundling the three
+/// into one type whose fields only this module can set makes that
+/// construction unreachable: every `TrustedMmapFile` that exists has
+/// necessarily been through [`open_trusted_mmap_file`]'s mode/uid/ACL and
+/// parent-directory checks, because there is no other way to build one.
+///
+/// This module hands out no `File`, `&File`, or `&mut File` for this type --
+/// not even to a `pub(crate)` sibling. A caller that needs to read a header
+/// (Q4/Q3 preflight) between the trust-gated open and the mapping does so
+/// through [`std::io::Read`] and [`std::io::Seek`], which this type
+/// implements by delegating to the private `file` field, plus
+/// [`len`](Self::len) for the file's byte length. None of those three grant
+/// a route to `memmap2::Mmap::map`, whose `MmapAsRawDesc` bound is satisfied
+/// by `&File` (and by a raw fd) but not by `&mut impl Read + Seek` or any
+/// borrow this type exposes -- so a caller can read the guarded bytes but
+/// cannot construct a mapping of them. Mapping stays reachable solely
+/// through [`map_and_verify_trusted`], which this type provides no way
+/// around: it is the only function that can see `prior` or construct a
+/// `Mmap` from `file`.
+#[derive(Debug)]
+#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+pub(crate) struct TrustedMmapFile {
+    file: File,
+    prior: std::fs::Metadata,
+    path: PathBuf,
+}
+
+impl TrustedMmapFile {
+    /// The guarded file's current on-disk length, for a header parser that
+    /// needs to bounds-check a declared payload against the real file size
+    /// without a route to the `File` itself.
+    #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+    pub(crate) fn len(&self) -> std::io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+}
+
+/// Delegates to the private `file` field so a header parser can read the
+/// guarded bytes without ever holding a `File`, `&File`, or `&mut File` --
+/// `Read` alone cannot satisfy `memmap2`'s `MmapAsRawDesc` bound, so this
+/// impl grants no route to a mapping.
+impl std::io::Read for TrustedMmapFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.file, buf)
+    }
+}
+
+/// Delegates to the private `file` field for the same reason [`Read`](std::io::Read)
+/// does above: a header parser needs to seek, not map.
+impl std::io::Seek for TrustedMmapFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.file, pos)
+    }
+}
+
+/// Open `path` for a trusted, no-copy mmap and return the still-open,
+/// trust-gated [`TrustedMmapFile`] every one of this crate's five mmap
+/// loaders needs -- callers never re-open or re-stat `path` afterward (see
+/// this module's fd-binding invariant).
 ///
 /// # FIFO / device DoS
 ///
@@ -480,7 +585,7 @@ unsafe extern "C" {
 /// ACL FFI calls at all.
 #[cfg(unix)]
 #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<(File, std::fs::Metadata), String> {
+pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -549,17 +654,25 @@ pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<(File, std::fs::Meta
     reject_if_mmap_parent_directory_chain_weak(path)?;
     reject_if_mmap_file_trust_boundary_weak(&file, path)?;
 
-    Ok((file, meta))
+    Ok(TrustedMmapFile {
+        file,
+        prior: meta,
+        path: path.to_path_buf(),
+    })
 }
 
 #[cfg(not(unix))]
 #[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
-pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<(File, std::fs::Metadata), String> {
+pub(crate) fn open_trusted_mmap_file(path: &Path) -> Result<TrustedMmapFile, String> {
     let file = File::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
     let meta = file
         .metadata()
         .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
-    Ok((file, meta))
+    Ok(TrustedMmapFile {
+        file,
+        prior: meta,
+        path: path.to_path_buf(),
+    })
 }
 
 /// Post-map integrity recheck, replacing a previous
@@ -631,6 +744,108 @@ pub(crate) fn verify_mmap_target_unchanged(
     _path: &Path,
 ) -> Result<(), String> {
     Ok(())
+}
+
+/// Map the `File` inside a [`TrustedMmapFile`] -- already opened and
+/// trust-gated by the only function that can construct one,
+/// [`open_trusted_mmap_file`] -- then run [`verify_mmap_target_unchanged`]
+/// against the `Metadata` that call captured before mapping.
+///
+/// This -- not a bare `Mmap::map`/`MmapOptions::new().map` call written out
+/// at each loader -- is one of the two places in this crate a checkpoint
+/// mapping is constructed (see [`map_after_untrusted_open`] for the other).
+/// Taking `&TrustedMmapFile` rather than separate `file`/`prior`/`path`
+/// parameters (the previous shape) makes "guarded before mapped, rechecked
+/// after mapped" a property the type system enforces, not one this
+/// function's own body merely happens to implement correctly: there is no
+/// `TrustedMmapFile` value that has not been through
+/// [`open_trusted_mmap_file`]'s mode/uid/ACL and parent-directory checks, so
+/// there is no call to this function that can skip them -- previously
+/// nothing stopped a caller from invoking this with an ungated `file`
+/// paired with that same file's own metadata as `prior`, which
+/// [`verify_mmap_target_unchanged`] cannot distinguish from a genuinely
+/// guarded-then-unchanged file. See [`TrustedMmapFile`]'s doc comment for
+/// that defeat in full.
+///
+/// A caller that needs to read the file's contents (a Q4/Q3 header, for
+/// instance) before the mapping is created does so between its
+/// `open_trusted_mmap_file` call and this one, via [`std::io::Read`] and
+/// [`std::io::Seek`] on the `&mut TrustedMmapFile` itself; nothing about
+/// that ordering is checked here, since reading bytes off an already-open,
+/// already-guarded fd has no bearing on the mmap trust boundary this module
+/// defends, only *mapping* does -- and `Read`/`Seek` grant no route to a
+/// mapping, since `memmap2::Mmap::map` requires `&File` (or a raw
+/// descriptor), which this type never surrenders.
+#[cfg_attr(not(feature = "metal-gpu"), allow(dead_code))]
+pub(crate) fn map_and_verify_trusted(handle: &TrustedMmapFile) -> Result<Mmap, String> {
+    // SAFETY: this function is the only place in the crate that can name
+    // `handle.file` -- the field is private to this module, `TrustedMmapFile`
+    // has no public constructor besides `open_trusted_mmap_file`, and the
+    // type exposes no method, trait impl, or `Deref` that hands back a
+    // `File`, `&File`, `&mut File`, or raw descriptor (its only accessors are
+    // `len`, `Read`, and `Seek`, none of which satisfy `memmap2`'s
+    // `MmapAsRawDesc` bound). So every `Mmap::map` call reachable from a
+    // `TrustedMmapFile` runs through this function, on a `file` that
+    // `open_trusted_mmap_file` has already put through its mode/uid/ACL and
+    // parent-directory trust checks -- the invariant is now carried by the
+    // type's field privacy plus its accessor surface, not by a caller's
+    // documented obligation to call the right function first. What this does
+    // NOT enforce: same-UID mutation through a second fd the owning process
+    // itself opens, and a foreign principal that already held a writable fd
+    // before this gate's hardening took effect, remain accepted residual
+    // risk -- see the module doc comment's "Trust-boundary scope" section.
+    let mmap = unsafe { Mmap::map(&handle.file) }
+        .map_err(|e| format!("failed to mmap {}: {e}", handle.path.display()))?;
+    verify_mmap_target_unchanged(&handle.file, &handle.prior, &handle.path)?;
+    Ok(mmap)
+}
+
+/// Guard and map a `File` the caller opened itself through a plain,
+/// symlink-following `File::open` -- the flavor [`reject_if_open_mmap_file_untrusted`]'s
+/// doc comment describes for loaders that must follow a final-component
+/// symlink (a HuggingFace hub-cache checkpoint), which `open_trusted_mmap_file`'s
+/// `O_NOFOLLOW` would reject outright.
+///
+/// This is the second (and last) place in this crate a checkpoint mapping is
+/// constructed -- see [`map_and_verify_trusted`] for the `open_trusted_mmap_file`
+/// flavor. Folding the snapshot, guard, map, and recheck into one function
+/// here keeps the same structural guarantee that flavor gets from
+/// [`TrustedMmapFile`]: a caller cannot reach a mapping of `file` without
+/// this function having run the guard against it first, and the mapping is
+/// rechecked against a pre-guard metadata snapshot exactly as
+/// [`map_and_verify_trusted`] rechecks against the snapshot
+/// `open_trusted_mmap_file` captured -- the two producers were asymmetric
+/// before this fix, with only the `open_trusted_mmap_file` flavor rechecking
+/// post-map identity; this closes that gap.
+pub(crate) fn map_after_untrusted_open(file: &File, path: &Path) -> Result<Mmap, String> {
+    // Snapshot before the guard, matching `open_trusted_mmap_file`'s
+    // stat-then-check order, so the post-map recheck below has a baseline
+    // taken before any of this function's own work could observe a change.
+    let prior = file
+        .metadata()
+        .map_err(|e| format!("failed to stat {}: {e}", path.display()))?;
+    reject_if_open_mmap_file_untrusted(file, path)?;
+    map_and_recheck(file, &prior, path)
+}
+
+/// Map `file` and immediately run the post-map identity recheck against
+/// `prior`. Factored out of [`map_after_untrusted_open`] so a caller who
+/// already ran the guard on a stale snapshot can be exercised -- this
+/// module's own regression test drives this exact "map, then recheck"
+/// sequence with a truncation injected between the guard and this call,
+/// the same shape [`map_and_verify_trusted`] gets for free from taking an
+/// already-guarded [`TrustedMmapFile`].
+fn map_and_recheck(file: &File, prior: &std::fs::Metadata, path: &Path) -> Result<Mmap, String> {
+    // SAFETY: the caller ran `reject_if_open_mmap_file_untrusted` against
+    // `file` before calling this, on the same descriptor; `prior` is the
+    // metadata snapshot taken before that guard ran, so the recheck below
+    // catches a truncate-or-replace race landed in the guard-to-map window.
+    // The model file must not be mutated while this process runs, the same
+    // residual invariant every mmap site in this crate relies on.
+    let mmap = unsafe { Mmap::map(file) }
+        .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;
+    verify_mmap_target_unchanged(file, prior, path)?;
+    Ok(mmap)
 }
 
 /// macOS extended-ACL inspection, isolated in its own submodule so the FFI
@@ -1266,6 +1481,51 @@ mod tests {
         );
     }
 
+    // #1368: `reject_if_open_mmap_file_untrusted` is the chokepoint for
+    // loaders that must follow a final-component symlink (HuggingFace
+    // hub-cache checkpoints) and so cannot use `open_trusted_mmap_file`'s
+    // `O_NOFOLLOW` open. This proves it still closes the write-boundary gap
+    // that matters: a group/other-writable target file is refused even
+    // though the caller opened it through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn reject_if_open_mmap_file_untrusted_fails_closed_on_writable_file_reached_via_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let real_path = tmp.path().join("real_shard.safetensors");
+        std::fs::write(
+            &real_path,
+            b"not a real checkpoint, only permissions matter here",
+        )
+        .expect("write real fixture");
+        std::fs::set_permissions(&real_path, std::fs::Permissions::from_mode(0o666))
+            .expect("chmod 0o666");
+
+        let symlink_path = tmp.path().join("model.safetensors");
+        std::os::unix::fs::symlink(&real_path, &symlink_path).expect("create symlink fixture");
+
+        // The loaders this function serves open the path with a plain,
+        // symlink-following `File::open` -- not `open_trusted_mmap_file`,
+        // which would reject this symlink outright via `O_NOFOLLOW`.
+        let file = File::open(&symlink_path).expect("open through the symlink");
+        let result = reject_if_open_mmap_file_untrusted(&file, &symlink_path);
+        assert!(
+            result.is_err(),
+            "a group/other-writable target reached via a final-component symlink \
+             must still be refused"
+        );
+
+        std::fs::set_permissions(&real_path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0o600");
+        let private_file = File::open(&symlink_path).expect("reopen through the symlink");
+        assert!(
+            reject_if_open_mmap_file_untrusted(&private_file, &symlink_path).is_ok(),
+            "an owner-only target reached via a final-component symlink must be accepted -- \
+             this function exists precisely so the symlink itself is not the rejection cause"
+        );
+    }
+
     // Regression test for #1037: a checkpoint whose parent directory is
     // group- or other-writable, without the sticky bit, must be refused --
     // a writable ancestor directory permits a rename-replace of the
@@ -1473,12 +1733,12 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .expect("chmod 0o600");
 
-        let (file, meta) =
+        let handle =
             open_trusted_mmap_file(&path).expect("a regular owner-only file must be accepted");
-        assert!(meta.is_file());
+        assert!(handle.prior.is_file());
         assert_eq!(
-            file.metadata().expect("stat returned file").len(),
-            meta.len()
+            handle.file.metadata().expect("stat returned file").len(),
+            handle.prior.len()
         );
     }
 
@@ -1530,10 +1790,9 @@ mod tests {
         let path = tmp.path().join("truncate_race.q4");
         std::fs::write(&path, vec![0xABu8; 4096]).expect("write fixture");
 
-        let (file, prior_meta) =
-            open_trusted_mmap_file(&path).expect("open + trust-gate the fixture");
+        let handle = open_trusted_mmap_file(&path).expect("open + trust-gate the fixture");
         // SAFETY: read-only mmap of a tempfile this test alone controls.
-        let _mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.expect("mmap fixture");
+        let _mmap = unsafe { memmap2::MmapOptions::new().map(&handle.file) }.expect("mmap fixture");
 
         // Simulate a writer truncating the file in the window between the
         // pre-map stat captured above and this recheck -- the exact race
@@ -1545,7 +1804,7 @@ mod tests {
             .set_len(4096 - 8)
             .expect("truncate fixture in place");
 
-        let result = verify_mmap_target_unchanged(&file, &prior_meta, &path);
+        let result = verify_mmap_target_unchanged(&handle.file, &handle.prior, &handle.path);
         assert!(
             result.is_err(),
             "a size change between the pre-map stat and this recheck must be rejected"
@@ -1567,13 +1826,80 @@ mod tests {
         let path = tmp.path().join("unchanged.q4");
         std::fs::write(&path, vec![0xCDu8; 4096]).expect("write fixture");
 
-        let (file, prior_meta) =
-            open_trusted_mmap_file(&path).expect("open + trust-gate the fixture");
-        let _mmap = unsafe { memmap2::MmapOptions::new().map(&file) }.expect("mmap fixture");
+        let handle = open_trusted_mmap_file(&path).expect("open + trust-gate the fixture");
+        let _mmap = unsafe { memmap2::MmapOptions::new().map(&handle.file) }.expect("mmap fixture");
 
         assert!(
-            verify_mmap_target_unchanged(&file, &prior_meta, &path).is_ok(),
+            verify_mmap_target_unchanged(&handle.file, &handle.prior, &handle.path).is_ok(),
             "a file untouched between the pre-map stat and the post-map recheck must be accepted"
+        );
+    }
+
+    // Regression for the second producer's post-map recheck (previously
+    // absent): `map_after_untrusted_open` -- the symlink-following flavor
+    // used by the F32/BF16 safetensors and QuaRot loaders -- must reject a
+    // truncate that lands between `reject_if_open_mmap_file_untrusted`
+    // passing and the mapping, exactly as `map_and_verify_trusted` already
+    // does for the `open_trusted_mmap_file` flavor. Drives
+    // `map_and_recheck` directly with a stale `prior` -- the same two
+    // building blocks `map_after_untrusted_open` composes -- because a test
+    // cannot otherwise land a mutation inside a single synchronous function
+    // call; this mirrors `verify_mmap_target_unchanged_rejects_a_truncate_after_validate_race`'s
+    // decomposition for the other producer.
+    #[test]
+    fn map_after_untrusted_open_rejects_a_truncate_between_guard_and_map() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let path = tmp.path().join("untrusted_open_race.safetensors");
+        std::fs::write(&path, vec![0xEFu8; 4096]).expect("write fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0o600");
+
+        let file = std::fs::File::open(&path).expect("open fixture");
+        let prior = file.metadata().expect("stat fixture");
+        reject_if_open_mmap_file_untrusted(&file, &path)
+            .expect("guard must accept an owner-only fixture");
+
+        // Simulate a writer truncating the file in the window between the
+        // guard passing and the map -- the exact race the missing recheck
+        // (Defect 2) previously let through unnoticed.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("reopen fixture for truncation")
+            .set_len(4096 - 8)
+            .expect("truncate fixture in place");
+
+        let result = map_and_recheck(&file, &prior, &path);
+        assert!(
+            result.is_err(),
+            "a size change between the guard and the map must be rejected"
+        );
+        let msg = result.expect_err("checked is_err above");
+        assert!(
+            msg.contains("refusing to trust mapped") && msg.contains("size"),
+            "error must state the mapping is untrusted and cite the size mismatch; got: {msg}"
+        );
+    }
+
+    // Control for the above: an unmodified file must still be accepted by
+    // `map_after_untrusted_open` end-to-end, proving the added snapshot +
+    // recheck do not simply reject everything.
+    #[test]
+    fn map_after_untrusted_open_accepts_an_unmodified_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir create");
+        let path = tmp.path().join("untrusted_open_unchanged.safetensors");
+        std::fs::write(&path, vec![0x11u8; 4096]).expect("write fixture");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0o600");
+
+        let file = std::fs::File::open(&path).expect("open fixture");
+        assert!(
+            map_after_untrusted_open(&file, &path).is_ok(),
+            "an owner-only, untouched file reached via a plain File::open must be accepted"
         );
     }
 

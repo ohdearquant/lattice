@@ -24,6 +24,7 @@
 //! Output: machine-readable `RESULT key=value ...` lines to stdout, one
 //! block per measurement, consumed by hand for the profiling report (this is
 //! a diagnostic tool, not a bench-gate harness).
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -175,23 +176,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut grammar_token_ids: Vec<u32> = Vec::new();
     for i in 0..runs {
         metal.reset_state();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: max_tokens,
-            temperature: 0.0,
-            top_k: 1,
-            top_p: 1.0,
-            min_p: 0.0,
-            top_n_sigma: 0.0,
-            repetition_penalty: 1.0,
-            seed: Some(42),
-            stop_token_ids: vec![],
-            enable_thinking: false,
-            enable_mtp: None,
-            grammar: Some(Arc::clone(&engine)),
-            stop_strings: vec![],
-            reasoning_budget: None,
-            logprobs: None,
-        };
+        let mut gen_cfg = GenerateConfig::default();
+        gen_cfg.max_new_tokens = max_tokens;
+        gen_cfg.temperature = 0.0;
+        gen_cfg.top_k = 1;
+        gen_cfg.top_p = 1.0;
+        gen_cfg.repetition_penalty = 1.0;
+        gen_cfg.seed = Some(42);
+        gen_cfg.stop_token_ids = vec![];
+        gen_cfg.enable_thinking = false;
+        gen_cfg.enable_mtp = None;
+        gen_cfg.grammar = Some(Arc::clone(&engine));
+        gen_cfg.stop_strings = vec![];
+        gen_cfg.reasoning_budget = None;
+        gen_cfg.logprobs = None;
         enable_mask_profiling();
         let t0 = Instant::now();
         let output = metal.generate(prompt, &tokenizer, &gen_cfg)?;
@@ -240,23 +238,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // prompt, no grammar, greedy.
     {
         metal.reset_state();
-        let gen_cfg = GenerateConfig {
-            max_new_tokens: max_tokens,
-            temperature: 0.0,
-            top_k: 1,
-            top_p: 1.0,
-            min_p: 0.0,
-            top_n_sigma: 0.0,
-            repetition_penalty: 1.0,
-            seed: Some(42),
-            stop_token_ids: vec![],
-            enable_thinking: false,
-            enable_mtp: None,
-            grammar: None,
-            stop_strings: vec![],
-            reasoning_budget: None,
-            logprobs: None,
-        };
+        let mut gen_cfg = GenerateConfig::default();
+        gen_cfg.max_new_tokens = max_tokens;
+        gen_cfg.temperature = 0.0;
+        gen_cfg.top_k = 1;
+        gen_cfg.top_p = 1.0;
+        gen_cfg.repetition_penalty = 1.0;
+        gen_cfg.seed = Some(42);
+        gen_cfg.stop_token_ids = vec![];
+        gen_cfg.enable_thinking = false;
+        gen_cfg.enable_mtp = None;
+        gen_cfg.grammar = None;
+        gen_cfg.stop_strings = vec![];
+        gen_cfg.reasoning_budget = None;
+        gen_cfg.logprobs = None;
         let t0 = Instant::now();
         let output = metal.generate(prompt, &tokenizer, &gen_cfg)?;
         let wall_ns = t0.elapsed().as_nanos() as u64;
@@ -307,23 +302,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         for (run_idx, p) in multi_prompts.iter().enumerate() {
             metal.reset_state();
-            let gen_cfg = GenerateConfig {
-                max_new_tokens: max_tokens,
-                temperature: 0.0,
-                top_k: 1,
-                top_p: 1.0,
-                min_p: 0.0,
-                top_n_sigma: 0.0,
-                repetition_penalty: 1.0,
-                seed: Some(42),
-                stop_token_ids: vec![],
-                enable_thinking: false,
-                enable_mtp: None,
-                grammar: Some(Arc::clone(&engine)),
-                stop_strings: vec![],
-                reasoning_budget: None,
-                logprobs: None,
-            };
+            let mut gen_cfg = GenerateConfig::default();
+            gen_cfg.max_new_tokens = max_tokens;
+            gen_cfg.temperature = 0.0;
+            gen_cfg.top_k = 1;
+            gen_cfg.top_p = 1.0;
+            gen_cfg.repetition_penalty = 1.0;
+            gen_cfg.seed = Some(42);
+            gen_cfg.stop_token_ids = vec![];
+            gen_cfg.enable_thinking = false;
+            gen_cfg.enable_mtp = None;
+            gen_cfg.grammar = Some(Arc::clone(&engine));
+            gen_cfg.stop_strings = vec![];
+            gen_cfg.reasoning_budget = None;
+            gen_cfg.logprobs = None;
             let output = metal.generate(p, &tokenizer, &gen_cfg)?;
 
             // Replay this run's token sequence through the SAME engine

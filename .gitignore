@@ -78,6 +78,8 @@ Thumbs.db
 /verdict*.md
 /FIX_INPUTS/
 /REVIEW_INPUTS/
+# Local gate/report output written into the repo root by scripts and one-off runs
+/REPORT.md
 
 *__pycache__/
 uv.lock

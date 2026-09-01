@@ -4,7 +4,7 @@
 //! Pattern: [linear, linear, linear, full] x 6 = 24 layers.
 //!
 //! Key features:
-//! - Autoregressive text generation with top-n-sigma/temperature/top-k/min-p/top-p sampling
+//! - Autoregressive text generation with temperature/top-k/top-p sampling
 //! - Tied embeddings (lm_head = embed_tokens^T)
 //! - Partial RoPE (25% of head_dim) on full-attention layers
 //! - GatedDeltaNet recurrent state for linear layers, KV cache for full layers
@@ -66,6 +66,10 @@ pub(crate) use generation_setup::{
 // (forward::metal_qwen35) calls this instead of its own inline
 // `if prompt_len == 0` copy, unifying the CPU/Metal empty-prompt contract.
 pub(crate) use generation::check_prompt_not_empty;
+// Raw-token Metal generation entry points cannot rely on a tokenizer/model
+// pairing to keep prompt ids inside the embedding table.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub(crate) use generation::check_prompt_ids_in_vocab;
 // Shared total-context admission bound (#922): every Metal generation entry
 // point (forward::metal_qwen35) calls this after check_prompt_not_empty to
 // mirror the CPU `generate`/`generate_streaming` total bound
@@ -83,7 +87,10 @@ pub(crate) use generation::check_context_budget;
 // gated identically) consumer needs the re-export; `generation.rs` itself
 // uses `DecodePolicy` directly within its own module.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-pub(crate) use generation::{DecodePolicy, StepOutcome, StopCheckOutcome};
+pub(crate) use generation::{
+    DecodePolicy, REASONING_CLOSE_MARKER, StepOutcome, StopCheckOutcome,
+    resolve_reasoning_close_token,
+};
 pub(crate) use norm::qwen35_rms_norm;
 pub(crate) use sampling::sample_token;
 pub(crate) use weights::{

@@ -1,7 +1,10 @@
 # lattice-inference — Contributor Map
 
-**Stability tier: Experimental.** This crate has high churn, 153 `unsafe` blocks, and 22
-`dead_code_allows`. It is NOT intended for direct use by platform or feature crates.
+**Stability tier: Experimental.** This crate has high churn, 295 `unsafe` blocks and 59
+`dead_code_allows` as of this commit. Both counts exclude comment lines, so a doc mentioning
+the pattern does not inflate them; recompute with
+`grep -rn 'unsafe {' crates/inference/src --include='*.rs' | grep -vE ':\s*//' | wc -l`
+and the same pipeline over `allow(dead_code` rather than trusting these numbers verbatim. It is NOT intended for direct use by platform or feature crates.
 Consumers should go through `lattice-embed`. The unsafe blocks are documented in
 `foundation/STABILITY.md §Tech Debt`. Tracking issue: #1306.
 See `foundation/STABILITY.md` for the full stability policy.
@@ -18,14 +21,14 @@ inference engine itself.
 
 These modules contain submodules (directories with their own `mod.rs`).
 
-| Module      | Responsibility                                                                                                                                                                                                                                                   |
-| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `attention` | Attention kernel variants: standard MHA, GQA, flash (CPU tiled), flash-causal (decoder prefill), GDN (gated decay network), GDN-fused, native sparse, and differential. Exposes `AttentionTag` for typed dispatch.                                               |
-| `forward`   | Compute backends: scalar CPU, NEON (AArch64), Metal (macOS MSL), WGPU, Q8/f16 CPU kernels, tiled GEMM (`metal_gemm`, `gpu_gemm`), batched prefill, and BitNet kernel. Exports `matmul_bt`, `rms_norm`, `silu_inplace`, `elementwise_mul` from the CPU submodule. |
-| `model`     | Model configs and loaders: `BertModel`/`BertConfig`, `QwenModel`/`QwenConfig`, `Qwen35Model`, `CrossEncoderModel`, `BitNet` config. Each submodule owns its safetensors load path and forward-pass dispatch.                                                     |
-| `tokenizer` | Tokenizer implementations: `WordPieceTokenizer` (BERT), `BpeTokenizer` (Qwen3/GPT-2 byte-level), `SentencePieceTokenizer`. Shared `Tokenizer` trait and `load_tokenizer` auto-detect helper live in `tokenizer/common.rs`.                                       |
-| `vision`    | Qwen3-VL vision encoder (ADR-049): ViT forward pass, patch preprocessing, MLP merger, `MultimodalInput` type. CPU-only; Metal GPU path is deferred.                                                                                                              |
-| `weights`   | Weight storage formats (`Tensor2D`), safetensors memory-mapped loading, f32/f16/Q8/Q4 weight structs, sharded-checkpoint support.                                                                                                                                |
+| Module      | Responsibility                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `attention` | Attention kernel variants: standard MHA, GQA, flash (CPU tiled), flash-causal (decoder prefill), GDN (gated decay network), GDN-fused, native sparse, and differential. Exposes `AttentionTag` for typed dispatch.                                                                                                                                                                                                                                   |
+| `forward`   | Compute backends: scalar CPU, NEON (AArch64), Metal (macOS MSL), WGPU, Q8/f16 CPU kernels, tiled GEMM (`metal_gemm`, `gpu_gemm`), batched prefill, and BitNet kernel. Exports `matmul_bt`, `rms_norm`, `silu_inplace`, `elementwise_mul` from the CPU submodule.                                                                                                                                                                                     |
+| `model`     | Model configs and loaders: `BertModel`/`BertConfig`, `QwenModel`/`QwenConfig`, `Qwen35Model` (config in the standalone `qwen35_config.rs`, separate from the `qwen35/` submodule directory), the `gemma4_*` family (`gemma4_config`/`gemma4_model`/`gemma4_loading`/`gemma4_ops`/`gemma4_preflight`/`gemma4_weights`/`gemma4_cache`), `CrossEncoderModel`, `BitNet` config. Each submodule owns its safetensors load path and forward-pass dispatch. |
+| `tokenizer` | Tokenizer implementations: `WordPieceTokenizer` (BERT), `BpeTokenizer` (Qwen3/GPT-2 byte-level), `SentencePieceTokenizer`. Shared `Tokenizer` trait and `load_tokenizer` auto-detect helper live in `tokenizer/common.rs`.                                                                                                                                                                                                                           |
+| `vision`    | Qwen3-VL vision encoder (ADR-049): ViT forward pass, patch preprocessing, MLP merger, `MultimodalInput` type. CPU-only; Metal GPU path is deferred.                                                                                                                                                                                                                                                                                                  |
+| `weights`   | Weight storage formats (`Tensor2D`), safetensors memory-mapped loading, f32/f16/Q8/Q4 weight structs, sharded-checkpoint support.                                                                                                                                                                                                                                                                                                                    |
 
 ### Standalone modules
 
@@ -43,7 +46,7 @@ These modules contain submodules (directories with their own `mod.rs`).
 | `quant`       | Quantization pre-transforms: `quarot` (Walsh-Hadamard rotation primitives, ADR-044). Not yet wired into the Q4 weight path.                                                                                  |
 | `rope`        | Rotary position embeddings: `RopeTable` precomputes sin/cos tables and applies them in-place to Q and K slices before attention.                                                                             |
 | `sampling`    | Token sampling for generation: `Sampler`, `SamplingConfig` (temperature, top-k, top-p, repetition penalty).                                                                                                  |
-| `speculative` | N-gram prompt-lookup speculative decoding: `NgramSpeculator::speculate` + `verify_draft` (low-level) and `generate_with_speculation` (high-level wrapper).                                                   |
+| `speculative` | N-gram prompt lookup: low-level `NgramSpeculator::speculate` + `verify_draft`, the model-agnostic `generate_with_speculation`, and a state-owned Metal method of the same name.                              |
 
 ### Feature-gated modules
 

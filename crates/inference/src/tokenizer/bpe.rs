@@ -210,7 +210,7 @@ impl BpeTokenizer {
         vocab: HashMap<String, u32>,
         merges: Vec<(String, String)>,
         added_tokens: HashMap<String, u32>,
-        rendered_added: HashMap<String, u32>,
+        rendered_added: HashMap<u32, String>,
         cache_capacity: usize,
         max_seq_len: usize,
     ) -> Result<Self, InferenceError> {
@@ -218,10 +218,7 @@ impl BpeTokenizer {
         // Invert the renderable added-token set to id -> content for decode-side
         // lookup. Built once at construction; consulted by `token_for_id` only
         // when the base table misses (added-token ids exceed the base vocab range).
-        let added_render: HashMap<u32, String> = rendered_added
-            .into_iter()
-            .map(|(content, id)| (id, content))
-            .collect();
+        let added_render: HashMap<u32, String> = rendered_added;
         let mut merge_ranks: HashMap<String, HashMap<String, usize>> = HashMap::new();
         for (rank, (left, right)) in merges.into_iter().enumerate() {
             // First occurrence defines the rank: merges are listed in priority
@@ -467,6 +464,65 @@ impl BpeTokenizer {
         self.inner.special_tokens.get(name).copied()
     }
 
+    /// Look up a token ID by its exact rendered spelling (e.g. `"</think>"`,
+    /// `"<|im_end|>"`), not by decoded/detokenized text. `content` must match
+    /// the literal token string as it appears in the tokenizer's vocabulary or
+    /// added-tokens table -- it is never partial text, a text fragment
+    /// containing the token plus surrounding characters, or output that has
+    /// passed through [`Self::token_for_id`] / decoding.
+    ///
+    /// Lookup precedence (first match wins):
+    /// 1. `special_tokens` -- the fast-path table for tokens marked
+    ///    `special: true` in `tokenizer.json` (e.g. `<|im_end|>`).
+    /// 2. `vocab` -- the base BPE vocabulary (a `</think>`-style marker can
+    ///    live here if the tokenizer declares it as an ordinary vocab entry
+    ///    rather than a `special_tokens` entry or an added token).
+    /// 3. `added_render` -- added tokens with `special: false` (e.g.
+    ///    `<think>`/`</think>`, `<tool_call>`, FIM markers); this tier is an
+    ///    O(added_render.len()) linear scan, the only one of the three.
+    ///
+    /// This is the single resolution path for the `</think>` reasoning-close
+    /// marker: [`crate::model::qwen35::resolve_reasoning_close_token`] (the
+    /// actual generation-time validation, shared by the CPU and Metal decode
+    /// loops) and the Metal cross-turn prefix-cache fingerprint
+    /// (`cross_turn_metadata`) both call this directly rather than each
+    /// owning a separate cached/uncached copy of the lookup.
+    ///
+    /// EVERY matching id is returned, not the first, and the tiers make that
+    /// distinction load-bearing rather than pedantic: `vocab` and
+    /// `rendered_added` are independent constructor inputs with nothing
+    /// reconciling them, and added-token ids deliberately live beyond the base
+    /// vocabulary range, so one spelling can carry *different* ids in two tiers.
+    /// A caller that took only the head would silently discard the rest, and the
+    /// model could then emit a discarded alias that renders as the marker while
+    /// an id comparison against the head says it did not. Collapsing to a single
+    /// id is therefore only sound once a caller has established there is exactly
+    /// one, which is why no single-id accessor exists here: the check and the
+    /// lookup would be separable, and separable is how they drift.
+    pub(crate) fn token_ids_for_content(&self, content: &str) -> Vec<u32> {
+        let mut ids: Vec<u32> = Vec::new();
+        for id in self
+            .inner
+            .special_tokens
+            .get(content)
+            .into_iter()
+            .chain(self.inner.vocab.get(content))
+            .copied()
+            .chain(
+                self.inner
+                    .added_render
+                    .iter()
+                    .filter(|(_, token)| token.as_str() == content)
+                    .map(|(&id, _)| id),
+            )
+        {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
     /// **Unstable**: return the byte representation of every model token ID.
     ///
     /// `vocab_bytes(vocab_size)?[i]` is the byte sequence that token `i` decodes
@@ -534,9 +590,10 @@ impl BpeTokenizer {
         true
     }
 
+    #[cfg(test)]
     fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
         let mut scratch = TokenizeScratch::default();
-        self.tokenize_to_ids_into(text, &mut scratch)
+        self.tokenize_to_ids_into(text, &mut scratch).0
     }
 
     #[cfg(all(feature = "metal-gpu", feature = "serve"))]
@@ -564,7 +621,11 @@ impl BpeTokenizer {
         scratch.ids
     }
 
-    fn tokenize_to_ids_into(&self, text: &str, scratch: &mut TokenizeScratch) -> Vec<u32> {
+    /// Tokenizes into `scratch.ids`, returning the resulting ids and the
+    /// pre-truncation token count (equal to `ids.len()` unless truncation to
+    /// `max_seq_len` was applied, in which case it reports the larger,
+    /// pre-truncation count -- including the EOS token when `add_eos` adds one).
+    fn tokenize_to_ids_into(&self, text: &str, scratch: &mut TokenizeScratch) -> (Vec<u32>, usize) {
         scratch.ids.clear();
         if self.inner.add_bos
             && let Some(bos_id) = self.inner.bos_id
@@ -573,6 +634,12 @@ impl BpeTokenizer {
         }
 
         self.tokenize_text_into(text, scratch);
+
+        let pre_truncation_len = if self.inner.add_eos && self.inner.eos_id.is_some() {
+            scratch.ids.len() + 1
+        } else {
+            scratch.ids.len()
+        };
 
         if self.inner.add_eos {
             if let Some(eos_id) = self.inner.eos_id {
@@ -601,7 +668,7 @@ impl BpeTokenizer {
             scratch.ids.truncate(self.inner.max_seq_len);
         }
 
-        scratch.ids.clone()
+        (scratch.ids.clone(), pre_truncation_len)
     }
 
     fn tokenize_text_into(&self, text: &str, scratch: &mut TokenizeScratch) {
@@ -813,8 +880,14 @@ impl BpeTokenizer {
 
 impl Tokenizer for BpeTokenizer {
     fn tokenize(&self, text: &str) -> TokenizedInput {
-        let ids = self.tokenize_to_ids(text);
-        pad_ids(ids, self.inner.max_seq_len, self.inner.pad_id)
+        let mut scratch = TokenizeScratch::default();
+        let (ids, pre_truncation_len) = self.tokenize_to_ids_into(text, &mut scratch);
+        pad_ids(
+            ids,
+            self.inner.max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 
     fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput> {
@@ -825,12 +898,14 @@ impl Tokenizer for BpeTokenizer {
         let mut max_len = 0usize;
         let mut all = Vec::with_capacity(texts.len());
         for text in texts {
-            let ids = self.tokenize_to_ids_into(text, &mut scratch);
+            let (ids, pre_truncation_len) = self.tokenize_to_ids_into(text, &mut scratch);
             max_len = max_len.max(ids.len());
-            all.push(ids);
+            all.push((ids, pre_truncation_len));
         }
         all.into_iter()
-            .map(|ids| pad_ids(ids, max_len, self.inner.pad_id))
+            .map(|(ids, pre_truncation_len)| {
+                pad_ids(ids, max_len, self.inner.pad_id, pre_truncation_len)
+            })
             .collect()
     }
 
@@ -1575,6 +1650,24 @@ mod tests {
     }
 
     #[test]
+    fn test_bpe_pre_truncation_len_exceeds_real_length_when_truncated() {
+        // "hello world" -> [hello(11), Ġworld(16)] untruncated (2 tokens).
+        // With max_seq_len=1, the tokenizer truncates to 1 token but must
+        // still report the untruncated count via pre_truncation_len -- the
+        // context-window admission guard in serve/embeddings.rs compares
+        // against this field, not real_length, and this is the collision
+        // case where the tokenizer's own cap coincides with the model limit.
+        let tokenizer = synthetic_bpe().with_max_seq_len(1);
+        let input = tokenizer.tokenize("hello world");
+        assert_eq!(input.real_length, 1);
+        assert_eq!(
+            input.pre_truncation_len, 2,
+            "pre_truncation_len must report the untruncated token count"
+        );
+        assert!(input.pre_truncation_len > input.real_length);
+    }
+
+    #[test]
     fn test_bpe_tokenize_batch_pads_to_batch_max() {
         let tokenizer = synthetic_bpe();
         let batch = tokenizer.tokenize_batch(&["hello", "hello world"]);
@@ -1718,6 +1811,174 @@ mod tests {
             .expect("matching vocab length");
         assert!(logits[100].is_finite());
         assert!(logits[101].is_finite());
+    }
+
+    #[test]
+    fn decode_and_incremental_detokenize_render_non_ascii_added_tokens() {
+        use crate::tokenizer::detokenize::IncrementalDetokenizer;
+
+        let tokenizer = non_ascii_added_tokenizer();
+        assert_eq!(
+            tokenizer.token_bytes_for_id(100).as_deref(),
+            Some("好".as_bytes())
+        );
+        assert_eq!(
+            tokenizer.token_bytes_for_id(101).as_deref(),
+            Some("café".as_bytes())
+        );
+        assert_eq!(tokenizer.decode(&[100, 101]), Some("好café".to_string()));
+
+        let mut detok = IncrementalDetokenizer::new();
+        let mut text = String::new();
+        for id in [100, 101] {
+            text.push_str(&detok.push(&tokenizer, id));
+        }
+        text.push_str(&detok.finish());
+        assert_eq!(text, "好café");
+    }
+
+    #[test]
+    fn test_decode_renders_nonspecial_added_tokens() {
+        // Regression (qwen3.6-27b think-tag bug): added tokens with special=false
+        // (`</think>`, `<tool_call>`, FIM markers) live BEYOND the base vocab range,
+        // so before the fix `token_for_id` returned None and they decoded to the
+        // empty string — silently swallowed from the output stream even though the
+        // model sampled them correctly. They must now render as their literal text.
+        // special=true markers (im_end-style) must STILL be swallowed.
+        let mut vocab = HashMap::new();
+        for (s, i) in [("a", 0u32), ("b", 1), ("c", 2)] {
+            vocab.insert(s.to_string(), i);
+        }
+        // rendered_added = the special=false subset (content -> id), ids past base max.
+        let mut rendered = HashMap::new();
+        rendered.insert(100u32, "</think>".to_string());
+        rendered.insert(101u32, "<think>".to_string());
+        rendered.insert(102u32, "<tool_call>".to_string());
+
+        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
+            vocab,
+            Vec::new(),
+            HashMap::new(),
+            rendered,
+            DEFAULT_BPE_CACHE_CAPACITY,
+            DEFAULT_BPE_MAX_SEQ_LEN,
+        )
+        .expect("construct tokenizer with rendered added tokens");
+
+        assert_eq!(tokenizer.special_token_id("</think>"), None);
+        assert_eq!(tokenizer.token_ids_for_content("</think>"), vec![100]);
+
+        // special=false added tokens render verbatim (byte-level decode is identity
+        // for printable ASCII).
+        assert_eq!(tokenizer.decode(&[101]), Some("<think>".to_string()));
+        assert_eq!(tokenizer.decode(&[100]), Some("</think>".to_string()));
+        assert_eq!(tokenizer.decode(&[102]), Some("<tool_call>".to_string()));
+        // Mixed with base content tokens, in stream order.
+        assert_eq!(
+            tokenizer.decode(&[0, 1, 100, 2]),
+            Some("ab</think>c".to_string())
+        );
+        // An id present in neither base vocab nor the rendered set (e.g. a
+        // special=true marker) stays swallowed — token_for_id returns None.
+        assert_eq!(tokenizer.decode(&[200]), Some(String::new()));
+
+        // The incremental streaming detokenizer must agree byte-for-byte.
+        use crate::tokenizer::detokenize::IncrementalDetokenizer;
+        let mut detok = IncrementalDetokenizer::new();
+        let mut out = String::new();
+        for id in [0u32, 100, 1] {
+            out.push_str(&detok.push(&tokenizer, id));
+        }
+        out.push_str(&detok.finish());
+        assert_eq!(out, "a</think>b");
+    }
+
+    /// `token_ids_for_content` must resolve a marker from each of its three
+    /// tiers. The `vocab` and `added_render` tiers are the load-bearing ones:
+    /// `special_token_id` alone covers only the `special_tokens` tier, so a
+    /// marker declared as an ordinary vocab entry or as a `special: false`
+    /// added token resolves to `None` through that older path -- which is
+    /// exactly how an active reasoning budget became a silent no-op.
+    #[test]
+    fn token_ids_for_content_resolves_special_vocab_and_added_render_tiers() {
+        let mut vocab = HashMap::new();
+        vocab.insert("a".to_string(), 0u32);
+        // Tier 2: a marker declared as an ordinary base-vocabulary entry.
+        vocab.insert("</think>".to_string(), 7u32);
+
+        let mut specials = HashMap::new();
+        // Tier 1: the classic special-token table entry.
+        specials.insert("<|im_end|>".to_string(), 20u32);
+
+        let mut rendered = HashMap::new();
+        // Tier 3: a `special: false` added token, absent from both maps above.
+        rendered.insert(30u32, "<tool_call>".to_string());
+
+        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
+            vocab,
+            Vec::new(),
+            specials,
+            rendered,
+            DEFAULT_BPE_CACHE_CAPACITY,
+            DEFAULT_BPE_MAX_SEQ_LEN,
+        )
+        .expect("construct three-tier tokenizer");
+
+        assert_eq!(tokenizer.token_ids_for_content("<|im_end|>"), vec![20]);
+
+        // Tiers 2 and 3 are invisible to `special_token_id`.
+        assert_eq!(tokenizer.special_token_id("</think>"), None);
+        assert_eq!(tokenizer.token_ids_for_content("</think>"), vec![7]);
+        assert_eq!(tokenizer.special_token_id("<tool_call>"), None);
+        assert_eq!(tokenizer.token_ids_for_content("<tool_call>"), vec![30]);
+
+        // A spelling present in no tier resolves to None rather than to some
+        // near-miss entry.
+        assert!(tokenizer.token_ids_for_content("<think>").is_empty());
+    }
+
+    /// One spelling can carry DIFFERENT ids in two tiers, and the single-id
+    /// lookup necessarily discards all but the first.
+    ///
+    /// This is not exotic: `vocab` and `rendered_added` are independent
+    /// constructor inputs with nothing reconciling them, and added-token ids
+    /// deliberately live beyond the base vocabulary range, so a marker declared
+    /// in both is guaranteed to have two ids rather than one. The tier test
+    /// above cannot catch it because every spelling there appears in exactly one
+    /// tier -- it would pass unchanged against a lookup with no notion of
+    /// ambiguity at all.
+    #[test]
+    fn token_ids_for_content_reports_every_id_sharing_one_spelling() {
+        let mut vocab = HashMap::new();
+        vocab.insert("a".to_string(), 0u32);
+        vocab.insert("</think>".to_string(), 7u32);
+
+        let mut rendered = HashMap::new();
+        // The same rendered spelling, at the id an added token would really get.
+        rendered.insert(100u32, "</think>".to_string());
+
+        let tokenizer = BpeTokenizer::from_vocab_and_merges_with_config(
+            vocab,
+            Vec::new(),
+            HashMap::new(),
+            rendered,
+            DEFAULT_BPE_CACHE_CAPACITY,
+            DEFAULT_BPE_MAX_SEQ_LEN,
+        )
+        .expect("construct colliding-spelling tokenizer");
+
+        assert_eq!(tokenizer.token_ids_for_content("</think>"), vec![7, 100]);
+
+        // Tier precedence still decides which id comes first, so a caller that
+        // took only the head would silently drop id 100 here. That discard is
+        // the reason the resolver refuses this tokenizer rather than resolving
+        // it, and the reason no single-id accessor survives on this type.
+        assert_eq!(tokenizer.token_ids_for_content("</think>")[0], 7);
+
+        // Unambiguous spellings return exactly one id, so the ambiguity signal
+        // is a real discriminator and not something every lookup trips.
+        assert_eq!(tokenizer.token_ids_for_content("a"), vec![0]);
+        assert!(tokenizer.token_ids_for_content("<think>").is_empty());
     }
 
     #[test]

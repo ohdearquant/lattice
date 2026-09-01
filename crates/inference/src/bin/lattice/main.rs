@@ -48,7 +48,13 @@ enum Command {
     /// Start HTTP server with OpenAI-compatible API
     Serve {
         /// Path to model directory (SafeTensors, or a native Q4 quantized
-        /// directory produced by `quantize_q4`)
+        /// directory produced by `quantize_q4`). If this directory is a
+        /// vision-language checkpoint, /v1/embeddings additionally loads its
+        /// own independent f16-packed copy of the decoder alongside the chat
+        /// backend, costing roughly 2 extra resident bytes per checkpoint
+        /// parameter (f16 storage); a checkpoint without vision support
+        /// skips that extra load entirely, so only the chat backend stays
+        /// resident.
         #[arg(long)]
         model: String,
         /// Host address to bind (default: 127.0.0.1; use 0.0.0.0 for LAN)
@@ -86,6 +92,21 @@ enum Command {
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_pending: usize,
+        /// Eagerly load vision weights at startup instead of on the first
+        /// image request (issue #1336). Off by default: lazy loading keeps
+        /// text-only startup time and resident memory unchanged from a
+        /// text-only checkpoint, since vision weights are never read at all
+        /// unless an image request arrives. Pass this flag to trade a
+        /// longer, predictable startup (and the vision weights' resident
+        /// memory footprint held from the first request onward instead of
+        /// only after it) for eliminating the first image request's extra
+        /// load latency. Only affects Q4/Metal-backed vision-capable
+        /// checkpoints; text-only and non-Metal backends ignore it. If the
+        /// eager load fails, startup still succeeds: the server warns on
+        /// stderr and falls back to the normal lazy load on the first image
+        /// request, exactly as if this flag had not been passed.
+        #[arg(long)]
+        preload_vision: bool,
     },
     /// Preflight check: memory fit and artifact compatibility, without
     /// loading any model weights (config + tensor index inspection only).
@@ -156,6 +177,7 @@ async fn main() {
             model_id,
             tokenizer_dir,
             max_pending,
+            preload_vision,
         } => {
             use std::path::Path;
             use std::sync::Arc;
@@ -196,6 +218,7 @@ async fn main() {
                             model_path.to_path_buf(),
                             tokenizer_dir_path,
                             max_pending,
+                            preload_vision,
                         ) {
                             Ok((backend, _max_context)) => backend,
                             Err(e) => {
@@ -208,6 +231,7 @@ async fn main() {
                     {
                         let _ = &tokenizer_dir;
                         let _ = max_pending;
+                        let _ = preload_vision;
                         eprintln!("Error: {}", backend::metal_gpu_required_message(model_path));
                         std::process::exit(1);
                     }
@@ -232,12 +256,39 @@ async fn main() {
             };
             eprintln!("Model loaded. Serving as '{served_model_id}'.");
 
+            // `/v1/embeddings` needs its own f16-packed vision-language
+            // checkpoint load, independent of `model_backend` above (see
+            // `lattice_inference::serve::embeddings`'s module doc comment
+            // for why the two loaders can't share weights). Best-effort,
+            // same policy as `--preload-vision` failing: warn and continue
+            // with embeddings disabled rather than aborting startup, since a
+            // checkpoint that isn't vision-language-shaped is an expected,
+            // common case (most `lattice serve` deployments serve chat
+            // only).
+            let embedding_model =
+                match lattice_inference::serve::embeddings::EmbeddingModel::from_directory(
+                    model_path,
+                ) {
+                    Ok(embedding_model) => {
+                        eprintln!(
+                            "Embeddings enabled: pooled {}-dim vectors from {model}.",
+                            embedding_model.dimensions()
+                        );
+                        Some(Arc::new(embedding_model))
+                    }
+                    Err(err) => {
+                        eprintln!("Embeddings disabled ({model}): {err}");
+                        None
+                    }
+                };
+
             let state = serve::AppState {
                 model: model_backend,
                 default_max_tokens: max_tokens,
                 max_tokens_cap: 4096,
                 model_id: served_model_id.clone(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model,
             };
 
             let app = serve::router(state);
@@ -365,5 +416,38 @@ mod max_pending_cli_tests {
             parse_max_pending(&["--max-pending", "8"]).expect("8 is a valid cap"),
             8
         );
+    }
+}
+
+// ─── #1336 CLI boundary tests: `--preload-vision` defaults to lazy ────────
+#[cfg(test)]
+mod preload_vision_cli_tests {
+    use super::*;
+
+    fn parse_preload_vision(args: &[&str]) -> bool {
+        let mut full = vec!["lattice", "serve", "--model", "/tmp/model"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)
+            .expect("fixed --model arg always parses")
+            .command
+        {
+            Command::Serve { preload_vision, .. } => preload_vision,
+            _ => panic!("expected Command::Serve, got a different Command variant"),
+        }
+    }
+
+    /// Lazy loading is the default: omitting `--preload-vision` must not
+    /// flip it on. This is the CLI-level half of the "lazy stays the
+    /// default" contract the issue asks for -- the startup-behavior half is
+    /// structural (`ModelBackend::spawn_metal` only calls
+    /// `VisionRuntime::preload()` inside `if preload_vision { .. }`).
+    #[test]
+    fn preload_vision_omitted_defaults_to_false() {
+        assert!(!parse_preload_vision(&[]));
+    }
+
+    #[test]
+    fn preload_vision_flag_present_is_true() {
+        assert!(parse_preload_vision(&["--preload-vision"]));
     }
 }

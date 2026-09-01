@@ -5,7 +5,7 @@ use crate::weights::safetensors_layout::{
 };
 use memmap2::Mmap;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -167,9 +167,9 @@ impl CrossEncoderWeights {
 ///
 /// The owned variant exists for targets without real file-descriptor/mmap
 /// support (`wasm32-unknown-unknown`: `memmap2`'s wasm fallback compiles but
-/// every `Mmap::map` call returns `io::ErrorKind::Unsupported` at runtime) and
-/// for hosts that receive model weights as an in-memory buffer rather than a
-/// filesystem path (e.g. bytes handed in from JavaScript).
+/// every mmap construction call returns `io::ErrorKind::Unsupported` at
+/// runtime) and for hosts that receive model weights as an in-memory buffer
+/// rather than a filesystem path (e.g. bytes handed in from JavaScript).
 enum SafetensorsBacking {
     Mapped(Mmap),
     Owned(Vec<u8>),
@@ -218,21 +218,22 @@ impl SafetensorsFile {
         let file = File::open(path).map_err(|e| {
             InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", path.display()))
         })?;
-        Self::from_open_file(file, path.display().to_string())
+        Self::from_open_file(file, path)
     }
 
     /// Parse a safetensors file from an already-open [`File`].
     ///
     /// Manifest-derived shards reach this through [`open_manifest_entry_once`], which
-    /// validates the manifest string and opens the file exactly once. Mapping the fd the
-    /// caller already holds is what keeps that single open meaningful; reopening by path
-    /// here would reintroduce the window between the open and the read.
-    pub(crate) fn from_open_file(file: File, display_path: String) -> Result<Self, InferenceError> {
-        // SAFETY: The file descriptor remains alive until the mmap is created,
-        // and the returned Mmap owns the mapping independently of the File.
-        let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
-            InferenceError::InvalidSafetensors(format!("failed to mmap {display_path}: {e}"))
-        })?;
+    /// opens the file exactly once. Mapping the fd the caller already holds is what keeps
+    /// that single open meaningful; reopening by path here would reintroduce the window
+    /// between the open and the read. `path` is used both to run the mmap trust-boundary
+    /// guard (via [`crate::weights::mmap_trust::map_after_untrusted_open`]) and to name the
+    /// file in error messages -- it should be the resolved real path when the caller has
+    /// one, matching that guard's own `path` requirement.
+    pub(crate) fn from_open_file(file: File, path: &Path) -> Result<Self, InferenceError> {
+        let display_path = path.display().to_string();
+        let mmap = crate::weights::mmap_trust::map_after_untrusted_open(&file, path)
+            .map_err(InferenceError::InvalidSafetensors)?;
 
         Self::from_backing(SafetensorsBacking::Mapped(mmap), display_path)
     }
@@ -1314,6 +1315,12 @@ pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError>
 /// [`contained_shard_path`] before the join: absolute paths and parent-directory components
 /// are rejected, lexically, without consulting any filesystem state.
 ///
+/// The returned file has already passed
+/// [`crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted`] against its resolved
+/// real path -- every caller mmaps this file read-only no-copy, so the same write-boundary
+/// gate every other checkpoint mmap goes through applies here too, without `open_trusted_mmap_file`'s
+/// `O_NOFOLLOW` (see that function's doc comment for why a hub-cache symlink must still resolve).
+///
 /// # Why this opens the file instead of returning a path to reopen
 ///
 /// Resolving a path and handing it back leaves the caller to `open()` it separately, and a
@@ -1341,6 +1348,8 @@ pub(crate) fn open_manifest_entry_once(
         InferenceError::InvalidSafetensors(format!("failed to open {}: {e}", candidate.display()))
     })?;
     let real_path = real_path_of_open_file(&file, &candidate)?;
+    crate::weights::mmap_trust::reject_if_open_mmap_file_untrusted(&file, &real_path)
+        .map_err(InferenceError::InvalidSafetensors)?;
     Ok((file, real_path))
 }
 
@@ -1405,7 +1414,7 @@ pub fn load_sharded(model_dir: &Path) -> Result<HashMap<String, Tensor>, Inferen
     let mut tensors = HashMap::with_capacity(index.weight_map.len());
     for (shard_file, tensor_names) in by_shard {
         let (file, real_path) = open_manifest_entry_once(model_dir, &shard_file)?;
-        let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
+        let shard = SafetensorsFile::from_open_file(file, &real_path)?;
         for tensor_name in tensor_names {
             let (data, shape) = shard.get_f32_tensor(&tensor_name)?;
             tensors.insert(
@@ -1463,7 +1472,7 @@ impl ShardedSafetensors {
     fn open_shard(&mut self, shard_file: &str) -> Result<&SafetensorsFile, InferenceError> {
         if !self.shards.contains_key(shard_file) {
             let (file, real_path) = open_manifest_entry_once(&self.root, shard_file)?;
-            let shard = SafetensorsFile::from_open_file(file, real_path.display().to_string())?;
+            let shard = SafetensorsFile::from_open_file(file, &real_path)?;
             self.shards.insert(shard_file.to_string(), shard);
         }
         self.shards.get(shard_file).ok_or_else(|| {
@@ -1790,10 +1799,10 @@ impl ShardedSafetensors {
 
 fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, InferenceError> {
     let mut parser = JsonParser::new(json);
-    parser.skip_ws();
     parser.expect(b'{')?;
 
     let mut tensors = HashMap::new();
+    let mut seen_keys = HashSet::new();
 
     loop {
         parser.skip_ws();
@@ -1811,12 +1820,22 @@ fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, I
         }
 
         let key = parser.parse_string()?;
+        if !seen_keys.insert(key.clone()) {
+            let kind = if key == "__metadata__" {
+                "metadata member"
+            } else {
+                "tensor name"
+            };
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "duplicate {kind} in safetensors header: {key}"
+            )));
+        }
         parser.skip_ws();
         parser.expect(b':')?;
         parser.skip_ws();
 
         if key == "__metadata__" {
-            parser.skip_value()?;
+            parser.parse_metadata()?;
         } else {
             let meta = parser.parse_tensor_meta(&key)?;
             tensors.insert(key, meta);
@@ -1826,6 +1845,12 @@ fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, I
         match parser.peek() {
             Some(b',') => {
                 parser.bump();
+                parser.skip_ws();
+                if matches!(parser.peek(), Some(b'}')) {
+                    return Err(InferenceError::InvalidSafetensors(
+                        "trailing comma in safetensors header object".into(),
+                    ));
+                }
             }
             Some(b'}') => {
                 parser.bump();
@@ -1842,6 +1867,15 @@ fn parse_safetensors_header(json: &str) -> Result<HashMap<String, TensorMeta>, I
                 ));
             }
         }
+    }
+
+    while matches!(parser.peek(), Some(b' ')) {
+        parser.bump();
+    }
+    if let Some(other) = parser.peek() {
+        return Err(InferenceError::InvalidSafetensors(format!(
+            "non-space byte {other} after top-level safetensors header object"
+        )));
     }
 
     Ok(tensors)
@@ -1897,77 +1931,51 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_string(&mut self) -> Result<String, InferenceError> {
+        let start = self.pos;
         self.expect(b'"')?;
-        let mut out = String::new();
+        let mut escaped = false;
         loop {
             let byte = self.bump().ok_or_else(|| {
                 InferenceError::InvalidSafetensors("unterminated string in header".into())
             })?;
-            match byte {
-                b'"' => break,
-                b'\\' => {
-                    let esc = self.bump().ok_or_else(|| {
-                        InferenceError::InvalidSafetensors(
-                            "unterminated escape sequence in header".into(),
-                        )
-                    })?;
-                    match esc {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let hex = self.take_n(4)?;
-                            let hex_str = std::str::from_utf8(hex).map_err(|e| {
-                                InferenceError::InvalidSafetensors(format!(
-                                    "invalid unicode escape in header: {e}"
-                                ))
-                            })?;
-                            let value = u16::from_str_radix(hex_str, 16).map_err(|e| {
-                                InferenceError::InvalidSafetensors(format!(
-                                    "invalid unicode escape value {hex_str}: {e}"
-                                ))
-                            })?;
-                            let ch = char::from_u32(value as u32).ok_or_else(|| {
-                                InferenceError::InvalidSafetensors(format!(
-                                    "invalid unicode scalar value {value}"
-                                ))
-                            })?;
-                            out.push(ch);
-                        }
-                        other => {
-                            return Err(InferenceError::InvalidSafetensors(format!(
-                                "unsupported escape sequence \\{}",
-                                other as char
-                            )));
-                        }
-                    }
-                }
-                other => out.push(other as char),
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                break;
             }
         }
-        Ok(out)
-    }
-
-    fn take_n(&mut self, n: usize) -> Result<&'a [u8], InferenceError> {
-        if self.pos + n > self.bytes.len() {
-            return Err(InferenceError::InvalidSafetensors(
-                "unexpected end of input while reading header".into(),
-            ));
-        }
-        let slice = &self.bytes[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(slice)
+        let raw = std::str::from_utf8(&self.bytes[start..self.pos]).map_err(|err| {
+            InferenceError::InvalidSafetensors(format!(
+                "safetensors header string is not valid UTF-8: {err}"
+            ))
+        })?;
+        serde_json::from_str(raw).map_err(|err| {
+            InferenceError::InvalidSafetensors(format!(
+                "invalid JSON string in safetensors header: {err}"
+            ))
+        })
     }
 
     fn parse_usize(&mut self) -> Result<usize, InferenceError> {
         let start = self.pos;
-        while matches!(self.peek(), Some(b'0'..=b'9')) {
-            self.pos += 1;
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "leading zero in unsigned integer at byte {start}"
+                    )));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => {}
         }
         if start == self.pos {
             return Err(InferenceError::InvalidSafetensors(format!(
@@ -2019,6 +2027,57 @@ impl<'a> JsonParser<'a> {
         Ok(values)
     }
 
+    /// Parse the optional safetensors `__metadata__` member. The wire format
+    /// requires a JSON object whose keys and values are strings; arbitrary
+    /// nested JSON is not a valid metadata payload.
+    fn parse_metadata(&mut self) -> Result<(), InferenceError> {
+        self.expect(b'{')?;
+        self.skip_ws();
+        let mut seen_keys = HashSet::new();
+        if matches!(self.peek(), Some(b'}')) {
+            self.bump();
+            return Ok(());
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_string()?;
+            if !seen_keys.insert(key.clone()) {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "duplicate __metadata__ key in safetensors header: {key}"
+                )));
+            }
+            self.skip_ws();
+            self.expect(b':')?;
+            self.skip_ws();
+            self.parse_string().map_err(|_| {
+                InferenceError::InvalidSafetensors(format!(
+                    "safetensors __metadata__ value for {key:?} must be a string"
+                ))
+            })?;
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => {
+                    self.bump();
+                }
+                Some(b'}') => {
+                    self.bump();
+                    break;
+                }
+                Some(other) => {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "expected ',' or '}}' in safetensors __metadata__, found byte {other}"
+                    )));
+                }
+                None => {
+                    return Err(InferenceError::InvalidSafetensors(
+                        "unexpected end of safetensors __metadata__ object".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn skip_value(&mut self) -> Result<(), InferenceError> {
         self.skip_ws();
         match self.peek() {
@@ -2040,9 +2099,15 @@ impl<'a> JsonParser<'a> {
                     self.depth -= 1;
                     return Ok(());
                 }
+                let mut seen_keys = HashSet::new();
                 loop {
                     self.skip_ws();
-                    self.parse_string()?;
+                    let key = self.parse_string()?;
+                    if !seen_keys.insert(key.clone()) {
+                        return Err(InferenceError::InvalidSafetensors(format!(
+                            "duplicate key in safetensors header object: {key}"
+                        )));
+                    }
                     self.skip_ws();
                     self.expect(b':')?;
                     self.skip_ws();
@@ -2115,10 +2180,7 @@ impl<'a> JsonParser<'a> {
             Some(b't') => self.skip_literal(b"true"),
             Some(b'f') => self.skip_literal(b"false"),
             Some(b'n') => self.skip_literal(b"null"),
-            Some(b'-' | b'0'..=b'9') => {
-                self.skip_number();
-                Ok(())
-            }
+            Some(b'-' | b'0'..=b'9') => self.skip_number(),
             Some(other) => Err(InferenceError::InvalidSafetensors(format!(
                 "unsupported JSON value starting with byte {other}"
             ))),
@@ -2141,13 +2203,68 @@ impl<'a> JsonParser<'a> {
         Ok(())
     }
 
-    fn skip_number(&mut self) {
-        while matches!(
-            self.peek(),
-            Some(b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
-        ) {
+    /// Consume one RFC 8259 JSON number. This is used only for unknown
+    /// extension values, but accepting a loose run of number-like bytes here
+    /// would make the entire safetensors header non-JSON while still passing
+    /// structural preflight.
+    fn skip_number(&mut self) -> Result<(), InferenceError> {
+        let start = self.pos;
+        if matches!(self.peek(), Some(b'-')) {
             self.pos += 1;
         }
+
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "leading zero in JSON number at byte {start}"
+                    )));
+                }
+            }
+            Some(b'1'..=b'9') => {
+                self.pos += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            _ => {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "invalid JSON number at byte {start}: expected an integer digit"
+                )));
+            }
+        }
+
+        if matches!(self.peek(), Some(b'.')) {
+            self.pos += 1;
+            let fraction_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == fraction_start {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "invalid JSON number at byte {start}: fraction has no digits"
+                )));
+            }
+        }
+
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.pos += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.pos += 1;
+            }
+            let exponent_start = self.pos;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.pos += 1;
+            }
+            if self.pos == exponent_start {
+                return Err(InferenceError::InvalidSafetensors(format!(
+                    "invalid JSON number at byte {start}: exponent has no digits"
+                )));
+            }
+        }
+
+        Ok(())
     }
 
     /// Parse one tensor's header entry. `tensor_name` is the key this entry
@@ -2167,6 +2284,7 @@ impl<'a> JsonParser<'a> {
         let mut dtype_str: Option<String> = None;
         let mut shape = None;
         let mut data_offsets = None;
+        let mut seen_keys = HashSet::new();
 
         if matches!(self.peek(), Some(b'}')) {
             self.bump();
@@ -2174,6 +2292,11 @@ impl<'a> JsonParser<'a> {
             loop {
                 self.skip_ws();
                 let key = self.parse_string()?;
+                if !seen_keys.insert(key.clone()) {
+                    return Err(InferenceError::InvalidSafetensors(format!(
+                        "duplicate member in tensor {tensor_name} header object: {key}"
+                    )));
+                }
                 self.skip_ws();
                 self.expect(b':')?;
                 self.skip_ws();
@@ -2466,6 +2589,227 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_tensor_name_in_safetensors_header_is_rejected() {
+        let header = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let err = SafetensorsFile::from_bytes(bytes)
+            .expect_err("duplicate tensor names must not collapse into the header map");
+        assert!(
+            err.to_string().contains("duplicate tensor name"),
+            "error must identify the duplicate header member: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_tensor_object_members_are_rejected() {
+        let duplicate_members = [
+            r#""dtype":"F32","dtype":"F32","shape":[1],"data_offsets":[0,4]"#,
+            r#""dtype":"F32","shape":[1],"shape":[1],"data_offsets":[0,4]"#,
+            r#""dtype":"F32","shape":[1],"data_offsets":[0,4],"data_offsets":[0,4]"#,
+            r#""dtype":"F32","shape":[1],"data_offsets":[0,4],"extra":1,"extra":2"#,
+            r#""dtype":"F32","shape":[1],"data_offsets":[0,4],"extra":{"nested":1,"nested":2}"#,
+        ];
+
+        for members in duplicate_members {
+            let header = format!(r#"{{"tensor":{{{members}}}}}"#);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+            let err = SafetensorsFile::from_bytes(bytes)
+                .expect_err("duplicate keys anywhere in a tensor object must be rejected");
+            assert!(
+                err.to_string().contains("duplicate"),
+                "error must identify the duplicate object member: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_must_be_a_unique_string_map() {
+        let invalid_headers = [
+            r#"{"__metadata__":{"source":"a","source":"b"},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            r#"{"__metadata__":{"source":1},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            r#"{"__metadata__":[],"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+            r#"{"__metadata__":{},"__metadata__":{},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        ];
+
+        for header in invalid_headers {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            SafetensorsFile::from_bytes(bytes)
+                .expect_err("safetensors metadata must be one unique string-to-string map");
+        }
+    }
+
+    #[test]
+    fn utf8_strings_decode_canonically_before_duplicate_checks() {
+        let header = r#"{"__metadata__":{"作者":"café 🚀"},"t\u00e9nsor\ud83d\ude80":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        let parsed = SafetensorsFile::from_bytes(bytes)
+            .expect("valid UTF-8 and a valid escaped surrogate pair must parse");
+        assert!(
+            parsed.has_tensor("ténsor🚀"),
+            "raw UTF-8 and escaped surrogate pairs must decode to canonical scalar values"
+        );
+
+        let duplicate = r#"{"__metadata__":{"é":"raw","\u00e9":"escaped"},"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(duplicate.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(duplicate.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+        SafetensorsFile::from_bytes(bytes)
+            .expect_err("raw and escaped forms of the same metadata key are duplicates");
+    }
+
+    #[test]
+    fn malformed_json_numbers_are_rejected() {
+        let invalid_members = [
+            r#""extra":-"#,
+            r#""extra":1+2"#,
+            r#""extra":01"#,
+            r#""extra":-01"#,
+            r#""extra":1."#,
+            r#""extra":1e"#,
+            r#""extra":1e+"#,
+            r#""shape":[01]"#,
+            r#""data_offsets":[00,4]"#,
+        ];
+
+        for invalid in invalid_members {
+            let members = match invalid.split_once(':').map(|(key, _)| key) {
+                Some(r#""shape""#) => {
+                    format!(r#""dtype":"F32",{invalid},"data_offsets":[0,4]"#)
+                }
+                Some(r#""data_offsets""#) => {
+                    format!(r#""dtype":"F32","shape":[1],{invalid}"#)
+                }
+                _ => format!(r#""dtype":"F32","shape":[1],"data_offsets":[0,4],{invalid}"#),
+            };
+            let header = format!(r#"{{"tensor":{{{members}}}}}"#);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+            assert!(
+                SafetensorsFile::from_bytes(bytes).is_err(),
+                "invalid JSON number must fail closed: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_json_numbers_in_unknown_values_are_accepted() {
+        let header = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4],"extra":[0,-1,1.5,1e2,-0.25E+2]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        SafetensorsFile::from_bytes(bytes)
+            .expect("RFC 8259 numbers in an unknown extension value must remain valid");
+    }
+
+    #[test]
+    fn malformed_unicode_surrogates_are_rejected() {
+        for escaped in [r#"\ud83d"#, r#"\ude80"#, r#"\ud83dX"#] {
+            let header = format!(
+                r#"{{"__metadata__":{{"value":"{escaped}"}},"tensor":{{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}}}"#
+            );
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&1.0f32.to_le_bytes());
+            SafetensorsFile::from_bytes(bytes)
+                .expect_err("a malformed JSON Unicode surrogate must fail closed");
+        }
+    }
+
+    #[test]
+    fn trailing_comma_in_header_object_is_rejected() {
+        let header = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        SafetensorsFile::from_bytes(bytes)
+            .expect_err("the safetensors header must be valid JSON without a trailing comma");
+    }
+
+    #[test]
+    fn non_space_bytes_after_top_level_header_are_rejected() {
+        let tensor = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let header = format!("{tensor}THIS_IS_NOT_JSON");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        SafetensorsFile::from_bytes(bytes)
+            .expect_err("the declared header may contain only space padding after its JSON object");
+    }
+
+    #[test]
+    fn space_padding_after_top_level_header_is_accepted() {
+        let tensor = r#"{"tensor":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let header = format!("{tensor}   ");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        SafetensorsFile::from_bytes(bytes)
+            .expect("ASCII space is valid safetensors header padding");
+    }
+
+    // #1368: `SafetensorsFile::open` is a raw-open entry point (used directly
+    // by the runtime model loaders, not just via `open_manifest_entry_once`)
+    // that must route through the mmap trust boundary the same as every
+    // other checkpoint mmap site in this crate. This proves the wiring, not
+    // just the underlying `reject_if_open_mmap_file_untrusted` predicate
+    // (already covered directly in `mmap_trust`'s own tests).
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_a_group_or_other_writable_checkpoint_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("lattice_weights_writable_checkpoint");
+        let header = r#"{"vec":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&1.0f32.to_le_bytes());
+
+        let mut file = File::create(&path).expect("test setup: create safetensors file");
+        file.write_all(&bytes)
+            .expect("test setup: write safetensors bytes");
+        drop(file);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod 0o666");
+
+        let err = SafetensorsFile::open(&path)
+            .expect_err("a group/other-writable checkpoint file must be refused");
+        assert!(
+            matches!(&err, InferenceError::InvalidSafetensors(msg) if msg.contains("refusing to load")),
+            "expected a trust-boundary refusal, got: {err:?}"
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod 0o600");
+        SafetensorsFile::open(&path).expect("an owner-only checkpoint file must still be accepted");
+    }
+
+    #[test]
     fn test_rejects_shape_byte_length_mismatch() {
         let path = temp_path("lattice_weights_bad_shape");
         let header = r#"{
@@ -2616,10 +2960,11 @@ mod tests {
         // couple hundred bytes -- far under MAX_SAFETENSORS_HEADER_BYTES, so only
         // the depth bound can be what rejects this fixture.
         let depth = MAX_SAFETENSORS_HEADER_DEPTH + 8;
-        let mut header = String::from(r#"{"__metadata__":"#);
+        let mut header =
+            String::from(r#"{"tensor":{"dtype":"F32","shape":[0],"data_offsets":[0,0],"extra":"#);
         header.push_str(&"[".repeat(depth));
         header.push_str(&"]".repeat(depth));
-        header.push('}');
+        header.push_str("}}");
         assert!(header.len() < MAX_SAFETENSORS_HEADER_BYTES);
 
         let mut bytes = Vec::new();

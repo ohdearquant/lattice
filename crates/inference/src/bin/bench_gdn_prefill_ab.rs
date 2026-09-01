@@ -243,15 +243,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Run `n` tokens through the isolated-timing chunk loop once; returns accumulated
     // GDN/non-GDN timing across all `max_prefill`-sized chunks. Caller must have
     // already called `state.set_gdn_chunked(..)` and `state.reset_state()`.
-    let run_once = |state: &mut MetalQwen35State, tokens: &[u32]| -> GdnIsolatedChunkTiming {
+    let run_once = |state: &mut MetalQwen35State,
+                    tokens: &[u32]|
+     -> Result<GdnIsolatedChunkTiming, lattice_inference::InferenceError> {
         let mut total = GdnIsolatedChunkTiming::default();
         let mut start = 0usize;
         for chunk in tokens.chunks(mp) {
-            let t = bench_support::forward_prefill_gdn_isolated_chunk(state, chunk, start);
+            let t = bench_support::forward_prefill_gdn_isolated_chunk(state, chunk, start)?;
             total.accumulate(&t);
             start += chunk.len();
         }
-        total
+        Ok(total)
     };
 
     #[derive(Clone, Copy)]
@@ -329,14 +331,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // above, no internal command-buffer-boundary timing is needed: production
     // dispatch already commits + waits synchronously per chunk, so a plain
     // `Instant` wrapped around the whole chunking loop is the real measurement.
-    let run_once_production = |state: &mut MetalQwen35State, tokens: &[u32]| -> f64 {
+    let run_once_production = |state: &mut MetalQwen35State,
+                               tokens: &[u32]|
+     -> Result<f64, lattice_inference::InferenceError> {
         let start = std::time::Instant::now();
         let mut pos = 0usize;
         for chunk in tokens.chunks(mp) {
-            bench_support::forward_prefill_production_chunk(state, chunk, pos);
+            bench_support::forward_prefill_production_chunk(state, chunk, pos)?;
             pos += chunk.len();
         }
-        start.elapsed().as_secs_f64() * 1000.0
+        Ok(start.elapsed().as_secs_f64() * 1000.0)
     };
 
     struct ProdRowResult {
@@ -379,7 +383,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.set_gdn_chunked(chunked);
                 for _ in 0..warmup {
                     state.reset_state();
-                    let _ = run_once_production(&mut state, &tokens);
+                    let _ = run_once_production(&mut state, &tokens)?;
                 }
             }
             let mut total_samples: [Vec<f64>; 2] =
@@ -388,7 +392,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for (i, &(chunked, _)) in prod_arms.iter().enumerate() {
                     state.set_gdn_chunked(chunked);
                     state.reset_state();
-                    total_samples[i].push(run_once_production(&mut state, &tokens));
+                    total_samples[i].push(run_once_production(&mut state, &tokens)?);
                 }
             }
             for (i, &(_, path_name)) in prod_arms.iter().enumerate() {
@@ -414,13 +418,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 for _ in 0..warmup {
                     state.reset_state();
-                    let _ = run_once_production(&mut state, &tokens);
+                    let _ = run_once_production(&mut state, &tokens)?;
                 }
 
                 let mut total_samples = Vec::with_capacity(repeats);
                 for _ in 0..repeats {
                     state.reset_state();
-                    total_samples.push(run_once_production(&mut state, &tokens));
+                    total_samples.push(run_once_production(&mut state, &tokens)?);
                 }
                 let total = stats(total_samples);
                 eprintln!(
@@ -461,7 +465,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 state.set_gdn_chunked(chunked);
                 for _ in 0..warmup {
                     state.reset_state();
-                    let _ = run_once(&mut state, &tokens);
+                    let _ = run_once(&mut state, &tokens)?;
                 }
             }
             let mut gdn_samples: [Vec<f64>; 2] =
@@ -474,7 +478,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 for (i, &(chunked, _)) in isolated_arms.iter().enumerate() {
                     state.set_gdn_chunked(chunked);
                     state.reset_state();
-                    let t = run_once(&mut state, &tokens);
+                    let t = run_once(&mut state, &tokens)?;
                     gdn_samples[i].push(t.gdn_ms);
                     total_samples[i].push(t.total_ms());
                     non_gdn_samples[i].push(t.non_gdn_ms);
@@ -509,7 +513,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 for _ in 0..warmup {
                     state.reset_state();
-                    let _ = run_once(&mut state, &tokens);
+                    let _ = run_once(&mut state, &tokens)?;
                 }
 
                 let mut gdn_samples = Vec::with_capacity(repeats);
@@ -517,7 +521,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut non_gdn_samples = Vec::with_capacity(repeats);
                 for _ in 0..repeats {
                     state.reset_state();
-                    let t = run_once(&mut state, &tokens);
+                    let t = run_once(&mut state, &tokens)?;
                     gdn_samples.push(t.gdn_ms);
                     total_samples.push(t.total_ms());
                     non_gdn_samples.push(t.non_gdn_ms);

@@ -8,13 +8,17 @@
 
 use crate::error::{Result, TuneError};
 use crate::lora::{LoraAdapter, LoraConfig, LoraLayer};
+use lattice_fann::lora as shared;
 use std::collections::HashMap;
 
 /// Maximum summed rank for one blended projection.
-pub(crate) const MAX_BLEND_RANK_TOTAL: usize = 4096;
-
-/// Aggregate cap on all blended A and B elements (about 4 GiB of f32 storage).
-pub(crate) const MAX_BLEND_TOTAL_ELEMENTS: usize = 1 << 30; // 1,073,741,824 elements ≈ 4 GiB f32
+///
+/// Re-exported from [`lattice_fann::lora::MAX_BLEND_RANK_TOTAL`], the shared
+/// cap this crate and `lattice-inference`'s Metal LoRA blend both enforce.
+/// Only referenced by tests below — non-test code calls `shared::*` directly
+/// so the cap itself lives in exactly one place.
+#[cfg(test)]
+pub(crate) const MAX_BLEND_RANK_TOTAL: usize = shared::MAX_BLEND_RANK_TOTAL;
 
 /// Blend a set of `(adapter, mixture_weight)` pairs into one rank-Σr adapter.
 ///
@@ -29,9 +33,20 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
     }
 
     for (idx, (_, w)) in adapters.iter().enumerate() {
-        if !w.is_finite() {
+        shared::check_finite_weight("blend_lora_adapters", idx, *w)
+            .map_err(TuneError::Validation)?;
+    }
+
+    // An adapter with no layers passes the outer `adapters.is_empty()` guard
+    // above (the outer slice itself is non-empty) but contributes nothing to
+    // `grouped` below, silently producing an empty-but-`Ok` blended adapter
+    // instead of an admission error — the same failure shape
+    // `blend_lora_layer_data` in `lattice-inference` rejects for its own
+    // empty inner layer slices.
+    for (idx, (adapter, _)) in adapters.iter().enumerate() {
+        if adapter.layers().is_empty() {
             return Err(TuneError::Validation(format!(
-                "blend_lora_adapters: weight at index {idx} is not finite ({w})"
+                "blend_lora_adapters: adapters[{idx}] has no layers"
             )));
         }
     }
@@ -53,36 +68,26 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
     let mut planned_elems: usize = 0;
     for ((layer_idx, module), entries) in &grouped {
         let (first, _) = entries[0]; // each key was inserted with >=1 layer
-        let dims = first.d_in.checked_add(first.d_out).ok_or_else(|| {
-            TuneError::Validation(format!(
-                "blend_lora_adapters: layer {layer_idx} module '{module}' d_in+d_out overflowed usize"
-            ))
-        })?;
         let mut group_rank: usize = 0;
         for (layer, _) in entries {
-            group_rank = group_rank.checked_add(layer.rank).ok_or_else(|| {
-                TuneError::Validation("blend_lora_adapters: rank_total overflowed usize".into())
-            })?;
+            group_rank = shared::accumulate_rank(group_rank, layer.rank, "blend_lora_adapters")
+                .map_err(TuneError::Validation)?;
         }
-        let group_elems = group_rank.checked_mul(dims).ok_or_else(|| {
-            TuneError::Validation(
-                "blend_lora_adapters: rank_total*(d_in+d_out) overflowed usize".into(),
-            )
-        })?;
-        planned_elems = planned_elems.checked_add(group_elems).ok_or_else(|| {
-            TuneError::Validation(
-                "blend_lora_adapters: aggregate blend element count overflowed usize".into(),
-            )
-        })?;
+        let group_elems = shared::checked_group_elements(
+            "blend_lora_adapters",
+            *layer_idx,
+            module,
+            group_rank,
+            first.d_in,
+            first.d_out,
+        )
+        .map_err(TuneError::Validation)?;
+        planned_elems =
+            shared::accumulate_planned_elements(planned_elems, group_elems, "blend_lora_adapters")
+                .map_err(TuneError::Validation)?;
     }
-    if planned_elems > MAX_BLEND_TOTAL_ELEMENTS {
-        return Err(TuneError::Validation(format!(
-            "blend_lora_adapters: aggregate blend size {planned_elems} elements exceeds \
-             MAX_BLEND_TOTAL_ELEMENTS={MAX_BLEND_TOTAL_ELEMENTS} (~{} GiB f32); reduce the \
-             number of adapters, their rank, or the number of target projections",
-            (MAX_BLEND_TOTAL_ELEMENTS * 4) / (1024 * 1024 * 1024)
-        )));
-    }
+    shared::check_aggregate_elements_cap(planned_elems, "blend_lora_adapters")
+        .map_err(TuneError::Validation)?;
 
     // Blend each (layer_idx, module) group independently.
     let mut blended_layers: HashMap<(usize, String), LoraLayer> = HashMap::new();
@@ -108,6 +113,7 @@ pub fn blend_lora_adapters(adapters: &[(&LoraAdapter, f32)]) -> Result<LoraAdapt
         rank: total_rank,
         alpha: total_rank as f32,
         target_modules,
+        dtype: "f32".into(),
     };
 
     LoraAdapter::new(config, blended_layers)
@@ -126,55 +132,40 @@ fn blend_layer_entries(
 
     // Validate that all entries share the same projection shape.
     for (idx, (layer, _)) in entries.iter().enumerate() {
-        if layer.d_in != d_in || layer.d_out != d_out {
-            return Err(TuneError::Validation(format!(
-                "blend_lora_adapters: layer {} module '{}' has mismatched dimensions \
-                 (entry 0: d_in={d_in}, d_out={d_out}; entry {idx}: d_in={}, d_out={})",
-                key.0, key.1, layer.d_in, layer.d_out
-            )));
-        }
+        shared::check_dims_match(
+            "blend_lora_adapters",
+            *key.0,
+            key.1,
+            d_in,
+            d_out,
+            idx,
+            layer.d_in,
+            layer.d_out,
+        )
+        .map_err(TuneError::Validation)?;
     }
 
     // Accumulate rank_total with overflow protection and a hard cap.
     let mut rank_total: usize = 0;
     for (layer, _) in entries {
-        rank_total = rank_total.checked_add(layer.rank).ok_or_else(|| {
-            TuneError::Validation("blend_layer_entries: rank_total overflowed usize".into())
-        })?;
+        rank_total = shared::accumulate_rank(rank_total, layer.rank, "blend_layer_entries")
+            .map_err(TuneError::Validation)?;
     }
-    if rank_total > MAX_BLEND_RANK_TOTAL {
-        return Err(TuneError::Validation(format!(
-            "blend_layer_entries: summed rank {rank_total} exceeds \
-             MAX_BLEND_RANK_TOTAL={MAX_BLEND_RANK_TOTAL}"
-        )));
-    }
+    shared::check_rank_total_cap(rank_total, "blend_layer_entries")
+        .map_err(TuneError::Validation)?;
 
     // Validate source buffers before copying their declared row-major shapes.
     for (idx, (layer, _)) in entries.iter().enumerate() {
-        let expected_a = layer.rank.checked_mul(d_in).ok_or_else(|| {
-            TuneError::Validation("blend_layer_entries: rank*d_in overflowed usize".into())
-        })?;
-        let expected_b = d_out.checked_mul(layer.rank).ok_or_else(|| {
-            TuneError::Validation("blend_layer_entries: d_out*rank overflowed usize".into())
-        })?;
-        if layer.a.len() != expected_a {
-            return Err(TuneError::Validation(format!(
-                "blend_layer_entries: entry {idx} A slice length {} \
-                 does not match rank*d_in={}*{}={expected_a}",
-                layer.a.len(),
-                layer.rank,
-                d_in,
-            )));
-        }
-        if layer.b.len() != expected_b {
-            return Err(TuneError::Validation(format!(
-                "blend_layer_entries: entry {idx} B slice length {} \
-                 does not match d_out*rank={}*{}={expected_b}",
-                layer.b.len(),
-                d_out,
-                layer.rank,
-            )));
-        }
+        shared::check_buffer_lengths(
+            "blend_layer_entries",
+            idx,
+            layer.rank,
+            d_in,
+            d_out,
+            layer.a.len(),
+            layer.b.len(),
+        )
+        .map_err(TuneError::Validation)?;
     }
 
     let a_buf_len = rank_total.checked_mul(d_in).ok_or_else(|| {
@@ -241,6 +232,7 @@ mod tests {
                 rank,
                 alpha: rank as f32, // scale = 1.0
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         )
@@ -393,6 +385,33 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Edge-case: an adapter with no layers is rejected explicitly, not
+    // silently blended into an empty-but-Ok adapter. Mirrors
+    // `blend_lora_layer_data`'s empty-inner-layer-slice rejection in
+    // `lattice-inference` (the two blends this crate and Metal both apply
+    // the same admission policy to).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn blend_adapter_with_no_layers_returns_error() {
+        let empty_adapter = LoraAdapter::new(
+            LoraConfig {
+                rank: 1,
+                alpha: 1.0,
+                target_modules: vec![],
+                dtype: "f32".into(),
+            },
+            HashMap::new(),
+        )
+        .expect("an adapter with zero layers is itself a valid, if inert, adapter");
+
+        let result = blend_lora_adapters(&[(&empty_adapter, 1.0)]);
+        assert!(
+            result.is_err(),
+            "an adapter with no layers must be rejected, not silently blended into an empty adapter"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Edge-case: non-finite weight returns an error.
     // -----------------------------------------------------------------------
     #[test]
@@ -430,6 +449,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         )
@@ -472,6 +492,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         };
@@ -511,6 +532,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         };
@@ -553,6 +575,7 @@ mod tests {
                 rank,
                 alpha,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         )
@@ -660,6 +683,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         };
@@ -717,7 +741,6 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn blend_aggregate_budget_exceeded_returns_err() {
-        use super::MAX_BLEND_TOTAL_ELEMENTS;
         let rank = MAX_BLEND_RANK_TOTAL; // 4096 — exactly at per-group cap, passes it
         let d_in = 2048usize;
         let d_out = 2048usize;
@@ -742,6 +765,7 @@ mod tests {
                 rank,
                 alpha: rank as f32,
                 target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
             },
             layers,
         };

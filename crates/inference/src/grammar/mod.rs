@@ -29,10 +29,8 @@
 //! let vocab_bytes: Vec<Vec<u8>> = tokenizer.vocab_bytes(model.config().vocab_size)?;
 //! let engine = Arc::new(GrammarEngine::new(&spec, vocab_bytes)?);
 //!
-//! let config = GenerateConfig {
-//!     grammar: Some(Arc::clone(&engine)),
-//!     ..Default::default()
-//! };
+//! let mut config = GenerateConfig::default();
+//! config.grammar = Some(Arc::clone(&engine));
 //! ```
 //!
 //! # Supported grammar formats

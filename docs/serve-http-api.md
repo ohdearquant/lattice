@@ -19,15 +19,21 @@ This codebase has **two** separately built HTTP servers with confusingly similar
 - **`lattice_serve`** — a separate, standalone binary
   (`crates/inference/src/bin/lattice_serve.rs`), purpose-built as the internal HTTP daemon the
   macOS Lattice Studio app spawns and talks to (introduced in PR #435). It has its own, narrower
-  route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, `GET /metrics`)
-  and its own disconnect-cancellation behavior (PR #552/#606) that `lattice serve` does not have
-  (see "Streaming" below). It is not what the README's HTTP API section documents, and it is out
-  of scope for this document -- with one exception worth flagging here: `lattice_serve`'s
-  `GET /metrics` (issue #583) carries the same "no authentication" posture described below for
-  `lattice serve`'s routes, and it is bound by the same `--host`/loopback-default rule. Do not
-  point `--host` at a non-loopback address for either binary without an external auth layer
-  (reverse proxy, firewall) in front -- `/metrics` exposes request volume/latency/error-rate shape
-  to anyone who can reach the listening address.
+  route set (`GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`,
+  `POST /v1/embeddings`, `GET /metrics`) and its own disconnect-cancellation behavior (PR
+  #552/#606); `lattice serve` gained an equivalent mechanism later (ADR-080 C2, issue #744 — see
+  "Streaming" below), so this is no longer a difference between the two binaries. It is not what
+  the README's HTTP API section documents, and it is out of scope for this document -- with one
+  exception worth flagging here: `lattice_serve`'s `GET /metrics` (issue #583) carries the same
+  "no authentication" posture described below for `lattice serve`'s routes, and it is bound by the
+  same `--host`/loopback-default rule. Do not point `--host` at a non-loopback address for either
+  binary without an external auth layer (reverse proxy, firewall) in front -- `/metrics` exposes
+  request volume/latency/error-rate shape to anyone who can reach the listening address. Both
+  binaries also have a `POST /v1/embeddings` route, but the implementations are independent:
+  `lattice serve`'s pools text and inline-data-URI images through a loaded vision-language
+  checkpoint, while `lattice_serve`'s (issue #584) embeds text only, through a separately loaded
+  `--embedding-model` `BertModel` -- see [`docs/capability-matrix.md`](capability-matrix.md) for
+  both request/response shapes and error codes, since both are out of scope for this document.
 
 If you arrived here from an issue or note that points at `lattice_serve.rs` specifically: the
 README's actual HTTP API example — the thing that issue was asking to be expanded — targets
@@ -61,25 +67,32 @@ Startup output:
 ```
 Loading model from ~/.lattice/models/qwen3.5-0.8b...
 Model loaded. Serving as 'qwen3.5-0.8b'.
-Listening on 127.0.0.1:8080  (model: qwen3.5-0.8b, max_tokens default: 64)
+Listening on 127.0.0.1:8080  (model: qwen3.5-0.8b, max_tokens default: 256)
   POST /v1/chat/completions
   GET  /health
 ```
 
-That printed route list is exhaustive — this is the complete router:
+That printed route list is a startup banner, not the full route table — it only echoes two of the
+routes below. This is the complete router:
 
 ```rust
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(root))
         .route("/health", get(health))
+        .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
-        .layer(DefaultBodyLimit::max(1_048_576)) // 1 MiB request body cap
+        .route("/v1/embeddings", post(embeddings))
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
 ```
 
-There is no `/v1/models`, `/v1/completions`, or any admin/metrics endpoint. If you need a model
-listing endpoint, that's `lattice_serve` (the other binary), not this one.
+`GET /` and `GET /v1/models` return an engine-identity document and a single-entry OpenAI model
+list, respectively. `POST /v1/embeddings` is always routed, but requires the server to have been
+started with `--model` pointed at a vision-language checkpoint; otherwise every request to it
+returns 400 `vision_unsupported` (see "`POST /v1/embeddings`" below). There is no `/v1/completions`
+or any admin/metrics endpoint.
 
 Shut down with Ctrl-C, or with SIGTERM on Unix:
 
@@ -97,29 +110,62 @@ these fixed shutdown intervals.
 
 ## Auth, rate limiting, and concurrency
 
-None of this is implemented today — worth stating explicitly, since issue #601 asks for it:
+Auth and rate limiting are not implemented today — worth stating explicitly, since issue #601
+asks for it. The Metal backend does have a per-request admission cap (see below), which is a
+different thing from rate limiting: it bounds outstanding work on one worker, not requests per
+client or per unit time.
 
 - **No authentication.** There is no API-key check, bearer-token check, or any other
-  `Authorization` handling anywhere in the router — it's exactly the two routes plus the
-  body-size layer shown above. Anyone who can reach the listening address can call it.
-- **No rate limiting, no per-request admission control.** There is no request-count or
-  concurrency-limiting middleware in front of the handlers. The only thing that rejects a request
-  before it reaches model code is the 1 MiB body-size cap already shown above.
+  `Authorization` handling anywhere in the router — none of the five routes shown above (or the
+  body-size layer wrapping them) add one. Anyone who can reach the listening address can call
+  any of them.
+- **No rate limiting.** There is no request-count or IP-based throttling middleware in front of the
+  handlers. The only overload/admission controls are the 1 MiB body-size cap already shown above
+  and the Metal-backend admission cap described next. Request validation (shape, bounds, sampling
+  parameters, unsupported fields — see `crates/inference/src/serve/contract.rs`) also rejects
+  requests before generation, but is a separate class of check from overload/rate control.
 - **CPU backend: not serialized by the server, but not free either.** Each CPU request's
   `generate` call runs as blocking work on a Tokio blocking-pool task
   (`tokio::task::spawn_blocking`, `crates/inference/src/bin/lattice.rs`), so multiple CPU requests
   can execute concurrently up to Tokio's blocking-pool size — this is not a hard concurrency-1
-  limit, but concurrent CPU requests still contend for the same CPU cores and memory.
-- **Metal/Q4 backend: effectively concurrency-1.** All Metal generation is funneled through one
-  dedicated worker thread (an `mpsc` channel into a single OS thread holding the `!Send` Metal
-  state, `crates/inference/src/bin/lattice.rs`) — a deliberate design choice matching how one local
-  GPU device actually works, not an oversight. Two concurrent requests against a Q4-backed
-  `lattice serve` run back-to-back, not in parallel; the later request's connection simply stays
-  open until its turn in the channel comes up.
+  limit, but concurrent CPU requests still contend for the same CPU cores and memory. There is no
+  per-request admission cap on this path.
+- **Metal/Q4 backend: effectively concurrency-1, with a bounded pending-job admission cap.** All
+  Metal generation is funneled through one dedicated worker thread (an `mpsc` channel into a
+  single OS thread holding the `!Send` Metal state, `crates/inference/src/serve/metal_worker.rs`)
+  — a deliberate design choice matching how one local GPU device actually works, not an oversight.
+  Two concurrent requests against a Q4-backed `lattice serve` run back-to-back, not in parallel;
+  the later request's connection simply stays open until its turn in the channel comes up, up to
+  `DEFAULT_MAX_PENDING_JOBS = 32` jobs queued or in flight at once by default (issue #932). Both
+  `lattice serve` and `lattice_serve` accept a `--max-pending <N>` startup flag to override this
+  default, ranged to `1..=tokio::sync::Semaphore::MAX_PERMITS` (`crates/inference/src/bin/lattice/main.rs`,
+  `crates/inference/src/bin/lattice_serve.rs`). A request submitted while the cap is already full
+  is rejected at the worker's admission boundary (`MetalWorkerClient::submit`'s
+  `try_acquire_owned`, `crates/inference/src/serve/metal_worker.rs:446`) before any Metal
+  generation work happens — the HTTP handler has already tokenized the rendered prompt during
+  request preparation ahead of that point (`prepare_chat_request`'s `tokenize_len` call,
+  `crates/inference/src/bin/lattice/serve.rs:1204`, versus the `submit` call at line 1329), so this
+  is not an end-to-end pre-tokenization guarantee, with:
+
+  ```json
+  {
+    "error": {
+      "message": "too many outstanding requests; the inference worker's pending-job queue is full, retry shortly",
+      "type": "server_error",
+      "code": "server_busy",
+      "param": null
+    }
+  }
+  ```
+
+  HTTP 503. This applies to both the streaming and non-streaming paths, and the rejection happens
+  before an SSE stream is ever committed to on the streaming path, so a client always gets a clean
+  JSON error body rather than a stream that starts and then fails.
 
 None of this makes `lattice serve` unsafe to run locally or behind your own reverse proxy that adds
-auth and rate limiting — it just means `lattice serve` itself provides neither, so don't expose it
-directly to an untrusted network.
+auth and rate limiting — it just means `lattice serve` itself provides neither (the Metal admission
+cap is an overload guard, not an auth or rate-limiting mechanism), so don't expose it directly to
+an untrusted network.
 
 ## `GET /health`
 
@@ -194,7 +240,8 @@ pub struct ChatCompletionRequest {
     pub response_format: Option<ResponseFormat>,     // only {"type": "text"} accepted
     pub tools: Option<Value>,                        // rejected if present
     pub tool_choice: Option<Value>,                  // rejected if present
-    pub logprobs: Option<bool>,                      // rejected if true (see "logprobs" below)
+    pub logprobs: Option<bool>,                      // see "logprobs" below
+    pub top_logprobs: Option<usize>,                 // 0-20; requires logprobs: true (see "logprobs" below)
     pub n: Option<usize>,                            // rejected if > 1
 }
 ```
@@ -213,13 +260,20 @@ use `{"type": "text", "text": "..."}`. A vision-capable Metal checkpoint also ac
 `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` part on a user
 message; JPEG uses `data:image/jpeg;base64,...`. The image may appear between text parts and keeps
 that position in the rendered multimodal prompt. The decoded payload is capped at 48,000 bytes,
-and each serving image is capped at 256 pre-merge patches (overridable via the
-`LATTICE_VISION_MAX_PATCHES` environment variable, which falls back to 256 for any unset, empty,
-malformed, zero, or negative value) and 16 MiB of preprocessed patch data.
+the declared pixel dimensions are capped at 2048px per side, and each serving image is capped at
+256 pre-merge patches (overridable via the `LATTICE_VISION_MAX_PATCHES` environment variable,
+which falls back to 256 for any unset, empty, malformed, zero, or negative value) and 16 MiB of
+preprocessed patch data — an image over any of those three budgets is rejected with 400
+`image_dimensions_exceeded` rather than the generic `invalid_image` (which stays reserved for a
+payload that genuinely isn't a decodable PNG or JPEG).
 Image requests must use `stream: false` (or omit `stream`) until the multimodal decoder supports
 incremental deltas. Remote URLs are never fetched, multi-image requests are rejected, and a
-text-only/CPU model returns 400 `vision_unsupported`. Audio/file parts remain unsupported rather
-than being silently dropped.
+text-only/CPU model returns 400 `vision_unsupported`. An image combined with
+`response_format.json_schema` or a nonzero `reasoning_budget` is rejected with 400
+`image_unsupported_combination` before the request reaches the shared Metal worker. A transient
+failure loading the vision checkpoint's weights returns 400 `vision_load_failed`; the load is
+retried on the next image request rather than failing every subsequent request for the life of the
+process. Audio/file parts remain unsupported rather than being silently dropped.
 
 `messages[].role` must be `"system"`, `"user"`, or `"assistant"`; `"tool"` and `"developer"` are
 explicitly named and rejected (`"role 'tool' is not supported by this server"`); anything else
@@ -237,13 +291,15 @@ Requests are validated in a fixed sequence; the first failure wins. Useful to kn
 predict which error you'll get when more than one thing is wrong with a request:
 
 1. JSON body parses and is under the 1 MiB limit.
-2. `reject_unsupported`: `tools`/`tool_choice` present, `logprobs: true`, `n > 1`,
-   `response_format.type != "text"`.
+2. `reject_unsupported`: `tools`/`tool_choice` present, `n > 1`, `response_format.type != "text"`,
+   and `stream: true` combined with `logprobs: true` (bare `logprobs: true` without streaming is
+   no longer rejected here — see "logprobs" below).
 3. `model` matches the server's loaded model ID.
 4. `messages` is non-empty.
 5. The **last** message has role `"user"` (a Qwen ChatML constraint — the conversation must end on
    a user turn for the model to have something to respond to).
-6. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` are all in range.
+6. `max_tokens`/`max_completion_tokens`, `temperature`, `top_p` are all in range, then
+   `top_logprobs` is checked against `logprobs` (0-20, requires `logprobs: true`).
 7. Every message renders into ChatML (role + content-part checks).
 8. The rendered prompt's token count plus `max_tokens` plus `reasoning_budget` (plus one reserved
    delimiter token) fits the model's context window (#831:
@@ -263,8 +319,8 @@ Every error response uses this envelope, live-verified for all three status code
 
 ```
 $ curl -s -w '\n%{http_code}\n' http://127.0.0.1:8080/v1/chat/completions \
-    -d '{"model":"qwen3.5-0.8b","messages":[{"role":"user","content":"hi"}],"logprobs":true}'
-{"error":{"message":"logprobs is not supported by this server","type":"invalid_request_error","code":"unsupported_feature","param":null}}
+    -d '{"model":"qwen3.5-0.8b","messages":[{"role":"user","content":"hi"}],"stream":true,"logprobs":true}'
+{"error":{"message":"logprobs is not supported together with stream: true","type":"invalid_request_error","code":"unsupported_feature","param":null}}
 400
 ```
 
@@ -305,25 +361,29 @@ $ curl -s -w '\n%{http_code}\n' http://127.0.0.1:8080/v1/chat/completions \
 413
 ```
 
-### `logprobs` — rejected today, in review for support
+### `logprobs` — supported on the non-streaming path, CPU backend only
 
-As of this writing, `"logprobs": true` is unconditionally rejected
-(`"logprobs is not supported by this server"`, code `unsupported_feature`) — confirmed both by
-source and by a live request above. **PR #620** (issue #585, still open/draft as of this writing)
-adds real OpenAI-compatible `logprobs`/`top_logprobs` support to this exact endpoint's
-non-streaming path, with `top_logprobs` range-checked to `0..=20` and required to pair with
-`logprobs: true`. Two things worth knowing if you're reading this close to when that PR lands:
+`"logprobs": true` is accepted on the non-streaming path (PR #620, issue #585): the response's
+`choices[].logprobs` carries an OpenAI-shaped envelope (`content[].token`/`logprob`/`bytes` plus
+`top_logprobs`), and `top_logprobs` is range-checked to `0..=20` and requires `logprobs: true` to
+be set alongside it. `stream: true` combined with `logprobs: true` is still rejected with 400
+`unsupported_feature` — streaming logprobs is out of scope.
 
-- Per that PR's own description, `stream: true` combined with `logprobs: true` will still be
-  rejected with 400 even after it merges — streaming logprobs is explicitly out of scope for that
-  change.
-- That PR's own description also notes that the cross-turn prefix-cache generation path (see
-  [`docs/cross-turn-cache.md`](cross-turn-cache.md)) doesn't populate logprobs and isn't reachable
-  from this HTTP server anyway — not a regression from that change, just a documented gap.
-
-If you're reading this after #620 has merged, verify the current behavior against
-`reject_unsupported` in `lattice.rs` directly rather than trusting this paragraph — it will be
-stale at that point.
+This support has a real gap worth knowing about: it is wired into the plain CPU `generate()` /
+`generate_streaming()` decode loop and the plain (non-cache-aware) Metal `generate_streaming()`,
+but **not** into the cross-turn prefix-cache-aware Metal path
+(`generate_streaming_with_prefix_cache_and_cancel`, see
+[`docs/cross-turn-cache.md`](cross-turn-cache.md)) — and that cache-aware path is what the shared
+Metal worker now uses for every text Metal-backed request, streaming or not — vision requests take
+a separate `generate_multimodal_vision_with_cancel` path that never reaches it, see
+[`docs/cross-turn-cache.md`](cross-turn-cache.md)
+(`check_logprobs_not_set` in `crates/inference/src/model/qwen35/generation.rs` fails closed on it).
+In practice: `logprobs: true` against a CPU (safetensors) server works as documented above; the
+same request against a Metal/Q4-backed server currently fails with a generic HTTP 500
+`internal_error` (`"inference failed"`) rather than either a clean result or a specific
+`unsupported_feature` rejection — the request is accepted by validation and only fails once
+generation starts. Verify current behavior against `reject_unsupported` and `check_logprobs_not_set`
+directly rather than trusting this paragraph if it looks like it's changed.
 
 ## `POST /v1/chat/completions` — streaming (SSE)
 
@@ -359,19 +419,104 @@ data: [DONE]
 ping if 15 seconds pass with no event), so a slow prefill before the first token won't look like a
 dead connection to an intermediate proxy.
 
-Two caveats worth knowing before you build on this:
+One caveat worth knowing before you build on this:
 
-- **No disconnect-cancellation.** If the client disconnects mid-stream, generation keeps running
-  to the `max_tokens` cap on the server — the dropped send errors are silently ignored, but nothing
-  stops the underlying generation early. This is called out directly in the handler's own comment:
-  "per-token backpressure / disconnect-cancellation is a future refinement." The separate
-  `lattice_serve` daemon binary _does_ have this (a `CancelOnDrop`/`watch::channel` mechanism added
-  in PR #552/#606) — `lattice serve` does not, as of this writing.
+- **Disconnect-cancellation is implemented.** If the client disconnects mid-stream, generation
+  stops early instead of running to the `max_tokens` cap (ADR-080 C2, issue #744): the handler
+  builds a `cancel_pair()` (`lattice_inference::serve::cancel_pair`) whose receiver both backends
+  poll before prefill, immediately after prefill, and at the top of every decode iteration; a
+  `cancel_guard` is tied to the SSE stream's own lifetime, so the instant axum drops the response
+  stream (client disconnect), the guard drops with it, flipping the receiver and stopping
+  generation. This mirrors the `lattice_serve` daemon binary's own
+  `CancelOnDrop`/`watch::channel` mechanism (PR #552/#606) — the two binaries no longer differ
+  here.
 - **Mid-stream generation failures are explicit.** If generation errors after emitting content,
   the server preserves those partial content chunks, then emits an OpenAI error envelope as an SSE
   `data:` payload (`type: "server_error"`, `code: "internal_error"`) followed by `[DONE]`. It does
   not emit a finish chunk, so `finish_reason: "stop"` remains reserved for genuine stop conditions.
   The specific engine error is logged server-side and is not exposed to the client.
+
+## `POST /v1/embeddings`
+
+Requires the server to have been started with `--model` pointed at a vision-language checkpoint
+(see "Extra memory when embeddings are enabled" below). Text items, inline-image items, or a mixed
+batch of both in one request:
+
+```bash
+curl http://127.0.0.1:8080/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": ["a plain string", {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}],
+    "pooling": "mean_visual"
+  }'
+```
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "object": "embedding", "index": 0, "embedding": [0.0123, -0.0871, 0.0456, 0.0219] },
+    { "object": "embedding", "index": 1, "embedding": [0.0342, -0.0158, 0.0904, -0.0027] }
+  ],
+  "model": "the-served-model-id",
+  "usage": { "prompt_tokens": 3, "total_tokens": 3 }
+}
+```
+
+(Truncated to 4 floats for readability; the real `embedding` vector length equals the checkpoint's
+decoder hidden size.)
+
+`input` also accepts a single plain string instead of an array. Notes on the fields:
+
+- `pooling`: `"mean_visual"` (default) or `"last_token"`. Any other value is 400
+  `invalid_pooling`.
+- Image items use the exact same `{"type":"image_url","image_url":{"url":...}}` shape and inline
+  data-URI parser chat's vision path uses — **remote `http(s)` image URLs are rejected** (400
+  `unsupported_image_url_scheme`); only `data:image/...;base64,...` is accepted. Malformed,
+  oversized, or wrong-format data URIs are 400 `invalid_image`.
+- `embedding` vectors are already L2-normalized server-side; no client-side normalization is
+  needed.
+- `data[].index` matches the item's position in the request's `input` array regardless of
+  processing order, so a mixed batch's response is caller-verifiable by index.
+- `usage.prompt_tokens` counts the real decoder-scaffold token count each item processes: a text
+  item's tokenized length, or — for an image item — the `vision_start` token, the checkpoint's
+  per-image pad-token count (derived from the image's patch grid), the `vision_end` token, and the
+  prompt text's tokenized length. Image cost is billed in tokens of the same scaffold the pooled
+  vision path actually runs through, not a flat placeholder.
+- Every item (text or image) whose scaffold token count would exceed the loaded checkpoint's
+  context window is rejected before it reaches pooled prefill, with 400
+  `context_length_exceeded` naming the item's index, its token count, and the limit — the same
+  preflight chat's own context-window check performs, applied here per input item instead of per
+  whole request.
+
+Caps, all enforced before an item is processed:
+
+| Cap                      | Value       |
+| ------------------------ | ----------- |
+| Per-image decoded bytes  | 48,000      |
+| Per-image base64 payload | 64,000      |
+| `input` array length     | 4,096 items |
+| Request body             | 1 MiB       |
+
+Unlike chat, `/v1/embeddings` does not limit a request to one image — each `input` item is
+embedded independently, so a batch of many images in one request is the expected use, bounded by
+the 4,096-item cap above rather than a single-image rule.
+
+If no vision-language checkpoint is loaded, every request to this route is rejected with 400
+`vision_unsupported`, naming `--model` as the remedy — restart the server pointed at a
+vision-language checkpoint directory to enable the route.
+
+### Extra memory when embeddings are enabled
+
+The embeddings loader opens the same `--model` directory the chat backend loaded, but independently
+and in f16 (unquantized): it requires a non-quantized safetensors vision-language directory,
+rejecting any directory containing a `quantize_index.json` (a Q4 checkpoint) and requiring
+`config.json` to declare a `vision_config`. A Q4 chat directory cannot double as the embeddings
+model, so whenever embeddings is enabled the chat backend serving that same directory is not Q4
+either. This second f16 load of the separate embeddings weights sits on top of whatever the chat
+backend already holds in memory, at roughly 2 bytes per checkpoint parameter, so expect resident
+memory to grow by roughly that much. If the loaded model directory has no vision config, this extra
+load is skipped entirely and only the chat backend stays resident.
 
 ## Context window and token-budget limits
 
@@ -401,10 +546,15 @@ the model's own config — but the 4096 `max_tokens_cap` still applies to both b
 
 ## A realistic multi-turn example
 
-The server is stateless per request — there is no session/conversation ID, and (as covered in
-[`docs/cross-turn-cache.md`](cross-turn-cache.md)) no cross-turn KV cache reuse either. Every
-request must carry the full conversation history in `messages`, and every request re-prefills that
-entire history from scratch:
+The server is stateless per request — there is no session/conversation ID — so every request must
+carry the full conversation history in `messages`. That doesn't mean every request re-prefills that
+history from scratch: on a Metal/Q4-backed server, a text request that safely extends the previous
+turn reuses the retained KV/GDN prefix via `generate_streaming_with_prefix_cache_and_cancel`
+(`crates/inference/src/serve/metal_worker.rs:1218`) instead of a full re-prefill; a
+vision-classified request always takes the separate `generate_multimodal_vision_with_cancel` path
+(`crates/inference/src/serve/metal_worker.rs:1166`) and never participates in that cache. The CPU
+(safetensors) backend has no such cache and always re-prefills the full history. See
+[`docs/cross-turn-cache.md`](cross-turn-cache.md) for what counts as a safe extension:
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -429,14 +579,24 @@ message content. There is no requirement to strip reasoning blocks between turns
 ## Summary
 
 - `lattice serve` (not the separate `lattice_serve` binary) is the OpenAI-compatible server this
-  document covers: `GET /health`, `POST /v1/chat/completions`, nothing else.
+  document covers: `GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, and
+  `POST /v1/embeddings` (see above; the last requires a vision-language checkpoint at startup).
+  The standalone `lattice_serve` binary also carries a `POST /v1/embeddings` route (issue #584),
+  through a separately loaded `--embedding-model` `BertModel` -- see the "Both binaries also have
+  a `POST /v1/embeddings` route" note above and [`docs/capability-matrix.md`](capability-matrix.md).
 - Non-streaming and streaming (SSE) both work today; the request struct's doc comment claiming
   streaming is unsupported is stale — verify against `reject_unsupported` and its tests, not that
   comment.
 - Every error is the OpenAI error envelope shape (`error.message`/`type`/`code`/`param`), with
   `code` distinguishing specific failure reasons; malformed-JSON parser detail and internal
   generation failures are logged server-side only, never returned to the client.
-- `logprobs` is rejected today; PR #620 (in review) adds it non-streaming-only.
+- `logprobs` is supported non-streaming-only (PR #620); on the CPU backend it returns real
+  per-token log probabilities, but on the Metal/Q4 backend it currently fails with a generic 500
+  because the shared cross-turn-cache-aware generation path doesn't implement it — see "logprobs"
+  above.
 - `max_tokens` is hard-capped at 4096 server-wide; the Metal/Q4 backend additionally caps total
   context at 4096 regardless of the model's own configured maximum.
-- No cross-turn caching or disconnect-cancellation on the streaming path.
+- The Metal/Q4 backend has cross-turn KV/GDN prefix caching and a bounded pending-job admission
+  cap (`server_busy`, HTTP 503, at 32 outstanding jobs by default, configurable via
+  `--max-pending`); both binaries now support client-disconnect cancellation on the streaming
+  path.

@@ -48,6 +48,7 @@
 //!
 //!   The post-processor (`scripts/bench_decode_slopefit.py`) reads these lines
 //!   and produces the final JSON.
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -185,22 +186,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Greedy, stop_token_ids empty — EOS token (248044) still stops generation
     // via the hard-coded path in generate().  The prompt design above avoids
     // natural EOS in the first 256 tokens on the 0.8B model (verified empirically).
-    let make_cfg = |n_tokens: usize| GenerateConfig {
-        max_new_tokens: n_tokens,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        min_p: 0.0,
-        top_n_sigma: 0.0,
-        repetition_penalty: 1.0,
-        seed: Some(42),
-        stop_token_ids: vec![],
-        enable_thinking: false,
-        enable_mtp: None,
-        grammar: None,
-        stop_strings: vec![],
-        reasoning_budget: None,
-        logprobs: None,
+    let make_cfg = |n_tokens: usize| {
+        let mut cfg = GenerateConfig::default();
+        cfg.max_new_tokens = n_tokens;
+        cfg.temperature = 0.0;
+        cfg.top_k = 1;
+        cfg.top_p = 1.0;
+        cfg.repetition_penalty = 1.0;
+        cfg.seed = Some(42);
+        cfg.stop_token_ids = vec![];
+        cfg.enable_thinking = false;
+        cfg.enable_mtp = None;
+        cfg.grammar = None;
+        cfg.stop_strings = vec![];
+        cfg.reasoning_budget = None;
+        cfg.logprobs = None;
+        cfg
     };
 
     eprintln!(

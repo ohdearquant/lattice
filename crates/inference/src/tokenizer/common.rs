@@ -28,6 +28,14 @@ pub struct TokenizedInput {
     pub token_type_ids: Vec<u32>,
     /// Number of real tokens before padding.
     pub real_length: usize,
+    /// Number of tokens produced before any max-sequence-length truncation
+    /// was applied. Equal to `real_length` when the tokenizer did not
+    /// truncate; larger than `real_length` (and than `input_ids.len()`) when
+    /// it did. Context-window admission checks must compare against this
+    /// field, not `real_length`, since `real_length` can never exceed the
+    /// tokenizer's own `max_seq_len` and so cannot signal an over-limit
+    /// input when `max_seq_len <= max_position_embeddings`.
+    pub pre_truncation_len: usize,
 }
 
 /// **Stable**: object-safe tokenizer trait; concrete impls (`WordPieceTokenizer`,
@@ -96,11 +104,18 @@ pub trait Tokenizer: Send + Sync {
 }
 
 /// Pad an ID sequence and explicit token type IDs to a fixed target length.
+///
+/// `pre_truncation_len` is the token count before any max-sequence-length
+/// truncation the caller applied; it must be `>= ids.len()` before padding.
+/// Required rather than defaulted so a construction site cannot silently omit
+/// it and make the context-window admission guard unreachable (see
+/// `TokenizedInput::pre_truncation_len`'s doc for why the guard depends on it).
 pub(crate) fn pad_ids_with_token_types(
     mut ids: Vec<u32>,
     mut token_type_ids: Vec<u32>,
     pad_to: usize,
     pad_id: u32,
+    pre_truncation_len: usize,
 ) -> TokenizedInput {
     let real_length = ids.len();
     assert_eq!(
@@ -117,11 +132,23 @@ pub(crate) fn pad_ids_with_token_types(
         attention_mask,
         token_type_ids,
         real_length,
+        pre_truncation_len,
     }
 }
 
 /// Pad an ID sequence to a fixed target length.
-pub(crate) fn pad_ids(mut ids: Vec<u32>, pad_to: usize, pad_id: u32) -> TokenizedInput {
+///
+/// `pre_truncation_len` is the token count before any max-sequence-length
+/// truncation the caller applied; it must be `>= ids.len()` before padding.
+/// Required rather than defaulted so a construction site cannot silently omit
+/// it and make the context-window admission guard unreachable (see
+/// `TokenizedInput::pre_truncation_len`'s doc for why the guard depends on it).
+pub(crate) fn pad_ids(
+    mut ids: Vec<u32>,
+    pad_to: usize,
+    pad_id: u32,
+    pre_truncation_len: usize,
+) -> TokenizedInput {
     let real_length = ids.len();
     let mut attention_mask = vec![1u32; real_length];
     ids.resize(pad_to, pad_id);
@@ -133,6 +160,7 @@ pub(crate) fn pad_ids(mut ids: Vec<u32>, pad_to: usize, pad_id: u32) -> Tokenize
         attention_mask,
         token_type_ids,
         real_length,
+        pre_truncation_len,
     }
 }
 
@@ -830,8 +858,17 @@ pub(crate) fn parse_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
 /// `special=false` added tokens (`<think>`/`</think>`, `<tool_call>`, FIM markers)
 /// are emitted verbatim. The base BPE vocab does not contain any added-token ids,
 /// so without this map their decode falls through to nothing and they are silently
-/// swallowed from the output stream. Returns `content -> id`.
-pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<String, u32> {
+/// swallowed from the output stream. Returns `id -> content`.
+///
+/// Keyed by ID, not by content, and the direction is load-bearing rather than a
+/// convenience for the callers that used to invert it. `added_tokens` may declare
+/// the same content twice at two ids, and keying by content silently kept only
+/// whichever entry parsed last. Every consumer wants `id -> content` anyway
+/// (decode-side rendering, and the alias set behind reasoning-close-marker
+/// validation), so the content-keyed intermediate existed only to lose the
+/// duplicate on the way. An id can render exactly one spelling, so this direction
+/// collapses nothing.
+pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<u32, String> {
     let mut tokens = HashMap::new();
     let Some(array) = root.get("added_tokens").and_then(JsonValue::as_array) else {
         return tokens;
@@ -859,7 +896,7 @@ pub(crate) fn parse_rendered_added_tokens(root: &JsonValue) -> HashMap<String, u
         else {
             continue;
         };
-        tokens.insert(content.to_string(), id);
+        tokens.insert(id, content.to_string());
     }
 
     tokens
@@ -1113,13 +1150,14 @@ mod tests {
         .unwrap();
 
         let rendered = parse_rendered_added_tokens(&json);
+        // Keyed by id, so the map answers "what does this id render as".
         // special=true is excluded (HF skip_special_tokens=True swallows it).
-        assert_eq!(rendered.get("<|im_start|>"), None);
+        assert!(!rendered.values().any(|c| c == "<|im_start|>"));
         // special=false renders verbatim.
-        assert_eq!(rendered.get("</think>").copied(), Some(2));
+        assert_eq!(rendered.get(&2).map(String::as_str), Some("</think>"));
         // absent special field defaults to false → renders.
-        assert_eq!(rendered.get("<think>").copied(), Some(3));
-        assert_eq!(rendered.get("<tool_call>").copied(), Some(4));
+        assert_eq!(rendered.get(&3).map(String::as_str), Some("<think>"));
+        assert_eq!(rendered.get(&4).map(String::as_str), Some("<tool_call>"));
         assert_eq!(rendered.len(), 3);
     }
 

@@ -2365,17 +2365,12 @@ pub(crate) fn checked_double(value: usize, what: &str) -> Result<usize, Inferenc
 
 /// **Unstable**: sampling configuration for text generation; fields may expand.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct GenerateConfig {
     pub max_new_tokens: usize,
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
-    /// Relative probability floor. Tokens below `min_p * max_probability` are removed.
-    /// `0.0` or NaN disables filtering; all other values clamp to `[0.0, 1.0]`.
-    pub min_p: f32,
-    /// Logit-space floor measured down from the maximum in population standard
-    /// deviations. Non-finite or non-positive values disable filtering.
-    pub top_n_sigma: f32,
     pub repetition_penalty: f32,
     /// Random seed for sampling. `None` = seed from system time.
     pub seed: Option<u64>,
@@ -2397,7 +2392,10 @@ pub struct GenerateConfig {
     pub stop_strings: Vec<String>,
     /// Reasoning-budget forcing (s1-style): after this many reasoning tokens are
     /// generated without a `</think>`, force-inject `</think>` to commit the model
-    /// to an answer. `None` or `Some(0)` = disabled (no behaviour change).
+    /// to an answer. `None`, `Some(0)`, or [`enable_thinking`](Self::enable_thinking)
+    /// `== false` = disabled (no behaviour change) -- with thinking disabled there is
+    /// no reasoning block for a forced `</think>` to close, so the budget is inert
+    /// regardless of its value. See [`GenerateConfig::effective_reasoning_budget`].
     pub reasoning_budget: Option<usize>,
     /// Capture per-token log-probabilities (OpenAI `logprobs`/`top_logprobs`).
     /// `None` (default) disables capture entirely -- no extra allocation or
@@ -2415,8 +2413,6 @@ impl std::fmt::Debug for GenerateConfig {
             .field("temperature", &self.temperature)
             .field("top_k", &self.top_k)
             .field("top_p", &self.top_p)
-            .field("min_p", &self.min_p)
-            .field("top_n_sigma", &self.top_n_sigma)
             .field("repetition_penalty", &self.repetition_penalty)
             .field("seed", &self.seed)
             .field("stop_token_ids", &self.stop_token_ids)
@@ -2437,8 +2433,6 @@ impl Default for GenerateConfig {
             temperature: 0.7,
             top_k: 50,
             top_p: 0.9,
-            min_p: 0.0,
-            top_n_sigma: 0.0,
             repetition_penalty: 1.1,
             seed: None,
             stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
@@ -2452,12 +2446,36 @@ impl Default for GenerateConfig {
     }
 }
 
+impl GenerateConfig {
+    /// `reasoning_budget` as every decode-path consumer must see it: `None`
+    /// whenever `enable_thinking` is false, since a budget without a
+    /// reasoning block to close is inert (see the field's own doc).
+    ///
+    /// This is the single point where that contract is enforced. Every
+    /// `decode_cap` / `check_context_budget` / `DecodePolicy` call site reads
+    /// this instead of the raw `reasoning_budget` field, so a future
+    /// consumer that does the same is correct by construction instead of
+    /// having to re-derive the `enable_thinking` gate itself.
+    pub(crate) fn effective_reasoning_budget(&self) -> Option<usize> {
+        self.reasoning_budget.filter(|_| self.enable_thinking)
+    }
+}
+
 /// Decide whether to force-close the thinking block this step (s1 budget forcing).
 ///
 /// Returns `Some(close_id)` to override the sampled token with `</think>`, else `None`.
-/// All conditions must hold: budget enabled and non-zero, thinking block is still open,
-/// enough tokens have been generated. Returns `None` immediately if any guard fails so
-/// the common disabled path costs a single `Option::None` check per step.
+/// All conditions must hold: thinking is enabled, budget enabled and non-zero, thinking
+/// block is still open, enough tokens have been generated. Returns `None` immediately if
+/// any guard fails so the common disabled path costs a single `Option::None` check per
+/// step.
+///
+/// `enable_thinking: false` makes `reasoning_budget` inert here regardless of its value --
+/// no reasoning block is produced in that state (the caller is contracted to have primed
+/// the prompt accordingly, see [`GenerateConfig::enable_thinking`]), so there is nothing to
+/// force-close. `resolve_reasoning_close_token` (`qwen35/generation.rs`), which resolves
+/// `close_id` for this function's `close_id` parameter, applies the identical
+/// short-circuit before validating the tokenizer, so the two functions agree about what the
+/// combination means instead of one rejecting it and the other silently no-opping.
 #[inline]
 pub(crate) fn force_close_think(
     reasoning_budget: Option<usize>,
@@ -2622,8 +2640,6 @@ mod tests {
         assert!((gen_cfg.temperature - 0.7).abs() < 1e-6);
         assert_eq!(gen_cfg.top_k, 50);
         assert!((gen_cfg.top_p - 0.9).abs() < 1e-6);
-        assert_eq!(gen_cfg.min_p, 0.0);
-        assert_eq!(gen_cfg.top_n_sigma, 0.0);
         assert!((gen_cfg.repetition_penalty - 1.1).abs() < 1e-6);
         assert!(
             gen_cfg.stop_token_ids.contains(&QWEN_CHAT_IM_END_TOKEN_ID),

@@ -17,6 +17,7 @@
 //!
 //! Metal run:
 //!   cargo bench -p lattice-inference --features "f16,metal-gpu" --bench topk_readback
+#![allow(clippy::field_reassign_with_default)]
 
 use std::time::Duration;
 
@@ -543,15 +544,12 @@ fn bench_sampling_pipeline(c: &mut Criterion) {
     group.bench_function("wide_k256_topp0.9", |b| {
         b.iter_batched(
             || {
-                Sampler::new(SamplingConfig {
-                    temperature: 0.7,
-                    top_k: 256,
-                    top_p: 0.9,
-                    min_p: 0.0,
-                    top_n_sigma: 0.0,
-                    repetition_penalty: 1.1,
-                })
-                .with_seed(0xDEAD_BEEF)
+                let mut sampling_config = SamplingConfig::default();
+                sampling_config.temperature = 0.7;
+                sampling_config.top_k = 256;
+                sampling_config.top_p = 0.9;
+                sampling_config.repetition_penalty = 1.1;
+                Sampler::new(sampling_config).with_seed(0xDEAD_BEEF)
             },
             |mut sampler| black_box(sampler.sample(black_box(&logits))),
             BatchSize::SmallInput,

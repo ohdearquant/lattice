@@ -2110,27 +2110,38 @@ class X86EmbedDriftObservationWorkflowTests(unittest.TestCase):
 
     def test_job_reports_failures_without_gating_the_workflow(self) -> None:
         self.assertIn("continue-on-error: true", self.job)
-        self.assertIn("-- --model bge-small-en-v1.5 --download-only", self.job)
-        self.assertIn("LATTICE_DRIFT_GATE_ENFORCE: '1'", self.job)
+        self._assert_provisions_all_four_models(self.job)
         self.assertIn(
-            "-- --nocapture > embed-drift-x86.log 2>&1",
+            "cargo run --release -p lattice-embed --bin embed-drift "
+            "-- --enforce --json",
             self.job,
         )
-        self.assertIn('exit "$status"', self.job)
+
+    def _assert_provisions_all_four_models(self, job: str) -> None:
+        provision_step = _workflow_step(job, "Provision embedding model weights")
+        for model in (
+            "bge-small-en-v1.5",
+            "multilingual-e5-small",
+            "all-minilm-l6-v2",
+            "paraphrase-multilingual-minilm-l12-v2",
+        ):
+            self.assertIn(model, provision_step)
         self.assertIn(
-            "grep -Fq 'Loaded drift baseline:' embed-drift-x86.log",
-            self.job,
-        )
-        self.assertIn(
-            "grep -Fq '[bge-small drift gate] max(1-cosine)=' "
-            "embed-drift-x86.log",
-            self.job,
+            "cargo run --release -p lattice-embed --bin embed \\\n"
+            '              -- --model "$model" --download-only',
+            provision_step,
         )
 
     def test_observation_does_not_replace_the_required_arm_gate(self) -> None:
         arm_job = _workflow_job(self.contents, "embed-drift")
         self.assertIn("runs-on: ubuntu-24.04-arm", arm_job)
-        self.assertIn("LATTICE_DRIFT_GATE_ENFORCE: '1'", arm_job)
+        self.assertNotIn("continue-on-error: true", arm_job)
+        self._assert_provisions_all_four_models(arm_job)
+        self.assertIn(
+            "cargo run --release -p lattice-embed --bin embed-drift "
+            "-- --enforce --json",
+            arm_job,
+        )
 
         parity_gate = _workflow_job(self.contents, "parity-gate")
         self.assertIn("embed-drift,", parity_gate)
@@ -2254,11 +2265,19 @@ class E2eRunnerSpecializationWorkflowTests(unittest.TestCase):
         self.assertIn("-xf quarot-q4.tar", q4_metal_code)
         self.assertIn("LATTICE_QUAROT_ARTIFACT_CONSUMED", q4_metal_code)
         self.assertNotIn("--bin quantize_quarot", q4_metal_code)
+        # The injection gate's filter list is pinned in full, and after the
+        # `--` separator. `cargo test` accepts one positional TESTNAME, so a
+        # multi-term filter written as `--lib a b c` exits 1 at argument
+        # parsing before any test binary is built; only libtest, on the far
+        # side of `--`, ORs multiple filters. Pinning the separator and every
+        # term is what distinguishes the working invocation from that
+        # look-alike, and it makes a change to the selected surface land in
+        # the same commit as the exact-count grep the gate asserts.
         for metal_gate_anchor in (
             "--test quarot_q4_composed_golden",
             '--features "f16,metal-gpu"',
             "LATTICE_METAL_TEST_ENFORCE: '1'",
-            "--lib inject -- --nocapture --test-threads=1",
+            "-- inject emit_head vision_runtime_preload",
             "--test vision_s5b_e2e_gate_test",
             "LATTICE_VISION_S5B_GREEDY_TOKENS",
             "--bin eval_perplexity --bin quantize_q4",

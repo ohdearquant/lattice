@@ -59,3 +59,11 @@ version = 2
 # runs continue-on-error (informational), so a fresh upstream disclosure cannot
 # wedge merges while still showing up in the log.
 yanked = "deny"
+ignore = [
+    # RUSTSEC-2024-0436 (paste 1.0.15): unmaintained-only advisory, no
+    # vulnerability. paste is a compile-time proc-macro that ships no runtime
+    # code. Every dependency path is transitive via metal / wgpu-hal /
+    # tokenizers, and no patched upgrade is available. Remove this entry once
+    # those upstreams drop paste.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained-only advisory (no vulnerability); paste is a compile-time proc-macro that ships no runtime code; all dependency paths are transitive via metal / wgpu-hal / tokenizers with no patched upgrade available; remove this entry when those upstreams drop paste" },
+]

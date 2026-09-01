@@ -24,7 +24,6 @@ pub struct SamplingConfig {
     pub top_k: usize,       // default 50
     pub top_p: f32,         // default 0.9
     pub min_p: f32,         // default 0.0 (disabled)
-    pub top_n_sigma: f32,   // default 0.0 (disabled)
     pub repetition_penalty: f32, // default 1.1
 }
 // SamplingConfig::greedy() factory: temperature=0, top_k=1
@@ -54,7 +53,7 @@ Key fast paths:
 
 ## Decision
 
-Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** and a `CandidateSet` intermediate. The canonical order is repetition penalty → top-n-sigma → temperature → top-k → min-p → top-p. Use **Xorshift64** as the PRNG. Use a **NEON threshold gate** to skip ~95% of the vocabulary before heap allocation in top-k. Provide a **greedy fast path** that avoids all allocation when argmax is not in the repetition window.
+Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** and a `CandidateSet` intermediate that separates the pipeline stages. The canonical order is repetition penalty → top-n-sigma → temperature → top-k → min-p → top-p. Use **Xorshift64** as the PRNG. Use a **NEON threshold gate** to skip ~95% of the vocabulary before heap allocation in top-k. Provide a **greedy fast path** that avoids all allocation when argmax is not in the repetition window.
 
 ---
 
@@ -67,7 +66,7 @@ Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** 
 5. **Repetition penalty applied to logit space**: `apply_repetition_penalty()` divides positive logits and multiplies negative logits (not a simple additive penalty). This is the standard HuggingFace convention: dividing by 1.1 for a token that appeared recently reduces its probability without creating negative infinity for tokens with positive logits.
 6. **Greedy fast path criteria**: The fast path skips when `temperature <= 0` OR `top_k == 1`, AND the argmax token is not in `recent_tokens`. If the argmax is in `recent_tokens`, repetition penalty must be applied, which requires the logit copy. The check is O(64) (linear scan of recent_tokens) — faster than the 993 KB clone.
 7. **`recent_tokens` window = 64**: 64 tokens at one per auto-regressive step is ~40–80 words of context. This is sufficient to prevent immediate n-gram repetition in generated text without excessive memory overhead.
-8. **Top-n-sigma precedes temperature and probability filters**: after repetition penalty, compute the population standard deviation over every finite adjusted logit, excluding `-∞` masks, and keep logits at least `max_logit - nσ`. The implementation uses f64 Welford accumulation without allocating. Non-finite or non-positive `n` disables the filter. Because the full vocabulary defines `σ`, an active filter routes Metal generation around compact top-k readback to the existing full-logit host sampler.
+8. **Top-n-sigma precedes temperature and probability filters**: after repetition penalty, compute the population standard deviation over every finite adjusted logit, excluding `-∞` masks, and mask logits below `max_logit - nσ`. The implementation uses f64 Welford accumulation without allocating. Non-finite or non-positive `n` disables the filter, and argmax-shaped selections (the greedy fast path, degenerate temperature, `top_k == 1`) skip it, since masking strictly below the max cannot change an argmax. Like min-p, the knob is carried out-of-band from the exhaustively-constructible published configs (`Sampler::with_top_n_sigma`, a `sample_full_logits` parameter); no production entry point sets it yet.
 9. **Min-p precedes top-p**: after top-n-sigma, temperature, and top-k, discard candidates whose probability is below `min_p * max_probability`, renormalize, then apply top-p. Since softmax weights share one denominator, the implementation compares `exp(logit - max_logit)` directly with `min_p`; this avoids an extra normalization pass. A default of `0.0` preserves the pre-min-p distribution exactly.
 
 ---
@@ -91,7 +90,8 @@ Implement sampling as a **`Sampler` struct with pre-allocated scratch buffers** 
 
 - Zero allocation in the greedy path when argmax is not in `recent_tokens` — the dominant case for embedding generation.
 - NEON gate reduces the top-k candidate set to ~100 tokens before any heap write, enabling O(100) sort instead of O(151,669).
-- CPU and Metal full-logit routes share one repetition/top-n-sigma/temperature/top-k/min-p/top-p pipeline.
+- `CandidateSet` API separates penalty, temperature, top-k, min-p, and top-p as composable pipeline stages.
+- CPU and Metal full-logit routes share one repetition/top-n-sigma/temperature/top-k/min-p/top-p engine (`sample_full_logits`).
 - Xorshift64 generates uniform samples in ~3 cycles; negligible overhead vs logit processing.
 
 **Negative**:

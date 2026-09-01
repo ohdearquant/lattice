@@ -368,6 +368,7 @@ impl ModelBackend {
         model_dir: std::path::PathBuf,
         tokenizer_dir: Option<std::path::PathBuf>,
         max_pending: usize,
+        preload_vision: bool,
     ) -> Result<(Self, usize), String> {
         use lattice_inference::serve::metal_worker::{
             ContextWindowPolicy, MetalWorker, StartupError, VisionRuntime, WorkerMetadata,
@@ -399,7 +400,20 @@ impl ModelBackend {
         // first in `prepare_chat_request`.
         let max_context = crate::chat::chat_max_cache_len();
         let vision_config = crate::chat::load_q4_config(&model_dir)?;
-        let vision_runtime = VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
+        let mut vision_runtime =
+            VisionRuntime::from_model_config(model_dir.clone(), &vision_config);
+        if preload_vision {
+            // issue #1336: eager-load now, on this startup thread, before the
+            // Metal worker thread spawns. Lazy stays the default (see the
+            // `--preload-vision` help text); a failure here must not abort
+            // startup — warn and fall back to the normal lazy load on the
+            // first image request, exactly as if this flag were absent.
+            if let Err(err) = vision_runtime.preload() {
+                eprintln!(
+                    "Warning: --preload-vision failed, falling back to lazy vision loading: {err}"
+                );
+            }
+        }
         let model_dir_for_loader = model_dir.clone();
         let tokenizer_path_for_loader = tokenizer_path.clone();
         let (owner, client, _meta) = MetalWorker::spawn_with_vision(
@@ -491,6 +505,13 @@ pub struct AppState {
     /// Monotonically increasing counter used to make response IDs unique
     /// across concurrent requests within the same second.
     pub request_counter: Arc<AtomicU64>,
+    /// Pooled text/image embedding model for `/v1/embeddings`, loaded
+    /// independently of `model` (a separate f16-packed checkpoint format --
+    /// see `lattice_inference::serve::embeddings`'s module doc comment).
+    /// `None` when no vision-language checkpoint was found at the served
+    /// model directory; every `/v1/embeddings` request then fails closed
+    /// with `vision_unsupported`.
+    pub embedding_model: Option<Arc<lattice_inference::serve::embeddings::EmbeddingModel>>,
 }
 
 // -----------------------------------------------------------------------
@@ -808,18 +829,22 @@ pub(super) fn finish_reason_for(
 /// Decode-side token allowance for the post-generation length invariant
 /// (#1334).
 ///
-/// Mirrors the decode term of admission's shared full-window formula
-/// (`crates/inference/src/serve/contract.rs::validate_context_window_with_budget`):
-/// `prompt + max_tokens + reasoning_budget + 1 <= max_context`. Admission's
-/// `+1` reserves the prompt/generation delimiter and has no counterpart
-/// here -- this only bounds tokens the engine actually generated, so the
-/// invariant is `generated_tokens > max_tokens + reasoning_budget`, not
-/// `> max_tokens + reasoning_budget + 1`. Using the same
-/// `max_tokens.saturating_add(reasoning_budget)` term as admission's
-/// `decode_budget` keeps the two checks from drifting apart the way the
-/// post-generation check drifted from admission before #1334.
+/// Mirrors `decode_cap` (`crates/inference/src/model/qwen35_config.rs`),
+/// which this must stay in agreement with: when a positive
+/// `reasoning_budget` is active and the model does not close its own
+/// thinking block, the engine force-emits a `</think>` delimiter as an
+/// extra generated token (`force_close_think` / `DecodePolicy::
+/// apply_override`), so a completion that legitimately used the full
+/// reasoning and answer allowance is `reasoning_budget + max_tokens + 1`
+/// tokens long, not `reasoning_budget + max_tokens`. The invariant is
+/// `generated_tokens > reasoning_budget + max_tokens + 1` for a positive
+/// budget, and unchanged at `generated_tokens > max_tokens` when the
+/// budget is absent or zero (no forced delimiter can occur).
 fn decode_token_budget(max_tokens: usize, reasoning_budget: Option<usize>) -> usize {
-    max_tokens.saturating_add(reasoning_budget.unwrap_or(0))
+    match reasoning_budget {
+        Some(rb) if rb > 0 => rb.saturating_add(max_tokens).saturating_add(1),
+        _ => max_tokens,
+    }
 }
 
 /// Resolve a token id back to its OpenAI `logprobs` text/bytes representation (#585).
@@ -892,8 +917,19 @@ pub async fn health() -> Json<HealthResponse> {
 /// had no equivalent route at all, an undocumented route-set divergence
 /// between the two binaries -- the routes did not actually match 1:1
 /// until this route landed.
+///
+/// Built locally rather than returning the shared
+/// [`lattice_inference::serve::root_body`] verbatim: this binary's
+/// `/v1/embeddings` route (unlike `/v1/chat/completions`, `/v1/models`, and
+/// `/health`) does not exist on `lattice_serve.rs` yet, so advertising it
+/// through the byte-identical shared body would falsely claim the daemon
+/// has it too.
 pub async fn root() -> Json<Value> {
-    Json(lattice_inference::serve::root_body())
+    let mut body = lattice_inference::serve::root_body();
+    if let Some(endpoints) = body.get_mut("endpoints").and_then(Value::as_array_mut) {
+        endpoints.push(Value::String("/v1/embeddings".to_string()));
+    }
+    Json(body)
 }
 
 /// `GET /v1/models` (ADR-080 C2, #746's sibling gap): advertises the
@@ -1144,6 +1180,7 @@ pub async fn chat_completions(
 /// generation/streaming behavior, not the raw-bytes preflight, which is
 /// covered separately in `serve::contract`'s own tests and this
 /// binary's router-level tests.
+#[allow(clippy::field_reassign_with_default)]
 async fn chat_completions_with_request(
     State(state): State<AppState>,
     req: ChatCompletionRequest,
@@ -1169,16 +1206,14 @@ async fn chat_completions_with_request(
         || state.model.max_context(),
     )?;
 
-    let gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig {
-        max_new_tokens: max_tokens,
-        temperature,
-        top_p,
-        seed,
-        stop_strings,
-        reasoning_budget,
-        logprobs,
-        ..Default::default()
-    };
+    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    gen_cfg.max_new_tokens = max_tokens;
+    gen_cfg.temperature = temperature;
+    gen_cfg.top_p = top_p;
+    gen_cfg.seed = seed;
+    gen_cfg.stop_strings = stop_strings;
+    gen_cfg.reasoning_budget = reasoning_budget;
+    gen_cfg.logprobs = logprobs;
 
     // Metal-only: reuse the exact messages normalized alongside the CPU
     // prompt, so role/content validation and allocation happen once.
@@ -1540,6 +1575,84 @@ async fn chat_completions_with_request(
 }
 
 // -----------------------------------------------------------------------
+// Embeddings
+// -----------------------------------------------------------------------
+
+/// `POST /v1/embeddings`: pooled text and image embeddings, OpenAI
+/// `embeddings`-shaped request/response. See
+/// `lattice_inference::serve::embeddings` for the wire contract and pooled
+/// execution this handler wires into axum.
+pub async fn embeddings(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<Response, ApiError> {
+    use lattice_inference::serve::embeddings::{
+        EmbeddingsRequest, embed_items, normalize_embedding_items, parse_pooling,
+    };
+
+    lattice_inference::serve::require_json_content_type(&headers)?;
+
+    let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
+        .await
+        .map_err(|err| {
+            let is_length_limit = std::error::Error::source(&err)
+                .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+            if is_length_limit {
+                return ApiError::PayloadTooLarge {
+                    message: "request body exceeds 1 MiB limit".to_string(),
+                };
+            }
+            eprintln!("invalid request body: {err}");
+            ApiError::BadRequest {
+                message: "invalid JSON request body".to_string(),
+                code: "invalid_request_body",
+            }
+        })?;
+
+    let req: EmbeddingsRequest = serde_json::from_slice(&bytes).map_err(|err| {
+        eprintln!("invalid request body: {err}");
+        ApiError::BadRequest {
+            message: "invalid JSON request body".to_string(),
+            code: "invalid_request_body",
+        }
+    })?;
+
+    let pooling = parse_pooling(req.pooling.as_deref())?;
+    let items = normalize_embedding_items(req.input.into_items())?;
+
+    let Some(embedder) = state.embedding_model.clone() else {
+        return Err(ApiError::BadRequest {
+            message: "embeddings require a loaded vision-language checkpoint; restart this \
+                      server with `--model` pointed at a vision-language checkpoint directory \
+                      to enable this route"
+                .to_string(),
+            code: "vision_unsupported",
+        });
+    };
+    let model_id = state.model_id.clone();
+
+    let (data, usage) = tokio::task::spawn_blocking(move || embed_items(&embedder, items, pooling))
+        .await
+        .map_err(|e| {
+            eprintln!("task join error: {e}");
+            ApiError::Internal {
+                message: "inference failed".to_string(),
+            }
+        })??;
+
+    Ok(
+        Json(lattice_inference::serve::embeddings::EmbeddingsResponse {
+            object: "list",
+            data,
+            model: model_id,
+            usage,
+        })
+        .into_response(),
+    )
+}
+
+// -----------------------------------------------------------------------
 // Router
 // -----------------------------------------------------------------------
 
@@ -1549,6 +1662,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/embeddings", post(embeddings))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
@@ -1673,6 +1787,7 @@ mod tests {
                 max_tokens_cap: 4096,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             };
             (state, unblock_tx, started_rx)
         }
@@ -3119,6 +3234,7 @@ mod tests {
             max_tokens_cap,
             model_id: "test-model".to_string(),
             request_counter: Arc::new(AtomicU64::new(0)),
+            embedding_model: None,
         }
     }
 
@@ -3222,6 +3338,7 @@ mod tests {
                 max_tokens_cap: 64,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             };
 
             let response = router(state)
@@ -3248,6 +3365,176 @@ mod tests {
             assert_eq!(
                 value["error"]["message"],
                 "image input requires a vision-capable model"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // POST /v1/embeddings router-level contract tests.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "test-utils")]
+    mod embeddings_route {
+        use super::*;
+        use axum::body::Body;
+        use lattice_inference::serve::embeddings::test_support::{
+            tiny_embedding_model, tiny_png_data_uri,
+        };
+        use tower::ServiceExt as _;
+
+        fn post_embeddings(body: serde_json::Value) -> axum::http::Request<Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request fixture must build")
+        }
+
+        fn state_with_embedder() -> AppState {
+            let mut state = tiny_state(64);
+            state.embedding_model = Some(Arc::new(tiny_embedding_model()));
+            state
+        }
+
+        async fn json_body(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            serde_json::from_slice(&bytes).expect("response body must be JSON")
+        }
+
+        #[tokio::test]
+        async fn no_embedding_model_loaded_fails_closed() {
+            let response = router(tiny_state(64))
+                .oneshot(post_embeddings(serde_json::json!({"input": "a"})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "vision_unsupported");
+        }
+
+        #[tokio::test]
+        async fn happy_path_text_only() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({"input": "a"})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            assert_eq!(value["object"], "list");
+            assert_eq!(value["data"][0]["object"], "embedding");
+            assert_eq!(value["data"][0]["index"], 0);
+            assert_eq!(value["data"][0]["embedding"].as_array().unwrap().len(), 8);
+        }
+
+        #[tokio::test]
+        async fn happy_path_image() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({
+                    "input": {"type": "image_url", "image_url": {"url": tiny_png_data_uri(0)}},
+                })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            let embedding = value["data"][0]["embedding"].as_array().unwrap();
+            let norm: f64 = embedding
+                .iter()
+                .map(|x| x.as_f64().unwrap().powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!((norm - 1.0).abs() < 1e-3, "expected unit norm, got {norm}");
+        }
+
+        #[tokio::test]
+        async fn mixed_batch_preserves_input_order() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({
+                    "input": [
+                        "a",
+                        {"type": "image_url", "image_url": {"url": tiny_png_data_uri(1)}},
+                        "b",
+                    ],
+                })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            let data = value["data"].as_array().unwrap();
+            assert_eq!(data.len(), 3);
+            assert_eq!(data[0]["index"], 0);
+            assert_eq!(data[1]["index"], 1);
+            assert_eq!(data[2]["index"], 2);
+        }
+
+        #[tokio::test]
+        async fn remote_url_rejected() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({
+                    "input": {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+                })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "unsupported_image_url_scheme");
+        }
+
+        #[tokio::test]
+        async fn malformed_data_uri_rejected() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({
+                    "input": {"type": "image_url", "image_url": {"url": "data:image/png,not-base64-marked"}},
+                })))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn invalid_pooling_rejected() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(
+                    serde_json::json!({"input": "a", "pooling": "max"}),
+                ))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "invalid_pooling");
+        }
+
+        #[tokio::test]
+        async fn empty_input_rejected() {
+            let response = router(state_with_embedder())
+                .oneshot(post_embeddings(serde_json::json!({"input": []})))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let value = json_body(response).await;
+            assert_eq!(value["error"]["code"], "invalid_input");
+        }
+
+        #[tokio::test]
+        async fn embeddings_route_advertised_at_root() {
+            let response = router(tiny_state(64))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("router must return a response");
+            let value = json_body(response).await;
+            assert!(
+                value["endpoints"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e == "/v1/embeddings")
             );
         }
     }
@@ -3591,6 +3878,7 @@ mod tests {
                 max_tokens_cap,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             }
         }
 
@@ -4045,6 +4333,7 @@ mod tests {
                 max_tokens_cap,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             }
         }
 
@@ -4246,6 +4535,7 @@ mod tests {
                 max_tokens_cap: 64,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             };
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -4273,16 +4563,16 @@ mod tests {
         /// field mirrors the request, every other field is
         /// `GenerateConfig::default()` -- exactly like production's own
         /// `..Default::default()` tail.
+        #[allow(clippy::field_reassign_with_default)]
         fn expected_gen_cfg() -> GenerateConfigSnapshot {
-            GenerateConfigSnapshot::from(&lattice_inference::model::qwen35_config::GenerateConfig {
-                max_new_tokens: 9,
-                temperature: 1.3,
-                top_p: 0.55,
-                seed: Some(7),
-                stop_strings: vec![],
-                logprobs: None,
-                ..Default::default()
-            })
+            let mut cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+            cfg.max_new_tokens = 9;
+            cfg.temperature = 1.3;
+            cfg.top_p = 0.55;
+            cfg.seed = Some(7);
+            cfg.stop_strings = vec![];
+            cfg.logprobs = None;
+            GenerateConfigSnapshot::from(&cfg)
         }
 
         #[tokio::test]
@@ -4388,6 +4678,7 @@ mod tests {
                 max_tokens_cap,
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
+                embedding_model: None,
             }
         }
 
@@ -4461,9 +4752,12 @@ mod tests {
 
         #[tokio::test]
         async fn non_streaming_exact_acceptance_positive_budget() {
+            // The +1 is the forced </think> delimiter (#1372): a positive
+            // reasoning_budget allows rb + max_tokens + 1 generated tokens,
+            // not rb + max_tokens.
             assert_non_streaming(
                 Some(REASONING_BUDGET),
-                MAX_TOKENS + REASONING_BUDGET,
+                MAX_TOKENS + REASONING_BUDGET + 1,
                 true,
                 "non-streaming, positive reasoning_budget, exact budget",
             )
@@ -4474,7 +4768,7 @@ mod tests {
         async fn non_streaming_one_past_rejection_positive_budget() {
             assert_non_streaming(
                 Some(REASONING_BUDGET),
-                MAX_TOKENS + REASONING_BUDGET + 1,
+                MAX_TOKENS + REASONING_BUDGET + 2,
                 false,
                 "non-streaming, positive reasoning_budget, one past budget",
             )
@@ -4563,9 +4857,12 @@ mod tests {
 
         #[tokio::test]
         async fn streaming_exact_acceptance_positive_budget() {
+            // The +1 is the forced </think> delimiter (#1372): a positive
+            // reasoning_budget allows rb + max_tokens + 1 generated tokens,
+            // not rb + max_tokens.
             assert_streaming(
                 Some(REASONING_BUDGET),
-                MAX_TOKENS + REASONING_BUDGET,
+                MAX_TOKENS + REASONING_BUDGET + 1,
                 true,
                 "streaming, positive reasoning_budget, exact budget",
             )
@@ -4576,7 +4873,7 @@ mod tests {
         async fn streaming_one_past_rejection_positive_budget() {
             assert_streaming(
                 Some(REASONING_BUDGET),
-                MAX_TOKENS + REASONING_BUDGET + 1,
+                MAX_TOKENS + REASONING_BUDGET + 2,
                 false,
                 "streaming, positive reasoning_budget, one past budget",
             )

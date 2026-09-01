@@ -3,8 +3,7 @@
 //! draw, and RNG helper.
 use crate::model::qwen35_config::GenerateConfig;
 
-/// Sample a token from logits using repetition penalty, top-n-sigma,
-/// temperature, top-k, min-p, and top-p.
+/// Sample a token from logits using temperature, top-k, min-p, top-p, and repetition penalty.
 ///
 /// Delegates to `crate::sampling::sample_full_logits`, the shared engine also
 /// used by the Metal CPU fallback (`forward/metal_qwen35.rs`'s private
@@ -20,7 +19,13 @@ pub(crate) fn sample_token(
     previous_ids: &[u32],
     rng_state: &mut u64,
 ) -> u32 {
-    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
+    // `GenerateConfig` cannot carry `min_p` or `top_n_sigma` (it is
+    // exhaustively constructible through the public API at published `0.7.1`;
+    // adding any field is a major break -- see
+    // `crate::sampling::Sampler::with_min_p` / `with_top_n_sigma`), and no
+    // production entry point sets either yet, so both paths are always
+    // disabled here.
+    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0, 0.0)
 }
 
 /// Reference oracle: the original allocating implementation of `sample_token`,
@@ -35,6 +40,8 @@ pub(crate) fn sample_token_reference(
     cfg: &GenerateConfig,
     previous_ids: &[u32],
     rng_state: &mut u64,
+    min_p: f32,
+    top_n_sigma: f32,
 ) -> u32 {
     let vocab_size = logits.len();
     let mut adjusted = logits.to_vec();
@@ -43,7 +50,24 @@ pub(crate) fn sample_token_reference(
         apply_repetition_penalty(&mut adjusted, previous_ids, cfg.repetition_penalty);
     }
 
-    let top_n_sigma_enabled = apply_top_n_sigma_reference(&mut adjusted, cfg.top_n_sigma);
+    // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so its
+    // reciprocal overflows or scales a logit past f32::MAX) carries no valid
+    // scaling and is routed to deterministic greedy argmax before any scaling,
+    // matching Sampler::sample, the Metal paths, and the documented "0.0 = greedy"
+    // contract. See `crate::sampling::temperature_degenerate`.
+    if crate::sampling::temperature_degenerate(cfg.temperature) {
+        return greedy_token(&adjusted);
+    }
+
+    // Mirrors the optimized engine: top-n-sigma masks the penalized,
+    // still-unscaled logits after the degenerate-temperature return (masking
+    // strictly below the max cannot change an argmax) and, like it, skips the
+    // filter for `top_k == 1`, where the selection is argmax-shaped. This
+    // implementation is deliberately independent (two-pass mean/variance vs
+    // the engine's single Welford pass) so a statistics bug in either shows
+    // up as a parity failure rather than being shared.
+    let top_n_sigma_enabled =
+        cfg.top_k != 1 && apply_top_n_sigma_reference(&mut adjusted, top_n_sigma);
     if top_n_sigma_enabled {
         let mut has_nan = false;
         let mut max_logit = f32::NEG_INFINITY;
@@ -54,15 +78,6 @@ pub(crate) fn sample_token_reference(
         if has_nan || !max_logit.is_finite() {
             return greedy_token(&adjusted);
         }
-    }
-
-    // A degenerate temperature (non-finite, <= 0, or finite-but-tiny so its
-    // reciprocal overflows or scales a logit past f32::MAX) carries no valid
-    // scaling and is routed to deterministic greedy argmax before any scaling,
-    // matching Sampler::sample, the Metal paths, and the documented "0.0 = greedy"
-    // contract. See `crate::sampling::temperature_degenerate`.
-    if crate::sampling::temperature_degenerate(cfg.temperature) {
-        return greedy_token(&adjusted);
     }
 
     if cfg.temperature != 1.0 {
@@ -83,9 +98,6 @@ pub(crate) fn sample_token_reference(
         });
         indices.truncate(k);
     }
-    if top_n_sigma_enabled {
-        indices.retain(|&idx| adjusted[idx] != f32::NEG_INFINITY);
-    }
 
     // Sort indices by descending adjusted logit + ascending token-id so that
     // build_softmax_probs iterates in the same order as
@@ -100,6 +112,10 @@ pub(crate) fn sample_token_reference(
             .then_with(|| a.cmp(&b))
     });
 
+    if top_n_sigma_enabled {
+        indices.retain(|&idx| adjusted[idx] != f32::NEG_INFINITY);
+    }
+
     // `indices` is already in (descending adjusted-logit, ascending token-id)
     // order from the pre-sort above. softmax is monotonic in the logit, so the
     // probabilities build_softmax_probs returns inherit exactly that order
@@ -112,7 +128,7 @@ pub(crate) fn sample_token_reference(
         return greedy_token(&adjusted);
     };
 
-    apply_min_p(&mut probs, cfg.min_p);
+    apply_min_p(&mut probs, min_p);
 
     if cfg.top_p < 1.0 {
         apply_top_p(&mut probs, cfg.top_p);
@@ -121,23 +137,11 @@ pub(crate) fn sample_token_reference(
     draw_from_distribution(&probs, rng_state)
 }
 
-#[cfg(test)]
-fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty: f32) {
-    let vocab_size = adjusted.len();
-    // previous_ids is the full token history and routinely repeats ids. Penalize each
-    // id exactly once (HF gather-once semantics; matches the Metal CandidateSet path).
-    // Applying per occurrence would compound to penalty^N and over-suppress common
-    // tokens as the sequence grows. O(n) dedup via a set — negligible beside the
-    // full-vocab `adjusted` clone the caller already pays each step.
-    let mut seen = std::collections::HashSet::with_capacity(previous_ids.len());
-    for &id in previous_ids {
-        let idx = id as usize;
-        if idx < vocab_size && seen.insert(id) {
-            adjusted[idx] = crate::sampling::penalized_logit(adjusted[idx], penalty);
-        }
-    }
-}
-
+/// Test-only oracle for the engine's `apply_top_n_sigma`: masks logits below
+/// `max - top_n_sigma * population_stddev`, computing the statistics with an
+/// independent two-pass mean/variance instead of the engine's Welford pass.
+/// Returns whether the filter was active (so the caller replicates the
+/// engine's fail-closed NaN/non-finite-max scan only when it ran).
 #[cfg(test)]
 fn apply_top_n_sigma_reference(adjusted: &mut [f32], top_n_sigma: f32) -> bool {
     if !top_n_sigma.is_finite() || top_n_sigma <= 0.0 || adjusted.len() <= 1 {
@@ -180,6 +184,23 @@ fn apply_top_n_sigma_reference(adjusted: &mut [f32], top_n_sigma: f32) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+fn apply_repetition_penalty(adjusted: &mut [f32], previous_ids: &[u32], penalty: f32) {
+    let vocab_size = adjusted.len();
+    // previous_ids is the full token history and routinely repeats ids. Penalize each
+    // id exactly once (HF gather-once semantics; matches the Metal CandidateSet path).
+    // Applying per occurrence would compound to penalty^N and over-suppress common
+    // tokens as the sequence grows. O(n) dedup via a set — negligible beside the
+    // full-vocab `adjusted` clone the caller already pays each step.
+    let mut seen = std::collections::HashSet::with_capacity(previous_ids.len());
+    for &id in previous_ids {
+        let idx = id as usize;
+        if idx < vocab_size && seen.insert(id) {
+            adjusted[idx] = crate::sampling::penalized_logit(adjusted[idx], penalty);
+        }
+    }
 }
 
 /// Greedy argmax with **first-wins** tie-break.
@@ -341,8 +362,6 @@ mod tests {
             temperature,
             top_k,
             top_p: 1.0,
-            min_p: 0.0,
-            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         }
@@ -636,8 +655,6 @@ mod tests {
             temperature,
             top_k,
             top_p,
-            min_p: 0.0,
-            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
@@ -649,8 +666,6 @@ mod tests {
             temperature,
             top_k,
             top_p,
-            min_p: 0.0,
-            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -673,12 +688,11 @@ mod tests {
         let logits = [0.0, 0.49_f32.ln(), 0.1_f32.ln()];
         let seed = 0x5870_5870_5870_5870;
         let draws = 128;
+        let min_p = 0.5;
         let cfg = GenerateConfig {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
-            min_p: 0.5,
-            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -686,20 +700,31 @@ mod tests {
             temperature: cfg.temperature,
             top_k: cfg.top_k,
             top_p: cfg.top_p,
-            min_p: cfg.min_p,
-            top_n_sigma: cfg.top_n_sigma,
             repetition_penalty: cfg.repetition_penalty,
         })
-        .with_seed(seed);
+        .with_seed(seed)
+        .with_min_p(min_p);
         let sampler_tokens: Vec<u32> = (0..draws).map(|_| sampler.sample(&logits)).collect();
 
+        // `sample_token` cannot carry `min_p` through `GenerateConfig` (see its
+        // doc comment), so the optimized path is exercised directly through the
+        // shared engine it delegates to, with `min_p` passed explicitly.
         let mut optimized_rng = seed;
         let optimized_tokens: Vec<u32> = (0..draws)
-            .map(|_| sample_token(&logits, &cfg, &[], &mut optimized_rng))
+            .map(|_| {
+                crate::sampling::sample_full_logits(
+                    &logits,
+                    &cfg,
+                    &[],
+                    &mut optimized_rng,
+                    min_p,
+                    0.0,
+                )
+            })
             .collect();
         let mut reference_rng = seed;
         let reference_tokens: Vec<u32> = (0..draws)
-            .map(|_| sample_token_reference(&logits, &cfg, &[], &mut reference_rng))
+            .map(|_| sample_token_reference(&logits, &cfg, &[], &mut reference_rng, min_p, 0.0))
             .collect();
 
         assert!(
@@ -715,12 +740,12 @@ mod tests {
         use crate::sampling::{Sampler, SamplingConfig};
 
         let logits = [10.0_f32, 9.5, 9.0, 8.0, 7.0, 2.0, 1.0, 0.0];
+        let min_p = 0.02;
+        let top_n_sigma = 1.5;
         let cfg = GenerateConfig {
             temperature: 2.0,
             top_k: 6,
             top_p: 0.67,
-            min_p: 0.02,
-            top_n_sigma: 1.5,
             repetition_penalty: 2.0,
             ..Default::default()
         };
@@ -728,8 +753,6 @@ mod tests {
             temperature: cfg.temperature,
             top_k: cfg.top_k,
             top_p: cfg.top_p,
-            min_p: cfg.min_p,
-            top_n_sigma: cfg.top_n_sigma,
             repetition_penalty: cfg.repetition_penalty,
         };
         let mut seen = [false; 8];
@@ -739,14 +762,29 @@ mod tests {
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
 
-            let mut sampler = Sampler::new(sampler_cfg.clone()).with_seed(seed);
+            let mut sampler = Sampler::new(sampler_cfg.clone())
+                .with_seed(seed)
+                .with_min_p(min_p)
+                .with_top_n_sigma(top_n_sigma);
             sampler.seed_history(&[0]);
             let sampler_token = sampler.sample(&logits);
 
+            // `sample_token` cannot carry `min_p` / `top_n_sigma` through
+            // `GenerateConfig` (see its doc comment), so the optimized path is
+            // exercised directly through the shared engine it delegates to,
+            // with both passed explicitly.
             let mut optimized_rng = seed;
-            let optimized_token = sample_token(&logits, &cfg, &[0], &mut optimized_rng);
+            let optimized_token = crate::sampling::sample_full_logits(
+                &logits,
+                &cfg,
+                &[0],
+                &mut optimized_rng,
+                min_p,
+                top_n_sigma,
+            );
             let mut reference_rng = seed;
-            let reference_token = sample_token_reference(&logits, &cfg, &[0], &mut reference_rng);
+            let reference_token =
+                sample_token_reference(&logits, &cfg, &[0], &mut reference_rng, min_p, top_n_sigma);
 
             assert_eq!(sampler_token, optimized_token);
             assert_eq!(optimized_token, reference_token);
@@ -892,8 +930,6 @@ mod tests {
             temperature,
             top_k,
             top_p,
-            min_p: 0.0,
-            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
         };
         let mut sampler = Sampler::new(config_a).with_seed(seed);
@@ -906,8 +942,6 @@ mod tests {
             temperature,
             top_k,
             top_p,
-            min_p: 0.0,
-            top_n_sigma: 0.0,
             repetition_penalty: 1.0,
             ..Default::default()
         };
@@ -970,7 +1004,8 @@ mod tests {
 
         for step in 0..steps {
             let token_opt = sample_token(&logits, &cfg, &history_opt, &mut rng_opt);
-            let token_ref = sample_token_reference(&logits, &cfg, &history_ref, &mut rng_ref);
+            let token_ref =
+                sample_token_reference(&logits, &cfg, &history_ref, &mut rng_ref, 0.0, 0.0);
             assert_eq!(
                 token_opt, token_ref,
                 "optimized sample_token diverged from sample_token_reference at step {step}"
@@ -1014,7 +1049,7 @@ mod tests {
 
         let mut rng_ref = seed;
         let tokens_ref: Vec<u32> = (0..n)
-            .map(|_| sample_token_reference(&logits, &cfg, &previous_ids, &mut rng_ref))
+            .map(|_| sample_token_reference(&logits, &cfg, &previous_ids, &mut rng_ref, 0.0, 0.0))
             .collect();
 
         assert_eq!(

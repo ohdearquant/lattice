@@ -93,6 +93,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "src/bin/bench_gdn_prefill_ab.rs",
     "src/bin/bench_logit_dump.rs",
     "src/bin/bench_lora_mixture.rs",
+    "src/bin/bench_vision_prefill_ab.rs",
     "src/bin/chat_metal.rs",
     "src/bin/dump_quarot_q4_golden.rs",
     "src/bin/eval_perplexity.rs",
@@ -104,6 +105,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
 const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "benches/attention_dispatch_bench.rs",
     "benches/attn_opt_bench.rs",
+    "benches/backward_stage0.rs",
     "benches/differential_attention_bench.rs",
     "benches/e2e_bench.rs",
     "benches/elementwise_bench.rs",
@@ -191,12 +193,12 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/chat_metal.rs:770:39",
+        recorded_position: "src/bin/chat_metal.rs:801:39",
         reason: "run Q4 initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::new()#1",
-        recorded_position: "src/bin/chat_metal.rs:795:39",
+        recorded_position: "src/bin/chat_metal.rs:826:39",
         reason: "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
@@ -206,17 +208,17 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "bin:lattice:src/bin/lattice/main.rs=>src/bin/lattice/serve.rs::ModelBackend::spawn_metal::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice/serve.rs:409:81",
+        recorded_position: "src/bin/lattice/serve.rs:423:81",
         reason: "ModelBackend::spawn_metal initializes a long-running server worker outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
         site: "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs::imp::load_model::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice_serve.rs:1693:47",
+        recorded_position: "src/bin/lattice_serve.rs:1795:47",
         reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
         site: "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs::imp::load_model::MetalQwen35State::new()#1",
-        recorded_position: "src/bin/lattice_serve.rs:1713:47",
+        recorded_position: "src/bin/lattice_serve.rs:1815:47",
         reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
 ];

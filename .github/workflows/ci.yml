@@ -248,6 +248,31 @@ jobs:
           cache-on-failure: true
       - name: tune — safetensors + inference-hook + serde (compile tests)
         run: cargo test -p lattice-tune --features safetensors,inference-hook,serde --no-run
+      # `LoraConfig::validate` (the check `LoraAdapter::new` runs on every
+      # construction path) deliberately does not enforce a known-module-name
+      # allowlist — the adapter representation is model-neutral. The only
+      # remaining enforcement of unknown/wrong-architecture target-module
+      # names is `LoraAdapter::validate_against`/`validate_against_bert`,
+      # gated behind `inference-hook` like the rest of this step's compile
+      # target above, so the `--no-run` step only ever type-checks them.
+      # Build AND run this specific surface, same as the `mixture` and
+      # `simulated-teacher` steps below, so the fail-closed rejection tests
+      # cannot rot silently.
+      - name: tune — LoRA validate_against rejection tests (build + run)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/lora-validate-against-tests.log"
+          if cargo test -p lattice-tune --lib --features inference-hook \
+            validate_against >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -q 'test lora::tests::validate_against_tests::test_validate_against_unknown_module_errors ... ok' "$log"
+          grep -q 'test lora::tests::validate_against_bert_tests::test_validate_against_bert_unknown_module_rejected ... ok' "$log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: tune — train-backward (compile tests)
         run: cargo test -p lattice-tune --features train-backward --no-run
       # The `mixture` feature gates the experimental online router-refit module
@@ -300,6 +325,17 @@ jobs:
       # divergence — locally-green, CI-green, and still rotting — cannot recur.
       - name: inference — default-feature clippy, isolated (no workspace unification)
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
+      # `cargo test --workspace`'s default target set is lib, bins, tests,
+      # benches, and doctests — it does NOT include `[[example]]` targets
+      # (that needs an explicit `--example`/`--examples`/`--all-targets`).
+      # drift_compare's `cosine()` degenerate-case regressions (both_zero_
+      # reads_as_identity, one_sided_collapse_reads_as_maximal_drift_*,
+      # normal_pair_computes_true_cosine) live in a `#[cfg(test)]` module
+      # inside `crates/transport/examples/drift_compare.rs`, so the required
+      # `ci` job's `cargo test --workspace` never builds or runs them. Run
+      # the example target explicitly so they cannot silently rot.
+      - name: transport — drift_compare example regressions (unreached by cargo test --workspace)
+        run: cargo test -p lattice-transport --example drift_compare
       # Metal kernels only exist on macOS; gate so Linux does not try to build them.
       - name: inference — metal-gpu (macOS only)
         if: runner.os == 'macOS'
@@ -330,6 +366,21 @@ jobs:
       - name: inference — metal-gpu clippy (macOS only)
         if: runner.os == 'macOS'
         run: cargo clippy -p lattice-inference --all-targets --features f16,metal-gpu -- -D warnings
+      # `bench-internals` gates the bench binaries under `src/bin/` (e.g.
+      # `bench_vision_prefill_ab`) and their `bench_support` module — without
+      # it in this feature list, `--all-targets` never compiles that surface,
+      # so lint debt there (an "items after a test module" error, #1336
+      # round 2) went undetected by this exact command until a manually
+      # widened invocation caught it. This is a separate --release step
+      # (rather than adding bench-internals to the step above) because
+      # `bench_vision_prefill_ab.rs:95` has a `compile_error!` gated on
+      # `debug_assertions` — "bench_vision_prefill_ab: MUST build --release
+      # (debug Metal timing is meaningless)" — so this surface cannot compile
+      # in a plain debug clippy pass, and forcing --release onto the fast
+      # debug lint above would slow it for everything else it covers.
+      - name: inference — metal-gpu bench clippy, release (macOS only)
+        if: runner.os == 'macOS'
+        run: cargo clippy --release -p lattice-inference --all-targets --features f16,metal-gpu,bench-internals -- -D warnings
       # The worker module is macOS/metal-gpu-gated, but this lifecycle test
       # uses only a blocking thread-local destructor and never acquires a
       # Metal device. Run it explicitly so compiling the test is not mistaken
@@ -478,6 +529,192 @@ jobs:
           fi
           cat "$log"
           grep -Eq '^test result: ok\. 5 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #1263: `compact_metal_candidate_path_applies_min_p` lives in the
+      # `#[cfg(all(target_os = "macos", feature = "metal-gpu"))] mod inner`
+      # module of metal_qwen35.rs, so the macOS metal-gpu clippy/build legs
+      # above compile and lint it, but no test-running step's filter ever
+      # matched it: the Q4 step (`--lib q4`) and the fused_attention step
+      # (`--lib forward::metal::`) are both substring filters against this
+      # test's full path
+      # (`forward::metal_qwen35::inner::min_p_compact_sampling_tests::compact_metal_candidate_path_applies_min_p`),
+      # neither "q4" nor "forward::metal::" (the module is `metal_qwen35`,
+      # not `metal`) occurs in it, and the grammar/f16-KV steps below filter
+      # on unrelated test names. Compiled-and-linted-but-never-run means
+      # dropping the min-p forwarding call at metal_qwen35.rs:12951 would
+      # turn no CI command red. This test needs no live Metal device (it
+      # only exercises `sample_from_candidates`'s CPU-side candidate math),
+      # so unlike the Q4/grammar/f16-KV steps it does not set
+      # LATTICE_METAL_TEST_ENFORCE. The exact "1 passed" grep guards against
+      # a silently zero-matching filter the same way those steps do.
+      - name: inference — compact Metal min-p forwarding gate (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-compact-min-p-test.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib min_p_compact_sampling_tests:: -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #1186 / PR #1219: this exact live-GPU regression dirties only GDN
+      # recurrent state while the KV cursor remains zero, then proves the
+      # hidden-returning prefill refuses to dispatch. The environment variable
+      # converts a missing Metal device from a green early return into failure;
+      # the exact test path and exact one-test count prevent filter skip-passes.
+      - name: inference — Metal hidden-prefill noninitial-GDN refusal (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-hidden-prefill-gdn-refusal.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::forward_prefill_with_hidden_rejects_noninitial_gdn_state_with_empty_kv' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference — Metal MTP cursor preflight (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-mtp-cursor-preflight.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::mtp_verifier_boundaries_reject_mismatched_live_cursor' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # MTP-loaded raw step regression: establish live KV/GDN/hidden state,
+      # then require an in-range stale position to fail before any state changes.
+      - name: inference — Metal raw-step cursor preflight (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-raw-step-cursor-preflight.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::raw_step_with_mtp_rejects_stale_live_cursor_without_mutation' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # MTP-loaded raw prefill regression: both fixed-zero public siblings must
+      # reject a live KV/GDN session before hidden readback or buffer mutation.
+      - name: inference — Metal raw-prefill fresh-session preflight (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-raw-prefill-fresh-session.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::raw_prefills_with_mtp_reject_live_session_without_mutation' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # The public bench-internals chunk helpers accept caller-supplied
+      # positions, so compile-only bench coverage is insufficient: execute the
+      # stale-cursor refusal against live KV/GDN state and fail when Metal is
+      # unavailable instead of allowing an early-returning test to pass.
+      - name: inference — Metal bench-prefill cursor preflight (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-bench-prefill-cursor-preflight.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu,bench-internals --lib \
+            'forward::metal_qwen35::inner::tests::bench_prefill_helpers_reject_stale_cursor_without_mutation' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # PR #1339's positive claim — hidden state is read back only when
+      # explicitly requested — was carried by these two tests, but both used
+      # a bare `let Some(_) = Device::system_default() else { return; }` with
+      # no LATTICE_METAL_TEST_ENFORCE guard, unlike every refusal test this PR
+      # added. A missing Metal device made them silent greens that executed
+      # nothing; this step forces the successful-readback path to run.
+      - name: inference — Metal explicit-hidden-readback step proof (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-step-proof.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::forward_step_with_hidden_matches_logits_state_and_proves_explicit_readback' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference — Metal explicit-hidden-readback prefill proof (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-prefill-proof.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::forward_prefill_with_hidden_matches_logits_state_and_proves_explicit_readback' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # tiny_metal_qwen35_fixture (used by the two proofs above) has zero GDN
+      # layers, so neither one exercises explicit hidden readback on a hybrid
+      # GDN+full-attention session. This closes that gap on tiny_hybrid_fixture.
+      - name: inference — Metal explicit-hidden-readback hybrid GDN proof (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-hidden-readback-hybrid-gdn-proof.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::forward_step_with_hidden_matches_logits_on_hybrid_gdn_state_and_proves_explicit_readback' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # #611: Metal generation paths applied grammar masks via `mask_logits`
       # but never checked for a surviving finite logit before sampling — a
       # grammar that blocked every token silently emitted token 0 instead of
@@ -595,7 +832,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683cb613d4ff7d29ceb2fe421b81294b4319512a # 1.93.1
       - name: Pin the real toolchain bin on PATH
         run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         with:
           shared-key: msrv
           cache-on-failure: true
@@ -678,7 +915,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: crate-ci/typos@bee27e3a4fd1ea2111cf90ab89cd076c870fce14 # v1.48.0
+      - uses: crate-ci/typos@a8168dc2984a9e2352f183ffe788f0f23a300389 # v1.49.1
 
   # Cheap ubuntu workflow/config lint. Catches malformed expressions, unknown
   # contexts/inputs, shellcheck-level issues, and changed-file range regressions
@@ -809,7 +1046,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         with:
           shared-key: semver-checks
       # metal-gpu does not compile on Linux and must stay off; default-features

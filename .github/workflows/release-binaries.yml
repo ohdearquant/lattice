@@ -64,9 +64,25 @@ jobs:
           TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          IS_DRAFT="$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft)"
-          if [ "$IS_DRAFT" != "true" ]; then
+          # github.token here is read-scoped (workflow-level `permissions: contents: read`).
+          # GitHub only shows draft releases to accounts with write access, so this token can
+          # never observe a draft: `gh release view` on a real, existing draft fails exactly
+          # the same way it would for no release at all ("release not found"). That collapses
+          # the check to three observable outcomes instead of a direct isDraft read:
+          #   1. view succeeds         -> visible to a read token -> published -> fail here.
+          #   2. view fails, not found -> draft (expected/good) or no release at all -> pass;
+          #      the write-scoped publish job's upload-release-assets.sh rechecks draft state
+          #      with a token that CAN see it and fails closed if the release is genuinely
+          #      missing (see require_draft/release_draft_state there).
+          #   3. view fails, other error (network, auth, rate limit) -> fail here rather than
+          #      silently passing a check we couldn't actually run.
+          if ERROR_OUTPUT="$(gh release view "$TAG" --repo "${{ github.repository }}" --json isDraft --jq .isDraft 2>&1)"; then
             echo "::error::Release is already published; create a new draft with a new tag and version."
+            exit 1
+          elif [ "$ERROR_OUTPUT" = "release not found" ]; then
+            exit 0
+          else
+            echo "::error::Could not determine release state for $TAG: $ERROR_OUTPUT"
             exit 1
           fi
 

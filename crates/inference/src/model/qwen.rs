@@ -3248,6 +3248,7 @@ mod tests {
                 attention_mask: vec![1, 1],
                 token_type_ids: vec![0, 0],
                 real_length: 2,
+                pre_truncation_len: 2,
             }
         }
 

@@ -31,6 +31,41 @@ pub enum BertPooling {
     CLS,
 }
 
+/// Default BERT pooling for a served embedding model, keyed on its directory
+/// or model name the same way `lattice_serve --embedding-model` identifies
+/// the model it loads. BGE-family checkpoint names all contain "bge"
+/// (matching every name `lattice-embed`'s `EmbeddingModel::model_id` uses for
+/// its BGE variants, e.g. `"BAAI/bge-small-en-v1.5"`); every other served
+/// family (E5, MiniLM) keeps [`BertPooling`]'s own mean-pooling default.
+///
+/// This mirrors `lattice-embed`'s `EmbeddingModel::bert_pooling` table
+/// (`crates/embed/src/model.rs`), duplicated rather than called: that
+/// function dispatches on `lattice-embed`'s own `#[non_exhaustive]`
+/// `EmbeddingModel` enum, not a name string, and `lattice-embed` already
+/// depends on this crate, so a call the other way would be a cyclic package
+/// dependency. See `lattice-embed`'s own test suite (`crates/embed/src/
+/// model.rs`) for the agreement check between the two tables -- it is the
+/// only crate that sees both `EmbeddingModel` and this function as the same
+/// compiled unit.
+///
+/// A name this function does not recognize (does not contain `"bge"`,
+/// case-insensitively) falls back to [`BertPooling::default`] (mean
+/// pooling) rather than erroring, matching the E5/MiniLM families' own
+/// pooling strategy.
+///
+/// `#[doc(hidden)]`: exported so `lattice_serve` and `lattice-embed`'s test
+/// suite can call it across the crate boundary. This hides it from rustdoc
+/// output only -- the item is still `pub` and reachable, and carries no
+/// stability guarantee.
+#[doc(hidden)]
+pub fn default_bert_pooling_for_model_name(name: &str) -> BertPooling {
+    if name.to_ascii_lowercase().contains("bge") {
+        BertPooling::CLS
+    } else {
+        BertPooling::default()
+    }
+}
+
 /// **Unstable**: internal pooling kernel; SIMD dispatch details may change.
 ///
 /// Dispatches to SIMD (NEON/AVX2) when available, falls back to scalar.

@@ -19,6 +19,21 @@
 //! - Low-level: `NgramSpeculator::speculate` + `verify_draft` for custom loops.
 //! - High-level: `generate_with_speculation` wraps any `forward_fn` closure.
 
+/// Upper bound applied to a caller-supplied `max_ngram`.
+///
+/// [`NgramSpeculator::speculate`] tries every n-gram length from `max_ngram`
+/// down to 2, and each attempt scans the whole prompt comparing `n` elements at
+/// every offset, so the work per generated token grows with the square of the
+/// attempted length and with prompt length. An unbounded `max_ngram` therefore
+/// lets a caller turn one generation request into an arbitrarily long CPU-bound
+/// search before a single token is produced.
+///
+/// The default is 5, and a match longer than a few dozen tokens is vanishingly
+/// rare in practice, so clamping here costs nothing real and removes the
+/// pathological case. The clamp is applied once, in
+/// [`NgramSpeculator::new`], so every entry point inherits the same bound.
+pub const MAX_NGRAM_LIMIT: usize = 64;
+
 /// **Unstable**: n-gram speculative decoding; algorithm parameters and API may change as
 /// the generation pipeline evolves.
 ///
@@ -29,7 +44,8 @@
 pub struct NgramSpeculator {
     /// The full prompt token sequence for n-gram matching.
     prompt_tokens: Vec<u32>,
-    /// Maximum n-gram length to try (tries `max_ngram` down to 2).
+    /// Maximum n-gram length to try (tries `max_ngram` down to 2), already
+    /// clamped to [`MAX_NGRAM_LIMIT`] by [`NgramSpeculator::new`].
     max_ngram: usize,
     /// Maximum number of draft tokens per speculation step.
     max_draft: usize,
@@ -42,12 +58,13 @@ impl NgramSpeculator {
     ///
     /// - `prompt_tokens`: the full tokenised prompt.
     /// - `max_ngram`: longest n-gram to attempt (default: 5). Tried in
-    ///   descending order; first match wins.
+    ///   descending order; first match wins. Values above
+    ///   [`MAX_NGRAM_LIMIT`] are clamped to it.
     /// - `max_draft`: maximum draft tokens to propose per step (default: 4).
     pub fn new(prompt_tokens: Vec<u32>, max_ngram: usize, max_draft: usize) -> Self {
         Self {
             prompt_tokens,
-            max_ngram,
+            max_ngram: max_ngram.min(MAX_NGRAM_LIMIT),
             max_draft,
         }
     }
@@ -71,7 +88,9 @@ impl NgramSpeculator {
 
             if let Some(pos) = self.find_ngram(suffix) {
                 let start = pos + n;
-                let end = (start + self.max_draft).min(self.prompt_tokens.len());
+                let end = start
+                    .saturating_add(self.max_draft)
+                    .min(self.prompt_tokens.len());
                 if start < end {
                     return self.prompt_tokens[start..end].to_vec();
                 }
@@ -1311,6 +1330,10 @@ pub trait MtpTargetVerifier {
 
     /// Forward `tokens` starting at `start_pos` through the target model.
     /// Returns per-token logits: `logits[i]` is target output after processing `tokens[i]`.
+    ///
+    /// `start_pos` must equal [`Self::cache_position`]. Implementations must reject a
+    /// mismatch before forwarding any token so KV placement and positional encoding
+    /// cannot observe different positions.
     fn verify_tokens(
         &mut self,
         tokens: &[u32],
@@ -2273,13 +2296,24 @@ where
 /// single-token forward step returning logits, and this function handles
 /// the speculation/verification loop.
 ///
+/// # Metal state warning
+///
+/// Do not pass a live
+/// [`MetalQwen35State::forward_step`](crate::forward::metal_qwen35::MetalQwen35State::forward_step)
+/// callback after Metal prefill. This compatibility wrapper feeds the final
+/// prompt token at `position = prompt_tokens.len()` on its first callback,
+/// which would duplicate that token in the Metal KV/GDN state. Use
+/// [`MetalQwen35State::generate_with_speculation`](crate::forward::metal_qwen35::MetalQwen35State::generate_with_speculation)
+/// instead; it owns admission, prefill, and state advancement.
+///
 /// # Arguments
 ///
 /// - `prompt_tokens`: tokenised prompt (caller must have already run prefill).
 /// - `max_new_tokens`: generation budget.
 /// - `eos_token`: stop token ID.
 /// - `forward_fn`: `(token_id, position) -> logits`.
-/// - `max_ngram`: longest n-gram to try (default: 5).
+/// - `max_ngram`: longest n-gram to try (default: 5); clamped to
+///   [`MAX_NGRAM_LIMIT`].
 /// - `max_draft`: max draft tokens per speculation step (default: 4).
 ///
 /// # Returns
@@ -2352,6 +2386,84 @@ where
     Ok(generated)
 }
 
+/// Drive n-gram speculative generation from logits produced by a completed
+/// prompt prefill.
+///
+/// Unlike [`generate_with_speculation`], the callback receives each newly
+/// emitted token exactly once at its true absolute position. The final token
+/// admitted by `max_new_tokens` is also forwarded so the caller's live state
+/// represents the full returned sequence.
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
+pub(crate) fn generate_with_speculation_from_prefill<F>(
+    prompt_tokens: &[u32],
+    max_new_tokens: usize,
+    eos_token: u32,
+    mut logits: Vec<f32>,
+    mut forward_fn: F,
+    max_ngram: usize,
+    max_draft: usize,
+) -> Result<Vec<u32>, crate::error::InferenceError>
+where
+    F: FnMut(u32, usize) -> Result<Vec<f32>, crate::error::InferenceError>,
+{
+    if prompt_tokens.is_empty() {
+        return Err(crate::error::InferenceError::Inference(
+            "empty prompt".into(),
+        ));
+    }
+
+    let speculator = NgramSpeculator::new(prompt_tokens.to_vec(), max_ngram, max_draft);
+    let mut generated = Vec::with_capacity(max_new_tokens);
+    let mut all_tokens = prompt_tokens.to_vec();
+    let mut position = prompt_tokens.len();
+
+    while generated.len() < max_new_tokens {
+        let draft = speculator.speculate(&all_tokens);
+        let mut rejected = false;
+
+        for &candidate in &draft {
+            if generated.len() == max_new_tokens {
+                break;
+            }
+
+            let model_choice = argmax(&logits) as u32;
+            if model_choice == eos_token {
+                return Ok(generated);
+            }
+
+            let emitted = if model_choice == candidate {
+                candidate
+            } else {
+                rejected = true;
+                model_choice
+            };
+            generated.push(emitted);
+            all_tokens.push(emitted);
+            logits = forward_fn(emitted, position)?;
+            position += 1;
+
+            if rejected {
+                break;
+            }
+        }
+
+        if generated.len() == max_new_tokens || rejected {
+            continue;
+        }
+
+        let bonus = argmax(&logits) as u32;
+        if bonus == eos_token {
+            break;
+        }
+        generated.push(bonus);
+        all_tokens.push(bonus);
+        logits = forward_fn(bonus, position)?;
+        position += 1;
+    }
+
+    Ok(generated)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2411,6 +2523,120 @@ mod tests {
         // Match [1, 2] at pos 0, max_draft=2 so drafts [3, 4] only
         let draft = spec.speculate(&[1, 2]);
         assert_eq!(draft, vec![3, 4]);
+    }
+
+    #[test]
+    fn speculate_saturates_adversarial_max_draft() {
+        let spec = NgramSpeculator::new(vec![1, 2, 3, 4], 5, usize::MAX);
+        assert_eq!(spec.speculate(&[1, 2]), vec![3, 4]);
+    }
+
+    /// Fixture for the two clamp tests below.
+    ///
+    /// Returns `(prompt, c_short, c_long)`, where `c_short` is the draft a
+    /// CLAMPED search produces and `c_long` the one an UNCLAMPED search
+    /// produces. The two tests are only able to fail because those differ, so
+    /// this helper asserts its own invariants rather than leaving them implicit
+    /// at two call sites: an edit that breaks the layout fails here, instead of
+    /// quietly leaving tests that pass while detecting nothing.
+    ///
+    /// The clamp has to change a RESULT, or nothing distinguishes it from its
+    /// own absence. A prompt whose longest repeat is shorter than the limit
+    /// produces the same draft either way, so the layout is built the other way
+    /// round: a 70-token block appears twice, and its trailing 64 tokens also
+    /// appear on their own, earlier, with a different continuation.
+    ///
+    /// Layout (indices), where `b` is 64 distinct tokens and `h` is a 6-token
+    /// head, so `hb` is 70 tokens long:
+    ///
+    /// ```text
+    ///   0..64    b            <- first occurrence of the 64-token suffix
+    ///  64..68    c_short      <- what follows it
+    ///  68..138   hb           <- first occurrence of the 70-token suffix
+    /// 138..142   c_long       <- what follows that
+    /// 142..212   hb           <- the tail, so the recent suffix IS hb
+    /// ```
+    ///
+    /// Searching at n = 70 finds `hb` at 68 and drafts `c_long`. Clamped to 64
+    /// the search starts at the shorter suffix, finds `b` at 0 — earlier — and
+    /// drafts `c_short`.
+    fn clamp_fixture() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+        let b: Vec<u32> = (100..100 + MAX_NGRAM_LIMIT as u32).collect();
+        let h: Vec<u32> = (200..206).collect();
+        let c_short: Vec<u32> = vec![900, 901, 902, 903];
+        let c_long: Vec<u32> = vec![910, 911, 912, 913];
+
+        let hb: Vec<u32> = h.iter().chain(b.iter()).copied().collect();
+        let mut prompt: Vec<u32> = Vec::new();
+        prompt.extend_from_slice(&b);
+        prompt.extend_from_slice(&c_short);
+        prompt.extend_from_slice(&hb);
+        prompt.extend_from_slice(&c_long);
+        prompt.extend_from_slice(&hb);
+
+        assert_eq!(
+            b.len(),
+            MAX_NGRAM_LIMIT,
+            "the short block must be exactly the limit, so a clamped search matches it whole"
+        );
+        assert!(
+            hb.len() > MAX_NGRAM_LIMIT,
+            "the long block must EXCEED the limit ({} vs {}), or clamped and unclamped searches \
+             try the same lengths and neither test can fail",
+            hb.len(),
+            MAX_NGRAM_LIMIT
+        );
+        assert_eq!(
+            &prompt[prompt.len() - hb.len()..],
+            hb.as_slice(),
+            "the prompt must end with the long block, or the recent suffix is not the one under test"
+        );
+        assert_ne!(
+            c_short, c_long,
+            "the two continuations must differ, or a clamped and an unclamped search draft the \
+             same tokens and the assertions below hold with the clamp removed"
+        );
+        assert_eq!(
+            c_short.len(),
+            c_long.len(),
+            "both continuations are used as the max_draft, so they must be the same length"
+        );
+
+        (prompt, c_short, c_long)
+    }
+
+    /// Removing the clamp makes this fail: the unclamped search matches the
+    /// 70-token block and drafts the other continuation.
+    #[test]
+    fn speculate_clamps_max_ngram_to_the_limit() {
+        let (prompt, c_short, c_long) = clamp_fixture();
+
+        // Far above the limit: the stored value must come back clamped.
+        let spec = NgramSpeculator::new(prompt.clone(), 10_000, c_short.len());
+        let draft = spec.speculate(&prompt);
+
+        assert_eq!(
+            draft, c_short,
+            "an unclamped search matches the longer block and drafts {c_long:?}; the clamp must \
+             hold the search to {MAX_NGRAM_LIMIT} tokens, which matches earlier and drafts \
+             {c_short:?}"
+        );
+    }
+
+    /// A caller asking for exactly the limit and a caller asking for far more
+    /// must be indistinguishable, which is the property the clamp exists to
+    /// provide.
+    #[test]
+    fn speculate_at_the_limit_and_far_above_it_agree() {
+        let (prompt, c_short, _c_long) = clamp_fixture();
+
+        let at_limit =
+            NgramSpeculator::new(prompt.clone(), MAX_NGRAM_LIMIT, c_short.len()).speculate(&prompt);
+        let above =
+            NgramSpeculator::new(prompt.clone(), usize::MAX, c_short.len()).speculate(&prompt);
+
+        assert_eq!(at_limit, above);
+        assert_eq!(at_limit, c_short);
     }
 
     #[test]
@@ -3260,6 +3486,145 @@ mod tests {
             spec_out, greedy_out,
             "speculative output diverged from greedy under tie-break: spec={spec_out:?} greedy={greedy_out:?}"
         );
+    }
+
+    #[test]
+    fn stateful_speculation_starts_from_prefill_and_forwards_final_budget_token() {
+        let prompt = vec![4u32, 5];
+        let initial_logits = logits_with_argmax(16, 7);
+        let mut calls = Vec::new();
+
+        let output = generate_with_speculation_from_prefill(
+            &prompt,
+            2,
+            15,
+            initial_logits,
+            |token, position| {
+                calls.push((token, position));
+                Ok(logits_with_argmax(16, 8))
+            },
+            5,
+            4,
+        )
+        .expect("prefill-seeded generation must succeed");
+
+        assert_eq!(output, vec![7, 8]);
+        assert_eq!(
+            calls,
+            vec![(7, prompt.len()), (8, prompt.len() + 1)],
+            "the callback must receive generated tokens at their true positions, \
+             including the final budget token"
+        );
+    }
+
+    #[test]
+    fn stateful_speculation_verifies_draft_against_prefill_logits() {
+        let prompt = vec![7u32, 8, 9, 0, 7, 8, 9];
+        let mut next = [7u32, 8, 9, 1].into_iter();
+        let mut calls = Vec::new();
+
+        let output = generate_with_speculation_from_prefill(
+            &prompt,
+            4,
+            31,
+            logits_with_argmax(32, 0),
+            |token, position| {
+                calls.push((token, position));
+                Ok(logits_with_argmax(
+                    32,
+                    next.next().expect("each emitted token must be forwarded"),
+                ))
+            },
+            5,
+            4,
+        )
+        .expect("matching draft must succeed");
+
+        assert_eq!(output, vec![0, 7, 8, 9]);
+        assert_eq!(
+            calls,
+            vec![(0, 7), (7, 8), (8, 9), (9, 10)],
+            "each accepted draft token must advance live state exactly once"
+        );
+    }
+
+    #[test]
+    fn stateful_speculation_handles_draft_mismatch_and_eos_during_verification() {
+        let prompt = vec![7u32, 8, 9, 0, 7, 8, 9];
+
+        let mut mismatch_calls = Vec::new();
+        let mismatch = generate_with_speculation_from_prefill(
+            &prompt,
+            1,
+            31,
+            logits_with_argmax(32, 6),
+            |token, position| {
+                mismatch_calls.push((token, position));
+                Ok(logits_with_argmax(32, 5))
+            },
+            5,
+            4,
+        )
+        .expect("a rejected draft must emit and forward the model choice");
+        assert_eq!(mismatch, vec![6]);
+        assert_eq!(mismatch_calls, vec![(6, prompt.len())]);
+
+        let eos = 3u32;
+        let mut eos_calls = Vec::new();
+        let stopped = generate_with_speculation_from_prefill(
+            &prompt,
+            4,
+            eos,
+            logits_with_argmax(32, 0),
+            |token, position| {
+                eos_calls.push((token, position));
+                Ok(logits_with_argmax(32, eos))
+            },
+            5,
+            4,
+        )
+        .expect("EOS during draft verification is a successful stop");
+        assert_eq!(stopped, vec![0]);
+        assert_eq!(
+            eos_calls,
+            vec![(0, prompt.len())],
+            "EOS must not be returned or forwarded"
+        );
+    }
+
+    #[test]
+    fn stateful_speculation_stops_before_forwarding_eos_and_propagates_step_errors() {
+        let eos = 3u32;
+        let no_forward = generate_with_speculation_from_prefill(
+            &[1, 2],
+            4,
+            eos,
+            logits_with_argmax(8, eos),
+            |_token, _position| panic!("EOS selected from prefill logits must not be forwarded"),
+            5,
+            4,
+        )
+        .expect("EOS is a successful stop");
+        assert!(no_forward.is_empty());
+
+        let error = generate_with_speculation_from_prefill(
+            &[1, 2],
+            1,
+            eos,
+            logits_with_argmax(8, 4),
+            |_token, _position| {
+                Err(crate::error::InferenceError::Inference(
+                    "synthetic step failure".into(),
+                ))
+            },
+            5,
+            4,
+        );
+        assert!(matches!(
+            error,
+            Err(crate::error::InferenceError::Inference(ref message))
+                if message == "synthetic step failure"
+        ));
     }
 
     // ── rejection_sample_draft tests ─────────────────────────────────────────

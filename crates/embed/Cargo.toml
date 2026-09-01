@@ -28,7 +28,7 @@ chrono = { workspace = true }
 
 # Caching
 lru = "0.16.3"
-blake3 = { workspace = true }
+sha2 = { workspace = true }
 parking_lot = { workspace = true }
 
 # Error handling
@@ -53,7 +53,7 @@ tracing = "0.1"
 # its own ureq/download stack to non-wasm targets, so a plain `--features wasm`
 # build stays download-free; edge/cross builds drop it with
 # `--no-default-features --features native`. See issue #1095.
-lattice-inference = { version = "0.9.0", path = "../inference", optional = true, default-features = false, features = [
+lattice-inference = { version = "0.10.0", path = "../inference", optional = true, default-features = false, features = [
     "std",
     "f16",
 ] }
@@ -139,6 +139,11 @@ local = []
 [[bin]]
 name = "embed"
 path = "src/bin/embed.rs"
+required-features = ["native"]
+
+[[bin]]
+name = "embed-drift"
+path = "src/bin/embed-drift.rs"
 required-features = ["native"]
 
 [[example]]

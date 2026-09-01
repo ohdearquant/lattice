@@ -30,6 +30,39 @@ and this project adheres to
   is a function of the role and model configuration already present in the key.
 - `TextTooLong` now reports the bound that actually rejected the input, so the
   reported maximum is one the caller can relate to their own input.
+- The in-memory embedding cache key and `ModelProvenance::hash` are now derived
+  with SHA-256 rather than BLAKE3, and the `blake3` dependency is dropped from
+  the workspace. Both values keep their existing shape: a 32-byte cache key and
+  a 64-character lowercase hex string.
+  **This is a breaking change for `ModelProvenance::hash`.** `ModelProvenance`
+  is documented as stable and is `Serialize`/`Deserialize`, and its `hash` is
+  computed from its own persisted `model_id`, `loaded_at_iso`, and `model`
+  fields via a published formula, so a consumer holding a serialized record
+  can recompute the digest independently and compare it against `hash`.
+  Recomputing with SHA-256 verifies records produced from this release
+  onward. A record produced by an earlier release carries a BLAKE3 digest,
+  which SHA-256 recomputation does not reproduce, and the serialized struct
+  carries no explicit algorithm or version field.
+  A consumer that keeps both formulas is not blocked by that: because all
+  three inputs are themselves persisted fields, it can recompute both
+  digests over the documented input and compare each against `hash`. For an
+  intact record the matching formula is the one that produced it, so the
+  record is classified without any external release metadata. If neither
+  matches, the record was altered or came from some formula other than
+  these two, which is a verification failure rather than a classification.
+  A consumer that supports SHA-256 alone cannot verify older records, and
+  has to track which release produced each record out of band, re-derive
+  the affected records, or stop verifying the older ones.
+  The embedding cache key is not affected by that compatibility concern.
+  Its construction is published (see "Key construction" in
+  `crates/embed/docs/model.md`, repeated in `crates/embed/docs/design.md`),
+  but the cache itself lives in memory for the life of the process, and its
+  key scheme is explicitly documented as unstable and not to be persisted
+  across sessions or process versions. A changed key therefore invalidates
+  no cache-owned data and breaks no supported cross-version contract.
+  Nothing stops an external caller from storing the public 32-byte key
+  itself, but such a key is outside the documented contract and a stored
+  one may simply miss after an upgrade.
 
 #### Compatibility note for external implementors
 
