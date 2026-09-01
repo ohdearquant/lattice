@@ -2531,12 +2531,20 @@ mod tests {
         assert_eq!(spec.speculate(&[1, 2]), vec![3, 4]);
     }
 
-    /// The clamp on `max_ngram` has to change a RESULT, not just a loop bound,
-    /// or nothing distinguishes it from its own absence. A prompt whose longest
-    /// repeat is shorter than the limit produces the same draft either way, so
-    /// this fixture is built the other way round: a 70-token block appears
-    /// twice, and its trailing 64 tokens also appear on their own, earlier,
-    /// with a different continuation.
+    /// Fixture for the two clamp tests below.
+    ///
+    /// Returns `(prompt, c_short, c_long)`, where `c_short` is the draft a
+    /// CLAMPED search produces and `c_long` the one an UNCLAMPED search
+    /// produces. The two tests are only able to fail because those differ, so
+    /// this helper asserts its own invariants rather than leaving them implicit
+    /// at two call sites: an edit that breaks the layout fails here, instead of
+    /// quietly leaving tests that pass while detecting nothing.
+    ///
+    /// The clamp has to change a RESULT, or nothing distinguishes it from its
+    /// own absence. A prompt whose longest repeat is shorter than the limit
+    /// produces the same draft either way, so the layout is built the other way
+    /// round: a 70-token block appears twice, and its trailing 64 tokens also
+    /// appear on their own, earlier, with a different continuation.
     ///
     /// Layout (indices), where `b` is 64 distinct tokens and `h` is a 6-token
     /// head, so `hb` is 70 tokens long:
@@ -2551,10 +2559,8 @@ mod tests {
     ///
     /// Searching at n = 70 finds `hb` at 68 and drafts `c_long`. Clamped to 64
     /// the search starts at the shorter suffix, finds `b` at 0 — earlier — and
-    /// drafts `c_short`. Asserting `c_short` therefore fails if the clamp is
-    /// removed.
-    #[test]
-    fn speculate_clamps_max_ngram_to_the_limit() {
+    /// drafts `c_short`.
+    fn clamp_fixture() -> (Vec<u32>, Vec<u32>, Vec<u32>) {
         let b: Vec<u32> = (100..100 + MAX_NGRAM_LIMIT as u32).collect();
         let h: Vec<u32> = (200..206).collect();
         let c_short: Vec<u32> = vec![900, 901, 902, 903];
@@ -2569,45 +2575,60 @@ mod tests {
         prompt.extend_from_slice(&hb);
 
         assert_eq!(
+            b.len(),
+            MAX_NGRAM_LIMIT,
+            "the short block must be exactly the limit, so a clamped search matches it whole"
+        );
+        assert!(
+            hb.len() > MAX_NGRAM_LIMIT,
+            "the long block must EXCEED the limit ({} vs {}), or clamped and unclamped searches \
+             try the same lengths and neither test can fail",
+            hb.len(),
+            MAX_NGRAM_LIMIT
+        );
+        assert_eq!(
             &prompt[prompt.len() - hb.len()..],
             hb.as_slice(),
-            "fixture must end with the long block, or the recent suffix is not the one under test"
+            "the prompt must end with the long block, or the recent suffix is not the one under test"
         );
+        assert_ne!(
+            c_short, c_long,
+            "the two continuations must differ, or a clamped and an unclamped search draft the \
+             same tokens and the assertions below hold with the clamp removed"
+        );
+        assert_eq!(
+            c_short.len(),
+            c_long.len(),
+            "both continuations are used as the max_draft, so they must be the same length"
+        );
+
+        (prompt, c_short, c_long)
+    }
+
+    /// Removing the clamp makes this fail: the unclamped search matches the
+    /// 70-token block and drafts the other continuation.
+    #[test]
+    fn speculate_clamps_max_ngram_to_the_limit() {
+        let (prompt, c_short, c_long) = clamp_fixture();
 
         // Far above the limit: the stored value must come back clamped.
         let spec = NgramSpeculator::new(prompt.clone(), 10_000, c_short.len());
         let draft = spec.speculate(&prompt);
 
         assert_eq!(
-            draft,
-            c_short,
-            "an unclamped search matches the {}-token block at index {} and drafts {:?}; \
-             the clamp must hold the search to {} tokens, which matches earlier and drafts {:?}",
-            hb.len(),
-            b.len() + c_short.len(),
-            c_long,
-            MAX_NGRAM_LIMIT,
-            c_short
+            draft, c_short,
+            "an unclamped search matches the longer block and drafts {c_long:?}; the clamp must \
+             hold the search to {MAX_NGRAM_LIMIT} tokens, which matches earlier and drafts \
+             {c_short:?}"
         );
     }
 
     /// A caller asking for exactly the limit and a caller asking for far more
     /// must be indistinguishable, which is the property the clamp exists to
-    /// provide. Same fixture as above.
+    /// provide.
     #[test]
     fn speculate_at_the_limit_and_far_above_it_agree() {
-        let b: Vec<u32> = (100..100 + MAX_NGRAM_LIMIT as u32).collect();
-        let h: Vec<u32> = (200..206).collect();
-        let c_short: Vec<u32> = vec![900, 901, 902, 903];
-        let c_long: Vec<u32> = vec![910, 911, 912, 913];
-
-        let hb: Vec<u32> = h.iter().chain(b.iter()).copied().collect();
-        let mut prompt: Vec<u32> = Vec::new();
-        prompt.extend_from_slice(&b);
-        prompt.extend_from_slice(&c_short);
-        prompt.extend_from_slice(&hb);
-        prompt.extend_from_slice(&c_long);
-        prompt.extend_from_slice(&hb);
+        let (prompt, c_short, _c_long) = clamp_fixture();
 
         let at_limit =
             NgramSpeculator::new(prompt.clone(), MAX_NGRAM_LIMIT, c_short.len()).speculate(&prompt);
