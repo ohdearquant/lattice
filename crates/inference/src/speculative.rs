@@ -2602,6 +2602,50 @@ mod tests {
             "both continuations are used as the max_draft, so they must be the same length"
         );
 
+        // The assertions above constrain the pieces. These constrain their PLACEMENT,
+        // which is what the tests actually rest on, and which a layout edit walks
+        // straight through: both of the mutations below left every assertion above and
+        // all 12 `speculate_` tests passing.
+        let c_short_at = b.len();
+        let hb_first_at = c_short_at + c_short.len();
+        let c_long_at = hb_first_at + hb.len();
+        let hb_last_at = c_long_at + c_long.len();
+
+        assert_eq!(
+            prompt.len(),
+            hb_last_at + hb.len(),
+            "the prompt must be exactly b | c_short | hb | c_long | hb; another length means a \
+             piece was added, dropped or resized, and every offset below is then reading \
+             something other than what it names"
+        );
+        assert_eq!(
+            &prompt[..b.len()],
+            b.as_slice(),
+            "the prompt must OPEN with the bare {MAX_NGRAM_LIMIT}-token block. Opening with the \
+             long block instead still contains a copy of it, so a clamped search still matches \
+             and still drafts c_short: the test keeps passing while no longer exercising a \
+             distinct shorter match"
+        );
+        assert_eq!(
+            &prompt[c_short_at..c_short_at + c_short.len()],
+            c_short.as_slice(),
+            "the short block must be followed by c_short, or a clamped search drafts something \
+             the clamp assertion does not name"
+        );
+        assert_eq!(
+            &prompt[hb_first_at..hb_first_at + hb.len()],
+            hb.as_slice(),
+            "the long block must sit between the two continuations, or the unclamped search has \
+             no earlier long match to find"
+        );
+        assert_eq!(
+            &prompt[c_long_at..c_long_at + c_long.len()],
+            c_long.as_slice(),
+            "the long block must be followed by c_long. With c_short here instead, a clamped and \
+             an unclamped search draft the SAME tokens, so removing the clamp stops changing the \
+             outcome and the regression test can no longer fail"
+        );
+
         (prompt, c_short, c_long)
     }
 
