@@ -6694,14 +6694,19 @@ mod inner {
         /// aborting; the assert stays as the internal invariant for direct callers of
         /// the batched chunk schedulers.
         ///
-        /// Wired into [`Self::try_forward_prefill`], which is the entry point every
-        /// request-facing generation path prefills through.
-        /// [`Self::forward_prefill_with_hidden`] and
-        /// [`Self::forward_prefill_all_logits`] enter the batched schedulers without
-        /// this check and still abort on an MoE model; their callers are the
-        /// perplexity/profiling paths rather than request handling. Extending the check
-        /// to them would change those paths from abort to `Err`, which is a separate
-        /// behaviour change from this rejection.
+        /// Wired into all three public entry points that can reach the batched
+        /// schedulers: [`Self::try_forward_prefill`],
+        /// [`Self::forward_prefill_with_hidden`], and
+        /// [`Self::forward_prefill_all_logits`]. Every request-facing caller prefills
+        /// through one of them — `generate`, `generate_streaming`, and
+        /// `generate_streaming_with_cancel` through the first, `embed_tokens` through
+        /// the first, `compute_token_nlls` through the last — so an MoE model reports
+        /// this input instead of aborting the process.
+        ///
+        /// [`Self::forward_prefill`] is the exception, by construction: it unwraps
+        /// [`Self::try_forward_prefill`]'s result, so it still aborts. Its remaining
+        /// callers are the bench and profiling examples, which treat an unsupported
+        /// checkpoint as a contract violation.
         fn check_prefill_moe_batched_unsupported(
             &self,
             entry_point: &str,
@@ -7201,11 +7206,12 @@ mod inner {
         /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
-        /// comment for the invariant this enforces. `generate`/`generate_streaming`/
-        /// `generate_multimodal`/`compute_token_nlls` all call this after their own
-        /// `reset_state()`, which has already cleared the cache, so this clear is a
-        /// no-op on those paths; it only matters for a consumer calling this
-        /// entry point directly against a state with a live retained entry.
+        /// comment for the invariant this enforces. The clear happens inside
+        /// [`Self::try_forward_prefill`], which this wraps. No production caller in
+        /// this crate remains — the generation entry points prefill through the
+        /// fallible route directly — so this wrapper's callers are this module's own
+        /// tests, the bench and profiling examples, and any external consumer that
+        /// wants the panicking form.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
             match self.try_forward_prefill(token_ids) {
                 Ok(logits) => logits,
@@ -7237,15 +7243,12 @@ mod inner {
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
         /// dispatch for an empty prompt, an out-of-vocabulary token, a prompt
         /// whose token range exceeds the session capacity, or a session that is
-        /// not fresh (see above). On rejection, session state (KV cache, GDN
-        /// state, hidden-readback counters) is left unchanged.
-        ///
-        /// # Panics
-        ///
-        /// Aborts before dispatch on a multi-token prompt against a model with MoE
-        /// layers and no active LoRA adapter, which takes the batched schedulers.
-        /// Unlike [`Self::try_forward_prefill`], this entry point does not convert
-        /// that case into an error.
+        /// not fresh (see above). Returns
+        /// [`crate::error::InferenceError::UnsupportedModel`] for a multi-token
+        /// prompt against a model with MoE layers and no active LoRA adapter: that
+        /// input takes the batched schedulers, which have no MoE schedule. On
+        /// rejection, session state (KV cache, GDN state, hidden-readback counters)
+        /// is left unchanged.
         pub fn forward_prefill_with_hidden(
             &mut self,
             token_ids: &[u32],
@@ -7260,6 +7263,10 @@ mod inner {
             self.check_forward_token_ids("forward_prefill_with_hidden", token_ids)?;
             self.check_hidden_prefill_fresh_session()?;
             self.check_forward_range_capacity(0, token_ids.len(), false)?;
+            self.check_prefill_moe_batched_unsupported(
+                "forward_prefill_with_hidden",
+                token_ids.len(),
+            )?;
             self.cross_turn_prefix_cache.clear();
 
             if token_ids.len() == 1 {
@@ -7316,14 +7323,10 @@ mod inner {
         /// dispatch when the session is not fresh (see above). Returns an error
         /// when more than one position is requested while a LoRA adapter is active,
         /// because the batched all-position path does not apply LoRA projections.
-        ///
-        /// # Panics
-        ///
-        /// Aborts before dispatch on a multi-token prompt against a model with MoE
-        /// layers: the all-position path is batched by construction and the batched
-        /// schedulers have no MoE schedule. Unlike
-        /// [`Self::try_forward_prefill`], this entry point does not convert that
-        /// case into an error.
+        /// Returns [`crate::error::InferenceError::UnsupportedModel`] for a
+        /// multi-token prompt against a model with MoE layers: the all-position
+        /// path is batched by construction and the batched schedulers have no MoE
+        /// schedule.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -7341,6 +7344,10 @@ mod inner {
                         .into(),
                 ));
             }
+            self.check_prefill_moe_batched_unsupported(
+                "forward_prefill_all_logits",
+                token_ids.len(),
+            )?;
             self.cross_turn_prefix_cache.clear();
             Ok(self.forward_prefill_impl(token_ids, true))
         }
@@ -9246,6 +9253,9 @@ mod inner {
         /// `generate` contract (#611).
         /// Returns `InferenceError::Inference` when the prompt plus requested decode
         /// cap exceeds [`Self::max_context`].
+        /// Returns `InferenceError::UnsupportedModel` for a multi-token prompt on a
+        /// model with MoE layers and no active LoRA adapter: prefill for that input
+        /// is batched and the batched schedulers have no MoE schedule.
         pub fn generate(
             &mut self,
             prompt: &str,
@@ -9278,8 +9288,14 @@ mod inner {
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
-            // Batch prefill: process all prompt tokens at once (GEMM)
-            let mut prefill_logits = self.forward_prefill(&prompt_ids);
+            // Batch prefill: process all prompt tokens at once (GEMM). Through the
+            // fallible entry point, not the unwrapping wrapper: a multi-token prompt
+            // on an MoE model has no batched schedule, and this is a request-facing
+            // call, so it must come back as `UnsupportedModel` rather than aborting
+            // the process. `try_forward_prefill` rejects before any state mutation,
+            // and every generation entry point calls `reset_state()` at its top, so
+            // returning here leaves nothing for this call to unwind.
+            let mut prefill_logits = self.try_forward_prefill(&prompt_ids)?;
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
@@ -11100,6 +11116,10 @@ mod inner {
         /// `generate_streaming` contract (#611).
         /// Returns `InferenceError::Inference` when the prompt plus effective decode
         /// cap exceeds [`Self::max_context`].
+        /// Returns `InferenceError::UnsupportedModel` for a multi-token prompt on a
+        /// model with MoE layers and no active LoRA adapter, for the reason given on
+        /// [`Self::generate`]. `generate_streaming` shares this implementation and so
+        /// reports the same error.
         pub fn generate_streaming_with_cancel<F, C>(
             &mut self,
             prompt: &str,
@@ -11176,8 +11196,10 @@ mod inner {
                 });
             }
 
-            // Batch prefill
-            let mut prefill_logits = self.forward_prefill(&prompt_ids);
+            // Batch prefill, through the fallible entry point for the same reason
+            // `generate` does: an MoE model has no batched prefill schedule, and a
+            // streaming request must see that as an error rather than an abort.
+            let mut prefill_logits = self.try_forward_prefill(&prompt_ids)?;
 
             // The prefill call itself cannot be interrupted mid-flight (it is one
             // GPU dispatch), so this is the earliest point a disconnect that
@@ -13045,6 +13067,9 @@ mod inner {
         ///
         /// - `tokens` empty, longer than the session's context, or containing
         ///   an id at or above `vocab_size`.
+        /// - More than one token against a model with MoE layers: the prefill this
+        ///   runs to produce the hidden state is batched, and the batched schedulers
+        ///   have no MoE schedule.
         /// - [`HiddenPooling::Mean`], which this path does not implement. Mean
         ///   pooling needs every position's *post-norm* hidden state, and the
         ///   Metal prefill normalizes only the rows it is about to project to
@@ -13103,8 +13128,12 @@ mod inner {
             self.session
                 .final_hidden_captured
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            let _ = self.forward_prefill(tokens);
+            // Fallible route: a multi-token prompt on an MoE model has no batched
+            // prefill schedule. Restore the capture flag before propagating, so a
+            // rejected call leaves the session exactly as it found it.
+            let prefill = self.try_forward_prefill(tokens);
             self.session.capture_final_hidden = previous;
+            prefill?;
 
             if !self
                 .session
@@ -28676,6 +28705,254 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
             crate::tokenizer::bpe::BpeTokenizer::from_vocab_and_merges(vocab, Vec::new())
                 .expect("single-char vocab tokenizer build")
+        }
+
+        /// Shared assertion for the #1448 entry-point sweep. Every public prefill
+        /// route that can reach the batched schedulers must REPORT an unsupported
+        /// (MoE) multi-token prefill as `UnsupportedModel`, never abort the process.
+        ///
+        /// Each caller does its own `catch_unwind` around its own entry point and
+        /// hands the outcome here, because a panic is the exact failure under guard:
+        /// it has to be observed as a caught unwind, not allowed to propagate. The
+        /// variant is asserted rather than just "an error", and "did not panic" is
+        /// deliberately not the assertion — a test that only checks for the absence
+        /// of a crash passes against a route that rejects for some unrelated reason,
+        /// and so would pass without the guard under test ever running.
+        fn assert_moe_prefill_rejected<T: std::fmt::Debug>(
+            outcome: std::thread::Result<Result<T, crate::error::InferenceError>>,
+            entry_point: &str,
+        ) {
+            let Ok(returned) = outcome else {
+                panic!(
+                    "{entry_point}: an unsupported-MoE prefill must come back as Err; it \
+                     unwound as a panic instead, which in a release build is the process \
+                     abort this guard exists to remove"
+                )
+            };
+            let error = match returned {
+                Err(error) => error,
+                Ok(value) => panic!(
+                    "{entry_point}: an unsupported-MoE prefill must not succeed; got {value:?}"
+                ),
+            };
+            let message = match &error {
+                crate::error::InferenceError::UnsupportedModel(message) => message.clone(),
+                other => panic!(
+                    "{entry_point}: the documented contract is \
+                     InferenceError::UnsupportedModel; got {other:?}. Any other variant \
+                     means a different rejection fired first and this test would pass \
+                     without the guard under test having run at all"
+                ),
+            };
+            assert!(
+                message.contains("MoE"),
+                "{entry_point}: the rejection must name the MoE batched-prefill \
+                 limitation so a caller can act on it; got {message:?}"
+            );
+        }
+
+        /// Regression (#1448): `forward_prefill_with_hidden` takes the batched
+        /// schedulers for a multi-token prompt with no active LoRA adapter, and those
+        /// have no MoE schedule. Until the check was wired in here it aborted on that
+        /// input. Three tokens, one more than the two-token minimum, so the assertion
+        /// is not resting on the smallest possible batch.
+        #[test]
+        fn forward_prefill_with_hidden_reports_moe_prefill_rejection() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("moe prefill fixture must construct");
+            let position_before = state.session.position;
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.forward_prefill_with_hidden(&[1u32, 3, 5])
+            }));
+            assert_moe_prefill_rejected(outcome, "forward_prefill_with_hidden");
+            assert_eq!(
+                state.session.position, position_before,
+                "the rejection runs before any dispatch, so session position must be \
+                 untouched"
+            );
+        }
+
+        /// Regression (#1448): `forward_prefill_all_logits` is batched by
+        /// construction — it has no per-token fallback at all — so an MoE checkpoint
+        /// reached it and aborted. Its production caller is perplexity evaluation,
+        /// which now gets an error it can report.
+        #[test]
+        fn forward_prefill_all_logits_reports_moe_prefill_rejection() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("moe prefill fixture must construct");
+            let position_before = state.session.position;
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.forward_prefill_all_logits(&[1u32, 3, 5])
+            }));
+            assert_moe_prefill_rejected(outcome, "forward_prefill_all_logits");
+            assert_eq!(
+                state.session.position, position_before,
+                "the rejection runs before any dispatch, so session position must be \
+                 untouched"
+            );
+        }
+
+        /// Regression (#1448): `generate` prefilled through the panicking
+        /// `forward_prefill` wrapper, so the typed rejection that already existed one
+        /// level down was turned straight back into an abort on the request-facing
+        /// path. This is the one that matters for a server: an ordinary valid prompt
+        /// against an MoE checkpoint took the host down.
+        #[test]
+        fn generate_reports_moe_prefill_rejection_without_panicking() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::tokenizer::common::Tokenizer;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let prompt = "abc";
+            let tokenized = tokenizer.tokenize(prompt);
+            assert!(
+                tokenized.real_length > 1,
+                "test construction: the prompt must tokenize to more than one token \
+                 (got {}), or prefill never reaches the batched path under guard",
+                tokenized.real_length
+            );
+
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32)
+                .expect("moe prefill fixture must construct");
+            let gen_cfg = moe_rejection_gen_cfg();
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.generate(prompt, &tokenizer, &gen_cfg)
+            }));
+            assert_moe_prefill_rejected(outcome, "generate");
+        }
+
+        /// Regression (#1448): `generate_streaming` shares
+        /// `generate_streaming_with_cancel`'s one implementation, which prefilled
+        /// through the same panicking wrapper `generate` did. Covered separately
+        /// rather than assumed from `generate`, because the two build their prefill
+        /// call independently — the sibling-invocation-path case this fix's own
+        /// review has to answer for.
+        #[test]
+        fn generate_streaming_reports_moe_prefill_rejection_without_panicking() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+            use crate::tokenizer::common::Tokenizer;
+
+            let tokenizer = single_char_vocab_tokenizer();
+            let prompt = "abc";
+            let tokenized = tokenizer.tokenize(prompt);
+            assert!(
+                tokenized.real_length > 1,
+                "test construction: the prompt must tokenize to more than one token \
+                 (got {}), or prefill never reaches the batched path under guard",
+                tokenized.real_length
+            );
+
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32)
+                .expect("moe prefill fixture must construct");
+            let gen_cfg = moe_rejection_gen_cfg();
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.generate_streaming(prompt, &tokenizer, &gen_cfg, |_, _| true)
+            }));
+            assert_moe_prefill_rejected(outcome, "generate_streaming");
+        }
+
+        /// Regression (#1448): `embed_tokens` is the third caller of the panicking
+        /// wrapper and is not named in the issue — found by grepping the wrapper's
+        /// call sites rather than by working the reported list. It is request-facing
+        /// (it backs Metal embedding), so it had the same abort. It also sets
+        /// `capture_final_hidden` around the prefill, so the rejection has to restore
+        /// that flag on the way out; the second assertion is what makes the early
+        /// return distinguishable from one that leaks session state.
+        #[test]
+        fn embed_tokens_reports_moe_prefill_rejection_without_panicking() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("moe prefill fixture must construct");
+            let capture_before = state.session.capture_final_hidden;
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.embed_tokens(
+                    &[1u32, 3, 5],
+                    crate::model::qwen35::HiddenPooling::LastToken,
+                )
+            }));
+            assert_moe_prefill_rejected(outcome, "embed_tokens");
+            assert_eq!(
+                state.session.capture_final_hidden, capture_before,
+                "a rejected embed must restore capture_final_hidden; leaving it set \
+                 would make the next unrelated forward pass capture a hidden row it \
+                 was never asked for"
+            );
+        }
+
+        /// Minimal decode config for the #1448 rejection tests. Every field is set
+        /// so that nothing but the MoE prefill can reject: no grammar, no logprobs,
+        /// no MTP, no stop tokens, and a decode budget the tiny fixture's context
+        /// comfortably admits. If one of those guards fired first,
+        /// `assert_moe_prefill_rejected` would see the wrong error variant and fail
+        /// rather than pass on the wrong evidence.
+        fn moe_rejection_gen_cfg() -> crate::model::qwen35_config::GenerateConfig {
+            crate::model::qwen35_config::GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            }
         }
 
         fn assert_context_budget_error<T: std::fmt::Debug>(
