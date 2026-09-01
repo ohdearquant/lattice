@@ -2,6 +2,7 @@
 pub mod bert;
 pub mod bitnet_config;
 pub mod cross_encoder;
+pub mod ernie45;
 pub mod gemma4_cache;
 pub mod gemma4_config;
 mod gemma4_loading;
