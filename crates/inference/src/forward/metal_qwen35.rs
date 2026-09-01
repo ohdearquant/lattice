@@ -2511,6 +2511,18 @@ mod inner {
     /// empirically by PPL regression when using head_dim). The partial-RoPE
     /// frequency spectrum is compressed into the first `rope_dim` dimensions
     /// rather than sliced from a wider head_dim spectrum.
+    /// Single derivation point for the engine's `has_moe_layer` flag. Both
+    /// state constructors (f16 and Q4) build the flag from this same layer
+    /// scan, so a change to layer classification cannot update one
+    /// constructor and silently leave the other inconsistent.
+    fn derive_has_moe_layer(
+        layer_weights: &[(MetalLayerAttnWeights, MetalCommonLayerWeights)],
+    ) -> bool {
+        layer_weights
+            .iter()
+            .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)))
+    }
+
     fn build_rope_interleaved(rope_dim: usize, max_pos: usize, theta: f64) -> (Vec<f32>, Vec<f32>) {
         let half = rope_dim / 2;
         let mut cos_data = Vec::with_capacity(max_pos * half);
@@ -3211,9 +3223,7 @@ mod inner {
             let rope_cos = make_buffer(&device, &cos_data, "rope_cos");
             let rope_sin = make_buffer(&device, &sin_data, "rope_sin");
 
-            let has_moe_layer = layer_weights
-                .iter()
-                .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)));
+            let has_moe_layer = derive_has_moe_layer(&layer_weights);
 
             Ok(Self {
                 device,
@@ -12940,9 +12950,7 @@ mod inner {
                 None
             };
 
-            let has_moe_layer = layer_weights
-                .iter()
-                .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)));
+            let has_moe_layer = derive_has_moe_layer(&layer_weights);
             Ok(Self {
                 engine: MetalQwen35Engine {
                     device,
@@ -13922,9 +13930,12 @@ mod inner {
         ///
         /// Returns the shared context-budget error before cache restore or eviction
         /// when the prompt plus effective decode cap exceeds [`Self::max_context`].
-        /// Returns `InferenceError::UnsupportedModel` on a model with MoE layers:
-        /// the suffix prefill this path runs is batched in every branch, and the
-        /// batched schedulers have no MoE schedule.
+        /// Returns `InferenceError::UnsupportedModel` when a model with MoE
+        /// layers reaches a batched prefill — a multi-token suffix (or full
+        /// fallback prefill) with no active LoRA adapter. Single-token
+        /// suffixes and LoRA-active prefills run per-token forward steps,
+        /// which support MoE (see [`Self::reject_moe_batched`] and the gated
+        /// [`Self::check_prefill_moe_batched_unsupported`]).
         pub fn generate_streaming_with_prefix_cache<F>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
