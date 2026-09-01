@@ -133,14 +133,58 @@ impl GemmaBpeTokenizer {
     pub fn from_tokenizer_json_str(text: &str) -> Result<Self, InferenceError> {
         let root = parse_json(text)?;
         validate_gemma_bpe_shape(&root)?;
+        Self::build_from_validated(&root)
+    }
 
+    /// **Unstable**: load an ERNIE-family SentencePiece-BPE
+    /// `tokenizer.json` file (PaddleOCR-VL's `LlamaTokenizer`-class fast
+    /// serialization). Selected explicitly by the caller, exactly like the
+    /// Gemma constructor above.
+    pub fn from_ernie_tokenizer_json(path: &Path) -> Result<Self, InferenceError> {
+        let text = fs::read_to_string(path).map_err(|e| {
+            InferenceError::Tokenizer(format!("failed to read {}: {e}", path.display()))
+        })?;
+        Self::from_ernie_tokenizer_json_str(&text)
+    }
+
+    /// **Unstable**: load an ERNIE-family SentencePiece-BPE `tokenizer.json`
+    /// string.
+    ///
+    /// The ERNIE shape (read from `PaddlePaddle/PaddleOCR-VL-1.6`'s
+    /// `tokenizer.json`) differs from Gemma's in exactly two
+    /// behavior-identical declarations, so it shares this type's whole
+    /// encode/decode engine and only the fail-closed validator differs:
+    ///
+    /// - `normalizer` is `Sequence([Replace(" " -> "\u{2581}")])` — the same
+    ///   single replace, wrapped in a one-element `Sequence`;
+    /// - `pre_tokenizer` is `null` — Gemma declares a literal-space `Split`
+    ///   that never fires because the normalizer has already consumed every
+    ///   space (see the module docs), so "absent" and "dead" are the same
+    ///   pipeline.
+    ///
+    /// Every `model` field the merge/fallback logic depends on
+    /// (`type == "BPE"`, `byte_fallback == true`, `fuse_unk == true`,
+    /// `ignore_merges == false`, null affixes/dropout) and the exact
+    /// `Sequence[Replace, ByteFallback, Fuse]` decoder are validated
+    /// identically to the Gemma path.
+    pub fn from_ernie_tokenizer_json_str(text: &str) -> Result<Self, InferenceError> {
+        let root = parse_json(text)?;
+        validate_ernie_bpe_shape(&root)?;
+        Self::build_from_validated(&root)
+    }
+
+    /// Shared constructor body for the validated Gemma/ERNIE shapes: both
+    /// validators guarantee the identical effective pipeline this engine
+    /// implements (metaspace replace -> BPE merges with byte fallback ->
+    /// run-based fallback decode), so everything past validation is common.
+    fn build_from_validated(root: &JsonValue) -> Result<Self, InferenceError> {
         let vocab =
-            json_object_to_vocab(json_path(&root, &["model", "vocab"]).ok_or_else(|| {
+            json_object_to_vocab(json_path(root, &["model", "vocab"]).ok_or_else(|| {
                 InferenceError::Tokenizer("tokenizer.json missing model.vocab".into())
             })?)?;
         let id_to_token = invert_vocab(&vocab)?;
 
-        let merges_value = json_path(&root, &["model", "merges"]).ok_or_else(|| {
+        let merges_value = json_path(root, &["model", "merges"]).ok_or_else(|| {
             InferenceError::Tokenizer("tokenizer.json missing model.merges".into())
         })?;
         let merges_list = parse_merges_json(merges_value)?;
@@ -153,9 +197,9 @@ impl GemmaBpeTokenizer {
                 .or_insert(rank);
         }
 
-        let mut added = parse_added_tokens(&root);
+        let mut added = parse_added_tokens(root);
         added.retain(|name, _| !name.is_empty());
-        let added_render: HashMap<u32, String> = parse_rendered_added_tokens(&root);
+        let added_render: HashMap<u32, String> = parse_rendered_added_tokens(root);
         let rendered_ids: HashSet<u32> = added_render.keys().copied().collect();
         let special_skip_ids: HashSet<u32> = added
             .values()
@@ -521,23 +565,7 @@ fn parse_byte_fallback_token(tok: &str) -> Option<u8> {
 /// logic depends on. Every field this constructor does *not* check is
 /// exactly the set this loader's encode/decode logic never reads.
 fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
-    let model_type = json_path(root, &["model", "type"])
-        .and_then(JsonValue::as_str)
-        .unwrap_or("");
-    if model_type != "BPE" {
-        return Err(InferenceError::Tokenizer(format!(
-            "GemmaBpeTokenizer expects tokenizer.json model.type == \"BPE\", found {model_type:?}"
-        )));
-    }
-
-    let byte_fallback = json_path(root, &["model", "byte_fallback"])
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    if !byte_fallback {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects tokenizer.json model.byte_fallback == true".into(),
-        ));
-    }
+    validate_spm_bpe_model_fields(root, "GemmaBpeTokenizer")?;
 
     let normalizer = root.get("normalizer");
     let is_gemma_normalizer = normalizer.is_some_and(|n| {
@@ -583,47 +611,127 @@ fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
                 .into(),
         ));
     };
-    validate_gemma_decoder_sequence(decoders)?;
+    validate_gemma_decoder_sequence(decoders)
+}
 
-    let model = root.get("model").unwrap_or(&JsonValue::Null);
-    if !is_null_or_absent(model.get("dropout")) {
+/// Fails closed unless `root` matches the ERNIE SentencePiece-BPE shape
+/// (see [`GemmaBpeTokenizer::from_ernie_tokenizer_json_str`]): the same
+/// `model` and `decoder` contract as the Gemma validator, a one-element
+/// `Sequence([Replace(" " -> "\u{2581}")])` normalizer, and an absent/null
+/// `pre_tokenizer`. A Gemma-shaped file fails this validator (bare `Replace`
+/// normalizer, literal-`Split` pre-tokenizer) just as an ERNIE-shaped file
+/// fails the Gemma one — each constructor keeps making an explicit
+/// structural claim about its input instead of best-effort adapting.
+fn validate_ernie_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
+    validate_spm_bpe_model_fields(root, "ErnieBpe (GemmaBpeTokenizer ERNIE path)")?;
+
+    let normalizer = root.get("normalizer");
+    let is_ernie_normalizer = normalizer.is_some_and(|n| {
+        n.get("type").and_then(JsonValue::as_str) == Some("Sequence")
+            && n.get("normalizers")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|stages| {
+                    stages.len() == 1
+                        && stages[0].get("type").and_then(JsonValue::as_str) == Some("Replace")
+                        && json_path(&stages[0], &["pattern", "String"]).and_then(JsonValue::as_str)
+                            == Some(" ")
+                        && stages[0].get("content").and_then(JsonValue::as_str) == Some("\u{2581}")
+                })
+    });
+    if !is_ernie_normalizer {
         return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.dropout == null (this loader \
-             always applies BPE merges); tokenizer.json declares a different \
-             shape, refusing to guess"
-                .into(),
-        ));
-    }
-    if !is_null_or_absent(model.get("continuing_subword_prefix")) {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.continuing_subword_prefix == null \
-             (this loader never affix-wraps a subword); tokenizer.json declares \
+            "ERNIE BPE path expects a Sequence normalizer containing exactly \
+             one Replace(\" \" -> \"\u{2581}\") stage; tokenizer.json declares \
              a different shape, refusing to guess"
                 .into(),
         ));
     }
-    if !is_null_or_absent(model.get("end_of_word_suffix")) {
+
+    if !is_null_or_absent(root.get("pre_tokenizer")) {
         return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.end_of_word_suffix == null (this \
+            "ERNIE BPE path expects pre_tokenizer == null (the normalizer has \
+             already consumed every space, so any declared pre-tokenizer \
+             would be a pipeline this loader does not implement); \
+             tokenizer.json declares a different shape, refusing to guess"
+                .into(),
+        ));
+    }
+
+    let decoders = root
+        .get("decoder")
+        .filter(|d| d.get("type").and_then(JsonValue::as_str) == Some("Sequence"))
+        .and_then(|d| d.get("decoders"))
+        .and_then(JsonValue::as_array);
+    let Some(decoders) = decoders else {
+        return Err(InferenceError::Tokenizer(
+            "ERNIE BPE path expects decoder == Sequence[Replace(\"\u{2581}\" -> \
+             \" \"), ByteFallback, Fuse]; tokenizer.json declares a different \
+             shape, refusing to guess"
+                .into(),
+        ));
+    };
+    validate_gemma_decoder_sequence(decoders)
+}
+
+/// The `model`-field contract shared by the Gemma and ERNIE validators:
+/// `type == "BPE"`, `byte_fallback == true`, `fuse_unk == true`,
+/// `ignore_merges == false`, and null/absent
+/// `dropout`/`continuing_subword_prefix`/`end_of_word_suffix` — exactly the
+/// fields the BPE merge/fallback logic reads. `who` names the failing path
+/// in each error so a rejection is attributable.
+fn validate_spm_bpe_model_fields(root: &JsonValue, who: &str) -> Result<(), InferenceError> {
+    let model_type = json_path(root, &["model", "type"])
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    if model_type != "BPE" {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects tokenizer.json model.type == \"BPE\", found {model_type:?}"
+        )));
+    }
+
+    let byte_fallback = json_path(root, &["model", "byte_fallback"])
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    if !byte_fallback {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects tokenizer.json model.byte_fallback == true"
+        )));
+    }
+
+    let model = root.get("model").unwrap_or(&JsonValue::Null);
+    if !is_null_or_absent(model.get("dropout")) {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.dropout == null (this loader always applies \
+             BPE merges); tokenizer.json declares a different shape, refusing \
+             to guess"
+        )));
+    }
+    if !is_null_or_absent(model.get("continuing_subword_prefix")) {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.continuing_subword_prefix == null (this \
              loader never affix-wraps a subword); tokenizer.json declares a \
              different shape, refusing to guess"
-                .into(),
-        ));
+        )));
+    }
+    if !is_null_or_absent(model.get("end_of_word_suffix")) {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.end_of_word_suffix == null (this loader \
+             never affix-wraps a subword); tokenizer.json declares a \
+             different shape, refusing to guess"
+        )));
     }
     if model.get("fuse_unk").and_then(JsonValue::as_bool) != Some(true) {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.fuse_unk == true; tokenizer.json \
-             declares a different shape, refusing to guess"
-                .into(),
-        ));
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.fuse_unk == true; tokenizer.json declares a \
+             different shape, refusing to guess"
+        )));
     }
     if model.get("ignore_merges").and_then(JsonValue::as_bool) != Some(false) {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.ignore_merges == false (this \
-             loader always applies BPE merges); tokenizer.json declares a \
-             different shape, refusing to guess"
-                .into(),
-        ));
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.ignore_merges == false (this loader always \
+             applies BPE merges); tokenizer.json declares a different shape, \
+             refusing to guess"
+        )));
     }
 
     Ok(())

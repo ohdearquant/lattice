@@ -1,0 +1,11 @@
+{
+ "source_repo": "PaddlePaddle/PaddleOCR-VL-1.6",
+ "revision": "c5630abae1d940eafe0697512a0325494b02ab42",
+ "fetched": "2026-09-01",
+ "goldens_generator": "tokenizers.Tokenizer.from_file over tokenizer.json; decode with skip_special_tokens=True",
+ "files": {
+  "tokenizer.json": {"bytes": 11189060, "sha256": "c8a215a59183d0d0781adc33bacd3ce6162716f7fd568fb30234a74d69803a7d"},
+  "tokenizer_config.json": {"bytes": 186947, "sha256": "1f979337347cc0cb72a6282d8a23ed183539aa81a87a906f022aee2bab83c7c5"},
+  "chat_template.jinja": {"bytes": 1474, "sha256": "2f27812dab7f333e471884e0c803d807f11953d5453140dfb1aaba234f872bc8"}
+ }
+}
