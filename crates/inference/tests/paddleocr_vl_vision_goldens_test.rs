@@ -40,7 +40,8 @@ fn vision_forward_matches_hf_reference() {
 #[cfg(feature = "f16")]
 mod gate {
     use lattice_inference::vision::paddleocr_vit::{
-        PaddleOcrVisionConfig, PaddleOcrVisionWeights, paddleocr_vision_forward_trace,
+        PaddleOcrVisionConfig, PaddleOcrVisionWeights, paddleocr_vision_forward,
+        paddleocr_vision_forward_trace,
     };
     use lattice_inference::weights::SafetensorsFile;
     use serde::Deserialize;
@@ -282,6 +283,13 @@ mod gate {
                     case.id
                 );
             }
+            let projector =
+                paddleocr_vision_forward(&weights, &cfg, &pixels, gh, gw).expect("forward");
+            assert_eq!(
+                projector, trace.projector,
+                "case {}: production output",
+                case.id
+            );
             println!(
                 "case {}: grid {gh}x{gw} ({n} patches) all checkpoints within tolerance, \
                  worst |diff| {worst:.2e}",

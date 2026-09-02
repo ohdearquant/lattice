@@ -109,16 +109,26 @@ pub const MAX_VISION_HEADS: usize = 64;
 /// The shipped table side is 27; 128 allows substantially larger position
 /// tables while keeping their checked allocation products bounded.
 pub const MAX_VISION_POSITION_SIDE: usize = 128;
+/// Maximum patch edge length accepted by a vision checkpoint.
+pub const MAX_VISION_PATCH_SIZE: usize = 64;
 /// Maximum text-decoder width emitted by the projector.
 ///
 /// The shipped text width is 1024; 4096 supports wider decoder projections
 /// while bounding projector output allocations.
 pub const MAX_VISION_TEXT_HIDDEN_SIZE: usize = 4096;
+/// Maximum aggregate f32 checkpoint size accepted by the vision loader.
+///
+/// The shipped 27-layer, 1152-wide, 4304-intermediate encoder expands to about
+/// 1.65 GB of f32 (`4 * h^2 + 2 * inter * h + biases` per layer, times 27,
+/// plus embeddings and projector). 8 GiB leaves about five times headroom
+/// while rejecting the combination admitted by the per-field maxima.
+pub const MAX_VISION_CHECKPOINT_BYTES: u128 = 8_589_934_592;
 /// Maximum number of image patches accepted by the PaddleOCR-VL forward.
 ///
 /// The shipped preprocessing budget of 1,003,520 pixels at patch 14 yields at
-/// most 5,120 tokens. At this cap the shared per-head score buffer is 256 MiB.
-pub const MAX_VISION_TOKENS: usize = 8192;
+/// most 5,120 tokens, exactly. At this cap the shared per-head score buffer is
+/// 100 MiB.
+pub const MAX_VISION_TOKENS: usize = 5120;
 
 fn checked_mul(a: usize, b: usize, what: &str) -> Result<usize, InferenceError> {
     a.checked_mul(b).ok_or_else(|| {
@@ -126,6 +136,34 @@ fn checked_mul(a: usize, b: usize, what: &str) -> Result<usize, InferenceError> 
             "vision dimension product {what} ({a} * {b}) overflows usize"
         ))
     })
+}
+
+fn checked_tensor_bytes(shape: &[usize], name: &str) -> Result<u128, InferenceError> {
+    let elements = shape.iter().try_fold(1u128, |product, &dimension| {
+        product.checked_mul(dimension as u128)
+    });
+    let elements = elements.ok_or_else(|| {
+        InferenceError::Inference(format!(
+            "tensor {name} declared element count overflows u128"
+        ))
+    })?;
+    elements.checked_mul(4).ok_or_else(|| {
+        InferenceError::Inference(format!("tensor {name} declared byte count overflows u128"))
+    })
+}
+
+fn add_checkpoint_tensor_bytes(
+    total: &mut u128,
+    shape: &[usize],
+    name: &str,
+) -> Result<(), InferenceError> {
+    let bytes = checked_tensor_bytes(shape, name)?;
+    *total = total.checked_add(bytes).ok_or_else(|| {
+        InferenceError::Inference(format!(
+            "vision checkpoint byte count overflows u128 while adding {name}"
+        ))
+    })?;
+    Ok(())
 }
 
 fn reserve_exact<T>(buffer: &mut Vec<T>, len: usize, what: &str) -> Result<(), InferenceError> {
@@ -197,12 +235,76 @@ fn checked_config_sizes(cfg: &PaddleOcrVisionConfig) -> Result<CheckedConfigSize
     })
 }
 
+fn checked_checkpoint_bytes(cfg: &PaddleOcrVisionConfig) -> Result<u128, InferenceError> {
+    let h = cfg.hidden_size;
+    let inter = cfg.intermediate_size;
+    let p = cfg.patch_size;
+    let side = cfg.pos_table_side();
+    let merged = checked_mul(
+        checked_mul(
+            h,
+            cfg.spatial_merge_size,
+            "hidden_size * spatial_merge_size",
+        )?,
+        cfg.spatial_merge_size,
+        "merged width",
+    )?;
+    let mut total = 0u128;
+
+    add_checkpoint_tensor_bytes(
+        &mut total,
+        &[h, cfg.num_channels, p, p],
+        "patch embedding weight",
+    )?;
+    add_checkpoint_tensor_bytes(&mut total, &[h], "patch embedding bias")?;
+    add_checkpoint_tensor_bytes(&mut total, &[side, side, h], "position embedding")?;
+
+    for _ in 0..cfg.num_hidden_layers {
+        add_checkpoint_tensor_bytes(&mut total, &[h], "layer_norm1 weight")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h], "layer_norm1 bias")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h, h], "q projection weight")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h], "q projection bias")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h, h], "k projection weight")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h], "k projection bias")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h, h], "v projection weight")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h], "v projection bias")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h, h], "out projection weight")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h], "out projection bias")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h], "layer_norm2 weight")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h], "layer_norm2 bias")?;
+        add_checkpoint_tensor_bytes(&mut total, &[inter, h], "fc1 weight")?;
+        add_checkpoint_tensor_bytes(&mut total, &[inter], "fc1 bias")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h, inter], "fc2 weight")?;
+        add_checkpoint_tensor_bytes(&mut total, &[h], "fc2 bias")?;
+    }
+
+    add_checkpoint_tensor_bytes(&mut total, &[h], "post layernorm weight")?;
+    add_checkpoint_tensor_bytes(&mut total, &[h], "post layernorm bias")?;
+    add_checkpoint_tensor_bytes(&mut total, &[h], "projector norm weight")?;
+    add_checkpoint_tensor_bytes(&mut total, &[h], "projector norm bias")?;
+    add_checkpoint_tensor_bytes(&mut total, &[merged, merged], "projector linear 1 weight")?;
+    add_checkpoint_tensor_bytes(&mut total, &[merged], "projector linear 1 bias")?;
+    add_checkpoint_tensor_bytes(
+        &mut total,
+        &[cfg.text_hidden_size, merged],
+        "projector linear 2 weight",
+    )?;
+    add_checkpoint_tensor_bytes(
+        &mut total,
+        &[cfg.text_hidden_size],
+        "projector linear 2 bias",
+    )?;
+    Ok(total)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CheckedForwardSizes {
     config: CheckedConfigSizes,
     hidden_values: usize,
     qkv_values: usize,
     intermediate_values: usize,
+    rope_values: usize,
+    merged_tokens: usize,
     packed_values: usize,
     projector_values: usize,
 }
@@ -218,6 +320,7 @@ fn checked_forward_sizes(
     let qkv_width = checked_mul(3, cfg.hidden_size, "3 * hidden_size")?;
     let qkv_values = checked_mul(n, qkv_width, "n * 3 * hidden_size")?;
     let intermediate_values = checked_mul(n, cfg.intermediate_size, "n * intermediate_size")?;
+    let rope_values = checked_mul(n, cfg.head_dim(), "n * head_dim")?;
     let blocks_h = grid_h / cfg.spatial_merge_size;
     let blocks_w = grid_w / cfg.spatial_merge_size;
     let merged_tokens = checked_mul(blocks_h, blocks_w, "merged token count")?;
@@ -236,6 +339,8 @@ fn checked_forward_sizes(
         hidden_values,
         qkv_values,
         intermediate_values,
+        rope_values,
+        merged_tokens,
         packed_values,
         projector_values,
     })
@@ -341,9 +446,9 @@ impl PaddleOcrVisionConfig {
         }
         // The reference sizes its position table as `(image_size // patch_size)^2`
         // (384 // 14 = 27, discarding the 6-pixel remainder).
-        if self.patch_size == 0 {
+        if !(1..=MAX_VISION_PATCH_SIZE).contains(&self.patch_size) {
             return Err(InferenceError::Inference(format!(
-                "vision patch_size {} must be greater than zero",
+                "vision patch_size {} must be in 1..=MAX_VISION_PATCH_SIZE ({MAX_VISION_PATCH_SIZE})",
                 self.patch_size
             )));
         }
@@ -360,6 +465,12 @@ impl PaddleOcrVisionConfig {
             )));
         }
         checked_config_sizes(self)?;
+        let checkpoint_bytes = checked_checkpoint_bytes(self)?;
+        if checkpoint_bytes > MAX_VISION_CHECKPOINT_BYTES {
+            return Err(InferenceError::Inference(format!(
+                "vision checkpoint requires {checkpoint_bytes} bytes; exceeds MAX_VISION_CHECKPOINT_BYTES ({MAX_VISION_CHECKPOINT_BYTES})"
+            )));
+        }
         Ok(())
     }
 
@@ -433,6 +544,31 @@ fn load_tensor<T: TensorSource + ?Sized>(
     name: &str,
     expected: &[usize],
 ) -> Result<Vec<f32>, InferenceError> {
+    let declared_shape = source
+        .tensor_shape(name)?
+        .ok_or_else(|| InferenceError::MissingTensor(name.to_string()))?;
+    if declared_shape != expected {
+        return Err(InferenceError::ShapeMismatch {
+            name: name.to_string(),
+            expected: expected.to_vec(),
+            actual: declared_shape,
+        });
+    }
+    let declared_bytes = checked_tensor_bytes(&declared_shape, name)?;
+    if declared_bytes > crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES {
+        return Err(InferenceError::Inference(format!(
+            "vision tensor {name}: declared size ({declared_bytes} bytes) exceeds MAX_VISION_TENSOR_BYTES ({}) -- rejected before decoding",
+            crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES
+        )));
+    }
+    let expected_elements = expected
+        .iter()
+        .try_fold(1usize, |product, &dimension| product.checked_mul(dimension))
+        .ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "expected element count for tensor {name} overflows usize"
+            ))
+        })?;
     let (data, shape) = source.get_f32_tensor_owned(name)?;
     if shape != expected {
         return Err(InferenceError::ShapeMismatch {
@@ -440,6 +576,12 @@ fn load_tensor<T: TensorSource + ?Sized>(
             expected: expected.to_vec(),
             actual: shape,
         });
+    }
+    if data.len() != expected_elements {
+        return Err(InferenceError::Inference(format!(
+            "tensor {name} materialized {} values; expected {expected_elements}",
+            data.len()
+        )));
     }
     Ok(data)
 }
@@ -589,16 +731,11 @@ type PosEmbedAndRopeTables = (Vec<f32>, Vec<f32>, Vec<f32>);
 fn build_pos_embed_and_rope_tables(
     weights: &PaddleOcrVisionWeights,
     cfg: &PaddleOcrVisionConfig,
+    sizes: &CheckedForwardSizes,
     grid_h: usize,
     grid_w: usize,
 ) -> Result<PosEmbedAndRopeTables, InferenceError> {
     let hidden = cfg.hidden_size;
-    let n = grid_h.checked_mul(grid_w).ok_or_else(|| {
-        InferenceError::Inference(format!(
-            "vision grid {grid_h}x{grid_w} overflows the patch count"
-        ))
-    })?;
-    let sizes = checked_forward_sizes(cfg, n, grid_h, grid_w)?;
     let side = cfg.pos_table_side();
     let head_dim = cfg.head_dim();
     let rope_dim = head_dim / 2;
@@ -610,10 +747,8 @@ fn build_pos_embed_and_rope_tables(
     }
 
     let mut pos = try_zeroed_f32(sizes.hidden_values, "position embedding")?;
-    let cos_values = checked_mul(n, head_dim, "n * head_dim for cosine table")?;
-    let sin_values = checked_mul(n, head_dim, "n * head_dim for sine table")?;
-    let mut cos_t = try_zeroed_f32(cos_values, "cosine table")?;
-    let mut sin_t = try_zeroed_f32(sin_values, "sine table")?;
+    let mut cos_t = try_zeroed_f32(sizes.rope_values, "cosine table")?;
+    let mut sin_t = try_zeroed_f32(sizes.rope_values, "sine table")?;
     for (idx, (pos_row, (cos_row, sin_row))) in pos
         .chunks_mut(hidden)
         .zip(cos_t.chunks_mut(head_dim).zip(sin_t.chunks_mut(head_dim)))
@@ -693,6 +828,7 @@ fn check_grid(
 /// `pixel_values` is `[grid_h * grid_w, channels * patch * patch]`, each
 /// patch flattened `(channel, row, col)` after the reference's
 /// rescale-and-normalize preprocessing.
+/// Returns only the projector output `[n / 4, text_hidden_size]`.
 ///
 /// # Errors
 ///
@@ -700,6 +836,23 @@ fn check_grid(
 /// [`MAX_VISION_TOKENS`], is not a multiple of the merge kernel on either
 /// axis, overflows a dimension product, or `pixel_values` has the wrong
 /// length.
+pub fn paddleocr_vision_forward(
+    weights: &PaddleOcrVisionWeights,
+    cfg: &PaddleOcrVisionConfig,
+    pixel_values: &[f32],
+    grid_h: usize,
+    grid_w: usize,
+) -> Result<Vec<f32>, InferenceError> {
+    match forward_impl(weights, cfg, pixel_values, grid_h, grid_w, false)? {
+        ForwardOutput::Projector(projector) => Ok(projector),
+        ForwardOutput::Trace(_) => Err(InferenceError::Inference(
+            "vision forward returned trace data for a production request".to_string(),
+        )),
+    }
+}
+
+/// Encoder + projector over one image's raster-ordered patches, retaining
+/// intermediate activations for validation and diagnostics.
 pub fn paddleocr_vision_forward_trace(
     weights: &PaddleOcrVisionWeights,
     cfg: &PaddleOcrVisionConfig,
@@ -707,6 +860,27 @@ pub fn paddleocr_vision_forward_trace(
     grid_h: usize,
     grid_w: usize,
 ) -> Result<PaddleOcrVisionTrace, InferenceError> {
+    match forward_impl(weights, cfg, pixel_values, grid_h, grid_w, true)? {
+        ForwardOutput::Trace(trace) => Ok(trace),
+        ForwardOutput::Projector(_) => Err(InferenceError::Inference(
+            "vision trace forward returned only projector data".to_string(),
+        )),
+    }
+}
+
+enum ForwardOutput {
+    Projector(Vec<f32>),
+    Trace(PaddleOcrVisionTrace),
+}
+
+fn forward_impl(
+    weights: &PaddleOcrVisionWeights,
+    cfg: &PaddleOcrVisionConfig,
+    pixel_values: &[f32],
+    grid_h: usize,
+    grid_w: usize,
+    keep_trace: bool,
+) -> Result<ForwardOutput, InferenceError> {
     let n = check_grid(cfg, grid_h, grid_w)?;
     cfg.validate()?;
     let sizes = checked_forward_sizes(cfg, n, grid_h, grid_w)?;
@@ -729,22 +903,28 @@ pub fn paddleocr_vision_forward_trace(
 
     let mut hidden_states = batch_matvec(&weights.patch_weight, pixel_values, n, hidden, patch_len);
     add_bias_rows(&mut hidden_states, &weights.patch_bias);
-    let (pos, cos_t, sin_t) = build_pos_embed_and_rope_tables(weights, cfg, grid_h, grid_w)?;
+    let (pos, cos_t, sin_t) =
+        build_pos_embed_and_rope_tables(weights, cfg, &sizes, grid_h, grid_w)?;
     for (x, p) in hidden_states.iter_mut().zip(&pos) {
         *x += p;
     }
-    let embed = try_clone_f32(&hidden_states, "embedding trace")?;
+    let embed = if keep_trace {
+        Some(try_clone_f32(&hidden_states, "embedding trace")?)
+    } else {
+        None
+    };
 
     let head_dim = cfg.head_dim();
     let n_heads = cfg.num_attention_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let eps = cfg.layer_norm_eps;
-    let mut layer_outputs = Vec::new();
-    reserve_exact(
-        &mut layer_outputs,
-        cfg.num_hidden_layers,
-        "layer output trace",
-    )?;
+    let mut layer_outputs = if keep_trace {
+        let mut outputs = Vec::new();
+        reserve_exact(&mut outputs, cfg.num_hidden_layers, "layer output trace")?;
+        Some(outputs)
+    } else {
+        None
+    };
 
     for layer in &weights.layers {
         let mut normed = try_clone_f32(&hidden_states, "attention normalization")?;
@@ -800,7 +980,9 @@ pub fn paddleocr_vision_forward_trace(
         for (x, p) in hidden_states.iter_mut().zip(&fc2) {
             *x += p;
         }
-        layer_outputs.push(try_clone_f32(&hidden_states, "layer output trace")?);
+        if let Some(outputs) = layer_outputs.as_mut() {
+            outputs.push(try_clone_f32(&hidden_states, "layer output trace")?);
+        }
     }
 
     let mut post = hidden_states;
@@ -810,14 +992,20 @@ pub fn paddleocr_vision_forward_trace(
         &weights.post_ln_bias,
         eps,
     );
-    let projector = project_merged(weights, cfg, &post, grid_h, grid_w)?;
+    let projector = project_merged(weights, cfg, &sizes, &post, grid_h, grid_w)?;
 
-    Ok(PaddleOcrVisionTrace {
-        embed,
-        layer_outputs,
-        post_layernorm: post,
-        projector,
-    })
+    match (embed, layer_outputs) {
+        (Some(embed), Some(layer_outputs)) => Ok(ForwardOutput::Trace(PaddleOcrVisionTrace {
+            embed,
+            layer_outputs,
+            post_layernorm: post,
+            projector,
+        })),
+        (None, None) => Ok(ForwardOutput::Projector(projector)),
+        _ => Err(InferenceError::Inference(
+            "vision trace retention state is inconsistent".to_string(),
+        )),
+    }
 }
 
 /// `mlp_AR`: per-token LayerNorm, then each 2x2 raster block of tokens
@@ -827,12 +1015,11 @@ pub fn paddleocr_vision_forward_trace(
 fn project_merged(
     weights: &PaddleOcrVisionWeights,
     cfg: &PaddleOcrVisionConfig,
+    sizes: &CheckedForwardSizes,
     features: &[f32],
     grid_h: usize,
     grid_w: usize,
 ) -> Result<Vec<f32>, InferenceError> {
-    let n = checked_mul(grid_h, grid_w, "grid_h * grid_w")?;
-    let sizes = checked_forward_sizes(cfg, n, grid_h, grid_w)?;
     let hidden = cfg.hidden_size;
     let m = cfg.spatial_merge_size;
     let merged = sizes.config.merged_width;
@@ -845,7 +1032,7 @@ fn project_merged(
     );
     let blocks_h = grid_h / m;
     let blocks_w = grid_w / m;
-    let nb = checked_mul(blocks_h, blocks_w, "merged token count")?;
+    let nb = sizes.merged_tokens;
     let mut packed = try_zeroed_f32(sizes.packed_values, "projector packed")?;
     for br in 0..blocks_h {
         for bc in 0..blocks_w {
@@ -928,6 +1115,8 @@ mod tests {
         cfg = valid_cfg();
         cfg.hidden_size = MAX_VISION_HIDDEN_SIZE;
         cfg.num_attention_heads = MAX_VISION_HEADS;
+        cfg.num_hidden_layers = 1;
+        cfg.intermediate_size = 1;
         cfg.validate().unwrap();
         cfg.hidden_size = MAX_VISION_HIDDEN_SIZE + 1;
         assert!(cfg.validate().is_err());
@@ -946,6 +1135,8 @@ mod tests {
         cfg.validate().unwrap();
         cfg.num_attention_heads = MAX_VISION_HEADS;
         cfg.hidden_size = MAX_VISION_HIDDEN_SIZE;
+        cfg.num_hidden_layers = 1;
+        cfg.intermediate_size = 1;
         cfg.validate().unwrap();
         cfg.num_attention_heads = MAX_VISION_HEADS + 1;
         assert!(cfg.validate().is_err());
@@ -973,6 +1164,31 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 
+    #[test]
+    fn validate_rejects_checkpoint_over_aggregate_budget() {
+        let mut cfg = valid_cfg();
+        cfg.num_hidden_layers = MAX_VISION_LAYERS;
+        cfg.hidden_size = MAX_VISION_HIDDEN_SIZE;
+        cfg.intermediate_size = MAX_VISION_INTERMEDIATE_SIZE;
+        cfg.num_attention_heads = MAX_VISION_HEADS;
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("MAX_VISION_CHECKPOINT_BYTES"), "{error}");
+
+        valid_cfg().validate().unwrap();
+    }
+
+    #[test]
+    fn validate_bounds_patch_size() {
+        let mut cfg = valid_cfg();
+        cfg.patch_size = MAX_VISION_PATCH_SIZE + 1;
+        cfg.image_size = cfg.patch_size;
+        let error = cfg.validate().unwrap_err().to_string();
+        assert!(error.contains("MAX_VISION_PATCH_SIZE"), "{error}");
+
+        cfg.patch_size = MAX_VISION_PATCH_SIZE;
+        cfg.validate().unwrap();
+    }
+
     struct PanickingTensorSource;
 
     impl TensorSource for PanickingTensorSource {
@@ -990,6 +1206,65 @@ mod tests {
         ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
             panic!("invalid configuration reached tensor source");
         }
+    }
+
+    struct CountingTensorSource {
+        declared_shape: Option<Vec<usize>>,
+        materializations: usize,
+    }
+
+    impl TensorSource for CountingTensorSource {
+        fn has_tensor(&mut self, _name: &str) -> Result<bool, InferenceError> {
+            Ok(self.declared_shape.is_some())
+        }
+
+        fn tensor_shape(&mut self, _name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            Ok(self.declared_shape.clone())
+        }
+
+        fn get_f32_tensor_owned(
+            &mut self,
+            _name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            self.materializations += 1;
+            Ok((Vec::new(), Vec::new()))
+        }
+    }
+
+    #[test]
+    fn load_tensor_preflights_wrong_shape_without_materialization() {
+        let mut source = CountingTensorSource {
+            declared_shape: Some(vec![4]),
+            materializations: 0,
+        };
+        let error = load_tensor(&mut source, "tensor", &[2, 2]).unwrap_err();
+        assert!(matches!(error, InferenceError::ShapeMismatch { .. }));
+        assert_eq!(source.materializations, 0);
+    }
+
+    #[test]
+    fn load_tensor_preflights_missing_tensor_without_materialization() {
+        let mut source = CountingTensorSource {
+            declared_shape: None,
+            materializations: 0,
+        };
+        let error = load_tensor(&mut source, "tensor", &[2, 2]).unwrap_err();
+        assert!(matches!(error, InferenceError::MissingTensor(name) if name == "tensor"));
+        assert_eq!(source.materializations, 0);
+    }
+
+    #[test]
+    fn load_tensor_rejects_oversized_declared_tensor_before_materialization() {
+        let oversized = crate::model::qwen35_config::MAX_VISION_TENSOR_BYTES as usize / 4 + 1;
+        let mut source = CountingTensorSource {
+            declared_shape: Some(vec![oversized]),
+            materializations: 0,
+        };
+        let error = load_tensor(&mut source, "tensor", &[oversized])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MAX_VISION_TENSOR_BYTES"), "{error}");
+        assert_eq!(source.materializations, 0);
     }
 
     #[test]
@@ -1017,6 +1292,14 @@ mod tests {
             check_grid(&cfg, 2, MAX_VISION_TOKENS / 2).unwrap(),
             MAX_VISION_TOKENS
         );
+    }
+
+    #[test]
+    fn check_grid_caps_tokens_at_shipped_budget() {
+        let cfg = valid_cfg();
+        assert_eq!(check_grid(&cfg, 64, 80).unwrap(), 5120);
+        let error = check_grid(&cfg, 74, 70).unwrap_err().to_string();
+        assert!(error.contains("MAX_VISION_TOKENS"), "{error}");
     }
 
     #[test]
