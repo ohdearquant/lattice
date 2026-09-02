@@ -1,0 +1,88 @@
+name: 'Provision PaddleOCR-VL (pinned + hash-verified)'
+description: >-
+  Downloads PaddlePaddle/PaddleOCR-VL at a pinned revision and verifies the
+  snapshot before the decoder differential test consumes it: both files must
+  match their expected digest, and the directory must contain nothing else.
+outputs:
+  model-dir:
+    description: 'Local snapshot directory for the downloaded model.'
+    value: ${{ steps.download.outputs.model_dir }}
+runs:
+  using: 'composite'
+  steps:
+    - id: download
+      shell: bash
+      env:
+        # Pinned to an immutable commit so a later upstream push cannot change
+        # the checkpoint used by the native Rust decoder. Bump deliberately:
+        # fetch the new commit's tree via the HF API, verify its hashes, then
+        # update this revision and the checksums in the verify step together.
+        PADDLEOCR_VL_REVISION: c5630abae1d940eafe0697512a0325494b02ab42
+      run: |
+        set -euo pipefail
+        # The allowlist names the materialized set explicitly. The verify step
+        # below asserts an exact set, so the download and verification
+        # manifests describe the same files.
+        MODEL_CACHE=$(python3 -c "
+        from huggingface_hub import snapshot_download
+        print(snapshot_download('PaddlePaddle/PaddleOCR-VL', revision='$PADDLEOCR_VL_REVISION', allow_patterns=[
+            'config.json',
+            'model.safetensors',
+        ]))
+        ")
+        echo "model_dir=$MODEL_CACHE" >> "$GITHUB_OUTPUT"
+
+    # The digest checks prove that both expected files are present and
+    # unmodified. The exact-set check also rejects hidden files, directories,
+    # and other additions that could affect model loading.
+    - id: verify
+      shell: bash
+      env:
+        MODEL_CACHE: ${{ steps.download.outputs.model_dir }}
+      run: |
+        set -euo pipefail
+        cd "$MODEL_CACHE"
+
+        MANIFEST="$(mktemp)"
+        cat > "$MANIFEST" <<'HASHES'
+        ce7f4565f8b1db78532ad5d1b9ebe55c2139d49bd4cb04778b580a08a598f171  config.json
+        85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db  model.safetensors
+        HASHES
+
+        shasum -a 256 -c "$MANIFEST"
+
+        EXPECTED="$(mktemp)"
+        sed 's/^[0-9a-f]*  //' "$MANIFEST" > "$EXPECTED"
+
+        ALLOWED=()
+        while IFS= read -r name; do
+          [ -n "$name" ] && ALLOWED+=("$name")
+        done < "$EXPECTED"
+        if [ "${#ALLOWED[@]}" -eq 0 ]; then
+          echo "::error::allowlist parsed empty; refusing to treat that as nothing to check"
+          exit 1
+        fi
+
+        ACTUAL="$(mktemp)"
+        find . -mindepth 1 -maxdepth 1 -print0 > "$ACTUAL"
+
+        unverified=0
+        while IFS= read -r -d '' entry; do
+          entry="${entry#./}"
+          found=0
+          for allowed in "${ALLOWED[@]}"; do
+            if [ "$entry" = "$allowed" ]; then
+              found=1
+              break
+            fi
+          done
+          if [ "$found" -eq 0 ]; then
+            printf '::error::provisioned snapshot contains an entry that is not hash-verified: %s\n' "$entry"
+            unverified=1
+          fi
+        done < "$ACTUAL"
+
+        if [ "$unverified" -ne 0 ]; then
+          echo "Refusing to hand an unverified reference to the decoder test." >&2
+          exit 1
+        fi
