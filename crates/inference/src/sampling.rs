@@ -446,6 +446,12 @@ pub struct Sampler {
     /// through the public API at published `0.7.1`, so it cannot gain a field
     /// without a major break); set via [`with_min_p`](Self::with_min_p).
     min_p: f32,
+    /// Top-n-sigma: mask logits below `max_logit - top_n_sigma *
+    /// population_stddev` before candidate selection. 0.0, negative, or
+    /// non-finite = disabled. Carried out-of-band from `SamplingConfig` for
+    /// the same published-API reason as `min_p`; set via
+    /// [`with_top_n_sigma`](Self::with_top_n_sigma).
+    top_n_sigma: f32,
     rng: Rng,
     /// Token IDs seen since the last `reset`: prompt tokens (from `seed_history`)
     /// followed by all generated tokens.  Full history is retained for repetition penalty.
@@ -474,6 +480,7 @@ impl Sampler {
         Self {
             config,
             min_p: 0.0,
+            top_n_sigma: 0.0,
             rng: Rng::new(seed),
             recent_tokens: Vec::new(),
             penalty_seen: std::collections::HashSet::new(),
@@ -492,6 +499,12 @@ impl Sampler {
     /// **Unstable**: set min-p (relative-probability floor). 0.0 = disabled.
     pub fn with_min_p(mut self, min_p: f32) -> Self {
         self.min_p = min_p;
+        self
+    }
+
+    /// **Unstable**: set top-n-sigma (stddev-relative logit floor). 0.0 = disabled.
+    pub fn with_top_n_sigma(mut self, top_n_sigma: f32) -> Self {
+        self.top_n_sigma = top_n_sigma;
         self
     }
 
@@ -560,6 +573,16 @@ impl Sampler {
             self.apply_penalty_to_logit_scratch(penalty);
         }
 
+        // Top-n-sigma masks logits below `max - n * sigma` ahead of the fused
+        // top-k, so a masked token can never enter the candidate set. The
+        // greedy fast path above returns before this point: masking strictly
+        // below the max cannot change an argmax, so the filter would be a
+        // no-op there at the cost of two full-vocabulary passes.
+        let top_n_sigma_enabled = top_n_sigma_active(self.top_n_sigma);
+        if top_n_sigma_enabled {
+            apply_top_n_sigma(&mut self.logit_scratch, self.top_n_sigma);
+        }
+
         let (has_nan, max_logit) = scan_nan_or_nonfinite_max(&self.logit_scratch);
         if has_nan || !max_logit.is_finite() {
             let token = argmax_f32(&self.logit_scratch);
@@ -581,6 +604,13 @@ impl Sampler {
             inv_temp,
             &mut self.candidate_scratch,
         );
+        if top_n_sigma_enabled {
+            // `select_top_k` can seed its heap with masked entries when fewer
+            // than `top_k` logits survive the filter; drop them so the softmax
+            // below only sees survivors.
+            self.candidate_scratch
+                .retain(|candidate| candidate.logit != f32::NEG_INFINITY);
+        }
         let mut cs = CandidateSet {
             candidates: std::mem::take(&mut self.candidate_scratch),
         };
@@ -675,6 +705,7 @@ pub(crate) fn sample_full_logits(
     previous_ids: &[u32],
     rng_state: &mut u64,
     min_p: f32,
+    top_n_sigma: f32,
 ) -> u32 {
     FULL_LOGIT_SCRATCH.with(|cell| {
         let mut scratch = cell.borrow_mut();
@@ -706,6 +737,16 @@ pub(crate) fn sample_full_logits(
         // greedy argmax over the already-penalized logits.
         if temperature_degenerate(cfg.temperature) {
             return argmax_f32(logit_scratch);
+        }
+
+        // Top-n-sigma runs after the degenerate-temperature return above and
+        // is skipped for `top_k == 1`: masking strictly below the max can
+        // change neither an argmax nor a k=1 selection, so in both
+        // argmax-shaped cases the filter would spend two full-vocabulary
+        // passes to produce the token those paths already produce without it.
+        let top_n_sigma_enabled = top_n_sigma_active(top_n_sigma) && cfg.top_k != 1;
+        if top_n_sigma_enabled {
+            apply_top_n_sigma(logit_scratch, top_n_sigma);
         }
 
         let inv_temp = if cfg.temperature != 1.0 {
@@ -742,6 +783,10 @@ pub(crate) fn sample_full_logits(
         // Streaming min-heap top-k with fused temperature scaling — the softmax
         // draw below runs only over these k survivors, never the full vocabulary.
         select_top_k(logit_scratch, cfg.top_k, inv_temp, candidate_scratch);
+        if top_n_sigma_enabled {
+            // Same masked-survivor cleanup as `Sampler::sample`.
+            candidate_scratch.retain(|candidate| candidate.logit != f32::NEG_INFINITY);
+        }
 
         let mut cs = CandidateSet {
             candidates: std::mem::take(candidate_scratch),
@@ -800,6 +845,57 @@ pub(crate) fn penalized_logit(logit: f32, penalty: f32) -> f32 {
         logit / penalty
     } else {
         logit * penalty
+    }
+}
+
+/// Whether a top-n-sigma value enables filtering.
+#[inline]
+pub(crate) fn top_n_sigma_active(top_n_sigma: f32) -> bool {
+    top_n_sigma.is_finite() && top_n_sigma > 0.0
+}
+
+/// Mask logits below `max_logit - top_n_sigma * population_stddev` to
+/// `NEG_INFINITY`, in place, using a single Welford pass for the statistics.
+///
+/// The statistics exclude `NEG_INFINITY`, which represents an upstream mask.
+/// Any other non-finite value leaves the slice untouched so the sampler's
+/// existing poisoned-distribution guard can fail closed to argmax.
+fn apply_top_n_sigma(logits: &mut [f32], top_n_sigma: f32) {
+    if !top_n_sigma_active(top_n_sigma) || logits.len() <= 1 {
+        return;
+    }
+
+    let mut count = 0_u64;
+    let mut mean = 0.0_f64;
+    let mut squared_deviation_sum = 0.0_f64;
+    let mut max_logit = f32::NEG_INFINITY;
+
+    for &logit in logits.iter() {
+        if logit == f32::NEG_INFINITY {
+            continue;
+        }
+        if !logit.is_finite() {
+            return;
+        }
+
+        count += 1;
+        let value = f64::from(logit);
+        let delta = value - mean;
+        mean += delta / count as f64;
+        squared_deviation_sum += delta * (value - mean);
+        max_logit = max_logit.max(logit);
+    }
+
+    if count == 0 {
+        return;
+    }
+
+    let stddev = (squared_deviation_sum / count as f64).sqrt();
+    let threshold = f64::from(max_logit) - f64::from(top_n_sigma) * stddev;
+    for logit in logits {
+        if f64::from(*logit) < threshold {
+            *logit = f32::NEG_INFINITY;
+        }
     }
 }
 
@@ -1599,6 +1695,207 @@ mod tests {
         }
         // Token 0 should get almost all samples (its probability >> 0.5)
         assert!(counts[0] > 90);
+    }
+
+    #[test]
+    fn top_n_sigma_masks_below_max_minus_population_stddev() {
+        let mut logits = [4.0_f32, 3.0, 2.0, 1.0, f32::NEG_INFINITY];
+        apply_top_n_sigma(&mut logits, 1.7);
+
+        assert_eq!(logits[0], 4.0);
+        assert_eq!(logits[1], 3.0);
+        assert_eq!(logits[2], f32::NEG_INFINITY);
+        assert_eq!(logits[3], f32::NEG_INFINITY);
+        assert_eq!(logits[4], f32::NEG_INFINITY);
+    }
+
+    #[test]
+    fn top_n_sigma_keeps_logits_equal_to_the_threshold() {
+        let mut logits = [4.0_f32, 2.0];
+        apply_top_n_sigma(&mut logits, 2.0);
+
+        assert_eq!(logits, [4.0, 2.0]);
+    }
+
+    #[test]
+    fn top_n_sigma_defaults_disabled() {
+        assert!(!top_n_sigma_active(0.0));
+
+        let logits = [4.0_f32, 3.0, 2.0, 1.0];
+        let mut unset = Sampler::new(SamplingConfig::default()).with_seed(7);
+        let mut disabled = Sampler::new(SamplingConfig::default())
+            .with_seed(7)
+            .with_top_n_sigma(0.0);
+        assert_eq!(unset.sample(&logits), disabled.sample(&logits));
+    }
+
+    #[test]
+    fn top_n_sigma_selection_is_temperature_invariant() {
+        let mut raw = [4.0_f32, 3.0, 2.0, 1.0];
+        let mut scaled = raw.map(|logit| logit / 2.5);
+        apply_top_n_sigma(&mut raw, 1.0);
+        apply_top_n_sigma(&mut scaled, 1.0);
+
+        let raw_mask = raw.map(f32::is_finite);
+        let scaled_mask = scaled.map(f32::is_finite);
+        assert_eq!(raw_mask, scaled_mask);
+    }
+
+    #[test]
+    fn top_n_sigma_invalid_values_are_disabled_noops() {
+        let original = [4.0_f32, 3.0, 2.0, 1.0];
+        for disabled in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut logits = original;
+            apply_top_n_sigma(&mut logits, disabled);
+            assert_eq!(
+                logits.map(f32::to_bits),
+                original.map(f32::to_bits),
+                "top_n_sigma={disabled:?} must preserve every logit bit"
+            );
+        }
+    }
+
+    #[test]
+    fn top_n_sigma_preserves_poisoned_distribution_fallbacks() {
+        let config = SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+        };
+
+        let mut nan_sampler = Sampler::new(config.clone())
+            .with_seed(7)
+            .with_top_n_sigma(1.0);
+        assert_eq!(nan_sampler.sample(&[4.0, f32::NAN, 1.0]), 0);
+
+        let mut infinity_sampler = Sampler::new(config.clone())
+            .with_seed(7)
+            .with_top_n_sigma(1.0);
+        assert_eq!(infinity_sampler.sample(&[4.0, f32::INFINITY, 1.0]), 1);
+
+        let mut masked_sampler = Sampler::new(config).with_seed(7).with_top_n_sigma(1.0);
+        assert_eq!(masked_sampler.sample(&[f32::NEG_INFINITY; 3]), 0);
+    }
+
+    #[test]
+    fn top_n_sigma_interacts_with_the_existing_sampling_pipeline() {
+        let logits = [10.0_f32, 9.5, 9.0, 8.0, 7.0, 2.0, 1.0, 0.0];
+        let config = SamplingConfig {
+            temperature: 2.0,
+            top_k: 6,
+            top_p: 0.67,
+            repetition_penalty: 2.0,
+        };
+        let mut active_seen = [false; 8];
+        let mut disabled_seen = [false; 8];
+
+        for index in 0..512_u64 {
+            let seed = index
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut active_sampler = Sampler::new(config.clone())
+                .with_seed(seed)
+                .with_min_p(0.02)
+                .with_top_n_sigma(1.5);
+            active_sampler.seed_history(&[0]);
+            active_seen[active_sampler.sample(&logits) as usize] = true;
+
+            let mut disabled_sampler = Sampler::new(config.clone())
+                .with_seed(seed)
+                .with_min_p(0.02)
+                .with_top_n_sigma(0.0);
+            disabled_sampler.seed_history(&[0]);
+            disabled_seen[disabled_sampler.sample(&logits) as usize] = true;
+        }
+
+        assert_eq!(
+            active_seen,
+            [false, true, true, false, false, false, false, false],
+            "penalty -> top-n-sigma -> temperature -> top-k -> min-p -> top-p \
+             must leave exactly tokens 1 and 2 reachable"
+        );
+        assert!(
+            disabled_seen[3],
+            "the disabled control must reach token 3 or the top-n-sigma route assertion is vacuous"
+        );
+    }
+
+    #[test]
+    fn top_n_sigma_runs_after_repetition_penalty() {
+        let mut sampler = Sampler::new(SamplingConfig {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            repetition_penalty: 2.0,
+        })
+        .with_seed(7)
+        .with_top_n_sigma(1.0);
+        sampler.seed_history(&[0]);
+
+        assert_eq!(sampler.sample(&[10.0, 9.0, 0.0, 0.0]), 1);
+        assert_eq!(sampler.logit_scratch[0], f32::NEG_INFINITY);
+        assert_eq!(sampler.logit_scratch[1], 9.0);
+    }
+
+    #[test]
+    fn sample_full_logits_top_n_sigma_masks_candidates() {
+        let logits = [10.0_f32, 9.5, 9.0, 8.0, 7.0, 2.0, 1.0, 0.0];
+        let cfg = GenerateConfig {
+            temperature: 2.0,
+            top_k: 6,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        let mut active_seen = [false; 8];
+        let mut disabled_seen = [false; 8];
+        for index in 0..512_u64 {
+            let mut active_rng = index
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407)
+                | 1;
+            let mut disabled_rng = active_rng;
+            active_seen
+                [sample_full_logits(&logits, &cfg, &[], &mut active_rng, 0.0, 1.5) as usize] = true;
+            disabled_seen
+                [sample_full_logits(&logits, &cfg, &[], &mut disabled_rng, 0.0, 0.0) as usize] =
+                true;
+        }
+
+        // mean = 5.8125, population stddev ~= 3.856, threshold = 10 - 1.5 * 3.856
+        // ~= 4.22: tokens 0-4 survive, tokens 5-7 (logits 2, 1, 0) are masked.
+        assert!(
+            active_seen.iter().skip(5).all(|&seen| !seen),
+            "top_n_sigma=1.5 must mask every token below max - 1.5 * stddev; saw {active_seen:?}"
+        );
+        assert!(
+            disabled_seen[5],
+            "the disabled control (top_k = 6 keeps tokens 0-5) must reach token 5, \
+             which the filter masks, or the assertion above is vacuous; saw {disabled_seen:?}"
+        );
+    }
+
+    #[test]
+    fn sample_full_logits_top_k_one_stays_argmax_with_top_n_sigma() {
+        let logits = [1.0_f32, 4.0, 2.0, 3.0];
+        let cfg = GenerateConfig {
+            temperature: 0.8,
+            top_k: 1,
+            top_p: 1.0,
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+
+        for top_n_sigma in [0.0, 0.5, 100.0] {
+            let mut rng = 7_u64;
+            assert_eq!(
+                sample_full_logits(&logits, &cfg, &[], &mut rng, 0.0, top_n_sigma),
+                1,
+                "top_k == 1 must select the argmax regardless of top_n_sigma={top_n_sigma}"
+            );
+        }
     }
 
     #[test]
@@ -2865,6 +3162,7 @@ mod tests {
                 &gen_cfg,
                 &previous_ids,
                 &mut rng_after,
+                0.0,
                 0.0,
             ));
         }

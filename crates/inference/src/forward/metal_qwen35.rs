@@ -294,7 +294,7 @@ mod route_predicate_tests {
             ..greedy_gen_cfg(vec![])
         };
         let mut rng = 7u64;
-        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng, 0.0);
+        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng, 0.0, 0.0);
         assert_eq!(
             canonical, 1,
             "sample_token must penalize the previously-seen argmax enough to \
@@ -11006,7 +11006,7 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0)
+        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0, 0.0)
     }
 
     /// Signpost-traced sampling shared by every autoregressive decode loop's

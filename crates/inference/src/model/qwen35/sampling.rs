@@ -1,5 +1,6 @@
-//! Qwen3.5 token sampling, repetition penalty, greedy fallback, softmax probability
-//! build, min-p/top-p filtering, distribution draw, and RNG helper.
+//! Qwen3.5 token sampling, repetition penalty, greedy fallback, top-n-sigma
+//! filtering, softmax probability build, min-p/top-p filtering, distribution
+//! draw, and RNG helper.
 use crate::model::qwen35_config::GenerateConfig;
 
 /// Sample a token from logits using temperature, top-k, min-p, top-p, and repetition penalty.
@@ -18,11 +19,13 @@ pub(crate) fn sample_token(
     previous_ids: &[u32],
     rng_state: &mut u64,
 ) -> u32 {
-    // `GenerateConfig` cannot carry `min_p` (it is exhaustively constructible
-    // through the public API at published `0.7.1`; adding any field is a
-    // major break -- see `crate::sampling::Sampler::with_min_p`), and no
-    // production entry point sets it yet, so this path is always disabled.
-    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0)
+    // `GenerateConfig` cannot carry `min_p` or `top_n_sigma` (it is
+    // exhaustively constructible through the public API at published `0.7.1`;
+    // adding any field is a major break -- see
+    // `crate::sampling::Sampler::with_min_p` / `with_top_n_sigma`), and no
+    // production entry point sets either yet, so both paths are always
+    // disabled here.
+    crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0, 0.0)
 }
 
 /// Reference oracle: the original allocating implementation of `sample_token`,
@@ -38,6 +41,7 @@ pub(crate) fn sample_token_reference(
     previous_ids: &[u32],
     rng_state: &mut u64,
     min_p: f32,
+    top_n_sigma: f32,
 ) -> u32 {
     let vocab_size = logits.len();
     let mut adjusted = logits.to_vec();
@@ -53,6 +57,27 @@ pub(crate) fn sample_token_reference(
     // contract. See `crate::sampling::temperature_degenerate`.
     if crate::sampling::temperature_degenerate(cfg.temperature) {
         return greedy_token(&adjusted);
+    }
+
+    // Mirrors the optimized engine: top-n-sigma masks the penalized,
+    // still-unscaled logits after the degenerate-temperature return (masking
+    // strictly below the max cannot change an argmax) and, like it, skips the
+    // filter for `top_k == 1`, where the selection is argmax-shaped. This
+    // implementation is deliberately independent (two-pass mean/variance vs
+    // the engine's single Welford pass) so a statistics bug in either shows
+    // up as a parity failure rather than being shared.
+    let top_n_sigma_enabled =
+        cfg.top_k != 1 && apply_top_n_sigma_reference(&mut adjusted, top_n_sigma);
+    if top_n_sigma_enabled {
+        let mut has_nan = false;
+        let mut max_logit = f32::NEG_INFINITY;
+        for &logit in &adjusted {
+            has_nan |= logit.is_nan();
+            max_logit = max_logit.max(logit);
+        }
+        if has_nan || !max_logit.is_finite() {
+            return greedy_token(&adjusted);
+        }
     }
 
     if cfg.temperature != 1.0 {
@@ -87,6 +112,10 @@ pub(crate) fn sample_token_reference(
             .then_with(|| a.cmp(&b))
     });
 
+    if top_n_sigma_enabled {
+        indices.retain(|&idx| adjusted[idx] != f32::NEG_INFINITY);
+    }
+
     // `indices` is already in (descending adjusted-logit, ascending token-id)
     // order from the pre-sort above. softmax is monotonic in the logit, so the
     // probabilities build_softmax_probs returns inherit exactly that order
@@ -106,6 +135,55 @@ pub(crate) fn sample_token_reference(
     }
 
     draw_from_distribution(&probs, rng_state)
+}
+
+/// Test-only oracle for the engine's `apply_top_n_sigma`: masks logits below
+/// `max - top_n_sigma * population_stddev`, computing the statistics with an
+/// independent two-pass mean/variance instead of the engine's Welford pass.
+/// Returns whether the filter was active (so the caller replicates the
+/// engine's fail-closed NaN/non-finite-max scan only when it ran).
+#[cfg(test)]
+fn apply_top_n_sigma_reference(adjusted: &mut [f32], top_n_sigma: f32) -> bool {
+    if !top_n_sigma.is_finite() || top_n_sigma <= 0.0 || adjusted.len() <= 1 {
+        return false;
+    }
+
+    let mut finite_count = 0_u64;
+    let mut sum = 0.0_f64;
+    let mut max_logit = f32::NEG_INFINITY;
+    for &logit in adjusted.iter() {
+        if logit == f32::NEG_INFINITY {
+            continue;
+        }
+        if !logit.is_finite() {
+            return true;
+        }
+        finite_count += 1;
+        sum += f64::from(logit);
+        max_logit = max_logit.max(logit);
+    }
+    if finite_count == 0 {
+        return true;
+    }
+
+    let mean = sum / finite_count as f64;
+    let variance = adjusted
+        .iter()
+        .copied()
+        .filter(|&logit| logit != f32::NEG_INFINITY)
+        .map(|logit| {
+            let delta = f64::from(logit) - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / finite_count as f64;
+    let threshold = f64::from(max_logit) - f64::from(top_n_sigma) * variance.sqrt();
+    for logit in adjusted {
+        if f64::from(*logit) < threshold {
+            *logit = f32::NEG_INFINITY;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -634,12 +712,19 @@ mod tests {
         let mut optimized_rng = seed;
         let optimized_tokens: Vec<u32> = (0..draws)
             .map(|_| {
-                crate::sampling::sample_full_logits(&logits, &cfg, &[], &mut optimized_rng, min_p)
+                crate::sampling::sample_full_logits(
+                    &logits,
+                    &cfg,
+                    &[],
+                    &mut optimized_rng,
+                    min_p,
+                    0.0,
+                )
             })
             .collect();
         let mut reference_rng = seed;
         let reference_tokens: Vec<u32> = (0..draws)
-            .map(|_| sample_token_reference(&logits, &cfg, &[], &mut reference_rng, min_p))
+            .map(|_| sample_token_reference(&logits, &cfg, &[], &mut reference_rng, min_p, 0.0))
             .collect();
 
         assert!(
@@ -648,6 +733,70 @@ mod tests {
         );
         assert_eq!(sampler_tokens, optimized_tokens);
         assert_eq!(optimized_tokens, reference_tokens);
+    }
+
+    #[test]
+    fn top_n_sigma_is_active_and_identical_across_cpu_sampling_paths() {
+        use crate::sampling::{Sampler, SamplingConfig};
+
+        let logits = [10.0_f32, 9.5, 9.0, 8.0, 7.0, 2.0, 1.0, 0.0];
+        let min_p = 0.02;
+        let top_n_sigma = 1.5;
+        let cfg = GenerateConfig {
+            temperature: 2.0,
+            top_k: 6,
+            top_p: 0.67,
+            repetition_penalty: 2.0,
+            ..Default::default()
+        };
+        let sampler_cfg = SamplingConfig {
+            temperature: cfg.temperature,
+            top_k: cfg.top_k,
+            top_p: cfg.top_p,
+            repetition_penalty: cfg.repetition_penalty,
+        };
+        let mut seen = [false; 8];
+
+        for index in 0..512_u64 {
+            let seed = index
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+
+            let mut sampler = Sampler::new(sampler_cfg.clone())
+                .with_seed(seed)
+                .with_min_p(min_p)
+                .with_top_n_sigma(top_n_sigma);
+            sampler.seed_history(&[0]);
+            let sampler_token = sampler.sample(&logits);
+
+            // `sample_token` cannot carry `min_p` / `top_n_sigma` through
+            // `GenerateConfig` (see its doc comment), so the optimized path is
+            // exercised directly through the shared engine it delegates to,
+            // with both passed explicitly.
+            let mut optimized_rng = seed;
+            let optimized_token = crate::sampling::sample_full_logits(
+                &logits,
+                &cfg,
+                &[0],
+                &mut optimized_rng,
+                min_p,
+                top_n_sigma,
+            );
+            let mut reference_rng = seed;
+            let reference_token =
+                sample_token_reference(&logits, &cfg, &[0], &mut reference_rng, min_p, top_n_sigma);
+
+            assert_eq!(sampler_token, optimized_token);
+            assert_eq!(optimized_token, reference_token);
+            seen[sampler_token as usize] = true;
+        }
+
+        assert_eq!(
+            seen,
+            [false, true, true, false, false, false, false, false],
+            "the canonical and independent pipelines must retain exactly the \
+             expected two-token nucleus"
+        );
     }
 
     #[test]
@@ -855,7 +1004,8 @@ mod tests {
 
         for step in 0..steps {
             let token_opt = sample_token(&logits, &cfg, &history_opt, &mut rng_opt);
-            let token_ref = sample_token_reference(&logits, &cfg, &history_ref, &mut rng_ref, 0.0);
+            let token_ref =
+                sample_token_reference(&logits, &cfg, &history_ref, &mut rng_ref, 0.0, 0.0);
             assert_eq!(
                 token_opt, token_ref,
                 "optimized sample_token diverged from sample_token_reference at step {step}"
@@ -899,7 +1049,7 @@ mod tests {
 
         let mut rng_ref = seed;
         let tokens_ref: Vec<u32> = (0..n)
-            .map(|_| sample_token_reference(&logits, &cfg, &previous_ids, &mut rng_ref, 0.0))
+            .map(|_| sample_token_reference(&logits, &cfg, &previous_ids, &mut rng_ref, 0.0, 0.0))
             .collect();
 
         assert_eq!(
