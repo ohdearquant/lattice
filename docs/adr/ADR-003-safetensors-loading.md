@@ -2,7 +2,10 @@
 
 **Status**: Accepted\
 **Date**: 2026-05-13\
-**Crate**: `lattice-inference`
+**Crate**: `lattice-inference`\
+**Proposed amendment**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would compose
+the existing per-file mmap authority into a retained whole-snapshot embedding preparation
+capability without creating a second mapping token.
 
 ---
 
