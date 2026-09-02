@@ -33,7 +33,7 @@ fn main() {
     let cfg = Ernie45Config::from_config_json(&dir.join("config.json")).unwrap();
     let mut source = SafetensorsFile::open(&dir.join("model.safetensors")).unwrap();
     let weights = Ernie45Weights::load(&mut source, &cfg).unwrap();
-    let model = Ernie45Model::new(cfg, weights);
+    let model = Ernie45Model::new(cfg, weights).unwrap();
     let trace = model.forward_trace(&ids).unwrap();
 
     let write = |name: &str, buf: &[f32]| {

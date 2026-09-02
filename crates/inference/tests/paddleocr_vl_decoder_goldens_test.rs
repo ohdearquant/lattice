@@ -66,12 +66,15 @@ mod gate {
     const RTOL: f32 = 2e-3;
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Golden {
         revision: String,
+        dtype: String,
         cases: Vec<Case>,
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Case {
         id: String,
         ids: Vec<u32>,
@@ -80,6 +83,7 @@ mod gate {
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Checkpoint {
         name: String,
         last_tok_first8: Vec<f32>,
@@ -87,6 +91,7 @@ mod gate {
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct LogitsGolden {
         argmax_per_pos: Vec<usize>,
         last_tok_first8: Vec<f32>,
@@ -150,6 +155,10 @@ mod gate {
             golden.revision, "c5630abae1d940eafe0697512a0325494b02ab42",
             "fixture revision drifted from the pinned checkpoint"
         );
+        assert_eq!(
+            golden.dtype, "weights bf16 upcast to f32, eager attention, no cache",
+            "fixture dtype contract drifted"
+        );
         assert!(
             golden.cases.len() >= 4,
             "goldens shrank to {} cases",
@@ -160,9 +169,28 @@ mod gate {
         let mut source =
             SafetensorsFile::open(&dir.join("model.safetensors")).expect("open weights");
         let weights = Ernie45Weights::load(&mut source, &cfg).expect("weights load");
-        let model = Ernie45Model::new(cfg, weights);
+        let model = Ernie45Model::new(cfg, weights).expect("model validates");
 
         for case in &golden.cases {
+            assert!(!case.ids.is_empty(), "case {} has no token ids", case.id);
+            assert_eq!(
+                case.logits.argmax_per_pos.len(),
+                case.ids.len(),
+                "case {}: argmax coverage must match sequence length",
+                case.id
+            );
+            assert_eq!(
+                case.logits.last_tok_first8.len(),
+                8,
+                "case {}: logits first-eight golden length",
+                case.id
+            );
+            assert_eq!(
+                case.logits.last_tok_top5.len(),
+                5,
+                "case {}: logits top-five golden length",
+                case.id
+            );
             let trace = model.forward_trace(&case.ids).expect("forward");
             let s = case.ids.len();
             let h = model.config().hidden_size;
@@ -188,7 +216,14 @@ mod gate {
                     _ => "final_norm".to_string(),
                 };
                 assert_eq!(ck.name, expected_name, "case {}: checkpoint order", case.id);
-                let last = &buf[(s - 1) * h..][..8.min(h)];
+                assert_eq!(
+                    ck.last_tok_first8.len(),
+                    8,
+                    "case {} {}: checkpoint first-eight golden length",
+                    case.id,
+                    ck.name
+                );
+                let last = &buf[(s - 1) * h..][..8];
                 worst = worst.max(assert_slice_close(
                     last,
                     &ck.last_tok_first8,
@@ -241,9 +276,14 @@ mod gate {
                 case.logits.last_tok_mean_abs
             );
             println!(
-                "case {}: S={s} all checkpoints within tolerance, worst |diff| {worst:.2e}",
+                "LATTICE_POCR_DECODER_CASE id={} seq={s} worst_abs={worst:.2e}",
                 case.id
             );
         }
+        println!(
+            "LATTICE_POCR_DECODER_GATE cases={} checkpoint_revision={}",
+            golden.cases.len(),
+            golden.revision
+        );
     }
 }
