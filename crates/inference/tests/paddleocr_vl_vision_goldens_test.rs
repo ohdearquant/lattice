@@ -64,12 +64,16 @@ mod gate {
     const RTOL: f32 = 1e-3;
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Golden {
         revision: String,
+        dtype: String,
+        pixel_formula: String,
         cases: Vec<Case>,
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Case {
         id: String,
         grid_h: usize,
@@ -79,6 +83,7 @@ mod gate {
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct Checkpoint {
         name: String,
         last_tok_first8: Vec<f32>,
@@ -87,6 +92,7 @@ mod gate {
     }
 
     #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct ProjectorGolden {
         rows: usize,
         first_row_first8: Vec<f32>,
@@ -172,6 +178,16 @@ mod gate {
         assert_eq!(
             golden.revision, "c5630abae1d940eafe0697512a0325494b02ab42",
             "fixture revision drifted from the pinned checkpoint"
+        );
+        assert_eq!(
+            golden.dtype,
+            "weights bf16 upcast to f32, eager attention, use_rope=True, interpolate_pos_encoding=True",
+            "fixture dtype metadata does not match this test"
+        );
+        assert_eq!(
+            golden.pixel_formula,
+            "pixel[i,c,py,px] = ((i*7 + c*13 + py*3 + px*5) % 17) / 8 - 1; i = raster patch index",
+            "fixture pixel formula metadata does not match this test"
         );
         assert!(
             golden.cases.len() >= 3,

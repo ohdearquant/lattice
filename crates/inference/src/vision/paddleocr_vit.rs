@@ -84,6 +84,162 @@ fn default_merge() -> usize {
 pub const PROJECTOR_NORM_EPS: f32 = 1e-5;
 /// Vision RoPE base, hardcoded in the reference `SigLIPRotaryEmbedding`.
 pub const VISION_ROPE_THETA: f32 = 10_000.0;
+/// Maximum number of transformer blocks accepted from a vision checkpoint.
+///
+/// The shipped checkpoint has 27 blocks; 64 leaves room for checkpoints more
+/// than twice as deep without allowing unbounded layer-vector allocation.
+pub const MAX_VISION_LAYERS: usize = 64;
+/// Maximum vision hidden width accepted from a checkpoint.
+///
+/// The shipped width is 1152; 4096 is a generous multiple that keeps the
+/// checked tensor products within practical CPU memory bounds.
+pub const MAX_VISION_HIDDEN_SIZE: usize = 4096;
+/// Maximum vision MLP intermediate width accepted from a checkpoint.
+///
+/// The shipped width is 4304; 16384 leaves room for wider checkpoints while
+/// bounding the per-token MLP buffers.
+pub const MAX_VISION_INTERMEDIATE_SIZE: usize = 16_384;
+/// Maximum attention-head count accepted from a checkpoint.
+///
+/// The shipped count is 16; 64 accommodates wider attention layouts while
+/// bounding per-head work.
+pub const MAX_VISION_HEADS: usize = 64;
+/// Maximum learned position-table side in patches.
+///
+/// The shipped table side is 27; 128 allows substantially larger position
+/// tables while keeping their checked allocation products bounded.
+pub const MAX_VISION_POSITION_SIDE: usize = 128;
+/// Maximum text-decoder width emitted by the projector.
+///
+/// The shipped text width is 1024; 4096 supports wider decoder projections
+/// while bounding projector output allocations.
+pub const MAX_VISION_TEXT_HIDDEN_SIZE: usize = 4096;
+/// Maximum number of image patches accepted by the PaddleOCR-VL forward.
+///
+/// The shipped preprocessing budget of 1,003,520 pixels at patch 14 yields at
+/// most 5,120 tokens. At this cap the shared per-head score buffer is 256 MiB.
+pub const MAX_VISION_TOKENS: usize = 8192;
+
+fn checked_mul(a: usize, b: usize, what: &str) -> Result<usize, InferenceError> {
+    a.checked_mul(b).ok_or_else(|| {
+        InferenceError::Inference(format!(
+            "vision dimension product {what} ({a} * {b}) overflows usize"
+        ))
+    })
+}
+
+fn reserve_exact<T>(buffer: &mut Vec<T>, len: usize, what: &str) -> Result<(), InferenceError> {
+    buffer.try_reserve_exact(len).map_err(|error| {
+        InferenceError::Inference(format!(
+            "failed to allocate {what} buffer for {len} elements: {error}"
+        ))
+    })
+}
+
+fn try_zeroed_f32(len: usize, what: &str) -> Result<Vec<f32>, InferenceError> {
+    let mut buffer = Vec::new();
+    reserve_exact(&mut buffer, len, what)?;
+    buffer.resize(len, 0.0);
+    Ok(buffer)
+}
+
+fn try_clone_f32(input: &[f32], what: &str) -> Result<Vec<f32>, InferenceError> {
+    let mut buffer = Vec::new();
+    reserve_exact(&mut buffer, input.len(), what)?;
+    buffer.extend_from_slice(input);
+    Ok(buffer)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckedConfigSizes {
+    patch_len: usize,
+    position_rows: usize,
+    merged_width: usize,
+}
+
+fn checked_config_sizes(cfg: &PaddleOcrVisionConfig) -> Result<CheckedConfigSizes, InferenceError> {
+    let channels_patch = checked_mul(
+        cfg.num_channels,
+        cfg.patch_size,
+        "num_channels * patch_size",
+    )?;
+    let patch_len = checked_mul(channels_patch, cfg.patch_size, "patch length")?;
+    let side = cfg.pos_table_side();
+    let position_rows = checked_mul(side, side, "position table side squared")?;
+    checked_mul(position_rows, cfg.hidden_size, "position table values")?;
+    checked_mul(cfg.hidden_size, cfg.hidden_size, "hidden_size squared")?;
+    checked_mul(
+        cfg.intermediate_size,
+        cfg.hidden_size,
+        "intermediate_size * hidden_size",
+    )?;
+    checked_mul(
+        cfg.hidden_size,
+        cfg.intermediate_size,
+        "hidden_size * intermediate_size",
+    )?;
+    let merge_width = checked_mul(
+        cfg.hidden_size,
+        cfg.spatial_merge_size,
+        "hidden_size * spatial_merge_size",
+    )?;
+    let merged_width = checked_mul(merge_width, cfg.spatial_merge_size, "merged width")?;
+    checked_mul(merged_width, merged_width, "merged width squared")?;
+    checked_mul(
+        cfg.text_hidden_size,
+        merged_width,
+        "text_hidden_size * merged width",
+    )?;
+    Ok(CheckedConfigSizes {
+        patch_len,
+        position_rows,
+        merged_width,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CheckedForwardSizes {
+    config: CheckedConfigSizes,
+    hidden_values: usize,
+    qkv_values: usize,
+    intermediate_values: usize,
+    packed_values: usize,
+    projector_values: usize,
+}
+
+fn checked_forward_sizes(
+    cfg: &PaddleOcrVisionConfig,
+    n: usize,
+    grid_h: usize,
+    grid_w: usize,
+) -> Result<CheckedForwardSizes, InferenceError> {
+    let config = checked_config_sizes(cfg)?;
+    let hidden_values = checked_mul(n, cfg.hidden_size, "n * hidden_size")?;
+    let qkv_width = checked_mul(3, cfg.hidden_size, "3 * hidden_size")?;
+    let qkv_values = checked_mul(n, qkv_width, "n * 3 * hidden_size")?;
+    let intermediate_values = checked_mul(n, cfg.intermediate_size, "n * intermediate_size")?;
+    let blocks_h = grid_h / cfg.spatial_merge_size;
+    let blocks_w = grid_w / cfg.spatial_merge_size;
+    let merged_tokens = checked_mul(blocks_h, blocks_w, "merged token count")?;
+    let packed_values = checked_mul(
+        merged_tokens,
+        config.merged_width,
+        "packed projector values",
+    )?;
+    let projector_values = checked_mul(
+        merged_tokens,
+        cfg.text_hidden_size,
+        "projector output values",
+    )?;
+    Ok(CheckedForwardSizes {
+        config,
+        hidden_values,
+        qkv_values,
+        intermediate_values,
+        packed_values,
+        projector_values,
+    })
+}
 
 impl PaddleOcrVisionConfig {
     /// Parse and validate a checkpoint `config.json`.
@@ -123,15 +279,52 @@ impl PaddleOcrVisionConfig {
         Ok(cfg)
     }
 
-    /// Reject shapes this reference cannot run: heads must divide the hidden
-    /// size, `head_dim` must be divisible by 4 (two RoPE axes, each with
-    /// paired frequencies), the position table must be square in patches,
-    /// and the projector's merge kernel is fixed at 2x2 by the reference.
+    /// Reject shapes this reference cannot run: dimensions must stay within
+    /// the documented checkpoint caps, heads must divide the hidden size,
+    /// `head_dim` must be divisible by 4 (two RoPE axes, each with paired
+    /// frequencies), the position table must be square in patches, and the
+    /// projector's merge kernel is fixed at 2x2 by the reference.
     ///
     /// # Errors
     ///
     /// [`InferenceError::Inference`] naming the violated invariant.
     pub fn validate(&self) -> Result<(), InferenceError> {
+        if !(1..=MAX_VISION_LAYERS).contains(&self.num_hidden_layers) {
+            return Err(InferenceError::Inference(format!(
+                "vision num_hidden_layers {} must be in 1..=MAX_VISION_LAYERS ({MAX_VISION_LAYERS})",
+                self.num_hidden_layers
+            )));
+        }
+        if !(1..=MAX_VISION_HIDDEN_SIZE).contains(&self.hidden_size) {
+            return Err(InferenceError::Inference(format!(
+                "vision hidden_size {} must be in 1..=MAX_VISION_HIDDEN_SIZE ({MAX_VISION_HIDDEN_SIZE})",
+                self.hidden_size
+            )));
+        }
+        if !(1..=MAX_VISION_INTERMEDIATE_SIZE).contains(&self.intermediate_size) {
+            return Err(InferenceError::Inference(format!(
+                "vision intermediate_size {} must be in 1..=MAX_VISION_INTERMEDIATE_SIZE ({MAX_VISION_INTERMEDIATE_SIZE})",
+                self.intermediate_size
+            )));
+        }
+        if !(1..=MAX_VISION_HEADS).contains(&self.num_attention_heads) {
+            return Err(InferenceError::Inference(format!(
+                "vision num_attention_heads {} must be in 1..=MAX_VISION_HEADS ({MAX_VISION_HEADS})",
+                self.num_attention_heads
+            )));
+        }
+        if self.num_channels != 3 {
+            return Err(InferenceError::Inference(format!(
+                "vision num_channels {} is unsupported; the reference requires 3",
+                self.num_channels
+            )));
+        }
+        if !(1..=MAX_VISION_TEXT_HIDDEN_SIZE).contains(&self.text_hidden_size) {
+            return Err(InferenceError::Inference(format!(
+                "vision text_hidden_size {} must be in 1..=MAX_VISION_TEXT_HIDDEN_SIZE ({MAX_VISION_TEXT_HIDDEN_SIZE})",
+                self.text_hidden_size
+            )));
+        }
         if self.num_attention_heads == 0
             || !self.hidden_size.is_multiple_of(self.num_attention_heads)
         {
@@ -147,12 +340,17 @@ impl PaddleOcrVisionConfig {
             )));
         }
         // The reference sizes its position table as `(image_size // patch_size)^2`
-        // (384 // 14 = 27, discarding the 6-pixel remainder), so only a zero
-        // side is invalid here.
-        if self.patch_size == 0 || self.image_size / self.patch_size == 0 {
+        // (384 // 14 = 27, discarding the 6-pixel remainder).
+        if self.patch_size == 0 {
             return Err(InferenceError::Inference(format!(
-                "vision image_size {} smaller than patch_size {}",
-                self.image_size, self.patch_size
+                "vision patch_size {} must be greater than zero",
+                self.patch_size
+            )));
+        }
+        let side = self.image_size / self.patch_size;
+        if !(1..=MAX_VISION_POSITION_SIDE).contains(&side) {
+            return Err(InferenceError::Inference(format!(
+                "vision position-table side {side} must be in 1..=MAX_VISION_POSITION_SIDE ({MAX_VISION_POSITION_SIDE})"
             )));
         }
         if self.spatial_merge_size != 2 {
@@ -161,11 +359,7 @@ impl PaddleOcrVisionConfig {
                 self.spatial_merge_size
             )));
         }
-        if self.num_hidden_layers == 0 || self.num_channels == 0 || self.text_hidden_size == 0 {
-            return Err(InferenceError::Inference(
-                "vision config has a zero layer/channel/text-hidden count".into(),
-            ));
-        }
+        checked_config_sizes(self)?;
         Ok(())
     }
 
@@ -262,9 +456,10 @@ impl PaddleOcrVisionWeights {
         source: &mut T,
         cfg: &PaddleOcrVisionConfig,
     ) -> Result<Self, InferenceError> {
+        cfg.validate()?;
+        let sizes = checked_config_sizes(cfg)?;
         let h = cfg.hidden_size;
         let p = cfg.patch_size;
-        let side = cfg.pos_table_side();
         let vm = "visual.vision_model.";
         let patch_weight = load_tensor(
             source,
@@ -279,9 +474,10 @@ impl PaddleOcrVisionWeights {
         let pos_embed = load_tensor(
             source,
             &format!("{vm}embeddings.position_embedding.weight"),
-            &[side * side, h],
+            &[sizes.position_rows, h],
         )?;
-        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut layers = Vec::new();
+        reserve_exact(&mut layers, cfg.num_hidden_layers, "vision layer")?;
         for i in 0..cfg.num_hidden_layers {
             let lp = format!("{vm}encoder.layers.{i}.");
             let inter = cfg.intermediate_size;
@@ -310,7 +506,7 @@ impl PaddleOcrVisionWeights {
         }
         let post_ln_weight = load_tensor(source, &format!("{vm}post_layernorm.weight"), &[h])?;
         let post_ln_bias = load_tensor(source, &format!("{vm}post_layernorm.bias"), &[h])?;
-        let merged = cfg.merged_width();
+        let merged = sizes.merged_width;
         let t = cfg.text_hidden_size;
         Ok(Self {
             patch_weight,
@@ -388,25 +584,36 @@ fn bilinear_pos_embed_half_pixel(
 /// Per patch: `rotary = concat(row * inv_freq, col * inv_freq)` over
 /// `head_dim / 2`, then `emb = concat(rotary, rotary)` — the reference's
 /// `rope_emb_max_grid[pids].flatten(1).repeat(1, 2)`.
+type PosEmbedAndRopeTables = (Vec<f32>, Vec<f32>, Vec<f32>);
+
 fn build_pos_embed_and_rope_tables(
     weights: &PaddleOcrVisionWeights,
     cfg: &PaddleOcrVisionConfig,
     grid_h: usize,
     grid_w: usize,
-) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+) -> Result<PosEmbedAndRopeTables, InferenceError> {
     let hidden = cfg.hidden_size;
-    let n = grid_h * grid_w;
+    let n = grid_h.checked_mul(grid_w).ok_or_else(|| {
+        InferenceError::Inference(format!(
+            "vision grid {grid_h}x{grid_w} overflows the patch count"
+        ))
+    })?;
+    let sizes = checked_forward_sizes(cfg, n, grid_h, grid_w)?;
     let side = cfg.pos_table_side();
     let head_dim = cfg.head_dim();
     let rope_dim = head_dim / 2;
     let rope_half = rope_dim / 2;
-    let inv_freq: Vec<f32> = (0..rope_half)
-        .map(|i| 1.0 / VISION_ROPE_THETA.powf((2 * i) as f32 / rope_dim as f32))
-        .collect();
+    let mut inv_freq = Vec::new();
+    reserve_exact(&mut inv_freq, rope_half, "vision RoPE frequency")?;
+    for i in 0..rope_half {
+        inv_freq.push(1.0 / VISION_ROPE_THETA.powf((2 * i) as f32 / rope_dim as f32));
+    }
 
-    let mut pos = vec![0.0f32; n * hidden];
-    let mut cos_t = vec![0.0f32; n * head_dim];
-    let mut sin_t = vec![0.0f32; n * head_dim];
+    let mut pos = try_zeroed_f32(sizes.hidden_values, "position embedding")?;
+    let cos_values = checked_mul(n, head_dim, "n * head_dim for cosine table")?;
+    let sin_values = checked_mul(n, head_dim, "n * head_dim for sine table")?;
+    let mut cos_t = try_zeroed_f32(cos_values, "cosine table")?;
+    let mut sin_t = try_zeroed_f32(sin_values, "sine table")?;
     for (idx, (pos_row, (cos_row, sin_row))) in pos
         .chunks_mut(hidden)
         .zip(cos_t.chunks_mut(head_dim).zip(sin_t.chunks_mut(head_dim)))
@@ -435,7 +642,7 @@ fn build_pos_embed_and_rope_tables(
             }
         }
     }
-    (pos, cos_t, sin_t)
+    Ok((pos, cos_t, sin_t))
 }
 
 fn add_bias_rows(x: &mut [f32], bias: &[f32]) {
@@ -452,6 +659,35 @@ fn layer_norm_rows(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
     }
 }
 
+fn check_grid(
+    cfg: &PaddleOcrVisionConfig,
+    grid_h: usize,
+    grid_w: usize,
+) -> Result<usize, InferenceError> {
+    let n = grid_h.checked_mul(grid_w).ok_or_else(|| {
+        InferenceError::Inference(format!(
+            "vision grid {grid_h}x{grid_w} overflows the patch count"
+        ))
+    })?;
+    if n > MAX_VISION_TOKENS {
+        return Err(InferenceError::Inference(format!(
+            "vision grid {grid_h}x{grid_w} has {n} tokens; maximum is MAX_VISION_TOKENS ({MAX_VISION_TOKENS})"
+        )));
+    }
+    let m = cfg.spatial_merge_size;
+    if m == 0
+        || grid_h == 0
+        || grid_w == 0
+        || !grid_h.is_multiple_of(m)
+        || !grid_w.is_multiple_of(m)
+    {
+        return Err(InferenceError::Inference(format!(
+            "vision grid {grid_h}x{grid_w} must be non-empty and a multiple of the {m}x{m} merge kernel"
+        )));
+    }
+    Ok(n)
+}
+
 /// Encoder + projector over one image's raster-ordered patches.
 ///
 /// `pixel_values` is `[grid_h * grid_w, channels * patch * patch]`, each
@@ -460,8 +696,10 @@ fn layer_norm_rows(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
 ///
 /// # Errors
 ///
-/// [`InferenceError::Inference`] if the grid is empty, not a multiple of the
-/// merge kernel on either axis, or `pixel_values` has the wrong length.
+/// [`InferenceError::Inference`] if the grid is empty, exceeds
+/// [`MAX_VISION_TOKENS`], is not a multiple of the merge kernel on either
+/// axis, overflows a dimension product, or `pixel_values` has the wrong
+/// length.
 pub fn paddleocr_vision_forward_trace(
     weights: &PaddleOcrVisionWeights,
     cfg: &PaddleOcrVisionConfig,
@@ -469,16 +707,13 @@ pub fn paddleocr_vision_forward_trace(
     grid_h: usize,
     grid_w: usize,
 ) -> Result<PaddleOcrVisionTrace, InferenceError> {
-    let m = cfg.spatial_merge_size;
-    if grid_h == 0 || grid_w == 0 || !grid_h.is_multiple_of(m) || !grid_w.is_multiple_of(m) {
-        return Err(InferenceError::Inference(format!(
-            "vision grid {grid_h}x{grid_w} must be non-empty and a multiple of the {m}x{m} merge kernel"
-        )));
-    }
-    let n = grid_h * grid_w;
+    let n = check_grid(cfg, grid_h, grid_w)?;
+    cfg.validate()?;
+    let sizes = checked_forward_sizes(cfg, n, grid_h, grid_w)?;
     let hidden = cfg.hidden_size;
-    let patch_len = cfg.patch_len();
-    if pixel_values.len() != n * patch_len {
+    let patch_len = sizes.config.patch_len;
+    let pixel_values_len = checked_mul(n, patch_len, "n * patch_len")?;
+    if pixel_values.len() != pixel_values_len {
         return Err(InferenceError::Inference(format!(
             "pixel_values has {} values; expected {n} patches x {patch_len}",
             pixel_values.len()
@@ -494,20 +729,25 @@ pub fn paddleocr_vision_forward_trace(
 
     let mut hidden_states = batch_matvec(&weights.patch_weight, pixel_values, n, hidden, patch_len);
     add_bias_rows(&mut hidden_states, &weights.patch_bias);
-    let (pos, cos_t, sin_t) = build_pos_embed_and_rope_tables(weights, cfg, grid_h, grid_w);
+    let (pos, cos_t, sin_t) = build_pos_embed_and_rope_tables(weights, cfg, grid_h, grid_w)?;
     for (x, p) in hidden_states.iter_mut().zip(&pos) {
         *x += p;
     }
-    let embed = hidden_states.clone();
+    let embed = try_clone_f32(&hidden_states, "embedding trace")?;
 
     let head_dim = cfg.head_dim();
     let n_heads = cfg.num_attention_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let eps = cfg.layer_norm_eps;
-    let mut layer_outputs = Vec::with_capacity(cfg.num_hidden_layers);
+    let mut layer_outputs = Vec::new();
+    reserve_exact(
+        &mut layer_outputs,
+        cfg.num_hidden_layers,
+        "layer output trace",
+    )?;
 
     for layer in &weights.layers {
-        let mut normed = hidden_states.clone();
+        let mut normed = try_clone_f32(&hidden_states, "attention normalization")?;
         layer_norm_rows(&mut normed, &layer.ln1_weight, &layer.ln1_bias, eps);
         let mut q = batch_matvec(&layer.q_weight, &normed, n, hidden, hidden);
         let mut k = batch_matvec(&layer.k_weight, &normed, n, hidden, hidden);
@@ -518,14 +758,20 @@ pub fn paddleocr_vision_forward_trace(
 
         // Fused `[n, Q | K | V]` layout for the shared attention kernel, RoPE
         // applied per head on Q and K while packing.
-        let mut qkv = vec![0.0f32; n * 3 * hidden];
-        for i in 0..n {
-            let cos_row = &cos_t[i * head_dim..(i + 1) * head_dim];
-            let sin_row = &sin_t[i * head_dim..(i + 1) * head_dim];
-            let dst = &mut qkv[i * 3 * hidden..(i + 1) * 3 * hidden];
-            dst[..hidden].copy_from_slice(&q[i * hidden..(i + 1) * hidden]);
-            dst[hidden..2 * hidden].copy_from_slice(&k[i * hidden..(i + 1) * hidden]);
-            dst[2 * hidden..].copy_from_slice(&v[i * hidden..(i + 1) * hidden]);
+        let qkv_width = checked_mul(3, hidden, "3 * hidden_size")?;
+        let mut qkv = try_zeroed_f32(sizes.qkv_values, "qkv")?;
+        for (((q_row, k_row), v_row), (dst, (cos_row, sin_row))) in q
+            .chunks(hidden)
+            .zip(k.chunks(hidden))
+            .zip(v.chunks(hidden))
+            .zip(
+                qkv.chunks_mut(qkv_width)
+                    .zip(cos_t.chunks(head_dim).zip(sin_t.chunks(head_dim))),
+            )
+        {
+            dst[..hidden].copy_from_slice(q_row);
+            dst[hidden..2 * hidden].copy_from_slice(k_row);
+            dst[2 * hidden..].copy_from_slice(v_row);
             for h in 0..n_heads {
                 apply_rope_inplace(&mut dst[h * head_dim..(h + 1) * head_dim], cos_row, sin_row);
                 let kb = hidden + h * head_dim;
@@ -539,10 +785,11 @@ pub fn paddleocr_vision_forward_trace(
             *x += p;
         }
 
-        let mut normed = hidden_states.clone();
+        let mut normed = try_clone_f32(&hidden_states, "MLP normalization")?;
         layer_norm_rows(&mut normed, &layer.ln2_weight, &layer.ln2_bias, eps);
         let inter = cfg.intermediate_size;
         let mut fc1 = batch_matvec(&layer.fc1_weight, &normed, n, inter, hidden);
+        debug_assert_eq!(fc1.len(), sizes.intermediate_values);
         for row in fc1.chunks_mut(inter) {
             for (x, b) in row.iter_mut().zip(&layer.fc1_bias) {
                 *x = gelu(*x + b);
@@ -553,7 +800,7 @@ pub fn paddleocr_vision_forward_trace(
         for (x, p) in hidden_states.iter_mut().zip(&fc2) {
             *x += p;
         }
-        layer_outputs.push(hidden_states.clone());
+        layer_outputs.push(try_clone_f32(&hidden_states, "layer output trace")?);
     }
 
     let mut post = hidden_states;
@@ -563,7 +810,7 @@ pub fn paddleocr_vision_forward_trace(
         &weights.post_ln_bias,
         eps,
     );
-    let projector = project_merged(weights, cfg, &post, grid_h, grid_w);
+    let projector = project_merged(weights, cfg, &post, grid_h, grid_w)?;
 
     Ok(PaddleOcrVisionTrace {
         embed,
@@ -583,11 +830,13 @@ fn project_merged(
     features: &[f32],
     grid_h: usize,
     grid_w: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, InferenceError> {
+    let n = checked_mul(grid_h, grid_w, "grid_h * grid_w")?;
+    let sizes = checked_forward_sizes(cfg, n, grid_h, grid_w)?;
     let hidden = cfg.hidden_size;
     let m = cfg.spatial_merge_size;
-    let merged = cfg.merged_width();
-    let mut normed = features.to_vec();
+    let merged = sizes.config.merged_width;
+    let mut normed = try_clone_f32(features, "projector normalization")?;
     layer_norm_rows(
         &mut normed,
         &weights.proj_norm_weight,
@@ -596,8 +845,8 @@ fn project_merged(
     );
     let blocks_h = grid_h / m;
     let blocks_w = grid_w / m;
-    let nb = blocks_h * blocks_w;
-    let mut packed = vec![0.0f32; nb * merged];
+    let nb = checked_mul(blocks_h, blocks_w, "merged token count")?;
+    let mut packed = try_zeroed_f32(sizes.packed_values, "projector packed")?;
     for br in 0..blocks_h {
         for bc in 0..blocks_w {
             let dst = &mut packed[(br * blocks_w + bc) * merged..][..merged];
@@ -612,6 +861,7 @@ fn project_merged(
         }
     }
     let mut l1 = batch_matvec(&weights.proj_l1_weight, &packed, nb, merged, merged);
+    debug_assert_eq!(l1.len(), sizes.packed_values);
     for row in l1.chunks_mut(merged) {
         for (x, b) in row.iter_mut().zip(&weights.proj_l1_bias) {
             *x = gelu_exact(*x + b);
@@ -619,8 +869,9 @@ fn project_merged(
     }
     let t = cfg.text_hidden_size;
     let mut out = batch_matvec(&weights.proj_l2_weight, &l1, nb, t, merged);
+    debug_assert_eq!(out.len(), sizes.projector_values);
     add_bias_rows(&mut out, &weights.proj_l2_bias);
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -630,6 +881,10 @@ mod tests {
     const CFG: &str = r#"{"hidden_size": 1024, "vision_config": {"hidden_size": 1152,
         "intermediate_size": 4304, "num_hidden_layers": 27, "num_attention_heads": 16,
         "patch_size": 14, "image_size": 384, "layer_norm_eps": 1e-06, "spatial_merge_size": 2}}"#;
+
+    fn valid_cfg() -> PaddleOcrVisionConfig {
+        PaddleOcrVisionConfig::from_config_json_str(CFG).unwrap()
+    }
 
     #[test]
     fn config_parses_pinned_shape() {
@@ -647,6 +902,128 @@ mod tests {
         assert!(PaddleOcrVisionConfig::from_config_json_str(&bad_merge).is_err());
         let bad_heads = CFG.replace("\"num_attention_heads\": 16", "\"num_attention_heads\": 7");
         assert!(PaddleOcrVisionConfig::from_config_json_str(&bad_heads).is_err());
+    }
+
+    #[test]
+    fn config_rejects_layer_count_above_cap() {
+        let mut cfg = valid_cfg();
+        for layers in [0, MAX_VISION_LAYERS + 1, usize::MAX] {
+            cfg.num_hidden_layers = layers;
+            let error = cfg.validate().unwrap_err().to_string();
+            assert!(error.contains("MAX_VISION_LAYERS"), "{error}");
+        }
+
+        cfg.num_hidden_layers = MAX_VISION_LAYERS;
+        cfg.validate().unwrap();
+        cfg.num_hidden_layers = 27;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn config_enforces_dimension_caps_and_lower_bounds() {
+        let mut cfg = valid_cfg();
+
+        cfg.hidden_size = 0;
+        assert!(cfg.validate().is_err());
+        cfg = valid_cfg();
+        cfg.hidden_size = MAX_VISION_HIDDEN_SIZE;
+        cfg.num_attention_heads = MAX_VISION_HEADS;
+        cfg.validate().unwrap();
+        cfg.hidden_size = MAX_VISION_HIDDEN_SIZE + 1;
+        assert!(cfg.validate().is_err());
+
+        cfg = valid_cfg();
+        cfg.intermediate_size = 1;
+        cfg.validate().unwrap();
+        cfg.intermediate_size = MAX_VISION_INTERMEDIATE_SIZE;
+        cfg.validate().unwrap();
+        cfg.intermediate_size = MAX_VISION_INTERMEDIATE_SIZE + 1;
+        assert!(cfg.validate().is_err());
+
+        cfg = valid_cfg();
+        cfg.hidden_size = 4;
+        cfg.num_attention_heads = 1;
+        cfg.validate().unwrap();
+        cfg.num_attention_heads = MAX_VISION_HEADS;
+        cfg.hidden_size = MAX_VISION_HIDDEN_SIZE;
+        cfg.validate().unwrap();
+        cfg.num_attention_heads = MAX_VISION_HEADS + 1;
+        assert!(cfg.validate().is_err());
+
+        cfg = valid_cfg();
+        cfg.image_size = cfg.patch_size;
+        cfg.validate().unwrap();
+        cfg.image_size = MAX_VISION_POSITION_SIDE * cfg.patch_size;
+        cfg.validate().unwrap();
+        cfg.image_size = (MAX_VISION_POSITION_SIDE + 1) * cfg.patch_size;
+        assert!(cfg.validate().is_err());
+
+        cfg = valid_cfg();
+        cfg.text_hidden_size = 1;
+        cfg.validate().unwrap();
+        cfg.text_hidden_size = MAX_VISION_TEXT_HIDDEN_SIZE;
+        cfg.validate().unwrap();
+        cfg.text_hidden_size = MAX_VISION_TEXT_HIDDEN_SIZE + 1;
+        assert!(cfg.validate().is_err());
+
+        cfg = valid_cfg();
+        cfg.num_channels = 3;
+        cfg.validate().unwrap();
+        cfg.num_channels = 4;
+        assert!(cfg.validate().is_err());
+    }
+
+    struct PanickingTensorSource;
+
+    impl TensorSource for PanickingTensorSource {
+        fn has_tensor(&mut self, _name: &str) -> Result<bool, InferenceError> {
+            panic!("invalid configuration reached tensor source");
+        }
+
+        fn tensor_shape(&mut self, _name: &str) -> Result<Option<Vec<usize>>, InferenceError> {
+            panic!("invalid configuration reached tensor source");
+        }
+
+        fn get_f32_tensor_owned(
+            &mut self,
+            _name: &str,
+        ) -> Result<(Vec<f32>, Vec<usize>), InferenceError> {
+            panic!("invalid configuration reached tensor source");
+        }
+    }
+
+    #[test]
+    fn loader_validates_before_reading_tensors() {
+        let mut cfg = valid_cfg();
+        cfg.num_hidden_layers = MAX_VISION_LAYERS + 1;
+        let mut source = PanickingTensorSource;
+        let error = PaddleOcrVisionWeights::load(&mut source, &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("MAX_VISION_LAYERS"), "{error}");
+    }
+
+    #[test]
+    fn check_grid_rejects_quadratic_attention_blowup() {
+        let cfg = valid_cfg();
+        let error = check_grid(&cfg, 256, 256).unwrap_err().to_string();
+        assert!(error.contains("MAX_VISION_TOKENS"));
+    }
+
+    #[test]
+    fn check_grid_accepts_largest_legal_grid() {
+        let cfg = valid_cfg();
+        assert_eq!(
+            check_grid(&cfg, 2, MAX_VISION_TOKENS / 2).unwrap(),
+            MAX_VISION_TOKENS
+        );
+    }
+
+    #[test]
+    fn check_grid_rejects_overflow_and_unmerged_shapes() {
+        let cfg = valid_cfg();
+        assert!(check_grid(&cfg, usize::MAX, 2).is_err());
+        assert!(check_grid(&cfg, 1, 2).is_err());
     }
 
     #[test]
