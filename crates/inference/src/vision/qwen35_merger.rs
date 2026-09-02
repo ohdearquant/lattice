@@ -53,7 +53,7 @@ fn erf(x: f64) -> f64 {
 /// `nn.GELU()` default (`approximate="none"`), which is what
 /// `Qwen3_5VisionPatchMerger.act_fn` hardcodes.
 #[inline(always)]
-fn gelu_exact(x: f32) -> f32 {
+pub(crate) fn gelu_exact(x: f32) -> f32 {
     let xd = x as f64;
     (0.5 * xd * (1.0 + erf(xd / std::f64::consts::SQRT_2))) as f32
 }
