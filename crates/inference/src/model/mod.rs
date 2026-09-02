@@ -11,6 +11,7 @@ pub mod gemma4_model;
 pub mod gemma4_ops;
 pub mod gemma4_preflight;
 mod gemma4_weights;
+pub mod paddleocr_vl;
 pub mod qwen;
 pub mod qwen35;
 pub mod qwen35_config;
