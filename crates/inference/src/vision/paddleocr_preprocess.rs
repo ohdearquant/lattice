@@ -33,12 +33,22 @@ const PRECISION_BITS: i32 = 22;
 /// Bicubic kernel constant `a` (CubicConvolution "Keys" curve).
 const BICUBIC_A: f64 = -0.5;
 
-/// Maximum side length accepted for an input or resized image.
+/// Maximum side length accepted for an input image.
 ///
-/// This accommodates common high-resolution document pages while bounding
-/// the intermediate RGB resize buffer independently of the configured target
-/// pixel budget.
-pub const MAX_IMAGE_SIDE: usize = 4096;
+/// The caller already holds the input buffer. The horizontal-pass
+/// intermediate buffer is `src_h * dst_w * 3` bytes, with a worst case of
+/// `MAX_INPUT_IMAGE_SIDE * MAX_RESIZED_IMAGE_SIDE * 3 = 201_326_592` bytes.
+pub const MAX_INPUT_IMAGE_SIDE: usize = 16_384;
+
+/// Maximum pixel count accepted for an input image: 64 mebipixels.
+///
+/// The caller already holds the input buffer. The horizontal-pass
+/// intermediate buffer is `src_h * dst_w * 3` bytes, with a worst case of
+/// `MAX_INPUT_IMAGE_SIDE * MAX_RESIZED_IMAGE_SIDE * 3 = 201_326_592` bytes.
+pub const MAX_INPUT_PIXELS: usize = 67_108_864;
+
+/// Maximum side length accepted for a resized image.
+pub const MAX_RESIZED_IMAGE_SIDE: usize = 4096;
 
 /// Maximum configured target pixel budget for one image.
 ///
@@ -56,10 +66,11 @@ pub const MAX_RESIZE_FACTOR: usize = 256;
 
 /// Conservative pixel allowance for the reference algorithm's upward ceil
 /// rounding. Each dimension can increase by less than one factor cell, so
-/// `factor * (2 * MAX_IMAGE_SIDE + factor)` covers the resulting area delta;
+/// `factor * (2 * MAX_RESIZED_IMAGE_SIDE + factor)` covers the resulting area
+/// delta;
 /// this constant uses [`MAX_RESIZE_FACTOR`] for a single global allocation cap.
 pub const SMART_RESIZE_PIXEL_SLACK: usize =
-    MAX_RESIZE_FACTOR * (2 * MAX_IMAGE_SIDE + MAX_RESIZE_FACTOR);
+    MAX_RESIZE_FACTOR * (2 * MAX_RESIZED_IMAGE_SIDE + MAX_RESIZE_FACTOR);
 
 /// Image processor configuration from `preprocessor_config.json`.
 ///
@@ -271,15 +282,21 @@ fn checked_rgb8_len(height: usize, width: usize, context: &str) -> Result<usize,
     })
 }
 
-fn check_image_side(value: usize, name: &str, context: &str) -> Result<(), InferenceError> {
+fn check_image_side(
+    value: usize,
+    name: &str,
+    context: &str,
+    maximum: usize,
+    maximum_name: &str,
+) -> Result<(), InferenceError> {
     if value == 0 {
         return Err(InferenceError::Inference(format!(
             "{context} {name} must be at least 1"
         )));
     }
-    if value > MAX_IMAGE_SIDE {
+    if value > maximum {
         return Err(InferenceError::Inference(format!(
-            "{context} {name} {value} exceeds MAX_IMAGE_SIDE {MAX_IMAGE_SIDE}"
+            "{context} {name} {value} exceeds {maximum_name} {maximum}"
         )));
     }
     Ok(())
@@ -293,6 +310,34 @@ fn checked_pixel_count(
     height
         .checked_mul(width)
         .ok_or_else(|| InferenceError::Inference(format!("{context} pixel count overflows usize")))
+}
+
+fn check_input_image_dimensions(
+    height: usize,
+    width: usize,
+    context: &str,
+) -> Result<(), InferenceError> {
+    check_image_side(
+        height,
+        "height",
+        context,
+        MAX_INPUT_IMAGE_SIDE,
+        "MAX_INPUT_IMAGE_SIDE",
+    )?;
+    check_image_side(
+        width,
+        "width",
+        context,
+        MAX_INPUT_IMAGE_SIDE,
+        "MAX_INPUT_IMAGE_SIDE",
+    )?;
+    let pixels = checked_pixel_count(height, width, context)?;
+    if pixels > MAX_INPUT_PIXELS {
+        return Err(InferenceError::Inference(format!(
+            "{context} input geometry {height}x{width} has {pixels} pixels, exceeding MAX_INPUT_PIXELS {MAX_INPUT_PIXELS}"
+        )));
+    }
+    Ok(())
 }
 
 fn allocation_error(context: &str, elements: usize, error: TryReserveError) -> InferenceError {
@@ -342,8 +387,7 @@ pub fn smart_resize(
     min_pixels: usize,
     max_pixels: usize,
 ) -> Result<(usize, usize), InferenceError> {
-    check_image_side(height, "height", "smart_resize")?;
-    check_image_side(width, "width", "smart_resize")?;
+    check_input_image_dimensions(height, width, "smart_resize")?;
     if factor == 0 || factor > MAX_RESIZE_FACTOR {
         return Err(InferenceError::Inference(format!(
             "smart_resize factor {factor} must be in 1..={MAX_RESIZE_FACTOR}"
@@ -383,18 +427,42 @@ pub fn smart_resize(
     let min_pixels_f64 = min_pixels as f64;
     if pixels > max_pixels_f64 {
         let beta = (h * w / max_pixels_f64).sqrt();
-        h_bar = (h / beta / f).floor().max(1.0) * f;
-        w_bar = (w / beta / f).floor().max(1.0) * f;
+        h_bar = (h / beta / f).floor() * f;
+        w_bar = (w / beta / f).floor() * f;
     } else if pixels < min_pixels_f64 {
         let beta = (min_pixels_f64 / (h * w)).sqrt();
         h_bar = (h * beta / f).ceil() * f;
         w_bar = (w * beta / f).ceil() * f;
     }
 
+    let zero_dimensions = match (h_bar == 0.0, w_bar == 0.0) {
+        (true, true) => Some("height and width"),
+        (true, false) => Some("height"),
+        (false, true) => Some("width"),
+        (false, false) => None,
+    };
+    if let Some(zero_dimensions) = zero_dimensions {
+        return Err(InferenceError::Inference(format!(
+            "smart_resize rounded {zero_dimensions} to zero for input geometry {height}x{width}"
+        )));
+    }
+
     let resized_h = h_bar as usize;
     let resized_w = w_bar as usize;
-    check_image_side(resized_h, "resized height", "smart_resize")?;
-    check_image_side(resized_w, "resized width", "smart_resize")?;
+    check_image_side(
+        resized_h,
+        "resized height",
+        "smart_resize",
+        MAX_RESIZED_IMAGE_SIDE,
+        "MAX_RESIZED_IMAGE_SIDE",
+    )?;
+    check_image_side(
+        resized_w,
+        "resized width",
+        "smart_resize",
+        MAX_RESIZED_IMAGE_SIDE,
+        "MAX_RESIZED_IMAGE_SIDE",
+    )?;
     check_resize_target(resized_h, resized_w, max_pixels)?;
     Ok((resized_h, resized_w))
 }
@@ -420,6 +488,7 @@ fn bicubic_kernel(x: f64) -> f64 {
 struct SpanCoeffs {
     ksize: usize,
     taps: Vec<i32>,
+    spans: Vec<(u32, u32)>,
 }
 
 /// Compute per-output coefficient tables for one separable pass over
@@ -466,10 +535,22 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Result<SpanCoeffs, Infe
     taps.try_reserve_exact(table_len)
         .map_err(|error| allocation_error("coefficient table", table_len, error))?;
     taps.resize(table_len, 0);
+    let mut spans = Vec::new();
+    spans
+        .try_reserve_exact(out_size)
+        .map_err(|error| allocation_error("coefficient spans", out_size, error))?;
+    spans.resize(out_size, (0, 0));
     let scale22 = 1i32 << PRECISION_BITS;
 
     for xx in 0..out_size {
         let (xmin, xmax, center, ss) = coefficient_span(in_size, out_size, xx);
+        let xmin_u32 = u32::try_from(xmin).map_err(|_| {
+            InferenceError::Inference("coefficient span start does not fit in u32".into())
+        })?;
+        let xmax_u32 = u32::try_from(xmax).map_err(|_| {
+            InferenceError::Inference("coefficient span length does not fit in u32".into())
+        })?;
+        spans[xx] = (xmin_u32, xmax_u32);
         let mut ww = 0.0f64;
         for x in 0..xmax {
             ww += bicubic_kernel((x as f64 + xmin as f64 - center + 0.5) * ss);
@@ -488,7 +569,7 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Result<SpanCoeffs, Infe
         }
     }
 
-    Ok(SpanCoeffs { ksize, taps })
+    Ok(SpanCoeffs { ksize, taps, spans })
 }
 
 /// Fixed-point accumulation scale: `1 << 21`, i.e. half of the 22-bit
@@ -515,10 +596,21 @@ pub fn resize_bicubic_rgb8(
     dst_h: usize,
     dst_w: usize,
 ) -> Result<Vec<u8>, InferenceError> {
-    check_image_side(src_h, "source height", "resize_bicubic_rgb8")?;
-    check_image_side(src_w, "source width", "resize_bicubic_rgb8")?;
-    check_image_side(dst_h, "destination height", "resize_bicubic_rgb8")?;
-    check_image_side(dst_w, "destination width", "resize_bicubic_rgb8")?;
+    check_input_image_dimensions(src_h, src_w, "resize_bicubic_rgb8")?;
+    check_image_side(
+        dst_h,
+        "destination height",
+        "resize_bicubic_rgb8",
+        MAX_RESIZED_IMAGE_SIDE,
+        "MAX_RESIZED_IMAGE_SIDE",
+    )?;
+    check_image_side(
+        dst_w,
+        "destination width",
+        "resize_bicubic_rgb8",
+        MAX_RESIZED_IMAGE_SIDE,
+        "MAX_RESIZED_IMAGE_SIDE",
+    )?;
     let expected = checked_rgb8_len(src_h, src_w, "resize_bicubic_rgb8 input")?;
     if src.len() != expected {
         return Err(InferenceError::ShapeMismatch {
@@ -551,7 +643,9 @@ pub fn resize_bicubic_rgb8(
     for c in 0..3 {
         for y in 0..src_h {
             for xx in 0..dst_w {
-                let (xmin, xmax, _, _) = coefficient_span(src_w, dst_w, xx);
+                let (xmin, xmax) = x_coeffs.spans[xx];
+                let xmin = xmin as usize;
+                let xmax = xmax as usize;
                 let mut ss: i32 = ACC_BIAS;
                 let tap_base = xx * x_coeffs.ksize;
                 for x in 0..xmax {
@@ -573,7 +667,9 @@ pub fn resize_bicubic_rgb8(
     for c in 0..3 {
         for x in 0..dst_w {
             for yy in 0..dst_h {
-                let (xmin, xmax, _, _) = coefficient_span(src_h, dst_h, yy);
+                let (xmin, xmax) = y_coeffs.spans[yy];
+                let xmin = xmin as usize;
+                let xmax = xmax as usize;
                 let mut ss: i32 = ACC_BIAS;
                 let tap_base = yy * y_coeffs.ksize;
                 for y in 0..xmax {
@@ -616,8 +712,7 @@ pub fn preprocess_rgb8(
     width: usize,
 ) -> Result<PreprocessedImage, InferenceError> {
     cfg.validate()?;
-    check_image_side(height, "height", "preprocess_rgb8")?;
-    check_image_side(width, "width", "preprocess_rgb8")?;
+    check_input_image_dimensions(height, width, "preprocess_rgb8")?;
     let patch = cfg.patch_size;
     let expected = checked_rgb8_len(height, width, "preprocess_rgb8 input")?;
     if rgb.len() != expected {
@@ -713,6 +808,21 @@ mod tests {
     fn smart_resize_large_image_scales_down() {
         let (h, w) = smart_resize(2000, 1500, 28, 112_896, 1_003_520).expect("smart_resize");
         assert_eq!((h, w), (1148, 840));
+    }
+
+    #[test]
+    fn smart_resize_rejects_zero_rounded_dimension() {
+        let err = smart_resize(4096, 100, 28, 1, 784).expect_err("zero target width");
+        assert!(matches!(err, InferenceError::Inference(_)));
+        let message = err.to_string();
+        assert!(message.contains("width"), "got: {message}");
+        assert!(message.contains("4096x100"), "got: {message}");
+    }
+
+    #[test]
+    fn smart_resize_keeps_nonzero_rounded_dimensions() {
+        let resized = smart_resize(4096, 4096, 28, 1, 784).expect("nonzero target");
+        assert_eq!(resized, (28, 28));
     }
 
     #[test]
@@ -864,6 +974,23 @@ mod tests {
     }
 
     #[test]
+    fn preprocess_admits_full_resolution_phone_geometry_before_buffer_check() {
+        let cfg = PaddleOcrImageProcessorConfig::paddleocr_vl_defaults();
+        let err = preprocess_rgb8(&cfg, &[], 8064, 6048).expect_err("empty RGB buffer");
+        assert!(matches!(err, InferenceError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn smart_resize_bounds_full_resolution_phone_output() {
+        let cfg = PaddleOcrImageProcessorConfig::paddleocr_vl_defaults();
+        let (height, width) =
+            smart_resize(6048, 8064, 28, cfg.min_pixels, cfg.max_pixels).expect("smart resize");
+        assert!(height <= MAX_RESIZED_IMAGE_SIDE);
+        assert!(width <= MAX_RESIZED_IMAGE_SIDE);
+        assert!(height * width <= cfg.max_pixels);
+    }
+
+    #[test]
     fn oversized_preprocessor_json_is_rejected_before_read() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("preprocessor_config.json");
@@ -878,9 +1005,11 @@ mod tests {
     #[test]
     fn image_dimensions_and_buffer_lengths_are_bounded() {
         let cfg = PaddleOcrImageProcessorConfig::paddleocr_vl_defaults();
-        assert!(preprocess_rgb8(&cfg, &[], MAX_IMAGE_SIDE + 1, 1).is_err());
-        assert!(resize_bicubic_rgb8(&[], MAX_IMAGE_SIDE + 1, 1, 1, 1).is_err());
-        assert!(resize_bicubic_rgb8(&[0, 0, 0], 1, 1, 1, MAX_IMAGE_SIDE + 1).is_err());
+        for &(height, width) in &[(MAX_INPUT_IMAGE_SIDE + 1, 1), (16_384, 4_097)] {
+            assert!(preprocess_rgb8(&cfg, &[], height, width).is_err());
+            assert!(resize_bicubic_rgb8(&[], height, width, 1, 1).is_err());
+        }
+        assert!(resize_bicubic_rgb8(&[0, 0, 0], 1, 1, 1, MAX_RESIZED_IMAGE_SIDE + 1).is_err());
         assert!(resize_bicubic_rgb8(&[0, 0, 0], 1, 1, 1, 1).is_ok());
         assert!(preprocess_rgb8(&cfg, &[0, 0, 0], 1, 1).is_ok());
     }
