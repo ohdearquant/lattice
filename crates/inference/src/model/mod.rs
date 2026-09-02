@@ -1,7 +1,9 @@
 //! Model module index for BERT, BitNet config, cross-encoder, Qwen, Qwen3.5, and Qwen3.5 config, with BERT/CrossEncoder/Qwen/Qwen3.5 type re-exports.
 pub mod bert;
 pub mod bitnet_config;
+pub(crate) mod config_file;
 pub mod cross_encoder;
+pub mod ernie45;
 pub mod gemma4_cache;
 pub mod gemma4_config;
 mod gemma4_loading;
@@ -9,6 +11,7 @@ pub mod gemma4_model;
 pub mod gemma4_ops;
 pub mod gemma4_preflight;
 mod gemma4_weights;
+pub mod paddleocr_vl;
 pub mod qwen;
 pub mod qwen35;
 pub mod qwen35_config;

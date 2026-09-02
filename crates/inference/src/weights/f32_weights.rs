@@ -1,4 +1,5 @@
 //! Safetensors metadata and f32 weight structs, including tensor, transformer-layer, BERT, cross-encoder, safetensors-file, and Qwen layer weights.
+use crate::bounded_read::{BoundedReadError, read_text_bounded};
 use crate::error::InferenceError;
 use crate::weights::safetensors_layout::{
     SafetensorsLayoutEntry, safetensors_dtype, validate_safetensors_layout,
@@ -1046,11 +1047,11 @@ pub struct ShardedQwenBacking {
 /// Upper bound, in bytes, on `model.safetensors.index.json` accepted from a checkpoint
 /// directory (FIX 6).
 ///
-/// `parse_index` previously `read_to_string`'d the entire file with no size limit before
-/// any bounded validation ran. Real sharded Qwen3.5/3.6 checkpoints (up to ~26 shards,
-/// tens of thousands of tensor names) produce index files on the order of a few MiB; 64
-/// MiB (67,108,864) leaves roughly an order of magnitude of headroom while rejecting an
-/// unbounded ignored-field or oversized `weight_map` from exhausting memory before parse.
+/// The index is opened once, checked for regular-file identity and initial size on that
+/// handle, and read through the same handle with a one-byte overrun check. Real sharded
+/// Qwen3.5/3.6 checkpoints (up to ~26 shards, tens of thousands of tensor names) produce
+/// index files on the order of a few MiB; 64 MiB (67,108,864) leaves roughly an order of
+/// magnitude of headroom while rejecting an oversized `weight_map` before parsing.
 pub(crate) const MAX_SAFETENSORS_INDEX_BYTES: u64 = 67_108_864;
 
 /// Upper bound on the number of entries in `SafetensorsIndex::weight_map` accepted from a
@@ -1288,20 +1289,24 @@ pub fn contained_shard_path(model_dir: &Path, shard_file: &str) -> Result<PathBu
 /// Parse `model.safetensors.index.json` from a model directory.
 pub fn parse_index(model_dir: &Path) -> Result<SafetensorsIndex, InferenceError> {
     let index_path = model_dir.join("model.safetensors.index.json");
-    // FIX 6: check the file's metadata length before `read_to_string` materializes a
-    // same-sized buffer -- admission-order applies to file parsing, not just tensor
-    // bytes. See `MAX_SAFETENSORS_INDEX_BYTES` docs.
-    let file_len = std::fs::metadata(&index_path)
-        .map_err(InferenceError::Io)?
-        .len();
-    if file_len > MAX_SAFETENSORS_INDEX_BYTES {
-        return Err(InferenceError::InvalidSafetensors(format!(
-            "{} is {file_len} bytes, exceeding MAX_SAFETENSORS_INDEX_BYTES \
-             ({MAX_SAFETENSORS_INDEX_BYTES})",
-            index_path.display()
-        )));
-    }
-    let json = std::fs::read_to_string(&index_path).map_err(InferenceError::Io)?;
+    // The shared reader checks the open handle and bounds its read to the same handle.
+    let json =
+        read_text_bounded(&index_path, MAX_SAFETENSORS_INDEX_BYTES).map_err(
+            |error| match error {
+                BoundedReadError::TooLarge { len, cap } => {
+                    InferenceError::InvalidSafetensors(format!(
+                        "{} is {len} bytes, exceeding MAX_SAFETENSORS_INDEX_BYTES \
+                         ({cap})",
+                        index_path.display()
+                    ))
+                }
+                BoundedReadError::NotRegularFile => InferenceError::InvalidSafetensors(format!(
+                    "{} is not a regular file",
+                    index_path.display()
+                )),
+                BoundedReadError::Io(error) => InferenceError::Io(error),
+            },
+        )?;
     serde_json::from_str(&json).map_err(|e| {
         InferenceError::InvalidSafetensors(format!("failed to parse {}: {e}", index_path.display()))
     })
@@ -3955,19 +3960,53 @@ mod tests {
 
     #[test]
     fn parse_index_rejects_oversized_index_file() {
-        // FIX 6 regression: an oversized model.safetensors.index.json must be rejected
-        // via the file's metadata length, before `read_to_string` materializes it.
         let root = temp_dir("lattice_index_oversized");
-        let oversized = format!(
-            r#"{{"metadata":{{}},"weight_map":{{}}, "pad":"{}"}}"#,
-            "x".repeat(MAX_SAFETENSORS_INDEX_BYTES as usize + 1)
-        );
-        fs::write(root.join("model.safetensors.index.json"), oversized)
-            .expect("test setup: write oversized index");
+        let oversized = File::create(root.join("model.safetensors.index.json"))
+            .expect("test setup: create oversized index");
+        oversized
+            .set_len(MAX_SAFETENSORS_INDEX_BYTES + 1)
+            .expect("test setup: extend oversized index");
         let err = parse_index(&root).expect_err("an oversized safetensors index must be rejected");
         assert!(
             err.to_string().contains("MAX_SAFETENSORS_INDEX_BYTES"),
             "wrong guard fired: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_index_rejects_a_directory_at_the_index_path() {
+        let root = temp_dir("lattice_index_directory");
+        fs::create_dir(root.join("model.safetensors.index.json"))
+            .expect("test setup: create index directory");
+
+        let err = parse_index(&root).expect_err("an index directory must be rejected");
+        assert!(
+            err.to_string().contains("is not a regular file"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_index_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = temp_dir("lattice_index_fifo");
+        let path = root.join("model.safetensors.index.json");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid, NUL-terminated path for the duration of the call.
+        let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let err = parse_index(&root).expect_err("a FIFO index must be rejected without blocking");
+        assert!(
+            err.to_string().contains("is not a regular file"),
+            "wrong error: {err}"
         );
     }
 

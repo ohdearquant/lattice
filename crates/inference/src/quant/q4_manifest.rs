@@ -38,8 +38,9 @@
 //! from this module.
 
 use std::fs;
-use std::io::Read;
 use std::path::Path;
+
+use crate::bounded_read::{BoundedReadError, read_bytes_bounded};
 
 /// Bounded size cap for `quantize_index.json` reads (#504 remaining slice
 /// 2). The index is a small per-tensor manifest (name/file/quantized/
@@ -64,9 +65,8 @@ pub enum Q4ManifestError {
     /// Deliberately distinct from genuine absence: a broken installation
     /// must fail closed, not be treated as "no manifest".
     Unreadable(String),
-    /// The file exceeds [`MAX_QUANTIZE_INDEX_LEN`], caught either at stat
-    /// time or by the bounded `Take` read overrunning the cap (the latter
-    /// guards a file swapped larger between stat and read).
+    /// The file exceeds [`MAX_QUANTIZE_INDEX_LEN`], caught from the open
+    /// handle's metadata or by the bounded read overrunning the cap.
     TooLarge(String),
     /// The file's bytes are not valid JSON at all.
     InvalidJson(String),
@@ -153,14 +153,11 @@ pub struct Q4Manifest {
 /// permission-denied, a dangling symlink, or another I/O error — is `Err`.
 ///
 /// Uses [`fs::symlink_metadata`] (does not follow symlinks) to decide
-/// absence-vs-present, then [`fs::metadata`] (follows symlinks) to read the
-/// target's size: a directory entry that exists but is a symlink to a
+/// absence-vs-present, then delegates the file read to the shared
+/// handle-bound reader. A directory entry that exists but is a symlink to a
 /// missing target is thereby distinguished from a path with no entry at
 /// all — the former is a broken installation and must fail closed, not be
-/// silently treated as "no manifest" (a real bug in an earlier version of
-/// this reader). Stat-then-take, not a bare [`fs::read`], so a file swapped
-/// for something huge between the stat and the read cannot cause an
-/// unbounded allocation (#504 remaining slice 2).
+/// silently treated as "no manifest".
 pub fn read_manifest_bytes_bounded(path: &Path) -> Result<Option<Vec<u8>>, Q4ManifestError> {
     match fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -172,45 +169,22 @@ pub fn read_manifest_bytes_bounded(path: &Path) -> Result<Option<Vec<u8>>, Q4Man
             )));
         }
     }
-    // The entry exists (possibly a symlink); resolve it to find its real
-    // size. Any failure here (broken symlink target, permission denied on
-    // the target, ...) is a hard error, never `Ok(None)`.
-    let metadata = fs::metadata(path).map_err(|e| {
-        Q4ManifestError::Unreadable(format!(
-            "{}: quantize_index.json entry exists but is unreadable \
-             (broken symlink or permission error): {e}",
-            path.display()
-        ))
-    })?;
-    if metadata.len() > MAX_QUANTIZE_INDEX_LEN {
-        return Err(Q4ManifestError::TooLarge(format!(
-            "{}: quantize_index.json too large: {} bytes exceeds cap of {MAX_QUANTIZE_INDEX_LEN} bytes",
-            path.display(),
-            metadata.len()
-        )));
-    }
-    let file = fs::File::open(path).map_err(|e| {
-        Q4ManifestError::Unreadable(format!(
-            "{}: failed to open quantize_index.json: {e}",
-            path.display()
-        ))
-    })?;
-    let mut buf = Vec::new();
-    file.take(MAX_QUANTIZE_INDEX_LEN.saturating_add(1))
-        .read_to_end(&mut buf)
-        .map_err(|e| {
-            Q4ManifestError::Unreadable(format!(
-                "{}: failed to read quantize_index.json: {e}",
+    read_bytes_bounded(path, MAX_QUANTIZE_INDEX_LEN)
+        .map(Some)
+        .map_err(|error| match error {
+            BoundedReadError::NotRegularFile => Q4ManifestError::Unreadable(format!(
+                "{}: quantize_index.json is not a regular file",
                 path.display()
-            ))
-        })?;
-    if buf.len() as u64 > MAX_QUANTIZE_INDEX_LEN {
-        return Err(Q4ManifestError::TooLarge(format!(
-            "{}: quantize_index.json too large: read exceeds cap of {MAX_QUANTIZE_INDEX_LEN} bytes",
-            path.display()
-        )));
-    }
-    Ok(Some(buf))
+            )),
+            BoundedReadError::TooLarge { len, cap } => Q4ManifestError::TooLarge(format!(
+                "{}: quantize_index.json too large: {len} bytes exceeds cap of {cap} bytes",
+                path.display()
+            )),
+            BoundedReadError::Io(error) => Q4ManifestError::Unreadable(format!(
+                "{}: failed to open/read quantize_index.json: {error}",
+                path.display()
+            )),
+        })
 }
 
 /// Parse `bytes` (the contents of a `quantize_index.json`) into a
@@ -481,6 +455,28 @@ mod tests {
             matches!(err, Q4ManifestError::Unreadable(_)),
             "wrong error variant: {err:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_manifest_bytes_bounded_rejects_a_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("quantize_index.json");
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_path` is a valid, NUL-terminated path for the duration of the call.
+        let result = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let err = read_manifest_bytes_bounded(&path)
+            .expect_err("a FIFO must be rejected without opening a writer");
+        assert!(matches!(err, Q4ManifestError::Unreadable(_)));
     }
 
     #[test]

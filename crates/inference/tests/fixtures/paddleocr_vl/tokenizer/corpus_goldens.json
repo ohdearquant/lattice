@@ -1,0 +1,456 @@
+[
+ {
+  "id": "ascii",
+  "category": "plain",
+  "text": "Hello, world!",
+  "ids": [
+   16276,
+   93938,
+   3135,
+   94018
+  ],
+  "tokens": [
+   "Hello",
+   ",",
+   "▁world",
+   "!"
+  ],
+  "decoded": "Hello, world!"
+ },
+ {
+  "id": "digits_inline",
+  "category": "digits",
+  "text": "abc123 456.78",
+  "ids": [
+   13056,
+   4,
+   5,
+   6,
+   93919,
+   7,
+   8,
+   9,
+   93937,
+   10,
+   11
+  ],
+  "tokens": [
+   "abc",
+   "1",
+   "2",
+   "3",
+   "▁",
+   "4",
+   "5",
+   "6",
+   ".",
+   "7",
+   "8"
+  ],
+  "decoded": "abc123 456.78"
+ },
+ {
+  "id": "digits_run",
+  "category": "digits",
+  "text": "20260901 13:24:51",
+  "ids": [
+   5,
+   3,
+   5,
+   9,
+   3,
+   12,
+   3,
+   4,
+   93919,
+   4,
+   6,
+   93963,
+   5,
+   7,
+   93963,
+   8,
+   4
+  ],
+  "tokens": [
+   "2",
+   "0",
+   "2",
+   "6",
+   "0",
+   "9",
+   "0",
+   "1",
+   "▁",
+   "1",
+   "3",
+   ":",
+   "2",
+   "4",
+   ":",
+   "5",
+   "1"
+  ],
+  "decoded": "20260901 13:24:51"
+ },
+ {
+  "id": "cjk_medical",
+  "category": "cjk",
+  "text": "血常规检查结果：白细胞计数 9.5×10^9/L",
+  "ids": [
+   44852,
+   55185,
+   94035,
+   56170,
+   43072,
+   93919,
+   12,
+   93937,
+   8,
+   95010,
+   4,
+   3,
+   94082,
+   12,
+   93945,
+   93966
+  ],
+  "tokens": [
+   "血常规",
+   "检查结果",
+   "：",
+   "白细胞",
+   "计数",
+   "▁",
+   "9",
+   ".",
+   "5",
+   "×",
+   "1",
+   "0",
+   "^",
+   "9",
+   "/",
+   "L"
+  ],
+  "decoded": "血常规检查结果：白细胞计数 9.5×10^9/L"
+ },
+ {
+  "id": "cjk_mixed_units",
+  "category": "cjk",
+  "text": "总蛋白 65.4 g/L (参考值 60-80)",
+  "ids": [
+   94446,
+   8729,
+   93919,
+   9,
+   8,
+   93937,
+   7,
+   346,
+   93945,
+   93966,
+   322,
+   5607,
+   94505,
+   93919,
+   9,
+   3,
+   93942,
+   11,
+   3,
+   93948
+  ],
+  "tokens": [
+   "总",
+   "蛋白",
+   "▁",
+   "6",
+   "5",
+   ".",
+   "4",
+   "▁g",
+   "/",
+   "L",
+   "▁(",
+   "参考",
+   "值",
+   "▁",
+   "6",
+   "0",
+   "-",
+   "8",
+   "0",
+   ")"
+  ],
+  "decoded": "总蛋白 65.4 g/L (参考值 60-80)"
+ },
+ {
+  "id": "multi_space",
+  "category": "whitespace",
+  "text": "a  b   c",
+  "ids": [
+   93922,
+   269,
+   93939,
+   269,
+   284
+  ],
+  "tokens": [
+   "a",
+   "▁▁",
+   "b",
+   "▁▁",
+   "▁c"
+  ],
+  "decoded": "a  b   c"
+ },
+ {
+  "id": "leading_space",
+  "category": "whitespace",
+  "text": " leading",
+  "ids": [
+   8143
+  ],
+  "tokens": [
+   "▁leading"
+  ],
+  "decoded": " leading"
+ },
+ {
+  "id": "trailing_space",
+  "category": "whitespace",
+  "text": "trailing ",
+  "ids": [
+   66465,
+   93919
+  ],
+  "tokens": [
+   "trailing",
+   "▁"
+  ],
+  "decoded": "trailing "
+ },
+ {
+  "id": "newlines",
+  "category": "whitespace",
+  "text": "OCR:\nAssistant:\n",
+  "ids": [
+   93972,
+   2497,
+   93963,
+   23,
+   92267,
+   93963,
+   23
+  ],
+  "tokens": [
+   "O",
+   "CR",
+   ":",
+   "<0x0A>",
+   "Assistant",
+   ":",
+   "<0x0A>"
+  ],
+  "decoded": "OCR:\nAssistant:\n"
+ },
+ {
+  "id": "byte_fallback",
+  "category": "bytes",
+  "text": "🩸 émojï ﬃ",
+  "ids": [
+   253,
+   172,
+   182,
+   197,
+   1697,
+   43102,
+   95964,
+   93919,
+   252,
+   185,
+   144
+  ],
+  "tokens": [
+   "<0xF0>",
+   "<0x9F>",
+   "<0xA9>",
+   "<0xB8>",
+   "▁é",
+   "moj",
+   "ï",
+   "▁",
+   "<0xEF>",
+   "<0xAC>",
+   "<0x83>"
+  ],
+  "decoded": "🩸 émojï ﬃ"
+ },
+ {
+  "id": "loc_tokens",
+  "category": "added",
+  "text": "<|LOC_0|><|LOC_42|><|LOC_1003|>",
+  "ids": [
+   100297,
+   100339,
+   93953,
+   94031,
+   7120,
+   93944,
+   4,
+   3,
+   3,
+   6,
+   61125
+  ],
+  "tokens": [
+   "<|LOC_0|>",
+   "<|LOC_42|>",
+   "<",
+   "|",
+   "LOC",
+   "_",
+   "1",
+   "0",
+   "0",
+   "3",
+   "|>"
+  ],
+  "decoded": "<|LOC_0|><|LOC_42|><|LOC_1003|>"
+ },
+ {
+  "id": "loc_with_digits",
+  "category": "added",
+  "text": "<|LOC_BEGIN|><|LOC_12|><|LOC_SEP|><|LOC_999|><|LOC_END|>90",
+  "ids": [
+   101298,
+   100309,
+   101300,
+   101296,
+   101299,
+   12,
+   3
+  ],
+  "tokens": [
+   "<|LOC_BEGIN|>",
+   "<|LOC_12|>",
+   "<|LOC_SEP|>",
+   "<|LOC_999|>",
+   "<|LOC_END|>",
+   "9",
+   "0"
+  ],
+  "decoded": "<|LOC_12|><|LOC_999|>90"
+ },
+ {
+  "id": "image_specials",
+  "category": "special",
+  "text": "<|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>",
+  "ids": [
+   101305,
+   100295,
+   101306
+  ],
+  "tokens": [
+   "<|IMAGE_START|>",
+   "<|IMAGE_PLACEHOLDER|>",
+   "<|IMAGE_END|>"
+  ],
+  "decoded": ""
+ },
+ {
+  "id": "text_markers",
+  "category": "added",
+  "text": "<|TEXT_START|>标题<|TEXT_END|>",
+  "ids": [
+   101314,
+   5781,
+   101315
+  ],
+  "tokens": [
+   "<|TEXT_START|>",
+   "标题",
+   "<|TEXT_END|>"
+  ],
+  "decoded": "<|TEXT_START|>标题<|TEXT_END|>"
+ },
+ {
+  "id": "chat_prompt",
+  "category": "template",
+  "text": "<|begin_of_sentence|>User: <|IMAGE_START|><|IMAGE_PLACEHOLDER|><|IMAGE_END|>OCR:\nAssistant:\n",
+  "ids": [
+   100273,
+   2969,
+   93963,
+   93919,
+   101305,
+   100295,
+   101306,
+   93972,
+   2497,
+   93963,
+   23,
+   92267,
+   93963,
+   23
+  ],
+  "tokens": [
+   "<|begin_of_sentence|>",
+   "User",
+   ":",
+   "▁",
+   "<|IMAGE_START|>",
+   "<|IMAGE_PLACEHOLDER|>",
+   "<|IMAGE_END|>",
+   "O",
+   "CR",
+   ":",
+   "<0x0A>",
+   "Assistant",
+   ":",
+   "<0x0A>"
+  ],
+  "decoded": "User: OCR:\nAssistant:\n"
+ },
+ {
+  "id": "empty",
+  "category": "edge",
+  "text": "",
+  "ids": [],
+  "tokens": [],
+  "decoded": ""
+ },
+ {
+  "id": "table_row",
+  "category": "ocr",
+  "text": "| 项目 | 结果 | 单位 | 参考范围 |",
+  "ids": [
+   94031,
+   57271,
+   697,
+   56180,
+   697,
+   92134,
+   697,
+   93919,
+   5607,
+   5407,
+   697
+  ],
+  "tokens": [
+   "|",
+   "▁项目",
+   "▁|",
+   "▁结果",
+   "▁|",
+   "▁单位",
+   "▁|",
+   "▁",
+   "参考",
+   "范围",
+   "▁|"
+  ],
+  "decoded": "| 项目 | 结果 | 单位 | 参考范围 |"
+ }
+]

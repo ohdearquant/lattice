@@ -345,13 +345,11 @@ fn bilinear_pos_embed(
 /// decisions" contract).
 pub(crate) fn apply_rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     let half = x.len() / 2;
-    let mut rotated = vec![0.0f32; x.len()];
     for i in 0..half {
-        rotated[i] = -x[half + i];
-        rotated[half + i] = x[i];
-    }
-    for i in 0..x.len() {
-        x[i] = x[i] * cos[i] + rotated[i] * sin[i];
+        let a = x[i];
+        let b = x[half + i];
+        x[i] = a * cos[i] + (-b) * sin[i];
+        x[half + i] = b * cos[half + i] + a * sin[half + i];
     }
 }
 
@@ -570,7 +568,7 @@ pub fn qwen35_vit_forward(
 /// the entire `[n, ...]` sequence is one attention segment).
 /// `qkv`: `[n, 3 * hidden]` with per-row layout `[Q(hidden) | K(hidden) | V(hidden)]`,
 /// each of Q/K/V split into `n_heads` contiguous `head_dim`-wide chunks.
-fn multihead_attention_full(
+pub(crate) fn multihead_attention_full(
     qkv: &[f32],
     n: usize,
     hidden: usize,

@@ -139,6 +139,10 @@ path = "crates/inference/examples/diff_gdn_layer.rs"
 reason = "Correctness/parity comparison gate; prints a pass/fail diff, not a timed measurement."
 
 [[non_measurement_surface]]
+path = "crates/inference/examples/ernie45_trace_dump.rs"
+reason = "Correctness instrument: dumps forward-pass activations as raw f32 for offline diffing against the HF reference archive; no timing."
+
+[[non_measurement_surface]]
 path = "crates/inference/src/bin/chat_metal.rs"
 reason = "Long-running interactive product process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
