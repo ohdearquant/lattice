@@ -902,7 +902,7 @@ jobs:
           # The vision and end-to-end gates print one summary line per golden only after every
           # assertion passed; a run that skipped prints neither. The counts pin the fixture sets
           # (three synthetic grids, one image) so a silently shrunk fixture cannot pass as a run.
-          test "$(grep -c '^case [0-9]*: grid [0-9]*x[0-9]* ([0-9]* patches) all checkpoints within tolerance' paddleocr-gates.log)" -eq 3
+          test "$(grep -c '^case g[0-9]*x[0-9]*: grid [0-9]*x[0-9]* ([0-9]* patches) all checkpoints within tolerance' paddleocr-gates.log)" -eq 3
           grep -q '^paddleocr_vl_e2e: prefill .* greedy exact 24 of 24$' paddleocr-gates.log
 
   # The QuaRot converter and its refuse-on-fail forward-equivalence check are
