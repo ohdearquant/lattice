@@ -3,6 +3,9 @@
 **Status**: Accepted
 **Date**: 2026-05-13
 **Crate**: lattice-embed
+**Proposed amendment**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would resolve
+prepared model source, backend, dimensions, and cache policy once and report the effective vector
+semantics instead of treating a model label as identity.
 
 ## Context
 
@@ -69,8 +72,8 @@ dimension and a minimum of 32. For non-MRL models, setting `output_dim` returns 
 `EmbedError::InvalidInput` at construction time, not silently at inference time.
 
 The `ModelConfig::dimensions()` method returns the active dimension (truncated or native),
-and this is used as the third component of the Blake3 cache key — so different MRL
-truncations never collide in the cache.
+and this is included in the current SHA-256, role-aware cache key — so different MRL truncations
+never collide in the cache.
 
 **`key_version()` for cache invalidation across model families**
 
@@ -120,7 +123,7 @@ with the download URL.
 
 - Adding a new model requires only: new variant in the enum and new arms in each `const fn`. The compiler will error at any match arm that forgets the new variant (once `#[non_exhaustive]` is lifted internally).
 - `ModelConfig::validate()` catches MRL misconfiguration at construction time (below min 32, above native dimension, non-MRL model requesting truncation).
-- `ModelProvenance` records model identity, load timestamp, and a Blake3 metadata hash for lightweight audit logging — without loading model weights.
+- `ModelProvenance` records model identity, load timestamp, and a SHA-256 metadata hash for lightweight audit logging — without loading model weights.
 
 ### Negative
 
