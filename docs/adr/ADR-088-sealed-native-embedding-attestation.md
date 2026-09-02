@@ -183,9 +183,9 @@ environment variable. It performs no network access or automatic download. A con
 may read configuration before constructing a resolved spec, but the resolved value captures those
 choices once and the preparation operation consumes only that value.
 
-The first version supports only these five BERT-family local variants, using an explicit
-`CpuPinned` backend: `BgeSmallEnV15`, `BgeBaseEnV15`, `BgeLargeEnV15`, `AllMiniLmL6V2`, and
-`ParaphraseMultilingualMiniLmL12V2`. Their prepared tokenizer layouts are WordPiece. The tokenizer
+The first version supports only these four BERT-family local variants, using an explicit
+`CpuPinned` backend: `BgeSmallEnV15`, `BgeBaseEnV15`, `BgeLargeEnV15`, and `AllMiniLmL6V2`. Their
+prepared tokenizer layouts are WordPiece. The tokenizer
 admission closure is limited to the WordPiece and BPE variants described in D4; no third tokenizer
 family is admitted. BPE declarations are admitted by that closed profile, but no current BERT row
 uses one and Qwen decoder variants are rejected by this D2's BERT-only model boundary. `CpuPinned`
@@ -199,12 +199,16 @@ is absent from the descriptor. It rejects Qwen, remote models, adapters, Metal, 
 selection, vendor fallback, and per-call backend fallback with a typed unsupported-policy error.
 This is a deliberate safe subset, not a claim that Qwen is permanently unsupported.
 
-`MultilingualE5Small` and `MultilingualE5Base` are deferred to a follow-up ADR. Their Unigram/
-SentencePiece tokenizer layouts are outside the v1 closure: a tokenizer with `model.type` exactly
-`"Unigram"`, a `Metaspace` pre-tokenizer, or a `sentencepiece.bpe.model`/`spiece.model` file
-selected by precedence is rejected during preparation with a typed error naming the unsupported
-tokenizer model. Preparation never falls through to a lower-priority tokenizer candidate after that
-rejection.
+`MultilingualE5Small`, `MultilingualE5Base`, and `ParaphraseMultilingualMiniLmL12V2` are deferred to
+a follow-up ADR. Their Unigram/SentencePiece tokenizer layouts are outside the v1 closure: a
+tokenizer with `model.type` exactly `"Unigram"`, a `Metaspace` pre-tokenizer, or a
+`sentencepiece.bpe.model`/`spiece.model` file selected by precedence is rejected during preparation
+with a typed error naming the unsupported tokenizer model. The published `tokenizer.json` for
+`ParaphraseMultilingualMiniLmL12V2` declares `model.type` `"Unigram"` over a 250,002-entry
+vocabulary with a `Precompiled` normalizer and a `Sequence` pre-tokenizer, and the runtime loader
+routes it to the SentencePiece tokenizer. The prepared closure rejects it with the same typed
+unsupported-tokenizer error, and preparation never falls through to a lower-priority tokenizer
+candidate after that rejection.
 
 `lattice-inference` therefore gains an explicit BERT CPU-kernel-policy seam. Prepared services pass
 their frozen `CpuPinned` profile; the legacy service passes `Auto` and retains today's behavior.
@@ -951,7 +955,7 @@ The implementation PR must include deterministic tests for all of the following.
 - The fixture matrix admits only WordPiece and BPE tokenizer variants. A `model.type="Unigram"`,
   `Metaspace` pre-tokenizer, or selected `tokenizer.model`, `sentencepiece.bpe.model`, or
   `spiece.model` fixture is rejected at preparation with a typed unsupported-tokenizer error;
-  `MultilingualE5Small` and `MultilingualE5Base` remain deferred.
+  `MultilingualE5Small`, `MultilingualE5Base`, and `ParaphraseMultilingualMiniLmL12V2` remain deferred.
 - WordPiece fixtures cover cased and accent-preserving normalizer declarations, altered CJK or
   punctuation behavior, non-right padding/truncation, non-empty `never_split`, changed special-token
   templates, and contradictions between `tokenizer.json` and `tokenizer_config.json`; each fails
@@ -1024,15 +1028,15 @@ The implementation PR must include deterministic tests for all of the following.
   a larger batch, beside different-length neighbors, after neighbor/order permutations, and across
   accepted batch sizes. This pins `CanonicalPerItemV1` and rules out a packed-kernel regression.
 - Exact output, report, and descriptor goldens survive restart and source relocation.
-- An implementation-owned closed fixture table enumerates exactly the five admitted BERT variants:
-  `BgeSmallEnV15`, `BgeBaseEnV15`, `BgeLargeEnV15`, `AllMiniLmL6V2`, and
-  `ParaphraseMultilingualMiniLmL12V2`. Every row pins its production WordPiece tokenizer layout
+- An implementation-owned closed fixture table enumerates exactly the four admitted BERT variants:
+  `BgeSmallEnV15`, `BgeBaseEnV15`, `BgeLargeEnV15`, and `AllMiniLmL6V2`. Every row pins its
+  production WordPiece tokenizer layout
   and pooling strategy and runs Generic, Query, and Passage for each F32/F16/BF16 source dtype that
   row accepts; an unsupported dtype is explicitly rejected and tested. Across the table, every
   accepted tokenizer layout is exercised, BGE CLS and MiniLM mean pooling are covered, and an input
   above the advisory catalog token count but within the realized tokenizer/model cap is retained.
-  The `MultilingualE5Small` Unigram tokenizer fixture is a required rejection fixture, and
-  `MultilingualE5Base` is likewise deferred with the Unigram family.
+  The `MultilingualE5Small` Unigram fixture is the required rejection fixture while
+  `MultilingualE5Base` and `ParaphraseMultilingualMiniLmL12V2` are deferred with the Unigram family.
 - Wrapping/type-erasing a prepared service cannot expose an attested capability or authorize reuse
   of the original report for wrapper outputs.
 
