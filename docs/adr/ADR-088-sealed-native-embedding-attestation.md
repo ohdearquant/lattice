@@ -52,7 +52,8 @@ inseparably owns:
 
 1. the loaded model used for every request;
 2. the sealed private snapshot from which that model was constructed;
-3. the caller-supplied pre/post attestation report; and
+3. Lattice's canonical pre/post attestation reports and any optional caller-supplied
+   supplementary evidence; and
 4. a bounded effective descriptor of every code-owned vector semantic.
 
 The prepared value has no `into_parts`, raw-model getter, mutable snapshot getter, path getter,
@@ -74,7 +75,13 @@ pub struct PreparedModelDirectory { /* opaque pinned absolute source capability 
 pub struct PreparedSnapshotDirectory { /* opaque pinned absolute directory capability */ }
 pub struct NativePreparationLimits { /* private finite per-request ceilings */ }
 pub struct NativeResourceBudget { /* private finite shared ceilings */ }
-pub struct OpaqueAttestationReport(Box<[u8]>); // private field, 1..=4096 bytes
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttestationAlgorithm { Sha256V1 }
+pub struct CanonicalAttestationReport {
+    algorithm: AttestationAlgorithm,
+    digest: [u8; 32],
+}
+pub struct SupplementaryAttestationEvidence { /* private, bounded and digest-bound */ }
 
 impl PreparedModelDirectory {
     pub fn open(path: &Path) -> Result<Self>;
@@ -106,11 +113,6 @@ impl NativeResourceBudget {
     ) -> Result<Self>;
 }
 
-impl OpaqueAttestationReport {
-    pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self>;
-    pub fn as_bytes(&self) -> &[u8];
-}
-
 impl NativeEmbeddingPreparer {
     pub fn open(
         snapshot_parent: PreparedSnapshotDirectory,
@@ -121,7 +123,7 @@ impl NativeEmbeddingPreparer {
         &self,
         spec: ResolvedNativeEmbeddingSpec,
         limits: NativePreparationLimits,
-        fresh_attestor: F,
+        supplementary_attestor: Option<F>,
     ) -> Result<PreparedNativeEmbedding>
     where
         A: CheckpointAttestor,
@@ -132,8 +134,14 @@ pub struct PreparedNativeEmbedding {
     // private: loaded model, sealed snapshot, report, effective descriptor
 }
 
+impl CanonicalAttestationReport {
+    pub fn algorithm(&self) -> AttestationAlgorithm;
+    pub fn digest(&self) -> &[u8; 32];
+}
+
 impl PreparedNativeEmbedding {
-    pub fn attestation_report(&self) -> &OpaqueAttestationReport;
+    pub fn canonical_attestation(&self) -> &CanonicalAttestationReport;
+    pub fn supplementary_attestation(&self) -> Option<&SupplementaryAttestationEvidence>;
     pub fn effective_descriptor(&self) -> &EffectiveEmbeddingDescriptor;
 }
 
@@ -219,14 +227,17 @@ Preparation performs this sequence before returning a service:
    are normalized and unique.
 4. Validate the complete snapshot inventory, all bounded metadata, tokenizer selection, model
    geometry, and the effective descriptor. No loader fallback is permitted in prepared mode.
-5. Perform the first whole-snapshot attestation through a fresh caller attestor, then seal the
+5. Compute the first Lattice canonical attestation over the complete snapshot schedule, and,
+   when configured, obtain supplementary evidence from a fresh caller attestor. Then seal the
    snapshot read-only.
 6. Load the model only from the sealed snapshot under the existing ADR-003 mmap trust boundary.
 7. Re-read inventory and geometry from the same snapshot, reconstruct the effective descriptor,
-   and perform a second complete attestation using another fresh attestor and fresh opened-handle
-   read sequence.
-8. Require the inventory, effective descriptor, and opaque reports to match exactly before
-   publishing the prepared value.
+   and compute a second canonical attestation using a fresh opened-handle read sequence. When
+   configured, obtain supplementary evidence from another fresh caller attestor as well.
+8. Require the inventory, effective descriptor, and canonical reports to match exactly before
+   publishing the prepared value. If supplementary evidence is configured, its digest binding and
+   bounded payload must also validate on both passes and match; it is never a substitute for the
+   canonical report.
 
 The snapshot path is never returned. The prepared inner object retains the snapshot and every
 resource needed by model mappings. Snapshot cleanup starts only after the loaded model and any
@@ -390,11 +401,127 @@ count. The descriptor records the selected source file, key, raw value, capped v
 protocol. This preserves accepted legacy truncation behavior for valid checkpoints while refusing a
 configuration that could index beyond the sealed model.
 
-### D5: callers own digest framing through a capability-limited attestor
+Geometry alone is not sufficient. Prepared D4 also validates a closed set of output-affecting
+`config.json` semantics before loading. `model_type` must be present and exactly `"bert"`.
+`hidden_act` must be present and exactly `"gelu"`; the effective implementation value recorded in
+the descriptor is `GeluTanhApproxV1`, the tanh-form GELU approximation
+`0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`, with Lattice's versioned Padé
+`fast_tanh` kernel. It is not the erf-exact GELU and is not interchangeable with `relu`,
+`gelu_new`, or another activation name. `position_embedding_type` must be present and exactly
+`"absolute"`; absence is rejected rather than interpreted as an implicit default. The existing
+numeric fields, including `layer_norm_eps`, remain required and validated as above.
 
-Lattice owns safe enumeration, normalized ordering, opened-handle reads, and bounded streaming. It
-does not import a downstream digest protocol. The caller supplies an attestor factory. Preparation
-calls it exactly twice so pre-load and post-load passes never reuse mutable hash state.
+The remaining BERT configuration allowlist is explicit. `is_decoder` and `add_cross_attention`
+may be absent or `false`; `true` is rejected because this loader has no decoder or cross-attention
+path. `pruned_heads` may be absent or an empty object; a non-empty value is rejected. The
+`pad_token_id` field may be absent or must equal the selected vocabulary's `[PAD]` ID. The
+inference-only or training-only fields `hidden_dropout_prob`, `attention_probs_dropout_prob`,
+`classifier_dropout`, `use_cache`, `tie_word_embeddings`, `architectures`, `torch_dtype`,
+`transformers_version`, `_name_or_path`, `id2label`, `label2id`, `problem_type`, `return_dict`,
+`output_hidden_states`, and `output_attentions` are known output-irrelevant metadata for this
+encoder and are ignored after bounded type validation, even when their declared values are
+non-default.
+No other `config.json` key is ignored: an unknown key, or a known BERT option that can change
+embedding execution, is rejected with a typed preparation error. The descriptor records the
+validated activation, position-embedding, decoder/cross-attention, and pooling-relevant semantic
+profile, while actual tensor source dtypes and decode behavior are recorded from the sealed
+SafeTensors inventory rather than trusted from `torch_dtype`.
+
+### D4 tokenizer semantic closure
+
+The tokenizer checks also cover declared behavior, not only file precedence, vocabulary cardinality,
+and special-token IDs. `WordPieceTokenizer` in
+`crates/inference/src/tokenizer/wordpiece.rs` always lowercases each Unicode scalar, maps its
+supported accented forms and removes combining marks (therefore stripping accents from NFD input),
+surrounds CJK characters with separators, surrounds punctuation with separators, converts Unicode
+whitespace to ASCII-space separators, drops non-whitespace controls, and splits on the resulting
+whitespace. It greedily longest-matches whole-word pieces first and `##` continuation pieces after
+the first piece; an unmatched character emits the vocabulary `[UNK]` ID. It requires `[CLS]`,
+`[SEP]`, `[PAD]`, `[UNK]`, and `[MASK]`; it emits `[CLS]` and `[SEP]` itself, pads with `[PAD]`,
+and matches non-empty declared added/special tokens literally before normalizing surrounding text.
+There is no cased, accent-preserving, alternate CJK, alternate punctuation, left-padding, or
+decoder path in prepared WordPiece mode.
+
+For a selected WordPiece `tokenizer.json`, the declared pipeline must be exactly this supported
+shape, with no unlisted behavior-bearing members:
+
+| Declaration      | Required value                                                                                                             |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `model.type`     | `"WordPiece"`; `model.vocab` is the selected vocabulary                                                                    |
+| WordPiece model  | `unk_token` absent or `[UNK]`; `continuing_subword_prefix` absent or `##`; no unvalidated word-length cap                  |
+| `normalizer`     | `BertNormalizer` with `clean_text=true`, `handle_chinese_chars=true`, `lowercase=true`, and `strip_accents=true` or `null` |
+| `pre_tokenizer`  | `{"type":"BertPreTokenizer"}`                                                                                              |
+| `post_processor` | `TemplateProcessing` with single `[CLS] $A [SEP]` and pair `[CLS] $A [SEP] $B:1 [SEP]:1`, with matching IDs                |
+
+`strip_accents: null` is accepted only with `lowercase=true` and is canonicalized to effective
+`strip_accents=true`, matching the Hugging Face BERT normalizer convention. Any other normalizer,
+pre-tokenizer, post-processor template, or declared option is rejected with a typed preparation
+error; the loader must not silently ignore a cased normalizer or a false `strip_accents` flag.
+
+When `tokenizer_config.json` contains these fields, they are cross-checked against the
+`tokenizer.json` pipeline rather than used to override it: `do_lower_case=true`,
+`strip_accents=true` or `null` under the same canonicalization rule, `tokenize_chinese_chars=true`,
+`do_basic_tokenize=true`, and `padding_side`/`truncation_side` absent or `"right"`. Declared
+`cls_token`, `sep_token`, `pad_token`, `unk_token`, and `mask_token` values, when present, must be
+exactly `[CLS]`, `[SEP]`, `[PAD]`, `[UNK]`, and `[MASK]` respectively. `never_split` must be absent,
+`null`, or empty because only tokenizer.json added tokens are implemented. `clean_up_tokenization_spaces`
+is a decode-only setting and is ignored after it is validated as a boolean. `tokenizer_class`, when
+present, must be `BertTokenizer` or `BertTokenizerFast`. If a semantic field is
+present in both files, the files must agree after canonicalization; omission does not override an
+explicit value, and any contradiction is a typed error. The same rules apply to a legacy `vocab.txt`
+layout using the canonical implicit WordPiece profile; a tokenizer_config declaration that differs
+from that profile is rejected.
+
+For the BPE layouts admitted by the inventory, the same closure applies. `BpeTokenizer` in
+`crates/inference/src/tokenizer/bpe.rs` performs byte-level encoding and the fixed GPT-4-style
+pre-tokenization implemented by `gpt4_regex_pretokenize`; it does not lowercase, strip accents,
+split CJK specially, or apply a general normalizer. A BPE `tokenizer.json` therefore accepts only a
+missing or `null` `normalizer`. Its `pre_tokenizer` must be absent, a bare `ByteLevel` with
+`use_regex` absent or `true` and `add_prefix_space` absent or `false`, the exact fixed regex split
+implemented by Lattice, or a `Sequence` containing only that regex split and the supported
+`ByteLevel{use_regex:false}` tail. An arbitrary regex with the same JSON shape, `use_regex:false`
+without the preceding supported split, `Metaspace`, `Whitespace`, `BertPreTokenizer`, or any other
+declared pre-tokenizer is rejected; matching the outer type is not enough. BPE model flags that the
+implementation does not honor (`dropout`, `continuing_subword_prefix`, `end_of_word_suffix`,
+`fuse_unk`, `ignore_merges`, and `byte_fallback`) must be absent or their exact no-op value
+(`null`/`false` as applicable), and the effective unknown-token choice and post-processing flags
+must match the fields consumed by `BpeTokenizer`. Raw `vocab.json` plus `merges.txt` uses the
+canonical fixed GPT-4-style profile because it has no declaration to override it.
+
+For BPE `tokenizer_config.json`, `do_lower_case`, `strip_accents`, `tokenize_chinese_chars`, and
+`add_prefix_space` must be absent or `false`; `padding_side`/`truncation_side` must be absent or
+`"right"`; and `clean_up_tokenization_spaces` is decode-only and ignored after boolean validation.
+Any declared normalizer, pre-tokenizer, or tokenizer-config field that could alter token IDs and is
+not in this closed allowlist is rejected. The validated WordPiece or BPE semantic profile,
+including all canonicalized normalization and pre-tokenization values, is included in D6 and is
+reconstructed on the post-load pass.
+
+### D5: Lattice owns the canonical digest; callers may add supplementary evidence
+
+Lattice owns safe enumeration, normalized ordering, opened-handle reads, bounded streaming, and the
+identity-bearing digest. It does not import a downstream registry protocol: the digest is the
+evidence, while names of downstream tables, keys, and cache slots remain downstream. The caller may
+also supply an optional attestor factory for supplementary evidence. Preparation calls a configured
+factory exactly twice so pre-load and post-load passes never reuse mutable hash state.
+
+Lattice always computes `CanonicalAttestationReport` itself. Its fixed algorithm identifier is
+`AttestationAlgorithm::Sha256V1`, whose canonical domain is explicitly SHA-256-bound, and its
+digest is the 32-byte SHA-256 result over this exact byte framing, with all integers big-endian:
+
+```text
+b"lattice.sealed-native-embedding.sha256.v1\0"
+|| u64_be(file_count)
+|| repeat in lexicographic normalized-path order:
+     u64_be(path_byte_len) || path_bytes || u64_be(declared_len) || exactly declared_len content bytes
+|| b"lattice.sealed-native-embedding.sha256.v1.end\0"
+```
+
+The domain string and terminal marker are fixed ASCII byte strings, not caller inputs. The file
+count, path length, path bytes, declared length, and content are all part of the hash preimage;
+content is fed as the canonical exact-fill 1 MiB chunk schedule described below. The terminal
+marker is required even for an empty file set. `CanonicalAttestationReport` carries the
+`AttestationAlgorithm` value and `[u8; 32]` digest as typed fields, so an algorithm change cannot
+be confused with a digest produced by this version.
 
 The conceptual trait is:
 
@@ -404,34 +531,35 @@ pub trait CheckpointAttestor: Send + 'static {
     fn begin_file(&mut self, logical_path: &[u8], declared_len: u64) -> Result<()>;
     fn chunk(&mut self, bytes: &[u8]) -> Result<()>;
     fn end_file(&mut self) -> Result<()>;
-    fn finish(self) -> Result<OpaqueAttestationReport>;
+    fn finish(self) -> Result<SupplementaryAttestationEvidence>;
 }
 ```
 
-Before any file callback, Lattice supplies the exact file count. Files are emitted in strict
-lexicographic order by normalized logical relative-path bytes. Each path is emitted once, followed
-by its declared length and contiguous chunks covering exactly that many bytes. The chunk schedule is
-canonical: every non-final chunk is exactly 1 MiB, the final chunk is 1..=1 MiB, and an empty file
-has no chunk calls. Lattice uses an exact-read loop rather than exposing incidental short reads as
-chunk boundaries. No bytes from a later file are emitted before `end_file` succeeds. Short reads,
-growth beyond the declared length, callback errors, count or length disagreement, and byte-unequal
-second reports fail publication.
+Before any file callback, Lattice supplies the exact file count to the optional attestor. Files are
+emitted in strict lexicographic order by normalized logical relative-path bytes. Each path is
+emitted once, followed by its declared length and contiguous chunks covering exactly that many
+bytes. The chunk schedule is canonical: every non-final chunk is exactly 1 MiB, the final chunk is
+1..=1 MiB, and an empty file has no chunk calls. Lattice uses an exact-read loop rather than
+exposing incidental short reads as chunk boundaries. No bytes from a later file are emitted before
+`end_file` succeeds. Short reads, growth beyond the declared length, callback errors, count or
+length disagreement, and byte-unequal second canonical digests fail publication.
 
 The attestor receives no source or snapshot OS path, `File`, descriptor, mmap object, mutable
-buffer, or model handle. `OpaqueAttestationReport` is a Lattice-owned immutable byte value with a
-private representation and a mandatory 1..=4096-byte constructor bound. `finish` transfers those
-bytes into the prepared value; neither the caller nor attestor retains mutable aliasing through the
-API. The report bytes count toward preparation and steady-state resource charges. A downstream
-consumer may therefore own a versioned canonical digest protocol without becoming a second file or
-mmap authority. The attestor is trusted in-process code for availability and confidentiality: it
-receives every checkpoint byte and may retain bytes, allocate, block, or panic. Lattice bounds the
-bytes and chunk size it supplies, not callback-owned memory or execution time, and supervisor
-leases remain held through every callback.
+buffer, or model handle. `SupplementaryAttestationEvidence` is a Lattice-owned immutable,
+bounded value containing the caller's payload and an explicit `AttestationAlgorithm::Sha256V1` plus
+the canonical digest it claims to bind. Its private constructor accepts only a non-empty payload of
+at most 4096 bytes. At publication Lattice requires that binding algorithm and digest to equal its
+own canonical report on both passes; a malformed, missing, mismatched, or fixed/constant caller
+result that does not bind the current digest is rejected. Supplementary bytes are recorded beside,
+never instead of, the canonical report and cannot change or collide the identity material. They
+count toward preparation and steady-state resource charges. The attestor remains trusted in-process
+code for availability and confidentiality: it receives every checkpoint byte and may retain bytes,
+allocate, block, or panic. Lattice bounds the bytes and chunk size it supplies, not callback-owned
+memory or execution time, and supervisor leases remain held through every callback.
 
-The strength of a caller's report depends on its attestor. Identity-governing callers must use a
-collision-resistant complete-content construction, such as SHA-256 with explicit domain and
-length framing. Lattice still compares normalized inventory and the effective descriptor directly;
-a deliberately constant caller report is not represented as cryptographic evidence.
+The canonical digest is the cryptographic content evidence. A caller may use supplementary evidence
+for an external protocol, but a consumer must not treat that evidence as a replacement or use a
+constant caller report to authorize identity reuse.
 
 ### D6: the effective descriptor exposes all non-file vector semantics
 
@@ -442,6 +570,11 @@ borrowed typed accessors cover at least:
 - stable model variant and model family;
 - native and active output dimensions, including an explicit absent/present truncation marker;
 - selected tokenizer layout and tokenizer semantics revision;
+- validated tokenizer normalization, pre-tokenization, special-token, padding, and truncation
+  semantics, including the canonical WordPiece/BPE profile and cross-file agreement;
+- validated BERT configuration semantics: `model_type`, `hidden_act`/`GeluTanhApproxV1`,
+  `position_embedding_type`, decoder/cross-attention rejection state, and the closed ignored-field
+  policy;
 - catalog advisory token limit, realized tokenizer/model hard sequence cap, and truncation behavior;
 - query and document instruction bytes with explicit absence markers;
 - pooling strategy;
@@ -474,7 +607,7 @@ order from a `HashMap` is never identity order.
 
 It does not contain absolute paths, mtimes, inode numbers, load timestamps, process IDs, namespace,
 or a downstream vector-space fingerprint. Lattice reports facts; the downstream owner decides how
-to frame those facts into its own persisted identity.
+to frame the canonical attestation material and descriptor into its own persisted identity.
 
 The build descriptor is generated by a checked build-time manifest, not reconstructed from a crate
 version at runtime. Its canonical digest framing is versioned and path/time independent. A build
@@ -569,8 +702,9 @@ than unaccounted global use.
 
 On successful publication, the job transfers its retained-pool lease into the prepared inner
 object. The retained charge explicitly covers conservative live model/mapping allocations, exact
-snapshot bytes, tokenizer/vocabulary state, the descriptor, the 1..=4096-byte attestation report,
-normalized inventory/path bookkeeping, live-lock/control state, and maximum retained internal-cache
+snapshot bytes, tokenizer/vocabulary state, the descriptor, the fixed 32-byte canonical digest and
+optional 1..=4096-byte supplementary attestation evidence, normalized inventory/path bookkeeping,
+live-lock/control state, and maximum retained internal-cache
 bytes (zero in v1). Only the transient preparation scratch lease and preparation concurrency slot
 release. The retained lease remains until the final prepared/job reference, model, and snapshot are
 gone, or cleanup failure atomically transfers the complete `ResidueCharge` into the supervisor's
@@ -615,16 +749,21 @@ returning success. Process abort is outside this async drain guarantee.
 
 ### D9: publication is one atomic downstream capability
 
-A downstream registry must publish the prepared service and the identity derived from its borrowed
-report and descriptor as one atomic unit. It must not expose a service first and fill in identity
-later, nor accept an independently supplied identity alongside an arbitrary `EmbeddingService`.
-It must likewise reject outputs from a wrapper or decorator that is not itself part of the
-prepared descriptor and attestation.
+A downstream registry must publish the prepared service and identity material derived from its
+borrowed `CanonicalAttestationReport` and `EffectiveEmbeddingDescriptor` as one atomic unit. The
+identity material must include the report's `AttestationAlgorithm::Sha256V1` tag, its 32-byte
+Lattice-computed digest, and a canonical encoding of the complete effective descriptor. Optional
+`SupplementaryAttestationEvidence` is additional evidence only; it cannot replace, alter, or be
+used instead of those two identity inputs. The downstream registry may wrap this material in its
+own namespace and storage-specific framing, but it must not omit or substitute either Lattice
+input. It must not expose a service first and fill in identity later, nor accept an independently
+supplied identity alongside an arbitrary `EmbeddingService`. It must likewise reject outputs from a
+wrapper or decorator that is not itself part of the prepared descriptor and attestation.
 
 Lattice deliberately does not define Khive's table name, ANN key, lineage slot, cache key, daemon
-configuration ID, or migration protocol. It provides the bound service and evidence required for a
-consumer to define those safely. Existing vectors must be rebuilt from source when that complete
-identity changes; relabeling vectors is not evidence of equivalence.
+configuration ID, or migration protocol. It provides the bound service, canonical digest, and
+descriptor required for a consumer to define those safely. Existing vectors must be rebuilt from
+source when that complete identity changes; relabeling vectors is not evidence of equivalence.
 
 The descriptor reports the transformation for every `EmbeddingRole`, but it does not decide which
 role a consumer assigns to a query or document call. A downstream identity must also bind that
@@ -658,7 +797,7 @@ The implementation PR must include deterministic tests for all of the following.
 ### Snapshot and inventory
 
 - Once the source root and selected files are opened, replacing their paths cannot redirect copied
-  bytes; the report identifies the exact private snapshot combination that is loaded.
+  bytes; the canonical digest identifies the exact private snapshot combination that is loaded.
 - A one-hop internal relative file symlink is materialized; a root/ancestor symlink, link chain,
   directory link, escaping/absolute link, multiply linked file, and unsupported platform fail before
   copying target bytes.
@@ -688,15 +827,24 @@ The implementation PR must include deterministic tests for all of the following.
 
 ### Attestation and descriptor
 
-- Two fresh attestors receive identical `begin(file_count)`, path, length, and canonical exact-fill
-  1 MiB chunk sequences on a stable fixture, including empty, boundary, and multi-chunk files.
-- Empty and over-4096-byte reports are rejected; accepted report bytes are immutable, borrowed from
-  the service, and included in the retained charge. Multiple live services at the 4096-byte boundary
-  consume the exact aggregate report charge and cannot exceed the retained pool.
+- Lattice computes identical `CanonicalAttestationReport` values on both passes from identical
+  `begin(file_count)`, path, length, and canonical exact-fill 1 MiB chunk sequences on a stable
+  fixture, including empty, boundary, and multi-chunk files. The test asserts the exact domain,
+  big-endian framing, and terminal marker, including the zero-file case.
+- The canonical report always has algorithm `Sha256V1` and a 32-byte digest. Optional supplementary
+  evidence rejects empty or over-4096-byte payloads, a missing or mismatched canonical digest
+  binding, and a constant/fixed caller result that does not bind the current digest. Accepted
+  evidence is immutable, borrowed from the service, and included in the retained charge. Multiple
+  live services at the 4096-byte boundary consume the exact aggregate evidence charge and cannot
+  exceed the retained pool.
 - Path, timestamp, inode, source-root spelling, and load time do not change the report or descriptor.
-- Mutating any artifact byte, path, declared length, model variant, dimension, tokenizer selection,
-  query/document transform, pooling, normalization, dtype, tensor inventory, adapter marker,
-  provider revision, backend, or numeric-kernel profile changes the downstream golden identity.
+- Two checkpoints with identical metadata but different tensor bytes produce different canonical
+  digests and different downstream identities; mutating any artifact byte, path, declared length,
+  model variant, dimension, tokenizer selection, query/document transform, pooling, normalization,
+  dtype, tensor inventory, adapter marker, provider revision, backend, or numeric-kernel profile
+  changes the downstream golden identity.
+- The identity-material golden includes the `Sha256V1` algorithm tag, the canonical digest, and a
+  canonical effective-descriptor encoding; replacing the digest with a caller report is rejected.
 - Tensor metadata insertion permutations yield the same framed digest; every name/length/dtype/rank/
   dimension mutation changes it, and duplicate names or unsupported dtype tags fail.
 - Every `NumericBuildDescriptor` field and runtime floating-point control field participates in the
@@ -709,12 +857,27 @@ The implementation PR must include deterministic tests for all of the following.
   into one another or a later legacy call.
 - The report is borrowed from the service; no API can construct a prepared value from detached
   service and report parts.
-- Pre-load and post-load descriptor mismatch or report mismatch fails publication.
+- Pre-load and post-load descriptor mismatch or canonical-report mismatch fails publication;
+  configured supplementary evidence must also pass its digest-binding and equality checks.
 - Every `BertConfig` zero/bound/divisibility/non-finite case, every required-tensor missing/duplicate/
   wrong-shape/layer-index case, tokenizer/config vocabulary disagreement, out-of-range ordinary or
   special token ID, token-type mismatch, and sequence-cap/position-row mismatch fails before
   publication. The sequence-cap file/key precedence and raw/capped descriptor fields have exact
   goldens, including malformed higher-priority values that do not fall through.
+- `config.json` semantic goldens accept only `model_type="bert"`, `hidden_act="gelu"` with the
+  `GeluTanhApproxV1` meaning, and `position_embedding_type="absolute"`; relative positions, ReLU,
+  decoder mode, cross-attention, pruned heads, and unknown output-affecting fields fail with typed
+  preparation errors. Known dropout, cache, classifier, label, and other output-irrelevant fields
+  are covered as ignored metadata.
+- WordPiece fixtures cover cased and accent-preserving normalizer declarations, altered CJK or
+  punctuation behavior, non-right padding/truncation, non-empty `never_split`, changed special-token
+  templates, and contradictions between `tokenizer.json` and `tokenizer_config.json`; each fails
+  before publication. Accepted fixtures assert lowercasing, accent stripping, CJK/punctuation/
+  whitespace/control handling, literal added-token handling, `[UNK]` fallback, and fixed special
+  tokens. BPE fixtures cover null/non-null normalizers, every accepted pre-tokenizer shape, altered
+  regexes and unsupported sequence children, unsupported model flags, and tokenizer-config
+  contradictions; unsupported declarations fail and accepted normalization/pre-tokenization values
+  enter the descriptor.
 
 ### Policy, resources, and cancellation
 
@@ -827,8 +990,17 @@ including them would prevent the BERT prerequisite from landing safely.
 
 ### Let Lattice define the downstream fingerprint
 
-Rejected. Lattice owns artifact and execution facts, while downstream systems own their persistent
-identity framing and storage semantics. The capability-limited attestor preserves that boundary.
+Rejected as a downstream storage protocol. Lattice does define the canonical artifact digest and
+its typed algorithm binding because those are the evidence of the bytes actually loaded. Downstream
+systems still own the namespace, identity framing around the canonical digest plus descriptor, and
+storage semantics; supplementary caller evidence preserves that boundary without becoming the
+identity source.
+
+### Let the caller own the canonical content digest
+
+Rejected. A caller-controlled digest can be weak, constant, malformed, or computed over a different
+file schedule. Lattice must compute the fixed SHA-256 digest over its own opened handles and exact
+canonical schedule; caller output can only be optional, validated supplementary evidence.
 
 ## Consequences
 
@@ -854,9 +1026,10 @@ identity framing and storage semantics. The capability-limited attestor preserve
 
 ### Risks
 
-- A caller may supply a deliberately weak attestor. Lattice exposes this limitation and never calls
-  an opaque report a universal content digest; identity-governing consumers must pin their own
-  collision-resistant protocol.
+- Supplementary caller evidence may be deliberately weak or unavailable. Lattice never treats it as
+  the content digest: its binding must match the canonical report, and identity-governing consumers
+  must use the Lattice digest plus descriptor regardless of whether supplementary evidence is
+  configured.
 - Read-only filesystem permissions are not a hostile same-UID sandbox. The guarantee is generation
   coherence under the stated trust model, reinforced by opened handles, private path custody,
   pre/post attestation, and retained model resources.
