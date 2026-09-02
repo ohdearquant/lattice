@@ -2503,14 +2503,6 @@ mod inner {
         std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
 
-    /// Build interleaved partial RoPE cos/sin tables.
-    /// For Qwen3.5: partial_rotary_factor=0.25, head_dim=256 => rope_dim=64, half=32.
-    /// Tables: [max_pos, half_rope_dim] each.
-    ///
-    /// Qwen3.5 uses `theta^(-2i/rope_dim)` in the denominator (verified
-    /// empirically by PPL regression when using head_dim). The partial-RoPE
-    /// frequency spectrum is compressed into the first `rope_dim` dimensions
-    /// rather than sliced from a wider head_dim spectrum.
     /// Single derivation point for the engine's `has_moe_layer` flag. Both
     /// state constructors (f16 and Q4) build the flag from this same layer
     /// scan, so a change to layer classification cannot update one
@@ -2523,6 +2515,14 @@ mod inner {
             .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)))
     }
 
+    /// Build interleaved partial RoPE cos/sin tables.
+    /// For Qwen3.5: partial_rotary_factor=0.25, head_dim=256 => rope_dim=64, half=32.
+    /// Tables: [max_pos, half_rope_dim] each.
+    ///
+    /// Qwen3.5 uses `theta^(-2i/rope_dim)` in the denominator (verified
+    /// empirically by PPL regression when using head_dim). The partial-RoPE
+    /// frequency spectrum is compressed into the first `rope_dim` dimensions
+    /// rather than sliced from a wider head_dim spectrum.
     fn build_rope_interleaved(rope_dim: usize, max_pos: usize, theta: f64) -> (Vec<f32>, Vec<f32>) {
         let half = rope_dim / 2;
         let mut cos_data = Vec::with_capacity(max_pos * half);
@@ -6745,11 +6745,12 @@ mod inner {
         /// [`Self::forward_prefill_all_logits`]. The suffix primitive
         /// [`Self::forward_prefill_from`] — reached by the prefix-cache generation
         /// path — uses the unconditional form above. Every request-facing caller
-        /// prefills through one of the four: `generate`, `generate_streaming`, and
-        /// `generate_streaming_with_cancel` through the first, `embed_tokens` through
-        /// the first, `compute_token_nlls` through the third,
-        /// `generate_streaming_with_prefix_cache*` through the fourth — so an MoE
-        /// model reports this input instead of aborting the process.
+        /// prefills through one of the four: `generate`,
+        /// `generate_with_speculation`, `generate_streaming`,
+        /// `generate_streaming_with_cancel`, and `embed_tokens` through the
+        /// first, `compute_token_nlls` through the third,
+        /// `generate_streaming_with_prefix_cache*` through the fourth — so an
+        /// MoE model reports this input instead of aborting the process.
         ///
         /// [`Self::forward_prefill`] is the exception, by construction: it unwraps
         /// [`Self::try_forward_prefill`]'s result, so it still aborts. Its remaining
@@ -9194,11 +9195,12 @@ mod inner {
         /// place of the process abort this entry point produced previously.
         /// Dense models and the sequential LoRA prefill fallback are unaffected.
         ///
-        /// [`Self::generate`] and [`Self::generate_streaming`] reach the same
-        /// check but through [`Self::forward_prefill`], which unwraps its result,
-        /// so on those entry points the case still aborts — with the rejection
-        /// message rather than the batched-schedule assertion. Converting them is
-        /// a separate change to their signatures.
+        /// [`Self::generate`], [`Self::generate_streaming`],
+        /// [`Self::generate_streaming_with_cancel`], and
+        /// [`Self::generate_with_speculation`] reach the same check through
+        /// [`Self::try_forward_prefill`] and return the rejection as `Err`.
+        /// [`Self::forward_prefill`] is the one remaining unwrapping wrapper,
+        /// so callers using it still abort on this case.
         pub fn generate_with_speculation(
             &mut self,
             prompt_tokens: &[u32],
@@ -9274,15 +9276,10 @@ mod inner {
         }
 
         /// Disengage the compact sampling route engaged by
-        /// [`Self::configure_sampling_route`] when a generation is abandoned after
-        /// route configuration but before its decode loop — the same two clears the
-        /// cancellation paths perform. Without this, a prefill that fails after the
-        /// route was engaged (e.g. the MoE batched-prefill rejection) returns `Err`
-        /// with `compact_route`/`compact_topk` still set, and a subsequent raw
-        /// `forward_step` on the same session takes the compact branch and returns
-        /// empty logits plus a stale one-candidate `compact_result` instead of the
-        /// full `[vocab_size]` logits the caller expects.
-        fn clear_compact_route_after_failed_prefill(&mut self) {
+        /// The teardown for a compact sampling route engaged by
+        /// [`Self::configure_sampling_route`], whether generation completed, was
+        /// cancelled, or failed at prefill.
+        fn disengage_compact_route(&mut self) {
             self.session.compact_topk = 0;
             self.session.compact_route = GpuTopkRoute::CpuFallback;
         }
@@ -9345,7 +9342,7 @@ mod inner {
                 Ok(logits) => logits,
                 Err(error) => {
                     if use_compact {
-                        self.clear_compact_route_after_failed_prefill();
+                        self.disengage_compact_route();
                     }
                     return Err(error);
                 }
@@ -9397,8 +9394,7 @@ mod inner {
                 // uses them).
                 self.session.mtp_active = true;
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 // #1340: rebuild the MTP draft head's KV cache from the prompt
                 // before the first draft round, so it attends to the prompt prefix
@@ -9462,8 +9458,7 @@ mod inner {
 
             if is_stop(next_id) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -9495,8 +9490,7 @@ mod inner {
                 let delta = detok.push(tokenizer, next_id);
                 if matcher.push(&delta, &mut |_| {}) {
                     if use_compact {
-                        self.session.compact_topk = 0;
-                        self.session.compact_route = GpuTopkRoute::CpuFallback;
+                        self.disengage_compact_route();
                     }
                     let (_, matcher) = stop_text_state.take().expect("just matched Some(..)");
                     return Ok(GenerateOutput {
@@ -9628,8 +9622,7 @@ mod inner {
             }
 
             if use_compact {
-                self.session.compact_topk = 0;
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.disengage_compact_route();
             }
 
             // Detokenize: string-stop path uses the matcher's (possibly truncated)
@@ -10440,8 +10433,7 @@ mod inner {
             // with `use_compact == false`, which makes `forward_prefill` /
             // `forward_step` append a compact top-k dispatch and return empty
             // logits even though the caller expects the full-logit exact path.
-            self.session.compact_topk = 0;
-            self.session.compact_route = GpuTopkRoute::CpuFallback;
+            self.disengage_compact_route();
             self.session.compact_result.clear();
         }
 
@@ -11236,8 +11228,7 @@ mod inner {
             // uninterruptible once started) prefill matmul below.
             if should_cancel() {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -11258,7 +11249,7 @@ mod inner {
                 Ok(logits) => logits,
                 Err(error) => {
                     if use_compact {
-                        self.clear_compact_route_after_failed_prefill();
+                        self.disengage_compact_route();
                     }
                     return Err(error);
                 }
@@ -11270,8 +11261,7 @@ mod inner {
             // sampling or decode-loop work on its output.
             if should_cancel() {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -11345,8 +11335,7 @@ mod inner {
 
             if is_stop(next_id) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -11410,8 +11399,7 @@ mod inner {
                 crate::model::qwen35::StopCheckOutcome::Interrupted
             ) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text,
@@ -11428,8 +11416,7 @@ mod inner {
                 crate::model::qwen35::StopCheckOutcome::Stopped
             ) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text,
@@ -11604,8 +11591,7 @@ mod inner {
             }
 
             if use_compact {
-                self.session.compact_topk = 0;
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.disengage_compact_route();
             }
 
             // Flush trailing incomplete bytes (generation truncated mid-codepoint)
@@ -14253,7 +14239,7 @@ mod inner {
                     Ok(logits) => logits,
                     Err(error) => {
                         if use_compact {
-                            self.clear_compact_route_after_failed_prefill();
+                            self.disengage_compact_route();
                         }
                         return Err(error);
                     }
@@ -14268,8 +14254,7 @@ mod inner {
             // means the suffix prefill's cost was spent without being reused.
             if should_cancel() {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(CachedGenerateOutput {
                     output: GenerateOutput {
@@ -14376,8 +14361,7 @@ mod inner {
 
             if is_stop(next_id) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 self.save_cross_turn_prefix_or_clear(
                     slot_id,
@@ -14452,8 +14436,7 @@ mod inner {
                 crate::model::qwen35::StopCheckOutcome::Interrupted
             ) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 // The caller cut the stream after exactly one forwarded
                 // token (the prefill sample) — state represents prompt +
@@ -14479,8 +14462,7 @@ mod inner {
                 crate::model::qwen35::StopCheckOutcome::Stopped
             ) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 self.cross_turn_prefix_cache.remove(slot_id);
                 return Ok(CachedGenerateOutput {
@@ -14652,8 +14634,7 @@ mod inner {
             }
 
             if use_compact {
-                self.session.compact_topk = 0;
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.disengage_compact_route();
             }
 
             // Tail flush runs before the cache-save decision: a stop string can
@@ -29038,7 +29019,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 state.session.compact_route = GpuTopkRoute::BlockArgmax;
                 state.session.compact_topk = 1;
 
-                state.clear_compact_route_after_failed_prefill();
+                state.disengage_compact_route();
 
                 assert_eq!(
                     state.session.compact_route,
@@ -37979,6 +37960,89 @@ mod public_scheduling_entry_point_tests {
         functions
     }
 
+    /// Removes `//` comments and ordinary quoted strings while preserving source length;
+    /// block comments, raw strings, and character literals are outside its limits.
+    fn strip_comments_and_strings(source: &str) -> String {
+        let mut bytes = source.as_bytes().to_vec();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                bytes[index] = b' ';
+                bytes[index + 1] = b' ';
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    bytes[index] = b' ';
+                    index += 1;
+                }
+            } else if bytes[index] == b'"' {
+                bytes[index] = b' ';
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => {
+                            bytes[index] = b' ';
+                            index += 1;
+                            if index < bytes.len() && bytes[index] != b'\n' {
+                                bytes[index] = b' ';
+                            }
+                            index += 1;
+                        }
+                        b'"' => {
+                            bytes[index] = b' ';
+                            index += 1;
+                            break;
+                        }
+                        b'\n' => index += 1,
+                        _ => {
+                            bytes[index] = b' ';
+                            index += 1;
+                        }
+                    }
+                }
+            } else {
+                index += 1;
+            }
+        }
+        String::from_utf8(bytes).expect("source remains valid UTF-8 after scrubbing")
+    }
+
+    fn count_calls(source: &str, helper: &str) -> usize {
+        let call = format!("{helper}(");
+        source
+            .match_indices(&call)
+            .filter(|(start, _)| {
+                *start == 0 || {
+                    let previous = source.as_bytes()[*start - 1];
+                    !previous.is_ascii_alphanumeric() && previous != b'_'
+                }
+            })
+            .count()
+    }
+
+    fn contains_call(source: &str, helper: &str) -> bool {
+        count_calls(source, helper) > 0
+    }
+
+    #[test]
+    fn source_consistency_call_matching_ignores_comments_and_strings() {
+        let comment_only = "fn example() { // check_live_cursor(\n }";
+        let string_only = r#"fn example() { let text = "check_live_cursor("; }"#;
+        let real_call = "fn example() { self.check_live_cursor(); }";
+
+        assert!(!contains_call(
+            &strip_comments_and_strings(comment_only),
+            "check_live_cursor"
+        ));
+        assert!(!contains_call(
+            &strip_comments_and_strings(string_only),
+            "check_live_cursor"
+        ));
+        assert!(contains_call(
+            &strip_comments_and_strings(real_call),
+            "check_live_cursor"
+        ));
+    }
+
     #[test]
     fn every_public_stateful_scheduling_entry_point_has_preflight() {
         let source = include_str!("metal_qwen35.rs");
@@ -38047,17 +38111,14 @@ mod public_scheduling_entry_point_tests {
                 "check_raw_prefill_fresh_session",
             ),
             ("fn forward_prefill_from(", "reject_moe_batched"),
-            (
-                "pub fn generate(",
-                "clear_compact_route_after_failed_prefill",
-            ),
+            ("pub fn generate(", "disengage_compact_route"),
             (
                 "pub fn generate_streaming_with_cancel<F, C>(",
-                "clear_compact_route_after_failed_prefill",
+                "disengage_compact_route",
             ),
             (
                 "fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(",
-                "clear_compact_route_after_failed_prefill",
+                "disengage_compact_route",
             ),
             ("fn verify_tokens(", "check_live_cursor"),
             ("fn rollback_cache_to(", "rollback_speculative_state_to"),
@@ -38075,11 +38136,22 @@ mod public_scheduling_entry_point_tests {
                 "preflight_bench_prefill",
             ),
         ] {
+            let body = strip_comments_and_strings(item(real, declaration));
             assert!(
-                item(real, declaration).contains(preflight),
+                contains_call(&body, preflight),
                 "{declaration} must route through {preflight}"
             );
         }
+
+        let generate = strip_comments_and_strings(item(real, "pub fn generate("));
+        assert_eq!(
+            generate
+                .lines()
+                .filter(|line| line.trim() == "if use_compact {")
+                .count(),
+            count_calls(&generate, "disengage_compact_route"),
+            "each compact generation branch must disengage its route"
+        );
     }
 }
 
