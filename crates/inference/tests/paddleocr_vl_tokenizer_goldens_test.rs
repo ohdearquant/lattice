@@ -20,6 +20,7 @@
 //! (image/audio/LOC structure) are dropped, matching
 //! `skip_special_tokens=True`.
 
+use lattice_inference::error::InferenceError;
 use lattice_inference::tokenizer::common::Tokenizer;
 use lattice_inference::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use serde::Deserialize;
@@ -37,8 +38,20 @@ fn read_fixture(name: &str) -> String {
 }
 
 static TOKENIZER_JSON: LazyLock<String> = LazyLock::new(|| read_fixture("tokenizer.json"));
+
+#[derive(Deserialize)]
+struct TokenizerConfig {
+    model_max_length: usize,
+}
+
+fn fixture_model_max_length() -> usize {
+    serde_json::from_str::<TokenizerConfig>(&read_fixture("tokenizer_config.json"))
+        .expect("valid tokenizer_config.json")
+        .model_max_length
+}
+
 static TOKENIZER: LazyLock<GemmaBpeTokenizer> = LazyLock::new(|| {
-    GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&TOKENIZER_JSON)
+    GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&TOKENIZER_JSON, fixture_model_max_length())
         .expect("pinned PaddleOCR-VL tokenizer.json must load through the ERNIE path")
 });
 
@@ -49,7 +62,6 @@ struct CorpusCase {
     category: String,
     text: String,
     ids: Vec<u32>,
-    #[allow(dead_code)]
     tokens: Vec<String>,
     decoded: String,
 }
@@ -63,6 +75,60 @@ fn load_corpus() -> Vec<CorpusCase> {
 fn tokenize_ids(text: &str) -> Vec<u32> {
     let padded = TOKENIZER.tokenize(text);
     padded.input_ids[..padded.real_length].to_vec()
+}
+
+#[test]
+fn ernie_path_uses_fixture_tokenizer_config_limit() {
+    let expected: TokenizerConfig =
+        serde_json::from_str(&read_fixture("tokenizer_config.json")).expect("valid config");
+    assert!(expected.model_max_length > 4_096);
+
+    let tokenizer =
+        GemmaBpeTokenizer::from_ernie_tokenizer_json(&fixture_dir().join("tokenizer.json"))
+            .expect("fixture tokenizer must load through the ERNIE path");
+    assert_eq!(tokenizer.max_seq_len(), expected.model_max_length);
+}
+
+#[test]
+fn ernie_path_requires_a_sequence_limit_declaration() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock must be after the Unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "lattice-ernie-tokenizer-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).expect("unique temporary directory must be creatable");
+    let tokenizer_path = dir.join("tokenizer.json");
+    std::fs::copy(fixture_dir().join("tokenizer.json"), &tokenizer_path)
+        .expect("fixture tokenizer must be copied");
+
+    let result = GemmaBpeTokenizer::from_ernie_tokenizer_json(&tokenizer_path);
+    std::fs::remove_dir_all(&dir).expect("temporary directory must be removable");
+
+    let err = result.expect_err("missing tokenizer_config.json must fail closed");
+    assert!(matches!(err, InferenceError::Tokenizer(_)));
+    let message = err.to_string();
+    assert!(message.contains("tokenizer.json"));
+    assert!(message.contains("tokenizer_config.json"));
+}
+
+#[test]
+fn ernie_fixture_limit_preserves_4097_digit_tokens() {
+    let repeated_digits = "0123456789".repeat(410);
+    let text = &repeated_digits[..4_097];
+    let tokenized = TOKENIZER.tokenize(text);
+
+    assert_eq!(tokenized.real_length, 4_097);
+    assert_eq!(tokenized.pre_truncation_len, 4_097);
+}
+
+#[test]
+fn ernie_string_constructor_rejects_zero_limit() {
+    let err = GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&TOKENIZER_JSON, 0)
+        .expect_err("zero max_seq_len must be rejected");
+    assert!(matches!(err, InferenceError::Tokenizer(_)));
 }
 
 #[test]
@@ -80,6 +146,20 @@ fn corpus_goldens_encode_matches_hf_ids() {
             "case {:?} (text {:?}): got {:?}, HF golden {:?}",
             case.id, case.text, ids, case.ids
         );
+    }
+}
+
+#[test]
+fn corpus_goldens_token_strings_match_hf_tokens() {
+    for case in load_corpus() {
+        let actual: Vec<Option<&str>> =
+            case.ids.iter().map(|&id| TOKENIZER.token_str(id)).collect();
+        let expected: Vec<Option<&str>> = case
+            .tokens
+            .iter()
+            .map(|token| Some(token.as_str()))
+            .collect();
+        assert_eq!(actual, expected, "case {:?} token strings differ", case.id);
     }
 }
 
@@ -219,7 +299,7 @@ fn ernie_constructor_rejects_gemma_tokenizer_json() {
         std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("failed to read gemma fixture {}: {e}", path.display()))
     };
-    let err = GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&gemma_json)
+    let err = GemmaBpeTokenizer::from_ernie_tokenizer_json_str(&gemma_json, 4_096)
         .expect_err("ERNIE validator must reject the Gemma shape");
     let message = err.to_string();
     assert!(
