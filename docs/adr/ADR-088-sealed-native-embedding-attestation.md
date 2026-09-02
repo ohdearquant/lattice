@@ -52,8 +52,8 @@ inseparably owns:
 
 1. the loaded model used for every request;
 2. the sealed private snapshot from which that model was constructed;
-3. Lattice's canonical pre/post attestation reports and any optional caller-supplied
-   supplementary evidence; and
+3. Lattice's canonical pre/post attestation reports and any caller-supplied supplementary evidence
+   when `prepare_with_attestor` is used; and
 4. a bounded effective descriptor of every code-owned vector semantic.
 
 The prepared value has no `into_parts`, raw-model getter, mutable snapshot getter, path getter,
@@ -119,11 +119,17 @@ impl NativeEmbeddingPreparer {
         budget: NativeResourceBudget,
     ) -> Result<(Self, NativeEmbeddingDrain)>;
 
-    pub async fn prepare<A, F>(
+    pub async fn prepare(
         &self,
         spec: ResolvedNativeEmbeddingSpec,
         limits: NativePreparationLimits,
-        supplementary_attestor: Option<F>,
+    ) -> Result<PreparedNativeEmbedding>;
+
+    pub async fn prepare_with_attestor<A, F>(
+        &self,
+        spec: ResolvedNativeEmbeddingSpec,
+        limits: NativePreparationLimits,
+        attestor: F,
     ) -> Result<PreparedNativeEmbedding>
     where
         A: CheckpointAttestor,
@@ -137,6 +143,14 @@ pub struct PreparedNativeEmbedding {
 impl CanonicalAttestationReport {
     pub fn algorithm(&self) -> AttestationAlgorithm;
     pub fn digest(&self) -> &[u8; 32];
+}
+
+impl SupplementaryAttestationEvidence {
+    pub fn try_new(
+        algorithm: AttestationAlgorithm,
+        digest: [u8; 32],
+        payload: Vec<u8>,
+    ) -> Result<Self>;
 }
 
 impl PreparedNativeEmbedding {
@@ -169,9 +183,14 @@ environment variable. It performs no network access or automatic download. A con
 may read configuration before constructing a resolved spec, but the resolved value captures those
 choices once and the preparation operation consumes only that value.
 
-The first version supports the BERT-family local variants already represented by
-`EmbeddingModel`, using an explicit `CpuPinned` backend. `CpuPinned` disables Accelerate, AMX, and
-other vendor-library dispatch that cannot be completely identified, captures one Lattice-owned
+The first version supports only these five BERT-family local variants, using an explicit
+`CpuPinned` backend: `BgeSmallEnV15`, `BgeBaseEnV15`, `BgeLargeEnV15`, `AllMiniLmL6V2`, and
+`ParaphraseMultilingualMiniLmL12V2`. Their prepared tokenizer layouts are WordPiece. The tokenizer
+admission closure is limited to the WordPiece and BPE variants described in D4; no third tokenizer
+family is admitted. BPE declarations are admitted by that closed profile, but no current BERT row
+uses one and Qwen decoder variants are rejected by this D2's BERT-only model boundary. `CpuPinned`
+disables Accelerate, AMX, and other vendor-library dispatch that cannot be completely identified,
+captures one Lattice-owned
 scalar/SIMD capability and dispatch profile at preparation, and uses that immutable profile for the
 service lifetime. Every output-affecting operation—including matmul, attention softmax/exp,
 GELU/tanh, layer normalization, pooling, and final normalization—uses a versioned Lattice-owned
@@ -179,6 +198,13 @@ kernel; prepared mode does not call a dynamically resolved system math routine w
 is absent from the descriptor. It rejects Qwen, remote models, adapters, Metal, automatic backend
 selection, vendor fallback, and per-call backend fallback with a typed unsupported-policy error.
 This is a deliberate safe subset, not a claim that Qwen is permanently unsupported.
+
+`MultilingualE5Small` and `MultilingualE5Base` are deferred to a follow-up ADR. Their Unigram/
+SentencePiece tokenizer layouts are outside the v1 closure: a tokenizer with `model.type` exactly
+`"Unigram"`, a `Metaspace` pre-tokenizer, or a `sentencepiece.bpe.model`/`spiece.model` file
+selected by precedence is rejected during preparation with a typed error naming the unsupported
+tokenizer model. Preparation never falls through to a lower-priority tokenizer candidate after that
+rejection.
 
 `lattice-inference` therefore gains an explicit BERT CPU-kernel-policy seam. Prepared services pass
 their frozen `CpuPinned` profile; the legacy service passes `Auto` and retains today's behavior.
@@ -228,16 +254,17 @@ Preparation performs this sequence before returning a service:
 4. Validate the complete snapshot inventory, all bounded metadata, tokenizer selection, model
    geometry, and the effective descriptor. No loader fallback is permitted in prepared mode.
 5. Compute the first Lattice canonical attestation over the complete snapshot schedule, and,
-   when configured, obtain supplementary evidence from a fresh caller attestor. Then seal the
-   snapshot read-only.
+   when `prepare_with_attestor` is used, obtain supplementary evidence from a fresh caller
+   attestor. Then seal the snapshot read-only.
 6. Load the model only from the sealed snapshot under the existing ADR-003 mmap trust boundary.
 7. Re-read inventory and geometry from the same snapshot, reconstruct the effective descriptor,
    and compute a second canonical attestation using a fresh opened-handle read sequence. When
-   configured, obtain supplementary evidence from another fresh caller attestor as well.
+   `prepare_with_attestor` is used, obtain supplementary evidence from another fresh caller
+   attestor as well.
 8. Require the inventory, effective descriptor, and canonical reports to match exactly before
-   publishing the prepared value. If supplementary evidence is configured, its digest binding and
-   bounded payload must also validate on both passes and match; it is never a substitute for the
-   canonical report.
+   publishing the prepared value. If `prepare_with_attestor` is used, its supplementary evidence
+   digest binding and bounded payload must also validate on both passes and match; it is never a
+   substitute for the canonical report.
 
 The snapshot path is never returned. The prepared inner object retains the snapshot and every
 resource needed by model mappings. Snapshot cleanup starts only after the loaded model and any
@@ -332,9 +359,11 @@ Prepared BERT mode recognizes only the bounded model closure used by the BERT lo
 
 - `model.safetensors`;
 - `config.json`;
-- `tokenizer_config.json`; and
-- the supported tokenizer representation files (`tokenizer.json`, `vocab.txt`, `vocab.json`,
-  `merges.txt`, and `tokenizer.model`) that are present and relevant to deterministic selection.
+- `tokenizer_config.json`;
+- the supported tokenizer representation files (`tokenizer.json`, `vocab.txt`, `vocab.json`, and
+  `merges.txt`) that are present and relevant to deterministic selection; and
+- SentencePiece candidates (`tokenizer.model`, `sentencepiece.bpe.model`, and `spiece.model`) so
+  their selection can be rejected explicitly rather than treated as an implicit fallback.
 
 `model.safetensors`, `config.json`, and `tokenizer_config.json` are required in prepared v1. A
 single-file BERT checkpoint is required; an index or shard layout is rejected until a later
@@ -346,14 +375,17 @@ Tokenizer selection freezes this exact precedence:
 2. `vocab.json` plus `merges.txt`;
 3. `vocab.txt` plus `merges.txt`;
 4. `vocab.txt`; and
-5. `tokenizer.model`.
+5. `tokenizer.model`, `sentencepiece.bpe.model`, or `spiece.model`.
 
 Every present recognized candidate that can participate in or shadow that selection is copied and
 attested, even when it is lower in the precedence order. The effective descriptor names the
 selected layout. A present malformed higher-priority candidate or a partial two-file layout fails;
 prepared mode never falls through to a lower-priority candidate after such a failure. Adding a
 higher-priority candidate therefore changes both inventory evidence and the selected-layout
-descriptor instead of silently reusing an old identity.
+descriptor instead of silently reusing an old identity. A selected SentencePiece candidate, or a
+`tokenizer.json` whose `model.type` is `"Unigram"`, is rejected with a typed preparation error
+naming the unsupported tokenizer model; it never falls through to a lower-priority WordPiece or
+BPE candidate.
 
 Malformed or missing required configuration fails; prepared mode does not derive silent defaults
 from tensor shapes or a directory name. Files outside the recognized vector-affecting closure, such
@@ -429,8 +461,9 @@ SafeTensors inventory rather than trusted from `torch_dtype`.
 
 ### D4 tokenizer semantic closure
 
-The tokenizer checks also cover declared behavior, not only file precedence, vocabulary cardinality,
-and special-token IDs. `WordPieceTokenizer` in
+The tokenizer checks admit only WordPiece and BPE variants and cover declared behavior, not only
+file precedence, vocabulary cardinality, and special-token IDs. Unigram/SentencePiece is outside
+this closure and is rejected during preparation. `WordPieceTokenizer` in
 `crates/inference/src/tokenizer/wordpiece.rs` always lowercases each Unicode scalar, maps its
 supported accented forms and removes combining marks (therefore stripping accents from NFD input),
 surrounds CJK characters with separators, surrounds punctuation with separators, converts Unicode
@@ -457,6 +490,32 @@ shape, with no unlisted behavior-bearing members:
 `strip_accents=true`, matching the Hugging Face BERT normalizer convention. Any other normalizer,
 pre-tokenizer, post-processor template, or declared option is rejected with a typed preparation
 error; the loader must not silently ignore a cased normalizer or a false `strip_accents` flag.
+
+Added-token matching is also a closed declaration. The implementation consumes `content` and `id`
+for literal matching before normalizing surrounding text (`WordPieceTokenizer`), while BPE also
+consumes `special` to distinguish literal-rendered decode tokens from skipped control tokens
+(`BpeTokenizer`). Every `added_tokens` entry must declare all five behavior-bearing flags. The
+checked-in ADR-016 tokenizer fixtures contain these values:
+
+| Fixture / `content` entries                                                                                              | (`single_word`, `lstrip`, `rstrip`, `normalized`, `special`) |
+| ------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------ |
+| BGE WordPiece: `[PAD]`, `[UNK]`, `[CLS]`, `[SEP]`, `[MASK]`                                                              | (`false`, `false`, `false`, `false`, `true`)                 |
+| Multilingual E5 Unigram: `<s>`, `<pad>`, `</s>`, `<unk>`, `<mask>`                                                       | (`false`, `false`, `false`, `false`, `true`)                 |
+| Qwen3 BPE control: `<\|endoftext\|>`, `<\|im_start\|>`, `<\|im_end\|>`, `<\|object_ref_start\|>`, `<\|object_ref_end\|>` | (`false`, `false`, `false`, `false`, `true`)                 |
+| Qwen3 BPE control: `<\|box_start\|>`, `<\|box_end\|>`, `<\|quad_start\|>`, `<\|quad_end\|>`, `<\|vision_start\|>`        | (`false`, `false`, `false`, `false`, `true`)                 |
+| Qwen3 BPE control: `<\|vision_end\|>`, `<\|vision_pad\|>`, `<\|image_pad\|>`, `<\|video_pad\|>`                          | (`false`, `false`, `false`, `false`, `true`)                 |
+| Qwen3 BPE literal-rendered: `<tool_call>`, `</tool_call>`, `<\|fim_prefix\|>`, `<\|fim_middle\|>`                        | (`false`, `false`, `false`, `false`, `false`)                |
+| Qwen3 BPE literal-rendered: `<\|fim_suffix\|>`, `<\|fim_pad\|>`, `<\|repo_name\|>`, `<\|file_sep\|>`                     | (`false`, `false`, `false`, `false`, `false`)                |
+| Qwen3 BPE literal-rendered: `<tool_response>`, `</tool_response>`, `<think>`, `</think>`                                 | (`false`, `false`, `false`, `false`, `false`)                |
+
+The admitted flag set is therefore `single_word=false`, `lstrip=false`, `rstrip=false`,
+`normalized=false`, and `special=false` or `true`; missing flags are rejected too. These are the
+only values whose behavior the literal matcher and BPE decode path reproduce. Any other value, or
+any missing flag, is a typed preparation error naming the token and flag. In particular,
+`normalized=true`, `lstrip=true`, or `rstrip=true` on an added token is not silently accepted. The
+E5 fixture's `tokenizer_config.json` also contains an `AddedToken` object for `<mask>` with
+`lstrip=true` and `normalized=true`; because that fixture is Unigram it is rejected under the
+SentencePiece rule below, rather than treated as an admitted semantic.
 
 When `tokenizer_config.json` contains these fields, they are cross-checked against the
 `tokenizer.json` pipeline rather than used to override it: `do_lower_case=true`,
@@ -501,8 +560,9 @@ reconstructed on the post-load pass.
 Lattice owns safe enumeration, normalized ordering, opened-handle reads, bounded streaming, and the
 identity-bearing digest. It does not import a downstream registry protocol: the digest is the
 evidence, while names of downstream tables, keys, and cache slots remain downstream. The caller may
-also supply an optional attestor factory for supplementary evidence. Preparation calls a configured
-factory exactly twice so pre-load and post-load passes never reuse mutable hash state.
+also supply an attestor factory for supplementary evidence when `prepare_with_attestor` is used.
+That method calls its factory exactly twice so pre-load and post-load passes never reuse mutable
+hash state; `prepare` performs no caller-attestor callbacks.
 
 Lattice always computes `CanonicalAttestationReport` itself. Its fixed algorithm identifier is
 `AttestationAlgorithm::Sha256V1`, whose canonical domain is explicitly SHA-256-bound, and its
@@ -535,8 +595,9 @@ pub trait CheckpointAttestor: Send + 'static {
 }
 ```
 
-Before any file callback, Lattice supplies the exact file count to the optional attestor. Files are
-emitted in strict lexicographic order by normalized logical relative-path bytes. Each path is
+When `prepare_with_attestor` is used, before any file callback Lattice supplies the exact file count
+to the attestor. Files are emitted in strict lexicographic order by normalized logical relative-path
+bytes. Each path is
 emitted once, followed by its declared length and contiguous chunks covering exactly that many
 bytes. The chunk schedule is canonical: every non-final chunk is exactly 1 MiB, the final chunk is
 1..=1 MiB, and an empty file has no chunk calls. Lattice uses an exact-read loop rather than
@@ -547,9 +608,11 @@ length disagreement, and byte-unequal second canonical digests fail publication.
 The attestor receives no source or snapshot OS path, `File`, descriptor, mmap object, mutable
 buffer, or model handle. `SupplementaryAttestationEvidence` is a Lattice-owned immutable,
 bounded value containing the caller's payload and an explicit `AttestationAlgorithm::Sha256V1` plus
-the canonical digest it claims to bind. Its private constructor accepts only a non-empty payload of
-at most 4096 bytes. At publication Lattice requires that binding algorithm and digest to equal its
-own canonical report on both passes; a malformed, missing, mismatched, or fixed/constant caller
+the canonical digest it claims to bind. External callers construct it only through the public
+fallible `SupplementaryAttestationEvidence::try_new(algorithm, digest, payload)`, which records the
+claimed algorithm and digest and rejects payloads outside 1..=4096 bytes; the fields remain private.
+At publication Lattice requires the binding algorithm and digest to equal its own canonical report
+on both passes; a malformed, missing, mismatched, or fixed/constant caller
 result that does not bind the current digest is rejected. Supplementary bytes are recorded beside,
 never instead of, the canonical report and cannot change or collide the identity material. They
 count toward preparation and steady-state resource charges. The attestor remains trusted in-process
@@ -681,7 +744,14 @@ implementation uses checked arithmetic and enforces, before materializing the co
 - per-weight-file and aggregate snapshot byte limits;
 - safetensors header bytes, tensor count, rank, and aggregate tensor-metadata limits before metadata
   materialization;
-- bounded config/tokenizer parsing and bounded attestation chunks;
+- bounded config/tokenizer parsing and bounded attestation chunks; specifically, the recursive
+  `parse_value`/`parse_array`/`parse_object` parser in
+  `crates/inference/src/tokenizer/common.rs` must enforce a fixed maximum nesting depth of 64
+  before descending into any array or object, or use an explicitly iterative replacement. The
+  checked-in tokenizer fixtures reach at most eight container levels, leaving substantial margin;
+  over-depth input returns a typed preparation error rather than risking worker-stack exhaustion.
+  The same bound applies to `config.json`, `tokenizer_config.json`, `special_tokens_map.json`, and
+  safetensors headers wherever a nested-JSON parse exists;
 - a conservative peak-resident-byte estimate for loaded weights, conversions, fused tensors,
   scratch, and output; and
 - platform-representable file lengths, allocation sizes, and dimensions.
@@ -702,8 +772,9 @@ than unaccounted global use.
 
 On successful publication, the job transfers its retained-pool lease into the prepared inner
 object. The retained charge explicitly covers conservative live model/mapping allocations, exact
-snapshot bytes, tokenizer/vocabulary state, the descriptor, the fixed 32-byte canonical digest and
-optional 1..=4096-byte supplementary attestation evidence, normalized inventory/path bookkeeping,
+snapshot bytes, tokenizer/vocabulary state, the descriptor, the fixed 32-byte canonical digest and,
+when `prepare_with_attestor` is used, 1..=4096-byte supplementary attestation evidence, normalized
+inventory/path bookkeeping,
 live-lock/control state, and maximum retained internal-cache
 bytes (zero in v1). Only the transient preparation scratch lease and preparation concurrency slot
 release. The retained lease remains until the final prepared/job reference, model, and snapshot are
@@ -809,6 +880,11 @@ The implementation PR must include deterministic tests for all of the following.
   incomplete tokenizer layouts fail without fallback.
 - Missing, malformed, oversized, or grow-after-metadata config/tokenizer files fail before an
   unbounded allocation.
+- A tokenizer/config JSON regression fixture nests arrays and objects beyond the fixed depth-64
+  bound while remaining below the byte limit; the `common.rs` value parser refuses it with a typed
+  preparation error before descending into the over-depth container, with no stack overflow. The
+  same test family covers `config.json`, `tokenizer_config.json`, `special_tokens_map.json`, and
+  any safetensors header parsed as nested JSON.
 - Snapshot bytes remain available while any service `Arc` or encode job exists and are cleaned only
   after model/mapping release.
 - A live per-snapshot lock prevents scavenging; bounded-census overflow deletes nothing; an injected
@@ -831,12 +907,14 @@ The implementation PR must include deterministic tests for all of the following.
   `begin(file_count)`, path, length, and canonical exact-fill 1 MiB chunk sequences on a stable
   fixture, including empty, boundary, and multi-chunk files. The test asserts the exact domain,
   big-endian framing, and terminal marker, including the zero-file case.
-- The canonical report always has algorithm `Sha256V1` and a 32-byte digest. Optional supplementary
-  evidence rejects empty or over-4096-byte payloads, a missing or mismatched canonical digest
-  binding, and a constant/fixed caller result that does not bind the current digest. Accepted
-  evidence is immutable, borrowed from the service, and included in the retained charge. Multiple
-  live services at the 4096-byte boundary consume the exact aggregate evidence charge and cannot
-  exceed the retained pool.
+- The canonical report always has algorithm `Sha256V1` and a 32-byte digest. Evidence constructed
+  through `SupplementaryAttestationEvidence::try_new` rejects payloads of 0 and 4097 bytes, while a
+  value with a mismatched digest is rejected at publication. Evidence supplied when
+  `prepare_with_attestor` is used also rejects a missing or mismatched canonical digest binding and
+  a constant/fixed caller result that does not bind the current digest. Accepted evidence is
+  immutable, borrowed from the service, and included in the retained charge. Multiple live services
+  at the 4096-byte boundary consume the exact aggregate evidence charge and cannot exceed the
+  retained pool.
 - Path, timestamp, inode, source-root spelling, and load time do not change the report or descriptor.
 - Two checkpoints with identical metadata but different tensor bytes produce different canonical
   digests and different downstream identities; mutating any artifact byte, path, declared length,
@@ -858,7 +936,8 @@ The implementation PR must include deterministic tests for all of the following.
 - The report is borrowed from the service; no API can construct a prepared value from detached
   service and report parts.
 - Pre-load and post-load descriptor mismatch or canonical-report mismatch fails publication;
-  configured supplementary evidence must also pass its digest-binding and equality checks.
+  supplementary evidence supplied through `prepare_with_attestor` must also pass its digest-binding
+  and equality checks.
 - Every `BertConfig` zero/bound/divisibility/non-finite case, every required-tensor missing/duplicate/
   wrong-shape/layer-index case, tokenizer/config vocabulary disagreement, out-of-range ordinary or
   special token ID, token-type mismatch, and sequence-cap/position-row mismatch fails before
@@ -869,6 +948,10 @@ The implementation PR must include deterministic tests for all of the following.
   decoder mode, cross-attention, pruned heads, and unknown output-affecting fields fail with typed
   preparation errors. Known dropout, cache, classifier, label, and other output-irrelevant fields
   are covered as ignored metadata.
+- The fixture matrix admits only WordPiece and BPE tokenizer variants. A `model.type="Unigram"`,
+  `Metaspace` pre-tokenizer, or selected `tokenizer.model`, `sentencepiece.bpe.model`, or
+  `spiece.model` fixture is rejected at preparation with a typed unsupported-tokenizer error;
+  `MultilingualE5Small` and `MultilingualE5Base` remain deferred.
 - WordPiece fixtures cover cased and accent-preserving normalizer declarations, altered CJK or
   punctuation behavior, non-right padding/truncation, non-empty `never_split`, changed special-token
   templates, and contradictions between `tokenizer.json` and `tokenizer_config.json`; each fails
@@ -877,7 +960,9 @@ The implementation PR must include deterministic tests for all of the following.
   tokens. BPE fixtures cover null/non-null normalizers, every accepted pre-tokenizer shape, altered
   regexes and unsupported sequence children, unsupported model flags, and tokenizer-config
   contradictions; unsupported declarations fail and accepted normalization/pre-tokenization values
-  enter the descriptor.
+  enter the descriptor. Every `added_tokens` entry is checked against the table in D4: all five flags
+  are present, only the listed values are accepted, and a negative fixture names the token and flag
+  for an omitted or behavior-bearing value such as `normalized=true`, `lstrip=true`, or `rstrip=true`.
 
 ### Policy, resources, and cancellation
 
@@ -939,12 +1024,15 @@ The implementation PR must include deterministic tests for all of the following.
   a larger batch, beside different-length neighbors, after neighbor/order permutations, and across
   accepted batch sizes. This pins `CanonicalPerItemV1` and rules out a packed-kernel regression.
 - Exact output, report, and descriptor goldens survive restart and source relocation.
-- An implementation-owned closed fixture table enumerates all seven supported BERT variants. Every
-  row pins its production tokenizer layout and pooling strategy and runs Generic, Query, and Passage
-  for each F32/F16/BF16 source dtype that row accepts; an unsupported dtype is explicitly rejected
-  and tested. Across the table, every accepted tokenizer layout is exercised, BGE CLS and
-  E5/MiniLM mean pooling are covered, and an input above the advisory catalog token count but within
-  the realized tokenizer/model cap is retained.
+- An implementation-owned closed fixture table enumerates exactly the five admitted BERT variants:
+  `BgeSmallEnV15`, `BgeBaseEnV15`, `BgeLargeEnV15`, `AllMiniLmL6V2`, and
+  `ParaphraseMultilingualMiniLmL12V2`. Every row pins its production WordPiece tokenizer layout
+  and pooling strategy and runs Generic, Query, and Passage for each F32/F16/BF16 source dtype that
+  row accepts; an unsupported dtype is explicitly rejected and tested. Across the table, every
+  accepted tokenizer layout is exercised, BGE CLS and MiniLM mean pooling are covered, and an input
+  above the advisory catalog token count but within the realized tokenizer/model cap is retained.
+  The `MultilingualE5Small` Unigram tokenizer fixture is a required rejection fixture, and
+  `MultilingualE5Base` is likewise deferred with the Unigram family.
 - Wrapping/type-erasing a prepared service cannot expose an attested capability or authorize reuse
   of the original report for wrapper outputs.
 
