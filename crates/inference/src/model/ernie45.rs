@@ -18,13 +18,16 @@
 //! RoPE: the reference applies Qwen2-VL-style multimodal-section RoPE
 //! (`apply_multimodal_rotary_pos_emb`, `mrope_section` doubled and chunks
 //! gathered per position row `i % 3`) with **stride-half** `rotate_half`
-//! pairing. For text-only input the reference model derives all three
-//! position rows from the same `arange`, which makes the section gather a
-//! no-op: every chunk reads identical angles, so the result equals plain 1-D
-//! neox RoPE at `rope_theta`. This slice implements exactly that reduction
-//! (via the shared stride-half rope kernels) and asserts the config declares
-//! the multimodal sections it reduces away; the sectioned form becomes
-//! load-bearing only when vision positions enter in a later slice.
+//! pairing. Every rotary lane `i` in the half dimension reads the cos/sin of
+//! its token's position on row `i % 3` (`t`, `h`, `w`); the sections are
+//! doubled to cover both halves of the stride-half layout. For text-only
+//! input the reference model derives all three position rows from the same
+//! `arange`, which makes the section gather a no-op: every lane reads
+//! identical angles, so the result is bit-identical to plain 1-D neox RoPE
+//! at `rope_theta` (unit-tested). The sectioned form becomes load-bearing
+//! for the vision slice: `forward_embeds_trace` accepts pre-built
+//! embeddings (with the vision projector rows spliced in) and per-token
+//! 3-row positions from `paddleocr_vl::rope_index`.
 
 use std::path::Path;
 
@@ -32,7 +35,7 @@ use serde::Deserialize;
 
 use crate::error::InferenceError;
 use crate::forward::cpu::{matmul_bt, rms_norm, silu_inplace};
-use crate::model::gemma4_ops::{gemma4_apply_rope, gemma4_rope_cos_sin, gemma4_rope_inv_freq};
+use crate::model::gemma4_ops::{gemma4_apply_rope, gemma4_rope_inv_freq};
 use crate::weights::TensorSource;
 
 /// Maximum number of decoder layers accepted by the loader, eight times the
@@ -399,6 +402,58 @@ fn softmax_row_fail_closed(row: &mut [f32]) {
     }
 }
 
+/// Build the `[seq_len * head_dim]` cos/sin tables for the reference's
+/// sectioned multimodal RoPE.
+///
+/// Reference layout (`apply_multimodal_rotary_pos_emb`): `mrope_section`
+/// is repeated twice to cover the stride-half pairing (lane `j` pairs with
+/// `j + head_dim/2`, so both lanes of a pair must rotate by the same
+/// angle), and lane `i` of the half dimension gathers the cos/sin of
+/// position row `i % 3` over the tripled pattern `[t, h, w]`. With the
+/// pinned section `[16, 24, 24]` doubled, lanes 0..15 read `t`, 16..39
+/// read `h`, 40..63 read `w`, and the pattern repeats for lanes 64..127 —
+/// identical angles at `j` and `j + 64`, so `gemma4_apply_rope`'s
+/// stride-half rotation is unaffected. When a token's three rows agree,
+/// the tables are bit-identical to `gemma4_rope_cos_sin` on that row
+/// (verified by a unit test), which is why the text-only forward reduces
+/// to plain 1-D RoPE.
+fn mrope_cos_sin_table(cfg: &Ernie45Config, positions: &[[u32; 3]]) -> (Vec<f32>, Vec<f32>) {
+    let inv_freq = gemma4_rope_inv_freq(cfg.head_dim, cfg.rope_theta, None);
+    let s = positions.len();
+    let head_dim = cfg.head_dim;
+    let half = head_dim / 2;
+    // Lane -> position-row map: the half dimension's `mrope_section`
+    // (`[16, 24, 24]` pinned) is repeated twice to cover the stride-half
+    // pairing, so lane `j` reads position row `j`'s section index —
+    // `t, h, w, t, h, w` over the 128 lanes — and always uses frequency
+    // `j % half`. The repetition is what keeps paired lanes `j` and
+    // `j + half` on the same row.
+    let mut lane_row = vec![0usize; head_dim];
+    let mut j = 0;
+    for _rep in 0..2 {
+        for (row, &size) in cfg.rope_scaling.mrope_section.iter().enumerate() {
+            for _ in 0..size {
+                lane_row[j] = row;
+                j += 1;
+            }
+        }
+    }
+    // Config validation guarantees `sum(mrope_section) == head_dim / 2`,
+    // so the doubled sections tile the lanes exactly.
+    assert_eq!(j, head_dim);
+    let mut cos = vec![0f32; s * head_dim];
+    let mut sin = vec![0f32; s * head_dim];
+    for (t, pos) in positions.iter().enumerate() {
+        for j in 0..head_dim {
+            let angle = pos[lane_row[j]] as f32 * inv_freq[j % half];
+            let (sn, cs) = angle.sin_cos();
+            cos[t * head_dim + j] = cs;
+            sin[t * head_dim + j] = sn;
+        }
+    }
+    (cos, sin)
+}
+
 /// Validated ERNIE-4.5 decoder configuration and checkpoint weights.
 pub struct Ernie45Model {
     cfg: Ernie45Config,
@@ -494,13 +549,80 @@ impl Ernie45Model {
         &self.cfg
     }
 
+    /// The decoder's embedding table (`[vocab_size, hidden_size]`):
+    /// the multimodal prefill splices vision rows over copies of these.
+    pub fn embed_tokens(&self) -> &[f32] {
+        &self.weights.embed_tokens
+    }
+
     /// Full-sequence causal forward over `ids` (batch 1, positions
     /// `0..seq_len`, no cache), capturing every checkpoint the golden
-    /// comparison reads.
+    /// comparison reads. Thin wrapper over [`Self::forward_embeds_trace`]:
+    /// the embedding rows come from `embed_tokens` and all three mrope
+    /// position rows are the plain `arange`, so the sectioned gather
+    /// reduces to 1-D RoPE — bit-identical to the pre-vision path.
     pub fn forward_trace(&self, ids: &[u32]) -> Result<Ernie45Trace, InferenceError> {
+        let s = ids.len();
+        if s > MAX_SEQ_LEN {
+            return Err(InferenceError::InvalidInput(format!(
+                "ernie45 forward: sequence length {s} exceeds MAX_SEQ_LEN {MAX_SEQ_LEN}"
+            )));
+        }
+        let h = self.cfg.hidden_size;
+        if s == 0 {
+            return Err(InferenceError::Inference(
+                "ernie45 forward: empty token sequence".into(),
+            ));
+        }
+        for &id in ids {
+            if id as usize >= self.cfg.vocab_size {
+                return Err(InferenceError::Inference(format!(
+                    "ernie45 forward: token id {id} out of vocab range {}",
+                    self.cfg.vocab_size
+                )));
+            }
+        }
+        let embed_len = checked_product(s, h, "forward hidden buffer size")?;
+        let mut embeds = vec![0f32; embed_len];
+        for (t, &id) in ids.iter().enumerate() {
+            embeds[t * h..(t + 1) * h]
+                .copy_from_slice(&self.weights.embed_tokens[id as usize * h..][..h]);
+        }
+        let mut positions = Vec::new();
+        positions
+            .try_reserve_exact(s)
+            .map_err(|error| reserve_error("position buffer", error))?;
+        positions.extend((0..s as u32).map(|i| [i, i, i]));
+        self.forward_embeds_trace(&embeds, &positions)
+    }
+
+    /// Full-sequence causal forward over pre-built token embeddings and
+    /// per-token 3-row mrope positions (batch 1, no cache), capturing every
+    /// checkpoint the golden comparison reads.
+    ///
+    /// `embeds` is `[seq_len, hidden_size]` row-major — the vision slice
+    /// splices the projector rows into the image-placeholder positions
+    /// before calling. `positions` is one `[t, h, w]` triple per token, in
+    /// the reference's `get_rope_index` layout. The head's lanes are split
+    /// into `mrope_section` chunks (doubled for the stride-half pairing);
+    /// each chunk takes the cos/sin of the position row it names —
+    /// `t, h, w, t, h, w` — at that lane's own frequency. When all three rows
+    /// of every token agree (text only), the gather is a no-op and this is
+    /// bit-identical to the 1-D path — the invariant that keeps the text
+    /// decoder gate valid.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::Inference`] on empty input or a buffer/position
+    /// length that disagrees with the config.
+    pub fn forward_embeds_trace(
+        &self,
+        embeds: &[f32],
+        positions: &[[u32; 3]],
+    ) -> Result<Ernie45Trace, InferenceError> {
         let cfg = &self.cfg;
         let w = &self.weights;
-        let s = ids.len();
+        let s = positions.len();
         if s > MAX_SEQ_LEN {
             return Err(InferenceError::InvalidInput(format!(
                 "ernie45 forward: sequence length {s} exceeds MAX_SEQ_LEN {MAX_SEQ_LEN}"
@@ -512,13 +634,19 @@ impl Ernie45Model {
                 "ernie45 forward: empty token sequence".into(),
             ));
         }
-        for &id in ids {
-            if id as usize >= cfg.vocab_size {
-                return Err(InferenceError::Inference(format!(
-                    "ernie45 forward: token id {id} out of vocab range {}",
-                    cfg.vocab_size
-                )));
-            }
+        let embed_len = checked_product(s, h, "forward hidden buffer size")?;
+        if embeds.len() != embed_len {
+            return Err(InferenceError::InvalidInput(format!(
+                "ernie45 forward: embeds has {} values; expected {} tokens x {} hidden",
+                embeds.len(),
+                s,
+                h
+            )));
+        }
+        if !embeds.iter().all(|v| v.is_finite()) {
+            return Err(InferenceError::Inference(
+                "ernie45 forward: embeds carry a non-finite value".into(),
+            ));
         }
 
         let q_dim = cfg.q_dim()?;
@@ -533,19 +661,10 @@ impl Ernie45Model {
         let s_hd = checked_product(s, cfg.head_dim, "forward head buffer size")?;
         let hd_s = checked_product(cfg.head_dim, s, "forward transposed value buffer size")?;
 
-        let mut x = vec![0f32; s_h];
-        for (t, &id) in ids.iter().enumerate() {
-            x[t * h..(t + 1) * h].copy_from_slice(&w.embed_tokens[id as usize * h..][..h]);
-        }
+        let mut x = embeds.to_vec();
         let embed = x.clone();
 
-        let inv_freq = gemma4_rope_inv_freq(cfg.head_dim, cfg.rope_theta, None);
-        let mut positions = Vec::new();
-        positions
-            .try_reserve_exact(s)
-            .map_err(|error| reserve_error("position buffer", error))?;
-        positions.extend(0..s as u32);
-        let (cos, sin) = gemma4_rope_cos_sin(&inv_freq, &positions);
+        let (cos, sin) = mrope_cos_sin_table(cfg, positions);
 
         let heads = cfg.num_attention_heads;
         let kv_heads = cfg.num_key_value_heads;
@@ -683,6 +802,7 @@ impl Ernie45Model {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::gemma4_ops::gemma4_rope_cos_sin;
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -880,6 +1000,25 @@ mod tests {
         }
     }
 
+    fn test_config(head_dim: usize, mrope: &[usize]) -> Ernie45Config {
+        Ernie45Config {
+            hidden_size: 128,
+            intermediate_size: 256,
+            num_hidden_layers: 2,
+            num_attention_heads: 8,
+            num_key_value_heads: 2,
+            head_dim,
+            vocab_size: 300,
+            rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
+            rope_scaling: Ernie45RopeScaling {
+                mrope_section: mrope.to_vec(),
+            },
+            tie_word_embeddings: false,
+            use_bias: false,
+        }
+    }
+
     #[test]
     fn load_tensor_preflights_wrong_shape_without_materialization() {
         let mut source = StubSource::default();
@@ -907,6 +1046,130 @@ mod tests {
         assert!(
             matches!(result, Err(InferenceError::Inference(message)) if message.contains("model.embed_tokens.weight"))
         );
+    }
+
+    #[test]
+    fn config_rejects_section_layout_that_does_not_tile_half_dim() {
+        let bad = test_config(128, &[16, 24]);
+        assert!(bad.validate().is_err(), "sum 40 != 64 must be refused");
+        let good = test_config(128, &[16, 24, 24]);
+        assert!(good.validate().is_ok());
+    }
+
+    /// The sectioned gather must be a no-op when all three position rows
+    /// agree: bit-identical to the plain 1-D cos/sin tables. This is the
+    /// invariant that keeps the text-only decoder gate on the same
+    /// arithmetic as the pre-vision forward.
+    #[test]
+    fn mrope_table_equals_1d_rope_when_rows_agree() {
+        let cfg = test_config(128, &[16, 24, 24]);
+        let positions: Vec<[u32; 3]> = (0..9u32).map(|i| [i, i, i]).collect();
+        let (mcos, msin) = mrope_cos_sin_table(&cfg, &positions);
+        let inv = gemma4_rope_inv_freq(128, 1_000_000.0, None);
+        let (cos1, sin1) =
+            gemma4_rope_cos_sin(&inv, &positions.iter().map(|p| p[0]).collect::<Vec<_>>());
+        assert_eq!(mcos, cos1, "cos tables diverge on equal rows");
+        assert_eq!(msin, sin1, "sin tables diverge on equal rows");
+    }
+
+    /// The reference's pinned `[16, 24, 24]` section: lane 0..15 -> t,
+    /// 16..39 -> h, 40..63 -> w, and the pattern repeats at 64..127 so the
+    /// stride-half pair (j, j+64) always rotates by the same angle.
+    #[test]
+    fn mrope_table_section_rows_follow_pinned_layout() {
+        let cfg = test_config(128, &[16, 24, 24]);
+        // One token at position [3, 5, 7]: rows disagree, so a wrong row
+        // assignment changes the table.
+        let positions = [[3u32, 5, 7]];
+        let (cos, _sin) = mrope_cos_sin_table(&cfg, &positions);
+        let inv = gemma4_rope_inv_freq(128, 1_000_000.0, None);
+        let expect = |lane: usize| {
+            let row = match lane % 64 {
+                0..16 => 3f32,
+                16..40 => 5.0,
+                _ => 7.0,
+            };
+            (row * inv[lane % 64]).cos()
+        };
+        for lane in [0usize, 15, 16, 39, 40, 63, 64, 79, 103, 127] {
+            assert!(
+                (cos[lane] - expect(lane)).abs() < 1e-6,
+                "lane {lane}: {} vs {} — row assignment",
+                cos[lane],
+                expect(lane)
+            );
+        }
+        // A lane reading the wrong position row would shift its angle by
+        // at least 2 * inv_freq[j] * |pos diff| — far above 1e-6 for the
+        // frequencies this test samples.
+        assert!(
+            (cos[0] - cos[16]).abs() > 1e-4,
+            "t and h rows must produce different angles"
+        );
+    }
+
+    #[test]
+    fn forward_trace_matches_embedding_forward_on_arange_positions() {
+        let cfg = tiny_config();
+        let mut source = full_source(&cfg);
+        let weights = Ernie45Weights::load(&mut source, &cfg).unwrap();
+        let model = Ernie45Model::new(cfg, weights).unwrap();
+        let ids = [0u32, 1];
+        let positions = [[0u32, 0, 0], [1, 1, 1]];
+        let embeds = ids
+            .iter()
+            .flat_map(|&id| model.embed_tokens()[id as usize * 2..][..2].iter().copied())
+            .collect::<Vec<_>>();
+
+        let id_trace = model.forward_trace(&ids).unwrap();
+        let embed_trace = model.forward_embeds_trace(&embeds, &positions).unwrap();
+        assert_eq!(id_trace.embed, embed_trace.embed);
+        assert_eq!(id_trace.layer_outputs, embed_trace.layer_outputs);
+        assert_eq!(id_trace.final_norm, embed_trace.final_norm);
+        assert_eq!(id_trace.logits, embed_trace.logits);
+    }
+
+    #[test]
+    fn forward_embeds_trace_rejects_wrong_lengths() {
+        let cfg = test_config(64, &[16]);
+        // sum(mrope) must tile head_dim/2 = 32: fix config for this test.
+        let cfg = Ernie45Config {
+            rope_scaling: Ernie45RopeScaling {
+                mrope_section: vec![8, 8, 8, 8],
+            },
+            ..cfg
+        };
+        assert!(cfg.validate().is_ok());
+        let weights = Ernie45Weights {
+            embed_tokens: vec![0f32; 300 * 128],
+            layers: vec![
+                layer_weights(128, 256, 8 * 64, 2 * 64),
+                layer_weights(128, 256, 8 * 64, 2 * 64),
+            ],
+            final_norm: vec![1f32; 128],
+            lm_head: vec![0f32; 300 * 128],
+        };
+        let model = Ernie45Model::new(cfg, weights).unwrap();
+        assert!(model.forward_embeds_trace(&[], &[]).is_err());
+        assert!(
+            model
+                .forward_embeds_trace(&[0.0f32; 128], &[[0, 0, 0], [1, 1, 1]])
+                .is_err()
+        );
+    }
+
+    fn layer_weights(h: usize, inter: usize, qd: usize, kvd: usize) -> Ernie45LayerWeights {
+        Ernie45LayerWeights {
+            q_proj: vec![0f32; qd * h],
+            k_proj: vec![0f32; kvd * h],
+            v_proj: vec![0f32; kvd * h],
+            o_proj: vec![0f32; h * qd],
+            gate_proj: vec![0f32; inter * h],
+            up_proj: vec![0f32; inter * h],
+            down_proj: vec![0f32; h * inter],
+            input_layernorm: vec![1f32; h],
+            post_attention_layernorm: vec![1f32; h],
+        }
     }
 
     #[test]
