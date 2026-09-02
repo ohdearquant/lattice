@@ -850,7 +850,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -881,22 +881,29 @@ jobs:
         with:
           shared-key: paddleocr-decoder-gate
 
-      - name: Run ERNIE-4.5 decoder differential gate (fail-closed)
+      - name: Run PaddleOCR-VL differential gates (fail-closed)
         env:
           LATTICE_POCR_MODEL_DIR: ${{ steps.provision.outputs.model-dir }}
           LATTICE_POCR_GATE_ENFORCE: '1'
         run: |
           if cargo test --release -p lattice-inference --features f16 \
-            --test paddleocr_vl_decoder_goldens_test -- --nocapture > paddleocr-decoder-gate.log 2>&1
+            --test paddleocr_vl_decoder_goldens_test \
+            --test paddleocr_vl_vision_goldens_test \
+            --test paddleocr_vl_e2e_goldens_test -- --nocapture > paddleocr-gates.log 2>&1
           then
-            cat paddleocr-decoder-gate.log
+            cat paddleocr-gates.log
           else
             status=$?
-            cat paddleocr-decoder-gate.log
+            cat paddleocr-gates.log
             exit "$status"
           fi
-          grep -q '^LATTICE_POCR_DECODER_CASE ' paddleocr-decoder-gate.log
-          grep -q '^LATTICE_POCR_DECODER_GATE cases=4 checkpoint_revision=c5630abae1d940eafe0697512a0325494b02ab42$' paddleocr-decoder-gate.log
+          grep -q '^LATTICE_POCR_DECODER_CASE ' paddleocr-gates.log
+          grep -q '^LATTICE_POCR_DECODER_GATE cases=4 checkpoint_revision=c5630abae1d940eafe0697512a0325494b02ab42$' paddleocr-gates.log
+          # The vision and end-to-end gates print one summary line per golden only after every
+          # assertion passed; a run that skipped prints neither. The counts pin the fixture sets
+          # (three synthetic grids, one image) so a silently shrunk fixture cannot pass as a run.
+          test "$(grep -c '^case [0-9]*: grid [0-9]*x[0-9]* ([0-9]* patches) all checkpoints within tolerance' paddleocr-gates.log)" -eq 3
+          grep -q '^paddleocr_vl_e2e: prefill .* greedy exact 24 of 24$' paddleocr-gates.log
 
   # The QuaRot converter and its refuse-on-fail forward-equivalence check are
   # pure f64 CPU work. Generating the 0.62 GB artifact on the macOS runner held
