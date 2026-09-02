@@ -16,11 +16,6 @@ use lattice_inference::vision::paddleocr_preprocess::{
 use sha2::{Digest, Sha256};
 const FIXTURE: &str = "tests/fixtures/paddleocr_vl/preprocess/preprocess_goldens.json";
 
-/// Tolerance for the f32 patch-value and mean_abs assertions. The pipeline is
-/// exact integer arithmetic until the final f32 division, so this bound only
-/// guards the last conversion; do not loosen it.
-const F32_TOL: f64 = 1e-6;
-
 fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|b| format!("{b:02x}")).collect()
@@ -57,8 +52,8 @@ fn reference_patch(
     for c in 0..3 {
         for yy in 0..patch {
             for xx in 0..patch {
-                let byte = resized[((py * patch + yy) * dst_w + px * patch + xx) * 3 + c] as f32;
-                let v = byte * cfg.rescale_factor;
+                let byte = resized[((py * patch + yy) * dst_w + px * patch + xx) * 3 + c];
+                let v = (byte as f64 * cfg.rescale_factor) as f32;
                 out.push((v - cfg.image_mean[c]) / cfg.image_std[c]);
             }
         }
@@ -66,12 +61,30 @@ fn reference_patch(
     out
 }
 
-fn expect_close(label: &str, got: f32, want: f64) {
-    let diff = (got as f64 - want).abs();
+fn expect_exact(label: &str, got: f32, want: f64) {
     assert!(
-        diff <= F32_TOL,
-        "{label}: got {got}, want {want} (diff {diff} > {F32_TOL})"
+        got == want as f32,
+        "{label}: got {got:?} ({:?}), want {want:?} ({:?})",
+        got.to_bits(),
+        (want as f32).to_bits()
     );
+}
+
+fn expect_one_ulp(label: &str, got: f32, want: f64) {
+    // The fixture records the reference's vectorized float32 aggregate. A
+    // scalar traversal can choose a different reduction order by one ULP;
+    // sampled tensor values remain exact bit comparisons.
+    let want = want as f32;
+    assert!(
+        got.to_bits().abs_diff(want.to_bits()) <= 1,
+        "{label}: got {got:?} ({:?}), want {want:?} ({:?}) differ by more than one f32 ULP",
+        got.to_bits(),
+        want.to_bits()
+    );
+}
+
+fn scalar_mean_abs(values: &[f32]) -> f32 {
+    (values.iter().map(|value| value.abs() as f64).sum::<f64>() / values.len() as f64) as f32
 }
 
 #[test]
@@ -149,6 +162,12 @@ fn paddleocr_vl_preprocess_goldens() {
             .iter()
             .map(|v| v.as_u64().expect("u8 element") as u8)
             .collect();
+        let resized_last8_u8: Vec<u8> = case["resized_last8_u8"]
+            .as_array()
+            .expect("resized_last8_u8 array")
+            .iter()
+            .map(|v| v.as_u64().expect("u8 element") as u8)
+            .collect();
 
         // 1. The regenerated input must match the fixture; anything after is
         //    meaningless if the formula drifted.
@@ -176,6 +195,15 @@ fn paddleocr_vl_preprocess_goldens() {
             .unwrap_or_else(|e| panic!("[{id}] resize_bicubic_rgb8 failed: {e}"));
         let resized_sha = hex_sha256(&resized);
         let got_first8: Vec<u8> = resized[..8.min(resized.len())].to_vec();
+        assert_eq!(
+            got_first8, resized_first8_u8,
+            "[{id}] resized first 8 bytes mismatch"
+        );
+        let got_last8 = resized[resized.len() - 8..].to_vec();
+        assert_eq!(
+            got_last8, resized_last8_u8,
+            "[{id}] resized last 8 bytes mismatch"
+        );
         assert_eq!(
             resized_sha, resized_sha256,
             "[{id}] resized_sha256 mismatch: got {resized_sha}, fixture {resized_sha256}; \
@@ -208,7 +236,7 @@ fn paddleocr_vl_preprocess_goldens() {
             .zip(&first_patch_first8)
             .enumerate()
         {
-            expect_close(&format!("[{id}] first_patch_first8[{i}]"), *got, *want);
+            expect_exact(&format!("[{id}] first_patch_first8[{i}]"), *got, *want);
         }
         let last_base = patch_len * (num_patches - 1);
         for (i, (got, want)) in out.pixel_values[last_base..last_base + 8]
@@ -216,11 +244,10 @@ fn paddleocr_vl_preprocess_goldens() {
             .zip(&last_patch_first8)
             .enumerate()
         {
-            expect_close(&format!("[{id}] last_patch_first8[{i}]"), *got, *want);
+            expect_exact(&format!("[{id}] last_patch_first8[{i}]"), *got, *want);
         }
-        let got_mean_abs = out.pixel_values.iter().map(|v| v.abs() as f64).sum::<f64>()
-            / out.pixel_values.len() as f64;
-        expect_close(&format!("[{id}] mean_abs"), got_mean_abs as f32, mean_abs);
+        let got_mean_abs = scalar_mean_abs(&out.pixel_values);
+        expect_one_ulp(&format!("[{id}] mean_abs"), got_mean_abs, mean_abs);
 
         // 5. Patch order: two non-corner patches, re-sliced independently
         //    from the verified resized bytes. The first and last patches
@@ -232,7 +259,7 @@ fn paddleocr_vl_preprocess_goldens() {
             .zip(&ref01)
             .enumerate()
         {
-            expect_close(&format!("[{id}] patch(0,1)[{i}]"), *got, *want as f64);
+            expect_exact(&format!("[{id}] patch(0,1)[{i}]"), *got, *want as f64);
         }
         let ref10 = reference_patch(&resized, dst_w, 1, 0, &cfg);
         for (i, (got, want)) in out.pixel_values
@@ -241,7 +268,7 @@ fn paddleocr_vl_preprocess_goldens() {
             .zip(&ref10)
             .enumerate()
         {
-            expect_close(&format!("[{id}] patch(1,0)[{i}]"), *got, *want as f64);
+            expect_exact(&format!("[{id}] patch(1,0)[{i}]"), *got, *want as f64);
         }
     }
 }

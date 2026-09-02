@@ -10,8 +10,8 @@
 //!    `Image.resize` with `Image.BICUBIC` (a port of Pillow's
 //!    `src/libImaging/Resample.c`: separable horizontal-then-vertical passes,
 //!    per-output fixed-point coefficient tables with 22-bit precision).
-//! 3. Rescale by `rescale_factor` (1/255) and per-channel normalize
-//!    `(x - mean[c]) / std[c]` in f32.
+//! 3. Rescale by `rescale_factor` (1/255) through f64 and downcast to f32,
+//!    then per-channel normalize `(x - mean[c]) / std[c]` in f32.
 //! 4. Patchify into `[n_patches, 3, patch, patch]` in raster patch order
 //!    (row-major over the `grid_h x grid_w` patch grid), with
 //!    `grid_thw = (1, grid_h, grid_w)`.
@@ -22,6 +22,8 @@
 //! PIL 12.3.0.
 
 use crate::error::InferenceError;
+use crate::model::qwen35_config::MAX_CONFIG_JSON_BYTES;
+use std::collections::TryReserveError;
 use std::path::Path;
 
 /// Fixed-point coefficient precision (bits), matching Pillow's
@@ -31,7 +33,39 @@ const PRECISION_BITS: i32 = 22;
 /// Bicubic kernel constant `a` (CubicConvolution "Keys" curve).
 const BICUBIC_A: f64 = -0.5;
 
+/// Maximum side length accepted for an input or resized image.
+///
+/// This accommodates common high-resolution document pages while bounding
+/// the intermediate RGB resize buffer independently of the configured target
+/// pixel budget.
+pub const MAX_IMAGE_SIDE: usize = 4096;
+
+/// Maximum configured target pixel budget for one image.
+///
+/// The shipped PaddleOCR-VL default is 1,003,520 pixels. Eight times that
+/// value permits custom document configurations with useful headroom while
+/// keeping the resized RGB, intermediate, and normalized buffers finite and
+/// well below memory-exhaustion scale.
+pub const MAX_PIXEL_BUDGET: usize = 8_388_608;
+
+/// Maximum spatial factor accepted by the smart-resize configuration.
+///
+/// Factors used by supported vision processors are small; 256 bounds both
+/// patch geometry and the coefficient support of an untrusted configuration.
+pub const MAX_RESIZE_FACTOR: usize = 256;
+
+/// Conservative pixel allowance for the reference algorithm's upward ceil
+/// rounding. Each dimension can increase by less than one factor cell, so
+/// `factor * (2 * MAX_IMAGE_SIDE + factor)` covers the resulting area delta;
+/// this constant uses [`MAX_RESIZE_FACTOR`] for a single global allocation cap.
+pub const SMART_RESIZE_PIXEL_SLACK: usize =
+    MAX_RESIZE_FACTOR * (2 * MAX_IMAGE_SIDE + MAX_RESIZE_FACTOR);
+
 /// Image processor configuration from `preprocessor_config.json`.
+///
+/// The fields are public for compatibility with existing callers. Callers
+/// constructing this struct directly must call [`Self::validate`] before use;
+/// [`preprocess_rgb8`] enforces that boundary for every processing request.
 #[derive(Debug, Clone)]
 pub struct PaddleOcrImageProcessorConfig {
     /// Minimum pixel count after smart-resize; smaller images are scaled up.
@@ -48,7 +82,7 @@ pub struct PaddleOcrImageProcessorConfig {
     pub image_std: [f32; 3],
     /// Multiplicative rescale applied to uint8 values before normalization
     /// (1/255 for the shipped config).
-    pub rescale_factor: f32,
+    pub rescale_factor: f64,
 }
 
 impl PaddleOcrImageProcessorConfig {
@@ -109,7 +143,7 @@ impl PaddleOcrImageProcessorConfig {
             Ok(out)
         };
 
-        Ok(Self {
+        let config = Self {
             min_pixels: usize_field("min_pixels")?,
             max_pixels: usize_field("max_pixels")?,
             patch_size: usize_field("patch_size")?,
@@ -119,17 +153,25 @@ impl PaddleOcrImageProcessorConfig {
             rescale_factor: value
                 .get("rescale_factor")
                 .and_then(serde_json::Value::as_f64)
-                .map(|v| v as f32)
                 .ok_or_else(|| {
                     InferenceError::Inference(
                         "preprocessor_config is missing required field `rescale_factor`".into(),
                     )
                 })?,
-        })
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Parse a `preprocessor_config.json` file.
     pub fn from_preprocessor_json(path: &Path) -> Result<Self, InferenceError> {
+        let file_len = std::fs::metadata(path).map_err(InferenceError::Io)?.len();
+        if file_len > MAX_CONFIG_JSON_BYTES {
+            return Err(InferenceError::Inference(format!(
+                "preprocessor_config at {} is {file_len} bytes, exceeding MAX_CONFIG_JSON_BYTES ({MAX_CONFIG_JSON_BYTES})",
+                path.display()
+            )));
+        }
         let raw = std::fs::read_to_string(path).map_err(InferenceError::Io)?;
         Self::from_preprocessor_json_str(&raw)
     }
@@ -151,8 +193,131 @@ impl PaddleOcrImageProcessorConfig {
     /// `patch_size * merge_size`: the smart-resize divisibility factor (28
     /// for the shipped config).
     pub fn factor(&self) -> usize {
-        self.patch_size * self.merge_size
+        self.patch_size.saturating_mul(self.merge_size)
     }
+
+    /// Validate all configuration values before image dimensions are used.
+    pub fn validate(&self) -> Result<(), InferenceError> {
+        if self.min_pixels == 0 {
+            return Err(InferenceError::Inference(
+                "preprocessor_config min_pixels must be at least 1".into(),
+            ));
+        }
+        if self.min_pixels > self.max_pixels {
+            return Err(InferenceError::Inference(format!(
+                "preprocessor_config min_pixels {} exceeds max_pixels {}",
+                self.min_pixels, self.max_pixels
+            )));
+        }
+        if self.max_pixels > MAX_PIXEL_BUDGET {
+            return Err(InferenceError::Inference(format!(
+                "preprocessor_config max_pixels {} exceeds MAX_PIXEL_BUDGET {}",
+                self.max_pixels, MAX_PIXEL_BUDGET
+            )));
+        }
+        if self.patch_size == 0 {
+            return Err(InferenceError::Inference(
+                "preprocessor_config patch_size must be at least 1".into(),
+            ));
+        }
+        if self.merge_size == 0 {
+            return Err(InferenceError::Inference(
+                "preprocessor_config merge_size must be at least 1".into(),
+            ));
+        }
+        let factor = self
+            .patch_size
+            .checked_mul(self.merge_size)
+            .ok_or_else(|| {
+                InferenceError::Inference(
+                    "preprocessor_config patch_size * merge_size overflows usize".into(),
+                )
+            })?;
+        if factor > MAX_RESIZE_FACTOR {
+            return Err(InferenceError::Inference(format!(
+                "preprocessor_config patch_size * merge_size {factor} exceeds MAX_RESIZE_FACTOR {MAX_RESIZE_FACTOR}"
+            )));
+        }
+        if !self.rescale_factor.is_finite() || self.rescale_factor <= 0.0 {
+            return Err(InferenceError::Inference(
+                "preprocessor_config rescale_factor must be finite and positive".into(),
+            ));
+        }
+        for (name, values) in [
+            ("image_mean", &self.image_mean),
+            ("image_std", &self.image_std),
+        ] {
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(InferenceError::Inference(format!(
+                    "preprocessor_config {name} values must be finite"
+                )));
+            }
+        }
+        if self.image_std.iter().any(|value| *value <= 0.0) {
+            return Err(InferenceError::Inference(
+                "preprocessor_config image_std values must be positive".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn checked_rgb8_len(height: usize, width: usize, context: &str) -> Result<usize, InferenceError> {
+    let pixels = height.checked_mul(width).ok_or_else(|| {
+        InferenceError::Inference(format!("{context} pixel count overflows usize"))
+    })?;
+    pixels.checked_mul(3).ok_or_else(|| {
+        InferenceError::Inference(format!("{context} RGB byte length overflows usize"))
+    })
+}
+
+fn check_image_side(value: usize, name: &str, context: &str) -> Result<(), InferenceError> {
+    if value == 0 {
+        return Err(InferenceError::Inference(format!(
+            "{context} {name} must be at least 1"
+        )));
+    }
+    if value > MAX_IMAGE_SIDE {
+        return Err(InferenceError::Inference(format!(
+            "{context} {name} {value} exceeds MAX_IMAGE_SIDE {MAX_IMAGE_SIDE}"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_pixel_count(
+    height: usize,
+    width: usize,
+    context: &str,
+) -> Result<usize, InferenceError> {
+    height
+        .checked_mul(width)
+        .ok_or_else(|| InferenceError::Inference(format!("{context} pixel count overflows usize")))
+}
+
+fn allocation_error(context: &str, elements: usize, error: TryReserveError) -> InferenceError {
+    InferenceError::Inference(format!(
+        "{context} allocation for {elements} elements failed: {error}"
+    ))
+}
+
+fn check_resize_target(
+    height: usize,
+    width: usize,
+    max_pixels: usize,
+) -> Result<(), InferenceError> {
+    let resized_pixels = checked_pixel_count(height, width, "smart_resize resized")?;
+    let allowed_pixels = max_pixels
+        .checked_add(SMART_RESIZE_PIXEL_SLACK)
+        .ok_or_else(|| {
+            InferenceError::Inference("smart_resize pixel allowance overflows usize".into())
+        })?;
+    if resized_pixels > allowed_pixels {
+        return Err(InferenceError::Inference(format!(
+            "smart_resize target {height}x{width} has {resized_pixels} pixels, exceeding max_pixels {max_pixels} plus slack {SMART_RESIZE_PIXEL_SLACK}"
+        )));
+    }
+    Ok(())
 }
 
 /// Snap `(height, width)` to a multiple of `factor` so the pixel count lands
@@ -177,10 +342,17 @@ pub fn smart_resize(
     min_pixels: usize,
     max_pixels: usize,
 ) -> Result<(usize, usize), InferenceError> {
-    if height == 0 || width == 0 || factor == 0 || max_pixels == 0 {
+    check_image_side(height, "height", "smart_resize")?;
+    check_image_side(width, "width", "smart_resize")?;
+    if factor == 0 || factor > MAX_RESIZE_FACTOR {
         return Err(InferenceError::Inference(format!(
-            "smart_resize requires positive height, width, factor and max_pixels (got {height}x{width}, factor={factor}, max_pixels={max_pixels})"
+            "smart_resize factor {factor} must be in 1..={MAX_RESIZE_FACTOR}"
         )));
+    }
+    if min_pixels == 0 || min_pixels > max_pixels {
+        return Err(InferenceError::Inference(
+            "smart_resize pixel bounds must satisfy 1 <= min_pixels <= max_pixels".into(),
+        ));
     }
 
     let (mut h, mut w) = (height as f64, width as f64);
@@ -207,19 +379,24 @@ pub fn smart_resize(
     let mut w_bar = (w / f).round_ties_even() * f;
 
     let pixels = h_bar * w_bar;
-    let max_pixels = max_pixels as f64;
-    let min_pixels = min_pixels as f64;
-    if pixels > max_pixels {
-        let beta = (h * w / max_pixels).sqrt();
-        h_bar = (h / beta / f).floor() * f;
-        w_bar = (w / beta / f).floor() * f;
-    } else if pixels < min_pixels {
-        let beta = (min_pixels / (h * w)).sqrt();
+    let max_pixels_f64 = max_pixels as f64;
+    let min_pixels_f64 = min_pixels as f64;
+    if pixels > max_pixels_f64 {
+        let beta = (h * w / max_pixels_f64).sqrt();
+        h_bar = (h / beta / f).floor().max(1.0) * f;
+        w_bar = (w / beta / f).floor().max(1.0) * f;
+    } else if pixels < min_pixels_f64 {
+        let beta = (min_pixels_f64 / (h * w)).sqrt();
         h_bar = (h * beta / f).ceil() * f;
         w_bar = (w * beta / f).ceil() * f;
     }
 
-    Ok((h_bar as usize, w_bar as usize))
+    let resized_h = h_bar as usize;
+    let resized_w = w_bar as usize;
+    check_image_side(resized_h, "resized height", "smart_resize")?;
+    check_image_side(resized_w, "resized width", "smart_resize")?;
+    check_resize_target(resized_h, resized_w, max_pixels)?;
+    Ok((resized_h, resized_w))
 }
 
 /// Bicubic convolution kernel with constant `a = BICUBIC_A` (-0.5):
@@ -241,9 +418,8 @@ fn bicubic_kernel(x: f64) -> f64 {
 /// input index in the input, `xmax` the tap count, and `k_int` the 22-bit
 /// fixed-point taps (`PRECISION_BITS = 22`).
 struct SpanCoeffs {
-    xmin: usize,
-    xmax: usize,
-    k_int: Vec<i32>,
+    ksize: usize,
+    taps: Vec<i32>,
 }
 
 /// Compute per-output coefficient tables for one separable pass over
@@ -256,49 +432,63 @@ struct SpanCoeffs {
 /// [`bicubic_kernel`]; the taps for one output are normalized to sum to 1
 /// (when the sum is nonzero) and quantized to 22-bit fixed point with
 /// half-away-from-zero truncation, mirroring the C reference.
-fn precompute_coeffs(in_size: usize, out_size: usize) -> Vec<SpanCoeffs> {
+fn coefficient_span(in_size: usize, out_size: usize, index: usize) -> (usize, usize, f64, f64) {
     let scale = in_size as f64 / out_size as f64;
     let filterscale = scale.max(1.0);
     let support = 2.0 * filterscale;
-    let ksize = (support.ceil() as usize) * 2 + 1;
     let in_size_i64 = in_size as i64;
+    let center = (index as f64 + 0.5) * scale;
+    let ss = 1.0 / filterscale;
+    // C `(int)` cast truncates toward zero; then clamp to the input span.
+    let xmin = ((center - support + 0.5) as i64).max(0);
+    let xmax = ((center + support + 0.5) as i64).min(in_size_i64) - xmin;
+    (xmin as usize, xmax.max(0) as usize, center, ss)
+}
 
-    (0..out_size)
-        .map(|xx| {
-            let center = (xx as f64 + 0.5) * scale;
-            let ss = 1.0 / filterscale;
-            // C `(int)` cast truncates toward zero; then clamp to the input span.
-            let xmin = ((center - support + 0.5) as i64).max(0);
-            let xmax = ((center + support + 0.5) as i64).min(in_size_i64) - xmin;
-            let xmax = xmax.max(0) as usize;
+fn precompute_coeffs(in_size: usize, out_size: usize) -> Result<SpanCoeffs, InferenceError> {
+    if in_size == 0 || out_size == 0 {
+        return Err(InferenceError::Inference(
+            "coefficient table dimensions must be nonzero".into(),
+        ));
+    }
+    let scale = in_size as f64 / out_size as f64;
+    let support = 2.0 * scale.max(1.0);
+    let ksize = (support.ceil() as usize)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            InferenceError::Inference("coefficient table size overflows usize".into())
+        })?;
+    let table_len = out_size.checked_mul(ksize).ok_or_else(|| {
+        InferenceError::Inference("coefficient table length overflows usize".into())
+    })?;
+    let mut taps = Vec::new();
+    taps.try_reserve_exact(table_len)
+        .map_err(|error| allocation_error("coefficient table", table_len, error))?;
+    taps.resize(table_len, 0);
+    let scale22 = 1i32 << PRECISION_BITS;
 
-            let mut weights = vec![0.0f64; xmax];
-            for x in 0..xmax {
-                weights[x] = bicubic_kernel((x as f64 + xmin as f64 - center + 0.5) * ss);
-            }
-            let ww: f64 = weights.iter().sum();
+    for xx in 0..out_size {
+        let (xmin, xmax, center, ss) = coefficient_span(in_size, out_size, xx);
+        let mut ww = 0.0f64;
+        for x in 0..xmax {
+            ww += bicubic_kernel((x as f64 + xmin as f64 - center + 0.5) * ss);
+        }
+        let base = xx * ksize;
+        for x in 0..xmax {
+            let mut weight = bicubic_kernel((x as f64 + xmin as f64 - center + 0.5) * ss);
             if ww != 0.0 {
-                for w in weights.iter_mut() {
-                    *w /= ww;
-                }
+                weight /= ww;
             }
+            taps[base + x] = if weight < 0.0 {
+                (-0.5 + weight * scale22 as f64) as i32
+            } else {
+                (0.5 + weight * scale22 as f64) as i32
+            };
+        }
+    }
 
-            let mut k_int = vec![0i32; ksize];
-            let scale22 = 1i32 << PRECISION_BITS;
-            for (i, w) in weights.iter().enumerate() {
-                k_int[i] = if *w < 0.0 {
-                    (-0.5 + *w * scale22 as f64) as i32
-                } else {
-                    (0.5 + *w * scale22 as f64) as i32
-                };
-            }
-            SpanCoeffs {
-                xmin: xmin as usize,
-                xmax,
-                k_int,
-            }
-        })
-        .collect()
+    Ok(SpanCoeffs { ksize, taps })
 }
 
 /// Fixed-point accumulation scale: `1 << 21`, i.e. half of the 22-bit
@@ -325,7 +515,11 @@ pub fn resize_bicubic_rgb8(
     dst_h: usize,
     dst_w: usize,
 ) -> Result<Vec<u8>, InferenceError> {
-    let expected = src_h.saturating_mul(src_w).saturating_mul(3);
+    check_image_side(src_h, "source height", "resize_bicubic_rgb8")?;
+    check_image_side(src_w, "source width", "resize_bicubic_rgb8")?;
+    check_image_side(dst_h, "destination height", "resize_bicubic_rgb8")?;
+    check_image_side(dst_w, "destination width", "resize_bicubic_rgb8")?;
+    let expected = checked_rgb8_len(src_h, src_w, "resize_bicubic_rgb8 input")?;
     if src.len() != expected {
         return Err(InferenceError::ShapeMismatch {
             name: "resize_bicubic_rgb8 input".into(),
@@ -333,24 +527,37 @@ pub fn resize_bicubic_rgb8(
             actual: vec![src.len()],
         });
     }
-    if src_h == 0 || src_w == 0 || dst_h == 0 || dst_w == 0 {
-        return Err(InferenceError::Inference(
-            "resize_bicubic_rgb8 requires nonzero dimensions".into(),
-        ));
+    let dst_pixels = checked_pixel_count(dst_h, dst_w, "resize_bicubic_rgb8 destination")?;
+    let max_allowed_pixels = MAX_PIXEL_BUDGET
+        .checked_add(SMART_RESIZE_PIXEL_SLACK)
+        .ok_or_else(|| {
+            InferenceError::Inference("resize pixel allowance overflows usize".into())
+        })?;
+    if dst_pixels > max_allowed_pixels {
+        return Err(InferenceError::Inference(format!(
+            "resize_bicubic_rgb8 destination has {dst_pixels} pixels, exceeding allocation budget {max_allowed_pixels}"
+        )));
     }
 
-    let x_coeffs = precompute_coeffs(src_w, dst_w);
-    let y_coeffs = precompute_coeffs(src_h, dst_h);
+    let x_coeffs = precompute_coeffs(src_w, dst_w)?;
+    let y_coeffs = precompute_coeffs(src_h, dst_h)?;
 
     // Horizontal pass: src (src_h x src_w) -> mid (src_h x dst_w), HWC.
-    let mut mid = vec![0u8; src_h * dst_w * 3];
+    let mid_len = checked_rgb8_len(src_h, dst_w, "resize_bicubic_rgb8 intermediate")?;
+    let mut mid = Vec::new();
+    mid.try_reserve_exact(mid_len)
+        .map_err(|error| allocation_error("resize_bicubic_rgb8 intermediate", mid_len, error))?;
+    mid.resize(mid_len, 0);
     for c in 0..3 {
         for y in 0..src_h {
-            for (xx, coeffs) in (0..dst_w).zip(x_coeffs.iter()) {
+            for xx in 0..dst_w {
+                let (xmin, xmax, _, _) = coefficient_span(src_w, dst_w, xx);
                 let mut ss: i32 = ACC_BIAS;
-                for (x, tap) in (0..coeffs.xmax).zip(coeffs.k_int.iter()) {
-                    let px = src[(y * src_w + coeffs.xmin + x) * 3 + c] as i32;
-                    ss += px * *tap;
+                let tap_base = xx * x_coeffs.ksize;
+                for x in 0..xmax {
+                    let px = src[(y * src_w + xmin + x) * 3 + c] as i32;
+                    let tap = x_coeffs.taps[tap_base + x];
+                    ss += px * tap;
                 }
                 mid[(y * dst_w + xx) * 3 + c] = clip8(ss);
             }
@@ -358,14 +565,21 @@ pub fn resize_bicubic_rgb8(
     }
 
     // Vertical pass: mid (src_h x dst_w) -> out (dst_h x dst_w), HWC.
-    let mut out = vec![0u8; dst_h * dst_w * 3];
+    let out_len = checked_rgb8_len(dst_h, dst_w, "resize_bicubic_rgb8 output")?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(out_len)
+        .map_err(|error| allocation_error("resize_bicubic_rgb8 output", out_len, error))?;
+    out.resize(out_len, 0);
     for c in 0..3 {
         for x in 0..dst_w {
-            for (yy, coeffs) in (0..dst_h).zip(y_coeffs.iter()) {
+            for yy in 0..dst_h {
+                let (xmin, xmax, _, _) = coefficient_span(src_h, dst_h, yy);
                 let mut ss: i32 = ACC_BIAS;
-                for (y, tap) in (0..coeffs.xmax).zip(coeffs.k_int.iter()) {
-                    let px = mid[((coeffs.xmin + y) * dst_w + x) * 3 + c] as i32;
-                    ss += px * *tap;
+                let tap_base = yy * y_coeffs.ksize;
+                for y in 0..xmax {
+                    let px = mid[((xmin + y) * dst_w + x) * 3 + c] as i32;
+                    let tap = y_coeffs.taps[tap_base + y];
+                    ss += px * tap;
                 }
                 out[(yy * dst_w + x) * 3 + c] = clip8(ss);
             }
@@ -401,13 +615,11 @@ pub fn preprocess_rgb8(
     height: usize,
     width: usize,
 ) -> Result<PreprocessedImage, InferenceError> {
+    cfg.validate()?;
+    check_image_side(height, "height", "preprocess_rgb8")?;
+    check_image_side(width, "width", "preprocess_rgb8")?;
     let patch = cfg.patch_size;
-    if patch == 0 || cfg.merge_size == 0 {
-        return Err(InferenceError::Inference(
-            "patch_size and merge_size must be nonzero".into(),
-        ));
-    }
-    let expected = height.saturating_mul(width).saturating_mul(3);
+    let expected = checked_rgb8_len(height, width, "preprocess_rgb8 input")?;
     if rgb.len() != expected {
         return Err(InferenceError::ShapeMismatch {
             name: "preprocess_rgb8 input".into(),
@@ -416,7 +628,11 @@ pub fn preprocess_rgb8(
         });
     }
 
-    let (dst_h, dst_w) = smart_resize(height, width, cfg.factor(), cfg.min_pixels, cfg.max_pixels)?;
+    let factor = patch.checked_mul(cfg.merge_size).ok_or_else(|| {
+        InferenceError::Inference("preprocess_rgb8 resize factor overflows usize".into())
+    })?;
+    let (dst_h, dst_w) = smart_resize(height, width, factor, cfg.min_pixels, cfg.max_pixels)?;
+    check_resize_target(dst_h, dst_w, cfg.max_pixels)?;
     if dst_h % patch != 0 || dst_w % patch != 0 {
         return Err(InferenceError::Inference(format!(
             "resized image {dst_h} x {dst_w} is not divisible by patch_size {patch}"
@@ -426,9 +642,23 @@ pub fn preprocess_rgb8(
 
     let grid_h = dst_h / patch;
     let grid_w = dst_w / patch;
-    let n_patches = grid_h * grid_w;
-    let patch_len = 3 * patch * patch;
-    let mut pixel_values = vec![0.0f32; n_patches * patch_len];
+    let n_patches = grid_h.checked_mul(grid_w).ok_or_else(|| {
+        InferenceError::Inference("preprocess_rgb8 patch count overflows usize".into())
+    })?;
+    let patch_area = patch.checked_mul(patch).ok_or_else(|| {
+        InferenceError::Inference("preprocess_rgb8 patch area overflows usize".into())
+    })?;
+    let patch_len = 3usize.checked_mul(patch_area).ok_or_else(|| {
+        InferenceError::Inference("preprocess_rgb8 patch length overflows usize".into())
+    })?;
+    let value_len = n_patches.checked_mul(patch_len).ok_or_else(|| {
+        InferenceError::Inference("preprocess_rgb8 output length overflows usize".into())
+    })?;
+    let mut pixel_values = Vec::new();
+    pixel_values
+        .try_reserve_exact(value_len)
+        .map_err(|error| allocation_error("preprocess_rgb8 output", value_len, error))?;
+    pixel_values.resize(value_len, 0.0f32);
 
     for py_out in 0..grid_h {
         let py = py_out;
@@ -439,12 +669,12 @@ pub fn preprocess_rgb8(
             for c in 0..3 {
                 let mean = cfg.image_mean[c];
                 let std = cfg.image_std[c];
-                let mut o = out_base + c * patch * patch;
+                let mut o = out_base + c * patch_area;
                 for yy in 0..patch {
                     let row = dst_w * (py * patch + yy);
                     for xx in 0..patch {
-                        let v =
-                            resized[(row + px * patch + xx) * 3 + c] as f32 * cfg.rescale_factor;
+                        let v = (resized[(row + px * patch + xx) * 3 + c] as f64
+                            * cfg.rescale_factor) as f32;
                         pixel_values[o] = (v - mean) / std;
                         o += 1;
                     }
@@ -502,6 +732,7 @@ mod tests {
     #[test]
     fn defaults_match_shipped_config() {
         let cfg = PaddleOcrImageProcessorConfig::paddleocr_vl_defaults();
+        cfg.validate().expect("shipped defaults validate");
         assert_eq!(cfg.min_pixels, 112_896);
         assert_eq!(cfg.max_pixels, 1_003_520);
         assert_eq!(cfg.patch_size, 14);
@@ -553,6 +784,105 @@ mod tests {
                 "got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn config_validation_accepts_and_rejects_each_boundary() {
+        let mut cfg = PaddleOcrImageProcessorConfig::paddleocr_vl_defaults();
+
+        cfg.min_pixels = 0;
+        assert!(cfg.validate().is_err());
+        cfg.min_pixels = 1;
+        assert!(cfg.validate().is_ok());
+
+        cfg.min_pixels = 1;
+        cfg.max_pixels = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.min_pixels = 2;
+        assert!(cfg.validate().is_err());
+        cfg.min_pixels = 1;
+        cfg.max_pixels = MAX_PIXEL_BUDGET;
+        assert!(cfg.validate().is_ok());
+        cfg.max_pixels = MAX_PIXEL_BUDGET + 1;
+        assert!(cfg.validate().is_err());
+        cfg.max_pixels = 1_003_520;
+
+        cfg.patch_size = 0;
+        assert!(cfg.validate().is_err());
+        cfg.patch_size = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.merge_size = 0;
+        assert!(cfg.validate().is_err());
+        cfg.merge_size = 1;
+        assert!(cfg.validate().is_ok());
+
+        cfg.patch_size = MAX_RESIZE_FACTOR;
+        cfg.merge_size = 1;
+        assert!(cfg.validate().is_ok());
+        cfg.patch_size = MAX_RESIZE_FACTOR;
+        cfg.merge_size = 2;
+        assert!(cfg.validate().is_err());
+        cfg.patch_size = usize::MAX;
+        cfg.merge_size = 2;
+        assert!(cfg.validate().is_err());
+
+        cfg.patch_size = 14;
+        cfg.merge_size = 2;
+        cfg.rescale_factor = f64::MIN_POSITIVE;
+        assert!(cfg.validate().is_ok());
+        cfg.rescale_factor = 0.0;
+        assert!(cfg.validate().is_err());
+        cfg.rescale_factor = f64::INFINITY;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn preprocess_rejects_max_pixels_before_resize_allocation() {
+        let mut cfg = PaddleOcrImageProcessorConfig::paddleocr_vl_defaults();
+        cfg.min_pixels = usize::MAX;
+        cfg.max_pixels = usize::MAX;
+        assert!(
+            cfg.validate().is_err(),
+            "invalid budget must fail validation"
+        );
+        assert!(preprocess_rgb8(&cfg, &[0, 0, 0], 1, 1).is_err());
+    }
+
+    #[test]
+    fn preprocess_rescales_through_f64_before_f32() {
+        let cfg = PaddleOcrImageProcessorConfig {
+            min_pixels: 1,
+            max_pixels: 1,
+            patch_size: 1,
+            merge_size: 1,
+            image_mean: [0.0; 3],
+            image_std: [1.0; 3],
+            rescale_factor: 1.0 / 255.0,
+        };
+        let out = preprocess_rgb8(&cfg, &[254, 0, 0], 1, 1).expect("1x1 preprocess");
+        assert_eq!(out.pixel_values[0], (254.0f64 / 255.0) as f32);
+    }
+
+    #[test]
+    fn oversized_preprocessor_json_is_rejected_before_read() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("preprocessor_config.json");
+        let file = std::fs::File::create(&path).expect("create config");
+        file.set_len(MAX_CONFIG_JSON_BYTES + 1)
+            .expect("extend config");
+        let err = PaddleOcrImageProcessorConfig::from_preprocessor_json(&path)
+            .expect_err("oversized config");
+        assert!(err.to_string().contains("MAX_CONFIG_JSON_BYTES"));
+    }
+
+    #[test]
+    fn image_dimensions_and_buffer_lengths_are_bounded() {
+        let cfg = PaddleOcrImageProcessorConfig::paddleocr_vl_defaults();
+        assert!(preprocess_rgb8(&cfg, &[], MAX_IMAGE_SIDE + 1, 1).is_err());
+        assert!(resize_bicubic_rgb8(&[], MAX_IMAGE_SIDE + 1, 1, 1, 1).is_err());
+        assert!(resize_bicubic_rgb8(&[0, 0, 0], 1, 1, 1, MAX_IMAGE_SIDE + 1).is_err());
+        assert!(resize_bicubic_rgb8(&[0, 0, 0], 1, 1, 1, 1).is_ok());
+        assert!(preprocess_rgb8(&cfg, &[0, 0, 0], 1, 1).is_ok());
     }
 
     #[test]
