@@ -123,6 +123,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [085](ADR-085-explicit-quantization-simd.md)                  | Explicit Quantization SIMD Dispatch                                                                          | Accepted | ADR-058                                |
 | [086](ADR-086-retire-legacy-qwen-decode-api.md)               | Retire the Legacy Generic Qwen Decode API                                                                    | Accepted | ADR-080                                |
 | [087](ADR-087-bench-compare-gate-calibration-and-coverage.md) | Bench-compare Gate Calibration, Coverage, and Admissible Structural Proof                                    | Accepted | ADR-058, ADR-064                       |
+| [089](ADR-089-paddleocr-vl-cpu-reference-gated-by-goldens.md) | PaddleOCR-VL: CPU reference forward per slice, each gated by HF goldens, before any accelerated path         | Proposed |                                        |
 | [088](ADR-088-sealed-native-embedding-attestation.md)         | Sealed Native Embedding Preparation and Attestation                                                          | Proposed | ADR-003, ADR-005, ADR-014–017, ADR-087 |
 
 ## informational
