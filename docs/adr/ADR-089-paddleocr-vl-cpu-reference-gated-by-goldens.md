@@ -29,8 +29,12 @@ port, and a Metal path written against a wrong CPU reference would carry the err
    tolerance and a reported worst diff. The end-to-end gate asserts the preprocessing grid, prompt ids, rope
    positions, projector rows, spliced embeddings, the greedy choice at every prompt position, and the greedy
    token sequence exactly.
-3. Every gate is fail-closed: it skips with a printed line when the checkpoint is absent and panics under
-   `LATTICE_POCR_GATE_ENFORCE=1`, so a CI run without the checkpoint cannot read as a pass.
+3. Every gate is fail-closed where the checkpoint exists: the job `PaddleOCR-VL ERNIE-4.5 decoder gate
+   (ARM Linux)` in `.github/workflows/e2e-parity.yml` provisions the pinned checkpoint and runs the decoder,
+   vision, and end-to-end goldens with `LATTICE_POCR_GATE_ENFORCE=1`, under which a missing checkpoint or a
+   disabled `f16` feature panics. In every other job the test prints `SKIP <test>: checkpoint not found` and
+   returns; that run is degraded, not passing, and no PR may cite it as gate evidence. A slice is not merged
+   until its gate runs in that job.
 4. Each slice's PR records mutation arms: a deliberate convention flip (interpolation mode, RoPE section
    order, projector row order, GELU variant) run against the gate, with the outcome stated even when the
    fixture does not discriminate it. An undiscriminated arm is written down as a known gap, not dropped.
@@ -52,7 +56,11 @@ port, and a Metal path written against a wrong CPU reference would carry the err
   two callers; a change to them must keep both families' goldens green.
 - One known undiscriminated arm exists: the projector GELU variant swap passes the vision goldens at the
   current tolerance because the 4608-wide second linear averages the difference down; the end-to-end token
-  gate is the check that catches it.
+  gate is the check that catches it today. When the Metal slice opens, a projector-output golden at a tighter
+  tolerance is added so the token gate is not the only catcher.
+- At the time of writing the checkpoint job runs the decoder gate only; the vision and end-to-end goldens
+  join the same job in the workflow change that follows #1463. Until it lands they skip green in every CI
+  job, which is exactly the degraded arm decision 3 removes.
 
 ## Evidence
 
