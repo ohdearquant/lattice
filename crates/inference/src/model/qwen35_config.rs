@@ -13,8 +13,7 @@ use crate::stop_reason::StopReason;
 use std::path::Path;
 use std::sync::Arc;
 
-#[allow(unused_imports)]
-pub(crate) use crate::model::config_file::{MAX_CONFIG_JSON_BYTES, read_config_json_bounded};
+use crate::model::config_file::read_config_json_bounded;
 
 /// Chat turn end token for Qwen models.
 pub const QWEN_CHAT_IM_END_TOKEN_ID: u32 = 248_046;
@@ -406,17 +405,6 @@ pub(crate) const MAX_VISION_IN_CHANNELS: usize = 256;
 /// rejecting the multi-terabyte hostile case by several orders of magnitude.
 pub(crate) const MAX_VISION_TENSOR_BYTES: u128 = 536_870_912;
 
-/// Upper bound, in bytes, on a checkpoint configuration file accepted from a checkpoint directory (FIX 5).
-///
-/// `from_config_json` / `from_config_json_validated` (both independent `read_to_string`
-/// call sites) previously materialized the entire file into a `String` with no size limit,
-/// and `serde_json`'s `#[serde(default)]`/passthrough deserialization accepts unknown
-/// fields rather than rejecting them -- so an arbitrarily large ignored top-level field
-/// (e.g. a multi-gigabyte junk string under an unused key) exhausts memory before any
-/// bounded field-level validation in `validate()` ever runs. Real Qwen3.5/3.6 `config.json`
-/// files, including ones with a nested `vision_config`, are well under 100 KiB; 8 MiB
-/// (8,388,608) leaves nearly two orders of magnitude of headroom while rejecting the
-/// unbounded case.
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
 pub const QWEN3_NO_THINK_PREFIX: [u32; 6] = [
@@ -2585,6 +2573,7 @@ pub(crate) fn compute_layer_types(num_layers: usize, interval: usize) -> Vec<Lay
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::config_file::MAX_CONFIG_JSON_BYTES;
 
     #[test]
     fn test_config_construction_and_layer_types() {
