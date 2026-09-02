@@ -842,6 +842,62 @@ jobs:
           grep -q 'LATTICE_VISION_S4_E2E_COSINE' vision-s3-gate.log
           grep -q 'LATTICE_VISION_S4_E2E_MUTATION_COSINE' vision-s3-gate.log
 
+  # The ERNIE-4.5 decoder differential test is a required CPU gate. Its
+  # checkpoint is provisioned by a pinned, exact-set composite action so the
+  # test cannot silently skip on a clean runner.
+  paddleocr-decoder-gate:
+    name: PaddleOCR-VL ERNIE-4.5 decoder gate (ARM Linux)
+    needs: changes
+    if: needs.changes.outputs.engine == 'true' && github.event.pull_request.draft != true
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Cache Python packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: paddleocr-decoder-pip-${{ runner.os }}-${{ runner.arch }}-py311-v1
+
+      - name: Cache PaddleOCR-VL weights
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/huggingface/hub/models--PaddlePaddle--PaddleOCR-VL-1.6
+          key: hf-paddleocr-vl-${{ hashFiles('.github/actions/provision-paddleocr-vl/action.yml') }}
+
+      - name: Install Python deps
+        run: pip install "huggingface_hub==1.20.1"
+
+      - name: Provision PaddleOCR-VL checkpoint
+        id: provision
+        uses: ./.github/actions/provision-paddleocr-vl
+
+      - uses: ./.github/actions/rust-setup
+        with:
+          shared-key: paddleocr-decoder-gate
+
+      - name: Run ERNIE-4.5 decoder differential gate (fail-closed)
+        env:
+          LATTICE_POCR_MODEL_DIR: ${{ steps.provision.outputs.model-dir }}
+          LATTICE_POCR_GATE_ENFORCE: '1'
+        run: |
+          if cargo test --release -p lattice-inference --features f16 \
+            --test paddleocr_vl_decoder_goldens_test -- --nocapture > paddleocr-decoder-gate.log 2>&1
+          then
+            cat paddleocr-decoder-gate.log
+          else
+            status=$?
+            cat paddleocr-decoder-gate.log
+            exit "$status"
+          fi
+          grep -q '^LATTICE_POCR_DECODER_CASE ' paddleocr-decoder-gate.log
+          grep -q '^LATTICE_POCR_DECODER_GATE cases=4 checkpoint_revision=c5630abae1d940eafe0697512a0325494b02ab42$' paddleocr-decoder-gate.log
+
   # The QuaRot converter and its refuse-on-fail forward-equivalence check are
   # pure f64 CPU work. Generating the 0.62 GB artifact on the macOS runner held
   # the scarce pool for 14-18 minutes before any Metal assertion ran. Generate
@@ -1258,6 +1314,7 @@ jobs:
         wasm-parity,
         wasm-simd128-parity,
         vision-cpu-gates,
+        paddleocr-decoder-gate,
         quarot-artifact,
         q4-vision-gates,
         ppl-gate-selftest,
@@ -1277,6 +1334,7 @@ jobs:
           WASM_RESULT="${{ needs.wasm-parity.result }}"
           WASM_SIMD128_RESULT="${{ needs.wasm-simd128-parity.result }}"
           VISION_CPU_RESULT="${{ needs.vision-cpu-gates.result }}"
+          POCR_DECODER_RESULT="${{ needs.paddleocr-decoder-gate.result }}"
           QUAROT_ARTIFACT_RESULT="${{ needs.quarot-artifact.result }}"
           # The QuaRot golden, S5b, Metal injection gate and Q4 PPL regression
           # gate remain steps of one macOS job and report one result.
@@ -1289,7 +1347,7 @@ jobs:
           # draft branch below must never fire on merge_group, push, schedule,
           # or workflow_dispatch.
           DRAFT="${{ github.event.pull_request.draft }}"
-          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT vision-cpu-gates=$VISION_CPU_RESULT quarot-artifact=$QUAROT_ARTIFACT_RESULT q4-vision-gates=$Q4VISION_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
+          echo "changes=$CHANGES_RESULT engine=$ENGINE tune=$TUNE parity=$PARITY_RESULT embed-drift=$DRIFT_RESULT wasm-parity=$WASM_RESULT wasm-simd128-parity=$WASM_SIMD128_RESULT vision-cpu-gates=$VISION_CPU_RESULT paddleocr-decoder-gate=$POCR_DECODER_RESULT quarot-artifact=$QUAROT_ARTIFACT_RESULT q4-vision-gates=$Q4VISION_RESULT ppl-gate-selftest=$PPL_SELFTEST_RESULT metal-parity=$METAL_RESULT layer23-golden=$LAYER23_RESULT event=$EVENT_NAME"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed — failing closed."
             exit 1
@@ -1340,6 +1398,10 @@ jobs:
             echo "::error::Engine changed and the ARM Linux S3a/S4 CPU gates did not succeed (result=$VISION_CPU_RESULT)."
             exit 1
           fi
+          if [ "$POCR_DECODER_RESULT" != "success" ]; then
+            echo "::error::Engine changed and the ARM Linux ERNIE-4.5 decoder gate did not succeed (result=$POCR_DECODER_RESULT)."
+            exit 1
+          fi
           if [ "$QUAROT_ARTIFACT_RESULT" != "success" ]; then
             echo "::error::Engine changed and the ARM Linux QuaRot artifact job did not succeed (result=$QUAROT_ARTIFACT_RESULT)."
             exit 1
@@ -1360,5 +1422,5 @@ jobs:
               exit 1
             fi
           fi
-          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, vision-cpu-gates, quarot-artifact, q4-vision-gates, ppl-gate-selftest, and metal-parity all PASSED."
+          echo "Engine changed; parity, embed-drift, wasm-parity, wasm-simd128-parity, vision-cpu-gates, paddleocr-decoder-gate, quarot-artifact, q4-vision-gates, ppl-gate-selftest, and metal-parity all PASSED."
           exit 0
