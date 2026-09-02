@@ -27,20 +27,10 @@ pub(crate) fn read_config_json_bounded(path: &Path, what: &str) -> Result<String
             "{what} at {} is not a regular file",
             path.display()
         )),
-        BoundedReadError::TooLarge { len, cap } => {
-            if len == cap + 1 {
-                InferenceError::Inference(format!(
-                    "{what} at {} is exceeding MAX_CONFIG_JSON_BYTES ({cap})",
-                    path.display()
-                ))
-            } else {
-                InferenceError::Inference(format!(
-                    "{what} at {} is {len} bytes, exceeding MAX_CONFIG_JSON_BYTES \
-                     ({cap})",
-                    path.display()
-                ))
-            }
-        }
+        BoundedReadError::TooLarge { len, cap } => InferenceError::Inference(format!(
+            "{what} at {} is {len} bytes, exceeding MAX_CONFIG_JSON_BYTES ({cap})",
+            path.display()
+        )),
         BoundedReadError::Io(error) => InferenceError::Io(error),
     })
 }
