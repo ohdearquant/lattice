@@ -13,7 +13,12 @@ pub(crate) enum BoundedReadError {
     Io(io::Error),
 }
 
-/// Read a regular file through one non-blocking handle, bounded to `cap` bytes.
+/// Read a regular file, bounded to `cap` bytes.
+///
+/// On Unix the handle is opened with `O_NONBLOCK`, so a FIFO or device at
+/// `path` fails instead of hanging the caller. On other platforms only the
+/// regular-file check after `open` guards against special paths; opening one
+/// there may block, and the non-blocking guarantee is not claimed.
 pub(crate) fn read_bytes_bounded(path: &Path, cap: u64) -> Result<Vec<u8>, BoundedReadError> {
     let mut options = OpenOptions::new();
     options.read(true);
