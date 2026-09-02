@@ -57,6 +57,7 @@ pub mod weights;
 /// Continuous batching and scheduler support for multi-sequence inference. See [`kv_cache`]
 /// and [`model`].
 pub mod batch;
+pub(crate) mod bounded_read;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].
