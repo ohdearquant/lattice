@@ -72,12 +72,23 @@ check_platform_pkgjson() {  # $1=platform $2=pkgdir $3=pkgjson
 }
 
 # Guard: print the exact .node filename platform pkgjson's "main" field
-# names, or nothing if it names none. Shared by platform_matrix_guard's
-# fail-closed check below and platform_binaries_present's yes/no probe, so
-# the "exact filename from main, not a *.node glob" resolution rule lives in
-# exactly one place.
+# names, or nothing if it names none OR the value is not trustworthy as a
+# bare filename within the platform directory. Shared by
+# platform_matrix_guard's fail-closed check below and
+# platform_binaries_present's yes/no probe, so both the "exact filename from
+# main, not a *.node glob" resolution rule AND this validation rule live in
+# exactly one place: a present-but-untrusted "main" (a path separator, a
+# ".." segment, or a non-".node" extension) must resolve the same as an
+# absent one, since every caller already treats an empty result as
+# fail-closed via its own `[ -z "$node_rel" ]` check.
 platform_node_rel() {  # $1=pkgjson
-    node -p "require('$1').main || ''"
+    node -e '
+        const fs = require("fs")
+        const pkg = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+        const main = pkg.main || ""
+        const valid = main && !main.includes("/") && !main.includes("\\") && !main.includes("..") && main.endsWith(".node")
+        process.stdout.write(valid ? main : "")
+    ' "$1"
 }
 
 # Probe: report via exit status alone (never a hard error) whether every

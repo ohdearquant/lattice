@@ -15,30 +15,48 @@
 import { execFileSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const nativeDir = dirname(dirname(fileURLToPath(import.meta.url)))
-const pkg = JSON.parse(readFileSync(join(nativeDir, 'package.json'), 'utf8'))
-const platforms = Object.keys(pkg.optionalDependencies || {}).map(name =>
-  name.replace('@khive-ai/lattice-embed-', '')
-)
 
-function platformBinariesPresent() {
+// A platform package's "main" is trusted only when it resolves to exactly
+// the .node file the platform directory ships -- not any existing path the
+// field happens to name. Rejects an absent/empty value, a path separator
+// (forward or back), a ".." segment, and any extension other than ".node".
+export function isValidPlatformMain(main) {
+  return Boolean(main) && !main.includes('/') && !main.includes('\\') && !main.includes('..') && main.endsWith('.node')
+}
+
+// npm's own executable is `npm.cmd` on Windows; spawning the bare `npm`
+// name via execFileSync (no shell) throws ENOENT there instead of running
+// the artifacts step.
+export function npmCommandFor(platform) {
+  return platform === 'win32' ? 'npm.cmd' : 'npm'
+}
+
+export function platformBinariesPresent(dir) {
+  const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+  const platforms = Object.keys(pkg.optionalDependencies || {}).map(name =>
+    name.replace('@khive-ai/lattice-embed-', '')
+  )
   if (platforms.length === 0) return false
   for (const platform of platforms) {
-    const platformPkgPath = join(nativeDir, 'npm', platform, 'package.json')
+    const platformPkgPath = join(dir, 'npm', platform, 'package.json')
     if (!existsSync(platformPkgPath)) return false
     const platformPkg = JSON.parse(readFileSync(platformPkgPath, 'utf8'))
     const main = platformPkg.main || ''
-    if (!main || !existsSync(join(nativeDir, 'npm', platform, main))) return false
+    if (!isValidPlatformMain(main) || !existsSync(join(dir, 'npm', platform, main))) return false
   }
   return true
 }
 
-if (platformBinariesPresent()) {
-  console.log(
-    'Platform prebuilds already present for every configured target; skipping `napi artifacts`.'
-  )
-} else {
-  execFileSync('npm', ['run', 'artifacts'], { cwd: nativeDir, stdio: 'inherit' })
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+if (isMainModule) {
+  if (platformBinariesPresent(nativeDir)) {
+    console.log(
+      'Platform prebuilds already present for every configured target; skipping `napi artifacts`.'
+    )
+  } else {
+    execFileSync(npmCommandFor(process.platform), ['run', 'artifacts'], { cwd: nativeDir, stdio: 'inherit' })
+  }
 }
