@@ -22,7 +22,9 @@
 //! PIL 12.3.0.
 
 use crate::error::InferenceError;
+#[cfg(test)]
 use crate::model::qwen35_config::MAX_CONFIG_JSON_BYTES;
+use crate::model::qwen35_config::read_config_json_bounded;
 use std::collections::TryReserveError;
 use std::path::Path;
 
@@ -176,14 +178,7 @@ impl PaddleOcrImageProcessorConfig {
 
     /// Parse a `preprocessor_config.json` file.
     pub fn from_preprocessor_json(path: &Path) -> Result<Self, InferenceError> {
-        let file_len = std::fs::metadata(path).map_err(InferenceError::Io)?.len();
-        if file_len > MAX_CONFIG_JSON_BYTES {
-            return Err(InferenceError::Inference(format!(
-                "preprocessor_config at {} is {file_len} bytes, exceeding MAX_CONFIG_JSON_BYTES ({MAX_CONFIG_JSON_BYTES})",
-                path.display()
-            )));
-        }
-        let raw = std::fs::read_to_string(path).map_err(InferenceError::Io)?;
+        let raw = read_config_json_bounded(path, "preprocessor_config")?;
         Self::from_preprocessor_json_str(&raw)
     }
 
@@ -1000,6 +995,17 @@ mod tests {
         let err = PaddleOcrImageProcessorConfig::from_preprocessor_json(&path)
             .expect_err("oversized config");
         assert!(err.to_string().contains("MAX_CONFIG_JSON_BYTES"));
+    }
+
+    #[test]
+    fn preprocessor_json_rejects_a_directory() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let err = PaddleOcrImageProcessorConfig::from_preprocessor_json(directory.path())
+            .expect_err("a directory must be rejected as a preprocessor config file");
+        assert!(
+            err.to_string().contains("is not a regular file"),
+            "wrong error: {err}"
+        );
     }
 
     #[test]
