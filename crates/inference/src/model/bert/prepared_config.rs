@@ -1448,7 +1448,7 @@ mod tests {
                 PreparedBertConfigSyntaxFault::InvalidNumber,
             ),
             (
-                CANONICAL.replace("11,", "tru,").into_bytes(),
+                CANONICAL.replace("11,", "txue,").into_bytes(),
                 PreparedBertConfigSyntaxFault::InvalidLiteral,
             ),
             (
