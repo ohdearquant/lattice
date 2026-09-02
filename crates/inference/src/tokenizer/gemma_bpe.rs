@@ -64,7 +64,7 @@ struct GemmaBpeInner {
     id_to_token: Vec<String>,
     merges: HashMap<String, HashMap<String, usize>>,
     special_tokens: HashMap<String, u32>,
-    special_tokens_sorted: Vec<String>,
+    special_token_trie: SpecialTokenTrie,
     /// Rendered decode text for added tokens with `special=false`. Empty for
     /// the target checkpoint (all 24 added tokens are `special=true`), kept
     /// for shape parity with the general loading contract.
@@ -75,6 +75,80 @@ struct GemmaBpeInner {
     pad_id: u32,
     unk_id: Option<u32>,
     max_seq_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SpecialTokenTrie {
+    nodes: Vec<SpecialTokenTrieNode>,
+}
+
+#[derive(Debug, Clone)]
+struct SpecialTokenTrieNode {
+    children: Vec<(u8, usize)>,
+    terminal_id: Option<u32>,
+}
+
+impl SpecialTokenTrie {
+    fn new() -> Self {
+        Self {
+            nodes: vec![SpecialTokenTrieNode {
+                children: Vec::new(),
+                terminal_id: None,
+            }],
+        }
+    }
+
+    fn from_tokens(tokens: &HashMap<String, u32>) -> Self {
+        let mut trie = Self::new();
+        for (token, &id) in tokens {
+            trie.insert(token, id);
+        }
+        trie
+    }
+
+    fn insert(&mut self, token: &str, id: u32) {
+        let mut node_index = 0;
+        for &byte in token.as_bytes() {
+            let child_index = match self.nodes[node_index]
+                .children
+                .binary_search_by_key(&byte, |&(key, _)| key)
+            {
+                Ok(child_position) => self.nodes[node_index].children[child_position].1,
+                Err(child_position) => {
+                    let child_index = self.nodes.len();
+                    self.nodes.push(SpecialTokenTrieNode {
+                        children: Vec::new(),
+                        terminal_id: None,
+                    });
+                    self.nodes[node_index]
+                        .children
+                        .insert(child_position, (byte, child_index));
+                    child_index
+                }
+            };
+            node_index = child_index;
+        }
+        self.nodes[node_index].terminal_id = Some(id);
+    }
+
+    fn match_at(&self, text: &str, pos: usize) -> Option<(usize, u32)> {
+        let mut node_index = 0;
+        let mut best = None;
+        for (offset, &byte) in text.as_bytes()[pos..].iter().enumerate() {
+            let Some(child_position) = self.nodes[node_index]
+                .children
+                .binary_search_by_key(&byte, |&(key, _)| key)
+                .ok()
+            else {
+                break;
+            };
+            node_index = self.nodes[node_index].children[child_position].1;
+            if let Some(id) = self.nodes[node_index].terminal_id {
+                best = Some((pos + offset + 1, id));
+            }
+        }
+        best
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -133,14 +207,75 @@ impl GemmaBpeTokenizer {
     pub fn from_tokenizer_json_str(text: &str) -> Result<Self, InferenceError> {
         let root = parse_json(text)?;
         validate_gemma_bpe_shape(&root)?;
+        Self::build_from_validated(&root, DEFAULT_MAX_SEQ_LEN)
+    }
 
+    /// **Unstable**: load an ERNIE-family SentencePiece-BPE
+    /// `tokenizer.json` file (PaddleOCR-VL's `LlamaTokenizer`-class fast
+    /// serialization). Selected explicitly by the caller, exactly like the
+    /// Gemma constructor above. The maximum sequence length comes from a
+    /// positive `truncation.max_length` in `tokenizer.json`, or otherwise
+    /// from a positive `model_max_length` in the sibling
+    /// `tokenizer_config.json`.
+    pub fn from_ernie_tokenizer_json(path: &Path) -> Result<Self, InferenceError> {
+        let text = fs::read_to_string(path).map_err(|e| {
+            InferenceError::Tokenizer(format!("failed to read {}: {e}", path.display()))
+        })?;
+        let root = parse_json(&text)?;
+        validate_ernie_bpe_shape(&root)?;
+        let max_seq_len = ernie_max_seq_len(&root, path)?;
+        Self::build_from_validated(&root, max_seq_len)
+    }
+
+    /// **Unstable**: load an ERNIE-family SentencePiece-BPE `tokenizer.json`
+    /// string.
+    ///
+    /// `max_seq_len` is supplied explicitly because a string has no sibling
+    /// `tokenizer_config.json` from which to derive the limit.
+    ///
+    /// The ERNIE shape (read from `PaddlePaddle/PaddleOCR-VL-1.6`'s
+    /// `tokenizer.json`) differs from Gemma's in exactly two
+    /// behavior-identical declarations, so it shares this type's whole
+    /// encode/decode engine and only the fail-closed validator differs:
+    ///
+    /// - `normalizer` is `Sequence([Replace(" " -> "\u{2581}")])` — the same
+    ///   single replace, wrapped in a one-element `Sequence`;
+    /// - `pre_tokenizer` is `null` — Gemma declares a literal-space `Split`
+    ///   that never fires because the normalizer has already consumed every
+    ///   space (see the module docs), so "absent" and "dead" are the same
+    ///   pipeline.
+    ///
+    /// Every `model` field the merge/fallback logic depends on
+    /// (`type == "BPE"`, `byte_fallback == true`, `fuse_unk == true`,
+    /// `ignore_merges == false`, null affixes/dropout) and the exact
+    /// `Sequence[Replace, ByteFallback, Fuse]` decoder are validated
+    /// identically to the Gemma path.
+    pub fn from_ernie_tokenizer_json_str(
+        text: &str,
+        max_seq_len: usize,
+    ) -> Result<Self, InferenceError> {
+        if max_seq_len == 0 {
+            return Err(InferenceError::Tokenizer(
+                "ERNIE tokenizer max_seq_len must be greater than zero".into(),
+            ));
+        }
+        let root = parse_json(text)?;
+        validate_ernie_bpe_shape(&root)?;
+        Self::build_from_validated(&root, max_seq_len)
+    }
+
+    /// Shared constructor body for the validated Gemma/ERNIE shapes: both
+    /// validators guarantee the identical effective pipeline this engine
+    /// implements (metaspace replace -> BPE merges with byte fallback ->
+    /// run-based fallback decode), so everything past validation is common.
+    fn build_from_validated(root: &JsonValue, max_seq_len: usize) -> Result<Self, InferenceError> {
         let vocab =
-            json_object_to_vocab(json_path(&root, &["model", "vocab"]).ok_or_else(|| {
+            json_object_to_vocab(json_path(root, &["model", "vocab"]).ok_or_else(|| {
                 InferenceError::Tokenizer("tokenizer.json missing model.vocab".into())
             })?)?;
         let id_to_token = invert_vocab(&vocab)?;
 
-        let merges_value = json_path(&root, &["model", "merges"]).ok_or_else(|| {
+        let merges_value = json_path(root, &["model", "merges"]).ok_or_else(|| {
             InferenceError::Tokenizer("tokenizer.json missing model.merges".into())
         })?;
         let merges_list = parse_merges_json(merges_value)?;
@@ -153,9 +288,9 @@ impl GemmaBpeTokenizer {
                 .or_insert(rank);
         }
 
-        let mut added = parse_added_tokens(&root);
+        let mut added = parse_added_tokens(root);
         added.retain(|name, _| !name.is_empty());
-        let added_render: HashMap<u32, String> = parse_rendered_added_tokens(&root);
+        let added_render: HashMap<u32, String> = parse_rendered_added_tokens(root);
         let rendered_ids: HashSet<u32> = added_render.keys().copied().collect();
         let special_skip_ids: HashSet<u32> = added
             .values()
@@ -169,8 +304,7 @@ impl GemmaBpeTokenizer {
                 special_tokens.entry(name.to_string()).or_insert(id);
             }
         }
-        let mut special_tokens_sorted: Vec<String> = special_tokens.keys().cloned().collect();
-        special_tokens_sorted.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        let special_token_trie = SpecialTokenTrie::from_tokens(&special_tokens);
 
         let pad_id = known_special_id(&vocab, &["<pad>"]).unwrap_or(0);
         let unk_id = known_special_id(&vocab, &["<unk>"]);
@@ -181,12 +315,12 @@ impl GemmaBpeTokenizer {
                 id_to_token,
                 merges: merge_ranks,
                 special_tokens,
-                special_tokens_sorted,
+                special_token_trie,
                 added_render,
                 special_skip_ids,
                 pad_id,
                 unk_id,
-                max_seq_len: DEFAULT_MAX_SEQ_LEN,
+                max_seq_len,
             }),
         })
     }
@@ -200,7 +334,18 @@ impl GemmaBpeTokenizer {
         }
     }
 
-    fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
+    /// **Unstable**: returns the vocabulary spelling for `id`; added tokens
+    /// return their declared content.
+    pub fn token_str(&self, id: u32) -> Option<&str> {
+        self.inner
+            .special_tokens
+            .iter()
+            .find_map(|(token, &token_id)| (token_id == id).then_some(token.as_str()))
+            .or_else(|| self.inner.id_to_token.get(id as usize).map(String::as_str))
+    }
+
+    /// Returns the tokenized IDs and the pre-truncation token count.
+    fn tokenize_to_ids(&self, text: &str) -> (Vec<u32>, usize) {
         let mut ids = Vec::new();
         let mut segment_start = 0usize;
         let mut pos = 0usize;
@@ -223,22 +368,15 @@ impl GemmaBpeTokenizer {
         if segment_start < text.len() {
             self.encode_segment(&text[segment_start..], &mut ids);
         }
+        let pre_truncation_len = ids.len();
         if ids.len() > self.inner.max_seq_len {
             ids.truncate(self.inner.max_seq_len);
         }
-        ids
+        (ids, pre_truncation_len)
     }
 
     fn match_special(&self, text: &str, pos: usize) -> Option<(usize, u32)> {
-        let tail = &text[pos..];
-        for token in &self.inner.special_tokens_sorted {
-            if tail.starts_with(token.as_str())
-                && let Some(&id) = self.inner.special_tokens.get(token)
-            {
-                return Some((pos + token.len(), id));
-            }
-        }
-        None
+        self.inner.special_token_trie.match_at(text, pos)
     }
 
     /// Normalize (space -> ▁), split into initial BPE symbols (char, or
@@ -446,8 +584,13 @@ fn flush_byte_fallback_run(pending: &mut Vec<u8>, out: &mut String) {
 
 impl Tokenizer for GemmaBpeTokenizer {
     fn tokenize(&self, text: &str) -> TokenizedInput {
-        let ids = self.tokenize_to_ids(text);
-        pad_ids(ids, self.inner.max_seq_len, self.inner.pad_id)
+        let (ids, pre_truncation_len) = self.tokenize_to_ids(text);
+        pad_ids(
+            ids,
+            self.inner.max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 
     fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput> {
@@ -457,12 +600,14 @@ impl Tokenizer for GemmaBpeTokenizer {
         let mut max_len = 0usize;
         let mut all = Vec::with_capacity(texts.len());
         for text in texts {
-            let ids = self.tokenize_to_ids(text);
+            let (ids, pre_truncation_len) = self.tokenize_to_ids(text);
             max_len = max_len.max(ids.len());
-            all.push(ids);
+            all.push((ids, pre_truncation_len));
         }
         all.into_iter()
-            .map(|ids| pad_ids(ids, max_len, self.inner.pad_id))
+            .map(|(ids, pre_truncation_len)| {
+                pad_ids(ids, max_len, self.inner.pad_id, pre_truncation_len)
+            })
             .collect()
     }
 
@@ -483,6 +628,38 @@ impl Tokenizer for GemmaBpeTokenizer {
     fn max_seq_len(&self) -> usize {
         self.inner.max_seq_len
     }
+}
+
+fn ernie_max_seq_len(root: &JsonValue, tokenizer_path: &Path) -> Result<usize, InferenceError> {
+    if let Some(max_seq_len) = positive_seq_len(json_path(root, &["truncation", "max_length"])) {
+        return Ok(max_seq_len);
+    }
+
+    let config_path = tokenizer_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("tokenizer_config.json");
+    if let Ok(config_text) = fs::read_to_string(&config_path)
+        && let Ok(config) = parse_json(&config_text)
+        && let Some(max_seq_len) = positive_seq_len(config.get("model_max_length"))
+    {
+        return Ok(max_seq_len);
+    }
+
+    Err(InferenceError::Tokenizer(format!(
+        "ERNIE tokenizer sequence limit missing: expected positive \
+         truncation.max_length in {} or model_max_length in {}",
+        tokenizer_path.display(),
+        config_path.display()
+    )))
+}
+
+fn positive_seq_len(value: Option<&JsonValue>) -> Option<usize> {
+    value
+        .and_then(JsonValue::as_u64)
+        .filter(|&value| value > 0)
+        .and_then(|value| usize::try_from(value).ok())
 }
 
 fn byte_fallback_token(byte: u8) -> String {
@@ -512,23 +689,7 @@ fn parse_byte_fallback_token(tok: &str) -> Option<u8> {
 /// logic depends on. Every field this constructor does *not* check is
 /// exactly the set this loader's encode/decode logic never reads.
 fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
-    let model_type = json_path(root, &["model", "type"])
-        .and_then(JsonValue::as_str)
-        .unwrap_or("");
-    if model_type != "BPE" {
-        return Err(InferenceError::Tokenizer(format!(
-            "GemmaBpeTokenizer expects tokenizer.json model.type == \"BPE\", found {model_type:?}"
-        )));
-    }
-
-    let byte_fallback = json_path(root, &["model", "byte_fallback"])
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    if !byte_fallback {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects tokenizer.json model.byte_fallback == true".into(),
-        ));
-    }
+    validate_spm_bpe_model_fields(root, "GemmaBpeTokenizer")?;
 
     let normalizer = root.get("normalizer");
     let is_gemma_normalizer = normalizer.is_some_and(|n| {
@@ -574,47 +735,127 @@ fn validate_gemma_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
                 .into(),
         ));
     };
-    validate_gemma_decoder_sequence(decoders)?;
+    validate_gemma_decoder_sequence(decoders)
+}
 
-    let model = root.get("model").unwrap_or(&JsonValue::Null);
-    if !is_null_or_absent(model.get("dropout")) {
+/// Fails closed unless `root` matches the ERNIE SentencePiece-BPE shape
+/// (see [`GemmaBpeTokenizer::from_ernie_tokenizer_json_str`]): the same
+/// `model` and `decoder` contract as the Gemma validator, a one-element
+/// `Sequence([Replace(" " -> "\u{2581}")])` normalizer, and an absent/null
+/// `pre_tokenizer`. A Gemma-shaped file fails this validator (bare `Replace`
+/// normalizer, literal-`Split` pre-tokenizer) just as an ERNIE-shaped file
+/// fails the Gemma one — each constructor keeps making an explicit
+/// structural claim about its input instead of best-effort adapting.
+fn validate_ernie_bpe_shape(root: &JsonValue) -> Result<(), InferenceError> {
+    validate_spm_bpe_model_fields(root, "ErnieBpe (GemmaBpeTokenizer ERNIE path)")?;
+
+    let normalizer = root.get("normalizer");
+    let is_ernie_normalizer = normalizer.is_some_and(|n| {
+        n.get("type").and_then(JsonValue::as_str) == Some("Sequence")
+            && n.get("normalizers")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|stages| {
+                    stages.len() == 1
+                        && stages[0].get("type").and_then(JsonValue::as_str) == Some("Replace")
+                        && json_path(&stages[0], &["pattern", "String"]).and_then(JsonValue::as_str)
+                            == Some(" ")
+                        && stages[0].get("content").and_then(JsonValue::as_str) == Some("\u{2581}")
+                })
+    });
+    if !is_ernie_normalizer {
         return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.dropout == null (this loader \
-             always applies BPE merges); tokenizer.json declares a different \
-             shape, refusing to guess"
-                .into(),
-        ));
-    }
-    if !is_null_or_absent(model.get("continuing_subword_prefix")) {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.continuing_subword_prefix == null \
-             (this loader never affix-wraps a subword); tokenizer.json declares \
+            "ERNIE BPE path expects a Sequence normalizer containing exactly \
+             one Replace(\" \" -> \"\u{2581}\") stage; tokenizer.json declares \
              a different shape, refusing to guess"
                 .into(),
         ));
     }
-    if !is_null_or_absent(model.get("end_of_word_suffix")) {
+
+    if !is_null_or_absent(root.get("pre_tokenizer")) {
         return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.end_of_word_suffix == null (this \
+            "ERNIE BPE path expects pre_tokenizer == null (the normalizer has \
+             already consumed every space, so any declared pre-tokenizer \
+             would be a pipeline this loader does not implement); \
+             tokenizer.json declares a different shape, refusing to guess"
+                .into(),
+        ));
+    }
+
+    let decoders = root
+        .get("decoder")
+        .filter(|d| d.get("type").and_then(JsonValue::as_str) == Some("Sequence"))
+        .and_then(|d| d.get("decoders"))
+        .and_then(JsonValue::as_array);
+    let Some(decoders) = decoders else {
+        return Err(InferenceError::Tokenizer(
+            "ERNIE BPE path expects decoder == Sequence[Replace(\"\u{2581}\" -> \
+             \" \"), ByteFallback, Fuse]; tokenizer.json declares a different \
+             shape, refusing to guess"
+                .into(),
+        ));
+    };
+    validate_gemma_decoder_sequence(decoders)
+}
+
+/// The `model`-field contract shared by the Gemma and ERNIE validators:
+/// `type == "BPE"`, `byte_fallback == true`, `fuse_unk == true`,
+/// `ignore_merges == false`, and null/absent
+/// `dropout`/`continuing_subword_prefix`/`end_of_word_suffix` — exactly the
+/// fields the BPE merge/fallback logic reads. `who` names the failing path
+/// in each error so a rejection is attributable.
+fn validate_spm_bpe_model_fields(root: &JsonValue, who: &str) -> Result<(), InferenceError> {
+    let model_type = json_path(root, &["model", "type"])
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    if model_type != "BPE" {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects tokenizer.json model.type == \"BPE\", found {model_type:?}"
+        )));
+    }
+
+    let byte_fallback = json_path(root, &["model", "byte_fallback"])
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+    if !byte_fallback {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects tokenizer.json model.byte_fallback == true"
+        )));
+    }
+
+    let model = root.get("model").unwrap_or(&JsonValue::Null);
+    if !is_null_or_absent(model.get("dropout")) {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.dropout == null (this loader always applies \
+             BPE merges); tokenizer.json declares a different shape, refusing \
+             to guess"
+        )));
+    }
+    if !is_null_or_absent(model.get("continuing_subword_prefix")) {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.continuing_subword_prefix == null (this \
              loader never affix-wraps a subword); tokenizer.json declares a \
              different shape, refusing to guess"
-                .into(),
-        ));
+        )));
+    }
+    if !is_null_or_absent(model.get("end_of_word_suffix")) {
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.end_of_word_suffix == null (this loader \
+             never affix-wraps a subword); tokenizer.json declares a \
+             different shape, refusing to guess"
+        )));
     }
     if model.get("fuse_unk").and_then(JsonValue::as_bool) != Some(true) {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.fuse_unk == true; tokenizer.json \
-             declares a different shape, refusing to guess"
-                .into(),
-        ));
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.fuse_unk == true; tokenizer.json declares a \
+             different shape, refusing to guess"
+        )));
     }
     if model.get("ignore_merges").and_then(JsonValue::as_bool) != Some(false) {
-        return Err(InferenceError::Tokenizer(
-            "GemmaBpeTokenizer expects model.ignore_merges == false (this \
-             loader always applies BPE merges); tokenizer.json declares a \
-             different shape, refusing to guess"
-                .into(),
-        ));
+        return Err(InferenceError::Tokenizer(format!(
+            "{who} expects model.ignore_merges == false (this loader always \
+             applies BPE merges); tokenizer.json declares a different shape, \
+             refusing to guess"
+        )));
     }
 
     Ok(())
@@ -796,4 +1037,46 @@ pub fn total_audio_marker_expansion_tokens(durations_ms: &[u32]) -> usize {
         .copied()
         .map(|ms| audio_marker_expansion_tokens(ms) as usize)
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SpecialTokenTrie;
+
+    #[test]
+    fn special_token_trie_prefers_the_longest_terminal() {
+        let mut trie = SpecialTokenTrie::new();
+        trie.insert("ab", 1);
+        trie.insert("abc", 2);
+
+        assert_eq!(trie.match_at("abc", 0), Some((3, 2)));
+        assert_eq!(trie.match_at("abx", 0), Some((2, 1)));
+    }
+
+    #[test]
+    fn special_token_trie_rejects_an_unterminated_shared_prefix() {
+        let mut trie = SpecialTokenTrie::new();
+        trie.insert("abc", 1);
+
+        assert_eq!(trie.match_at("abx", 0), None);
+    }
+
+    #[test]
+    fn special_token_trie_matches_after_a_multibyte_character() {
+        let mut trie = SpecialTokenTrie::new();
+        trie.insert("<loc>", 1);
+        let text = "é<loc>";
+
+        assert_eq!(trie.match_at(text, "é".len()), Some((text.len(), 1)));
+    }
+
+    #[test]
+    fn special_token_trie_matches_at_the_end_of_text() {
+        let mut trie = SpecialTokenTrie::new();
+        trie.insert("<end>", 1);
+        let text = "prefix<end>";
+        let pos = text.len() - "<end>".len();
+
+        assert_eq!(trie.match_at(text, pos), Some((text.len(), 1)));
+    }
 }

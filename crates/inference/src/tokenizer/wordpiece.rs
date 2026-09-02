@@ -478,14 +478,23 @@ impl WordPieceTokenizer {
         <Self as Tokenizer>::tokenize_pair(self, query, document)
     }
 
-    fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
+    /// Returns the tokenized IDs and the pre-truncation token count.
+    fn tokenize_to_ids(&self, text: &str) -> (Vec<u32>, usize) {
         let mut scratch = TokenizeScratch::default();
         let mut ids = Vec::with_capacity(text.len().saturating_div(2).max(8));
-        self.tokenize_to_ids_into(text, &mut scratch, &mut ids);
-        ids
+        let pre_truncation_len = self.tokenize_to_ids_into(text, &mut scratch, &mut ids);
+        (ids, pre_truncation_len)
     }
 
-    fn tokenize_to_ids_into(&self, text: &str, scratch: &mut TokenizeScratch, out: &mut Vec<u32>) {
+    /// Tokenizes into `out`, returning the pre-truncation token count (equal
+    /// to `out.len()` after this call unless truncation to `max_seq_len` was
+    /// applied, in which case it reports the larger, pre-truncation count).
+    fn tokenize_to_ids_into(
+        &self,
+        text: &str,
+        scratch: &mut TokenizeScratch,
+        out: &mut Vec<u32>,
+    ) -> usize {
         out.clear();
         out.push(self.inner.cls_id);
 
@@ -510,9 +519,10 @@ impl WordPieceTokenizer {
 
         out.push(self.inner.sep_id);
 
-        if out.len() > self.inner.max_seq_len {
+        let pre_truncation_len = out.len();
+        if pre_truncation_len > self.inner.max_seq_len {
             warn!(
-                original_len = out.len(),
+                original_len = pre_truncation_len,
                 max_seq_len = self.inner.max_seq_len,
                 "truncating tokenized input to max_seq_len"
             );
@@ -521,6 +531,7 @@ impl WordPieceTokenizer {
                 *last = self.inner.sep_id;
             }
         }
+        pre_truncation_len
     }
 
     /// Tokenize `text` payload without special tokens; push word-piece IDs into `out`.
@@ -589,10 +600,12 @@ impl WordPieceTokenizer {
         }
     }
 
-    fn pad_batch(&self, id_batches: Vec<Vec<u32>>, pad_to: usize) -> Vec<TokenizedInput> {
+    fn pad_batch(&self, id_batches: Vec<(Vec<u32>, usize)>, pad_to: usize) -> Vec<TokenizedInput> {
         id_batches
             .into_iter()
-            .map(|ids| pad_ids(ids, pad_to, self.inner.pad_id))
+            .map(|(ids, pre_truncation_len)| {
+                pad_ids(ids, pad_to, self.inner.pad_id, pre_truncation_len)
+            })
             .collect()
     }
 
@@ -613,8 +626,13 @@ impl WordPieceTokenizer {
 
 impl Tokenizer for WordPieceTokenizer {
     fn tokenize(&self, text: &str) -> TokenizedInput {
-        let ids = self.tokenize_to_ids(text);
-        pad_ids(ids, self.inner.max_seq_len, self.inner.pad_id)
+        let (ids, pre_truncation_len) = self.tokenize_to_ids(text);
+        pad_ids(
+            ids,
+            self.inner.max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 
     fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput> {
@@ -640,9 +658,13 @@ impl Tokenizer for WordPieceTokenizer {
                         let mut local_max = 0usize;
                         let mut local = Vec::with_capacity(chunk.len());
                         for text in chunk {
-                            tokenizer.tokenize_to_ids_into(text, &mut scratch, &mut reusable_ids);
+                            let pre_truncation_len = tokenizer.tokenize_to_ids_into(
+                                text,
+                                &mut scratch,
+                                &mut reusable_ids,
+                            );
                             local_max = local_max.max(reusable_ids.len());
-                            local.push(reusable_ids.clone());
+                            local.push((reusable_ids.clone(), pre_truncation_len));
                         }
                         (chunk_idx, local_max, local)
                     }));
@@ -672,9 +694,10 @@ impl Tokenizer for WordPieceTokenizer {
             let mut max_len = 0usize;
             let mut all = Vec::with_capacity(texts.len());
             for text in texts {
-                self.tokenize_to_ids_into(text, &mut scratch, &mut reusable_ids);
+                let pre_truncation_len =
+                    self.tokenize_to_ids_into(text, &mut scratch, &mut reusable_ids);
                 max_len = max_len.max(reusable_ids.len());
-                all.push(reusable_ids.clone());
+                all.push((reusable_ids.clone(), pre_truncation_len));
             }
             (all, max_len)
         };
@@ -703,6 +726,10 @@ impl Tokenizer for WordPieceTokenizer {
 
         self.tokenize_wordpiece_payload_into(query, &mut scratch, &mut query_ids);
         self.tokenize_wordpiece_payload_into(document, &mut scratch, &mut doc_ids);
+
+        // 3 special tokens ([CLS] + 2x [SEP]) plus both untruncated payloads,
+        // before the budget truncation below runs.
+        let pre_truncation_len = 3 + query_ids.len() + doc_ids.len();
 
         // 3 slots reserved for [CLS], first [SEP], final [SEP].
         let payload_budget = max_seq_len.saturating_sub(3);
@@ -743,7 +770,13 @@ impl Tokenizer for WordPieceTokenizer {
         ids.truncate(max_seq_len);
         token_type_ids.truncate(max_seq_len);
 
-        pad_ids_with_token_types(ids, token_type_ids, max_seq_len, self.inner.pad_id)
+        pad_ids_with_token_types(
+            ids,
+            token_type_ids,
+            max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 }
 

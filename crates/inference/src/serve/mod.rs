@@ -31,8 +31,11 @@ use crate::model::qwen35_config::GenerateConfig;
 /// Shared chat-completions wire DTO and normalization policies.
 pub mod contract;
 
-/// Shared `/v1/embeddings` wire DTO, model loader, and pooled-embedding
-/// dispatch.
+/// `/v1/embeddings` wire DTOs, model loader, and pooled-embedding dispatch
+/// for the vision-language route, plus a separate, GPU-independent
+/// `/v1/embeddings` wire DTO, input normalization, and response building for
+/// `lattice_serve`'s text-only route (issue #584). See the module's own doc
+/// comment for how the two relate.
 pub mod embeddings;
 
 /// Convert normalized contract messages into the engine's chat representation.
@@ -289,14 +292,16 @@ pub enum ApiError {
     /// or unvalidated JSON as a 200 is prohibited, so this is still a 500,
     /// just with a code the caller can branch on instead of a generic one.
     ServerError { message: String, code: &'static str },
-    /// Admission rejected: the shared Metal worker's outstanding-job cap
-    /// (queued + in-flight) is already full — HTTP 503 (issue #932). This is
-    /// the ONE place `MetalWorkerClient::submit` is allowed to fail
-    /// outwardly (see that method's doc comment): every other failure mode
-    /// on that path still closes the returned receiver with zero events
-    /// instead. Deliberately 503 ("server busy, try again"), not 429: this
-    /// is a shared, single-GPU capacity limit on the server as a whole, not
-    /// a per-caller rate limit — the request itself was perfectly fine.
+    /// Server-side unavailability — HTTP 503, `code: "server_busy"`. An
+    /// admission-capacity rejection: the shared Metal worker's
+    /// outstanding-job cap, queued + in-flight, is already full — issue
+    /// #932 — or an embedding-worker concurrency cap. This is the ONE
+    /// place `MetalWorkerClient::submit` is allowed to fail outwardly (see
+    /// that method's doc comment): every other failure mode on that path
+    /// still closes the returned receiver with zero events instead.
+    /// Deliberately 503 ("server busy, try again"), not 429: capacity
+    /// limits are shared server-wide state, not a per-caller rate limit —
+    /// the request itself was perfectly fine.
     ServiceUnavailable { message: String },
     /// `Content-Type` missing or not JSON — HTTP 415. Mirrors axum's own
     /// `Json` extractor rejection (`json_content_type` in axum 0.8's
@@ -307,6 +312,10 @@ pub enum ApiError {
     /// (VALIDATE-BEFORE-MATERIALIZE) takes the raw request body directly
     /// and no longer goes through `Json`, which enforced this for free.
     UnsupportedMediaType { message: String },
+    /// A route whose backing model was never loaded at startup — HTTP 503,
+    /// `code: "embedding_model_not_loaded"`, for `POST /v1/embeddings`
+    /// with no `--embedding-model`.
+    EmbeddingModelNotLoaded { message: String },
 }
 
 impl ApiError {
@@ -319,6 +328,7 @@ impl ApiError {
             ApiError::Internal { message } => message,
             ApiError::ServerError { message, .. } => message,
             ApiError::ServiceUnavailable { message } => message,
+            ApiError::EmbeddingModelNotLoaded { message } => message,
             ApiError::UnsupportedMediaType { message } => message,
         }
     }
@@ -335,6 +345,7 @@ impl ApiError {
             ApiError::Internal { .. } => "internal_error",
             ApiError::ServerError { code, .. } => code,
             ApiError::ServiceUnavailable { .. } => "server_busy",
+            ApiError::EmbeddingModelNotLoaded { .. } => "embedding_model_not_loaded",
             ApiError::UnsupportedMediaType { .. } => "unsupported_media_type",
         }
     }
@@ -395,6 +406,17 @@ impl IntoResponse for ApiError {
                         message,
                         r#type: "server_error",
                         code: "server_busy".to_string(),
+                        param: None,
+                    },
+                });
+                (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+            }
+            ApiError::EmbeddingModelNotLoaded { message } => {
+                let body = Json(ErrorBody {
+                    error: ErrorDetail {
+                        message,
+                        r#type: "server_error",
+                        code: "embedding_model_not_loaded".to_string(),
                         param: None,
                     },
                 });
@@ -1005,6 +1027,7 @@ impl ParityCase {
 /// no `PartialEq`/`Eq` -- through assertion machinery. `has_grammar`
 /// records only whether a grammar engine was attached, not its identity.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct GenerateConfigSnapshot {
     pub max_new_tokens: usize,
     pub temperature: f32,

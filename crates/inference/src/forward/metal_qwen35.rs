@@ -26,6 +26,7 @@
 //! q/k/v/o_proj) and embed_tokens. Buffers kept as f32: norm weights, bias/log scalars,
 //! conv1d weights (small, read by CPU), RoPE tables, activation scratch buffers.
 
+#[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 mod mtp_weights;
 
 // -----------------------------------------------------------------------------
@@ -293,7 +294,7 @@ mod route_predicate_tests {
             ..greedy_gen_cfg(vec![])
         };
         let mut rng = 7u64;
-        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng);
+        let canonical = sample_token(&logits, &gen_cfg, &previous_ids, &mut rng, 0.0);
         assert_eq!(
             canonical, 1,
             "sample_token must penalize the previously-seen argmax enough to \
@@ -501,9 +502,11 @@ pub(crate) fn push_chat_generation_open(prompt: &mut String) {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 mod inner {
     mod dispatch;
+    mod gdn_state;
     mod layers;
 
     use super::GdnStateTrafficScope;
+    use gdn_state::{MetalGdnState, MetalGdnStatePrecision, active_gdn_layer_indices};
     // Chat message types + the shared ChatML renderer (#668) live at the file
     // top level (module-scope, above `mod inner`) so CPU-only builds can
     // render through the same `format_chat_template` this Metal path uses,
@@ -1052,20 +1055,19 @@ mod inner {
     }
 
     impl MetalGdnCheckpointPool {
-        fn new(
-            device: &Device,
-            max_tokens: usize,
-            conv_bufs: &[Buffer],
-            s_matrices: &[Buffer],
-        ) -> Self {
-            let num_layers = conv_bufs.len();
+        fn new(device: &Device, max_tokens: usize, state: &MetalGdnState) -> Self {
+            let num_layers = state.len();
+            let geometry = state.geometry();
+            debug_assert_eq!(geometry.allocated_layers, num_layers);
+            debug_assert!(geometry.active_layers <= geometry.architectural_layers);
+            debug_assert_eq!(state.precision(), MetalGdnStatePrecision::F32);
             let slots = max_tokens + 1;
             let conv_slots = (0..slots)
                 .map(|slot| {
                     (0..num_layers)
                         .map(|i| {
                             let buf = device.new_buffer(
-                                conv_bufs[i].length(),
+                                state.layer(i).conv_buffer().length(),
                                 MTLResourceOptions::StorageModeShared,
                             );
                             buf.set_label(&format!("gdn_ckpt_conv_s{slot}_l{i}"));
@@ -1079,7 +1081,7 @@ mod inner {
                     (0..num_layers)
                         .map(|i| {
                             let buf = device.new_buffer(
-                                s_matrices[i].length(),
+                                state.layer(i).s_matrix().length(),
                                 MTLResourceOptions::StorageModeShared,
                             );
                             buf.set_label(&format!("gdn_ckpt_s_s{slot}_l{i}"));
@@ -1588,6 +1590,11 @@ mod inner {
         /// Used by mtp_forward_one to apply R^T to embed and pre-final-hidden before
         /// the O-space MTP forward, and R to mtp_h_out before the logits GEMV.
         pub(crate) quarot_rotation: Option<crate::quant::quarot::hadamard::RandomizedHadamard>,
+        /// Whether any active layer's FFN is `MetalFfnWeights::Moe`. Computed once at
+        /// construction — layer FFN kinds never change after load (LoRA attaches to
+        /// attention projections, MTP weights are separate) — so the batched-prefill
+        /// MoE guards read this instead of rescanning `layer_weights` per call.
+        pub(crate) has_moe_layer: bool,
     }
 
     /// Per-request mutable inference state.
@@ -1603,9 +1610,8 @@ mod inner {
         // GDN GPU scratch buffer, to be wired in a future GPU-GDN pass. Not yet
         // tracked by a filed issue.
         pub(crate) gdn_scratch: GatedDeltaNetFusedScratch,
-        pub(crate) gdn_gpu_conv_bufs: Vec<Buffer>, // [num_linear_layers] each [qkv_dim * buf_len]
-        pub(crate) gdn_gpu_s_matrices: Vec<Buffer>, // [num_linear_layers] each [num_heads * vd * kd]
-        pub(crate) gdn_gpu_conv_out: Buffer,        // [qkv_dim] temporary conv1d output
+        pub(crate) gdn_gpu_state: MetalGdnState,
+        pub(crate) gdn_gpu_conv_out: Buffer, // [qkv_dim] temporary conv1d output
         pub(crate) kv_cache: MetalKvCache,
         /// Maximum batch prefill length (activation buffers sized for this).
         pub(crate) max_prefill: usize,
@@ -2497,6 +2503,18 @@ mod inner {
         std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
     }
 
+    /// Single derivation point for the engine's `has_moe_layer` flag. Both
+    /// state constructors (f16 and Q4) build the flag from this same layer
+    /// scan, so a change to layer classification cannot update one
+    /// constructor and silently leave the other inconsistent.
+    fn derive_has_moe_layer(
+        layer_weights: &[(MetalLayerAttnWeights, MetalCommonLayerWeights)],
+    ) -> bool {
+        layer_weights
+            .iter()
+            .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)))
+    }
+
     /// Build interleaved partial RoPE cos/sin tables.
     /// For Qwen3.5: partial_rotary_factor=0.25, head_dim=256 => rope_dim=64, half=32.
     /// Tables: [max_pos, half_rope_dim] each.
@@ -3205,6 +3223,8 @@ mod inner {
             let rope_cos = make_buffer(&device, &cos_data, "rope_cos");
             let rope_sin = make_buffer(&device, &sin_data, "rope_sin");
 
+            let has_moe_layer = derive_has_moe_layer(&layer_weights);
+
             Ok(Self {
                 device,
                 queue,
@@ -3219,6 +3239,7 @@ mod inner {
                 quant_format,
                 mtp_weights: None,
                 quarot_rotation: None,
+                has_moe_layer,
             })
         }
 
@@ -3352,23 +3373,8 @@ mod inner {
                 .collect();
             let gdn_scratch = GatedDeltaNetFusedScratch::default();
 
-            let num_value_heads = cfg.linear_num_value_heads();
-            let key_dim = cfg.linear_key_head_dim;
-            let value_dim = cfg.linear_value_head_dim;
             let qkv_dim2 = cfg.linear_qkv_dim();
-            let buf_len = cfg.linear_conv_kernel_dim.saturating_sub(1);
-            let gdn_gpu_conv_bufs: Vec<Buffer> = (0..num_linear)
-                .map(|i| make_zero_buffer(device, qkv_dim2 * buf_len, &format!("gdn_conv_{i}")))
-                .collect();
-            let gdn_gpu_s_matrices: Vec<Buffer> = (0..num_linear)
-                .map(|i| {
-                    make_zero_buffer(
-                        device,
-                        num_value_heads * value_dim * key_dim,
-                        &format!("gdn_s_{i}"),
-                    )
-                })
-                .collect();
+            let gdn_gpu_state = MetalGdnState::new(device, cfg, num_linear);
             let gdn_gpu_conv_out = make_zero_buffer(device, qkv_dim2, "gdn_conv_out");
             let kv_cache = MetalKvCache::new(device, num_full, kv_dim, max_cache_len, use_kv_f16);
 
@@ -3418,8 +3424,7 @@ mod inner {
                 Some(MetalGdnCheckpointPool::new(
                     device,
                     checkpoint_max_tokens,
-                    &gdn_gpu_conv_bufs,
-                    &gdn_gpu_s_matrices,
+                    &gdn_gpu_state,
                 ))
             } else {
                 None
@@ -3429,8 +3434,7 @@ mod inner {
                 activations,
                 gdn_states,
                 gdn_scratch,
-                gdn_gpu_conv_bufs,
-                gdn_gpu_s_matrices,
+                gdn_gpu_state,
                 gdn_gpu_conv_out,
                 kv_cache,
                 max_prefill,
@@ -4181,18 +4185,18 @@ mod inner {
             slot: usize,
             _traffic_scope: GdnStateTrafficScope,
         ) -> Result<(), crate::error::InferenceError> {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             let conv_sizes: Vec<u64> = self
                 .session
-                .gdn_gpu_conv_bufs
-                .iter()
-                .map(|b| b.length())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.conv_buffer().length())
                 .collect();
             let s_sizes: Vec<u64> = self
                 .session
-                .gdn_gpu_s_matrices
-                .iter()
-                .map(|b| b.length())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.s_matrix().length())
                 .collect();
             // Resolve the checkpoint pool BEFORE allocating Metal command objects
             // so an uninitialized pool returns Err without leaking an un-ended
@@ -4205,20 +4209,15 @@ mod inner {
             let cmd = self.engine.queue.new_command_buffer();
             let enc = cmd.new_blit_command_encoder();
             for i in 0..num_layers {
+                let layer = self.session.gdn_gpu_state.layer(i);
                 enc.copy_from_buffer(
-                    &self.session.gdn_gpu_conv_bufs[i],
+                    layer.conv_buffer(),
                     0,
                     &pool.conv_slots[slot][i],
                     0,
                     conv_sizes[i],
                 );
-                enc.copy_from_buffer(
-                    &self.session.gdn_gpu_s_matrices[i],
-                    0,
-                    &pool.s_slots[slot][i],
-                    0,
-                    s_sizes[i],
-                );
+                enc.copy_from_buffer(layer.s_matrix(), 0, &pool.s_slots[slot][i], 0, s_sizes[i]);
             }
             enc.end_encoding();
             cmd.commit();
@@ -4234,18 +4233,18 @@ mod inner {
             slot: usize,
             _traffic_scope: GdnStateTrafficScope,
         ) -> Result<(), crate::error::InferenceError> {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             let conv_sizes: Vec<u64> = self
                 .session
-                .gdn_gpu_conv_bufs
-                .iter()
-                .map(|b| b.length())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.conv_buffer().length())
                 .collect();
             let s_sizes: Vec<u64> = self
                 .session
-                .gdn_gpu_s_matrices
-                .iter()
-                .map(|b| b.length())
+                .gdn_gpu_state
+                .layers()
+                .map(|layer| layer.s_matrix().length())
                 .collect();
             // Resolve the checkpoint pool BEFORE allocating Metal command objects
             // so an uninitialized pool returns Err without leaking an un-ended
@@ -4258,20 +4257,15 @@ mod inner {
             let cmd = self.engine.queue.new_command_buffer();
             let enc = cmd.new_blit_command_encoder();
             for i in 0..num_layers {
+                let layer = self.session.gdn_gpu_state.layer(i);
                 enc.copy_from_buffer(
                     &pool.conv_slots[slot][i],
                     0,
-                    &self.session.gdn_gpu_conv_bufs[i],
+                    layer.conv_buffer(),
                     0,
                     conv_sizes[i],
                 );
-                enc.copy_from_buffer(
-                    &pool.s_slots[slot][i],
-                    0,
-                    &self.session.gdn_gpu_s_matrices[i],
-                    0,
-                    s_sizes[i],
-                );
+                enc.copy_from_buffer(&pool.s_slots[slot][i], 0, layer.s_matrix(), 0, s_sizes[i]);
             }
             enc.end_encoding();
             cmd.commit();
@@ -4603,7 +4597,11 @@ mod inner {
                         let h_off = (t * hidden) as u64 * 4;
                         unsafe {
                             enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                            enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+                            enc.set_buffer(
+                                0,
+                                Some(self.session.gdn_gpu_state.layer(linear_idx).conv_buffer()),
+                                0,
+                            );
                             enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), qkv_off);
                             enc.set_buffer(2, Some(&*w_conv), 0);
                             enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
@@ -4644,7 +4642,7 @@ mod inner {
                             enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_recurrence);
                             enc.set_buffer(
                                 0,
-                                Some(&self.session.gdn_gpu_s_matrices[linear_idx]),
+                                Some(self.session.gdn_gpu_state.layer(linear_idx).s_matrix()),
                                 0,
                             );
                             enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
@@ -6709,6 +6707,66 @@ mod inner {
             Ok(())
         }
 
+        /// Batched prefill has no MoE schedule: `assert_batched_prefill_dense_only`
+        /// panics on it. Reported here as a typed error so a caller sees a rejection
+        /// instead of the process aborting; the assert stays as the internal
+        /// invariant for direct callers of the batched chunk schedulers.
+        ///
+        /// This is the unconditional form: it rejects whenever the model has an MoE
+        /// layer, for call sites every remaining branch of which is batched.
+        /// [`Self::forward_prefill_from`] calls it after its single-token and LoRA
+        /// fast paths have already returned via per-token forward steps (which
+        /// support MoE). Entry points whose per-token routing is expressible as a
+        /// predicate on the input use
+        /// [`Self::check_prefill_moe_batched_unsupported`], which applies the
+        /// token-count/LoRA gate before delegating here.
+        fn reject_moe_batched(
+            &self,
+            entry_point: &str,
+        ) -> Result<(), crate::error::InferenceError> {
+            if self.engine.has_moe_layer {
+                return Err(crate::error::InferenceError::UnsupportedModel(format!(
+                    "{entry_point}: batched prefill (GEMM path) does not support MoE \
+                     layers. Decode one token at a time via forward_step for MoE \
+                     models."
+                )));
+            }
+            Ok(())
+        }
+
+        /// Gated form of [`Self::reject_moe_batched`] for entry points that route a
+        /// single-token or LoRA-active input to the per-token path, where MoE is
+        /// supported: only a multi-token, no-LoRA input reaches the batched
+        /// schedulers, so only that shape is rejected.
+        ///
+        /// Wired into the public entry points that can reach the batched schedulers
+        /// through `forward_prefill_impl` or the with-hidden chunk loop:
+        /// [`Self::try_forward_prefill`], [`Self::forward_prefill_with_hidden`], and
+        /// [`Self::forward_prefill_all_logits`]. The suffix primitive
+        /// [`Self::forward_prefill_from`] — reached by the prefix-cache generation
+        /// path — uses the unconditional form above. Every request-facing caller
+        /// prefills through one of the four: `generate`,
+        /// `generate_with_speculation`, `generate_streaming`,
+        /// `generate_streaming_with_cancel`, and `embed_tokens` through the
+        /// first, `compute_token_nlls` through the third,
+        /// `generate_streaming_with_prefix_cache*` through the fourth — so an
+        /// MoE model reports this input instead of aborting the process.
+        ///
+        /// [`Self::forward_prefill`] is the exception, by construction: it unwraps
+        /// [`Self::try_forward_prefill`]'s result, so it still aborts. Its remaining
+        /// callers are this module's tests, the bench and profiling examples, and any
+        /// external consumer that wants the panicking form.
+        fn check_prefill_moe_batched_unsupported(
+            &self,
+            entry_point: &str,
+            token_count: usize,
+        ) -> Result<(), crate::error::InferenceError> {
+            if token_count <= 1 || self.lora.is_some() {
+                return Ok(());
+            }
+            self.reject_moe_batched(entry_point)
+        }
+
         /// Pure capacity precondition for a Metal dispatch spanning `token_count` positions
         /// starting at `start_pos` — every position `start_pos..start_pos + token_count` must
         /// land inside the RoPE table / KV cache, and (when `gdn_pool_capacity` is `Some`)
@@ -6801,7 +6859,7 @@ mod inner {
         /// check this before asking [`Self::gdn_state_is_initial`], never conflate
         /// the two by treating an empty population as if it were a clean one.
         fn has_gdn_layers(&self) -> bool {
-            !self.session.gdn_gpu_conv_bufs.is_empty()
+            self.session.gdn_gpu_state.len() != 0
         }
 
         /// True when every GDN recurrent-state buffer (S matrices and conv1d
@@ -6822,15 +6880,16 @@ mod inner {
         /// self.gdn_state_is_initial()`, as [`Self::prefill_session_freshness`]
         /// does.
         fn gdn_state_is_initial(&self) -> bool {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             assert!(
                 num_layers > 0,
                 "gdn_state_is_initial: session has no GDN layers; check has_gdn_layers() \
                  first — an empty population and a clean population are not the same fact"
             );
             for i in 0..num_layers {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let layer = self.session.gdn_gpu_state.layer(i);
+                let conv_buf = layer.conv_buffer();
+                let s_buf = layer.s_matrix();
                 let conv_floats = (conv_buf.length() / 4) as usize;
                 let s_floats = (s_buf.length() / 4) as usize;
                 // SAFETY: GPU buffers are StorageModeShared (allocated with
@@ -7136,8 +7195,10 @@ mod inner {
         ///
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
         /// dispatch for a non-fresh session, an out-of-vocabulary token, or a token
-        /// range beyond the session capacity. Rejection leaves session state
-        /// unchanged.
+        /// range beyond the session capacity, and
+        /// [`crate::error::InferenceError::UnsupportedModel`] for a multi-token
+        /// prompt on an MoE model with no active LoRA adapter. Rejection leaves
+        /// session state unchanged.
         pub fn try_forward_prefill(
             &mut self,
             token_ids: &[u32],
@@ -7145,6 +7206,7 @@ mod inner {
             self.check_raw_prefill_fresh_session("try_forward_prefill")?;
             self.check_forward_token_ids("try_forward_prefill", token_ids)?;
             self.check_forward_range_capacity(0, token_ids.len(), false)?;
+            self.check_prefill_moe_batched_unsupported("try_forward_prefill", token_ids.len())?;
             self.cross_turn_prefix_cache.clear();
             Ok(self.forward_prefill_impl(token_ids, false))
         }
@@ -7181,11 +7243,12 @@ mod inner {
         /// # Cross-turn cache invalidation (#516)
         ///
         /// Public raw-forward entry point — see [`Self::forward_step`]'s doc
-        /// comment for the invariant this enforces. `generate`/`generate_streaming`/
-        /// `generate_multimodal`/`compute_token_nlls` all call this after their own
-        /// `reset_state()`, which has already cleared the cache, so this clear is a
-        /// no-op on those paths; it only matters for a consumer calling this
-        /// entry point directly against a state with a live retained entry.
+        /// comment for the invariant this enforces. The clear happens inside
+        /// [`Self::try_forward_prefill`], which this wraps. No production caller in
+        /// this crate remains — the generation entry points prefill through the
+        /// fallible route directly — so this wrapper's callers are this module's own
+        /// tests, the bench and profiling examples, and any external consumer that
+        /// wants the panicking form.
         pub fn forward_prefill(&mut self, token_ids: &[u32]) -> Vec<f32> {
             match self.try_forward_prefill(token_ids) {
                 Ok(logits) => logits,
@@ -7217,8 +7280,12 @@ mod inner {
         /// Returns [`crate::error::InferenceError::InvalidInput`] before GPU
         /// dispatch for an empty prompt, an out-of-vocabulary token, a prompt
         /// whose token range exceeds the session capacity, or a session that is
-        /// not fresh (see above). On rejection, session state (KV cache, GDN
-        /// state, hidden-readback counters) is left unchanged.
+        /// not fresh (see above). Returns
+        /// [`crate::error::InferenceError::UnsupportedModel`] for a multi-token
+        /// prompt against a model with MoE layers and no active LoRA adapter: that
+        /// input takes the batched schedulers, which have no MoE schedule. On
+        /// rejection, session state (KV cache, GDN state, hidden-readback counters)
+        /// is left unchanged.
         pub fn forward_prefill_with_hidden(
             &mut self,
             token_ids: &[u32],
@@ -7233,6 +7300,10 @@ mod inner {
             self.check_forward_token_ids("forward_prefill_with_hidden", token_ids)?;
             self.check_hidden_prefill_fresh_session()?;
             self.check_forward_range_capacity(0, token_ids.len(), false)?;
+            self.check_prefill_moe_batched_unsupported(
+                "forward_prefill_with_hidden",
+                token_ids.len(),
+            )?;
             self.cross_turn_prefix_cache.clear();
 
             if token_ids.len() == 1 {
@@ -7289,6 +7360,10 @@ mod inner {
         /// dispatch when the session is not fresh (see above). Returns an error
         /// when more than one position is requested while a LoRA adapter is active,
         /// because the batched all-position path does not apply LoRA projections.
+        /// Returns [`crate::error::InferenceError::UnsupportedModel`] for a
+        /// multi-token prompt against a model with MoE layers: the all-position
+        /// path is batched by construction and the batched schedulers have no MoE
+        /// schedule.
         ///
         /// # Cross-turn cache invalidation (#516)
         ///
@@ -7306,6 +7381,10 @@ mod inner {
                         .into(),
                 ));
             }
+            self.check_prefill_moe_batched_unsupported(
+                "forward_prefill_all_logits",
+                token_ids.len(),
+            )?;
             self.cross_turn_prefix_cache.clear();
             Ok(self.forward_prefill_impl(token_ids, true))
         }
@@ -7599,7 +7678,11 @@ mod inner {
                 let h_off = (t * cfg.hidden_size) as u64 * 4;
 
                 enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-                enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+                enc.set_buffer(
+                    0,
+                    Some(self.session.gdn_gpu_state.layer(linear_idx).conv_buffer()),
+                    0,
+                );
                 enc.set_buffer(1, Some(&self.session.activations.gdn_qkv), qkv_off);
                 enc.set_buffer(2, Some(&gdn_w.conv1d_weight), 0);
                 enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
@@ -7614,7 +7697,11 @@ mod inner {
                 );
 
                 enc.set_compute_pipeline_state(&self.engine.pipelines.gdn_recurrence);
-                enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
+                enc.set_buffer(
+                    0,
+                    Some(self.session.gdn_gpu_state.layer(linear_idx).s_matrix()),
+                    0,
+                );
                 enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
                 enc.set_buffer(2, Some(&self.session.activations.gdn_z), z_off);
                 enc.set_buffer(3, Some(&self.session.activations.hidden), h_off);
@@ -7855,13 +7942,8 @@ mod inner {
         /// GDN/KV work has already been recorded (or, for schedulers that split
         /// encoding across multiple command buffers, already committed to the GPU).
         fn assert_batched_prefill_dense_only(&self) {
-            let has_moe_layer = self
-                .engine
-                .layer_weights
-                .iter()
-                .any(|(_, common_w)| matches!(common_w.ffn, MetalFfnWeights::Moe(_)));
             assert!(
-                !has_moe_layer,
+                !self.engine.has_moe_layer,
                 "batched prefill does not support MoE layers (M>1 GEMM path); \
                  use decode-mode forward_step for MoE models instead"
             );
@@ -9082,6 +9164,83 @@ mod inner {
             }
         }
 
+        /// **Unstable**: greedy n-gram speculative generation over raw token ids.
+        ///
+        /// Owns the complete Metal lifecycle: validates the request before
+        /// mutation, resets recurrent state, prefills the prompt once, then
+        /// forwards every emitted non-EOS token at its absolute position. On
+        /// success with a non-zero generation budget, the live KV/GDN state
+        /// therefore represents `prompt_tokens.len() + generated.len()` tokens.
+        /// For a valid prompt, a zero generation budget returns an empty vector
+        /// without resetting existing state.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`crate::error::InferenceError::Inference`] for an empty
+        /// prompt or, for a non-zero generation budget, when the prompt plus
+        /// budget exceeds [`Self::max_context`]. Returns
+        /// [`crate::error::InferenceError::InvalidInput`] when a prompt token
+        /// cannot index the configured embedding table. Admission errors occur
+        /// before reset, prefill, allocation of generation history, or GPU work.
+        ///
+        /// `max_ngram` is clamped to
+        /// [`crate::speculative::MAX_NGRAM_LIMIT`]; the n-gram search scans the
+        /// prompt once per attempted length, so an unbounded value would let a
+        /// caller spend arbitrary CPU before the first token.
+        ///
+        /// Returns [`crate::error::InferenceError::UnsupportedModel`] for a
+        /// multi-token prompt on a model with MoE layers and no active LoRA
+        /// adapter: that prompt would take the Metal batched prefill path, which
+        /// has no MoE schedule. The rejection happens before GPU dispatch, in
+        /// place of the process abort this entry point produced previously.
+        /// Dense models and the sequential LoRA prefill fallback are unaffected.
+        ///
+        /// [`Self::generate`], [`Self::generate_streaming`],
+        /// [`Self::generate_streaming_with_cancel`], and
+        /// [`Self::generate_with_speculation`] reach the same check through
+        /// [`Self::try_forward_prefill`] and return the rejection as `Err`.
+        /// [`Self::forward_prefill`] is the one remaining unwrapping wrapper,
+        /// so callers using it still abort on this case.
+        pub fn generate_with_speculation(
+            &mut self,
+            prompt_tokens: &[u32],
+            max_new_tokens: usize,
+            eos_token: u32,
+            max_ngram: usize,
+            max_draft: usize,
+        ) -> Result<Vec<u32>, crate::error::InferenceError> {
+            crate::model::qwen35::check_prompt_not_empty(prompt_tokens.len())?;
+            crate::model::qwen35::check_prompt_ids_in_vocab(
+                prompt_tokens,
+                self.engine.config.vocab_size,
+            )?;
+            if max_new_tokens == 0 {
+                return Ok(Vec::new());
+            }
+            crate::model::qwen35::check_context_budget(
+                prompt_tokens.len(),
+                None,
+                max_new_tokens,
+                self.max_context(),
+            )?;
+
+            self.reset_state();
+            // Prefill through the fallible entry point, not the unwrapping
+            // wrapper: the batched path has no MoE schedule, so an ordinary
+            // multi-token prompt on an MoE model must come back as
+            // `UnsupportedModel` rather than aborting this request-facing call.
+            let prefill_logits = self.try_forward_prefill(prompt_tokens)?;
+            crate::speculative::generate_with_speculation_from_prefill(
+                prompt_tokens,
+                max_new_tokens,
+                eos_token,
+                prefill_logits,
+                |token, position| self.try_forward_step(token, position),
+                max_ngram,
+                max_draft,
+            )
+        }
+
         fn prepare_direct_generation(
             &self,
             prompt: &str,
@@ -9116,6 +9275,15 @@ mod inner {
             )
         }
 
+        /// Disengage the compact sampling route engaged by
+        /// The teardown for a compact sampling route engaged by
+        /// [`Self::configure_sampling_route`], whether generation completed, was
+        /// cancelled, or failed at prefill.
+        fn disengage_compact_route(&mut self) {
+            self.session.compact_topk = 0;
+            self.session.compact_route = GpuTopkRoute::CpuFallback;
+        }
+
         /// **Unstable**: generate text from a prompt; sampling parameters and output format may change.
         ///
         /// Generate text from a prompt.
@@ -9127,6 +9295,9 @@ mod inner {
         /// `generate` contract (#611).
         /// Returns `InferenceError::Inference` when the prompt plus requested decode
         /// cap exceeds [`Self::max_context`].
+        /// Returns `InferenceError::UnsupportedModel` for a multi-token prompt on a
+        /// model with MoE layers and no active LoRA adapter: prefill for that input
+        /// is batched and the batched schedulers have no MoE schedule.
         pub fn generate(
             &mut self,
             prompt: &str,
@@ -9159,8 +9330,23 @@ mod inner {
             // Initialise grammar state for grammar-constrained decoding (ADR-046).
             let mut grammar_state = gen_cfg.grammar.as_ref().map(|g| g.initial_state());
 
-            // Batch prefill: process all prompt tokens at once (GEMM)
-            let mut prefill_logits = self.forward_prefill(&prompt_ids);
+            // Batch prefill: process all prompt tokens at once (GEMM). Through the
+            // fallible entry point, not the unwrapping wrapper: a multi-token prompt
+            // on an MoE model has no batched schedule, and this is a request-facing
+            // call, so it must come back as `UnsupportedModel` rather than aborting
+            // the process. `try_forward_prefill` rejects before any state mutation;
+            // the error arm disengages the compact route configured above, exactly
+            // as the cancellation paths do, so the session is left clean for a raw
+            // `forward_step` caller.
+            let mut prefill_logits = match self.try_forward_prefill(&prompt_ids) {
+                Ok(logits) => logits,
+                Err(error) => {
+                    if use_compact {
+                        self.disengage_compact_route();
+                    }
+                    return Err(error);
+                }
+            };
 
             // Apply grammar masking to prefill logits before sampling.
             if let (Some(engine), Some(gs)) = (&gen_cfg.grammar, &mut grammar_state) {
@@ -9208,8 +9394,7 @@ mod inner {
                 // uses them).
                 self.session.mtp_active = true;
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 // #1340: rebuild the MTP draft head's KV cache from the prompt
                 // before the first draft round, so it attends to the prompt prefix
@@ -9273,8 +9458,7 @@ mod inner {
 
             if is_stop(next_id) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -9306,8 +9490,7 @@ mod inner {
                 let delta = detok.push(tokenizer, next_id);
                 if matcher.push(&delta, &mut |_| {}) {
                     if use_compact {
-                        self.session.compact_topk = 0;
-                        self.session.compact_route = GpuTopkRoute::CpuFallback;
+                        self.disengage_compact_route();
                     }
                     let (_, matcher) = stop_text_state.take().expect("just matched Some(..)");
                     return Ok(GenerateOutput {
@@ -9439,8 +9622,7 @@ mod inner {
             }
 
             if use_compact {
-                self.session.compact_topk = 0;
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.disengage_compact_route();
             }
 
             // Detokenize: string-stop path uses the matcher's (possibly truncated)
@@ -10202,7 +10384,8 @@ mod inner {
                 .map(|_| GatedDeltaNetState::new(cfg))
                 .collect();
             // Zero GPU GDN buffers
-            for buf in &self.session.gdn_gpu_conv_bufs {
+            for layer in self.session.gdn_gpu_state.layers() {
+                let buf = layer.conv_buffer();
                 // SAFETY: Each buffer is StorageModeShared, no command buffer is
                 // in flight during reset_state, and length() is the allocated size.
                 unsafe {
@@ -10210,7 +10393,8 @@ mod inner {
                     std::ptr::write_bytes(ptr, 0, buf.length() as usize);
                 }
             }
-            for buf in &self.session.gdn_gpu_s_matrices {
+            for layer in self.session.gdn_gpu_state.layers() {
+                let buf = layer.s_matrix();
                 // SAFETY: Each buffer is StorageModeShared, no command buffer is
                 // in flight during reset_state, and length() is the allocated size.
                 unsafe {
@@ -10249,8 +10433,7 @@ mod inner {
             // with `use_compact == false`, which makes `forward_prefill` /
             // `forward_step` append a compact top-k dispatch and return empty
             // logits even though the caller expects the full-logit exact path.
-            self.session.compact_topk = 0;
-            self.session.compact_route = GpuTopkRoute::CpuFallback;
+            self.disengage_compact_route();
             self.session.compact_result.clear();
         }
 
@@ -10706,6 +10889,21 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
+        // `GenerateConfig` cannot carry `min_p` (it is exhaustively
+        // constructible through the public API at published `0.7.1`; adding
+        // any field is a major break -- see
+        // `crate::sampling::Sampler::with_min_p`), and no production entry
+        // point sets it yet, so this path is always disabled.
+        sample_from_candidates_impl(candidates, cfg, previous_ids, rng_state, 0.0)
+    }
+
+    fn sample_from_candidates_impl(
+        candidates: &[crate::sampling::Candidate],
+        cfg: &GenerateConfig,
+        previous_ids: &[u32],
+        rng_state: &mut u64,
+        min_p: f32,
+    ) -> u32 {
         use crate::sampling::CandidateSet;
         let mut cs = CandidateSet::from_candidates(candidates.to_vec());
 
@@ -10725,7 +10923,59 @@ mod inner {
         // worst-probability token. Route through the canonical [0, 1) helper
         // (provably < 1.0), matching the CPU sampling path.
         let r = crate::sampling::uniform_f32_from_u64(raw);
-        cs.sample_top_p(cfg.top_p, r)
+        cs.sample_min_p_top_p(min_p, cfg.top_p, r)
+    }
+
+    #[cfg(test)]
+    mod min_p_compact_sampling_tests {
+        use super::{GenerateConfig, sample_from_candidates_impl};
+        use crate::sampling::Candidate;
+
+        #[test]
+        fn compact_metal_candidate_path_applies_min_p() {
+            let candidates = [
+                Candidate {
+                    token_id: 7,
+                    logit: 0.0,
+                },
+                Candidate {
+                    token_id: 8,
+                    logit: 0.49_f32.ln(),
+                },
+            ];
+            let disabled = GenerateConfig {
+                temperature: 1.0,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                ..Default::default()
+            };
+            let mut saw_tail_without_min_p = false;
+
+            for seed in [0x1234_5678_9abc_def0, 0xabad_1dea_dead_beef] {
+                let mut control_rng = seed;
+                saw_tail_without_min_p |=
+                    sample_from_candidates_impl(&candidates, &disabled, &[], &mut control_rng, 0.0)
+                        == 8;
+
+                let mut filtered_rng = seed;
+                assert_eq!(
+                    sample_from_candidates_impl(
+                        &candidates,
+                        &disabled,
+                        &[],
+                        &mut filtered_rng,
+                        0.5,
+                    ),
+                    7,
+                    "compact Metal candidates below min_p * max_probability must be removed"
+                );
+            }
+
+            assert!(
+                saw_tail_without_min_p,
+                "control seeds must exercise the tail candidate or the min-p assertion is vacuous"
+            );
+        }
     }
 
     fn xorshift64(state: &mut u64) -> u64 {
@@ -10746,8 +10996,8 @@ mod inner {
     /// old per-call `CandidateSet::from_full_logits` implementation: repetition
     /// penalty over the unique-id set from `previous_ids` (not a per-candidate
     /// `.contains()` scan over the full vocabulary), a streaming min-heap
-    /// partial top-k select feeding the top-p softmax draw (so softmax only
-    /// ever runs over the surviving k candidates), and thread-local scratch
+    /// partial top-k select feeding the min-p/top-p softmax draw (so softmax
+    /// only ever runs over the surviving k candidates), and thread-local scratch
     /// buffers reused across decode steps instead of a fresh vocab-sized
     /// `CandidateSet` per token.
     fn sample_token(
@@ -10756,7 +11006,7 @@ mod inner {
         previous_ids: &[u32],
         rng_state: &mut u64,
     ) -> u32 {
-        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state)
+        crate::sampling::sample_full_logits(logits, cfg, previous_ids, rng_state, 0.0)
     }
 
     /// Signpost-traced sampling shared by every autoregressive decode loop's
@@ -10912,6 +11162,10 @@ mod inner {
         /// `generate_streaming` contract (#611).
         /// Returns `InferenceError::Inference` when the prompt plus effective decode
         /// cap exceeds [`Self::max_context`].
+        /// Returns `InferenceError::UnsupportedModel` for a multi-token prompt on a
+        /// model with MoE layers and no active LoRA adapter, for the reason given on
+        /// [`Self::generate`]. `generate_streaming` shares this implementation and so
+        /// reports the same error.
         pub fn generate_streaming_with_cancel<F, C>(
             &mut self,
             prompt: &str,
@@ -10974,8 +11228,7 @@ mod inner {
             // uninterruptible once started) prefill matmul below.
             if should_cancel() {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -10988,8 +11241,19 @@ mod inner {
                 });
             }
 
-            // Batch prefill
-            let mut prefill_logits = self.forward_prefill(&prompt_ids);
+            // Batch prefill, through the fallible entry point for the same reason
+            // `generate` does: an MoE model has no batched prefill schedule, and a
+            // streaming request must see that as an error rather than an abort. The
+            // error arm disengages the compact route, mirroring the cancel paths.
+            let mut prefill_logits = match self.try_forward_prefill(&prompt_ids) {
+                Ok(logits) => logits,
+                Err(error) => {
+                    if use_compact {
+                        self.disengage_compact_route();
+                    }
+                    return Err(error);
+                }
+            };
 
             // The prefill call itself cannot be interrupted mid-flight (it is one
             // GPU dispatch), so this is the earliest point a disconnect that
@@ -10997,8 +11261,7 @@ mod inner {
             // sampling or decode-loop work on its output.
             if should_cancel() {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -11072,8 +11335,7 @@ mod inner {
 
             if is_stop(next_id) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -11137,8 +11399,7 @@ mod inner {
                 crate::model::qwen35::StopCheckOutcome::Interrupted
             ) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text,
@@ -11155,8 +11416,7 @@ mod inner {
                 crate::model::qwen35::StopCheckOutcome::Stopped
             ) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(GenerateOutput {
                     text,
@@ -11331,8 +11591,7 @@ mod inner {
             }
 
             if use_compact {
-                self.session.compact_topk = 0;
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.disengage_compact_route();
             }
 
             // Flush trailing incomplete bytes (generation truncated mid-codepoint)
@@ -12535,30 +12794,15 @@ mod inner {
             // ----------------------------------------------------------------
             // GDN recurrent states (same as new())
             // ----------------------------------------------------------------
-            let num_linear = cfg.num_active_linear_attention_layers();
+            let num_linear = active_gdn_layer_indices(cfg).len();
             let num_full = cfg.num_active_full_attention_layers();
             let gdn_states: Vec<GatedDeltaNetState> = (0..num_linear)
                 .map(|_| GatedDeltaNetState::new(cfg))
                 .collect();
             let gdn_scratch = GatedDeltaNetFusedScratch::default();
 
-            let num_value_heads = cfg.linear_num_value_heads();
-            let key_dim = cfg.linear_key_head_dim;
-            let value_dim = cfg.linear_value_head_dim;
             let qkv_dim = cfg.linear_qkv_dim();
-            let buf_len = cfg.linear_conv_kernel_dim.saturating_sub(1);
-            let gdn_gpu_conv_bufs: Vec<Buffer> = (0..num_linear)
-                .map(|i| make_zero_buffer(&device, qkv_dim * buf_len, &format!("gdn_conv_{i}")))
-                .collect();
-            let gdn_gpu_s_matrices: Vec<Buffer> = (0..num_linear)
-                .map(|i| {
-                    make_zero_buffer(
-                        &device,
-                        num_value_heads * value_dim * key_dim,
-                        &format!("gdn_s_{i}"),
-                    )
-                })
-                .collect();
+            let gdn_gpu_state = MetalGdnState::new(&device, cfg, num_linear);
             let gdn_gpu_conv_out = make_zero_buffer(&device, qkv_dim, "gdn_conv_out");
 
             let use_kv_f16 = matches!(
@@ -12669,8 +12913,7 @@ mod inner {
                 Some(MetalGdnCheckpointPool::new(
                     &device,
                     checkpoint_max_tokens,
-                    &gdn_gpu_conv_bufs,
-                    &gdn_gpu_s_matrices,
+                    &gdn_gpu_state,
                 ))
             } else {
                 None
@@ -12693,6 +12936,7 @@ mod inner {
                 None
             };
 
+            let has_moe_layer = derive_has_moe_layer(&layer_weights);
             Ok(Self {
                 engine: MetalQwen35Engine {
                     device,
@@ -12708,13 +12952,13 @@ mod inner {
                     quant_format,
                     mtp_weights: mtp_weights_opt,
                     quarot_rotation,
+                    has_moe_layer,
                 },
                 session: InferenceSession {
                     activations,
                     gdn_states,
                     gdn_scratch,
-                    gdn_gpu_conv_bufs,
-                    gdn_gpu_s_matrices,
+                    gdn_gpu_state,
                     gdn_gpu_conv_out,
                     kv_cache,
                     max_prefill,
@@ -12874,6 +13118,9 @@ mod inner {
         ///
         /// - `tokens` empty, longer than the session's context, or containing
         ///   an id at or above `vocab_size`.
+        /// - More than one token against a model with MoE layers: the prefill this
+        ///   runs to produce the hidden state is batched, and the batched schedulers
+        ///   have no MoE schedule.
         /// - [`HiddenPooling::Mean`], which this path does not implement. Mean
         ///   pooling needs every position's *post-norm* hidden state, and the
         ///   Metal prefill normalizes only the rows it is about to project to
@@ -12932,8 +13179,12 @@ mod inner {
             self.session
                 .final_hidden_captured
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            let _ = self.forward_prefill(tokens);
+            // Fallible route: a multi-token prompt on an MoE model has no batched
+            // prefill schedule. Restore the capture flag before propagating, so a
+            // rejected call leaves the session exactly as it found it.
+            let prefill = self.try_forward_prefill(tokens);
             self.session.capture_final_hidden = previous;
+            prefill?;
 
             if !self
                 .session
@@ -13083,11 +13334,12 @@ mod inner {
         }
 
         fn snapshot_gdn_states(&self) -> crate::attention::gdn::GdnSnapshot {
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             let mut snap = Vec::with_capacity(num_layers);
             for i in 0..num_layers {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let layer = self.session.gdn_gpu_state.layer(i);
+                let conv_buf = layer.conv_buffer();
+                let s_buf = layer.s_matrix();
                 let conv_floats = (conv_buf.length() / 4) as usize;
                 let s_floats = (s_buf.length() / 4) as usize;
                 // SAFETY: GPU buffers are StorageModeShared (allocated with
@@ -13129,7 +13381,7 @@ mod inner {
         ) -> Result<(), crate::error::InferenceError> {
             use crate::error::InferenceError;
 
-            let num_layers = self.session.gdn_gpu_conv_bufs.len();
+            let num_layers = self.session.gdn_gpu_state.len();
             if snapshot.len() != num_layers {
                 return Err(InferenceError::PrefixCache(format!(
                     "restore_gdn_states: snapshot has {} layers, expected {num_layers}",
@@ -13137,8 +13389,9 @@ mod inner {
                 )));
             }
             for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let layer = self.session.gdn_gpu_state.layer(i);
+                let conv_buf = layer.conv_buffer();
+                let s_buf = layer.s_matrix();
                 let conv_floats = (conv_buf.length() / 4) as usize;
                 let s_floats = (s_buf.length() / 4) as usize;
                 if conv_snap.len() != conv_floats || s_snap.len() != s_floats {
@@ -13155,8 +13408,9 @@ mod inner {
 
         fn restore_gdn_states_validated(&mut self, snapshot: &crate::attention::gdn::GdnSnapshot) {
             for (i, (s_snap, conv_snap)) in snapshot.iter().enumerate() {
-                let conv_buf = &self.session.gdn_gpu_conv_bufs[i];
-                let s_buf = &self.session.gdn_gpu_s_matrices[i];
+                let layer = self.session.gdn_gpu_state.layer(i);
+                let conv_buf = layer.conv_buffer();
+                let s_buf = layer.s_matrix();
                 // SAFETY: see snapshot_gdn_states. StorageModeShared lets the CPU write
                 // the buffer directly; validation above proves each snapshot exactly
                 // matches its destination, and callers invoke this outside any in-flight
@@ -13469,6 +13723,10 @@ mod inner {
                 }
                 return Ok(last_logits);
             }
+            // Every branch below is batched (the single-token and LoRA fast paths
+            // returned above via per-token forward steps, which support MoE), so the
+            // MoE rejection applies unconditionally from here (#1448).
+            self.reject_moe_batched("forward_prefill_from")?;
             let max_prefill = self.session.max_prefill;
             if token_ids.len() <= max_prefill {
                 // Only/last chunk — its logits are always the caller's answer.
@@ -13658,6 +13916,12 @@ mod inner {
         ///
         /// Returns the shared context-budget error before cache restore or eviction
         /// when the prompt plus effective decode cap exceeds [`Self::max_context`].
+        /// Returns `InferenceError::UnsupportedModel` when a model with MoE
+        /// layers reaches a batched prefill — a multi-token suffix (or full
+        /// fallback prefill) with no active LoRA adapter. Single-token
+        /// suffixes and LoRA-active prefills run per-token forward steps,
+        /// which support MoE (see [`Self::reject_moe_batched`] and the gated
+        /// [`Self::check_prefill_moe_batched_unsupported`]).
         pub fn generate_streaming_with_prefix_cache<F>(
             &mut self,
             slot_id: crate::kv_cache::CrossTurnSlotId,
@@ -13970,7 +14234,16 @@ mod inner {
             // The one line that differs structurally from `generate_streaming`:
             // prefill only the divergent suffix, at its true absolute position.
             let suffix = &prompt_ids[plan.suffix_start..];
-            let mut prefill_logits = self.forward_prefill_from(suffix, plan.suffix_start, false)?;
+            let mut prefill_logits =
+                match self.forward_prefill_from(suffix, plan.suffix_start, false) {
+                    Ok(logits) => logits,
+                    Err(error) => {
+                        if use_compact {
+                            self.disengage_compact_route();
+                        }
+                        return Err(error);
+                    }
+                };
 
             // The suffix prefill itself cannot be interrupted mid-flight (one
             // GPU dispatch), so this is the earliest point a disconnect that
@@ -13981,8 +14254,7 @@ mod inner {
             // means the suffix prefill's cost was spent without being reused.
             if should_cancel() {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 return Ok(CachedGenerateOutput {
                     output: GenerateOutput {
@@ -14089,8 +14361,7 @@ mod inner {
 
             if is_stop(next_id) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 self.save_cross_turn_prefix_or_clear(
                     slot_id,
@@ -14165,8 +14436,7 @@ mod inner {
                 crate::model::qwen35::StopCheckOutcome::Interrupted
             ) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 // The caller cut the stream after exactly one forwarded
                 // token (the prefill sample) — state represents prompt +
@@ -14192,8 +14462,7 @@ mod inner {
                 crate::model::qwen35::StopCheckOutcome::Stopped
             ) {
                 if use_compact {
-                    self.session.compact_topk = 0;
-                    self.session.compact_route = GpuTopkRoute::CpuFallback;
+                    self.disengage_compact_route();
                 }
                 self.cross_turn_prefix_cache.remove(slot_id);
                 return Ok(CachedGenerateOutput {
@@ -14365,8 +14634,7 @@ mod inner {
             }
 
             if use_compact {
-                self.session.compact_topk = 0;
-                self.session.compact_route = GpuTopkRoute::CpuFallback;
+                self.disengage_compact_route();
             }
 
             // Tail flush runs before the cache-save decision: a stop string can
@@ -14617,12 +14885,14 @@ mod inner {
                 .expect("mod tests must exist in this file");
             let production_src = &src[..production_end];
             let dispatch_src = include_str!("metal_qwen35/inner/dispatch.rs");
+            let gdn_state_src = include_str!("metal_qwen35/inner/gdn_state.rs");
             let layers_src = include_str!("metal_qwen35/inner/layers/mod.rs");
             let gdn_layer_src = include_str!("metal_qwen35/inner/layers/gdn.rs");
             let gqa_layer_src = include_str!("metal_qwen35/inner/layers/gqa.rs");
             let production_sources = [
                 production_src,
                 dispatch_src,
+                gdn_state_src,
                 layers_src,
                 gdn_layer_src,
                 gqa_layer_src,
@@ -14757,6 +15027,37 @@ mod inner {
                     .count(),
                 1,
                 "the main Qwen3.5 MSL source must compile in one registration block"
+            );
+        }
+
+        /// Behavioral guard for the allocation policy `from_q4_dir` uses to size
+        /// typed Metal GDN state (`active_gdn_layer_indices`, called at the
+        /// `num_linear` assignment above the `MetalGdnState::new` call in
+        /// `from_q4_dir`). Exercises the same pure decision the constructor makes
+        /// — which layer indices are GatedDeltaNet AND unpruned — without a GPU
+        /// or a model fixture download.
+        #[test]
+        fn q4_constructor_allocates_typed_gdn_state_for_active_layers() {
+            let (cfg, _weights) = tiny_hybrid_fixture();
+            // tiny_hybrid_fixture: layer_types = [Linear, Linear, Linear, Full],
+            // layer_mask all active — every linear-attention layer is selected,
+            // the full-attention layer (index 3) is excluded.
+            assert_eq!(super::active_gdn_layer_indices(&cfg), vec![0, 1, 2]);
+            assert_eq!(
+                super::active_gdn_layer_indices(&cfg).len(),
+                cfg.num_active_linear_attention_layers()
+            );
+
+            let mut pruned = cfg.clone();
+            pruned.layer_mask[1] = false;
+            assert_eq!(
+                super::active_gdn_layer_indices(&pruned),
+                vec![0, 2],
+                "a pruned linear-attention layer must not receive typed GDN state"
+            );
+            assert_eq!(
+                super::active_gdn_layer_indices(&pruned).len(),
+                pruned.num_active_linear_attention_layers()
             );
         }
 
@@ -18031,9 +18332,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         fn snapshot_gdn_bytes(state: &MetalQwen35State) -> Vec<Vec<u8>> {
             state
                 .session
-                .gdn_gpu_s_matrices
-                .iter()
-                .chain(state.session.gdn_gpu_conv_bufs.iter())
+                .gdn_gpu_state
+                .layers()
+                .map(super::gdn_state::MetalGdnLayerState::s_matrix)
+                .chain(
+                    state
+                        .session
+                        .gdn_gpu_state
+                        .layers()
+                        .map(super::gdn_state::MetalGdnLayerState::conv_buffer),
+                )
                 .map(|buf| {
                     // SAFETY: StorageModeShared, and the verifier preflight runs
                     // before creating a command buffer, so no GPU write is in flight.
@@ -24465,6 +24773,51 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             (cfg, weights)
         }
 
+        /// Regression test: `generate_with_speculation` must REPORT an unsupported
+        /// (MoE) multi-token prefill as an error, not abort the process. It is a
+        /// request-facing entry point, so reaching the batched path's MoE rejection
+        /// through the panicking `forward_prefill` wrapper turns an ordinary valid
+        /// prompt into a host crash. Two tokens is the smallest prompt that takes
+        /// the batched (M>1) path.
+        #[test]
+        fn generate_with_speculation_reports_moe_prefill_rejection_without_panicking() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 16)
+                .expect("moe prefill fixture must construct");
+
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.generate_with_speculation(&[1u32, 3, 5], 4, 0, 2, 2)
+            }));
+
+            let returned = outcome.expect(
+                "unsupported-MoE prefill must be returned as Err, never unwound as a panic",
+            );
+            let error = returned.expect_err("unsupported-MoE prefill must not produce tokens");
+            let message = match &error {
+                crate::error::InferenceError::UnsupportedModel(message) => message.clone(),
+                other => panic!(
+                    "the documented contract for an unsupported-MoE prefill is \
+                     InferenceError::UnsupportedModel; got {other:?}. Any other variant \
+                     means a different rejection fired and this test would pass without \
+                     the guard under test having run at all"
+                ),
+            };
+            assert!(
+                message.contains("MoE"),
+                "the rejection must name the MoE batched-prefill limitation so a caller \
+                 can act on it; got {message:?}"
+            );
+        }
+
         /// Regression test: batched prefill on an unsupported (MoE) config must
         /// reject before any state mutation, so a retry after the failure observes
         /// exactly the same clean session state — not a partially-encoded one.
@@ -24474,7 +24827,12 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// must stay untouched across repeated failed attempts.
         #[test]
         fn forward_prefill_batched_chunk_rejects_moe_before_any_state_mutation() {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
                 return;
             };
             let _guard = gpu_test_lock();
@@ -28414,6 +28772,326 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 .expect("single-char vocab tokenizer build")
         }
 
+        /// Shared assertion for the #1448 entry-point sweep. Every public prefill
+        /// route that can reach the batched schedulers must REPORT an unsupported
+        /// (MoE) multi-token prefill as `UnsupportedModel`, never abort the process.
+        ///
+        /// Each caller does its own `catch_unwind` around its own entry point and
+        /// hands the outcome here, because a panic is the exact failure under guard:
+        /// it has to be observed as a caught unwind, not allowed to propagate. The
+        /// variant is asserted rather than just "an error", and "did not panic" is
+        /// deliberately not the assertion — a test that only checks for the absence
+        /// of a crash passes against a route that rejects for some unrelated reason,
+        /// and so would pass without the guard under test ever running.
+        fn assert_moe_prefill_rejected<T: std::fmt::Debug>(
+            outcome: std::thread::Result<Result<T, crate::error::InferenceError>>,
+            entry_point: &str,
+        ) {
+            let Ok(returned) = outcome else {
+                panic!(
+                    "{entry_point}: an unsupported-MoE prefill must come back as Err; it \
+                     unwound as a panic instead, which in a release build is the process \
+                     abort this guard exists to remove"
+                )
+            };
+            let error = match returned {
+                Err(error) => error,
+                Ok(value) => panic!(
+                    "{entry_point}: an unsupported-MoE prefill must not succeed; got {value:?}"
+                ),
+            };
+            let message = match &error {
+                crate::error::InferenceError::UnsupportedModel(message) => message.clone(),
+                other => panic!(
+                    "{entry_point}: the documented contract is \
+                     InferenceError::UnsupportedModel; got {other:?}. Any other variant \
+                     means a different rejection fired first and this test would pass \
+                     without the guard under test having run at all"
+                ),
+            };
+            assert!(
+                message.contains("MoE"),
+                "{entry_point}: the rejection must name the MoE batched-prefill \
+                 limitation so a caller can act on it; got {message:?}"
+            );
+        }
+
+        /// Shared setup for the #1448 rejection tests: the `LATTICE_METAL_TEST_ENFORCE`
+        /// device contract, the machine-wide GPU lock, the MoE fixture, and state
+        /// construction, in one place so an entry-point addition or a setup change is
+        /// one edit instead of one per test. Runs `test` while the lock is held; on a
+        /// device-less machine it asserts the enforce contract and runs nothing.
+        fn with_moe_prefill_state(
+            max_cache_len: usize,
+            test: impl FnOnce(&Qwen35Config, &mut MetalQwen35State),
+        ) {
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _guard = gpu_test_lock();
+            let (cfg, weights) = tiny_moe_prefill_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, max_cache_len)
+                .expect("moe prefill fixture must construct");
+            test(&cfg, &mut state);
+        }
+
+        /// Regression (#1448): `forward_prefill_with_hidden` takes the batched
+        /// schedulers for a multi-token prompt with no active LoRA adapter, and those
+        /// have no MoE schedule. Until the check was wired in here it aborted on that
+        /// input. Three tokens, one more than the two-token minimum, so the assertion
+        /// is not resting on the smallest possible batch.
+        #[test]
+        fn forward_prefill_with_hidden_reports_moe_prefill_rejection() {
+            with_moe_prefill_state(16, |_cfg, state| {
+                let position_before = state.session.position;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.forward_prefill_with_hidden(&[1u32, 3, 5])
+                }));
+                assert_moe_prefill_rejected(outcome, "forward_prefill_with_hidden");
+                assert_eq!(
+                    state.session.position, position_before,
+                    "the rejection runs before any dispatch, so session position must \
+                     be untouched"
+                );
+            });
+        }
+
+        /// Regression (#1448): `forward_prefill_all_logits` is batched by
+        /// construction — it has no per-token fallback at all — so an MoE checkpoint
+        /// reached it and aborted. Its production caller is perplexity evaluation,
+        /// which now gets an error it can report.
+        #[test]
+        fn forward_prefill_all_logits_reports_moe_prefill_rejection() {
+            with_moe_prefill_state(16, |_cfg, state| {
+                let position_before = state.session.position;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.forward_prefill_all_logits(&[1u32, 3, 5])
+                }));
+                assert_moe_prefill_rejected(outcome, "forward_prefill_all_logits");
+                assert_eq!(
+                    state.session.position, position_before,
+                    "the rejection runs before any dispatch, so session position must \
+                     be untouched"
+                );
+            });
+        }
+
+        /// Regression (#1448): `generate` prefilled through the panicking
+        /// `forward_prefill` wrapper, so the typed rejection that already existed one
+        /// level down was turned straight back into an abort on the request-facing
+        /// path. This is the one that matters for a server: an ordinary valid prompt
+        /// against an MoE checkpoint took the host down.
+        #[test]
+        fn generate_reports_moe_prefill_rejection_without_panicking() {
+            with_moe_prefill_state(32, |_cfg, state| {
+                use crate::tokenizer::common::Tokenizer;
+
+                let tokenizer = single_char_vocab_tokenizer();
+                let prompt = "abc";
+                let tokenized = tokenizer.tokenize(prompt);
+                assert!(
+                    tokenized.real_length > 1,
+                    "test construction: the prompt must tokenize to more than one \
+                     token (got {}), or prefill never reaches the batched path under \
+                     guard",
+                    tokenized.real_length
+                );
+                let gen_cfg = moe_rejection_gen_cfg();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.generate(prompt, &tokenizer, &gen_cfg)
+                }));
+                assert_moe_prefill_rejected(outcome, "generate");
+            });
+        }
+
+        /// Regression (#1448): `generate_streaming` shares
+        /// `generate_streaming_with_cancel`'s one implementation, which prefilled
+        /// through the same panicking wrapper `generate` did. Covered separately
+        /// rather than assumed from `generate`, because the two build their prefill
+        /// call independently — the sibling-invocation-path case this fix's own
+        /// review has to answer for.
+        #[test]
+        fn generate_streaming_reports_moe_prefill_rejection_without_panicking() {
+            with_moe_prefill_state(32, |_cfg, state| {
+                use crate::tokenizer::common::Tokenizer;
+
+                let tokenizer = single_char_vocab_tokenizer();
+                let prompt = "abc";
+                let tokenized = tokenizer.tokenize(prompt);
+                assert!(
+                    tokenized.real_length > 1,
+                    "test construction: the prompt must tokenize to more than one \
+                     token (got {}), or prefill never reaches the batched path under \
+                     guard",
+                    tokenized.real_length
+                );
+                let gen_cfg = moe_rejection_gen_cfg();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.generate_streaming(prompt, &tokenizer, &gen_cfg, |_, _| true)
+                }));
+                assert_moe_prefill_rejected(outcome, "generate_streaming");
+            });
+        }
+
+        /// Regression (#1448 follow-up): the prefix-cache generation path reaches the
+        /// batched schedulers through `forward_prefill_from`, not through
+        /// `try_forward_prefill`, so the first fix left it able to abort — the
+        /// exact sibling-invocation-path miss the original test comment warned about,
+        /// found by the review rather than by the grep. The serve worker calls this
+        /// entry point directly, so this abort was remotely reachable.
+        #[test]
+        fn generate_streaming_with_prefix_cache_reports_moe_prefill_rejection() {
+            with_moe_prefill_state(32, |_cfg, state| {
+                use crate::tokenizer::common::Tokenizer;
+
+                let tokenizer = single_char_vocab_tokenizer();
+                let prompt = "abc";
+                let tokenized = tokenizer.tokenize(prompt);
+                assert!(
+                    tokenized.real_length > 1,
+                    "test construction: the prompt must tokenize to more than one \
+                     token (got {}), or the suffix prefill never spans multiple \
+                     tokens",
+                    tokenized.real_length
+                );
+                let gen_cfg = moe_rejection_gen_cfg();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state
+                        .generate_streaming_with_prefix_cache(
+                            crate::kv_cache::CrossTurnSlotId::DEFAULT,
+                            prompt,
+                            &tokenizer,
+                            &gen_cfg,
+                            |_, _| true,
+                        )
+                        .map(|cached| cached.output)
+                }));
+                assert_moe_prefill_rejected(outcome, "generate_streaming_with_prefix_cache");
+            });
+        }
+
+        /// Rule-separating pair for `forward_prefill_from` on an MoE model (#1448
+        /// follow-up): a single-token suffix takes the per-token `try_forward_step`
+        /// fast path, which supports MoE, and must SUCCEED with full-vocabulary
+        /// logits; a multi-token suffix has only batched branches left and must be
+        /// rejected as `UnsupportedModel`. Asserting both on one fixture is what
+        /// pins the rejection to the batched routing rather than to the model kind —
+        /// a rejection keyed on "is MoE" alone would fail the first arm.
+        #[test]
+        fn forward_prefill_from_separates_single_token_success_from_batched_rejection() {
+            with_moe_prefill_state(16, |cfg, state| {
+                let logits = state
+                    .forward_prefill_from(&[2u32], 0, false)
+                    .expect("a single-token suffix takes the per-token path, which supports MoE");
+                assert_eq!(
+                    logits.len(),
+                    cfg.vocab_size,
+                    "the single-token fast path must return full-vocabulary logits"
+                );
+
+                state.reset_state();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.forward_prefill_from(&[1u32, 3, 5], 0, false)
+                }));
+                assert_moe_prefill_rejected(outcome, "forward_prefill_from");
+            });
+        }
+
+        /// Regression (#1448 follow-up): a prefill that fails after
+        /// `configure_sampling_route` engaged the compact route must not leave that
+        /// route on the session — a raw `forward_step` afterward would take the
+        /// compact branch and return empty logits. Engages the route by direct field
+        /// assignment (the #171 pattern: route *selection* is env-keyed and
+        /// process-global, so an end-to-end engagement through `generate` is not
+        /// testable under parallel test execution), calls the cleanup the error arms
+        /// call, and asserts the outcome the contract names: `forward_step` returns
+        /// full-vocabulary logits. The wiring of the cleanup into all three
+        /// generation entry points' error arms is pinned by the source-consistency
+        /// rows in `public_scheduling_entry_points_route_through_their_preflights`.
+        #[test]
+        fn failed_prefill_compact_cleanup_restores_full_vocab_forward_step() {
+            with_moe_prefill_state(16, |cfg, state| {
+                state.session.compact_route = GpuTopkRoute::BlockArgmax;
+                state.session.compact_topk = 1;
+
+                state.disengage_compact_route();
+
+                assert_eq!(
+                    state.session.compact_route,
+                    GpuTopkRoute::CpuFallback,
+                    "the cleanup must disengage the compact route"
+                );
+                assert_eq!(
+                    state.session.compact_topk, 0,
+                    "the cleanup must clear compact_topk"
+                );
+                let logits = state.forward_step(3, 0);
+                assert_eq!(
+                    logits.len(),
+                    cfg.vocab_size,
+                    "after cleanup, a raw forward_step must return full [vocab_size] \
+                     logits via the exact path — a shorter/empty result means the \
+                     compact route survived the failed prefill"
+                );
+            });
+        }
+
+        /// Regression (#1448): `embed_tokens` is the third caller of the panicking
+        /// wrapper and is not named in the issue — found by grepping the wrapper's
+        /// call sites rather than by working the reported list. It is request-facing
+        /// (it backs Metal embedding), so it had the same abort. It also sets
+        /// `capture_final_hidden` around the prefill, so the rejection has to restore
+        /// that flag on the way out; the second assertion is what makes the early
+        /// return distinguishable from one that leaks session state.
+        #[test]
+        fn embed_tokens_reports_moe_prefill_rejection_without_panicking() {
+            with_moe_prefill_state(16, |_cfg, state| {
+                let capture_before = state.session.capture_final_hidden;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    state.embed_tokens(
+                        &[1u32, 3, 5],
+                        crate::model::qwen35::HiddenPooling::LastToken,
+                    )
+                }));
+                assert_moe_prefill_rejected(outcome, "embed_tokens");
+                assert_eq!(
+                    state.session.capture_final_hidden, capture_before,
+                    "a rejected embed must restore capture_final_hidden; leaving it \
+                     set would make the next unrelated forward pass capture a hidden \
+                     row it was never asked for"
+                );
+            });
+        }
+
+        /// Minimal decode config for the #1448 rejection tests. Every field is set
+        /// so that nothing but the MoE prefill can reject: no grammar, no logprobs,
+        /// no MTP, no stop tokens, and a decode budget the tiny fixture's context
+        /// comfortably admits. If one of those guards fired first,
+        /// `assert_moe_prefill_rejected` would see the wrong error variant and fail
+        /// rather than pass on the wrong evidence.
+        fn moe_rejection_gen_cfg() -> crate::model::qwen35_config::GenerateConfig {
+            crate::model::qwen35_config::GenerateConfig {
+                max_new_tokens: 4,
+                temperature: 0.0,
+                top_k: 1,
+                top_p: 1.0,
+                repetition_penalty: 1.0,
+                seed: Some(42),
+                stop_token_ids: vec![],
+                enable_thinking: false,
+                enable_mtp: Some(false),
+                grammar: None,
+                stop_strings: vec![],
+                reasoning_budget: None,
+                logprobs: None,
+            }
+        }
+
         fn assert_context_budget_error<T: std::fmt::Debug>(
             result: &Result<T, crate::error::InferenceError>,
             prompt_len: usize,
@@ -29213,6 +29891,106 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         #[test]
+        fn metal_speculative_generation_owns_prefill_and_context_admission() {
+            use crate::speculative::MtpTargetVerifier as _;
+
+            let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+            let Some(_) = metal::Device::system_default() else {
+                assert!(
+                    !enforce,
+                    "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present"
+                );
+                return;
+            };
+            let _gpu_guard = gpu_test_lock();
+
+            let (cfg, weights) = tiny_hybrid_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 32)
+                .expect("tiny hybrid fixture must construct");
+
+            state.reset_state();
+            let _ = state.forward_prefill(&[1]);
+            assert_eq!(state.session.kv_cache.seq_len, 1);
+
+            let mut warm_gdn = state.snapshot_gdn_states();
+            for (layer, (s_matrix, conv)) in warm_gdn.iter_mut().enumerate() {
+                for (index, value) in s_matrix.iter_mut().enumerate() {
+                    *value = 0.5 + layer as f32 * 0.01 + index as f32 * 1e-4;
+                }
+                for (index, value) in conv.iter_mut().enumerate() {
+                    *value = -0.7 - layer as f32 * 0.01 - index as f32 * 1e-4;
+                }
+            }
+            state.restore_gdn_states(&warm_gdn);
+            assert!(
+                warm_gdn
+                    .iter()
+                    .flat_map(|(s, conv)| s.iter().chain(conv))
+                    .any(|&value| value != 0.0),
+                "the warmed state must be observably non-zero before admission"
+            );
+
+            let over_budget_prompt = vec![0u32; 32];
+            let rejected = state.generate_with_speculation(&over_budget_prompt, 1, u32::MAX, 5, 4);
+            assert_context_budget_error(&rejected, 32, 1, 32);
+            assert_eq!(
+                state.session.kv_cache.seq_len, 1,
+                "context rejection must precede reset, prefill, and decode"
+            );
+            assert_eq!(
+                state.snapshot_gdn_states(),
+                warm_gdn,
+                "context rejection must preserve recurrent state before reset"
+            );
+
+            let mut exact_prompt = vec![0u32; 31];
+            exact_prompt[30] = 1;
+            let generated = state
+                .generate_with_speculation(&exact_prompt, 1, u32::MAX, 5, 4)
+                .expect("31 prompt tokens plus one generated token exactly fit");
+            assert_eq!(
+                generated,
+                vec![1],
+                "the first token must come from the completed prompt prefill"
+            );
+            assert_eq!(
+                state.session.kv_cache.seq_len,
+                exact_prompt.len() + generated.len(),
+                "the final budget token must be forwarded into live state"
+            );
+            assert!(
+                state
+                    .snapshot_gdn_states()
+                    .iter()
+                    .flat_map(|(s, conv)| s.iter().chain(conv))
+                    .all(|&value| value == 0.0),
+                "state-owned generation must reset the planted recurrent state before prefill"
+            );
+
+            let invalid_prompt =
+                state.generate_with_speculation(&[cfg.vocab_size as u32], 1, u32::MAX, 5, 4);
+            assert!(matches!(
+                invalid_prompt,
+                Err(crate::error::InferenceError::InvalidInput(ref message))
+                    if message
+                        == "prompt contains out-of-vocabulary token id 32 (vocab_size=32)"
+            ));
+            assert_eq!(
+                state.session.kv_cache.seq_len, 32,
+                "token-id rejection must precede reset and GPU work"
+            );
+
+            let zero_budget = state
+                .generate_with_speculation(&[0], 0, u32::MAX, 5, 4)
+                .expect("zero budget must be a successful no-op");
+            assert!(zero_budget.is_empty());
+            assert_eq!(
+                state.session.kv_cache.seq_len, 32,
+                "zero budget must not reset an existing session"
+            );
+        }
+
+        #[test]
         fn lora_mixture_context_rejection_preserves_adapter_and_cache() {
             let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
             let Some(_) = metal::Device::system_default() else {
@@ -30006,7 +30784,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // pre-draft / post-draft slot contents are observably distinct. The exact
             // values don't matter — only that conv rolling and S-matrix decay would
             // perturb them if GDN-only draft forwards touched the captured slot.
-            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: StorageModeShared; no command buffer in flight in the test.
                 unsafe {
@@ -30016,7 +30795,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 }
             }
-            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.conv_buffer();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -30149,7 +30929,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             });
 
             // Write a recognizable pattern into the live GPU GDN buffers.
-            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: StorageModeShared buffer; no command buffer in flight in the test.
                 unsafe {
@@ -30159,7 +30940,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 }
             }
-            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.conv_buffer();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -30171,10 +30953,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             }
 
             let snap = state.snapshot_gdn_states();
-            assert_eq!(snap.len(), state.session.gdn_gpu_s_matrices.len());
+            assert_eq!(snap.len(), state.session.gdn_gpu_state.len());
 
             // Clobber the live buffers.
-            for buf in &state.session.gdn_gpu_s_matrices {
+            for layer in state.session.gdn_gpu_state.layers() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -30184,7 +30967,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 }
             }
-            for buf in &state.session.gdn_gpu_conv_bufs {
+            for layer in state.session.gdn_gpu_state.layers() {
+                let buf = layer.conv_buffer();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -30197,7 +30981,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
             state.restore_gdn_states(&snap);
 
-            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 let live = unsafe {
@@ -30233,7 +31018,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             );
             malformed.pop();
 
-            for (li, buf) in state.session.gdn_gpu_s_matrices.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.s_matrix();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: StorageModeShared buffer; no command buffer is in flight.
                 unsafe {
@@ -30243,7 +31029,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                     }
                 }
             }
-            for (li, buf) in state.session.gdn_gpu_conv_bufs.iter().enumerate() {
+            for (li, layer) in state.session.gdn_gpu_state.layers().enumerate() {
+                let buf = layer.conv_buffer();
                 let n = (buf.length() / 4) as usize;
                 // SAFETY: see above.
                 unsafe {
@@ -31063,7 +31850,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         }
 
         /// Gate 3: Chunked-vs-serial GDN state diff.  After running the chunked prefill path the
-        /// final S matrices in `gdn_gpu_s_matrices` must match what the serial token-by-token path
+        /// final S matrices in the typed GDN state must match what the serial token-by-token path
         /// produces, within max_rel_diff < 1e-3.
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         #[test]
@@ -37173,6 +37960,89 @@ mod public_scheduling_entry_point_tests {
         functions
     }
 
+    /// Removes `//` comments and ordinary quoted strings while preserving source length;
+    /// block comments, raw strings, and character literals are outside its limits.
+    fn strip_comments_and_strings(source: &str) -> String {
+        let mut bytes = source.as_bytes().to_vec();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+                bytes[index] = b' ';
+                bytes[index + 1] = b' ';
+                index += 2;
+                while index < bytes.len() && bytes[index] != b'\n' {
+                    bytes[index] = b' ';
+                    index += 1;
+                }
+            } else if bytes[index] == b'"' {
+                bytes[index] = b' ';
+                index += 1;
+                while index < bytes.len() {
+                    match bytes[index] {
+                        b'\\' => {
+                            bytes[index] = b' ';
+                            index += 1;
+                            if index < bytes.len() && bytes[index] != b'\n' {
+                                bytes[index] = b' ';
+                            }
+                            index += 1;
+                        }
+                        b'"' => {
+                            bytes[index] = b' ';
+                            index += 1;
+                            break;
+                        }
+                        b'\n' => index += 1,
+                        _ => {
+                            bytes[index] = b' ';
+                            index += 1;
+                        }
+                    }
+                }
+            } else {
+                index += 1;
+            }
+        }
+        String::from_utf8(bytes).expect("source remains valid UTF-8 after scrubbing")
+    }
+
+    fn count_calls(source: &str, helper: &str) -> usize {
+        let call = format!("{helper}(");
+        source
+            .match_indices(&call)
+            .filter(|(start, _)| {
+                *start == 0 || {
+                    let previous = source.as_bytes()[*start - 1];
+                    !previous.is_ascii_alphanumeric() && previous != b'_'
+                }
+            })
+            .count()
+    }
+
+    fn contains_call(source: &str, helper: &str) -> bool {
+        count_calls(source, helper) > 0
+    }
+
+    #[test]
+    fn source_consistency_call_matching_ignores_comments_and_strings() {
+        let comment_only = "fn example() { // check_live_cursor(\n }";
+        let string_only = r#"fn example() { let text = "check_live_cursor("; }"#;
+        let real_call = "fn example() { self.check_live_cursor(); }";
+
+        assert!(!contains_call(
+            &strip_comments_and_strings(comment_only),
+            "check_live_cursor"
+        ));
+        assert!(!contains_call(
+            &strip_comments_and_strings(string_only),
+            "check_live_cursor"
+        ));
+        assert!(contains_call(
+            &strip_comments_and_strings(real_call),
+            "check_live_cursor"
+        ));
+    }
+
     #[test]
     fn every_public_stateful_scheduling_entry_point_has_preflight() {
         let source = include_str!("metal_qwen35.rs");
@@ -37240,6 +38110,16 @@ mod public_scheduling_entry_point_tests {
                 "pub fn forward_prefill_all_logits(",
                 "check_raw_prefill_fresh_session",
             ),
+            ("fn forward_prefill_from(", "reject_moe_batched"),
+            ("pub fn generate(", "disengage_compact_route"),
+            (
+                "pub fn generate_streaming_with_cancel<F, C>(",
+                "disengage_compact_route",
+            ),
+            (
+                "fn generate_streaming_with_prefix_cache_and_cancel_inner<F, C>(",
+                "disengage_compact_route",
+            ),
             ("fn verify_tokens(", "check_live_cursor"),
             ("fn rollback_cache_to(", "rollback_speculative_state_to"),
             ("pub fn prepare_hidden_for_bench(", "forward_step"),
@@ -37256,11 +38136,22 @@ mod public_scheduling_entry_point_tests {
                 "preflight_bench_prefill",
             ),
         ] {
+            let body = strip_comments_and_strings(item(real, declaration));
             assert!(
-                item(real, declaration).contains(preflight),
+                contains_call(&body, preflight),
                 "{declaration} must route through {preflight}"
             );
         }
+
+        let generate = strip_comments_and_strings(item(real, "pub fn generate("));
+        assert_eq!(
+            generate
+                .lines()
+                .filter(|line| line.trim() == "if use_compact {")
+                .count(),
+            count_calls(&generate, "disengage_compact_route"),
+            "each compact generation branch must disengage its route"
+        );
     }
 }
 
@@ -37970,10 +38861,10 @@ pub enum GdnStateCopyKind {
 
 /// Per-layer and aggregate GDN recurrent-state byte shape, derived from config.
 ///
-/// Mirrors the buffer sizes `new_session_inner` allocates: each
-/// `gdn_gpu_conv_bufs[i]` holds `linear_qkv_dim * (linear_conv_kernel_dim - 1)`
-/// f32 values, each `gdn_gpu_s_matrices[i]` holds
-/// `linear_num_value_heads * linear_value_head_dim * linear_key_head_dim` f32 values.
+/// Mirrors the buffer sizes `new_session_inner` allocates: each typed Metal GDN
+/// layer owns `linear_qkv_dim * (linear_conv_kernel_dim - 1)` conv-history f32
+/// values and `linear_num_value_heads * linear_value_head_dim *
+/// linear_key_head_dim` recurrent-matrix f32 values.
 #[cfg(feature = "gdn-state-counters")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GdnStateTrafficShape {
@@ -38410,6 +39301,22 @@ impl MetalQwen35State {
         ))
     }
 
+    /// **Unstable**: Metal n-gram speculative generation stub.
+    ///
+    /// Always returns a typed capability error without macOS + `metal-gpu`.
+    pub fn generate_with_speculation(
+        &mut self,
+        _prompt_tokens: &[u32],
+        _max_new_tokens: usize,
+        _eos_token: u32,
+        _max_ngram: usize,
+        _max_draft: usize,
+    ) -> Result<Vec<u32>, crate::error::InferenceError> {
+        Err(crate::error::InferenceError::Inference(
+            "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
+        ))
+    }
+
     /// **Unstable**: Metal generate stub; always errors without metal-gpu feature.
     ///
     /// #856 follow-up: this used to
@@ -38604,6 +39511,19 @@ mod non_metal_stub_tests {
             }
             other => panic!("expected Err(InferenceError::Inference(..)), got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_metal_stub_speculative_generation_returns_capability_error() {
+        let mut state = MetalQwen35State;
+
+        let result = state.generate_with_speculation(&[0], 1, u32::MAX, 5, 4);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(ref message))
+                if message
+                    == "Metal GPU not available (requires macOS + metal-gpu feature)"
+        ));
     }
 }
 

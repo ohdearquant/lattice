@@ -511,12 +511,22 @@ impl SentencePieceTokenizer {
         out
     }
 
-    fn add_special_tokens_and_truncate(&self, ids: &mut Vec<u32>) {
+    /// Inserts BOS/EOS and truncates to `max_seq_len`, returning the
+    /// pre-truncation token count (equal to `ids.len()` after this call
+    /// unless truncation was applied, in which case it reports the larger,
+    /// pre-truncation count -- including the EOS token when `add_eos` adds one).
+    fn add_special_tokens_and_truncate(&self, ids: &mut Vec<u32>) -> usize {
         if self.inner.add_bos
             && let Some(id) = self.inner.bos_id
         {
             ids.insert(0, id);
         }
+
+        let pre_truncation_len = if self.inner.add_eos && self.inner.eos_id.is_some() {
+            ids.len() + 1
+        } else {
+            ids.len()
+        };
 
         if self.inner.add_eos {
             if let Some(id) = self.inner.eos_id {
@@ -544,9 +554,17 @@ impl SentencePieceTokenizer {
             );
             ids.truncate(self.inner.max_seq_len);
         }
+
+        pre_truncation_len
     }
 
+    #[cfg(test)]
     fn tokenize_to_ids(&self, text: &str) -> Vec<u32> {
+        self.tokenize_to_ids_with_pre_truncation_len(text).0
+    }
+
+    /// Returns the tokenized IDs and the pre-truncation token count.
+    fn tokenize_to_ids_with_pre_truncation_len(&self, text: &str) -> (Vec<u32>, usize) {
         let mut ids = Vec::new();
         if self.inner.added_tokens_sorted.is_empty() {
             self.tokenize_regular_segment(text, &mut ids);
@@ -569,8 +587,8 @@ impl SentencePieceTokenizer {
                 }
             }
         }
-        self.add_special_tokens_and_truncate(&mut ids);
-        ids
+        let pre_truncation_len = self.add_special_tokens_and_truncate(&mut ids);
+        (ids, pre_truncation_len)
     }
 
     fn tokenize_regular_segment(&self, text: &str, ids: &mut Vec<u32>) {
@@ -708,8 +726,13 @@ impl SentencePieceTokenizer {
 
 impl Tokenizer for SentencePieceTokenizer {
     fn tokenize(&self, text: &str) -> TokenizedInput {
-        let ids = self.tokenize_to_ids(text);
-        pad_ids(ids, self.inner.max_seq_len, self.inner.pad_id)
+        let (ids, pre_truncation_len) = self.tokenize_to_ids_with_pre_truncation_len(text);
+        pad_ids(
+            ids,
+            self.inner.max_seq_len,
+            self.inner.pad_id,
+            pre_truncation_len,
+        )
     }
 
     fn tokenize_batch(&self, texts: &[&str]) -> Vec<TokenizedInput> {
@@ -719,12 +742,14 @@ impl Tokenizer for SentencePieceTokenizer {
         let mut max_len = 0usize;
         let mut all = Vec::with_capacity(texts.len());
         for text in texts {
-            let ids = self.tokenize_to_ids(text);
+            let (ids, pre_truncation_len) = self.tokenize_to_ids_with_pre_truncation_len(text);
             max_len = max_len.max(ids.len());
-            all.push(ids);
+            all.push((ids, pre_truncation_len));
         }
         all.into_iter()
-            .map(|ids| pad_ids(ids, max_len, self.inner.pad_id))
+            .map(|(ids, pre_truncation_len)| {
+                pad_ids(ids, max_len, self.inner.pad_id, pre_truncation_len)
+            })
             .collect()
     }
 
@@ -1095,6 +1120,24 @@ mod tests {
         let tokenizer = synthetic_tokenizer();
         let ids = tokenizer.tokenize_to_ids("hello world");
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_sentencepiece_pre_truncation_len_exceeds_real_length_when_truncated() {
+        // "hello world" -> [▁hello(1), ▁world(2)] untruncated (2 tokens).
+        // With max_seq_len=1, the tokenizer truncates to 1 token but must
+        // still report the untruncated count via pre_truncation_len -- the
+        // context-window admission guard in serve/embeddings.rs compares
+        // against this field, not real_length, and this is the collision
+        // case where the tokenizer's own cap coincides with the model limit.
+        let tokenizer = synthetic_tokenizer().with_max_seq_len(1);
+        let input = tokenizer.tokenize("hello world");
+        assert_eq!(input.real_length, 1);
+        assert_eq!(
+            input.pre_truncation_len, 2,
+            "pre_truncation_len must report the untruncated token count"
+        );
+        assert!(input.pre_truncation_len > input.real_length);
     }
 
     #[test]

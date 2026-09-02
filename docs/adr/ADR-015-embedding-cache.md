@@ -3,6 +3,9 @@
 **Status**: Accepted
 **Date**: 2026-05-13
 **Crate**: lattice-embed
+**Proposed amendment**: [ADR-088](ADR-088-sealed-native-embedding-attestation.md) would make the initial
+identity-governing prepared path disable result caches until they are bound to a complete space
+identity and persistent contents have an authenticity contract.
 
 ## Context
 
@@ -19,7 +22,15 @@ Under 8+ concurrent async tasks, this single lock serializes all cache reads.
 ## Decision
 
 The cache is implemented as 16 independent LRU shards behind a `parking_lot::RwLock`,
-with Blake3-based shard routing and per-shard `AtomicU64` hit/miss counters.
+with cryptographic-key-based shard routing and per-shard `AtomicU64` hit/miss counters.
+
+### Current key amendment (documented 2026-08-17)
+
+The shipped key uses SHA-256 over caller text bytes followed by
+`model_name:key_version:active_dim:role_tag`. The explicit `EmbeddingRole` tag isolates Generic,
+Query, and Passage entries. This supersedes the initial Blake3 algorithm and role-free preimage
+described historically below; the 16-shard routing and unstable/non-persistent key contract are
+unchanged.
 
 ### Key Design Choices
 
@@ -30,10 +41,10 @@ Shard selection is a bitwise AND: `key[0] as usize & SHARD_MASK` (where `SHARD_M
 This eliminates a modulo instruction on the hot path. With 8-core M4 Pro hardware concurrency,
 16 shards gives 2x oversubscription, keeping per-shard lock wait time negligible.
 
-**Blake3 for cache keys**
+**Historical initial key design — Blake3 (superseded above)**
 
-The key is `blake3(text_bytes || "model_name:key_version:active_dim")`, producing a `[u8; 32]`.
-Blake3 is chosen over FNV/xxHash because: (a) output is cryptographically uniform so the
+The initial decision was `blake3(text_bytes || "model_name:key_version:active_dim")`, producing a
+`[u8; 32]`. Blake3 was chosen over FNV/xxHash because: (a) output is cryptographically uniform so the
 first-byte shard selector distributes load evenly, and (b) collision resistance matters
 when different models can produce semantically different embeddings for the same text.
 The key includes the active MRL dimension (`model_config.dimensions()`) so a Qwen3-4B
@@ -85,7 +96,7 @@ This avoids cross-shard contention on the counter updates — there is no shared
 
 ### Negative
 
-- Under pathological key distributions (all texts hashing to the same first byte), one shard takes all the load. In practice, Blake3 output is uniform enough that this is not a concern.
+- Under pathological key distributions (all texts hashing to the same first byte), one shard takes all the load. In practice, SHA-256 output is uniform enough that this is not a concern.
 - The 16-shard fixed constant cannot be changed without rebuilding. Shard count is not configurable at runtime.
 
 ### Risks

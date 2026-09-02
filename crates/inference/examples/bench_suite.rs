@@ -7,6 +7,7 @@
 //!   cargo run --release -p lattice-inference --example bench_suite
 //!   cargo run --release -p lattice-inference --example bench_suite -- --json
 //!   cargo run --release -p lattice-inference --example bench_suite -- --json --baseline benchmarks/baseline.json
+#![allow(clippy::field_reassign_with_default)]
 
 use std::time::Instant;
 
@@ -182,13 +183,11 @@ fn bench_llm() -> Vec<Metric> {
     let model = Qwen35Model::from_safetensors(dir).expect("failed to load Qwen3.5-2B");
     let load_ms = t_load.elapsed().as_millis() as f64;
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 20,
-        temperature: 0.0,
-        top_k: 1,
-        seed: Some(42),
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 20;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.seed = Some(42);
 
     // Warmup
     let _ = model.generate("Hello", &gen_cfg);
@@ -292,13 +291,11 @@ fn bench_llm_f16() -> Vec<Metric> {
     let f16_weights = load_f16_weights(&sf, &cfg).expect("failed to load f16 weights");
     let load_ms = t_load.elapsed().as_millis() as f64;
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 20,
-        temperature: 0.0,
-        top_k: 1,
-        seed: Some(42),
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 20;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.seed = Some(42);
 
     // Warmup
     let _ = generate_f16(&f16_weights, &cfg, &tokenizer, &rope, "Hello", &gen_cfg);
@@ -382,13 +379,11 @@ fn bench_llm_q8() -> Vec<Metric> {
     // Drop the f32 model to free memory
     drop(model);
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 20,
-        temperature: 0.0,
-        top_k: 1,
-        seed: Some(42),
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 20;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.seed = Some(42);
 
     // Warmup
     let _ = generate_q8(&q8_weights, &cfg, &tokenizer, &rope, "Hello", &gen_cfg);
@@ -463,13 +458,11 @@ fn bench_llm_q8_neon() -> Vec<Metric> {
 
     drop(model);
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 20,
-        temperature: 0.0,
-        top_k: 1,
-        seed: Some(42),
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 20;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.seed = Some(42);
 
     // Warmup
     let _ = generate_q8_neon(&q8_model, &cfg, &tokenizer, &rope, "Hello", &gen_cfg);
@@ -541,13 +534,11 @@ fn bench_llm_metal() -> Vec<Metric> {
         MetalQwen35State::new(model.weights(), &cfg, 4096).expect("failed to init Metal GPU state");
     let init_ms = t_init.elapsed().as_millis() as f64;
 
-    let gen_cfg = GenerateConfig {
-        max_new_tokens: 20,
-        temperature: 0.0,
-        top_k: 1,
-        seed: Some(42),
-        ..Default::default()
-    };
+    let mut gen_cfg = GenerateConfig::default();
+    gen_cfg.max_new_tokens = 20;
+    gen_cfg.temperature = 0.0;
+    gen_cfg.top_k = 1;
+    gen_cfg.seed = Some(42);
 
     // Warmup
     let _ = metal_state.generate("Hello", &tokenizer, &gen_cfg);

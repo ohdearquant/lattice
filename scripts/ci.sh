@@ -1,4 +1,9 @@
 #!/bin/sh
+# General-purpose local CI pipeline: fmt check, clippy, doc lint, full
+# workspace test run, tokenizer parity gate, embedding parity vs HF, and a
+# release build. Not the checkpoint-gated job -- opts the Gemma-4 e2e forward
+# test into an explicit skip when its multi-GB checkpoint isn't present.
+# Usage: scripts/ci.sh
 set -e
 
 : "${LATTICE_REQUIRE_FIXTURES:=1}"

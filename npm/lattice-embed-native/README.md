@@ -100,6 +100,9 @@ npm run packlist      # pack-list guard: main package must not ship a .node bina
 npm run artifacts     # copy the locally built .node into npm/<platform>/
 npm run packlist:darwin-arm64  # pack-list guard: darwin-arm64 subpackage ships exactly one .node
 npm run test:prebuild # assert CI targets, napi targets, and optional packages stay aligned
+npm run create-npm-dirs # napi-rs: scaffold npm/<platform> subpackage directories
+npm run version:native  # napi-rs: sync the native subpackages' versions to this package's
+# prepublishOnly runs automatically on `npm publish`: `npm run artifacts && npm test`
 ```
 
 ## License

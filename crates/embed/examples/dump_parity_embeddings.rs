@@ -18,7 +18,7 @@
 //! The Qwen3-embedding-0.6b fixture is intentionally skipped (known forward
 //! divergence, lattice#103).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use lattice_embed::{EmbeddingModel, EmbeddingService, NativeEmbeddingService};
@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("fixtures")
         .join("embed_parity_v1");
 
-    let mut results: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
+    let mut results: BTreeMap<String, Vec<Vec<f32>>> = BTreeMap::new();
 
     for fixture in FIXTURES {
         let fixture_path = fixture_dir.join(fixture.file);

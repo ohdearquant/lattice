@@ -69,13 +69,13 @@ available.
 
 ```rust
 let texts = vec![
-    "first document",
-    "second document",
-    "third document",
+    "first document".to_string(),
+    "second document".to_string(),
+    "third document".to_string(),
 ];
 
 let embeddings = service
-    .embed_batch(&texts, EmbeddingModel::default())
+    .embed(&texts, EmbeddingModel::default())
     .await?;
 
 assert_eq!(embeddings.len(), 3);
@@ -147,11 +147,11 @@ and must be stored in separate namespaces.
 
 ## Feature Flags
 
-| Feature     | Default | Description                                             |
-| ----------- | ------- | ------------------------------------------------------- |
-| `native`    | yes     | Enable `NativeEmbeddingService` via `lattice-inference` |
-| `metal-gpu` | no      | Metal GPU backend for Apple Silicon                     |
-| `avx512`    | no      | AVX-512 kernels (requires nightly Rust)                 |
+| Feature     | Default | Description                                                                                                                                                                                                                                 |
+| ----------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `native`    | yes     | Enable `NativeEmbeddingService` via `lattice-inference`                                                                                                                                                                                     |
+| `metal-gpu` | no      | Metal GPU backend for Apple Silicon                                                                                                                                                                                                         |
+| `avx512`    | no      | Deprecated no-op — the AVX-512 VNNI int8 kernel is compiled unconditionally on stable x86_64 (no Cargo feature, no nightly toolchain) and is selected at runtime only when AVX-512F/BW/VNNI are all detected; otherwise AVX2 or scalar runs |
 
 ```toml
 # Apple Silicon with GPU acceleration
@@ -165,9 +165,22 @@ Models are cached at `~/.lattice/models/<model-name>/`. Each model directory con
 ```
 ~/.lattice/models/bge-small-en-v1.5/
     model.safetensors   # weight file (mmap'd at inference time)
-    vocab.txt           # WordPiece vocabulary (BGE/MiniLM)
-    tokenizer.json      # SentencePiece config (E5/Qwen3)
+    vocab.txt           # WordPiece vocabulary for this model
 ```
+
+On first download, the tokenizer file is chosen by a substring match on the model name
+(`crates/inference/src/download.rs`), not by model family: names containing `e5-` or `multilingual`
+fetch `tokenizer.json`, everything else fetches `vocab.txt` — so `paraphrase-multilingual-minilm-l12-v2`,
+a MiniLM model, fetches `tokenizer.json` rather than `vocab.txt`. Nothing prevents both files from
+being present in a model directory (e.g. if placed there manually). When both exist, the loader
+probes `tokenizer.json` first and returns as soon as the JSON declares a recognized tokenizer model
+type, falling through to `vocab.txt`/legacy files only when the JSON declares no model type
+(`crates/inference/src/tokenizer/common.rs`). Tokenizer kind is auto-detected from the file's
+contents when `tokenizer.json` is used; when the loader falls through to legacy files, kind is
+selected by which files are present instead, checked in this order: `vocab.json` + `merges.txt`
+or `vocab.txt` + `merges.txt` → BPE, `vocab.txt` when neither merge-file BPE condition matched →
+WordPiece, `tokenizer.model` → SentencePiece — see [`docs/models.md`](models.md) §4 for the
+precedence order and per-family notes.
 
 The `download` feature in `lattice-inference` (enabled by default) fetches from
 `https://huggingface.co/{model_id}/resolve/main/` on first use. Subsequent calls

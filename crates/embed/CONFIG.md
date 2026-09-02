@@ -141,17 +141,17 @@ LATTICE_EMBED_DIM=1024  # truncate 4B's 2560-dim output to 1024
 
 ## Embedding Cache
 
-**Source**: `foundation/embed/src/cache.rs:131`
+**Source**: `crates/embed/src/cache.rs:97`
 
-Sharded LRU cache for computed embeddings. Keys are BLAKE3 hashes of (model + input text). Avoids redundant inference for repeated inputs.
+Sharded LRU cache for computed embeddings. Keys are SHA-256 hashes of the input text followed by the model, its key version, its dimensions, and the embedding role (`compute_key`, `cache.rs:149-167`). Avoids redundant inference for repeated inputs.
 
 ### Configuration
 
 | Parameter          | Default               | Source                                    | Notes                              |
 | ------------------ | --------------------- | ----------------------------------------- | ---------------------------------- |
-| `capacity`         | `4000`                | `DEFAULT_CACHE_CAPACITY` at `cache.rs:33` | Total entries across all 16 shards |
+| `capacity`         | `4000`                | `DEFAULT_CACHE_CAPACITY` at `cache.rs:26` | Total entries across all 16 shards |
 | `shard_count`      | `16`                  | `NUM_SHARDS` (hardcoded)                  | Fixed at compile time              |
-| Per-shard capacity | `ceil(capacity / 16)` | Computed at `cache.rs:161`                | Minimum 1 per shard                |
+| Per-shard capacity | `ceil(capacity / 16)` | Computed at `cache.rs:120-125`            | Minimum 1 per shard                |
 
 **Why 4000**: At 384 dimensions × 4 bytes = 1.5 KB per embedding, 4000 entries ≈ 6 MB — fits comfortably in memory while covering a typical session's repeated queries. For bulk import workloads, increase via `EmbeddingCache::new(capacity)`.
 
@@ -159,7 +159,7 @@ Sharded LRU cache for computed embeddings. Keys are BLAKE3 hashes of (model + in
 
 ### CacheStats
 
-**Source**: `cache.rs:342`
+**Source**: `cache.rs:310`
 
 | Field      | Type    | Notes                               |
 | ---------- | ------- | ----------------------------------- |

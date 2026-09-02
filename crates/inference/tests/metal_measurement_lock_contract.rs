@@ -125,6 +125,7 @@ const TARGETS_WITHOUT_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/bench_gdn.rs",
     "examples/diff_attn_layer23.rs",
     "examples/diff_gdn_layer.rs",
+    "examples/ernie45_trace_dump.rs",
     "src/bin/gramtime_profile.rs",
     "src/bin/moe_admission_sim.rs",
     "src/bin/quantize_q4.rs",
@@ -193,12 +194,12 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/chat_metal.rs:800:39",
+        recorded_position: "src/bin/chat_metal.rs:801:39",
         reason: "run Q4 initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
         site: "bin:chat_metal:src/bin/chat_metal.rs=>src/bin/chat_metal.rs::run::MetalQwen35State::new()#1",
-        recorded_position: "src/bin/chat_metal.rs:825:39",
+        recorded_position: "src/bin/chat_metal.rs:826:39",
         reason: "run safetensors initialization belongs to a long-running interactive process outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
@@ -213,12 +214,12 @@ const CONSTRUCTION_EXEMPTIONS: &[ConstructionExemption] = &[
     },
     ConstructionExemption {
         site: "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs::imp::load_model::MetalQwen35State::from_q4_dir()#1",
-        recorded_position: "src/bin/lattice_serve.rs:1693:47",
+        recorded_position: "src/bin/lattice_serve.rs:1795:47",
         reason: "load_model Q4 initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
     ConstructionExemption {
         site: "bin:lattice_serve:src/bin/lattice_serve.rs=>src/bin/lattice_serve.rs::imp::load_model::MetalQwen35State::new()#1",
-        recorded_position: "src/bin/lattice_serve.rs:1713:47",
+        recorded_position: "src/bin/lattice_serve.rs:1815:47",
         reason: "load_model safetensors initialization belongs to a long-running server outside the bounded measurement-harness contract",
     },
 ];

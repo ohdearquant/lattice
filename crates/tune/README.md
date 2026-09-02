@@ -352,15 +352,18 @@ maintain both sides themselves.
 
 ## Feature Flags
 
-| Feature          | Default | Description                                                             |
-| ---------------- | ------- | ----------------------------------------------------------------------- |
-| `std`            | Yes     | Standard library support                                                |
-| `serde`          | No      | Serialization (propagates to lattice-fann)                              |
-| `gpu`            | No      | GPU-accelerated forward/backward passes and validation[^gpu-limitation] |
-| `gpu-tests`      | No      | GPU tests requiring hardware                                            |
-| `safetensors`    | No      | PEFT-compatible LoRA adapter serialization                              |
-| `inference-hook` | No      | `impl LoraHook for LoraAdapter` (pulls in `lattice-inference`)          |
-| `train-backward` | No      | Backward/gradient training surface (pulls in `lattice-inference`)       |
+| Feature             | Default | Description                                                                                                               |
+| ------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `std`               | Yes     | Standard library support                                                                                                  |
+| `sqlite`            | Yes     | SQLite-backed model registry storage (implies `serde`)                                                                    |
+| `serde`             | No      | Serialization (propagates to lattice-fann)                                                                                |
+| `gpu`               | No      | GPU-accelerated forward/backward passes and validation[^gpu-limitation]                                                   |
+| `gpu-tests`         | No      | GPU tests requiring hardware                                                                                              |
+| `safetensors`       | No      | PEFT-compatible LoRA adapter serialization                                                                                |
+| `inference-hook`    | No      | `impl LoraHook for LoraAdapter` (pulls in `lattice-inference`)                                                            |
+| `train-backward`    | No      | Backward/gradient training surface (pulls in `lattice-inference`)                                                         |
+| `mixture`           | No      | Online adapter-selector refit from preference feedback (experimental, bench-gated; pulls in `lattice-fann/online-router`) |
+| `simulated-teacher` | No      | Fixed labels for tests and examples; never enables the default labeling path                                              |
 
 [^gpu-limitation]: **Current limitation**: `GpuTrainer::train_batch` returns
     `Err` for every optimizer choice (Adam, AdamW, SGD-momentum, plain SGD,

@@ -9,6 +9,7 @@
 //! ```text
 //! lattice_serve --model qwen3.5-0.8b               # resolves from ~/.lattice/models
 //! lattice_serve --model ~/.lattice/models/qwen3.6-27b-q4 --port 11435
+//! lattice_serve --model qwen3.5-0.8b --embedding-model bge-small-en-v1.5
 //! ```
 //!
 //! Then point any OpenAI client at `http://127.0.0.1:11435/v1`:
@@ -16,12 +17,17 @@
 //! ```text
 //! curl http://127.0.0.1:11435/v1/chat/completions -H 'content-type: application/json' \
 //!   -d '{"model":"lattice","messages":[{"role":"user","content":"hi"}],"stream":true}'
+//! curl http://127.0.0.1:11435/v1/embeddings -H 'content-type: application/json' \
+//!   -d '{"input":["hello world","a second passage"]}'
 //! ```
 //!
 //! # Endpoints
 //!
 //! - `POST /v1/chat/completions` — streaming (SSE) and non-streaming, OpenAI shape
-//! - `GET  /v1/models`           — advertises the single loaded model
+//! - `POST /v1/embeddings`       — OpenAI shape (issue #584); answers 503
+//!   `embedding_model_not_loaded` unless `--embedding-model` was passed at
+//!   startup (see `EmbeddingState`, `AppState::embedding`)
+//! - `GET  /v1/models`           — advertises the single loaded chat model
 //! - `GET  /health`              — liveness probe (`ok`)
 //! - `GET  /metrics`             — Prometheus text-format metrics (issue #583):
 //!   request count + latency histogram by route/status, prompt/completion
@@ -43,6 +49,23 @@
 //! (the same default ollama uses). The ChatML template and `<|im_end|>` stop
 //! handling are reused verbatim from the engine; this binary only translates the
 //! OpenAI wire format on either side.
+//!
+//! `POST /v1/embeddings` (issue #584) does not go through that worker at
+//! all: it is served by an independently loaded, optional `BertModel`
+//! (`crate::model::bert`), which is CPU-only and has no `!Send` state of its
+//! own, so its `encode_batch` call runs via `tokio::task::spawn_blocking`
+//! instead of a dedicated owner thread. This is a deliberate scope choice,
+//! not an oversight: `lattice-embed`'s `EmbeddingService` trait is the
+//! natural-looking integration point, but `lattice-embed` already depends on
+//! `lattice-inference` (for `BertModel`/`QwenModel`), so a dependency edge
+//! the other way is a cyclic package dependency Cargo refuses to build.
+//! `BertModel` is this crate's own, already-published embedding primitive,
+//! so using it directly costs no new dependency edge and no default-build
+//! weight. It has no per-model pooling table (BGE-family checkpoints need
+//! CLS pooling, not `BertModel`'s mean-pooling default) — pass
+//! `--embedding-pooling cls` when serving one.
+
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -88,22 +111,24 @@ mod imp {
     use lattice_inference::serve::contract::{
         ContentPart as Part, ImageUrl, Message as InMsg, MessageContent, normalize_messages,
     };
+    use lattice_inference::serve::embeddings::{
+        TextEmbeddingsRequest, build_embeddings_response, check_embeddings_item_fits_window,
+        check_embeddings_model, check_embeddings_total_tokens, check_embeddings_unsupported_fields,
+        parse_embeddings_input,
+    };
     use lattice_inference::serve::into_engine_chat_messages;
     use lattice_inference::serve::metal_worker::{
         ContextWindowPolicy, MetalWorker, MetalWorkerClient, StartupError, VisionRuntime,
         WorkerEvent, WorkerMetadata,
     };
     use lattice_inference::serve::metrics::ServeMetrics;
-    /// Only used by the test module's `.tokenize(..)` calls on a real (tiny)
-    /// tokenizer; production code never tokenizes outside the shared worker
-    /// (`lattice_inference::serve::metal_worker`), hence the test feature gate.
-    #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
-    use lattice_inference::tokenizer::Tokenizer as _;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
+    use lattice_inference::{BertModel, BertPooling};
     use serde_json::{Value, json};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use tokio::sync::Semaphore;
     /// Only used by the test module's raw job-channel helpers
     /// (`mpsc::UnboundedReceiver<WorkerJob>` etc. -- see
     /// `lattice_inference::serve::metal_worker`'s `test-utils`-gated
@@ -179,6 +204,83 @@ mod imp {
         /// (structured-output v0 design note, stage 2). `Arc`-shared so
         /// every clone of `AppState` (one per request) hits the same cache.
         grammar_cache: Arc<GrammarCache>,
+        /// The optional embedding model loaded via `--embedding-model`
+        /// (issue #584). `None` when the flag was not passed at startup, in
+        /// which case `POST /v1/embeddings` answers 503
+        /// `embedding_model_not_loaded` for every request rather than the
+        /// route not existing at all -- the route is always registered so
+        /// its absence is a documented, discoverable server state instead of
+        /// a bare 404.
+        embedding: Option<Arc<EmbeddingState>>,
+    }
+
+    /// The loaded embedding model and its identity, independent of the
+    /// chat model this binary always loads. `BertModel` is CPU-only (no
+    /// `metal-gpu` dependency of its own -- see `crate::model::bert`), so it
+    /// is loaded directly on the calling thread at startup and its
+    /// `encode_batch` calls run via `spawn_blocking` rather than through the
+    /// shared Metal worker, which owns only the `!Send` chat model state.
+    pub struct EmbeddingState {
+        model: BertModel,
+        model_id: Arc<str>,
+        /// Bounded concurrent-job admission for `encode_batch`'s
+        /// `spawn_blocking` calls (issue #584 hardening), mirroring
+        /// `MetalWorkerClient`'s admission `Semaphore` (`AppState::max_pending`,
+        /// issue #932): each outstanding job can already allocate up to
+        /// [`lattice_inference::serve::embeddings::MAX_EMBEDDINGS_TOTAL_TOKENS`]
+        /// worth of activation buffers, so total memory pressure across
+        /// concurrent requests is bounded by (this cap) x (that per-request
+        /// budget) rather than growing with however many requests arrive at
+        /// once. Fixed at [`EMBEDDING_MAX_CONCURRENT_JOBS`] rather than a
+        /// CLI flag like `--max-pending`: CPU-bound batched matmuls have no
+        /// hardware queue depth to model, this cap exists purely to bound
+        /// aggregate memory.
+        admission: Arc<Semaphore>,
+    }
+
+    /// See [`EmbeddingState::admission`].
+    const EMBEDDING_MAX_CONCURRENT_JOBS: usize = 4;
+
+    /// Acquires one embedding-job admission slot, mirroring
+    /// `MetalWorkerClient::submit`'s admission check (issue #932) for
+    /// [`EmbeddingState::admission`]. Synchronous and non-blocking: a full
+    /// admission cap is rejected immediately, before any tokenization or
+    /// `encode_batch` work runs, exactly like the chat path's admission
+    /// check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`lattice_inference::serve::ApiError::ServiceUnavailable`]
+    /// (`server_busy`) when [`EMBEDDING_MAX_CONCURRENT_JOBS`] jobs are
+    /// already outstanding.
+    fn try_acquire_embedding_slot(
+        admission: &Arc<Semaphore>,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, lattice_inference::serve::ApiError> {
+        admission.clone().try_acquire_owned().map_err(|_| {
+            lattice_inference::serve::ApiError::ServiceUnavailable {
+                message: "too many outstanding /v1/embeddings requests; retry shortly".to_string(),
+            }
+        })
+    }
+
+    /// Runs one `encode_batch` job on the blocking thread pool with `permit`
+    /// moved into the closure, so the admission slot releases when the job
+    /// finishes rather than when the caller's `.await` is dropped. A
+    /// `spawn_blocking` task already under way is not cancelled by dropping
+    /// its `JoinHandle` (e.g. a disconnected client dropping the request
+    /// future), so a permit held only in the caller's stack frame would
+    /// release on disconnect while the job kept running -- letting repeated
+    /// disconnects admit unbounded concurrent jobs past the cap.
+    async fn run_embedding_encode(
+        permit: tokio::sync::OwnedSemaphorePermit,
+        work: impl FnOnce() -> Result<Vec<Vec<f32>>, lattice_inference::InferenceError> + Send + 'static,
+    ) -> Result<Result<Vec<Vec<f32>>, lattice_inference::InferenceError>, tokio::task::JoinError>
+    {
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work()
+        })
+        .await
     }
 
     // ─── OpenAI request shapes ───────────────────────────────────────────────
@@ -1638,21 +1740,21 @@ mod imp {
     }
 
     fn build_cfg(req: &ValidatedChatRequest) -> GenerateConfig {
-        GenerateConfig {
-            max_new_tokens: req.max_tokens,
-            temperature: req.temperature,
-            top_k: req.top_k,
-            top_p: req.top_p,
-            repetition_penalty: req.repetition_penalty,
-            seed: req.seed,
-            stop_token_ids: vec![QWEN_CHAT_IM_END_TOKEN_ID],
-            enable_thinking: true,
-            enable_mtp: None,
-            grammar: None,
-            stop_strings: req.stop_strings.clone(),
-            reasoning_budget: req.reasoning_budget,
-            logprobs: req.logprobs,
-        }
+        let mut cfg = GenerateConfig::default();
+        cfg.max_new_tokens = req.max_tokens;
+        cfg.temperature = req.temperature;
+        cfg.top_k = req.top_k;
+        cfg.top_p = req.top_p;
+        cfg.repetition_penalty = req.repetition_penalty;
+        cfg.seed = req.seed;
+        cfg.stop_token_ids = vec![QWEN_CHAT_IM_END_TOKEN_ID];
+        cfg.enable_thinking = true;
+        cfg.enable_mtp = None;
+        cfg.grammar = None;
+        cfg.stop_strings = req.stop_strings.clone();
+        cfg.reasoning_budget = req.reasoning_budget;
+        cfg.logprobs = req.logprobs;
+        cfg
     }
 
     // ─── GPU worker thread ───────────────────────────────────────────────────
@@ -2656,6 +2758,284 @@ mod imp {
         }
     }
 
+    /// `POST /v1/embeddings` (issue #584): OpenAI-compatible embeddings over
+    /// the independently loaded `--embedding-model` `BertModel`. Follows
+    /// `chat_completions`'s content-type/body-size/parse/validate cascade,
+    /// but has no worker to submit to: `BertModel::encode_batch` runs
+    /// directly, off the async executor via `spawn_blocking` (CPU matmuls,
+    /// not `.await`-friendly).
+    async fn embeddings(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+        let timer = Instant::now();
+        const ROUTE: &str = "/v1/embeddings";
+        if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                415,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
+        let body = match to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await {
+            Ok(body) => body,
+            Err(err) => {
+                let is_length_limit = std::error::Error::source(&err)
+                    .is_some_and(<dyn std::error::Error>::is::<http_body_util::LengthLimitError>);
+                let (status, code) = if is_length_limit {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "request_body_too_large")
+                } else {
+                    (StatusCode::BAD_REQUEST, "invalid_request")
+                };
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    ROUTE,
+                    status.as_u16(),
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some(code),
+                );
+                return err_response(
+                    status,
+                    if is_length_limit {
+                        "request body too large"
+                    } else {
+                        "invalid request body"
+                    },
+                    code,
+                );
+            }
+        };
+        let req: TextEmbeddingsRequest = match serde_json::from_slice(&body) {
+            Ok(req) => req,
+            Err(_) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    ROUTE,
+                    400,
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some("invalid_request_body"),
+                );
+                return err_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid request body",
+                    "invalid_request_body",
+                );
+            }
+        };
+        if let Err(err) = check_embeddings_unsupported_fields(&req) {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                400,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
+        let texts = match parse_embeddings_input(&req.input) {
+            Ok(texts) => texts,
+            Err(err) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    ROUTE,
+                    400,
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some(err.code()),
+                );
+                return err.into_response();
+            }
+        };
+        let Some(embedding) = s.embedding.clone() else {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                503,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some("embedding_model_not_loaded"),
+            );
+            return lattice_inference::serve::ApiError::EmbeddingModelNotLoaded {
+                message: "no embedding model is loaded; start lattice_serve with \
+                          --embedding-model <dir>"
+                    .to_string(),
+            }
+            .into_response();
+        };
+        if let Err(err) = check_embeddings_model(req.model.as_deref(), embedding.model_id.as_ref())
+        {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                400,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
+
+        let embedding_model_id = embedding.model_id.clone();
+        let (item_token_counts, item_pre_truncation_counts): (Vec<usize>, Vec<usize>) = {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            embedding
+                .model
+                .tokenizer()
+                .tokenize_batch(&refs)
+                .iter()
+                .map(|t| (t.real_length, t.pre_truncation_len))
+                .unzip()
+        };
+        let prompt_tokens: usize = item_token_counts.iter().sum();
+        // Checked per item, before either `BertModel::encode_batch` path
+        // runs: `encode_batch_packed` clamps an over-length item to
+        // `max_position_embeddings` and would otherwise answer 200 for a
+        // silently truncated embedding, and the single-item `encode` path
+        // does not clamp at all. See `check_embeddings_item_fits_window`'s
+        // doc comment. The guard tests `pre_truncation_len`, not
+        // `real_length`: the tokenizer's own `max_seq_len` truncation runs
+        // first, so `real_length` can never exceed it and the guard would be
+        // unsatisfiable whenever `max_seq_len <= max_position_embeddings`.
+        let max_position_embeddings = embedding.model.config().max_position_embeddings;
+        if let Some((index, &token_count)) = item_pre_truncation_counts
+            .iter()
+            .enumerate()
+            .find(|&(_, &count)| count > max_position_embeddings)
+        {
+            let err =
+                check_embeddings_item_fits_window(index, token_count, max_position_embeddings)
+                    .unwrap_err();
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                400,
+                Some(prompt_tokens),
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
+        if let Err(err) = check_embeddings_total_tokens(prompt_tokens) {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                400,
+                Some(prompt_tokens),
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
+        let admission_permit = match try_acquire_embedding_slot(&embedding.admission) {
+            Ok(permit) => permit,
+            Err(err) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    ROUTE,
+                    503,
+                    Some(prompt_tokens),
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some(err.code()),
+                );
+                return err.into_response();
+            }
+        };
+
+        let encode_result = run_embedding_encode(admission_permit, move || {
+            let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+            embedding.model.encode_batch(&refs)
+        })
+        .await;
+        let vectors = match encode_result {
+            Ok(Ok(vectors)) => vectors,
+            Ok(Err(err)) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    ROUTE,
+                    500,
+                    Some(prompt_tokens),
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some("internal_error"),
+                );
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("embedding generation failed: {err}"),
+                    "internal_error",
+                );
+            }
+            Err(join_err) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    ROUTE,
+                    500,
+                    Some(prompt_tokens),
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    Some("internal_error"),
+                );
+                return err_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("embedding worker task failed: {join_err}"),
+                    "internal_error",
+                );
+            }
+        };
+
+        let body =
+            build_embeddings_response(embedding_model_id.as_ref(), &vectors, prompt_tokens as u64);
+        emit_serve_event(
+            &s.metrics,
+            "POST",
+            ROUTE,
+            200,
+            Some(prompt_tokens),
+            None,
+            timer.elapsed().as_secs_f64() * 1000.0,
+            false,
+            None,
+        );
+        Json(body).into_response()
+    }
+
     /// ADR-080 C2 (#782): builds the shared `lattice_inference::serve::
     /// ApiError` envelope instead of this binary's previous ad hoc 2-field
     /// `{"error": {"message", "type"}}` shape (no `code`/`param` at all) --
@@ -2822,6 +3202,7 @@ mod imp {
             .route("/health", get(health))
             .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
+            .route("/v1/embeddings", post(embeddings))
             .route("/metrics", get(metrics_handler))
             .with_state(state)
     }
@@ -3027,6 +3408,77 @@ mod imp {
             )
         };
 
+        // Issue #584: independent, optional second model for
+        // `POST /v1/embeddings`. `BertModel` is CPU-only (see
+        // `crate::model::bert`'s doc comment) so it loads directly here,
+        // synchronously, the same way the chat model's tokenizer/config are
+        // reloaded above for the grammar cache -- no `!Send` worker thread
+        // boundary applies to it. `--embedding-model` is deliberately
+        // optional: an operator who only wants chat completions should not
+        // have to point this flag at anything, and the route itself stays
+        // registered either way (see `AppState::embedding`'s doc comment).
+        let embedding_state = match parse_arg(&args, "--embedding-model")
+            .or_else(|| std::env::var("LATTICE_SERVE_EMBEDDING_MODEL").ok())
+        {
+            None => None,
+            Some(embedding_model_arg) => {
+                let embedding_model_dir = resolve_model_dir(&embedding_model_arg);
+                if !embedding_model_dir.exists() {
+                    return Err(format!(
+                        "embedding model directory not found: {}",
+                        embedding_model_dir.display()
+                    )
+                    .into());
+                }
+                eprintln!(
+                    "[lattice_serve] loading embedding model from {} ...",
+                    embedding_model_dir.display()
+                );
+                let mut model = BertModel::from_directory(&embedding_model_dir).map_err(|e| {
+                    format!(
+                        "embedding model load failed ({}): {e}",
+                        embedding_model_dir.display()
+                    )
+                })?;
+                let embedding_model_id: Arc<str> = embedding_model_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("embedding")
+                    .into();
+                // Auto-select the same default `--embedding-pooling` would
+                // otherwise force the operator to pass explicitly. See
+                // `lattice_inference::pool::default_bert_pooling_for_model_name`
+                // for the rule and its agreement test against
+                // `lattice-embed`'s `EmbeddingModel::bert_pooling` table.
+                model.set_pooling(
+                    lattice_inference::pool::default_bert_pooling_for_model_name(
+                        &embedding_model_id,
+                    ),
+                );
+                match parse_arg(&args, "--embedding-pooling").as_deref() {
+                    None => {}
+                    Some("mean") => model.set_pooling(BertPooling::Mean),
+                    Some("cls") => model.set_pooling(BertPooling::CLS),
+                    Some(other) => {
+                        return Err(format!(
+                            "invalid --embedding-pooling '{other}'; expected 'mean' or 'cls'"
+                        )
+                        .into());
+                    }
+                }
+                eprintln!(
+                    "[lattice_serve] embedding model '{embedding_model_id}' ready \
+                     (dimensions={})",
+                    model.dimensions()
+                );
+                Some(Arc::new(EmbeddingState {
+                    model,
+                    model_id: embedding_model_id,
+                    admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+                }))
+            }
+        };
+
         let state = AppState {
             jobs,
             model_id,
@@ -3036,6 +3488,7 @@ mod imp {
             metrics: Arc::new(ServeMetrics::default()),
             vocab_bytes,
             grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+            embedding: embedding_state,
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -3049,11 +3502,11 @@ mod imp {
                 .map_err(|e| format!("bind {addr} failed: {e}"))?;
             eprintln!("[lattice_serve] OpenAI-compatible API on http://{addr}/v1");
             eprintln!(
-                "[lattice_serve]   POST /v1/chat/completions   GET /v1/models   GET /health   GET /metrics"
+                "[lattice_serve]   POST /v1/chat/completions   POST /v1/embeddings   \
+                 GET /v1/models   GET /health   GET /metrics"
             );
             println!("@@lattice {}", json!({"ev": "ready", "port": port}));
-            if let Err(error) =
-                lattice_inference::serve::serve_until_shutdown(listener, app).await
+            if let Err(error) = lattice_inference::serve::serve_until_shutdown(listener, app).await
             {
                 eprintln!("Server error: {error}");
                 std::process::exit(1);
@@ -3152,6 +3605,7 @@ mod imp {
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
                     grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                    embedding: None,
                 }
             }
             let (jobs, _rx) = test_client_and_jobs();
@@ -3443,7 +3897,42 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: Arc::new(vec![]),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             }
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        fn test_app_state_with_embedding(embedding: Arc<EmbeddingState>) -> AppState {
+            let mut state = test_app_state();
+            state.embedding = Some(embedding);
+            state
+        }
+
+        /// Loads a real embedding model for the `embeddings_*` route tests
+        /// below, from `LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR`. Mirrors
+        /// `crate::model::bert`'s own
+        /// `test_from_bytes_matches_from_directory` convention (an env var
+        /// pointing at a real downloaded model directory, `None` early-return
+        /// when unset) rather than a synthetic in-memory fixture:
+        /// `BertModel` has no all-zero-weight test constructor the way
+        /// `Qwen35Model`'s `test-utils` feature exposes one for the chat
+        /// model, and hand-building a synthetic safetensors byte buffer with
+        /// every tensor `BertWeights::load` requires (~16 tensors per layer)
+        /// is exactly the kind of unverifiable-in-this-environment risk this
+        /// route's tests are already carrying -- better to
+        /// reuse the repo's own established real-model convention than add a
+        /// second, novel, equally-unrun fixture-construction path.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        fn test_embedding_state() -> Option<Arc<EmbeddingState>> {
+            let dir = std::env::var("LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR").ok()?;
+            let model = BertModel::from_directory(std::path::Path::new(&dir)).expect(
+                "LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR must be a valid BertModel directory",
+            );
+            Some(Arc::new(EmbeddingState {
+                model,
+                model_id: Arc::from("test-embedding-model"),
+                admission: Arc::new(Semaphore::new(EMBEDDING_MAX_CONCURRENT_JOBS)),
+            }))
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -3495,6 +3984,421 @@ mod imp {
                 .expect("error response must carry error.code")
                 .to_string();
             (status, code)
+        }
+
+        // ── `/v1/embeddings` tests (issue #584) ──────────────────────────
+        //
+        // The four error-arm tests below (missing input, empty input, empty
+        // string inside an array, batch over the limit) and the
+        // no-model-loaded test need no `BertModel` at all: they return from
+        // `embeddings` before `s.embedding` is ever dereferenced for
+        // anything but its `is_some()`-equivalent check, so `test_app_state()`
+        // (`embedding: None`) is a faithful stand-in. The model-mismatch and
+        // success-path tests genuinely need a loaded model and are
+        // `#[ignore]`d behind `LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR` (see
+        // `test_embedding_state`'s doc comment).
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_missing_input_400() {
+            let body = Body::from(r#"{}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_empty_string_input_400() {
+            let body = Body::from(r#"{"input":""}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_input");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_empty_array_input_400() {
+            let body = Body::from(r#"{"input":[]}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_input");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_empty_string_inside_array_400() {
+            let body = Body::from(r#"{"input":["a","","c"]}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_input");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_batch_over_limit_400() {
+            use lattice_inference::serve::embeddings::MAX_EMBEDDINGS_BATCH_SIZE;
+            let items: Vec<String> = (0..MAX_EMBEDDINGS_BATCH_SIZE + 1)
+                .map(|i| format!("\"{i}\""))
+                .collect();
+            let body = Body::from(format!(r#"{{"input":[{}]}}"#, items.join(",")));
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "batch_size_exceeds_limit");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_no_model_loaded_503() {
+            let body = Body::from(r#"{"input":"hello"}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            // Documented contract (docs/capability-matrix.md): a request
+            // reaching this route with no `--embedding-model` loaded gets
+            // `embedding_model_not_loaded`, distinct from the Metal
+            // worker's admission-cap `server_busy` (issue #932) -- both are
+            // 503s, but only one names a route the operator forgot to
+            // enable.
+            assert_eq!(code, "embedding_model_not_loaded");
+        }
+
+        // ── `POST /v1/embeddings` unsupported-field rejection (contract
+        // fix: an OpenAI field this route cannot honor must be rejected,
+        // not silently ignored) -- like the tests above, these return
+        // before `s.embedding` is dereferenced for anything but its
+        // `is_some()`-equivalent check, so `test_app_state()` (no loaded
+        // model) is a faithful stand-in.
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_dimensions_field_400() {
+            let body = Body::from(r#"{"input":"hello","dimensions":3}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "unsupported_parameter");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_base64_encoding_format_400() {
+            let body = Body::from(r#"{"input":"hello","encoding_format":"base64"}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "unsupported_parameter");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_unknown_field_rejected_not_dropped() {
+            // `pooling` is not a declared field of `TextEmbeddingsRequest`;
+            // `deny_unknown_fields` must fail the parse rather than
+            // silently ignore it (the pre-fix behavior).
+            let body = Body::from(r#"{"input":"hello","pooling":"cls"}"#.to_string());
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request_body");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn embeddings_accepted_noop_fields_pass_validation() {
+            // `user` (caller metadata) and `encoding_format: "float"` (this
+            // route's only output shape) are genuine no-ops: a request
+            // carrying them must clear field validation and reach the next
+            // stage (here, the no-model-loaded 503) rather than being
+            // rejected as `unsupported_parameter`.
+            let body = Body::from(
+                r#"{"input":"hello","user":"trace-123","encoding_format":"float"}"#.to_string(),
+            );
+            let response = embeddings(State(test_app_state()), test_json_headers(), body).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(code, "embedding_model_not_loaded");
+        }
+
+        /// Unit-level coverage for the embedding-concurrency admission cap
+        /// ([`EmbeddingState::admission`] / [`try_acquire_embedding_slot`]):
+        /// a real end-to-end version of this test (two concurrent
+        /// `/v1/embeddings` requests, the first held open until the second
+        /// is rejected) would need the same "block a real worker thread
+        /// until signaled" rig `single_slot_blocking_state`/
+        /// `chat_completions_returns_503_json_envelope_when_admission_cap_reached`
+        /// use for the Metal chat path -- disproportionate here since the
+        /// admission check itself is a plain `Semaphore::try_acquire_owned`
+        /// call with no embedding-specific logic between "cap reached" and
+        /// "rejected", so exercising the semaphore directly covers the same
+        /// behavior the handler relies on.
+        #[test]
+        fn try_acquire_embedding_slot_rejects_once_cap_reached() {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit1 =
+                try_acquire_embedding_slot(&admission).expect("first slot must be admitted");
+            let err = try_acquire_embedding_slot(&admission)
+                .expect_err("second slot must be rejected: cap=1, 1 outstanding");
+            match err {
+                lattice_inference::serve::ApiError::ServiceUnavailable { .. } => {}
+                other => panic!("expected ServiceUnavailable, got {other:?}"),
+            }
+            drop(permit1);
+            let _permit2 = try_acquire_embedding_slot(&admission)
+                .expect("slot must be admitted again once the first is released");
+        }
+
+        /// Regression test for the admission-control hole where a client
+        /// disconnecting mid-request released the admission permit
+        /// immediately (the request future dropping at its `.await`) while
+        /// the already-started `spawn_blocking` `encode_batch` job kept
+        /// running to completion -- repeated disconnects could accumulate
+        /// unbounded concurrent jobs past [`EMBEDDING_MAX_CONCURRENT_JOBS`].
+        /// Exercises [`run_embedding_encode`] directly (the same helper
+        /// [`embeddings`] calls) rather than the full HTTP handler:
+        /// `BertModel` has no synthetic/mock constructor (see
+        /// `test_embedding_state`'s doc comment above), so there is no way
+        /// to give the real handler an artificially slow `encode_batch`
+        /// without a downloaded model directory. `run_embedding_encode` is
+        /// generic over the blocking closure, so a deterministic
+        /// channel-gated closure exercises the exact permit-lifetime
+        /// mechanics the fix changed.
+        ///
+        /// `tokio::spawn` + `JoinHandle::abort()` simulates axum dropping a
+        /// disconnected client's handler future mid-`.await`: at the point
+        /// of `abort()` the task is suspended awaiting the inner
+        /// `spawn_blocking` `JoinHandle` (not actively running), so tokio
+        /// drops the task's future there -- the same event a dropped
+        /// request future produces.
+        #[tokio::test]
+        async fn embedding_permit_survives_dropped_request_future() {
+            let admission = Arc::new(Semaphore::new(1));
+            let permit = admission
+                .clone()
+                .try_acquire_owned()
+                .expect("single slot must be admitted");
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let mut started_tx = Some(started_tx);
+
+            let task = tokio::spawn(run_embedding_encode(permit, move || {
+                started_tx
+                    .take()
+                    .expect("closure runs exactly once")
+                    .send(())
+                    .expect("test task must still be waiting on started_rx");
+                // Deterministic handshake, not a sleep: blocks until the
+                // test explicitly lets the "encode_batch" job finish.
+                release_rx
+                    .recv()
+                    .expect("release_tx must not be dropped before sending");
+                Ok(Vec::new())
+            }));
+
+            started_rx
+                .await
+                .expect("job must signal that it started running");
+
+            // Simulate the client disconnecting: cancel the outstanding
+            // request future while the blocking job is still in flight.
+            task.abort();
+            let join_result = task.await;
+            assert!(
+                join_result.is_err() && join_result.unwrap_err().is_cancelled(),
+                "aborted task must resolve as cancelled"
+            );
+
+            assert_eq!(
+                admission.available_permits(),
+                0,
+                "admission slot must stay held while the encode_batch job is still running, \
+                 not release just because the request future was dropped"
+            );
+
+            // Let the blocking job finish and confirm the slot frees up.
+            release_tx
+                .send(())
+                .expect("blocking closure must still be waiting on release_rx");
+            for _ in 0..200 {
+                if admission.available_permits() == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                admission.available_permits(),
+                1,
+                "admission slot must free once the encode_batch job actually completes"
+            );
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
+        async fn embeddings_total_token_budget_exceeded_400() {
+            use lattice_inference::serve::embeddings::MAX_EMBEDDINGS_TOTAL_TOKENS;
+            let Some(embedding) = test_embedding_state() else {
+                return;
+            };
+            // Repeated single-character words tokenize to roughly one real
+            // token each for a typical BPE vocabulary; comfortably above
+            // the budget regardless of the loaded checkpoint's exact
+            // tokenization, without needing to know its vocabulary.
+            let over_budget_text = "a ".repeat(MAX_EMBEDDINGS_TOTAL_TOKENS + 1000);
+            let body = Body::from(serde_json::json!({ "input": over_budget_text }).to_string());
+            let response = embeddings(
+                State(test_app_state_with_embedding(embedding)),
+                test_json_headers(),
+                body,
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "batch_token_budget_exceeded");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
+        async fn embeddings_wrong_model_name_400() {
+            let Some(embedding) = test_embedding_state() else {
+                return;
+            };
+            let body =
+                Body::from(r#"{"input":"hello","model":"not-the-loaded-model"}"#.to_string());
+            let response = embeddings(
+                State(test_app_state_with_embedding(embedding)),
+                test_json_headers(),
+                body,
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "model_not_found");
+        }
+
+        // Regression: the context-window guard used to measure each item's
+        // *post-truncation* token count (`WordPieceTokenizer` truncates to
+        // its own `max_seq_len` during tokenization), and `BertModel::
+        // from_directory` sets `max_seq_len = max_position_embeddings.min(
+        // 2048)`, so for every real BERT checkpoint loaded that way the two
+        // are equal by construction. A post-truncation count can never
+        // exceed `max_seq_len`, so the old `count > max_position_embeddings`
+        // test was unsatisfiable and an over-limit input was silently
+        // truncated and embedded instead of rejected. This fixture (a real
+        // `bge-small-en-v1.5` checkpoint, `max_position_embeddings: 512`,
+        // no `tokenizer_config.json` to set a different `model_max_length`)
+        // sits exactly in that collision case -- see the `assert_eq!` below.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
+        async fn embeddings_item_over_context_window_400() {
+            let Some(embedding) = test_embedding_state() else {
+                return;
+            };
+            assert_eq!(
+                embedding.model.tokenizer().max_seq_len(),
+                embedding.model.config().max_position_embeddings,
+                "fixture must sit in the collision case (tokenizer max_seq_len == \
+                 model max_position_embeddings) or this regression guards nothing"
+            );
+            // Comfortably above the 512-token window regardless of the
+            // loaded checkpoint's exact vocabulary.
+            let over_limit_text = "hello ".repeat(600);
+            let body = Body::from(serde_json::json!({ "input": over_limit_text }).to_string());
+            let response = embeddings(
+                State(test_app_state_with_embedding(embedding)),
+                test_json_headers(),
+                body,
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "context_length_exceeded");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
+        async fn embeddings_single_string_200_response_shape() {
+            let Some(embedding) = test_embedding_state() else {
+                return;
+            };
+            let dimensions = embedding.model.dimensions();
+            let body = Body::from(r#"{"input":"hello world"}"#.to_string());
+            let response = embeddings(
+                State(test_app_state_with_embedding(embedding)),
+                test_json_headers(),
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("response must be valid JSON");
+            assert_eq!(value["object"], "list");
+            assert_eq!(value["model"], "test-embedding-model");
+            let data = value["data"].as_array().expect("data must be an array");
+            assert_eq!(data.len(), 1);
+            assert_eq!(data[0]["object"], "embedding");
+            assert_eq!(data[0]["index"], 0);
+            assert_eq!(
+                data[0]["embedding"]
+                    .as_array()
+                    .expect("embedding must be an array")
+                    .len(),
+                dimensions
+            );
+            let prompt_tokens = value["usage"]["prompt_tokens"]
+                .as_u64()
+                .expect("usage.prompt_tokens must be an integer");
+            assert!(prompt_tokens > 0);
+            assert_eq!(value["usage"]["total_tokens"], prompt_tokens);
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        #[ignore = "requires LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR"]
+        async fn embeddings_array_input_preserves_index_order() {
+            let Some(embedding) = test_embedding_state() else {
+                return;
+            };
+            let body = Body::from(r#"{"input":["alpha","beta","gamma"]}"#.to_string());
+            let response = embeddings(
+                State(test_app_state_with_embedding(embedding)),
+                test_json_headers(),
+                body,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body must be readable");
+            let value: serde_json::Value =
+                serde_json::from_slice(&body).expect("response must be valid JSON");
+            let data = value["data"].as_array().expect("data must be an array");
+            assert_eq!(data.len(), 3);
+            for (expected_index, item) in data.iter().enumerate() {
+                assert_eq!(item["index"], expected_index);
+            }
+            let first = data[0]["embedding"]
+                .as_array()
+                .expect("embedding must be an array");
+            let second = data[1]["embedding"]
+                .as_array()
+                .expect("embedding must be an array");
+            assert_ne!(
+                first, second,
+                "distinct input texts must not produce identical embeddings"
+            );
         }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
@@ -3606,6 +4510,7 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: Arc::new(vec![]),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             };
             let body = Body::from(
                 serde_json::json!({
@@ -3944,6 +4849,7 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), test_json_headers(), body).await;
@@ -3991,6 +4897,7 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), test_json_headers(), body).await;
@@ -4030,6 +4937,7 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), test_json_headers(), body).await;
@@ -4072,6 +4980,7 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), test_json_headers(), body).await;
@@ -4119,6 +5028,7 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: route_test_vocab(),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             };
             let body = Body::from(structured_body(V0_ROUTE_SCHEMA, Some("true"), None));
             let response = chat_completions(State(state), test_json_headers(), body).await;
@@ -4819,6 +5729,7 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: Arc::new(vec![]),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             };
             let body = Body::from(
                 r#"{"messages":[{"role":"user","content":"hi"}],"stop":"\n"}"#.to_string(),
@@ -4896,6 +5807,7 @@ mod imp {
                 metrics: Arc::new(ServeMetrics::default()),
                 vocab_bytes: Arc::new(vec![]),
                 grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                embedding: None,
             };
             (state, jobs_rx)
         }
@@ -5328,6 +6240,7 @@ mod imp {
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
                     grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                    embedding: None,
                 }
             }
 
@@ -5427,6 +6340,7 @@ mod imp {
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
                     grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                    embedding: None,
                 };
                 (state, unblock_tx, started_rx)
             }
@@ -5655,6 +6569,7 @@ mod imp {
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
                     grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                    embedding: None,
                 }
             }
 
@@ -5753,6 +6668,7 @@ mod imp {
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         mod production_adapter_observation {
             use super::*;
+            use lattice_inference::Tokenizer;
             use lattice_inference::serve::{
                 ExpectedObservation, GenerateConfigSnapshot,
                 OBSERVATION_GOLDEN_USER_HI_THERE_CHATML, ProductionAdapterObservation,
@@ -5846,6 +6762,7 @@ mod imp {
                     metrics: Arc::new(ServeMetrics::default()),
                     vocab_bytes: Arc::new(vec![]),
                     grammar_cache: Arc::new(GrammarCache::new(GRAMMAR_CACHE_CAPACITY)),
+                    embedding: None,
                 };
                 let body = Body::from(
                     r#"{"messages":[{"role":"user","content":"hi there"}],"temperature":1.3,"top_p":0.55,"seed":7,"max_tokens":9}"#
@@ -5869,15 +6786,12 @@ mod imp {
             /// `grammar`, `reasoning_budget`, `logprobs`, `stop_strings`) to
             /// the exact same values `GenerateConfig::default()` carries.
             fn expected_gen_cfg() -> GenerateConfigSnapshot {
-                GenerateConfigSnapshot::from(
-                    &lattice_inference::model::qwen35_config::GenerateConfig {
-                        max_new_tokens: 9,
-                        temperature: 1.3,
-                        top_p: 0.55,
-                        seed: Some(7),
-                        ..Default::default()
-                    },
-                )
+                let mut cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+                cfg.max_new_tokens = 9;
+                cfg.temperature = 1.3;
+                cfg.top_p = 0.55;
+                cfg.seed = Some(7);
+                GenerateConfigSnapshot::from(&cfg)
             }
 
             #[tokio::test]

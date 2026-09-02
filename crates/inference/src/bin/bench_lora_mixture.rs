@@ -32,6 +32,7 @@
 //!   BENCH_WARMUP        warmup iterations for blend bench (default 5)
 //!   BENCH_ITERS         measured iterations (default 20)
 //!   BENCH_NEW_TOKENS    tokens to generate in decode bench (default 32)
+#![allow(clippy::field_reassign_with_default)]
 
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -237,11 +238,9 @@ fn run_gpu_decode_bench(
             let refs: Vec<(&[LoraLayerData], f32)> =
                 adapters.iter().map(|a| (a.as_slice(), weight)).collect();
 
-            let gen_cfg = GenerateConfig {
-                max_new_tokens: new_tokens,
-                enable_thinking: false,
-                ..GenerateConfig::default()
-            };
+            let mut gen_cfg = GenerateConfig::default();
+            gen_cfg.max_new_tokens = new_tokens;
+            gen_cfg.enable_thinking = false;
 
             // Warmup
             let _ = metal.generate_with_lora_mixture(&refs, prompt, &tokenizer, &gen_cfg);

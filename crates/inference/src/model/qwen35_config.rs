@@ -13,6 +13,8 @@ use crate::stop_reason::StopReason;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::model::config_file::read_config_json_bounded;
+
 /// Chat turn end token for Qwen models.
 pub const QWEN_CHAT_IM_END_TOKEN_ID: u32 = 248_046;
 
@@ -402,36 +404,6 @@ pub(crate) const MAX_VISION_IN_CHANNELS: usize = 256;
 /// fc1/fc2 weights); 512 MiB (536,870,912) leaves roughly 5x headroom above that while
 /// rejecting the multi-terabyte hostile case by several orders of magnitude.
 pub(crate) const MAX_VISION_TENSOR_BYTES: u128 = 536_870_912;
-
-/// Upper bound, in bytes, on `config.json` accepted from a checkpoint directory (FIX 5).
-///
-/// `from_config_json` / `from_config_json_validated` (both independent `read_to_string`
-/// call sites) previously materialized the entire file into a `String` with no size limit,
-/// and `serde_json`'s `#[serde(default)]`/passthrough deserialization accepts unknown
-/// fields rather than rejecting them -- so an arbitrarily large ignored top-level field
-/// (e.g. a multi-gigabyte junk string under an unused key) exhausts memory before any
-/// bounded field-level validation in `validate()` ever runs. Real Qwen3.5/3.6 `config.json`
-/// files, including ones with a nested `vision_config`, are well under 100 KiB; 8 MiB
-/// (8,388,608) leaves nearly two orders of magnitude of headroom while rejecting the
-/// unbounded case.
-pub(crate) const MAX_CONFIG_JSON_BYTES: u64 = 8_388_608;
-
-/// Read `config.json` into a `String`, rejecting an oversized file before it is
-/// materialized. See [`MAX_CONFIG_JSON_BYTES`] docs. Checks the file's metadata length
-/// (not the OS-buffered read itself) so the size-cap fires before `read_to_string`
-/// allocates a same-sized buffer -- admission-order applies to file parsing, not just
-/// tensor bytes (mirrors the safetensors index cap in `weights/f32_weights.rs`).
-fn read_config_json_bounded(path: &Path) -> Result<String, InferenceError> {
-    let file_len = std::fs::metadata(path).map_err(InferenceError::Io)?.len();
-    if file_len > MAX_CONFIG_JSON_BYTES {
-        return Err(InferenceError::Inference(format!(
-            "config.json at {} is {file_len} bytes, exceeding MAX_CONFIG_JSON_BYTES \
-             ({MAX_CONFIG_JSON_BYTES})",
-            path.display()
-        )));
-    }
-    std::fs::read_to_string(path).map_err(InferenceError::Io)
-}
 
 /// Empty think block token sequence: `<think>\n\n</think>\n\n`.
 /// Prefill this to disable chain-of-thought reasoning.
@@ -1328,7 +1300,7 @@ impl Qwen35Config {
 
     /// Parse a HF config.json (which may wrap fields inside `text_config`).
     pub fn from_config_json(path: &Path) -> Result<Self, InferenceError> {
-        let json = read_config_json_bounded(path)?;
+        let json = read_config_json_bounded(path, "config.json")?;
         Self::from_config_json_str(&json)
     }
 
@@ -1337,7 +1309,7 @@ impl Qwen35Config {
     pub fn from_config_json_validated(
         path: &Path,
     ) -> Result<ValidatedQwen35Config, InferenceError> {
-        let json = read_config_json_bounded(path)?;
+        let json = read_config_json_bounded(path, "config.json")?;
         Self::from_config_json_str_validated(&json)
     }
 
@@ -2363,8 +2335,9 @@ pub(crate) fn checked_double(value: usize, what: &str) -> Result<usize, Inferenc
     })
 }
 
-/// **Unstable**: sampling configuration for text generation; temperature/top-k/top-p may expand.
+/// **Unstable**: sampling configuration for text generation; fields may expand.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct GenerateConfig {
     pub max_new_tokens: usize,
     pub temperature: f32,
@@ -2600,6 +2573,7 @@ pub(crate) fn compute_layer_types(num_layers: usize, interval: usize) -> Vec<Lay
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::config_file::MAX_CONFIG_JSON_BYTES;
 
     #[test]
     fn test_config_construction_and_layer_types() {

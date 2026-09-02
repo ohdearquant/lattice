@@ -112,7 +112,11 @@ impl MetalQwen35State {
         // weight buffer dimensions allocated during initialization.
         unsafe {
             enc.set_compute_pipeline_state(&self.engine.pipelines.conv1d_silu);
-            enc.set_buffer(0, Some(&self.session.gdn_gpu_conv_bufs[linear_idx]), 0);
+            enc.set_buffer(
+                0,
+                Some(self.session.gdn_gpu_state.layer(linear_idx).conv_buffer()),
+                0,
+            );
             enc.set_buffer(1, Some(&self.session.activations.gdn_qkvz), 0); // QKV at offset 0 of fused buffer
             enc.set_buffer(2, Some(&*w_conv1d), 0);
             enc.set_buffer(3, Some(&self.session.gdn_gpu_conv_out), 0);
@@ -200,7 +204,11 @@ impl MetalQwen35State {
                         .as_ref()
                         .unwrap(),
                 );
-                enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
+                enc.set_buffer(
+                    0,
+                    Some(self.session.gdn_gpu_state.layer(linear_idx).s_matrix()),
+                    0,
+                );
                 enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
                 enc.set_buffer(2, Some(&self.session.activations.gdn_key_scratch), 0);
                 enc.set_buffer(3, Some(&self.session.activations.gdn_raw_out), 0);
@@ -230,7 +238,11 @@ impl MetalQwen35State {
                     .flatten()
                     .unwrap_or(&self.engine.pipelines.gdn_recurrence);
                 enc.set_compute_pipeline_state(recur_pipe);
-                enc.set_buffer(0, Some(&self.session.gdn_gpu_s_matrices[linear_idx]), 0);
+                enc.set_buffer(
+                    0,
+                    Some(self.session.gdn_gpu_state.layer(linear_idx).s_matrix()),
+                    0,
+                );
                 enc.set_buffer(1, Some(&self.session.gdn_gpu_conv_out), 0);
                 enc.set_buffer(2, Some(&self.session.activations.gdn_qkvz), z_byte_off);
                 enc.set_buffer(3, Some(&self.session.activations.hidden), 0);

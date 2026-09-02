@@ -52,18 +52,19 @@ fn compile(
 }
 
 fn generate(model: &Qwen35Model, grammar: Arc<GrammarEngine>, prompt: &str) -> Result<String, Box<dyn Error>> {
-    let config = GenerateConfig {
-        max_new_tokens: 64,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        seed: Some(7),
-        enable_thinking: false,
-        enable_mtp: Some(false),
-        grammar: Some(grammar),
-        ..GenerateConfig::default()
-    };
+    // `GenerateConfig` is `#[non_exhaustive]`, so construct it from `default()`
+    // and assign the fields you need; struct-expression syntax is not available
+    // outside `lattice-inference`.
+    let mut config = GenerateConfig::default();
+    config.max_new_tokens = 64;
+    config.temperature = 0.0;
+    config.top_k = 1;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
+    config.seed = Some(7);
+    config.enable_thinking = false;
+    config.enable_mtp = Some(false);
+    config.grammar = Some(grammar);
     Ok(model.generate(prompt, &config)?.text)
 }
 
@@ -664,6 +665,23 @@ println!("Drift magnitude: {:.4}", report.summary.drift_magnitude);
 println!("Converged: {}", report.summary.converged);
 ```
 
+For comparing two JSON embedding dumps from the command line (rather than calling the API
+directly), see `crates/transport/examples/drift_compare.rs`:
+
+```
+cargo run -p lattice-transport --example drift_compare --release -- \
+    /tmp/emb_v030.json /tmp/emb_main.json
+```
+
+It reports Wasserstein distance, max/mean displacement, and max pairwise cosine drift per model
+present in both files. The dump files it consumes are produced by
+`crates/embed/examples/dump_parity_embeddings.rs` (a fixture-driven parity-check tool, not a
+general-purpose API demo):
+
+```
+DUMP_OUT=/tmp/emb_main.json cargo run -p lattice-embed --example dump_parity_embeddings --release
+```
+
 ---
 
 ## lattice-tune
@@ -791,14 +809,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mixed = blend_lora_adapters(&[(&domain, 0.7), (&style, 0.3)])?;
     model.set_lora(Box::new(mixed));
 
-    let config = GenerateConfig {
-        max_new_tokens: 64,
-        temperature: 0.0,
-        top_k: 1,
-        top_p: 1.0,
-        repetition_penalty: 1.0,
-        ..GenerateConfig::default()
-    };
+    let mut config = GenerateConfig::default();
+    config.max_new_tokens = 64;
+    config.temperature = 0.0;
+    config.top_k = 1;
+    config.top_p = 1.0;
+    config.repetition_penalty = 1.0;
     println!("{}", model.generate("Explain ownership in Rust", &config)?.text);
     Ok(())
 }

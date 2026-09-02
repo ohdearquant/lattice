@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Runs the lattice-inference and lattice-embed Criterion benches once each,
+# saving a local Criterion baseline (no gate comparison, no provenance
+# tracking). Supervised via scripts/lib/bench-supervision.sh.
+# Usage: scripts/bench-ci.sh
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
