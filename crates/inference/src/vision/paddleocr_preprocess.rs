@@ -23,8 +23,8 @@
 
 use crate::error::InferenceError;
 #[cfg(test)]
-use crate::model::qwen35_config::MAX_CONFIG_JSON_BYTES;
-use crate::model::qwen35_config::read_config_json_bounded;
+use crate::model::config_file::MAX_CONFIG_JSON_BYTES;
+use crate::model::config_file::read_config_json_bounded;
 use std::collections::TryReserveError;
 use std::path::Path;
 
@@ -476,10 +476,13 @@ fn bicubic_kernel(x: f64) -> f64 {
     }
 }
 
-/// Per-output fixed-point filter taps for one separable pass, as produced by
-/// Pillow's `precompute_coeffs` (8 bpc normalization): `xmin` is the first
-/// input index in the input, `xmax` the tap count, and `k_int` the 22-bit
-/// fixed-point taps (`PRECISION_BITS = 22`).
+/// Per-output fixed-point filter taps for one separable pass: `ksize` is
+/// `2 * ceil(2 * max(in_size / out_size, 1.0)) + 1`, the number of coefficient
+/// slots allocated for each output; `taps` contains the normalized bicubic
+/// coefficients quantized to 22-bit fixed point, with output `xx`'s tap `x` at
+/// `taps[xx * ksize + x]` for `x` in `0..xmax`; and `spans[xx]` is
+/// `(xmin as u32, xmax as u32)`, the first input index and number of input
+/// samples covered by that output's coefficients.
 struct SpanCoeffs {
     ksize: usize,
     taps: Vec<i32>,
@@ -614,17 +617,7 @@ pub fn resize_bicubic_rgb8(
             actual: vec![src.len()],
         });
     }
-    let dst_pixels = checked_pixel_count(dst_h, dst_w, "resize_bicubic_rgb8 destination")?;
-    let max_allowed_pixels = MAX_PIXEL_BUDGET
-        .checked_add(SMART_RESIZE_PIXEL_SLACK)
-        .ok_or_else(|| {
-            InferenceError::Inference("resize pixel allowance overflows usize".into())
-        })?;
-    if dst_pixels > max_allowed_pixels {
-        return Err(InferenceError::Inference(format!(
-            "resize_bicubic_rgb8 destination has {dst_pixels} pixels, exceeding allocation budget {max_allowed_pixels}"
-        )));
-    }
+    check_resize_target(dst_h, dst_w, MAX_PIXEL_BUDGET)?;
 
     let x_coeffs = precompute_coeffs(src_w, dst_w)?;
     let y_coeffs = precompute_coeffs(src_h, dst_h)?;
@@ -722,13 +715,14 @@ pub fn preprocess_rgb8(
         InferenceError::Inference("preprocess_rgb8 resize factor overflows usize".into())
     })?;
     let (dst_h, dst_w) = smart_resize(height, width, factor, cfg.min_pixels, cfg.max_pixels)?;
-    check_resize_target(dst_h, dst_w, cfg.max_pixels)?;
     if dst_h % patch != 0 || dst_w % patch != 0 {
         return Err(InferenceError::Inference(format!(
             "resized image {dst_h} x {dst_w} is not divisible by patch_size {patch}"
         )));
     }
     let resized = resize_bicubic_rgb8(rgb, height, width, dst_h, dst_w)?;
+    let rescale_table: [f32; 256] =
+        std::array::from_fn(|value| (value as f64 * cfg.rescale_factor) as f32);
 
     let grid_h = dst_h / patch;
     let grid_w = dst_w / patch;
@@ -763,8 +757,7 @@ pub fn preprocess_rgb8(
                 for yy in 0..patch {
                     let row = dst_w * (py * patch + yy);
                     for xx in 0..patch {
-                        let v = (resized[(row + px * patch + xx) * 3 + c] as f64
-                            * cfg.rescale_factor) as f32;
+                        let v = rescale_table[resized[(row + px * patch + xx) * 3 + c] as usize];
                         pixel_values[o] = (v - mean) / std;
                         o += 1;
                     }
@@ -1018,6 +1011,20 @@ mod tests {
         assert!(resize_bicubic_rgb8(&[0, 0, 0], 1, 1, 1, MAX_RESIZED_IMAGE_SIDE + 1).is_err());
         assert!(resize_bicubic_rgb8(&[0, 0, 0], 1, 1, 1, 1).is_ok());
         assert!(preprocess_rgb8(&cfg, &[0, 0, 0], 1, 1).is_ok());
+    }
+
+    #[test]
+    fn resize_bicubic_rejects_destination_over_pixel_budget() {
+        let err = resize_bicubic_rgb8(
+            &[0, 0, 0],
+            1,
+            1,
+            MAX_RESIZED_IMAGE_SIDE,
+            MAX_RESIZED_IMAGE_SIDE,
+        )
+        .expect_err("destination over pixel budget");
+        let message = err.to_string();
+        assert!(message.contains("max_pixels"), "got: {message}");
     }
 
     #[test]
