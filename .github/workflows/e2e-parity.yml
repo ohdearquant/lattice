@@ -867,7 +867,7 @@ jobs:
       - name: Cache PaddleOCR-VL weights
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cache/huggingface/hub/models--PaddlePaddle--PaddleOCR-VL
+          path: ~/.cache/huggingface/hub/models--PaddlePaddle--PaddleOCR-VL-1.6
           key: hf-paddleocr-vl-${{ hashFiles('.github/actions/provision-paddleocr-vl/action.yml') }}
 
       - name: Install Python deps

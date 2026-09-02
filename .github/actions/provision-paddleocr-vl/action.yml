@@ -1,6 +1,6 @@
-name: 'Provision PaddleOCR-VL (pinned + hash-verified)'
+name: 'Provision PaddleOCR-VL-1.6 (pinned + hash-verified)'
 description: >-
-  Downloads PaddlePaddle/PaddleOCR-VL at a pinned revision and verifies the
+  Downloads PaddlePaddle/PaddleOCR-VL-1.6 at a pinned revision and verifies the
   snapshot before the decoder differential test consumes it: both files must
   match their expected digest, and the directory must contain nothing else.
 outputs:
@@ -25,7 +25,7 @@ runs:
         # manifests describe the same files.
         MODEL_CACHE=$(python3 -c "
         from huggingface_hub import snapshot_download
-        print(snapshot_download('PaddlePaddle/PaddleOCR-VL', revision='$PADDLEOCR_VL_REVISION', allow_patterns=[
+        print(snapshot_download('PaddlePaddle/PaddleOCR-VL-1.6', revision='$PADDLEOCR_VL_REVISION', allow_patterns=[
             'config.json',
             'model.safetensors',
         ]))
