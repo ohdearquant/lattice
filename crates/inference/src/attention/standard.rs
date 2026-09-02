@@ -1,7 +1,61 @@
 //! Standard attention buffers, multi-head attention, and in-place attention helpers.
+use crate::error::InferenceError;
 use crate::forward::cpu::{add_bias, matmul_bt, softmax_attention};
 use crate::lora_hook::{LoraHook, apply_lora_rows};
 use crate::weights::TransformerLayerWeights;
+
+/// Per-buffer byte cap for the transient head-batched scratch allocations
+/// `multi_head_attention_batched` creates once per packed sequence
+/// (`v_all_t`, `scores`, `q_stacked`/`k_stacked`, `scores_stacked`,
+/// `context_stacked`). Unlike [`AttentionBuffers`], whose buffers are sized
+/// once from the model's registered `max_seq_len` at construction time, this
+/// loop's `seq_len` is a per-request value read straight from the caller's
+/// packed `cu_seqlens` and has no load-time bound: `assert_standard_no_overflow`
+/// only rejects shapes that would *wrap* a `usize`, not shapes that fit but are
+/// large enough to abort the process with an OOM -- the dominant term,
+/// `scores_stacked`, is `(num_heads * seq_len)^2` elements, quadratic in a
+/// value the caller controls.
+///
+/// 256 MiB is exactly the `scores_stacked` footprint of BERT-large (16 heads)
+/// packed to its standard 512-token ceiling (`8192^2 * 4 bytes`), the largest
+/// shape in routine use through this path today -- BERT-base (12 heads) at the
+/// same 512 tokens needs only ~144 MiB. Anything past that is already outside
+/// the shape class this fusion optimization was measured for (see the
+/// `q_stacked` comment below on its own O(num_heads) scratch cost), so this
+/// cap rejects it with a typed error before attempting a transient allocation
+/// that could otherwise reach multiple GiB and abort the process, rather than
+/// tuning a ceiling for hypothetical wider-head-count checkpoints that have
+/// not been measured against this path.
+const MAX_HEAD_BATCH_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
+
+/// Compute a `rows * cols` element count for one of `multi_head_attention_batched`'s
+/// head-batched scratch buffers, rejecting both a `usize`-wrapping product and
+/// one that fits but would exceed [`MAX_HEAD_BATCH_SCRATCH_BYTES`]. Returns the
+/// element count (not the byte count) so the caller can pass it straight to
+/// `vec![0.0f32; n]`.
+fn checked_head_batch_scratch_len(
+    rows: usize,
+    cols: usize,
+    what: &str,
+) -> Result<usize, InferenceError> {
+    let elems = rows.checked_mul(cols).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "standard: head-batched {what} scratch element count ({rows} * {cols}) overflows usize"
+        ))
+    })?;
+    let bytes = elems.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
+        InferenceError::InvalidInput(format!(
+            "standard: head-batched {what} scratch byte size ({elems} elements * {}) overflows usize",
+            std::mem::size_of::<f32>()
+        ))
+    })?;
+    if bytes > MAX_HEAD_BATCH_SCRATCH_BYTES {
+        return Err(InferenceError::InvalidInput(format!(
+            "standard: head-batched {what} scratch would need {bytes} bytes for a {rows} x {cols} shape, exceeding the {MAX_HEAD_BATCH_SCRATCH_BYTES}-byte cap"
+        )));
+    }
+    Ok(elems)
+}
 
 /// **Unstable**: pre-allocated buffers for multi-head attention computation; field layout may change.
 #[derive(Debug, Clone)]
@@ -478,6 +532,13 @@ pub(crate) fn multi_head_attention_in_place(
 /// `multi_head_attention_in_place` writes into `buffers.temp` (bias-added,
 /// LoRA-applied); callers add the residual and run `layer_norm` themselves, exactly
 /// as the single-sequence path does.
+///
+/// # Errors
+///
+/// Returns [`InferenceError::InvalidInput`] when a packed sequence's
+/// head-batched scratch requirement (quadratic in `num_heads * seq_len`)
+/// would exceed [`MAX_HEAD_BATCH_SCRATCH_BYTES`] for any single buffer,
+/// instead of attempting the allocation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn multi_head_attention_batched(
     hidden_states: &[f32],
@@ -496,7 +557,7 @@ pub(crate) fn multi_head_attention_batched(
     output: &mut [f32],
     lora: &dyn LoraHook,
     layer_idx: usize,
-) {
+) -> Result<(), InferenceError> {
     assert!(
         cu_seqlens.len() >= 2,
         "standard: cu_seqlens must have at least 2 entries (batch + 1)"
@@ -622,21 +683,22 @@ pub(crate) fn multi_head_attention_batched(
         // Head-batching (#702) additionally needs `(num_heads*seq_len)^2`, a
         // strictly larger product than `assert_standard_no_overflow`'s own
         // `num_heads * seq_len * seq_len` check (missing one `num_heads`
-        // factor), so a shape that clears the guard above could still wrap
-        // here for a pathologically large `num_heads * seq_len`.
+        // factor), so a shape that clears the guard above could still wrap --
+        // or fit but be large enough to abort the process with an OOM --
+        // here for a pathologically large `num_heads * seq_len`. Every
+        // scratch buffer below is sized through `checked_head_batch_scratch_len`,
+        // which rejects both cases with a typed error instead of allocating.
         let stacked_rows = num_heads
             .checked_mul(seq_len)
             .expect("standard: num_heads * seq_len overflow");
-        assert!(
-            stacked_rows.checked_mul(stacked_rows).is_some(),
-            "standard shape overflow: (num_heads * seq_len)^2"
-        );
 
         let row_start = start * hidden_size;
         let concat_b = &mut concat[row_start..row_start + seq_len * hidden_size];
 
-        let mut v_all_t = vec![0.0f32; hidden_size * seq_len];
-        let mut scores = vec![0.0f32; num_heads * seq_len * seq_len];
+        let mut v_all_t =
+            vec![0.0f32; checked_head_batch_scratch_len(hidden_size, seq_len, "v_all_t")?];
+        let mut scores =
+            vec![0.0f32; checked_head_batch_scratch_len(stacked_rows, seq_len, "scores")?];
 
         // Head-batched Q*K^T (#702): instead of `num_heads` separate tiny
         // `matmul_bt` dispatches (M=seq_len, K=head_dim, N=seq_len each), stack
@@ -653,8 +715,9 @@ pub(crate) fn multi_head_attention_batched(
         // compute AND O(num_heads) more scratch memory per sequence; long
         // `seq_len` shapes should be re-measured before assuming this wins
         // uniformly, per the issue's own "measure first" mandate).
-        let mut q_stacked = vec![0.0f32; stacked_rows * head_dim];
-        let mut k_stacked = vec![0.0f32; stacked_rows * head_dim];
+        let stacked_qk_len = checked_head_batch_scratch_len(stacked_rows, head_dim, "q/k_stacked")?;
+        let mut q_stacked = vec![0.0f32; stacked_qk_len];
+        let mut k_stacked = vec![0.0f32; stacked_qk_len];
         for h in 0..num_heads {
             let head_offset = h * head_dim;
             let dst_row_start = h * seq_len;
@@ -672,7 +735,11 @@ pub(crate) fn multi_head_attention_batched(
             }
         }
 
-        let mut scores_stacked = vec![0.0f32; stacked_rows * stacked_rows];
+        let mut scores_stacked =
+            vec![
+                0.0f32;
+                checked_head_batch_scratch_len(stacked_rows, stacked_rows, "scores_stacked")?
+            ];
         matmul_bt(
             &q_stacked,
             &k_stacked,
@@ -721,7 +788,11 @@ pub(crate) fn multi_head_attention_batched(
         // as with the Q*K^T step, off-diagonal (h, h') blocks of the result
         // are computed and discarded (same O(num_heads) compute/memory
         // tradeoff noted above).
-        let mut context_stacked = vec![0.0f32; stacked_rows * hidden_size];
+        let mut context_stacked =
+            vec![
+                0.0f32;
+                checked_head_batch_scratch_len(stacked_rows, hidden_size, "context_stacked")?
+            ];
         matmul_bt(
             &scores,
             &v_all_t,
@@ -763,6 +834,7 @@ pub(crate) fn multi_head_attention_batched(
         hidden_size,
         hidden_size,
     );
+    Ok(())
 }
 
 /// Pre-#677 padded batched attention, preserved as a test-only reference.
@@ -1030,7 +1102,7 @@ pub mod bench_support {
         output: &mut [f32],
         lora: &dyn LoraHook,
         layer_idx: usize,
-    ) {
+    ) -> Result<(), InferenceError> {
         super::multi_head_attention_batched(
             hidden_states,
             layer_weights,
@@ -1696,7 +1768,8 @@ mod tests {
             &mut output,
             &lora,
             0,
-        );
+        )
+        .unwrap();
 
         assert_eq!(lora.calls.load(Ordering::Relaxed), total * 4);
 
@@ -2190,7 +2263,8 @@ mod tests {
                     &mut output,
                     lora,
                     0,
-                );
+                )
+                .unwrap();
             } else {
                 multi_head_attention_batched_per_head_reference(
                     &hidden_states_packed,
@@ -2245,5 +2319,198 @@ mod tests {
             max_abs_diff <= TOLERANCE,
             "head-batched vs per-head reference max_abs_diff {max_abs_diff} exceeds {TOLERANCE}"
         );
+    }
+
+    /// Identity-weighted, zero-biased `hidden_size x hidden_size` layer plus a
+    /// matching fused QKV weight/bias, for the `MAX_HEAD_BATCH_SCRATCH_BYTES`
+    /// boundary tests below. Those tests only exercise
+    /// `multi_head_attention_batched`'s scratch-sizing guard (does it
+    /// allocate or does it return the typed error), not the numeric attention
+    /// output, so the actual weight values are irrelevant as long as the
+    /// shapes are self-consistent.
+    struct ScratchCapTestLayer {
+        identity: Vec<f32>,
+        zero_bias: Vec<f32>,
+        ones: Vec<f32>,
+        fused_qkv_weight: Vec<f32>,
+        fused_qkv_bias: Vec<f32>,
+    }
+
+    fn identity_layer_for_scratch_cap_test(hidden_size: usize) -> ScratchCapTestLayer {
+        let mut identity = vec![0.0f32; hidden_size * hidden_size];
+        for i in 0..hidden_size {
+            identity[i * hidden_size + i] = 1.0;
+        }
+        let zero_bias = vec![0.0f32; hidden_size];
+        let ones = vec![1.0f32; hidden_size];
+        let mut fused_qkv_weight = Vec::with_capacity(3 * hidden_size * hidden_size);
+        fused_qkv_weight.extend_from_slice(&identity);
+        fused_qkv_weight.extend_from_slice(&identity);
+        fused_qkv_weight.extend_from_slice(&identity);
+        let fused_qkv_bias = vec![0.0f32; 3 * hidden_size];
+        ScratchCapTestLayer {
+            identity,
+            zero_bias,
+            ones,
+            fused_qkv_weight,
+            fused_qkv_bias,
+        }
+    }
+
+    /// `num_heads=64, head_dim=1` (`hidden_size=64`) keeps every fixed-cost
+    /// buffer (weights, `q`/`k`/`v`, `scores`) tiny while `stacked_rows =
+    /// num_heads * seq_len` -- the value `scores_stacked`'s `stacked_rows^2`
+    /// element count is quadratic in -- lands right at the
+    /// `MAX_HEAD_BATCH_SCRATCH_BYTES` (256 MiB) boundary: `seq_len=128` puts
+    /// `scores_stacked` at exactly 256 MiB (still accepted, the cap check is
+    /// `>`, not `>=`); `seq_len=129` puts it at ~260 MiB (rejected). This
+    /// mirrors a real shape class -- BERT-large-style 16-64 heads at a
+    /// few-hundred-token sequence -- without the multi-hundred-MiB-to-GiB
+    /// allocation a boundary test at, say, 16 heads x 8192 tokens would need.
+    fn run_batched_attention_at_seq_len(seq_len: usize) -> Result<(), InferenceError> {
+        let hidden_size = 64;
+        let num_heads = 64;
+        let head_dim = 1;
+        let ScratchCapTestLayer {
+            identity,
+            zero_bias,
+            ones,
+            fused_qkv_weight,
+            fused_qkv_bias,
+        } = identity_layer_for_scratch_cap_test(hidden_size);
+        let layer = TransformerLayerWeights {
+            query_weight: Tensor2D {
+                data: &identity,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            query_bias: Tensor1D {
+                data: &zero_bias,
+                len: hidden_size,
+            },
+            key_weight: Tensor2D {
+                data: &identity,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            key_bias: Tensor1D {
+                data: &zero_bias,
+                len: hidden_size,
+            },
+            value_weight: Tensor2D {
+                data: &identity,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            value_bias: Tensor1D {
+                data: &zero_bias,
+                len: hidden_size,
+            },
+            attn_output_weight: Tensor2D {
+                data: &identity,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            attn_output_bias: Tensor1D {
+                data: &zero_bias,
+                len: hidden_size,
+            },
+            attn_layer_norm_weight: Tensor1D {
+                data: &ones,
+                len: hidden_size,
+            },
+            attn_layer_norm_bias: Tensor1D {
+                data: &zero_bias,
+                len: hidden_size,
+            },
+            ffn_intermediate_weight: Tensor2D {
+                data: &identity,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            ffn_intermediate_bias: Tensor1D {
+                data: &zero_bias,
+                len: hidden_size,
+            },
+            ffn_output_weight: Tensor2D {
+                data: &identity,
+                rows: hidden_size,
+                cols: hidden_size,
+            },
+            ffn_output_bias: Tensor1D {
+                data: &zero_bias,
+                len: hidden_size,
+            },
+            ffn_layer_norm_weight: Tensor1D {
+                data: &ones,
+                len: hidden_size,
+            },
+            ffn_layer_norm_bias: Tensor1D {
+                data: &zero_bias,
+                len: hidden_size,
+            },
+        };
+
+        let cu_seqlens = vec![0usize, seq_len];
+        let total = seq_len;
+        let hidden_states = vec![0.1f32; total * hidden_size];
+        let mut q = vec![0.0f32; total * hidden_size];
+        let mut k = vec![0.0f32; total * hidden_size];
+        let mut v = vec![0.0f32; total * hidden_size];
+        let mut qkv = vec![0.0f32; 3 * total * hidden_size];
+        let mut concat = vec![0.0f32; total * hidden_size];
+        let mut output = vec![0.0f32; total * hidden_size];
+
+        multi_head_attention_batched(
+            &hidden_states,
+            &layer,
+            &fused_qkv_weight,
+            &fused_qkv_bias,
+            &cu_seqlens,
+            hidden_size,
+            num_heads,
+            head_dim,
+            &mut q,
+            &mut k,
+            &mut v,
+            &mut qkv,
+            &mut concat,
+            &mut output,
+            &NoopLoraHook,
+            0,
+        )?;
+        assert!(
+            output.iter().all(|x| x.is_finite()),
+            "batched output must be finite"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn head_batched_attention_rejects_scratch_over_the_cap_with_typed_error() {
+        // num_heads=64, seq_len=129 -> stacked_rows=8256, scores_stacked =
+        // 8256^2 * 4 bytes = 272,646,144 bytes (~260 MiB), just over the
+        // 256 MiB `MAX_HEAD_BATCH_SCRATCH_BYTES` cap.
+        let err = run_batched_attention_at_seq_len(129)
+            .expect_err("scratch requirement over the cap must be rejected, not allocated");
+        match err {
+            InferenceError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("scores_stacked") && msg.contains("exceeding"),
+                    "error message should name the offending buffer and the cap: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn head_batched_attention_accepts_scratch_at_the_cap_boundary() {
+        // num_heads=64, seq_len=128 -> stacked_rows=8192, scores_stacked =
+        // 8192^2 * 4 bytes = 268,435,456 bytes, exactly the 256 MiB cap. The
+        // guard rejects only what's strictly *over* the cap, so this shape
+        // must still succeed and allocate/compute normally.
+        run_batched_attention_at_seq_len(128)
+            .expect("scratch requirement exactly at the cap must still be accepted");
     }
 }

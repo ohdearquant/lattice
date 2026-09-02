@@ -1071,7 +1071,8 @@ fn bench_attention_batched_kernel(c: &mut Criterion) {
                         &mut output,
                         &NoopLoraHook,
                         0,
-                    );
+                    )
+                    .unwrap();
                     black_box(output.as_slice());
                 });
             });
@@ -1115,7 +1116,8 @@ fn bench_attention_batched_kernel(c: &mut Criterion) {
                         &mut output,
                         &NoopLoraHook,
                         0,
-                    );
+                    )
+                    .unwrap();
                     black_box(output.as_slice());
                 });
             });
