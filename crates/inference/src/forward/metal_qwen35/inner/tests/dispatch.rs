@@ -7,6 +7,14 @@ use super::*;
 /// KV kernels actually construct and execute, and fails loudly
 /// (LATTICE_METAL_TEST_ENFORCE=1) instead of skip-passing when a Metal
 /// device is absent.
+///
+/// It is opt-in by environment, not by name: `LATTICE_KV_F16` and
+/// `LATTICE_METAL_PATH_PROOF` select the path being probed and must be set
+/// before the state is constructed, so a run that does not set them has not
+/// asked the question and reports `reason=not_configured` rather than failing.
+/// `LATTICE_METAL_TEST_ENFORCE=1`, which the CI leg sets alongside both, turns
+/// that same absence back into a hard failure, so the fail-closed property the
+/// probe exists for is unchanged where it is actually exercised.
 #[test]
 fn f16_kv_metal_path_executes_and_reports_capability() {
     let _gpu_guard = gpu_test_lock();
@@ -20,20 +28,30 @@ fn f16_kv_metal_path_executes_and_reports_capability() {
         return;
     };
 
-    assert!(
-        matches!(
-            std::env::var("LATTICE_KV_F16").as_deref(),
-            Ok("1") | Ok("true")
-        ),
-        "f16 KV Metal probe must run with LATTICE_KV_F16=1"
+    // Not configured to run and configured-but-incapable are different answers, and
+    // only the second one is a defect. Both variables must be read before the state is
+    // built, so the test cannot set them itself: `MetalQwen35State::new` reads
+    // `LATTICE_KV_F16` during construction, and setting a process-wide variable from
+    // inside one test would reach every other test running beside it. So the leg that
+    // wants this probe sets them, and the enforcement flag is what makes their absence
+    // a failure — exactly as it does for a missing device above.
+    let configured = matches!(
+        std::env::var("LATTICE_KV_F16").as_deref(),
+        Ok("1") | Ok("true")
+    ) && matches!(
+        std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
+        Ok("1") | Ok("true")
     );
-    assert!(
-        matches!(
-            std::env::var("LATTICE_METAL_PATH_PROOF").as_deref(),
-            Ok("1") | Ok("true")
-        ),
-        "f16 KV Metal probe must run with LATTICE_METAL_PATH_PROOF=1"
-    );
+    if !configured {
+        eprintln!("[METAL_F16_KV_CAPABILITY] supported=false reason=not_configured");
+        assert!(
+            !enforce,
+            "LATTICE_METAL_TEST_ENFORCE=1 but LATTICE_KV_F16 and LATTICE_METAL_PATH_PROOF \
+             are not both set: the probe cannot report a capability it was never asked to \
+             exercise, and skipping here would be the skip-pass this test exists to prevent"
+        );
+        return;
+    }
 
     let (cfg, weights) = tiny_metal_qwen35_fixture();
     let mut state = match MetalQwen35State::new(&weights, &cfg, 16) {
