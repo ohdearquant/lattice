@@ -4,57 +4,144 @@ use crate::forward::cpu::{add_bias, matmul_bt, softmax_attention};
 use crate::lora_hook::{LoraHook, apply_lora_rows};
 use crate::weights::TransformerLayerWeights;
 
-/// Per-buffer byte cap for the transient head-batched scratch allocations
-/// `multi_head_attention_batched` creates once per packed sequence
-/// (`v_all_t`, `scores`, `q_stacked`/`k_stacked`, `scores_stacked`,
-/// `context_stacked`). Unlike [`AttentionBuffers`], whose buffers are sized
-/// once from the model's registered `max_seq_len` at construction time, this
-/// loop's `seq_len` is a per-request value read straight from the caller's
-/// packed `cu_seqlens` and has no load-time bound: `assert_standard_no_overflow`
-/// only rejects shapes that would *wrap* a `usize`, not shapes that fit but are
-/// large enough to abort the process with an OOM -- the dominant term,
-/// `scores_stacked`, is `(num_heads * seq_len)^2` elements, quadratic in a
-/// value the caller controls.
+/// Total byte budget for the transient head-batched scratch that ONE call to
+/// `multi_head_attention_batched` holds live at once for a single packed
+/// sequence. Six buffers are allocated inside that loop -- `v_all_t`,
+/// `scores`, `q_stacked`, `k_stacked`, `scores_stacked`, `context_stacked` --
+/// and none is dropped before the iteration ends, so the number that matters
+/// is their SUM, not any one of them.
 ///
-/// 256 MiB is exactly the `scores_stacked` footprint of BERT-large (16 heads)
-/// packed to its standard 512-token ceiling (`8192^2 * 4 bytes`), the largest
-/// shape in routine use through this path today -- BERT-base (12 heads) at the
-/// same 512 tokens needs only ~144 MiB. Anything past that is already outside
-/// the shape class this fusion optimization was measured for (see the
-/// `q_stacked` comment below on its own O(num_heads) scratch cost), so this
-/// cap rejects it with a typed error before attempting a transient allocation
-/// that could otherwise reach multiple GiB and abort the process, rather than
-/// tuning a ceiling for hypothetical wider-head-count checkpoints that have
-/// not been measured against this path.
-const MAX_HEAD_BATCH_SCRATCH_BYTES: usize = 256 * 1024 * 1024;
+/// Unlike [`AttentionBuffers`], whose buffers are sized once from the model's
+/// registered `max_seq_len` at construction time, this loop's `seq_len` is a
+/// per-request value read straight from the caller's packed `cu_seqlens` and
+/// has no load-time bound: `assert_standard_no_overflow` only rejects shapes
+/// that would *wrap* a `usize`, not shapes that fit but are large enough to
+/// abort the process with an OOM -- and the dominant term, `scores_stacked`,
+/// is `(num_heads * seq_len)^2` elements, quadratic in a value the caller
+/// controls.
+///
+/// Per-call totals at f32 for the shapes that actually run through this path
+/// (`v_all_t` = `hidden_size*seq_len`, `scores` = `num_heads*seq_len^2`,
+/// `q_stacked` = `k_stacked` = `num_heads*seq_len*head_dim`, `scores_stacked`
+/// = `(num_heads*seq_len)^2`, `context_stacked` = `num_heads*seq_len*hidden_size`):
+///
+/// | shape | largest single buffer | total held at once |
+/// | --- | --- | --- |
+/// | 12 heads, hidden 384, head_dim 32, 512 tokens (bge-small) | 144.00 MiB | 167.25 MiB |
+/// | 12 heads, hidden 768, head_dim 64, 512 tokens (BERT-base) | 144.00 MiB | 178.50 MiB |
+/// | 16 heads, hidden 1024, head_dim 64, 512 tokens (BERT-large) | 256.00 MiB | 310.00 MiB |
+///
+/// 384 MiB admits BERT-large at its standard 512-token ceiling -- the largest
+/// shape in routine use through this path -- with room above it, and rejects
+/// anything meaningfully larger before a transient allocation that could reach
+/// multiple GiB is attempted. A budget at or below 310 MiB would reject a
+/// shape this path is expected to serve; that boundary is pinned by a test
+/// rather than left to the comment.
+///
+/// Scope, stated because the number invites the wrong reading: this bounds ONE
+/// call. N calls running concurrently can hold up to N times this budget, and
+/// nothing here accounts across them -- the check is stateless arithmetic over
+/// one shape, so every caller clears it independently. Process-wide admission
+/// is a separate policy question, tracked outside this module.
+const MAX_HEAD_BATCH_SCRATCH_BYTES: usize = 384 * 1024 * 1024;
 
-/// Compute a `rows * cols` element count for one of `multi_head_attention_batched`'s
-/// head-batched scratch buffers, rejecting both a `usize`-wrapping product and
-/// one that fits but would exceed [`MAX_HEAD_BATCH_SCRATCH_BYTES`]. Returns the
-/// element count (not the byte count) so the caller can pass it straight to
-/// `vec![0.0f32; n]`.
-fn checked_head_batch_scratch_len(
-    rows: usize,
-    cols: usize,
-    what: &str,
-) -> Result<usize, InferenceError> {
-    let elems = rows.checked_mul(cols).ok_or_else(|| {
-        InferenceError::InvalidInput(format!(
-            "standard: head-batched {what} scratch element count ({rows} * {cols}) overflows usize"
-        ))
-    })?;
-    let bytes = elems.checked_mul(std::mem::size_of::<f32>()).ok_or_else(|| {
-        InferenceError::InvalidInput(format!(
-            "standard: head-batched {what} scratch byte size ({elems} elements * {}) overflows usize",
-            std::mem::size_of::<f32>()
-        ))
-    })?;
-    if bytes > MAX_HEAD_BATCH_SCRATCH_BYTES {
-        return Err(InferenceError::InvalidInput(format!(
-            "standard: head-batched {what} scratch would need {bytes} bytes for a {rows} x {cols} shape, exceeding the {MAX_HEAD_BATCH_SCRATCH_BYTES}-byte cap"
-        )));
+/// Element counts for the six head-batched scratch buffers one packed sequence
+/// needs, plus the total byte footprint they occupy at once.
+///
+/// `q_stacked` and `k_stacked` share `stacked_qk` because they are the same shape.
+#[derive(Debug)]
+struct HeadBatchScratchPlan {
+    stacked_rows: usize,
+    v_all_t: usize,
+    scores: usize,
+    stacked_qk: usize,
+    scores_stacked: usize,
+    context_stacked: usize,
+    /// What the budget is actually compared against. Nothing in the allocation
+    /// path needs it -- the planner has already accepted or rejected by the
+    /// time it returns -- so only the tests that pin the budget read it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    total_bytes: usize,
+}
+
+/// Size every head-batched scratch buffer for one packed sequence and reject the
+/// shape -- before a single allocation is attempted -- when any product wraps a
+/// `usize` or when the six buffers together exceed
+/// [`MAX_HEAD_BATCH_SCRATCH_BYTES`].
+///
+/// This is pure arithmetic and allocates nothing, so the rejection costs a few
+/// multiplications rather than the multi-GiB `vec![0.0; n]` it prevents.
+fn head_batch_scratch_plan(
+    num_heads: usize,
+    seq_len: usize,
+    hidden_size: usize,
+    head_dim: usize,
+) -> Result<HeadBatchScratchPlan, InferenceError> {
+    let shape = || {
+        format!(
+            "num_heads {num_heads}, seq_len {seq_len}, hidden_size {hidden_size}, head_dim {head_dim}"
+        )
+    };
+    let mul = |a: usize, b: usize, what: &str| -> Result<usize, InferenceError> {
+        a.checked_mul(b).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "standard: head-batched {what} scratch element count ({a} * {b}) overflows usize for {}",
+                shape()
+            ))
+        })
+    };
+
+    let stacked_rows = mul(num_heads, seq_len, "stacked_rows")?;
+    let v_all_t = mul(hidden_size, seq_len, "v_all_t")?;
+    let scores = mul(stacked_rows, seq_len, "scores")?;
+    let stacked_qk = mul(stacked_rows, head_dim, "q/k_stacked")?;
+    let scores_stacked = mul(stacked_rows, stacked_rows, "scores_stacked")?;
+    let context_stacked = mul(stacked_rows, hidden_size, "context_stacked")?;
+
+    // Sum in the order the buffers are allocated, so the error names the buffer
+    // whose addition crossed the budget rather than whichever one is largest.
+    let mut elems: usize = 0;
+    for (what, n) in [
+        ("v_all_t", v_all_t),
+        ("scores", scores),
+        ("q_stacked", stacked_qk),
+        ("k_stacked", stacked_qk),
+        ("scores_stacked", scores_stacked),
+        ("context_stacked", context_stacked),
+    ] {
+        elems = elems.checked_add(n).ok_or_else(|| {
+            InferenceError::InvalidInput(format!(
+                "standard: head-batched scratch element total overflows usize at {what} for {}",
+                shape()
+            ))
+        })?;
+        let bytes = elems
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                InferenceError::InvalidInput(format!(
+                    "standard: head-batched scratch byte total overflows usize at {what} for {}",
+                    shape()
+                ))
+            })?;
+        if bytes > MAX_HEAD_BATCH_SCRATCH_BYTES {
+            return Err(InferenceError::InvalidInput(format!(
+                "standard: head-batched scratch for {} needs {bytes} bytes once {what} is added \
+                 (six buffers are live at once), exceeding the \
+                 {MAX_HEAD_BATCH_SCRATCH_BYTES}-byte per-call total budget",
+                shape()
+            )));
+        }
     }
-    Ok(elems)
+
+    Ok(HeadBatchScratchPlan {
+        stacked_rows,
+        v_all_t,
+        scores,
+        stacked_qk,
+        scores_stacked,
+        context_stacked,
+        total_bytes: elems * std::mem::size_of::<f32>(),
+    })
 }
 
 /// **Unstable**: pre-allocated buffers for multi-head attention computation; field layout may change.
@@ -535,10 +622,10 @@ pub(crate) fn multi_head_attention_in_place(
 ///
 /// # Errors
 ///
-/// Returns [`InferenceError::InvalidInput`] when a packed sequence's
-/// head-batched scratch requirement (quadratic in `num_heads * seq_len`)
-/// would exceed [`MAX_HEAD_BATCH_SCRATCH_BYTES`] for any single buffer,
-/// instead of attempting the allocation.
+/// Returns [`InferenceError::InvalidInput`] when a packed sequence's six
+/// head-batched scratch buffers (whose dominant term is quadratic in
+/// `num_heads * seq_len`) would together exceed
+/// [`MAX_HEAD_BATCH_SCRATCH_BYTES`], instead of attempting the allocation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn multi_head_attention_batched(
     hidden_states: &[f32],
@@ -685,20 +772,18 @@ pub(crate) fn multi_head_attention_batched(
         // `num_heads * seq_len * seq_len` check (missing one `num_heads`
         // factor), so a shape that clears the guard above could still wrap --
         // or fit but be large enough to abort the process with an OOM --
-        // here for a pathologically large `num_heads * seq_len`. Every
-        // scratch buffer below is sized through `checked_head_batch_scratch_len`,
-        // which rejects both cases with a typed error instead of allocating.
-        let stacked_rows = num_heads
-            .checked_mul(seq_len)
-            .expect("standard: num_heads * seq_len overflow");
+        // here for a pathologically large `num_heads * seq_len`. And all six
+        // buffers below stay live until this iteration ends, so what has to be
+        // bounded is their sum. `head_batch_scratch_plan` sizes every one of
+        // them, rejects both cases with a typed error, and allocates nothing.
+        let plan = head_batch_scratch_plan(num_heads, seq_len, hidden_size, head_dim)?;
+        let stacked_rows = plan.stacked_rows;
 
         let row_start = start * hidden_size;
         let concat_b = &mut concat[row_start..row_start + seq_len * hidden_size];
 
-        let mut v_all_t =
-            vec![0.0f32; checked_head_batch_scratch_len(hidden_size, seq_len, "v_all_t")?];
-        let mut scores =
-            vec![0.0f32; checked_head_batch_scratch_len(stacked_rows, seq_len, "scores")?];
+        let mut v_all_t = vec![0.0f32; plan.v_all_t];
+        let mut scores = vec![0.0f32; plan.scores];
 
         // Head-batched Q*K^T (#702): instead of `num_heads` separate tiny
         // `matmul_bt` dispatches (M=seq_len, K=head_dim, N=seq_len each), stack
@@ -715,7 +800,7 @@ pub(crate) fn multi_head_attention_batched(
         // compute AND O(num_heads) more scratch memory per sequence; long
         // `seq_len` shapes should be re-measured before assuming this wins
         // uniformly, per the issue's own "measure first" mandate).
-        let stacked_qk_len = checked_head_batch_scratch_len(stacked_rows, head_dim, "q/k_stacked")?;
+        let stacked_qk_len = plan.stacked_qk;
         let mut q_stacked = vec![0.0f32; stacked_qk_len];
         let mut k_stacked = vec![0.0f32; stacked_qk_len];
         for h in 0..num_heads {
@@ -735,11 +820,7 @@ pub(crate) fn multi_head_attention_batched(
             }
         }
 
-        let mut scores_stacked =
-            vec![
-                0.0f32;
-                checked_head_batch_scratch_len(stacked_rows, stacked_rows, "scores_stacked")?
-            ];
+        let mut scores_stacked = vec![0.0f32; plan.scores_stacked];
         matmul_bt(
             &q_stacked,
             &k_stacked,
@@ -788,11 +869,7 @@ pub(crate) fn multi_head_attention_batched(
         // as with the Q*K^T step, off-diagonal (h, h') blocks of the result
         // are computed and discarded (same O(num_heads) compute/memory
         // tradeoff noted above).
-        let mut context_stacked =
-            vec![
-                0.0f32;
-                checked_head_batch_scratch_len(stacked_rows, hidden_size, "context_stacked")?
-            ];
+        let mut context_stacked = vec![0.0f32; plan.context_stacked];
         matmul_bt(
             &scores,
             &v_all_t,
@@ -2361,12 +2438,14 @@ mod tests {
     /// buffer (weights, `q`/`k`/`v`, `scores`) tiny while `stacked_rows =
     /// num_heads * seq_len` -- the value `scores_stacked`'s `stacked_rows^2`
     /// element count is quadratic in -- lands right at the
-    /// `MAX_HEAD_BATCH_SCRATCH_BYTES` (256 MiB) boundary: `seq_len=128` puts
-    /// `scores_stacked` at exactly 256 MiB (still accepted, the cap check is
-    /// `>`, not `>=`); `seq_len=129` puts it at ~260 MiB (rejected). This
-    /// mirrors a real shape class -- BERT-large-style 16-64 heads at a
-    /// few-hundred-token sequence -- without the multi-hundred-MiB-to-GiB
-    /// allocation a boundary test at, say, 16 heads x 8192 tokens would need.
+    /// `MAX_HEAD_BATCH_SCRATCH_BYTES` (384 MiB, a TOTAL over the six live
+    /// buffers) boundary. At this shape the total is
+    /// `4 * (4160*seq_len^2 + 4288*seq_len)` bytes, so `seq_len=155` totals
+    /// 402,434,560 bytes (under the budget, accepted -- the check is `>`, not
+    /// `>=`) and `seq_len=156` totals 407,626,752 bytes (over it, rejected).
+    /// This mirrors a real shape class -- BERT-large-style 16-64 heads at a
+    /// few-hundred-token sequence -- without the multi-GiB allocation a
+    /// boundary test at, say, 16 heads x 8192 tokens would need.
     fn run_batched_attention_at_seq_len(seq_len: usize) -> Result<(), InferenceError> {
         let hidden_size = 64;
         let num_heads = 64;
@@ -2488,16 +2567,15 @@ mod tests {
 
     #[test]
     fn head_batched_attention_rejects_scratch_over_the_cap_with_typed_error() {
-        // num_heads=64, seq_len=129 -> stacked_rows=8256, scores_stacked =
-        // 8256^2 * 4 bytes = 272,646,144 bytes (~260 MiB), just over the
-        // 256 MiB `MAX_HEAD_BATCH_SCRATCH_BYTES` cap.
-        let err = run_batched_attention_at_seq_len(129)
-            .expect_err("scratch requirement over the cap must be rejected, not allocated");
+        // num_heads=64, head_dim=1, hidden_size=64, seq_len=156: the six live
+        // buffers total 407,626,752 bytes, just over the 384 MiB budget.
+        let err = run_batched_attention_at_seq_len(156)
+            .expect_err("scratch requirement over the budget must be rejected, not allocated");
         match err {
             InferenceError::InvalidInput(msg) => {
                 assert!(
                     msg.contains("scores_stacked") && msg.contains("exceeding"),
-                    "error message should name the offending buffer and the cap: {msg}"
+                    "error message should name the offending buffer and the budget: {msg}"
                 );
             }
             other => panic!("expected InvalidInput, got {other:?}"),
@@ -2506,11 +2584,102 @@ mod tests {
 
     #[test]
     fn head_batched_attention_accepts_scratch_at_the_cap_boundary() {
-        // num_heads=64, seq_len=128 -> stacked_rows=8192, scores_stacked =
-        // 8192^2 * 4 bytes = 268,435,456 bytes, exactly the 256 MiB cap. The
-        // guard rejects only what's strictly *over* the cap, so this shape
-        // must still succeed and allocate/compute normally.
-        run_batched_attention_at_seq_len(128)
-            .expect("scratch requirement exactly at the cap must still be accepted");
+        // Same shape at seq_len=155: 402,434,560 bytes, under the 384 MiB
+        // budget. The guard rejects only what is strictly *over* it, so this
+        // shape must still succeed and allocate/compute normally.
+        run_batched_attention_at_seq_len(155)
+            .expect("scratch requirement under the budget must still be accepted");
+    }
+
+    /// The three shapes the budget exists to arbitrate, checked against the
+    /// planner directly: it allocates nothing, so these cost microseconds and
+    /// can state exact byte totals instead of a boundary.
+    ///
+    /// `bge_small` and `bert_large` are the load-bearing pair. They pin the
+    /// budget from below: BERT-large at its standard 512-token ceiling needs
+    /// 310.00 MiB live at once, so any budget at or under that rejects a shape
+    /// this path is expected to serve, and this test goes red the moment the
+    /// constant is lowered that far.
+    #[test]
+    fn scratch_plan_admits_the_shapes_that_actually_run_through_this_path() {
+        // 12 heads, hidden 384, head_dim 32, 512 tokens.
+        let bge_small = head_batch_scratch_plan(12, 512, 384, 32)
+            .expect("bge-small at 512 tokens must be admitted");
+        assert_eq!(bge_small.total_bytes, 175_374_336, "bge-small total");
+
+        // 16 heads, hidden 1024, head_dim 64, 512 tokens.
+        let bert_large = head_batch_scratch_plan(16, 512, 1024, 64)
+            .expect("BERT-large at 512 tokens must be admitted");
+        assert_eq!(bert_large.total_bytes, 325_058_560, "BERT-large total");
+        assert!(
+            bert_large.total_bytes <= MAX_HEAD_BATCH_SCRATCH_BYTES,
+            "the budget must admit the largest shape in routine use"
+        );
+    }
+
+    /// The rule-separating case: EVERY individual buffer fits inside the budget
+    /// while their sum does not. A per-buffer cap of the same value accepts
+    /// this shape and then allocates 704 MiB; the total budget rejects it once
+    /// the running sum reaches 576 MiB, before the fifth buffer is allocated.
+    ///
+    /// The first assertion is what makes the test separate the two rules rather
+    /// than merely observe a rejection.
+    #[test]
+    fn scratch_plan_rejects_a_shape_whose_buffers_each_fit_but_whose_sum_does_not() {
+        // num_heads=2, hidden_size=4096, head_dim=2048, seq_len=4096:
+        // stacked_rows=8192, so scores_stacked is 8192^2 * 4 = 256 MiB, the
+        // largest of the six, and the sum is 704 MiB.
+        let (num_heads, seq_len, hidden_size, head_dim) = (2, 4096, 4096, 2048);
+        let stacked_rows = num_heads * seq_len;
+        let largest_single = [
+            hidden_size * seq_len,
+            stacked_rows * seq_len,
+            stacked_rows * head_dim,
+            stacked_rows * stacked_rows,
+            stacked_rows * hidden_size,
+        ]
+        .into_iter()
+        .max()
+        .expect("non-empty")
+            * std::mem::size_of::<f32>();
+        assert!(
+            largest_single <= MAX_HEAD_BATCH_SCRATCH_BYTES,
+            "fixture must keep every single buffer inside the budget, else it \
+             cannot distinguish a per-buffer cap from a total one: largest is \
+             {largest_single} bytes"
+        );
+
+        let err = head_batch_scratch_plan(num_heads, seq_len, hidden_size, head_dim)
+            .expect_err("a shape whose buffers sum past the budget must be rejected");
+        match err {
+            InferenceError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("603979776") && msg.contains("per-call total budget"),
+                    "error must show the running total that crossed the budget: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    /// The arm the budget comparison structurally cannot reach: a product that
+    /// wraps `usize` produces a SMALL number, and a small number is under any
+    /// budget. Only the per-product `checked_mul` catches it.
+    #[test]
+    fn scratch_plan_rejects_a_product_that_wraps_usize() {
+        // num_heads = 2^33, seq_len = 2 -> stacked_rows = 2^34, whose square is
+        // 2^68 and does not fit a 64-bit usize. Every earlier product does fit,
+        // so this reaches `scores_stacked` before failing.
+        let err = head_batch_scratch_plan(1usize << 33, 2, 64, 1)
+            .expect_err("a wrapping product must be rejected, not silently truncated");
+        match err {
+            InferenceError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("scores_stacked") && msg.contains("overflows usize"),
+                    "error must name the wrapping product: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 }
