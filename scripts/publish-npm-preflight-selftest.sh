@@ -546,6 +546,73 @@ else
 fi
 
 echo
+echo "=== publish-npm.sh platform_binaries_present main-field validation self-test ==="
+# platform_binaries_present funnels its per-platform .node resolution
+# through platform_node_rel -- the same function platform_matrix_guard's
+# exact-path guard uses -- so hardening that one function against an
+# absent/empty "main", a path-separator or ".." value, or a non-".node"
+# extension protects both callers. These arms exercise
+# platform_binaries_present directly, mirroring the JS-side
+# platformBinariesPresent coverage in
+# npm/lattice-embed-native/__test__/guard-artifacts.spec.mjs.
+run_binaries_present_case() {  # $1=NATIVE_DIR
+  RUNNER="$MSB/binpresent-runner.sh"
+  {
+    echo 'PUBLISH_NPM_SH_LIB_ONLY=1'
+    printf '. %q\n' "$SRC"
+    printf 'NATIVE_DIR=%q\n' "$1"
+    printf 'platform_binaries_present\n'
+    printf 'echo BINARIES_PRESENT_TRUE\n'
+  } > "$RUNNER"
+  OUT="$(/bin/sh -c "set -e; . '$RUNNER'" 2>&1)"
+  return $?
+}
+
+# (bp1) must-PASS control: a fully valid single-platform matrix returns true.
+NATIVE="$MSB/bp1-binpresent-valid"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3"
+add_valid_platform "$NATIVE" "darwin-arm64" "1.2.3"
+run_binaries_present_case "$NATIVE"; rc=$?
+check "(bp1) platform_binaries_present valid matrix returns true" 0 $rc
+if printf '%s' "$OUT" | grep -qF "BINARIES_PRESENT_TRUE"; then
+  echo "  PASS:   -> function returned success"; pass=$((pass+1))
+else
+  echo "  FAIL:   -> did not reach success marker (got: $(printf '%s' "$OUT" | tr '\n' '|'))"; fail=$((fail+1))
+fi
+
+# (bp2) empty "main" returns false.
+NATIVE="$MSB/bp2-binpresent-emptymain"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3"
+d="$NATIVE/npm/darwin-arm64"; mkdir -p "$d"
+cat > "$d/package.json" <<'EOF'
+{"name": "@khive-ai/lattice-embed-darwin-arm64", "version": "1.2.3", "main": ""}
+EOF
+run_binaries_present_case "$NATIVE"; rc=$?
+check "(bp2) platform_binaries_present empty main returns false" 1 $rc
+
+# (bp3) a "main" that escapes the platform directory via "..". The escaped
+# file is created and DOES exist on disk, so a defeated validation rule
+# would make this arm go green for the wrong reason (a missing-file
+# coincidence) instead of holding rc 1 from the rejected-format check.
+NATIVE="$MSB/bp3-binpresent-evil"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3"
+d="$NATIVE/npm/darwin-arm64"; mkdir -p "$d"
+cat > "$d/package.json" <<'EOF'
+{"name": "@khive-ai/lattice-embed-darwin-arm64", "version": "1.2.3", "main": "../evil.js"}
+EOF
+printf 'arbitrary file escaping the platform directory\n' > "$NATIVE/npm/evil.js"
+run_binaries_present_case "$NATIVE"; rc=$?
+check "(bp3) platform_binaries_present path-traversal main returns false" 1 $rc
+
+# (bp4) a "main" with no separator and no ".." but the wrong extension --
+# also present on disk, isolating the extension check from the two above.
+NATIVE="$MSB/bp4-binpresent-wrongext"; build_native_fixture "$NATIVE" "darwin-arm64:1.2.3"
+d="$NATIVE/npm/darwin-arm64"; mkdir -p "$d"
+cat > "$d/package.json" <<'EOF'
+{"name": "@khive-ai/lattice-embed-darwin-arm64", "version": "1.2.3", "main": "README.md"}
+EOF
+printf '# not a binary\n' > "$d/README.md"
+run_binaries_present_case "$NATIVE"; rc=$?
+check "(bp4) platform_binaries_present non-.node main returns false" 1 $rc
+
+echo
 echo "=== publish-npm.sh npm-pack-command-failure guard self-test ==="
 # publish-npm.sh's platform_matrix_guard fails closed when `npm pack
 # --dry-run --json` itself returns nonzero -- distinct from the packlist
