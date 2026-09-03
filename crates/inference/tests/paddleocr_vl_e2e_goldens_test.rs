@@ -1,5 +1,5 @@
 //! PaddleOCR-VL-1.6 end-to-end CPU forward vs the HF reference: one image
-//! plus the `"OCR:"` prompt, greedy decode, no KV cache.
+//! plus the `"OCR:"` prompt, greedy decode, cached and uncached.
 //!
 //! The committed fixture (`fixtures/paddleocr_vl/e2e/e2e_goldens.json` +
 //! `e2e_image.png`) was captured from the pinned checkpoint's own
@@ -18,7 +18,9 @@
 //! - spliced embeddings (last-token first8, mean_abs),
 //! - prompt logits (argmax at every position, last-token first8 / top-5 /
 //!   mean_abs),
-//! - the 24 greedy tokens (exact, in order).
+//! - the 24 greedy tokens (exact, in order), produced by the KV-cached
+//!   loop and again by the uncached re-forward loop, which must agree
+//!   with each other as well as with the fixture.
 //!
 //! **Fail-closed contract** (mirrors `paddleocr_vl_decoder_goldens_test.rs`):
 //! the ~1.9 GB checkpoint is not committed. With `LATTICE_POCR_MODEL_DIR`
@@ -26,7 +28,7 @@
 //! test prints a skip line and returns. With `LATTICE_POCR_GATE_ENFORCE=1`,
 //! a missing checkpoint panics instead of skipping.
 //!
-//! Run (release only — the no-cache greedy loop re-forwards the ~0.9B
+//! Run (release only — the uncached reference loop re-forwards the ~0.9B
 //! decoder over the full sequence per step):
 //! ```bash
 //! cargo test --release -p lattice-inference --features f16 \
@@ -269,11 +271,11 @@ mod gate {
             "prompt logits last_tok_mean_abs",
         ));
 
-        // 8. Greedy decode, no cache: every token reproduced exactly.
-        // The fixture records per-step top1/top2 margins; the smallest
-        // recorded margin is 3.78 (step 7: 16.072 - 12.289), far above the
-        // 0.05 threshold, so all 24 steps are compared exactly with no
-        // early stop.
+        // 8. Greedy decode with the KV cache: every token reproduced
+        // exactly. The fixture records per-step top1/top2 margins; the
+        // smallest recorded margin is 3.78 (step 7: 16.072 - 12.289), far
+        // above the 0.05 threshold, so all 24 steps are compared exactly
+        // with no early stop.
         let t1 = std::time::Instant::now();
         let generated = model
             .generate_greedy(
@@ -301,10 +303,48 @@ mod gate {
             assert_eq!(g, e, "greedy step {i}");
         }
 
+        // 9. The cache's own acceptance: the cached loop above and the
+        // uncached re-forward loop must produce the same tokens on the
+        // same input. Holding both against the golden would not settle
+        // this — the golden is 24 tokens of one image, and a cache that
+        // diverged only after the horizon, or only on another prompt,
+        // would still match it. The two loops share every stage except
+        // the attention read, so an equality here is the invariant
+        // stated as an equation.
+        let t2 = std::time::Instant::now();
+        let uncached = model
+            .generate_greedy_uncached(
+                &tokenizer,
+                rgb,
+                h,
+                w,
+                &golden.prompt_text,
+                golden.greedy.max_new_tokens,
+            )
+            .expect("uncached greedy decode");
+        let uncached_s = t2.elapsed().as_secs_f64();
+        assert_eq!(
+            generated, uncached,
+            "cached and uncached greedy sequences diverged"
+        );
+
+        // Read the two greedy timings with care, and do not quote them as a
+        // decode benchmark. Each call runs the whole pipeline, image
+        // processor and vision encoder included, and on this fixture that
+        // shared prefix dominates: the prompt is 157 tokens, so the 24
+        // full-sequence decoder forwards the uncached loop makes, against
+        // the cached loop's 24 single-token steps, are worth a few seconds
+        // against a total near 230s. Measured 2026-09-03, one run: cached
+        // 229.39s against uncached 224.49s, i.e. the difference came out
+        // negative, which is the shared vision pass varying by more than
+        // the decoder work being compared. What the cache saves per step
+        // is a structural property of the code (one token instead of the
+        // whole sequence); isolating it is a bench-harness job.
         println!(
-            "paddleocr_vl_e2e: prefill {prefill_s:.2}s, greedy {greedy_s:.2}s ({} steps), \
-             worst |diff| {worst:.2e} (ATOL=RTOL={ATOL:e}) — all fields within tolerance, \
-             greedy exact {} of {}",
+            "paddleocr_vl_e2e: prefill {prefill_s:.2}s, greedy cached {greedy_s:.2}s vs \
+             uncached {uncached_s:.2}s ({} steps, single run), worst |diff| {worst:.2e} \
+             (ATOL=RTOL={ATOL:e}) — all fields within tolerance, greedy exact {} of {}, \
+             cached == uncached",
             generated.len(),
             generated.len(),
             golden.greedy.tokens.len()
