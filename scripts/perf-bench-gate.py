@@ -53,16 +53,21 @@ writes an atomic perf-bench-gate-status/v1 document. Ambient refusal is checked
 before the final exit/status verdict, so exit 3 outranks pass or regression for
 every target in the run. Excessive order bias is the other exit-3 cause.
 
---informational-target (lattice#714): quick-mode Criterion runs on
-sub-microsecond micro-benches (lattice-embed's `simd` bench target) are
-dominated by scheduler/thermal jitter rather than code changes — confirmed
-by two same-toolchain quick-mode A/A runs on identical refs flipping FAIL/
-WARN sign across dozens of entries (lattice#714). bench-compare isolates each
-bench target in its own Criterion output root, passes that root's exact target
-key through --target, and marks the key informational only when the reviewed
-manifest says so. Every result in that root is still measured and reported,
-but excluded from the FAIL/WARN gate and exit code. Full mode omits
---informational-target, so every result gates normally.
+--informational-target: bench-compare isolates each bench target in its own
+Criterion output root and passes that root's exact key through --target. A
+reviewed caller policy may mark that same key informational: the quick-mode
+noise-demotion manifest does this for lattice-embed's `simd` target (#714),
+and the embed target/feature calibration allowlist does it at either resolution
+for selected configurations that have not calibrated the gate. Every result in
+an informational root is still measured and reported, but excluded from the
+FAIL/WARN verdict and exit code. This classifier validates exact target identity;
+the caller owns the policy decision to withhold gating authority.
+
+Run provenance is schema-versioned. New bench-compare runs write
+lattice-bench-provenance-v2, where embed_features is required. The reader also
+accepts legacy v1, which predates embed feature selection and therefore
+normalizes that absent concept to embed_features=<none> for display. A v1 record
+that contains embed_features is rejected rather than silently redefining v1.
 """
 
 from __future__ import annotations
@@ -89,7 +94,8 @@ except ImportError:
 if sys.version_info[:2] < (3, 11):
     raise SystemExit(_PYTHON_REQUIREMENT_ERROR)
 
-PROVENANCE_SCHEMA = "lattice-bench-provenance-v1"
+PROVENANCE_SCHEMA_V1 = "lattice-bench-provenance-v1"
+PROVENANCE_SCHEMA_V2 = "lattice-bench-provenance-v2"
 MACHINE_STATE_SCHEMA = "lattice-machine-state-v1"
 PHASE_LABELS = ("before first arm", "between order strata", "after final arm")
 PROVENANCE_FIELDS = (
@@ -112,9 +118,17 @@ PROVENANCE_FIELDS = (
     "baseline_name",
     "targets",
     "inference_features",
+    "embed_features",
     "filters",
     "enforcement",
 )
+PROVENANCE_V1_FIELDS = tuple(
+    field for field in PROVENANCE_FIELDS if field != "embed_features"
+)
+PROVENANCE_FIELDS_BY_SCHEMA = {
+    PROVENANCE_SCHEMA_V1: PROVENANCE_V1_FIELDS,
+    PROVENANCE_SCHEMA_V2: PROVENANCE_FIELDS,
+}
 
 # Thresholds — ADR-058 §D3. Edit here; the workflow imports nothing else.
 #
@@ -514,6 +528,7 @@ def order_balance_results(
 
 @dataclass(frozen=True)
 class RunProvenance:
+    schema: str
     fields: dict[str, str]
     locks: tuple[str, ...]
     ambient_samples: tuple[str, ...]
@@ -689,14 +704,27 @@ def load_run_provenance(path: Path) -> RunProvenance:
         else:
             fields[key] = value
 
-    if fields.get("schema") != PROVENANCE_SCHEMA:
+    schema = fields.get("schema")
+    if schema not in PROVENANCE_FIELDS_BY_SCHEMA:
         raise ValueError(
-            f"{path}: schema must be {PROVENANCE_SCHEMA!r}, got "
-            f"{fields.get('schema')!r}"
+            f"{path}: schema must be one of "
+            f"{tuple(PROVENANCE_FIELDS_BY_SCHEMA)!r}, got {schema!r}"
         )
-    missing = [field for field in PROVENANCE_FIELDS if field not in fields]
+    schema_fields = PROVENANCE_FIELDS_BY_SCHEMA[schema]
+    unexpected = sorted(set(fields) - {"schema", *schema_fields})
+    if unexpected:
+        raise ValueError(
+            f"{path}: {schema} does not allow provenance fields: "
+            f"{', '.join(unexpected)}"
+        )
+    missing = [field for field in schema_fields if field not in fields]
     if missing:
         raise ValueError(f"{path}: missing provenance fields: {', '.join(missing)}")
+    if schema == PROVENANCE_SCHEMA_V1:
+        # v1 predates embed target feature selection. Its only representable
+        # meaning is the legacy default, so normalize that historical meaning
+        # for the v2-shaped report without accepting a v2 field under v1.
+        fields["embed_features"] = "<none>"
     started = parse_utc_timestamp(fields["started_utc"], "started_utc")
     finished = parse_utc_timestamp(fields["finished_utc"], "finished_utc")
     if finished < started:
@@ -799,6 +827,7 @@ def load_run_provenance(path: Path) -> RunProvenance:
 
     fields.pop("schema")
     return RunProvenance(
+        schema=schema,
         fields=fields,
         locks=tuple(repeated["lock"]),
         ambient_samples=tuple(repeated["ambient"]),
@@ -1302,6 +1331,7 @@ def render_run_provenance(
         )
         lines.append("")
     else:
+        lines.append(f"    schema={provenance.schema}")
         blocked_checkpoints = [
             state for state in provenance.machine_states
             if state.get("gate", {}).get("status") == "blocked"
@@ -1450,9 +1480,8 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
 
     if info:
         lines.append(
-            f"**ℹ️ {len(info)} informational** (below quick-mode resolution — "
-            f"lattice-embed SIMD micro-benches, tracked in #714; not gated here, "
-            f"re-run `--full` for a gated verdict)"
+            f"**ℹ️ {len(info)} informational** (explicit target policy; "
+            f"measured and reported, excluded from the verdict)"
         )
         if decision_suppressed_reason is None and (
             info_fails or info_warns or info_unattributable or info_wins
@@ -1537,8 +1566,8 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
         )
     if informational_target is not None:
         lines.append(
-            f"_Target `{informational_target}` classified informational-only in quick mode "
-            f"(lattice#714); its {len(info)} measurement(s) are excluded from the verdict._\n"
+            f"_Target `{informational_target}` classified informational-only by explicit "
+            f"target policy; its {len(info)} measurement(s) are excluded from the verdict._\n"
         )
     else:
         lines.append("")
@@ -2592,6 +2621,7 @@ def run_selftest() -> int:
             "baseline_name": "compare-base",
             "targets": "lattice-inference:fixture",
             "inference_features": "<none>",
+            "embed_features": "<none>",
             "filters": "inference='<all>' embed='<all>'",
             "enforcement": "fail-on-regression",
         }
@@ -2650,7 +2680,7 @@ def run_selftest() -> int:
             },
         ]
         provenance_lines = [
-            f"schema={PROVENANCE_SCHEMA}",
+            "schema=lattice-bench-provenance-v2",
             *[f"{field}={provenance_fields[field]}" for field in PROVENANCE_FIELDS],
             "lock=bench-window: acquired",
             "lock=Metal GPU: acquired",
@@ -2683,6 +2713,7 @@ def run_selftest() -> int:
             )
         for expected in (
             "<summary>Run provenance</summary>",
+            "schema=lattice-bench-provenance-v2",
             "host_id=hostname-sha256:0123456789abcdef",
             "criterion_base_samples=4 Linear (1 benchmark)",
             "criterion_head_samples=2 Flat (1 benchmark)",
@@ -2697,6 +2728,96 @@ def run_selftest() -> int:
                 failures.append(
                     f"run-provenance: stored report omitted {expected!r}"
                 )
+
+        legacy_v1_path = Path(td) / "legacy-v1-provenance.txt"
+        legacy_v1_path.write_text(
+            "\n".join(
+                "schema=lattice-bench-provenance-v1"
+                if line.startswith("schema=")
+                else line
+                for line in provenance_lines
+                if not line.startswith("embed_features=")
+            )
+            + "\n"
+        )
+        legacy_v1_run = _run(
+            provenance_root,
+            "--provenance-file",
+            str(legacy_v1_path),
+            "--require-provenance",
+        )
+        if (
+            legacy_v1_run.returncode != 0
+            or "schema=lattice-bench-provenance-v1" not in legacy_v1_run.stdout
+            or "embed_features=<none>" not in legacy_v1_run.stdout
+        ):
+            failures.append(
+                "run-provenance: legacy v1 was not accepted with the "
+                "deterministic embed_features=<none> default"
+            )
+        else:
+            print(
+                "SCHEMA PROOF: legacy provenance v1 accepted and rendered "
+                "with embed_features=<none>"
+            )
+
+        v1_with_v2_field_path = Path(td) / "v1-with-v2-field-provenance.txt"
+        v1_with_v2_field_path.write_text(
+            "\n".join(
+                "schema=lattice-bench-provenance-v1"
+                if line.startswith("schema=")
+                else line
+                for line in provenance_lines
+            )
+            + "\n"
+        )
+        v1_with_v2_field_run = _run(
+            provenance_root,
+            "--provenance-file",
+            str(v1_with_v2_field_path),
+            "--require-provenance",
+        )
+        if (
+            v1_with_v2_field_run.returncode != 2
+            or "v1 does not allow provenance fields: embed_features"
+            not in v1_with_v2_field_run.stderr
+        ):
+            failures.append(
+                "run-provenance: v1 silently accepted the v2 embed_features field"
+            )
+        else:
+            print(
+                "SCHEMA PROOF: provenance v1 rejects the v2-only "
+                "embed_features field"
+            )
+
+        incomplete_v2_path = Path(td) / "incomplete-v2-provenance.txt"
+        incomplete_v2_path.write_text(
+            "\n".join(
+                line
+                for line in provenance_lines
+                if not line.startswith("embed_features=")
+            )
+            + "\n"
+        )
+        incomplete_v2_run = _run(
+            provenance_root,
+            "--provenance-file",
+            str(incomplete_v2_path),
+            "--require-provenance",
+        )
+        if (
+            incomplete_v2_run.returncode != 2
+            or "missing provenance fields: embed_features"
+            not in incomplete_v2_run.stderr
+        ):
+            failures.append(
+                "run-provenance: v2 accepted a missing embed_features field"
+            )
+        else:
+            print(
+                "SCHEMA PROOF: provenance v2 requires embed_features"
+            )
 
         darwin_ungated = Path(td) / "darwin-ungated-provenance.txt"
         darwin_ungated.write_text(
@@ -2904,8 +3025,8 @@ def run_selftest() -> int:
           "slash-bearing group, demoted target informational, non-demoted target gated), "
           "require-measurements (empty root, gating pass, explicit informational target, "
           "mismatch refusal, partial-run refusal), ABBA directional-drift correction, "
-          "malformed reverse-number refusal, selected-baseline completeness, and "
-          "stale-head freshness all correct")
+          "malformed reverse-number refusal, selected-baseline completeness, provenance "
+          "v1/v2 compatibility, and stale-head freshness all correct")
     return 0
 
 
@@ -2924,7 +3045,7 @@ def main() -> int:
                          "root. bench-compare passes this for every target.")
     ap.add_argument("--informational-target",
                     help="Classify this exact target as informational-only. Must equal --target; "
-                         "omit for gating/full-mode runs.")
+                         "the caller owns the reviewed policy decision.")
     ap.add_argument("--resolution", choices=("quick", "full"), default="full",
                     help="Measurement resolution used for verdict classification "
                          "(default: full).")
@@ -2952,7 +3073,8 @@ def main() -> int:
                          "No report is generated.")
     ap.add_argument("--provenance-file", type=Path,
                     help="Strict bench-compare key=value provenance handoff to embed in the "
-                         "Markdown report.")
+                         "Markdown report. Accepts legacy v1 and current v2; v1 defaults "
+                         "the then-unrepresented embed_features field to <none>.")
     ap.add_argument("--require-provenance", action="store_true",
                     help="Fail (exit 2) unless complete run provenance and actual Criterion "
                          "base/head sample metadata are available.")
