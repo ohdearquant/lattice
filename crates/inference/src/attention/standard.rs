@@ -961,6 +961,60 @@ pub(crate) fn multi_head_attention_batched_padded_reference(
     );
 }
 
+// -----------------------------------------------------------------------
+// Bench-only support module
+// -----------------------------------------------------------------------
+
+/// Bench-only re-export of [`multi_head_attention_batched`], which stays
+/// `pub(crate)` outside `bench-internals` builds. Same visibility discipline
+/// as `weights::bench_support` and `forward::neon_forward::bench_support`:
+/// the default public API is unchanged, and only a `--features
+/// bench-internals` build can reach the packed-batch attention path directly
+/// from a Criterion bench.
+#[cfg(feature = "bench-internals")]
+pub mod bench_support {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn multi_head_attention_batched(
+        hidden_states: &[f32],
+        layer_weights: &TransformerLayerWeights<'_>,
+        fused_qkv_weight: &[f32],
+        fused_qkv_bias: &[f32],
+        cu_seqlens: &[usize],
+        hidden_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        q: &mut [f32],
+        k: &mut [f32],
+        v: &mut [f32],
+        qkv: &mut [f32],
+        concat: &mut [f32],
+        output: &mut [f32],
+        lora: &dyn LoraHook,
+        layer_idx: usize,
+    ) {
+        super::multi_head_attention_batched(
+            hidden_states,
+            layer_weights,
+            fused_qkv_weight,
+            fused_qkv_bias,
+            cu_seqlens,
+            hidden_size,
+            num_heads,
+            head_dim,
+            q,
+            k,
+            v,
+            qkv,
+            concat,
+            output,
+            lora,
+            layer_idx,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
