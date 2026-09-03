@@ -999,7 +999,14 @@ fn bench_attention_kernel(c: &mut Criterion) {
 // `BertModel::forward_batch` uses: the only route that reaches it is
 // `e2e_bench`, transitively and only at that binary's own input sizes, which
 // top out around 100 tokens. The group below is the direct caller that closes
-// that gap, so a coverage audit reading this comment should count it as one.
+// that gap.
+//
+// It is not in any default bench workflow: `scripts/bench-ci.sh` and
+// `scripts/bench-gate.sh` both select `elementwise_cpu_bench` with no features,
+// so comparing this group requires naming the target
+// (`lattice-inference:inference_bench`) and enabling `bench-internals`
+// explicitly. Without both, this group's body is a no-op and the comparison is
+// silently empty.
 //
 // Sweep geometry: attention cost in this path is dominated by the score and
 // context products, both O(num_heads * seq_len^2 * head_dim) for a fixed model
