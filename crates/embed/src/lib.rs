@@ -40,7 +40,11 @@ pub use service::{DEFAULT_MAX_BATCH_SIZE, EmbeddingRole, EmbeddingService, MAX_T
 pub use simd::{SimdConfig, simd_config};
 
 #[cfg(feature = "native")]
-pub use service::{CachedEmbeddingService, NativeEmbeddingService};
+pub use service::{
+    CachedEmbeddingService, CheckpointAttestor, MAX_ATTESTATION_REPORT_BYTES,
+    MIN_ATTESTATION_REPORT_BYTES, NativeEmbeddingService, NativeResourceBudget,
+    OpaqueAttestationReport,
+};
 
 /// Utility functions for vector operations.
 ///
