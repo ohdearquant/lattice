@@ -331,10 +331,10 @@ mod gate {
         // Read the two greedy timings with care, and do not quote them as a
         // decode benchmark. Each call runs the whole pipeline, image
         // processor and vision encoder included, and on this fixture that
-        // shared prefix dominates: the prompt is 157 tokens, so the 22
-        // full-sequence decoder forwards the uncached loop makes and the
-        // cached one does not are worth a few seconds against a total near
-        // 230s. Measured 2026-09-03 on one machine, one run: cached
+        // shared prefix dominates: the prompt is 157 tokens, so the 24
+        // full-sequence decoder forwards the uncached loop makes, against
+        // the cached loop's 24 single-token steps, are worth a few seconds
+        // against a total near 230s. Measured 2026-09-03, one run: cached
         // 229.39s against uncached 224.49s, i.e. the difference came out
         // negative, which is the shared vision pass varying by more than
         // the decoder work being compared. What the cache saves per step
