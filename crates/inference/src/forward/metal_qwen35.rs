@@ -21129,9 +21129,9 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// sequence used here, a per-layer invocation counter is numerically
         /// identical to the decode position, so the first two records cannot
         /// discriminate the two — the discriminating probe is the third
-        /// decode, which REPEATS position `1`: the threaded `position` reads
-        /// back `1` again, while any invocation counter (since arm or since
-        /// state creation) would have advanced to `2`. That third
+        /// decode, which runs after `reset_state()` at position `0`: the
+        /// threaded `position` reads back `0`, while any invocation counter
+        /// (since arm or since state creation) would stand at `2`. That third
         /// record is what proves `position` is the value actually threaded
         /// through `encode_mlp_block` into `encode_moe_ffn`. Also exercises
         /// `dump_moe_routing_trace_jsonl`'s round-trip.
@@ -21175,15 +21175,29 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(logits1.iter().all(|v| v.is_finite()));
             drop(_forced1);
 
-            // Third decode REPEATS position 1. Mechanically safe: raw
-            // `forward_step` has no position-monotonicity check, and the KV
-            // write appends at `seq_len` (slot 2) while applying RoPE
-            // position 1, well below capacity. This is the counter-vs-
-            // position discriminator: a per-layer invocation counter — since
-            // arm or since state creation — has advanced past 1 by this
-            // third call, so only the genuinely threaded `position` reads 1.
+            // Third decode restarts the session and decodes at position 0.
+            // The original discriminator here repeated position 1 while the
+            // live cursor had already advanced to 2, and documented that as
+            // mechanically safe because raw `forward_step` had no
+            // position-monotonicity check. That was true when this test was
+            // written and stopped being true when #1339 added
+            // `check_live_cursor`, which rejects a supplied position that does
+            // not equal `kv_cache.seq_len` before dispatch: KV placement and
+            // attention length derive from the cursor while RoPE uses the
+            // supplied position, so the two disagreeing is exactly the state
+            // that guard exists to refuse.
+            //
+            // `reset_state()` returns the cursor to 0 and does not touch the
+            // thread-local trace, so the same counter-vs-position question is
+            // asked in a form the guard admits, and asked more sharply: the
+            // threaded `position` reads 0 here, while a per-layer invocation
+            // counter — since arm or since state creation — stands at 2 by
+            // this third call. 0 and 2 cannot be confused, and 0 also differs
+            // from the previous record's 1, so a stale carried-over value
+            // cannot pass either.
+            state.reset_state();
             let _forced2 = ForcedMoeExpertsGuard::set(vec![0, 3]);
-            let logits2 = state.forward_step(3, 1);
+            let logits2 = state.forward_step(3, 0);
             assert!(logits2.iter().all(|v| v.is_finite()));
             drop(_forced2);
 
@@ -21201,8 +21215,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(trace[1].selected_ids, vec![2, 1]);
             assert_eq!(trace[2].layer_idx, 0);
             assert_eq!(
-                trace[2].token_idx, 1,
-                "repeated-position decode must record the threaded position (1), \
+                trace[2].token_idx, 0,
+                "post-reset decode must record the threaded position (0), \
                  not an invocation count (which would be 2 by this call): {trace:?}"
             );
             assert_eq!(trace[2].selected_ids, vec![0, 3]);
@@ -21226,8 +21240,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert_eq!(parsed.token_idx, 0);
             assert_eq!(parsed.selected_ids, vec![2, 3]);
 
-            // Collector auto-disarms on take; a follow-up decode must not append further.
-            let _more = state.forward_step(3, 2);
+            // Collector auto-disarms on take; a follow-up decode must not append
+            // further. Position 1 because the reset above restarted the session
+            // and only one token has been decoded since, so 1 is the live cursor
+            // this call has to match.
+            let _more = state.forward_step(3, 1);
             assert!(take_moe_routing_trace().is_empty());
         }
 
