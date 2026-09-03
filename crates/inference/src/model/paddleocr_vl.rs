@@ -23,16 +23,20 @@
 //!    block holds `t = start` while `h`/`w` walk the merged grid in
 //!    raster order; text after the image resumes all three from
 //!    (max so far) + 1.
-//! 4. **Greedy loop** — no KV cache (first slice): every step re-runs the
-//!    full forward over prompt + generated so far and takes the argmax of
-//!    the last row's logits; generated tokens are text, so their position
-//!    columns continue the text-after rule. Stops at eos or
-//!    `max_new_tokens`.
+//! 4. **Greedy loop** — prefill the prompt once into the decoder's
+//!    caller-owned KV cache, then step one token at a time (each step
+//!    forwards only the new token and attends over the cached rows);
+//!    every step takes the argmax of the produced logits; generated
+//!    tokens are text, so their position columns continue the
+//!    text-after rule. Stops at eos or `max_new_tokens`. The uncached
+//!    re-forward loop stays on the type as `generate_greedy_uncached`:
+//!    it is the differential reference the cached loop is held equal to,
+//!    and the e2e gate runs both and requires the same tokens.
 
 use std::path::Path;
 
 use crate::error::InferenceError;
-use crate::model::ernie45::{Ernie45Config, Ernie45Model, Ernie45Weights};
+use crate::model::ernie45::{Ernie45Config, Ernie45KvCache, Ernie45Model, Ernie45Weights};
 use crate::tokenizer::common::Tokenizer;
 use crate::tokenizer::gemma_bpe::GemmaBpeTokenizer;
 use crate::vision::paddleocr_preprocess::{
@@ -68,6 +72,19 @@ pub struct PrefillTrace {
     pub grid_thw: (usize, usize, usize),
     /// `(height, width)` after smart-resize.
     pub resized_hw: (usize, usize),
+}
+
+/// The pipeline's output up to the decoder forward — every field of
+/// [`PrefillTrace`] except `logits`. Produced by
+/// `PaddleOcrVlModel::assemble_prompt` and consumed by whichever forward
+/// the caller wants: the traced full-sequence one, or `kv_prefill`.
+struct PromptAssembly {
+    prompt_ids: Vec<u32>,
+    positions: Vec<[u32; 3]>,
+    projector_rows: Vec<f32>,
+    spliced_embeds: Vec<f32>,
+    grid_thw: (usize, usize, usize),
+    resized_hw: (usize, usize),
 }
 
 /// Image + text -> greedy tokens, over the full PaddleOCR-VL-1.6
@@ -252,6 +269,40 @@ impl PaddleOcrVlModel {
         w: usize,
         text: &str,
     ) -> Result<PrefillTrace, InferenceError> {
+        let assembly = self.assemble_prompt(tokenizer, rgb, h, w, text)?;
+        let trace = self
+            .decoder
+            .forward_embeds_trace(&assembly.spliced_embeds, &assembly.positions)?;
+        Ok(PrefillTrace {
+            prompt_ids: assembly.prompt_ids,
+            positions: assembly.positions,
+            projector_rows: assembly.projector_rows,
+            spliced_embeds: assembly.spliced_embeds,
+            logits: trace.logits,
+            grid_thw: assembly.grid_thw,
+            resized_hw: assembly.resized_hw,
+        })
+    }
+
+    /// Everything the decoder needs from an image and a prompt — token
+    /// ids, mrope positions, projector rows, spliced embedding rows — that
+    /// is, every stage of the pipeline up to but not including the decoder
+    /// forward.
+    ///
+    /// This is split out of [`Self::prefill`] so that each greedy loop runs
+    /// exactly one prompt forward. Routing the cached loop through
+    /// `prefill` instead would run the traced forward, which materialises
+    /// `[seq_len, vocab]` logits and a clone of every layer's output, and
+    /// then discard all of it before running `kv_prefill` over the same
+    /// tokens — two full prompt forwards where the cache exists to buy one.
+    fn assemble_prompt(
+        &self,
+        tokenizer: &GemmaBpeTokenizer,
+        rgb: &[u8],
+        h: usize,
+        w: usize,
+        text: &str,
+    ) -> Result<PromptAssembly, InferenceError> {
         let PreprocessedImage {
             pixel_values,
             grid_thw,
@@ -297,27 +348,100 @@ impl PaddleOcrVlModel {
 
         let positions =
             Self::rope_index(&prompt_ids, grid_thw, self.vision_cfg.spatial_merge_size)?;
-        let trace = self.decoder.forward_embeds_trace(&spliced, &positions)?;
 
-        Ok(PrefillTrace {
+        Ok(PromptAssembly {
             prompt_ids,
             positions,
             projector_rows: projector,
             spliced_embeds: spliced,
-            logits: trace.logits,
             grid_thw,
             resized_hw,
         })
     }
 
-    /// Greedy decode over `max_new_tokens` steps with **no KV cache**:
-    /// every step re-runs the full forward over the whole sequence (first
-    /// slice; a cached decode is a follow-up). `rgb` is interleaved HWC
-    /// RGB8, length `h * w * 3`.
+    /// Run the prompt half of the uncached greedy loop: prompt assembly
+    /// plus the decoder's traced full-sequence forward, returning the
+    /// prefill trace and the last row's logits (the loop's first decision
+    /// row). The cached loop does not use this — it assembles the prompt
+    /// and forwards it once through `kv_prefill`.
+    fn greedy_prefill(
+        &self,
+        tokenizer: &GemmaBpeTokenizer,
+        rgb: &[u8],
+        h: usize,
+        w: usize,
+        text: &str,
+    ) -> Result<(PrefillTrace, Vec<f32>), InferenceError> {
+        let prefill = self.prefill(tokenizer, rgb, h, w, text)?;
+        let vocab = self.decoder_cfg.vocab_size;
+        let last = prefill.prompt_ids.len();
+        let last_logits = prefill.logits[(last - 1) * vocab..][..vocab].to_vec();
+        Ok((prefill, last_logits))
+    }
+
+    /// Uncached greedy reference: prefill once, then re-forward the whole
+    /// prompt-plus-generated sequence at every step and take the argmax
+    /// of the last row. This is the original full-re-forward loop, kept
+    /// as the differential baseline the cached [`Self::generate_greedy`]
+    /// is held equal to; both stop at `EOS_ID` or `max_new_tokens`.
     ///
     /// # Errors
     ///
-    /// Any pipeline error; stops early at `EOS_ID` or when
+    /// Same as [`Self::generate_greedy`].
+    pub fn generate_greedy_uncached(
+        &self,
+        tokenizer: &GemmaBpeTokenizer,
+        rgb: &[u8],
+        h: usize,
+        w: usize,
+        text: &str,
+        max_new_tokens: usize,
+    ) -> Result<Vec<u32>, InferenceError> {
+        if max_new_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        let hidden = self.decoder_cfg.hidden_size;
+        let (prefill, mut last_logits) = self.greedy_prefill(tokenizer, rgb, h, w, text)?;
+
+        let mut embeds = prefill.spliced_embeds;
+        let mut positions = prefill.positions;
+        let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
+
+        for _ in 0..max_new_tokens {
+            let next = argmax_u32(&last_logits);
+            generated.push(next);
+            if next == EOS_ID {
+                break;
+            }
+            // Extend the sequence by one text token and re-forward.
+            let embed_len = embeds.len();
+            embeds.resize(embed_len + hidden, 0.0);
+            embeds[embed_len..]
+                .copy_from_slice(&self.decoder.embed_tokens()[next as usize * hidden..][..hidden]);
+            let p = positions
+                .iter()
+                .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]))
+                + 1;
+            positions.push([p, p, p]);
+            last_logits = self
+                .decoder
+                .forward_embeds_last_logits(&embeds, &positions)?;
+        }
+        Ok(generated)
+    }
+
+    /// Greedy decode over `max_new_tokens` steps with a KV cache: the
+    /// prompt is assembled and forwarded once into a freshly allocated
+    /// [`Ernie45KvCache`] (capacity `prompt + max_new_tokens`), then each
+    /// step forwards only the new token, attending over the cached rows.
+    /// [`Self::generate_greedy_uncached`] stays available as the
+    /// differential reference the two are held equal to. `rgb` is
+    /// interleaved HWC RGB8, length `h * w * 3`.
+    ///
+    /// # Errors
+    ///
+    /// Any pipeline error, or a prompt plus `max_new_tokens` that overflows
+    /// the cache capacity; stops early at `EOS_ID` or when
     /// `max_new_tokens` tokens have been produced.
     pub fn generate_greedy(
         &self,
@@ -332,35 +456,44 @@ impl PaddleOcrVlModel {
             return Ok(Vec::new());
         }
         let hidden = self.decoder_cfg.hidden_size;
-        let vocab = self.decoder_cfg.vocab_size;
-        let prefill = self.prefill(tokenizer, rgb, h, w, text)?;
-
-        let mut ids = prefill.prompt_ids;
-        let mut embeds = prefill.spliced_embeds;
-        let mut positions = prefill.positions;
-        let mut last_logits: Vec<f32> = prefill.logits[(ids.len() - 1) * vocab..][..vocab].to_vec();
+        // Prompt assembly only: the cached loop's one and only prompt
+        // forward is the `kv_prefill` below.
+        let assembly = self.assemble_prompt(tokenizer, rgb, h, w, text)?;
+        let prompt_len = assembly.prompt_ids.len();
+        let capacity = prompt_len.checked_add(max_new_tokens).ok_or_else(|| {
+            InferenceError::Inference(format!(
+                "paddleocr greedy: prompt {prompt_len} + {max_new_tokens} tokens overflows usize"
+            ))
+        })?;
+        let mut cache = Ernie45KvCache::new(
+            self.decoder_cfg.num_hidden_layers,
+            self.decoder_cfg.kv_dim()?,
+            capacity,
+        )?;
+        let mut last_logits =
+            self.decoder
+                .kv_prefill(&assembly.spliced_embeds, &assembly.positions, &mut cache)?;
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
+        // The new text tokens' positions continue the text-after rule:
+        // (max position so far) + 1 on all three rows. The max over the
+        // prompt rows is computed once; every generated token's row is
+        // then strictly larger than all earlier rows, so it advances the
+        // max by exactly one per step.
+        let mut max_pos = assembly
+            .positions
+            .iter()
+            .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]));
         for _ in 0..max_new_tokens {
             let next = argmax_u32(&last_logits);
             generated.push(next);
             if next == EOS_ID {
                 break;
             }
-            // Extend the sequence by one text token and re-forward.
-            ids.push(next);
-            let embed_len = embeds.len();
-            embeds.resize(embed_len + hidden, 0.0);
-            embeds[embed_len..]
-                .copy_from_slice(&self.decoder.embed_tokens()[next as usize * hidden..][..hidden]);
-            let p = positions
-                .iter()
-                .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]))
-                + 1;
-            positions.push([p, p, p]);
-            last_logits = self
-                .decoder
-                .forward_embeds_last_logits(&embeds, &positions)?;
+            max_pos += 1;
+            let position = [max_pos, max_pos, max_pos];
+            let embed = &self.decoder.embed_tokens()[next as usize * hidden..][..hidden];
+            last_logits = self.decoder.kv_decode_step(embed, position, &mut cache)?;
         }
         Ok(generated)
     }

@@ -9,11 +9,14 @@
 //! (`Ernie4_5ForCausalLM` in the checkpoint's own modeling source): 18-layer
 //! pre-norm dense decoder, GQA with expanded heads (`num_heads * head_dim !=
 //! hidden_size`: q 1024->2048, k/v 1024->256, o 2048->1024), SiLU gate/up/down
-//! MLP, RMSNorm (`w * x * rsqrt(mean(x^2) + eps)`), untied `lm_head`. No KV
-//! cache and no sampling here — this module exists to be held against the HF
-//! reference activations captured in
-//! `tests/fixtures/paddleocr_vl/decoder/decoder_goldens.json`, and later
-//! slices build generation on top of a verified forward.
+//! MLP, RMSNorm (`w * x * rsqrt(mean(x^2) + eps)`), untied `lm_head`. No
+//! sampling here — this module exists to be held against the HF reference
+//! activations captured in
+//! `tests/fixtures/paddleocr_vl/decoder/decoder_goldens.json`, with greedy
+//! generation built on top of the verified forward: the uncached entry
+//! points re-run the whole sequence per step (the differential reference),
+//! and the caller-owned [`Ernie45KvCache`] prefills once, then steps one
+//! token at a time.
 //!
 //! RoPE: the reference applies Qwen2-VL-style multimodal-section RoPE
 //! (`apply_multimodal_rotary_pos_emb`, `mrope_section` doubled and chunks
@@ -228,7 +231,11 @@ impl Ernie45Config {
         )
     }
 
-    fn kv_dim(&self) -> Result<usize, InferenceError> {
+    /// `num_key_value_heads * head_dim`, checked. Crate-visible because it
+    /// is also the width an [`Ernie45KvCache`] must be built for, and a
+    /// caller recomputing that product by hand could disagree with the
+    /// value `kv_prefill` validates against.
+    pub(crate) fn kv_dim(&self) -> Result<usize, InferenceError> {
         checked_product(
             self.num_key_value_heads,
             self.head_dim,
@@ -620,7 +627,7 @@ impl Ernie45Model {
         embeds: &[f32],
         positions: &[[u32; 3]],
     ) -> Result<Ernie45Trace, InferenceError> {
-        let core = self.forward_embeds_core(embeds, positions, true)?;
+        let core = self.forward_embeds_core(embeds, positions, true, None)?;
         Ok(Ernie45Trace {
             embed: core.embed,
             layer_outputs: core.layer_outputs,
@@ -648,8 +655,317 @@ impl Ernie45Model {
         embeds: &[f32],
         positions: &[[u32; 3]],
     ) -> Result<Vec<f32>, InferenceError> {
-        let core = self.forward_embeds_core(embeds, positions, false)?;
+        let core = self.forward_embeds_core(embeds, positions, false, None)?;
         Ok(core.logits)
+    }
+
+    /// Fill a fresh [`Ernie45KvCache`] with the prompt's post-RoPE keys and
+    /// values and return the last row's logits (`vocab_size` values).
+    ///
+    /// This is the full-sequence causal forward over `embeds` and
+    /// `positions` — the same arithmetic as
+    /// [`Self::forward_embeds_last_logits`], which stays the uncached
+    /// differential reference — with one addition: each layer's post-RoPE
+    /// key rows and value rows are copied into the cache at rows
+    /// `0..seq_len` as they are produced, so every subsequent
+    /// [`Self::kv_decode_step`] attends over them without recomputing the
+    /// prompt. The returned logits are therefore bit-for-bit what
+    /// [`Self::forward_embeds_last_logits`] returns for the same input:
+    /// the sink only copies rows the kernel already computed.
+    ///
+    /// `cache` must be empty ([`Ernie45KvCache::is_empty`]) and large
+    /// enough for `positions.len()` tokens; the cache is caller-owned and
+    /// the model keeps no state of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::Inference`] on an empty sequence, a sequence that
+    /// exceeds the cache capacity, a non-empty or shape-mismatched cache,
+    /// or a checked-arithmetic overflow; [`InferenceError::InvalidInput`]
+    /// on an `embeds` length that disagrees with `positions` and the
+    /// config.
+    pub fn kv_prefill(
+        &self,
+        embeds: &[f32],
+        positions: &[[u32; 3]],
+        cache: &mut Ernie45KvCache,
+    ) -> Result<Vec<f32>, InferenceError> {
+        let s = positions.len();
+        if s == 0 {
+            return Err(InferenceError::Inference(
+                "ernie45 kv prefill: empty token sequence".into(),
+            ));
+        }
+        let kv_dim = self.cfg.kv_dim()?;
+        self.check_cache_shape(cache, kv_dim)?;
+        if s > cache.capacity {
+            return Err(InferenceError::Inference(format!(
+                "ernie45 kv prefill: {} prompt tokens exceed the cache capacity {capacity}",
+                s,
+                capacity = cache.capacity
+            )));
+        }
+        if !cache.is_empty() {
+            return Err(InferenceError::Inference(format!(
+                "ernie45 kv prefill: cache already holds {} tokens; prefill requires an empty cache",
+                cache.len()
+            )));
+        }
+        let h = self.cfg.hidden_size;
+        let embed_len = checked_product(s, h, "kv prefill hidden buffer size")?;
+        if embeds.len() != embed_len {
+            return Err(InferenceError::InvalidInput(format!(
+                "ernie45 kv prefill: embeds has {} values; expected {} tokens x {} hidden",
+                embeds.len(),
+                s,
+                h
+            )));
+        }
+        if !embeds.iter().all(|v| v.is_finite()) {
+            return Err(InferenceError::Inference(
+                "ernie45 kv prefill: embeds carry a non-finite value".into(),
+            ));
+        }
+        // Per-layer views of the cache's two row stores; the field borrows
+        // end before `cache.len` is written below. `cap_kv` is one layer's
+        // footprint in elements.
+        let cap_kv = checked_product(cache.capacity, kv_dim, "kv cache per-layer capacity")?;
+        let k_sink = &mut cache.layer_k;
+        let v_sink = &mut cache.layer_v;
+        let core =
+            self.forward_embeds_core(embeds, positions, false, Some((k_sink, v_sink, cap_kv)))?;
+        cache.len = s;
+        Ok(core.logits)
+    }
+
+    /// Decode one token against a prefilled [`Ernie45KvCache`]: append the
+    /// token's post-RoPE key and value rows to the cache, run the decoder
+    /// over that single token with its attention attending over cache rows
+    /// `0..=cache.len()`, and return its logits (`vocab_size` values).
+    ///
+    /// `embeds` is exactly one row of `hidden_size` values (the embedding,
+    /// or spliced projector row, of the new token); `position` is its
+    /// 3-row mrope position, the same triple the uncached path would have
+    /// used for that token. Per layer the arithmetic mirrors
+    /// [`Self::forward_embeds_core`] for a one-token sequence — same
+    /// norm/projection/MLP calls, same exact-exp softmax — except the
+    /// attention reads its keys and values from the cache instead of from
+    /// this call's own projections, which is precisely the KV-cache
+    /// invariant: the cached rows are bit-for-bit the rows the full
+    /// forward would have computed.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::Inference`] on an empty cache (no prefill ran), a
+    /// cache at capacity, a shape-mismatched cache, a non-finite `embeds`,
+    /// or a checked-arithmetic overflow; [`InferenceError::InvalidInput`]
+    /// on an `embeds` length that disagrees with the config (the same
+    /// split [`Self::kv_prefill`] uses).
+    pub fn kv_decode_step(
+        &self,
+        embeds: &[f32],
+        position: [u32; 3],
+        cache: &mut Ernie45KvCache,
+    ) -> Result<Vec<f32>, InferenceError> {
+        let h = self.cfg.hidden_size;
+        let len = cache.len();
+        if len == 0 {
+            return Err(InferenceError::Inference(
+                "ernie45 kv step: cache is empty; run kv_prefill first".into(),
+            ));
+        }
+        if len == cache.capacity {
+            return Err(InferenceError::Inference(format!(
+                "ernie45 kv step: cache is full ({} tokens at capacity {capacity}); the sequence would overflow",
+                len,
+                capacity = cache.capacity
+            )));
+        }
+        let kv_dim = self.cfg.kv_dim()?;
+        self.check_cache_shape(cache, kv_dim)?;
+        if embeds.len() != h {
+            return Err(InferenceError::InvalidInput(format!(
+                "ernie45 kv step: embeds has {} values; expected 1 token x {} hidden",
+                embeds.len(),
+                h
+            )));
+        }
+        if !embeds.iter().all(|v| v.is_finite()) {
+            return Err(InferenceError::Inference(
+                "ernie45 kv step: embeds carry a non-finite value".into(),
+            ));
+        }
+        self.kv_decode_core(embeds, position, cache, kv_dim)
+    }
+
+    /// The cached decode kernel: one token through every layer, attention
+    /// reading keys/values from `cache` rows `0..=cache.len()`.
+    fn kv_decode_core(
+        &self,
+        embeds: &[f32],
+        position: [u32; 3],
+        cache: &mut Ernie45KvCache,
+        kv_dim: usize,
+    ) -> Result<Vec<f32>, InferenceError> {
+        let cfg = &self.cfg;
+        let w = &self.weights;
+        let h = cfg.hidden_size;
+        let len = cache.len();
+        // The caller checked len < capacity, so len + 1 cannot wrap.
+        let keys = len + 1;
+
+        let q_dim = cfg.q_dim()?;
+        let s_q_dim = checked_product(1, q_dim, "kv step query buffer size")?;
+        let s_kv_dim = checked_product(1, kv_dim, "kv step key/value buffer size")?;
+        let s_h = checked_product(1, h, "kv step hidden buffer size")?;
+        let s_intermediate =
+            checked_product(1, cfg.intermediate_size, "kv step intermediate buffer size")?;
+        let s_keys = checked_product(1, keys, "kv step attention score buffer size")?;
+        let keys_hd = checked_product(keys, cfg.head_dim, "kv step key head buffer size")?;
+        let hd_keys = checked_product(cfg.head_dim, keys, "kv step transposed value buffer size")?;
+        let hd = cfg.head_dim;
+
+        let mut x = embeds.to_vec();
+        let (cos, sin) = mrope_cos_sin_table(cfg, &[position]);
+
+        let heads = cfg.num_attention_heads;
+        let kv_heads = cfg.num_key_value_heads;
+        let groups = heads / kv_heads;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let cap_kv = checked_product(cache.capacity, kv_dim, "kv cache per-layer capacity")?;
+
+        let mut normed = vec![0f32; s_h];
+        let mut q = vec![0f32; s_q_dim];
+        let mut k = vec![0f32; s_kv_dim];
+        let mut v = vec![0f32; s_kv_dim];
+        let mut attn_out = vec![0f32; s_q_dim];
+        let mut proj = vec![0f32; s_h];
+        let mut gate = vec![0f32; s_intermediate];
+        let mut up = vec![0f32; s_intermediate];
+        let mut scores = vec![0f32; s_keys];
+        let mut q_h = vec![0f32; hd];
+        let mut k_h = vec![0f32; keys_hd];
+        let mut v_t = vec![0f32; hd_keys];
+        let mut out_h = vec![0f32; hd];
+
+        for (layer_idx, layer) in w.layers.iter().enumerate() {
+            // Attention block: same norm/projection/RoPE calls as
+            // `forward_embeds_core` at s == 1.
+            normed.copy_from_slice(&x);
+            rms_norm(&mut normed, &layer.input_layernorm, h, cfg.rms_norm_eps);
+            matmul_bt(&normed, &layer.q_proj, &mut q, 1, h, q_dim);
+            matmul_bt(&normed, &layer.k_proj, &mut k, 1, h, kv_dim);
+            matmul_bt(&normed, &layer.v_proj, &mut v, 1, h, kv_dim);
+            gemma4_apply_rope(&mut q, &cos, &sin, 1, heads, hd);
+            gemma4_apply_rope(&mut k, &cos, &sin, 1, kv_heads, hd);
+
+            // Append this token's rows to the cache at row `len`, in the
+            // same `[token, kv_head, head_dim]` layout the kernel's own
+            // `k` / `v` buffers use.
+            let row_base = checked_product(
+                checked_product(layer_idx, cache.capacity, "kv cache layer offset")?,
+                kv_dim,
+                "kv cache row offset",
+            )? + checked_product(len, kv_dim, "kv cache row offset")?;
+            cache.layer_k[row_base..row_base + kv_dim].copy_from_slice(&k);
+            cache.layer_v[row_base..row_base + kv_dim].copy_from_slice(&v);
+
+            // Causal GQA attention over the cached keys. Every cached key
+            // is at or before this token's position, so there is no
+            // masking row to zero (the uncached path's `row[tq + 1..]`
+            // tail). The exact `f32::exp` softmax and the one-KV-head-at-a-
+            // time `k_h` / `v_t` scratch copies are the prefill kernel's.
+            let layer_k = &cache.layer_k[layer_idx * cap_kv..][..keys * kv_dim];
+            let layer_v = &cache.layer_v[layer_idx * cap_kv..][..keys * kv_dim];
+            for kvh in 0..kv_heads {
+                for tk in 0..keys {
+                    let k_row = &layer_k[tk * kv_dim + kvh * hd..][..hd];
+                    k_h[tk * hd..(tk + 1) * hd].copy_from_slice(k_row);
+                    for d in 0..hd {
+                        v_t[d * keys + tk] = layer_v[tk * kv_dim + kvh * hd + d];
+                    }
+                }
+                for qh in kvh * groups..(kvh + 1) * groups {
+                    let q_row = &q[qh * hd..(qh + 1) * hd];
+                    q_h.copy_from_slice(q_row);
+                    matmul_bt(&q_h, &k_h, &mut scores, 1, hd, keys);
+                    for score in &mut scores[..keys] {
+                        *score *= scale;
+                    }
+                    softmax_row_fail_closed(&mut scores[..keys]);
+                    matmul_bt(&scores, &v_t, &mut out_h, 1, keys, hd);
+                    attn_out[qh * hd..(qh + 1) * hd].copy_from_slice(&out_h);
+                }
+            }
+            matmul_bt(&attn_out, &layer.o_proj, &mut proj, 1, q_dim, h);
+            for (xi, pi) in x.iter_mut().zip(proj.iter()) {
+                *xi += pi;
+            }
+
+            // MLP block: identical calls to `forward_embeds_core` at s == 1.
+            normed.copy_from_slice(&x);
+            rms_norm(
+                &mut normed,
+                &layer.post_attention_layernorm,
+                h,
+                cfg.rms_norm_eps,
+            );
+            matmul_bt(
+                &normed,
+                &layer.gate_proj,
+                &mut gate,
+                1,
+                h,
+                cfg.intermediate_size,
+            );
+            matmul_bt(
+                &normed,
+                &layer.up_proj,
+                &mut up,
+                1,
+                h,
+                cfg.intermediate_size,
+            );
+            silu_inplace(&mut gate);
+            for (g, &u) in gate.iter_mut().zip(up.iter()) {
+                *g *= u;
+            }
+            matmul_bt(
+                &gate,
+                &layer.down_proj,
+                &mut proj,
+                1,
+                cfg.intermediate_size,
+                h,
+            );
+            for (xi, pi) in x.iter_mut().zip(proj.iter()) {
+                *xi += pi;
+            }
+        }
+
+        let mut final_normed = x;
+        rms_norm(&mut final_normed, &w.final_norm, h, cfg.rms_norm_eps);
+        let mut logits = vec![0f32; cfg.vocab_size];
+        matmul_bt(&final_normed, &w.lm_head, &mut logits, 1, h, cfg.vocab_size);
+        cache.len = len + 1;
+        Ok(logits)
+    }
+
+    /// Fail-closed cache/model shape check, run before any allocation: a
+    /// cache built from a different checkpoint layout would index the
+    /// layer buffers at wrong offsets.
+    fn check_cache_shape(
+        &self,
+        cache: &Ernie45KvCache,
+        kv_dim: usize,
+    ) -> Result<(), InferenceError> {
+        if cache.layers != self.cfg.num_hidden_layers || cache.kv_dim != kv_dim {
+            return Err(InferenceError::Inference(format!(
+                "ernie45 kv: cache was built for {} layers x kv_dim {}, this model has {} layers x kv_dim {}",
+                cache.layers, cache.kv_dim, self.cfg.num_hidden_layers, kv_dim
+            )));
+        }
+        Ok(())
     }
 
     /// Shared body of [`Self::forward_embeds_trace`] and
@@ -659,11 +975,21 @@ impl Ernie45Model {
     /// per-layer `layer_outputs` clone, and applies `lm_head` to the last
     /// row only, allocating a `vocab`-length `logits` buffer instead of
     /// `seq_len * vocab`.
+    ///
+    /// `kv_sink`, when `Some`, is `(&mut layer_k, &mut layer_v, cap_kv)`:
+    /// the caller cache's per-layer key and value row stores, each
+    /// `[layers * cap_kv]` with `cap_kv = capacity * kv_dim`, and `cap_kv`
+    /// the element stride between layers. After each layer's post-RoPE
+    /// `k` / `v` buffers are produced, every token's row is copied into
+    /// both stores at row `token` — the pure-memcpy side effect of
+    /// [`Self::kv_prefill`]. `None` (the uncached paths) skips it, so the
+    /// no-cache forward is bit-for-bit the pre-sink kernel.
     fn forward_embeds_core(
         &self,
         embeds: &[f32],
         positions: &[[u32; 3]],
         keep_trace: bool,
+        mut kv_sink: Option<(&mut Vec<f32>, &mut Vec<f32>, usize)>,
     ) -> Result<Ernie45CoreOut, InferenceError> {
         let cfg = &self.cfg;
         let w = &self.weights;
@@ -741,7 +1067,7 @@ impl Ernie45Model {
         let mut v_t = vec![0f32; hd_s];
         let mut out_h = vec![0f32; s_hd];
 
-        for layer in &w.layers {
+        for (layer_idx, layer) in w.layers.iter().enumerate() {
             // Attention block.
             normed.copy_from_slice(&x);
             rms_norm(&mut normed, &layer.input_layernorm, h, cfg.rms_norm_eps);
@@ -750,6 +1076,16 @@ impl Ernie45Model {
             matmul_bt(&normed, &layer.v_proj, &mut v, s, h, kv_dim);
             gemma4_apply_rope(&mut q, &cos, &sin, s, heads, hd);
             gemma4_apply_rope(&mut k, &cos, &sin, s, kv_heads, hd);
+
+            if let Some((k_sink, v_sink, cap_kv)) = kv_sink.as_mut() {
+                let layer_base = checked_product(layer_idx, *cap_kv, "kv cache layer offset")?;
+                let (k_chunks, v_chunks) = (k.chunks_exact(kv_dim), v.chunks_exact(kv_dim));
+                for (tk, (k_row, v_row)) in k_chunks.zip(v_chunks).enumerate() {
+                    let dst = layer_base + tk * kv_dim;
+                    k_sink[dst..dst + kv_dim].copy_from_slice(k_row);
+                    v_sink[dst..dst + kv_dim].copy_from_slice(v_row);
+                }
+            }
 
             // Causal GQA attention, batched through GEMM one KV head at a time. The softmax is
             // exact `f32::exp` deliberately (mirroring `gemma4_model.rs`'s
@@ -873,6 +1209,121 @@ struct Ernie45CoreOut {
     layer_outputs: Vec<Vec<f32>>,
     final_norm: Vec<f32>,
     logits: Vec<f32>,
+}
+
+/// Caller-owned KV cache for the ERNIE-4.5 decoder's cached decode:
+/// `kv_prefill` fills it with the prompt's post-RoPE keys and values, and
+/// `kv_decode_step` appends one row per step.
+///
+/// Layout: per layer, the post-RoPE key rows and value rows for tokens
+/// `0..len`, each row `[kv_head, head_dim]` — the exact layout the
+/// uncached kernel's per-layer `k` / `v` buffers use, so the attention
+/// code reads cached rows with the same indexing and no second layout.
+/// The two stores are pre-allocated for `capacity` tokens in
+/// [`Self::new`]; nothing here allocates on the decode hot path.
+///
+/// The cache is opaque and explicit — [`Ernie45Model`] keeps no hidden
+/// state, and every entry point re-validates the cache's shape before
+/// touching it (a cache built for a different checkpoint layout is
+/// rejected rather than indexed at wrong offsets).
+///
+/// Why a type of its own rather than
+/// [`FlatKVCache`][crate::kv_cache::flat::FlatKVCache]: that cache stores
+/// f16 and dequantises on read, which is the right trade where memory is
+/// the constraint, but it cannot carry this decoder's contract — the
+/// cached rows must be *bit-for-bit* the rows the uncached forward
+/// computed, which is what
+/// [`Ernie45Model::kv_prefill`]'s equality with
+/// [`Ernie45Model::forward_embeds_last_logits`] rests on. Storing f32
+/// keeps that equality exact. `model/gemma4_cache.rs` holds its own f32
+/// cache for the same reason.
+pub struct Ernie45KvCache {
+    layers: usize,
+    capacity: usize,
+    kv_dim: usize,
+    /// Number of tokens currently stored (`0..=capacity`).
+    len: usize,
+    /// Post-RoPE key rows, `[layers * capacity * kv_dim]`.
+    layer_k: Vec<f32>,
+    /// Value rows, `[layers * capacity * kv_dim]`.
+    layer_v: Vec<f32>,
+}
+
+impl Ernie45KvCache {
+    /// Allocate an empty cache for `num_hidden_layers` layers, each row of
+    /// `kv_dim` values (the model's `num_key_value_heads * head_dim`),
+    /// holding up to `capacity` tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::Inference`] on zero dimensions or a
+    /// checked-arithmetic overflow; the OS returning no memory for the
+    /// allocation.
+    pub fn new(
+        num_hidden_layers: usize,
+        kv_dim: usize,
+        capacity: usize,
+    ) -> Result<Self, InferenceError> {
+        for (name, value) in [
+            ("num_hidden_layers", num_hidden_layers),
+            ("kv_dim", kv_dim),
+            ("capacity", capacity),
+        ] {
+            if value == 0 {
+                return Err(InferenceError::Inference(format!(
+                    "ernie45 kv cache: {name} must be positive, got 0"
+                )));
+            }
+        }
+        let per_layer = checked_product(
+            checked_product(num_hidden_layers, capacity, "kv cache token capacity")?,
+            kv_dim,
+            "kv cache row store",
+        )?;
+        let mut layer_k = Vec::new();
+        let mut layer_v = Vec::new();
+        layer_k
+            .try_reserve_exact(per_layer)
+            .map_err(|error| reserve_error("kv cache key rows", error))?;
+        layer_k.resize(per_layer, 0.0);
+        layer_v
+            .try_reserve_exact(per_layer)
+            .map_err(|error| reserve_error("kv cache value rows", error))?;
+        layer_v.resize(per_layer, 0.0);
+        Ok(Self {
+            layers: num_hidden_layers,
+            capacity,
+            kv_dim,
+            len: 0,
+            layer_k,
+            layer_v,
+        })
+    }
+
+    /// Tokens currently stored, `0..=capacity`.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no token has been stored yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The token count this cache was allocated for.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// The decoder layer count this cache was built for.
+    pub fn layers(&self) -> usize {
+        self.layers
+    }
+
+    /// Per-token key/value projection width this cache was built for.
+    pub fn kv_dim(&self) -> usize {
+        self.kv_dim
+    }
 }
 
 #[cfg(test)]
@@ -1413,5 +1864,585 @@ mod tests {
         assert!(
             matches!(result, Err(InferenceError::Inference(message)) if message.contains("non-finite"))
         );
+    }
+
+    // -- kv_prefill / kv_decode_step: the cached decode path --
+    //
+    // The sink copies post-RoPE k/v rows the kernel already computed, and
+    // the step kernel mirrors the full forward at s == 1, so the cached
+    // path must be bit-for-bit the uncached one — assert_eq, no tolerance.
+
+    fn kv_test_cache(model: &Ernie45Model, capacity: usize) -> Ernie45KvCache {
+        let cfg = model.config();
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        Ernie45KvCache::new(cfg.num_hidden_layers, kv_dim, capacity).unwrap()
+    }
+
+    /// The prefill's returned logits are the full forward's last row —
+    /// the sink is a pure copy side effect, so the two must agree exactly,
+    /// at a multi-row sequence length.
+    #[test]
+    fn kv_prefill_last_logits_bit_exact_vs_uncached() {
+        let (cfg, model) = equiv_model();
+        let s = 5usize;
+        let embeds = pseudo_random_vec(s * cfg.hidden_size, 333);
+        let positions: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        let uncached = model
+            .forward_embeds_last_logits(&embeds, &positions)
+            .unwrap();
+        let mut cache = kv_test_cache(&model, s);
+        let cached = model.kv_prefill(&embeds, &positions, &mut cache).unwrap();
+        assert_eq!(cache.len(), s);
+        assert_eq!(cached, uncached);
+    }
+
+    /// The cached decode loop (prefill + one step per token) must match
+    /// the uncached re-forward loop: the prefill's logits bit-for-bit
+    /// (identical code path), every step's logits within a quoted
+    /// measured bound — see the comparison block below for why exactness
+    /// is unavailable for the steps — and the prompt's cached rows
+    /// untouched by the stepping.
+    #[test]
+    fn kv_cached_decode_sequence_matches_uncached() {
+        let (cfg, model) = equiv_model();
+        let s = 3usize;
+        let steps = 2usize;
+        let embeds = pseudo_random_vec((s + steps) * cfg.hidden_size, 444);
+        let positions: Vec<[u32; 3]> = (0..(s + steps) as u32).map(|i| [i, i, i]).collect();
+
+        // Uncached reference: prefill slice + one re-forward per step.
+        let ref_prefill = model
+            .forward_embeds_last_logits(&embeds[..s * cfg.hidden_size], &positions[..s])
+            .unwrap();
+        let mut ref_step_logits: Vec<Vec<f32>> = Vec::new();
+        for t in 0..steps {
+            let n = s + t + 1;
+            ref_step_logits.push(
+                model
+                    .forward_embeds_last_logits(&embeds[..n * cfg.hidden_size], &positions[..n])
+                    .unwrap(),
+            );
+        }
+
+        // Cached path: one prefill, then one token at a time.
+        let mut cache = kv_test_cache(&model, s + steps);
+        let cached_prefill = model
+            .kv_prefill(&embeds[..s * cfg.hidden_size], &positions[..s], &mut cache)
+            .unwrap();
+        // Snapshot the prompt rows before any step mutates the cache.
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        // The layout is `[layer][capacity][kv_dim]` — the layer stride is
+        // `capacity * kv_dim`, not `kv_dim`.
+        let layer_stride = cache.capacity() * kv_dim;
+        let snapshot_rows = |cache: &Ernie45KvCache, rows: usize| -> (Vec<f32>, Vec<f32>) {
+            let mut k = Vec::new();
+            let mut v = Vec::new();
+            for layer in 0..cfg.num_hidden_layers {
+                let base = layer * layer_stride;
+                k.extend_from_slice(&cache.layer_k[base..base + rows * kv_dim]);
+                v.extend_from_slice(&cache.layer_v[base..base + rows * kv_dim]);
+            }
+            (k, v)
+        };
+        let (prompt_k, prompt_v) = snapshot_rows(&cache, s);
+        let mut cached_step_logits: Vec<Vec<f32>> = Vec::new();
+        for t in 0..steps {
+            let n = s + t;
+            let row = &embeds[n * cfg.hidden_size..(n + 1) * cfg.hidden_size];
+            // The step attends over `cache.len() + 1` keys; printed so the
+            // comment below about the two paths' GEMM shapes is read off a
+            // run rather than taken on trust.
+            println!("kv step {t}: keys = {}", cache.len() + 1);
+            cached_step_logits.push(model.kv_decode_step(row, positions[n], &mut cache).unwrap());
+        }
+
+        assert_eq!(cached_prefill, ref_prefill);
+        assert_eq!(cache.len(), s + steps);
+        // Every step gets the tolerance, step 0 included. The two paths'
+        // GEMMs differ only in `m`: for the last row the cached path calls
+        // `matmul_bt(q, K, scores, 1, hd, keys)` and `matmul_bt(scores,
+        // V^T, out, 1, keys, hd)`, while the uncached path calls the same
+        // two with `m = seq_len` and reads the last output row. `k` and
+        // `n` agree — `keys == seq_len` at every step — so the difference
+        // is purely which BLAS kernel Accelerate picks for a 1-row versus
+        // an m-row call, and how it orders the accumulation. Nothing about
+        // that varies between step 0 and step 1: an earlier version of
+        // this test asserted step 0 bit-for-bit on the stated grounds that
+        // its attention had `keys == 1`, which is false — after a
+        // 3-token prefill step 0 runs with `keys == 4` (printed below).
+        // It passed, but on coincidence, so it was a flake waiting for a
+        // different machine or a different Accelerate build.
+        //
+        // The bound is what the equality is actually worth. Measured on
+        // this seeded model (dev profile, 2026-09-03, this machine):
+        // worst |diff| 9.54e-7. The bound allows ~1000x headroom over
+        // that, and is still orders of magnitude below the smallest
+        // greedy top-1/top-2 margin this codebase gates on (3.78, e2e
+        // fixture), so it cannot hide a decision change. It is not a
+        // weak check for the failures that matter: a structural error
+        // (wrong cache offset, wrong head mapping, wrong position row)
+        // moves logits by O(1), which this catches by three orders of
+        // magnitude, and the prefill assert above is still exact.
+        const STEP_LOGIT_MAX_DIFF: f32 = 1e-3;
+        for (t, (cached, ref_row)) in cached_step_logits
+            .iter()
+            .zip(ref_step_logits.iter())
+            .enumerate()
+        {
+            let worst = cached
+                .iter()
+                .zip(ref_row.iter())
+                .map(|(a, b)| (*a - *b).abs())
+                .fold(0f32, f32::max);
+            println!("kv step {t} worst |diff| vs uncached: {worst:e}");
+            assert!(
+                worst <= STEP_LOGIT_MAX_DIFF,
+                "step {t} worst |diff| {worst:e} exceeds the measured bound {STEP_LOGIT_MAX_DIFF:e}"
+            );
+        }
+
+        // Cache row invariant: the steps only append — every prompt row
+        // written by the prefill is untouched afterward (bit-for-bit).
+        let (cached_k, cached_v) = snapshot_rows(&cache, s);
+        assert_eq!(
+            cached_k, prompt_k,
+            "prompt key rows disturbed after stepping"
+        );
+        assert_eq!(
+            cached_v, prompt_v,
+            "prompt value rows disturbed after stepping"
+        );
+    }
+
+    /// Disagreed mrope rows (the vision-block layout, where a token's
+    /// three position rows differ from each other) must round-trip
+    /// through the cache: a step's RoPE tables come from the step's own
+    /// triple, not the prompt's.
+    ///
+    /// Two arms, because the matching arm alone proves nothing about what
+    /// this test is named for — it would still pass if the step ignored
+    /// its position argument and the reference happened to agree. The
+    /// second arm feeds the step a *wrong* triple (the prompt's last
+    /// token) and requires the result to move far more than the
+    /// reduction-order bound, so a step that dropped its own position
+    /// would redden this test rather than sail through it.
+    #[test]
+    fn kv_decode_step_uses_its_own_mrope_position_rows() {
+        let (cfg, model) = equiv_model();
+        let s = 2usize;
+        let prompt_embeds = pseudo_random_vec(s * cfg.hidden_size, 555);
+        let prompt_positions = [[0u32, 2, 5], [1, 4, 7]];
+        let step_embeds = pseudo_random_vec(cfg.hidden_size, 666);
+        let step_position = [9u32, 11, 13];
+
+        let mut all_embeds = prompt_embeds.clone();
+        all_embeds.extend_from_slice(&step_embeds);
+        let ref_logit = model
+            .forward_embeds_last_logits(
+                &all_embeds,
+                &[prompt_positions[0], prompt_positions[1], step_position],
+            )
+            .unwrap();
+
+        // Both arms are measured against one bound, `MRope_TOL`, so they
+        // bracket: arm 1 must land inside it and arm 2 outside, which is
+        // only possible if the step actually reads its position argument.
+        // The bound is 1e-4 — 100x above the reduction-order noise the
+        // sequence test measured for a step (9.5e-7, and 0 for this one),
+        // and 20x below the arm-2 gap measured here (2.06e-3, 2026-09-03,
+        // this machine). A step that ignored its own triple and reused
+        // the prompt's would put arm 2 at the noise floor, three orders
+        // of magnitude the wrong side of the bound.
+        const MROPE_TOL: f32 = 1e-4;
+
+        // Arm 1: the step's own triple reproduces the uncached forward.
+        // Not asserted bit-for-bit: the GEMMs differ in `m`; see
+        // `kv_cached_decode_sequence_matches_uncached`.
+        let mut cache = kv_test_cache(&model, s + 1);
+        model
+            .kv_prefill(&prompt_embeds, &prompt_positions, &mut cache)
+            .unwrap();
+        let cached_logit = model
+            .kv_decode_step(&step_embeds, step_position, &mut cache)
+            .unwrap();
+        let worst = cached_logit
+            .iter()
+            .zip(ref_logit.iter())
+            .map(|(a, b)| (*a - *b).abs())
+            .fold(0f32, f32::max);
+        assert!(
+            worst <= MROPE_TOL,
+            "step with its own mrope triple diverged by {worst:e} from the uncached forward"
+        );
+
+        // Arm 2: the same step with the wrong triple must land outside
+        // the bound arm 1 passed under. The comparison is against arm 1's
+        // own result, not against `ref_logit`: a step that ignored its
+        // `position` argument entirely would return the *same* value for
+        // both triples, which is a gap of exactly zero here, but would
+        // still sit far from `ref_logit` and so would sail past a
+        // gap-vs-reference form of this arm.
+        let mut wrong_cache = kv_test_cache(&model, s + 1);
+        model
+            .kv_prefill(&prompt_embeds, &prompt_positions, &mut wrong_cache)
+            .unwrap();
+        let wrong_logit = model
+            .kv_decode_step(&step_embeds, prompt_positions[s - 1], &mut wrong_cache)
+            .unwrap();
+        let gap = wrong_logit
+            .iter()
+            .zip(cached_logit.iter())
+            .map(|(a, b)| (*a - *b).abs())
+            .fold(0f32, f32::max);
+        println!("mrope arm 1 worst |diff| {worst:e}, arm 2 (wrong triple) gap {gap:e}");
+        assert!(
+            gap > MROPE_TOL,
+            "stepping with the prompt's triple instead of the step's own moved the logits by \
+             only {gap:e}: this test cannot see the defect it is named for"
+        );
+        let _ = cfg;
+    }
+
+    #[test]
+    fn kv_prefill_rejects_empty_sequence() {
+        let (_cfg, model) = equiv_model();
+        let mut cache = kv_test_cache(&model, 4);
+        let result = model.kv_prefill(&[], &[], &mut cache);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("empty token sequence")
+        ));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn kv_prefill_rejects_over_capacity_before_filling() {
+        let (cfg, model) = equiv_model();
+        let mut cache = kv_test_cache(&model, 3);
+        let s = 4usize;
+        let embeds = pseudo_random_vec(s * cfg.hidden_size, 777);
+        let positions: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        let result = model.kv_prefill(&embeds, &positions, &mut cache);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("exceed the cache capacity")
+        ));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn kv_prefill_rejects_non_empty_cache() {
+        let (cfg, model) = equiv_model();
+        let s = 2usize;
+        let mut cache = kv_test_cache(&model, 4);
+        let fill = pseudo_random_vec(s * cfg.hidden_size, 888);
+        let fill_pos: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        model.kv_prefill(&fill, &fill_pos, &mut cache).unwrap();
+        let result = model.kv_prefill(&fill, &fill_pos, &mut cache);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("already holds")
+        ));
+        assert_eq!(cache.len(), s);
+    }
+
+    #[test]
+    fn kv_prefill_rejects_wrong_embeds_length() {
+        let (cfg, model) = equiv_model();
+        let mut cache = kv_test_cache(&model, 4);
+        let positions: Vec<[u32; 3]> = (0..3u32).map(|i| [i, i, i]).collect();
+        // 3 positions but only 2 rows of embeds.
+        let embeds = pseudo_random_vec(2 * cfg.hidden_size, 999);
+        let result = model.kv_prefill(&embeds, &positions, &mut cache);
+        assert!(matches!(result, Err(InferenceError::InvalidInput(_))));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn kv_prefill_rejects_non_finite_embeds() {
+        let (cfg, model) = equiv_model();
+        let mut cache = kv_test_cache(&model, 4);
+        let mut embeds = pseudo_random_vec(2 * cfg.hidden_size, 1010);
+        embeds[0] = f32::NAN;
+        let positions = [[0u32, 0, 0], [1, 1, 1]];
+        let result = model.kv_prefill(&embeds, &positions, &mut cache);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("non-finite")
+        ));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn kv_decode_step_rejects_empty_cache() {
+        let (cfg, model) = equiv_model();
+        let mut cache = kv_test_cache(&model, 4);
+        let embed = pseudo_random_vec(cfg.hidden_size, 1111);
+        let result = model.kv_decode_step(&embed, [0, 0, 0], &mut cache);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("cache is empty")
+        ));
+    }
+
+    #[test]
+    fn kv_decode_step_rejects_full_cache() {
+        let (cfg, model) = equiv_model();
+        let s = 2usize;
+        let mut cache = kv_test_cache(&model, s);
+        let embeds = pseudo_random_vec(s * cfg.hidden_size, 1212);
+        let positions: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        model.kv_prefill(&embeds, &positions, &mut cache).unwrap();
+        let embed = pseudo_random_vec(cfg.hidden_size, 1313);
+        let result = model.kv_decode_step(&embed, [s as u32, s as u32, s as u32], &mut cache);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("cache is full")
+        ));
+        assert_eq!(cache.len(), s);
+    }
+
+    #[test]
+    fn kv_entries_reject_mismatched_cache_shape() {
+        let (cfg, model) = equiv_model();
+        // A cache for a different layer count.
+        let mut foreign_layers = Ernie45KvCache::new(
+            cfg.num_hidden_layers + 1,
+            cfg.num_key_value_heads * cfg.head_dim,
+            4,
+        )
+        .unwrap();
+        let s = 2usize;
+        let embeds = pseudo_random_vec(s * cfg.hidden_size, 1414);
+        let positions: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        let result = model.kv_prefill(&embeds, &positions, &mut foreign_layers);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("built for")
+        ));
+        // Same layer count, wrong kv_dim.
+        let mut narrow = Ernie45KvCache::new(cfg.num_hidden_layers, cfg.head_dim, 4).unwrap();
+        let result = model.kv_prefill(&embeds, &positions, &mut narrow);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("built for")
+        ));
+        // The step path checks the shape too: a non-empty cache with the
+        // right layer count but the wrong kv_dim must be rejected, not
+        // indexed at wrong offsets.
+        let mut nonempty_wrong_kv =
+            Ernie45KvCache::new(cfg.num_hidden_layers, cfg.head_dim, 4).unwrap();
+        nonempty_wrong_kv.len = 1;
+        let embed = pseudo_random_vec(cfg.hidden_size, 1416);
+        let result = model.kv_decode_step(&embed, [0, 0, 0], &mut nonempty_wrong_kv);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("built for")
+        ));
+    }
+
+    #[test]
+    fn kv_decode_step_rejects_wrong_embeds_length() {
+        let (cfg, model) = equiv_model();
+        let s = 2usize;
+        let mut cache = kv_test_cache(&model, 4);
+        let embeds = pseudo_random_vec(s * cfg.hidden_size, 1515);
+        let positions: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        model.kv_prefill(&embeds, &positions, &mut cache).unwrap();
+        let short = pseudo_random_vec(cfg.hidden_size - 1, 1616);
+        let result = model.kv_decode_step(&short, [2, 2, 2], &mut cache);
+        assert!(matches!(result, Err(InferenceError::InvalidInput(_))));
+        assert_eq!(cache.len(), s);
+    }
+
+    #[test]
+    fn kv_decode_step_rejects_non_finite_embeds() {
+        let (cfg, model) = equiv_model();
+        let s = 2usize;
+        let mut cache = kv_test_cache(&model, 4);
+        let embeds = pseudo_random_vec(s * cfg.hidden_size, 1717);
+        let positions: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        model.kv_prefill(&embeds, &positions, &mut cache).unwrap();
+        let mut bad = pseudo_random_vec(cfg.hidden_size, 1818);
+        bad[0] = f32::INFINITY;
+        let result = model.kv_decode_step(&bad, [2, 2, 2], &mut cache);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("non-finite")
+        ));
+        assert_eq!(cache.len(), s);
+    }
+
+    /// The issue's acceptance test at the decoder level, on the committed
+    /// fixture's token sequences: the greedy token sequence produced with
+    /// the KV cache (prefill once, then one step per token) must equal
+    /// the sequence produced by the uncached re-forward loop. Embedding
+    /// rows come from the model's own `embed_tokens`, positions continue
+    /// the plain `arange` — the text-only reduction the whole module is
+    /// built on.
+    #[test]
+    fn kv_greedy_sequence_matches_uncached_on_committed_fixture() {
+        let cfg = Ernie45Config::from_config_json_str(
+            r#"{"hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 18,
+                "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 128,
+                "vocab_size": 103424, "rms_norm_eps": 1e-5, "rope_theta": 500000.0,
+                "rope_scaling": {"mrope_section": [16, 24, 24]},
+                "tie_word_embeddings": false, "use_bias": false}"#,
+        )
+        .unwrap();
+        let mut seed = 0x51ed_c0de_a11c_e5b0_u64;
+        let mut next = |len: usize| -> Vec<f32> {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            pseudo_random_vec(len, seed)
+        };
+        let h = cfg.hidden_size;
+        let weights = Ernie45Weights {
+            embed_tokens: next(cfg.vocab_size * h),
+            layers: (0..cfg.num_hidden_layers)
+                .map(|_| Ernie45LayerWeights {
+                    q_proj: next(cfg.num_attention_heads * cfg.head_dim * h),
+                    k_proj: next(cfg.num_key_value_heads * cfg.head_dim * h),
+                    v_proj: next(cfg.num_key_value_heads * cfg.head_dim * h),
+                    o_proj: next(h * cfg.num_attention_heads * cfg.head_dim),
+                    gate_proj: next(cfg.intermediate_size * h),
+                    up_proj: next(cfg.intermediate_size * h),
+                    down_proj: next(h * cfg.intermediate_size),
+                    input_layernorm: next(h).into_iter().map(|v| v + 1.5).collect(),
+                    post_attention_layernorm: next(h).into_iter().map(|v| v + 1.5).collect(),
+                })
+                .collect(),
+            final_norm: next(h).into_iter().map(|v| v + 1.5).collect(),
+            lm_head: next(cfg.vocab_size * h),
+        };
+        let model = Ernie45Model::new(cfg, weights).unwrap();
+        let embeds = model.embed_tokens();
+
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/paddleocr_vl/decoder/decoder_goldens.json");
+        let golden: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        let cases: Vec<Vec<u32>> = golden
+            .get("cases")
+            .and_then(|c| c.as_array())
+            .unwrap()
+            .iter()
+            .map(|c| {
+                c["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| i.as_u64().unwrap() as u32)
+                    .collect()
+            })
+            .collect();
+        assert!(cases.len() >= 4, "fixture shrank to {} cases", cases.len());
+
+        for (case_idx, ids) in cases.iter().enumerate() {
+            let prompt_len = ids.len();
+            let max_new_tokens = 4usize;
+            let prompt_embeds: Vec<f32> = ids
+                .iter()
+                .flat_map(|&id| embeds[id as usize * h..][..h].iter().copied())
+                .collect();
+            let prompt_positions: Vec<[u32; 3]> =
+                (0..prompt_len as u32).map(|i| [i, i, i]).collect();
+
+            // Uncached reference loop: re-forward the whole sequence.
+            let mut ref_embeds = prompt_embeds.clone();
+            let mut ref_positions = prompt_positions.clone();
+            let mut ref_logits = model
+                .forward_embeds_last_logits(&ref_embeds, &ref_positions)
+                .unwrap();
+            let mut ref_greedy: Vec<u32> = Vec::new();
+            for _ in 0..max_new_tokens {
+                let next = ref_logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i as u32)
+                    .unwrap();
+                ref_greedy.push(next);
+                if next == 2 {
+                    break;
+                }
+                let p = ref_positions
+                    .iter()
+                    .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]))
+                    + 1;
+                ref_embeds.extend_from_slice(&embeds[next as usize * h..][..h]);
+                ref_positions.push([p, p, p]);
+                ref_logits = model
+                    .forward_embeds_last_logits(&ref_embeds, &ref_positions)
+                    .unwrap();
+            }
+
+            // Cached loop: one prefill, then one step per token.
+            let kv_dim = model.config().num_key_value_heads * model.config().head_dim;
+            let mut cache = Ernie45KvCache::new(
+                model.config().num_hidden_layers,
+                kv_dim,
+                prompt_len + max_new_tokens,
+            )
+            .unwrap();
+            let mut max_pos = prompt_positions
+                .iter()
+                .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]));
+            let mut cached_logits = model
+                .kv_prefill(&prompt_embeds, &prompt_positions, &mut cache)
+                .unwrap();
+            let mut cached_greedy: Vec<u32> = Vec::new();
+            for _ in 0..max_new_tokens {
+                let next = cached_logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.total_cmp(b.1))
+                    .map(|(i, _)| i as u32)
+                    .unwrap();
+                cached_greedy.push(next);
+                if next == 2 {
+                    break;
+                }
+                max_pos += 1;
+                let position = [max_pos, max_pos, max_pos];
+                let row = &embeds[next as usize * h..][..h];
+                cached_logits = model.kv_decode_step(row, position, &mut cache).unwrap();
+            }
+
+            assert_eq!(
+                cached_greedy,
+                ref_greedy,
+                "case {case_idx}: greedy token sequence diverges ({} tokens)",
+                ref_greedy.len()
+            );
+        }
+    }
+
+    #[test]
+    fn kv_cache_new_rejects_zero_dimensions_and_overflow() {
+        assert!(Ernie45KvCache::new(0, 8, 4).is_err());
+        assert!(Ernie45KvCache::new(2, 0, 4).is_err());
+        assert!(Ernie45KvCache::new(2, 8, 0).is_err());
+        let result = Ernie45KvCache::new(4, 8, usize::MAX);
+        assert!(matches!(
+            result,
+            Err(InferenceError::Inference(message))
+                if message.contains("overflow")
+        ));
+        let cache = Ernie45KvCache::new(2, 8, 4).unwrap();
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.capacity(), 4);
+        assert_eq!(cache.layers(), 2);
+        assert_eq!(cache.kv_dim(), 8);
     }
 }
