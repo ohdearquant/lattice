@@ -903,7 +903,12 @@ jobs:
           # assertion passed; a run that skipped prints neither. The counts pin the fixture sets
           # (three synthetic grids, one image) so a silently shrunk fixture cannot pass as a run.
           test "$(grep -c '^case g[0-9]*x[0-9]*: grid [0-9]*x[0-9]* ([0-9]* patches) all checkpoints within tolerance' paddleocr-gates.log)" -eq 3
-          grep -q '^paddleocr_vl_e2e: prefill .* greedy exact 24 of 24$' paddleocr-gates.log
+          # The trailing `cached == uncached` is load-bearing, not decoration: it is
+          # the last thing the end-to-end test prints, and only after the KV-cached
+          # greedy loop has been re-run uncached and the two token sequences compared.
+          # Anchoring on it means a build whose cached/uncached comparison was removed
+          # or short-circuited fails this gate instead of passing on the older line.
+          grep -q '^paddleocr_vl_e2e: prefill .* greedy exact 24 of 24, cached == uncached$' paddleocr-gates.log
 
   # The QuaRot converter and its refuse-on-fail forward-equivalence check are
   # pure f64 CPU work. Generating the 0.62 GB artifact on the macOS runner held
