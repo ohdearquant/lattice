@@ -2295,10 +2295,21 @@ mod tests {
     /// rows come from the model's own `embed_tokens`, positions continue
     /// the plain `arange` — the text-only reduction the whole module is
     /// built on.
+    ///
+    /// The layer count is the one shape here that is NOT production-sized, and
+    /// it is the only one that can be cut without weakening the test: the cache
+    /// is indexed per layer, so four layers exercise the same offset arithmetic
+    /// eighteen do, while every shape the kernels actually compute against --
+    /// `hidden_size`, `intermediate_size`, `head_dim`, and the 2/16 KV-to-query
+    /// head ratio -- stays exactly as the checkpoint ships it. `vocab_size` is
+    /// pinned by the committed fixture, whose token ids are real tokenizer
+    /// output and index straight into `embed_tokens`. Measured on this test:
+    /// eighteen layers cost 1.45 GiB peak RSS and 12.1s in an ordinary
+    /// `cargo test` run, of which the extra fourteen layers are 0.79 GiB.
     #[test]
     fn kv_greedy_sequence_matches_uncached_on_committed_fixture() {
         let cfg = Ernie45Config::from_config_json_str(
-            r#"{"hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 18,
+            r#"{"hidden_size": 1024, "intermediate_size": 3072, "num_hidden_layers": 4,
                 "num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 128,
                 "vocab_size": 103424, "rms_norm_eps": 1e-5, "rope_theta": 500000.0,
                 "rope_scaling": {"mrope_section": [16, 24, 24]},
@@ -2423,6 +2434,18 @@ mod tests {
                 cached_logits = model.kv_decode_step(row, position, &mut cache).unwrap();
             }
 
+            // Compared BEFORE the equality assert, because two loops that both
+            // stopped after one token agree trivially and would report a pass
+            // that covered a single decode step. The bound is what the loop is
+            // allowed to produce, so a fixture or a break condition that
+            // silently shortens the sequence fails here rather than passing.
+            assert_eq!(
+                ref_greedy.len(),
+                max_new_tokens,
+                "case {case_idx}: reference loop produced {} of {max_new_tokens} tokens, so the \
+                 equality below would compare a shorter sequence than intended",
+                ref_greedy.len()
+            );
             assert_eq!(
                 cached_greedy,
                 ref_greedy,
