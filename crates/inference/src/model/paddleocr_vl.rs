@@ -338,12 +338,11 @@ impl PaddleOcrVlModel {
         let mut ids = prefill.prompt_ids;
         let mut embeds = prefill.spliced_embeds;
         let mut positions = prefill.positions;
-        let mut logits = prefill.logits;
+        let mut last_logits: Vec<f32> = prefill.logits[(ids.len() - 1) * vocab..][..vocab].to_vec();
         let mut generated: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
         for _ in 0..max_new_tokens {
-            let last = &logits[(ids.len() - 1) * vocab..][..vocab];
-            let next = argmax_u32(last);
+            let next = argmax_u32(&last_logits);
             generated.push(next);
             if next == EOS_ID {
                 break;
@@ -359,10 +358,9 @@ impl PaddleOcrVlModel {
                 .fold(0u32, |m, r| m.max(r[0]).max(r[1]).max(r[2]))
                 + 1;
             positions.push([p, p, p]);
-            logits = self
+            last_logits = self
                 .decoder
-                .forward_embeds_trace(&embeds, &positions)?
-                .logits;
+                .forward_embeds_last_logits(&embeds, &positions)?;
         }
         Ok(generated)
     }
