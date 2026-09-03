@@ -453,7 +453,7 @@ impl BertModel {
             cu_seqlens.push(end);
         }
 
-        let hidden = self.forward_batch(&input_ids, &token_type_ids, &cu_seqlens, &NoopLoraHook);
+        let hidden = self.forward_batch(&input_ids, &token_type_ids, &cu_seqlens, &NoopLoraHook)?;
 
         // Every packed row is real, so pooling needs an all-ones mask rather than
         // the padding-aware mask the old padded path built. One shared buffer sized
@@ -743,7 +743,7 @@ impl BertModel {
         token_type_ids: &[u32],
         cu_seqlens: &[usize],
         lora: &dyn LoraHook,
-    ) -> Vec<f32> {
+    ) -> Result<Vec<f32>, InferenceError> {
         let hidden_size = self.config.hidden_size;
         let intermediate_size = self.config.intermediate_size;
         let num_heads = self.config.num_attention_heads;
@@ -836,7 +836,7 @@ impl BertModel {
                 &mut attn_out,
                 lora,
                 layer_idx,
-            );
+            )?;
 
             residual_add_layer_norm(
                 &mut hidden,
@@ -898,7 +898,7 @@ impl BertModel {
             );
         }
 
-        hidden
+        Ok(hidden)
     }
 
     /// Pre-#677 padded batched-encode pipeline, preserved as a test-only reference.

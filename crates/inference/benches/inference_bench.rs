@@ -990,6 +990,147 @@ fn bench_attention_kernel(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Head-batched attention kernel benchmark (#702)
+//
+// `bench_attention_kernel` above exercises `multi_head_attention`, the
+// single-sequence per-head path. Until this group existed, NO declared bench
+// target in this crate called `multi_head_attention_batched` -- the
+// packed-batch path #702 changed to stack every head's Q@K^T and scores@V
+// into one `matmul_bt` call per sequence -- directly; the only route that
+// reached it at all was `e2e_bench`, transitively through
+// `BertModel::forward_batch`, whose inputs top out around 100 tokens. That
+// gap is why the group below exists, and the group itself is now the direct
+// caller, so a coverage audit reading this comment should count it as one.
+//
+// Sweep geometry: the head-batched matmuls compute `num_heads`x the summed
+// per-head FLOPs (both scale as O(seq_len^2 * head_dim) in the shared
+// score/context term), while collapsing `num_heads` small `matmul_bt`
+// dispatches into one per sequence. The crossover between "dispatch savings
+// win" and "extra arithmetic dominates" is where the fixed per-dispatch cost
+// saved, `(num_heads - 1) * dispatch_overhead`, balances the extra compute,
+// `(num_heads - 1) * num_heads * seq_len^2 * head_dim * flop_cost` -- i.e. it
+// scales with `seq_len^2` for a fixed model shape. `seq_len` in `[16, 128]`
+// (bge-small's HIDDEN_SIZE=384/NUM_HEADS=12/HEAD_DIM=32 shape) is exactly
+// the range `attention_kernel` above and `e2e_bench` already exercise
+// without this change being flagged as a regression there, so this sweep
+// brackets that known short end against the long end, up to `MAX_SEQ_LEN`
+// (512), bge-small's `max_position_embeddings` limit.
+//
+// Requires `--features bench-internals` to reach
+// `multi_head_attention_batched`, which stays `pub(crate)` otherwise; the
+// group itself is always registered (empty no-op body without the feature),
+// matching the `inference_perf` bench's convention for gated groups.
+// ---------------------------------------------------------------------------
+
+fn bench_attention_batched_kernel(c: &mut Criterion) {
+    #[cfg(feature = "bench-internals")]
+    {
+        use lattice_inference::attention::standard::bench_support::multi_head_attention_batched;
+
+        let (layer_weights, _layer_storage) =
+            synthetic_layer_weights(HIDDEN_SIZE, INTERMEDIATE_SIZE);
+        let layer = &layer_weights;
+        let fused_qkv_weight = random_vec_with_seed(3 * HIDDEN_SIZE * HIDDEN_SIZE, 0x4000_0001);
+        let fused_qkv_bias = random_bias_with_seed(3 * HIDDEN_SIZE, 0x4000_0002);
+
+        let mut group = c.benchmark_group("attention_batched_kernel");
+        group.sample_size(10);
+        group.warm_up_time(Duration::from_secs(1));
+        group.measurement_time(Duration::from_secs(4));
+
+        // Primary axis: sequence length, single packed segment (batch=1),
+        // sweeping the dispatch-bound short end through the arithmetic-bound
+        // long end (see geometry note above).
+        for seq_len in [16usize, 32, 64, 128, 256, 384, 512] {
+            let cu_seqlens = vec![0usize, seq_len];
+            let total = seq_len;
+            let hidden_states = random_vec(total * HIDDEN_SIZE);
+            let mut q = vec![0.0f32; total * HIDDEN_SIZE];
+            let mut k = vec![0.0f32; total * HIDDEN_SIZE];
+            let mut v = vec![0.0f32; total * HIDDEN_SIZE];
+            let mut qkv = vec![0.0f32; total * HIDDEN_SIZE * 3];
+            let mut concat = vec![0.0f32; total * HIDDEN_SIZE];
+            let mut output = vec![0.0f32; total * HIDDEN_SIZE];
+
+            group.throughput(Throughput::Elements((NUM_HEADS * seq_len * seq_len) as u64));
+            group.bench_function(BenchmarkId::new("seq_len", seq_len), |b| {
+                b.iter(|| {
+                    multi_head_attention_batched(
+                        black_box(hidden_states.as_slice()),
+                        layer,
+                        black_box(fused_qkv_weight.as_slice()),
+                        black_box(fused_qkv_bias.as_slice()),
+                        black_box(cu_seqlens.as_slice()),
+                        HIDDEN_SIZE,
+                        NUM_HEADS,
+                        HEAD_DIM,
+                        &mut q,
+                        &mut k,
+                        &mut v,
+                        &mut qkv,
+                        &mut concat,
+                        &mut output,
+                        &NoopLoraHook,
+                        0,
+                    )
+                    .unwrap();
+                    black_box(output.as_slice());
+                });
+            });
+        }
+
+        // Secondary axis: batch shape at a fixed representative seq_len
+        // (mirrors `bench_batch_encoding_throughput`'s batch_size sweep at
+        // seq_len=32), confirming a multi-segment `cu_seqlens` batch reaches
+        // the same code path real callers (`BertModel::forward_batch`) use.
+        let batch_seq_len = 32usize;
+        for batch_size in [1usize, 4, 8, 16] {
+            let cu_seqlens: Vec<usize> = (0..=batch_size).map(|i| i * batch_seq_len).collect();
+            let total = batch_size * batch_seq_len;
+            let hidden_states = random_vec(total * HIDDEN_SIZE);
+            let mut q = vec![0.0f32; total * HIDDEN_SIZE];
+            let mut k = vec![0.0f32; total * HIDDEN_SIZE];
+            let mut v = vec![0.0f32; total * HIDDEN_SIZE];
+            let mut qkv = vec![0.0f32; total * HIDDEN_SIZE * 3];
+            let mut concat = vec![0.0f32; total * HIDDEN_SIZE];
+            let mut output = vec![0.0f32; total * HIDDEN_SIZE];
+
+            group.throughput(Throughput::Elements(
+                (batch_size * NUM_HEADS * batch_seq_len * batch_seq_len) as u64,
+            ));
+            group.bench_function(BenchmarkId::new("batch_size", batch_size), |b| {
+                b.iter(|| {
+                    multi_head_attention_batched(
+                        black_box(hidden_states.as_slice()),
+                        layer,
+                        black_box(fused_qkv_weight.as_slice()),
+                        black_box(fused_qkv_bias.as_slice()),
+                        black_box(cu_seqlens.as_slice()),
+                        HIDDEN_SIZE,
+                        NUM_HEADS,
+                        HEAD_DIM,
+                        &mut q,
+                        &mut k,
+                        &mut v,
+                        &mut qkv,
+                        &mut concat,
+                        &mut output,
+                        &NoopLoraHook,
+                        0,
+                    )
+                    .unwrap();
+                    black_box(output.as_slice());
+                });
+            });
+        }
+
+        group.finish();
+    }
+    #[cfg(not(feature = "bench-internals"))]
+    let _ = c;
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default();
@@ -999,6 +1140,7 @@ criterion_group!(
         bench_tokenizer_throughput,
         bench_full_forward_pass,
         bench_batch_encoding_throughput,
-        bench_attention_kernel
+        bench_attention_kernel,
+        bench_attention_batched_kernel
 );
 criterion_main!(benches);
