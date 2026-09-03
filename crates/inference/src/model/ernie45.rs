@@ -1219,8 +1219,13 @@ struct Ernie45CoreOut {
 /// `0..len`, each row `[kv_head, head_dim]` — the exact layout the
 /// uncached kernel's per-layer `k` / `v` buffers use, so the attention
 /// code reads cached rows with the same indexing and no second layout.
-/// The two stores are pre-allocated for `capacity` tokens in
-/// [`Self::new`]; nothing here allocates on the decode hot path.
+/// The two stores are sized for `capacity` tokens in [`Self::new`] and
+/// are only ever written into afterwards, so the cache itself never
+/// reallocates or grows as the sequence advances. That is a statement
+/// about the cache, not about the step: [`Ernie45Model::kv_decode_step`]
+/// still allocates its own per-call scratch buffers, exactly as the
+/// uncached kernel does, and reusing those across steps is a separate
+/// change.
 ///
 /// The cache is opaque and explicit — [`Ernie45Model`] keeps no hidden
 /// state, and every entry point re-validates the cache's shape before
