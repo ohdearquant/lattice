@@ -328,9 +328,18 @@ mod gate {
             "cached and uncached greedy sequences diverged"
         );
 
-        // Both loops ran in this process, on this machine, over this one
-        // input: a single observation of what the cache bought here, not a
-        // benchmark. Real before/after numbers come from the bench harness.
+        // Read the two greedy timings with care, and do not quote them as a
+        // decode benchmark. Each call runs the whole pipeline, image
+        // processor and vision encoder included, and on this fixture that
+        // shared prefix dominates: the prompt is 157 tokens, so the 22
+        // full-sequence decoder forwards the uncached loop makes and the
+        // cached one does not are worth a few seconds against a total near
+        // 230s. Measured 2026-09-03 on one machine, one run: cached
+        // 229.39s against uncached 224.49s, i.e. the difference came out
+        // negative, which is the shared vision pass varying by more than
+        // the decoder work being compared. What the cache saves per step
+        // is a structural property of the code (one token instead of the
+        // whole sequence); isolating it is a bench-harness job.
         println!(
             "paddleocr_vl_e2e: prefill {prefill_s:.2}s, greedy cached {greedy_s:.2}s vs \
              uncached {uncached_s:.2}s ({} steps, single run), worst |diff| {worst:.2e} \
