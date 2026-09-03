@@ -794,9 +794,10 @@ pub(crate) fn multi_head_attention_batched(
         // off-diagonal cross-head blocks (Q of head h against K of head h'
         // != h), which are simply discarded below when only the diagonal
         // block is copied into `scores`. That extra compute is `num_heads`x
-        // the original tiny-GEMM FLOPs (negligible in absolute terms at these
-        // shapes -- see .khive/artifacts/w3-embed/attribution_*.txt -- but it
-        // does mean this trades a fixed dispatch cost for O(num_heads) more
+        // the original tiny-GEMM FLOPs, which is small in absolute terms at
+        // the shape this targets (bge-small geometry, head_dim 32, where the
+        // per-call dispatch tax rather than the arithmetic is what dominates),
+        // but it does mean this trades a fixed dispatch cost for O(num_heads) more
         // compute AND O(num_heads) more scratch memory per sequence; long
         // `seq_len` shapes should be re-measured before assuming this wins
         // uniformly, per the issue's own "measure first" mandate).
@@ -2180,13 +2181,21 @@ mod tests {
     /// differently than the per-head loop, small enough to stay a fast
     /// default (non-`#[ignore]`) unit test.
     ///
-    /// Mutation-sensitive: this test was run against a deliberately broken
-    /// head-batched implementation (the scores*V diagonal-block extraction
-    /// offset by one head, i.e. reading block `(h+1) % num_heads` instead of
-    /// `h`) and failed with max_abs_diff = 2.5768063 (five orders of
-    /// magnitude above TOLERANCE), then passed again (max_abs_diff = 0.0)
-    /// after reverting; see `.khive/artifacts/w3-embed/mutation_FAIL_run.txt`
-    /// and `mutation_PASS_run.txt` for both captured runs.
+    /// Mutation-sensitive on BOTH stacked products, with the arms recorded
+    /// here rather than pointed at an untracked file:
+    ///
+    /// * `scores*V` diagonal-block extraction offset by one head (reading
+    ///   block `(h+1) % num_heads` instead of `h`): max_abs_diff 2.5768063,
+    ///   five orders of magnitude above TOLERANCE; 0.0 again once restored.
+    /// * `Q*K^T` diagonal-block extraction offset the same way
+    ///   (`block_col_start`): max_abs_diff 0.39962053, four orders of
+    ///   magnitude above TOLERANCE.
+    ///
+    /// The second arm is the reason the input values above are not linear in
+    /// the flat index, and the difference was measured rather than assumed:
+    /// with the previous linear ramp, this same mutation left the test GREEN.
+    /// A test that passes under the mutation it exists to catch is decoration,
+    /// so the fixture change is the load-bearing part, not the assertion.
     #[test]
     fn head_batched_attention_matches_per_head_reference() {
         let hidden_size = 24;
@@ -2302,11 +2311,22 @@ mod tests {
         // Sequence 0: 4 tokens; sequence 1: 6 tokens. Non-trivial, distinct
         // per-token values (not a repeated/uniform row) so every head's
         // scores/context differ token-to-token.
+        //
+        // The values must NOT be linear in the flat index, and that is the
+        // whole reason for the `% 5` and `% 7` terms. Under a purely linear
+        // ramp, head h' 's slice of the key vector differs from head h's by
+        // the SAME constant vector for every token, so a wrong `Q*K^T` column
+        // block adds `Q_h[i] . c` to row i -- a per-row constant, which
+        // softmax is invariant to. The mutation would then be invisible in the
+        // output, and the test would report parity for an implementation that
+        // reads the wrong head's keys. Breaking the linearity breaks that
+        // invariance; the mutation arm in this test's doc comment is what
+        // proves it.
         let seq0: Vec<f32> = (0..4 * hidden_size)
-            .map(|i| 1.0 + i as f32 * 0.05)
+            .map(|i| 1.0 + i as f32 * 0.05 + 0.31 * ((i % 5) as f32))
             .collect();
         let seq1: Vec<f32> = (0..6 * hidden_size)
-            .map(|i| -2.0 + i as f32 * 0.03)
+            .map(|i| -2.0 + i as f32 * 0.03 - 0.23 * ((i % 7) as f32))
             .collect();
         let mut hidden_states_packed = Vec::with_capacity(10 * hidden_size);
         hidden_states_packed.extend_from_slice(&seq0);
@@ -2389,8 +2409,8 @@ mod tests {
         // does not spuriously fail this test -- while a genuine head-block
         // indexing bug, which misattributes an entire head's projection (a
         // different scale/bias, not a rounding difference), still blows
-        // through it by orders of magnitude. See the mutation evidence below
-        // and in `.khive/artifacts/w3-embed/`.
+        // through it by orders of magnitude. The mutation arms this tolerance
+        // was chosen against are recorded in this test's own doc comment.
         const TOLERANCE: f32 = 1e-5;
         assert!(
             max_abs_diff <= TOLERANCE,

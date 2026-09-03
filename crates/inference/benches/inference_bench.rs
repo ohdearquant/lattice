@@ -994,12 +994,14 @@ fn bench_attention_kernel(c: &mut Criterion) {
 // Head-batched attention kernel benchmark (#702)
 //
 // `bench_attention_kernel` above exercises `multi_head_attention`, the
-// single-sequence per-head path. No declared bench target in this crate
-// calls `multi_head_attention_batched` -- the packed-batch path #702 changed
-// to stack every head's Q@K^T and scores@V into one `matmul_bt` call per
-// sequence -- directly; the only route that reaches it at all is
-// `e2e_bench`, transitively through `BertModel::forward_batch`, and that
-// target's inputs top out around 100 tokens.
+// single-sequence per-head path. Until this group existed, NO declared bench
+// target in this crate called `multi_head_attention_batched` -- the
+// packed-batch path #702 changed to stack every head's Q@K^T and scores@V
+// into one `matmul_bt` call per sequence -- directly; the only route that
+// reached it at all was `e2e_bench`, transitively through
+// `BertModel::forward_batch`, whose inputs top out around 100 tokens. That
+// gap is why the group below exists, and the group itself is now the direct
+// caller, so a coverage audit reading this comment should count it as one.
 //
 // Sweep geometry: the head-batched matmuls compute `num_heads`x the summed
 // per-head FLOPs (both scale as O(seq_len^2 * head_dim) in the shared
