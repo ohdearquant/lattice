@@ -620,6 +620,51 @@ impl Ernie45Model {
         embeds: &[f32],
         positions: &[[u32; 3]],
     ) -> Result<Ernie45Trace, InferenceError> {
+        let core = self.forward_embeds_core(embeds, positions, true)?;
+        Ok(Ernie45Trace {
+            embed: core.embed,
+            layer_outputs: core.layer_outputs,
+            final_norm: core.final_norm,
+            logits: core.logits,
+        })
+    }
+
+    /// Same forward as [`Self::forward_embeds_trace`], but returns only the
+    /// last row of logits (`vocab_size` values) instead of materializing
+    /// `[seq_len, vocab_size]`, and skips every intermediate-activation
+    /// clone the trace keeps for the golden comparison. Every validation
+    /// [`Self::forward_embeds_trace`] performs — `MAX_SEQ_LEN`, empty input,
+    /// `embeds` length, non-finite `embeds` — runs identically here: both
+    /// entry points share [`Self::forward_embeds_core`]'s front half.
+    ///
+    /// Intended for a greedy decode loop that re-forwards the whole
+    /// sequence per step and only ever reads the last row's logits.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::forward_embeds_trace`].
+    pub fn forward_embeds_last_logits(
+        &self,
+        embeds: &[f32],
+        positions: &[[u32; 3]],
+    ) -> Result<Vec<f32>, InferenceError> {
+        let core = self.forward_embeds_core(embeds, positions, false)?;
+        Ok(core.logits)
+    }
+
+    /// Shared body of [`Self::forward_embeds_trace`] and
+    /// [`Self::forward_embeds_last_logits`]. `keep_trace == true` reproduces
+    /// today's trace exactly (every clone kept, `logits` is `[seq_len,
+    /// vocab]`); `keep_trace == false` skips the `embed` clone and every
+    /// per-layer `layer_outputs` clone, and applies `lm_head` to the last
+    /// row only, allocating a `vocab`-length `logits` buffer instead of
+    /// `seq_len * vocab`.
+    fn forward_embeds_core(
+        &self,
+        embeds: &[f32],
+        positions: &[[u32; 3]],
+        keep_trace: bool,
+    ) -> Result<Ernie45CoreOut, InferenceError> {
         let cfg = &self.cfg;
         let w = &self.weights;
         let s = positions.len();
@@ -656,13 +701,17 @@ impl Ernie45Model {
         let s_kv_dim = checked_product(s, kv_dim, "forward key/value buffer size")?;
         let s_intermediate =
             checked_product(s, cfg.intermediate_size, "forward intermediate buffer size")?;
-        let s_vocab = checked_product(s, cfg.vocab_size, "forward logits buffer size")?;
+        let s_vocab = if keep_trace {
+            checked_product(s, cfg.vocab_size, "forward logits buffer size")?
+        } else {
+            cfg.vocab_size
+        };
         let s_s = checked_product(s, s, "forward attention score buffer size")?;
         let s_hd = checked_product(s, cfg.head_dim, "forward head buffer size")?;
         let hd_s = checked_product(cfg.head_dim, s, "forward transposed value buffer size")?;
 
         let mut x = embeds.to_vec();
-        let embed = x.clone();
+        let embed = if keep_trace { x.clone() } else { Vec::new() };
 
         let (cos, sin) = mrope_cos_sin_table(cfg, positions);
 
@@ -673,9 +722,11 @@ impl Ernie45Model {
         let scale = 1.0 / (hd as f32).sqrt();
 
         let mut layer_outputs = Vec::new();
-        layer_outputs
-            .try_reserve_exact(cfg.num_hidden_layers)
-            .map_err(|error| reserve_error("trace layer outputs", error))?;
+        if keep_trace {
+            layer_outputs
+                .try_reserve_exact(cfg.num_hidden_layers)
+                .map_err(|error| reserve_error("trace layer outputs", error))?;
+        }
         let mut normed = vec![0f32; s_h];
         let mut q = vec![0f32; s_q_dim];
         let mut k = vec![0f32; s_kv_dim];
@@ -782,21 +833,46 @@ impl Ernie45Model {
                 *xi += pi;
             }
 
-            layer_outputs.push(x.clone());
+            if keep_trace {
+                layer_outputs.push(x.clone());
+            }
         }
 
         let mut final_normed = x;
         rms_norm(&mut final_normed, &w.final_norm, h, cfg.rms_norm_eps);
         let mut logits = vec![0f32; s_vocab];
-        matmul_bt(&final_normed, &w.lm_head, &mut logits, s, h, cfg.vocab_size);
+        if keep_trace {
+            matmul_bt(&final_normed, &w.lm_head, &mut logits, s, h, cfg.vocab_size);
+        } else {
+            matmul_bt(
+                &final_normed[(s - 1) * h..],
+                &w.lm_head,
+                &mut logits,
+                1,
+                h,
+                cfg.vocab_size,
+            );
+        }
 
-        Ok(Ernie45Trace {
+        Ok(Ernie45CoreOut {
             embed,
             layer_outputs,
-            final_norm: final_normed,
+            final_norm: if keep_trace { final_normed } else { Vec::new() },
             logits,
         })
     }
+}
+
+/// Internal output of [`Ernie45Model::forward_embeds_core`], shared by the
+/// full-trace and last-row-logits entry points. `embed`, `layer_outputs`,
+/// and `final_norm` are only populated when `keep_trace == true`; `logits`
+/// is `[seq_len, vocab_size]` when `keep_trace == true` and `vocab_size`
+/// (the last row only) otherwise.
+struct Ernie45CoreOut {
+    embed: Vec<f32>,
+    layer_outputs: Vec<Vec<f32>>,
+    final_norm: Vec<f32>,
+    logits: Vec<f32>,
 }
 
 #[cfg(test)]
@@ -1182,6 +1258,160 @@ mod tests {
         let result = model.forward_trace(&ids);
         assert!(
             matches!(result, Err(InferenceError::InvalidInput(message)) if message.contains("MAX_SEQ_LEN"))
+        );
+    }
+
+    // -- forward_embeds_last_logits: equivalence with forward_embeds_trace --
+    //
+    // All-zero weights (as `full_source`/`layer_weights` build) make every
+    // row's hidden state identical regardless of position, which cannot
+    // distinguish "last row" from "any other row". These tests use a small
+    // deterministic pseudo-random model instead, so the bit-for-bit
+    // comparison is actually load-bearing.
+
+    /// Deterministic (seeded) pseudo-random f32 values in `[-1, 1)`, used to
+    /// build non-trivial weights/embeds so equivalence tests can't pass by
+    /// every row collapsing to the same value.
+    fn pseudo_random_vec(len: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let bits = (state >> 33) as u32;
+                (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn equiv_test_config() -> Ernie45Config {
+        Ernie45Config {
+            hidden_size: 8,
+            intermediate_size: 8,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 4,
+            vocab_size: 6,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            rope_scaling: Ernie45RopeScaling {
+                mrope_section: vec![2],
+            },
+            tie_word_embeddings: false,
+            use_bias: false,
+        }
+    }
+
+    fn equiv_weights(cfg: &Ernie45Config) -> Ernie45Weights {
+        let h = cfg.hidden_size;
+        let q_dim = cfg.q_dim().unwrap();
+        let kv_dim = cfg.kv_dim().unwrap();
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut next = |len: usize| -> Vec<f32> {
+            seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            pseudo_random_vec(len, seed)
+        };
+        // Norm gammas near 1.0 so RMSNorm doesn't zero out the signal.
+        let next_gamma = |len: usize, next: &mut dyn FnMut(usize) -> Vec<f32>| -> Vec<f32> {
+            next(len).into_iter().map(|v| v + 1.5).collect()
+        };
+        let embed_tokens = next(cfg.vocab_size * h);
+        let mut layers = Vec::new();
+        for _ in 0..cfg.num_hidden_layers {
+            layers.push(Ernie45LayerWeights {
+                q_proj: next(q_dim * h),
+                k_proj: next(kv_dim * h),
+                v_proj: next(kv_dim * h),
+                o_proj: next(h * q_dim),
+                gate_proj: next(cfg.intermediate_size * h),
+                up_proj: next(cfg.intermediate_size * h),
+                down_proj: next(h * cfg.intermediate_size),
+                input_layernorm: next_gamma(h, &mut next),
+                post_attention_layernorm: next_gamma(h, &mut next),
+            });
+        }
+        let final_norm = next_gamma(h, &mut next);
+        let lm_head = next(cfg.vocab_size * h);
+        Ernie45Weights {
+            embed_tokens,
+            layers,
+            final_norm,
+            lm_head,
+        }
+    }
+
+    fn equiv_model() -> (Ernie45Config, Ernie45Model) {
+        let cfg = equiv_test_config();
+        let weights = equiv_weights(&cfg);
+        let model = Ernie45Model::new(cfg.clone(), weights).unwrap();
+        (cfg, model)
+    }
+
+    /// The load-bearing equivalence check: `forward_embeds_last_logits`
+    /// must equal the last `vocab_size` values of `forward_embeds_trace`'s
+    /// logits bit-for-bit (same arithmetic, same order), at `s == 1`.
+    #[test]
+    fn forward_embeds_last_logits_matches_trace_last_row_s1() {
+        let (cfg, model) = equiv_model();
+        let s = 1usize;
+        let embeds = pseudo_random_vec(s * cfg.hidden_size, 111);
+        let positions: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        let trace = model.forward_embeds_trace(&embeds, &positions).unwrap();
+        let last = model
+            .forward_embeds_last_logits(&embeds, &positions)
+            .unwrap();
+        let vocab = cfg.vocab_size;
+        assert_eq!(&last[..], &trace.logits[(s - 1) * vocab..][..vocab]);
+    }
+
+    /// Same equivalence check at a multi-row sequence length, so a mutation
+    /// that reads the wrong row (e.g. row 0 instead of row `s - 1`) is
+    /// actually distinguishable — at `s == 1` row 0 and row `s - 1` are the
+    /// same row.
+    #[test]
+    fn forward_embeds_last_logits_matches_trace_last_row_s5() {
+        let (cfg, model) = equiv_model();
+        let s = 5usize;
+        let embeds = pseudo_random_vec(s * cfg.hidden_size, 222);
+        let positions: Vec<[u32; 3]> = (0..s as u32).map(|i| [i, i, i]).collect();
+        let trace = model.forward_embeds_trace(&embeds, &positions).unwrap();
+        let last = model
+            .forward_embeds_last_logits(&embeds, &positions)
+            .unwrap();
+        let vocab = cfg.vocab_size;
+        assert_eq!(&last[..], &trace.logits[(s - 1) * vocab..][..vocab]);
+    }
+
+    #[test]
+    fn forward_embeds_last_logits_rejects_empty_input() {
+        let (_cfg, model) = equiv_model();
+        let result = model.forward_embeds_last_logits(&[], &[]);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(message)) if message.contains("empty token sequence"))
+        );
+    }
+
+    #[test]
+    fn forward_embeds_last_logits_rejects_wrong_embeds_length() {
+        let (cfg, model) = equiv_model();
+        let positions = [[0u32, 0, 0], [1, 1, 1]];
+        // 2 positions but only 1 row of embeds.
+        let embeds = vec![0f32; cfg.hidden_size];
+        let result = model.forward_embeds_last_logits(&embeds, &positions);
+        assert!(matches!(result, Err(InferenceError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn forward_embeds_last_logits_rejects_non_finite_embeds() {
+        let (cfg, model) = equiv_model();
+        let positions = [[0u32, 0, 0]];
+        let mut embeds = vec![0.1f32; cfg.hidden_size];
+        embeds[0] = f32::NAN;
+        let result = model.forward_embeds_last_logits(&embeds, &positions);
+        assert!(
+            matches!(result, Err(InferenceError::Inference(message)) if message.contains("non-finite"))
         );
     }
 }
