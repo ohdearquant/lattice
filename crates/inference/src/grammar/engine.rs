@@ -30,14 +30,14 @@
 //!
 //! - `mask_logits`: O(vocab_size / 64) bitmask scan + O(k × stack_depth) for
 //!   context-dependent tokens, where k is the current grammar state's
-//!   precomputed candidate count when a state-local list was stored, or the
-//!   global union across all states when it was withheld under the
-//!   partition's aggregate capacity budget.
+//!   precomputed candidate count. On the first `mask_logits` call for a
+//!   state, that state's row is built: O(vocab_size × max_token_len) once
+//!   per distinct state, never repeated.
 //! - `advance`: O(stack_depth) PDA step; typical depth 2–8.
-//! - `new`: O(|states| × vocab_size × max_token_len) — called once. `|states|`
-//!   is capped at `MAX_GRAMMAR_STATES` (256) and is the dominant, schema-
-//!   dependent factor; see [`GrammarEngine::new`] for measured figures at
-//!   both ends of that range.
+//! - `new`: O(|states|) — state enumeration only. `|states|` is capped at
+//!   `MAX_GRAMMAR_STATES` (256); the per-state partition rows are built
+//!   lazily on first visit, so the constructor no longer pays the
+//!   O(|states| × vocab_size × max_token_len) cost it used to.
 //! - First `mask_logits` call on a state past the cap: builds a byte trie
 //!   over the vocabulary, `O(vocab_size × max_token_len)` with no `|states|`
 //!   term. See [`GrammarEngine::trie_build_ns`] for a measured figure.
@@ -52,8 +52,8 @@ use crate::grammar::spec::GrammarSpec;
 use crate::grammar::trie::ByteTrie;
 use crate::grammar::vocab_partition::VocabPartition;
 use std::fmt;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 // ---------------------------------------------------------------------------
 // Profiling instrumentation (issue #734 diagnostics)
@@ -326,14 +326,18 @@ fn states_equal(a: &GrammarState, b: &GrammarState) -> bool {
 /// Thread-safe and `Clone`-free after construction.  Share via
 /// `Arc<GrammarEngine>` across concurrent requests.
 pub struct GrammarEngine {
-    /// The compiled grammar (for runtime PDA advancement).
-    grammar: CompiledGrammar,
-    /// Precomputed vocabulary partition (bitmask table + context-dependent ids).
+    /// The compiled grammar (for runtime PDA advancement). Shared with
+    /// `partition` (`Arc`) so the partition can build per-state rows
+    /// lazily from `&self` without borrowing this field.
+    grammar: Arc<CompiledGrammar>,
+    /// Precomputed vocabulary partition (lazy per-state rows + context-dependent ids).
     partition: VocabPartition,
     /// Vocabulary size (used for bounds checking).
     vocab_size: usize,
-    /// Raw vocabulary byte sequences (used for context-dependent token checks).
-    vocab_bytes: Vec<Vec<u8>>,
+    /// Raw vocabulary byte sequences (used for context-dependent token
+    /// checks). Shared with `partition` (`Arc`) so the partition can build
+    /// per-state rows lazily without duplicating the vocabulary.
+    vocab_bytes: Arc<Vec<Vec<u8>>>,
     /// Set when state enumeration in `new` hit `MAX_GRAMMAR_STATES` before
     /// exhausting the reachable state graph: some runtime states then have
     /// no precomputed mask and fall back to `mask_by_trie`. See
@@ -356,45 +360,33 @@ impl GrammarEngine {
     /// `vocab_bytes[i]` is the UTF-8 / byte-level representation of token `i`.
     /// For BPE tokenizers, obtain this via `BpeTokenizer::vocab_bytes(model_vocab_size)`.
     ///
-    /// This runs in O(|states| × vocab_size × max_token_len) time, where
-    /// `|states|` is capped at `MAX_GRAMMAR_STATES` (256, see
-    /// `vocab_partition::MAX_GRAMMAR_STATES`) and is schema-dependent — a
-    /// timing figure is only meaningful alongside the `|states|` it was
-    /// measured at. Two reference points against the real Qwen3 tokenizer
-    /// (248,320 tokens):
+    /// Construction enumerates the grammar's reachable states (capped at
+    /// `MAX_GRAMMAR_STATES`, 256, see
+    /// `vocab_partition::MAX_GRAMMAR_STATES`) and stores them; the
+    /// per-state partition rows are built lazily on first visit
+    /// (`VocabPartition`), so the constructor's cost is state enumeration
+    /// only — O(|states| × vocab_size × max_token_len) for the BFS itself —
+    /// and no longer includes the O(|states| × vocab_size × max_token_len)
+    /// all-pairs mask simulation that a pre-lazy build paid up front.
+    /// The first `mask_logits` call in each distinct state pays that state's
+    /// row build once, O(vocab_size × max_token_len), after which every
+    /// later call in the state is a bitmask scan.
     ///
-    /// | schema                                             | \|states\| | measured |
-    /// |------------------------------------------------------|-----------|----------|
-    /// | bare 3-member string enum, no object wrapper          | 13        | ~0.2–0.6 s |
-    /// | 4-level nested object, 6 string enums (issue #734 repro) | 256 (cap) | ~21–45 s (up to ~155 s under heavy concurrent load) |
-    ///
-    /// Measured with `cargo run --release --bin gramtime_profile`
-    /// (`crates/inference/src/bin/gramtime_profile.rs`), 6–10 repetitions per
-    /// schema, on a shared development machine with other processes
-    /// competing for CPU — the low ends above are the least-contended
-    /// samples, not an idle-machine floor; see that binary's module doc for
-    /// full per-repetition figures and methodology. Per-(state, token)-pair
-    /// cost was **not** constant between the two schemas (roughly 2–5×
-    /// higher for the capped schema), plausibly because its states sit at
-    /// deeper, more backtracking-prone PDA stack configurations than the
-    /// enum's flat single-rule matching — so `|states|` alone does not fully
-    /// determine build time either, only bounds its order of magnitude.
-    ///
-    /// This cost is **construction only**. A schema whose state count hits
-    /// the cap pays a second, separate cost the first time `mask_logits` is
-    /// called on a state outside the precomputed set: see
-    /// [`Self::trie_build_ns`]. Caching the `GrammarEngine` across requests
-    /// with the same schema amortizes both — the constructor cost shown
-    /// here, and that first-mask trie build — over every subsequent request
-    /// against the same schema.
+    /// A schema whose state count hits the cap pays a further, separate
+    /// cost the first time `mask_logits` is called on a state outside the
+    /// enumerated set: the byte-trie build, see [`Self::trie_build_ns`].
+    /// Caching the `GrammarEngine` across requests with the same schema
+    /// amortizes both over every subsequent request against the same schema.
     pub fn new(spec: &GrammarSpec, vocab_bytes: Vec<Vec<u8>>) -> Result<Self, GrammarError> {
         let vocab_size = vocab_bytes.len();
 
-        // Compile spec to grammar.
-        let grammar = match spec {
+        // Compile spec to grammar. `Arc`-shared with the partition so its
+        // lazily built rows can read the grammar from `&self`.
+        let grammar = Arc::new(match spec {
             GrammarSpec::JsonSchema(schema) => compile(schema)?,
             GrammarSpec::Gbnf(gbnf) => parse_gbnf(gbnf)?,
-        };
+        });
+        let vocab_bytes = Arc::new(vocab_bytes);
 
         // Enumerate grammar states reachable from the initial state.
         // We limit to MAX_GRAMMAR_STATES to bound memory usage.
@@ -496,9 +488,8 @@ impl GrammarEngine {
     /// iterations for Qwen3's 248,320 tokens), taking under 40 µs on modern
     /// Apple Silicon.  Context-dependent tokens add O(k × stack_depth)
     /// overhead, where k is the precomputed candidate count for this grammar
-    /// state when a state-local list was stored. A state whose list was
-    /// withheld under the partition's aggregate capacity budget conservatively
-    /// falls back to k being the union across every state.
+    /// state. The state's row (bitmask + candidate list) is built on the
+    /// first call in that state and reused for every later call.
     pub fn mask_logits(
         &self,
         state: &mut GrammarState,
@@ -1155,8 +1146,9 @@ mod tests {
             crate::grammar::vocab_partition::MAX_GRAMMAR_STATES,
             "grammar must exceed the state cap for this regression to bite"
         );
-        engine.partition = VocabPartition::build(&grammar, states, &vocab);
-        engine.grammar = grammar;
+        engine.partition =
+            VocabPartition::build(&Arc::new(grammar.clone()), states, &Arc::new(vocab));
+        engine.grammar = Arc::new(grammar);
 
         // Drive into a deep state beyond the enumerated cap: quote + 270 a's.
         let mut state = engine.initial_state();
@@ -1650,6 +1642,266 @@ mod tests {
              over_cap_states={over_cap_states} over_accepts=0 mismatches=0",
             vocab.len(),
             corpus.len(),
+        );
+    }
+    // ------------------------------------------------------------------
+    // Laziness of the per-state partition rows (VocabPartition redesign)
+    // ------------------------------------------------------------------
+
+    /// Fixture for the laziness tests: `root ::= "ab" | "cd"`.
+    ///
+    /// Enumerated states: 0 = initial, 1 = after `a`, 2 = after `c`,
+    /// 3 = complete. The per-state context-dependent lists are
+    /// `[1]` (b"ad") at state 0 and `[3]` (b"be") at state 1 — strictly
+    /// smaller than the global union `[1, 3]`, so a decode that walks the
+    /// `a`/`b` arm never needs state 2's row and never consults the union.
+    fn abcd_spec() -> GrammarSpec {
+        GrammarSpec::Gbnf("root ::= \"ab\" | \"cd\"\n".to_string())
+    }
+
+    fn abcd_vocab() -> Vec<Vec<u8>> {
+        vec![
+            b"a".to_vec(),
+            b"ad".to_vec(),
+            b"b".to_vec(),
+            b"be".to_vec(),
+            b"c".to_vec(),
+            b"cd".to_vec(),
+            b"d".to_vec(),
+        ]
+    }
+
+    /// The global union is never consulted by the decode path: empty it,
+    /// then run constrained decoding through the engine and assert the
+    /// results are byte-identical to an unmutated run.
+    ///
+    /// This is the test that fails if `context_dependent_ids_for_state`
+    /// ever hands back the union instead of the state's own list (the
+    /// pre-redesign `unwrap_or(&self.context_dependent)` shape): with the
+    /// union emptied, such a query returns an empty candidate set, the
+    /// recheck never inspects token b"be" at the after-`a` state, and that
+    /// token stays allowed — diverging from the baseline below. (The
+    /// narrower "row not yet built" form of the old fallback is
+    /// structurally unreachable in the decode path: `apply_mask` builds
+    /// the row before the recheck query runs, so by the time the list is
+    /// read, it exists.)
+    #[test]
+    fn union_is_not_consulted() {
+        let spec = abcd_spec();
+
+        // Baseline: unmutated engine, full decode of "ab". Fresh logits
+        // buffer per mask call, as a real forward pass produces fresh
+        // logits each step.
+        let baseline = GrammarEngine::new(&spec, abcd_vocab()).expect("abcd grammar builds");
+        let mut baseline_state = baseline.initial_state();
+        let mut baseline_logits = vec![1.0f32; 7];
+        baseline
+            .mask_logits(&mut baseline_state, &mut baseline_logits)
+            .expect("baseline first mask");
+        // b"ad" must be rechecked and blocked at the initial state by the
+        // per-state list alone (the union is not yet computed at all).
+        assert_eq!(
+            baseline_logits[1],
+            f32::NEG_INFINITY,
+            "b'ad' blocked by the per-state recheck in the baseline run"
+        );
+        assert!(baseline.advance(&mut baseline_state, 0), "'a' accepted");
+        let mut baseline_logits = vec![1.0f32; 7];
+        baseline
+            .mask_logits(&mut baseline_state, &mut baseline_logits)
+            .expect("baseline second mask");
+        assert!(baseline.advance(&mut baseline_state, 2), "'b' accepted");
+        let baseline_final = baseline_logits.clone();
+
+        // Mutated: global union force-emptied after construction.
+        let mutated = GrammarEngine::new(&spec, abcd_vocab()).expect("abcd grammar builds");
+        mutated.partition.force_context_union_empty_for_test();
+        let mut mutated_state = mutated.initial_state();
+        let mut mutated_logits = vec![1.0f32; 7];
+        mutated
+            .mask_logits(&mut mutated_state, &mut mutated_logits)
+            .expect("mutated first mask");
+        assert!(mutated.advance(&mut mutated_state, 0), "'a' accepted");
+        let mut mutated_logits = vec![1.0f32; 7];
+        mutated
+            .mask_logits(&mut mutated_state, &mut mutated_logits)
+            .expect("mutated second mask");
+        assert!(mutated.advance(&mut mutated_state, 2), "'b' accepted");
+
+        assert_eq!(
+            mutated_logits, baseline_final,
+            "decoding with an emptied global union must be byte-identical              to the unmutated run: the union is never consulted"
+        );
+        // The per-state query must also ignore the (emptied) union and
+        // return each state's own list.
+        assert_eq!(
+            mutated.partition.ctx_list_for_state(0),
+            vec![1],
+            "state 0's list must survive an emptied union"
+        );
+        assert_eq!(
+            mutated.partition.ctx_list_for_state(1),
+            vec![3],
+            "state 1's list must survive an emptied union"
+        );
+    }
+
+    /// The per-state list drives the recheck loop. Three observations:
+    ///
+    /// 1. The candidate counter — incremented once per token the loop
+    ///    visits, at loop entry — must equal the size of state 0's own
+    ///    per-state list (1 here), not the global union (2). A recheck
+    ///    loop that iterates the union, or a `context_dependent_ids_for_state`
+    ///    that returns the union, visits 2 and fails.
+    /// 2. Emptying ONE state's list (the mask is kept identical) leaves the
+    ///    token b"ad" no longer rechecked, so it is no longer blocked —
+    ///    the list, not the mask, is what drives the recheck's candidate
+    ///    iteration.
+    /// 3. Every other token is unaffected: blocking decisions are governed
+    ///    by the mask plus the per-candidate simulation, which is why a
+    ///    loop that rechecked a *different* candidate set with the same
+    ///    final verdicts would not be caught by (2) alone. Assertion (1)
+    ///    is what makes the candidate set itself observable.
+    #[test]
+    fn per_state_list_is_load_bearing() {
+        use crate::grammar::pda::SimResult;
+
+        let spec = abcd_spec();
+        let vocab = abcd_vocab();
+
+        // State 0's per-state list is [1] (token b"ad"); the global union is
+        // [1, 3]. Token 1 is mask-allowed optimistically at the initial state
+        // but rejected by the runtime recheck, so it ends up blocked.
+        let baseline = GrammarEngine::new(&spec, vocab.clone()).expect("abcd grammar builds");
+        let mut b_state = baseline.initial_state();
+        let mut b_logits = vec![1.0f32; vocab.len()];
+        baseline
+            .mask_logits(&mut b_state, &mut b_logits)
+            .expect("baseline mask");
+        assert_eq!(
+            b_logits[1],
+            f32::NEG_INFINITY,
+            "b'ad' must be blocked by the per-state recheck"
+        );
+
+        // The recheck loop must iterate state 0's OWN per-state list (size 1),
+        // not the global union (size 2). The candidate counter is incremented
+        // once per token the loop visits, at loop entry, so it equals the size
+        // of the list actually iterated. A "iterate the union" regression
+        // would visit 2 and fail this assertion.
+        let counter_engine = GrammarEngine::new(&spec, vocab.clone()).expect("abcd grammar builds");
+        reset_context_recheck_candidates_for_test();
+        let mut c_state = counter_engine.initial_state();
+        let mut c_logits = vec![1.0f32; vocab.len()];
+        counter_engine
+            .mask_logits(&mut c_state, &mut c_logits)
+            .expect("mask for counter");
+        assert_eq!(
+            take_context_recheck_candidates_for_test(),
+            1,
+            "recheck loop must visit exactly state 0's per-state candidate (1),              not the global union (2): the per-state list drives the loop"
+        );
+
+        // Mutation: rebuild the engine and install state 0's row with the
+        // correct mask but an EMPTY per-state list (via the test seam, before
+        // first visit so the lazy row is never re-built from the grammar).
+        let engine = GrammarEngine::new(&spec, vocab.clone()).expect("abcd grammar builds");
+        let initial = engine.initial_state();
+        let mut mask = vec![0u64; engine.vocab_size.div_ceil(64)];
+        for (token_id, token_bytes) in vocab.iter().enumerate() {
+            if token_bytes.is_empty() {
+                continue;
+            }
+            if matches!(
+                simulate_token(&initial, &engine.grammar, token_bytes).0,
+                SimResult::Accept | SimResult::ContextDependent
+            ) {
+                mask[token_id / 64] |= 1u64 << (token_id % 64);
+            }
+        }
+        engine.partition.set_row_for_test(0, mask, Vec::new());
+
+        // With the list emptied, token 1 is mask-allowed but no longer rechecked,
+        // so it stays allowed; the loop now visits zero candidates.
+        reset_context_recheck_candidates_for_test();
+        let mut state = engine.initial_state();
+        let mut logits = vec![1.0f32; vocab.len()];
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("mutated mask");
+        assert_eq!(
+            take_context_recheck_candidates_for_test(),
+            0,
+            "with state 0's list emptied, the recheck loop visits no candidate"
+        );
+        assert_ne!(
+            logits[1],
+            f32::NEG_INFINITY,
+            "with state 0's per-state list emptied, b'ad' is no longer rechecked              and must stay allowed — the list is load-bearing"
+        );
+        // Everything else is unchanged: the mask, not the list, governs it.
+        for (i, (m, b)) in logits.iter().zip(b_logits.iter()).enumerate() {
+            if i == 1 {
+                continue;
+            }
+            assert_eq!(
+                m, b,
+                "token {i} must be unaffected by emptying state 0's list"
+            );
+        }
+    }
+
+    /// Driving a decode through some states must not build the rows of
+    /// states it never visits. This pins the hard invariant that
+    /// `find_state_id` — which iterates `num_states()` and
+    /// `grammar_state(sid)` on every decode step — must not force a row
+    /// build, or the laziness is defeated on the first decode step.
+    ///
+    /// The `a`/`b` decode visits states 0, 1 and 3; state 2 (after `c`)
+    /// is enumerated by the BFS but unreachable by this decode and must
+    /// stay uninitialised.
+    #[test]
+    fn unvisited_states_are_not_built() {
+        let spec = abcd_spec();
+        let vocab = abcd_vocab();
+        let engine = GrammarEngine::new(&spec, vocab.clone()).expect("abcd grammar builds");
+        assert_eq!(
+            engine.partition.num_states(),
+            4,
+            "initial, after-a, after-c, complete"
+        );
+        for sid in 0..4 {
+            assert!(
+                !engine.partition.row_is_built(sid),
+                "no row may be built before the first visit"
+            );
+        }
+
+        // Drive the `a`/`b` arm to completion. Fresh logits buffer per
+        // mask call, as a real forward pass produces fresh logits each step.
+        let mut state = engine.initial_state();
+        let mut logits = vec![1.0f32; vocab.len()];
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("first mask");
+        assert!(engine.advance(&mut state, 0), "'a' accepted");
+        let mut logits = vec![1.0f32; vocab.len()];
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("second mask");
+        assert!(engine.advance(&mut state, 2), "'b' accepted");
+        let mut logits = vec![1.0f32; vocab.len()];
+        engine
+            .mask_logits(&mut state, &mut logits)
+            .expect("third mask");
+        assert!(state.is_complete());
+
+        assert!(engine.partition.row_is_built(0), "state 0 visited");
+        assert!(engine.partition.row_is_built(1), "state 1 visited");
+        assert!(engine.partition.row_is_built(3), "complete state visited");
+        assert!(
+            !engine.partition.row_is_built(2),
+            "state 2 was never visited and must not have been built"
         );
     }
 }
