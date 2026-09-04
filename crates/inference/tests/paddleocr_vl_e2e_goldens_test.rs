@@ -22,6 +22,15 @@
 //!   loop and again by the uncached re-forward loop, which must agree
 //!   with each other as well as with the fixture.
 //!
+//! `e2e_image.png` itself is a synthetic document rendered for this test: a
+//! plain white page of generic mid-range lab values in a uniform system font,
+//! with no personal name, patient id, date, or institution, and none of the
+//! perspective, shadow, or page-edge artifacts a photographed document carries.
+//! It is not a photograph of a real record and holds no personal data, which is
+//! what makes it safe in a public repository. Recorded here because the rendered
+//! content is a medical report, so the question is a reasonable one to ask and
+//! an expensive one to re-answer from the bytes alone.
+//!
 //! **Fail-closed contract** (mirrors `paddleocr_vl_decoder_goldens_test.rs`):
 //! the ~1.9 GB checkpoint is not committed. With `LATTICE_POCR_MODEL_DIR`
 //! unset and the default `~/.lattice/models/paddleocr-vl-1.6` absent, this
