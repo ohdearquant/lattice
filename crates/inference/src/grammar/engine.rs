@@ -1819,7 +1819,11 @@ mod tests {
                 mask[token_id / 64] |= 1u64 << (token_id % 64);
             }
         }
-        engine.partition.set_row_for_test(0, mask, Vec::new());
+        // A stored (explicitly empty) per-state list, not `None` — `None`
+        // means "dense, fall back to the global union", which would hand
+        // the recheck loop the union [1, 3] instead of the empty list this
+        // mutation installs.
+        engine.partition.set_row_for_test(0, mask, Some(Vec::new()));
 
         // With the list emptied, token 1 is mask-allowed but no longer rechecked,
         // so it stays allowed; the loop now visits zero candidates.

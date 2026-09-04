@@ -35,10 +35,11 @@
 //!    step; builds the state's row on first use.
 //! 3. `VocabPartition::context_dependent_ids_for_state(state_id)` — returns
 //!    the token ids that need runtime PDA inspection in the current state,
-//!    from that state's own list.  An out-of-range `state_id` returns an
-//!    empty list (fail-closed): the caller has no precomputed mask for it
-//!    and must never fall back to another state's or the global union's
-//!    candidates.
+//!    from that state's own list; a state whose list was too dense to store
+//!    under its per-state budget falls back to the global union. An
+//!    out-of-range `state_id` returns an empty list (fail-closed): the
+//!    caller has no precomputed mask for it and must never fall back to
+//!    another state's or the global union's candidates.
 
 use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
@@ -91,12 +92,14 @@ pub struct VocabPartition {
 ///
 /// `mask` encodes which tokens are allowed (or optimistically allowed and
 /// pending the runtime context-dependent recheck) in this state.
-/// `context_dependent` lists the tokens that need runtime PDA inspection;
-/// every built row carries its own list, so a decode step in state `s`
-/// never consults any other state's candidates.
+/// `context_dependent` lists the tokens that need runtime PDA inspection in
+/// this state; `None` means the state's list was too dense to store under
+/// the per-state budget, so queries for the state fall back to the global
+/// union (a superset that preserves exact masking semantics at the cost of
+/// rechecking more tokens).
 struct StateRow {
     mask: Vec<u64>,
-    context_dependent: Vec<usize>,
+    context_dependent: Option<Vec<usize>>,
 }
 
 impl VocabPartition {
@@ -112,6 +115,12 @@ impl VocabPartition {
     /// (`build_state_row`), so construction no longer pays
     /// O(|states| × |vocab| × |token_length|) and only states a decode run
     /// actually reaches ever cost anything.
+    ///
+    /// The per-state context-dependent list is additionally bounded: a state
+    /// whose list would exceed `mask_stride.max(64)` entries (see
+    /// `context_entry_budget`) is stored as dense and falls back to the
+    /// global union on query, so a dense grammar cannot inflate the
+    /// per-state rows far beyond the mask table.
     ///
     /// `grammar` and `vocab_bytes` are shared (not cloned) with the caller
     /// — `GrammarEngine` keeps its own handles to the same allocation.
@@ -150,15 +159,18 @@ impl VocabPartition {
         }
     }
 
-    /// Simulate every (this state, token) pair into one row.
+    /// Simulate every (this state, token) pair, returning the mask and the
+    /// list of tokens that need runtime PDA inspection in this state.
     ///
-    /// Called once per state, on first visit, from `state_row` via
-    /// `OnceLock::get_or_init`.
-    fn build_state_row(
+    /// Pure function of `(grammar_state, grammar, vocab_bytes)`, so it is
+    /// safe to run twice for the same state: `build_state_row` uses it once
+    /// per row build, and `context_dependent_ids` uses it again for states
+    /// whose list was withheld under the per-state budget.
+    fn classify_state(
         grammar_state: &GrammarState,
         grammar: &CompiledGrammar,
         vocab_bytes: &[Vec<u8>],
-    ) -> StateRow {
+    ) -> (Vec<u64>, Vec<usize>) {
         let vocab_size = vocab_bytes.len();
         let mask_stride = vocab_size.div_ceil(64);
         let mut mask = vec![0u64; mask_stride];
@@ -192,10 +204,44 @@ impl VocabPartition {
             }
         }
         state_context_dependent.shrink_to_fit();
+        (mask, state_context_dependent)
+    }
 
+    /// Per-state budget for the stored context-dependent list: no more
+    /// entries than the state's mask holds words (`mask_stride`), with a
+    /// floor of 64 so tiny vocabularies never fall back. A dense
+    /// adversarial grammar can classify every token as context-dependent in
+    /// every state; without the bound, storing all of those ids would cost
+    /// 64x the masks on 64-bit hosts. Capping each state's list at its own
+    /// mask's stride keeps the aggregate per-state storage at most on par
+    /// with the mask table; the overflow case falls back to the global
+    /// union, which preserves exact masking semantics.
+    fn context_entry_budget(&self) -> usize {
+        self.mask_stride.max(64)
+    }
+
+    /// Simulate every (this state, token) pair into one row.
+    ///
+    /// Called once per state, on first visit, from `state_row` via
+    /// `OnceLock::get_or_init`.
+    fn build_state_row(
+        &self,
+        grammar_state: &GrammarState,
+        grammar: &CompiledGrammar,
+        vocab_bytes: &[Vec<u8>],
+    ) -> StateRow {
+        let (mask, state_context_dependent) =
+            Self::classify_state(grammar_state, grammar, vocab_bytes);
+        let context_dependent = if state_context_dependent.len() <= self.context_entry_budget() {
+            Some(state_context_dependent)
+        } else {
+            // Too dense to store under the per-state budget: query falls
+            // back to the global union.
+            None
+        };
         StateRow {
             mask,
-            context_dependent: state_context_dependent,
+            context_dependent,
         }
     }
 
@@ -206,7 +252,7 @@ impl VocabPartition {
     fn state_row(&self, state_id: usize) -> &StateRow {
         let cell = &self.rows[state_id];
         cell.get_or_init(|| {
-            Self::build_state_row(
+            self.build_state_row(
                 &self.states[state_id],
                 self.grammar.as_ref(),
                 self.vocab.as_ref(),
@@ -270,11 +316,30 @@ impl VocabPartition {
     /// Computed lazily on first call (which builds every state's row), so a
     /// partition whose states are never all visited does not pay for a
     /// full-scan union it does not need.
+    ///
+    /// The union is the complete set of context-dependent tokens: a dense
+    /// row that withheld its list contributes the tokens re-simulated for
+    /// it here, so the union never undercounts a state's candidates.
     pub fn context_dependent_ids(&self) -> &[usize] {
         self.context_dependent.get_or_init(|| {
             let mut union: HashSet<usize> = HashSet::new();
             for state_id in 0..self.num_states() {
-                union.extend(self.state_row(state_id).context_dependent.iter().copied());
+                let row = self.state_row(state_id);
+                match &row.context_dependent {
+                    Some(list) => {
+                        union.extend(list.iter().copied());
+                    }
+                    None => {
+                        // Dense row: the stored list was withheld, so the
+                        // union must classify this state itself.
+                        let (_, list) = Self::classify_state(
+                            &self.states[state_id],
+                            self.grammar.as_ref(),
+                            self.vocab.as_ref(),
+                        );
+                        union.extend(list);
+                    }
+                }
             }
             let mut v: Vec<usize> = union.into_iter().collect();
             v.sort_unstable();
@@ -283,7 +348,11 @@ impl VocabPartition {
     }
 
     /// Returns the token ids that need runtime PDA inspection in `state_id`,
-    /// from that state's own list (built on first visit).
+    /// from that state's own list (built on first visit). A dense state
+    /// (list withheld under the per-state budget) falls back to the global
+    /// union — a superset of the state's own candidates, so masking
+    /// semantics are preserved exactly: the recheck loop only rechecks more
+    /// tokens, it never skips one.
     ///
     /// An out-of-range `state_id` returns an empty slice — fail-closed. No
     /// other state's or the global union's candidates may stand in for an
@@ -295,7 +364,10 @@ impl VocabPartition {
         if state_id >= self.num_states() {
             return &[];
         }
-        &self.state_row(state_id).context_dependent
+        match &self.state_row(state_id).context_dependent {
+            Some(list) => list,
+            None => self.context_dependent_ids(),
+        }
     }
 
     /// Returns the number of precomputed grammar states.
@@ -343,6 +415,14 @@ impl VocabPartition {
             .is_some_and(|cell| cell.get().is_some())
     }
 
+    /// Whether `state_id`'s built row stored its own context-dependent list
+    /// (`Some`) or withheld it under the per-state budget and falls back to
+    /// the global union (`None`). Test hook for the memory-bound contract.
+    #[cfg(test)]
+    pub(crate) fn context_list_is_stored(&self, state_id: usize) -> bool {
+        self.state_row(state_id).context_dependent.is_some()
+    }
+
     /// Pre-seed the global union as empty so a test can prove the decode
     /// path never consults it. Idempotent and effective only while the
     /// union is still uninitialised — which holds for a freshly built
@@ -373,7 +453,7 @@ impl VocabPartition {
         &self,
         state_id: usize,
         mask: Vec<u64>,
-        context_dependent: Vec<usize>,
+        context_dependent: Option<Vec<usize>>,
     ) {
         let cell = self
             .rows
@@ -594,6 +674,59 @@ mod tests {
         partition.apply_mask(99, &mut logits);
         for l in &logits {
             assert_eq!(*l, f32::NEG_INFINITY, "unknown state blocks all tokens");
+        }
+    }
+
+    /// A grammar that classifies every token as context-dependent in every
+    /// state must not store an unbounded per-state list: each visited state
+    /// falls back to the global union instead.
+    ///
+    /// Fixture from the pre-refactor bound's own test: `root ::= "aaaa"`
+    /// (3 reachable states) over a 128-token vocabulary where every token is
+    /// `b"ax"` — a valid prefix `a` followed by an invalid `x`, so every
+    /// token is context-dependent in every state. The 128-token mask stride
+    /// is 2, so the per-state budget is the 64 floor; each state's 128-entry
+    /// list exceeds it and must be withheld.
+    #[test]
+    fn dense_state_lists_fall_back_within_mask_sized_budget() {
+        let mut builder = GrammarBuilder::new();
+        builder.add_rule(
+            "root",
+            vec![b"aaaa".iter().copied().map(Symbol::Terminal).collect()],
+        );
+        let grammar = builder.build();
+
+        let state0 = GrammarState::initial();
+        let mut state1 = state0.clone();
+        assert_eq!(
+            advance_byte(&mut state1, &grammar, b'a'),
+            StepResult::Accepted
+        );
+        let mut state2 = state1.clone();
+        assert_eq!(
+            advance_byte(&mut state2, &grammar, b'a'),
+            StepResult::Accepted
+        );
+
+        let vocab = vec![b"ax".to_vec(); 128];
+        let partition = VocabPartition::build(
+            &Arc::new(grammar),
+            vec![state0, state1, state2],
+            &Arc::new(vocab),
+        );
+
+        // All 128 tokens are context-dependent in every state.
+        assert_eq!(partition.context_dependent_ids().len(), 128);
+        for state_id in 0..3 {
+            assert!(
+                !partition.context_list_is_stored(state_id),
+                "dense state {state_id} must withhold its list under the per-state budget"
+            );
+            assert_eq!(
+                partition.context_dependent_ids_for_state(state_id),
+                partition.context_dependent_ids(),
+                "dense state {state_id} must fall back to the global union"
+            );
         }
     }
 
