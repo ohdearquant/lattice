@@ -677,6 +677,24 @@ impl Ernie45Model {
     /// enough for `positions.len()` tokens; the cache is caller-owned and
     /// the model keeps no state of its own.
     ///
+    /// Build a cache laid out for this model, sized for `capacity` tokens.
+    ///
+    /// [`Ernie45KvCache::new`] takes the layer count and the per-token KV width
+    /// as raw numbers, and the checked helper that derives the second one from a
+    /// config is crate-private. An out-of-crate caller therefore had to re-derive
+    /// `num_key_value_heads * head_dim` by hand, unchecked, and a layout that
+    /// disagrees with the model's is not rejected at construction: it surfaces
+    /// later and indirectly, as a shape mismatch inside a prefill. Going through
+    /// the model removes both the duplicated arithmetic and that failure mode.
+    ///
+    /// # Errors
+    ///
+    /// [`InferenceError::Inference`] on a zero dimension or a checked-arithmetic
+    /// overflow in the layout, propagated from [`Ernie45KvCache::new`].
+    pub fn new_kv_cache(&self, capacity: usize) -> Result<Ernie45KvCache, InferenceError> {
+        Ernie45KvCache::new(self.cfg.num_hidden_layers, self.cfg.kv_dim()?, capacity)
+    }
+
     /// # Errors
     ///
     /// [`InferenceError::Inference`] on an empty sequence, a sequence that
@@ -1329,6 +1347,43 @@ impl Ernie45KvCache {
     pub fn kv_dim(&self) -> usize {
         self.kv_dim
     }
+
+    /// Drop the stored rows without releasing the allocation, so the cache can
+    /// serve another prompt.
+    ///
+    /// Without this a caller decoding a second prompt has to drop the cache and
+    /// build a new one, because [`Ernie45Model::kv_prefill`] refuses a non-empty
+    /// cache and the stores are private. That throws away buffers which were
+    /// sized correctly and are about to be refilled with the same shapes, which
+    /// is the ordinary serving pattern rather than an edge case.
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// Roll the stored row count back to `len`, keeping the allocation.
+    ///
+    /// Rows above `len` are left in place rather than zeroed, and that is sound
+    /// rather than a shortcut: every read of the stores is bounded by the live
+    /// row count (the decode step attends over `len + 1` keys and slices
+    /// `..keys * kv_dim`), and each appended row is written at row `len` before
+    /// any read of it. So a stale row above `len` is unreachable until it is
+    /// overwritten by the append that makes it live again.
+    ///
+    /// Growing is not truncation: `len` above the current length is refused
+    /// rather than clamped, because the rows it would expose were never written
+    /// by this sequence and clamping would silently hand back a shorter cache
+    /// than the caller asked for.
+    pub fn truncate(&mut self, len: usize) -> Result<(), InferenceError> {
+        if len > self.len {
+            return Err(InferenceError::Inference(format!(
+                "ernie45 kv cache truncate: requested length {len} exceeds the {} rows stored; \
+                 truncation cannot grow a cache",
+                self.len
+            )));
+        }
+        self.len = len;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1881,6 +1936,137 @@ mod tests {
         let cfg = model.config();
         let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
         Ernie45KvCache::new(cfg.num_hidden_layers, kv_dim, capacity).unwrap()
+    }
+
+    /// The point of `clear`: a reused cache must be indistinguishable from a
+    /// freshly allocated one, not merely "close". Both arms run the same prompt
+    /// through prefill plus one decode step; the reused arm has already served a
+    /// different, longer prompt first, so if `clear` left any observable trace --
+    /// a stale row inside the attention window, a length that did not reset --
+    /// the two logit vectors would part. They are compared bitwise because both
+    /// arms perform identical arithmetic in identical order, so anything less
+    /// than equality is a defect rather than drift.
+    #[test]
+    fn kv_cleared_cache_is_indistinguishable_from_a_fresh_one() {
+        let (cfg, model) = equiv_model();
+        let h = cfg.hidden_size;
+        let embeds_a: Vec<f32> = pseudo_random_vec(6 * h, 0x51ed_c0de_c1ea_0001);
+        let positions_a: Vec<[u32; 3]> = (0..6u32).map(|i| [i, i, i]).collect();
+        let embeds_b: Vec<f32> = pseudo_random_vec(3 * h, 0x51ed_c0de_c1ea_0002);
+        let positions_b: Vec<[u32; 3]> = (0..3u32).map(|i| [i, i, i]).collect();
+        let step_row: Vec<f32> = pseudo_random_vec(h, 0x51ed_c0de_c1ea_0003);
+
+        // Reused arm: serve the LONGER prompt first, so any row left behind sits
+        // inside the window the second prompt will attend over.
+        let mut reused = kv_test_cache(&model, 8);
+        model
+            .kv_prefill(&embeds_a, &positions_a, &mut reused)
+            .unwrap();
+        model
+            .kv_decode_step(&step_row, [6, 6, 6], &mut reused)
+            .unwrap();
+        assert_eq!(
+            reused.len(),
+            7,
+            "setup: the first prompt must actually fill rows"
+        );
+        reused.clear();
+        assert!(reused.is_empty(), "clear must reset the live row count");
+        assert_eq!(
+            reused.capacity(),
+            8,
+            "clear must keep the allocation -- releasing it defeats the purpose"
+        );
+        let reused_prefill = model
+            .kv_prefill(&embeds_b, &positions_b, &mut reused)
+            .unwrap();
+        let reused_step = model
+            .kv_decode_step(&step_row, [3, 3, 3], &mut reused)
+            .unwrap();
+
+        // Fresh arm: same second prompt, never used before.
+        let mut fresh = kv_test_cache(&model, 8);
+        let fresh_prefill = model
+            .kv_prefill(&embeds_b, &positions_b, &mut fresh)
+            .unwrap();
+        let fresh_step = model
+            .kv_decode_step(&step_row, [3, 3, 3], &mut fresh)
+            .unwrap();
+
+        assert_eq!(
+            reused_prefill, fresh_prefill,
+            "prefill into a cleared cache diverged from a fresh one"
+        );
+        assert_eq!(
+            reused_step, fresh_step,
+            "decode after a cleared cache diverged from a fresh one"
+        );
+        assert_eq!(reused.len(), fresh.len());
+    }
+
+    /// `truncate` rolls back and refuses to grow. The growth arm matters more
+    /// than it looks: clamping instead of refusing would hand back a cache
+    /// shorter than asked for while reporting success.
+    #[test]
+    fn kv_truncate_rolls_back_and_refuses_to_grow() {
+        let (cfg, model) = equiv_model();
+        let h = cfg.hidden_size;
+        let embeds: Vec<f32> = pseudo_random_vec(5 * h, 0x51ed_c0de_c1ea_0004);
+        let positions: Vec<[u32; 3]> = (0..5u32).map(|i| [i, i, i]).collect();
+        let mut cache = kv_test_cache(&model, 8);
+        model.kv_prefill(&embeds, &positions, &mut cache).unwrap();
+        assert_eq!(cache.len(), 5);
+
+        cache.truncate(2).unwrap();
+        assert_eq!(cache.len(), 2, "truncate must roll the live row count back");
+        assert_eq!(
+            cache.capacity(),
+            8,
+            "truncate must not release the allocation"
+        );
+
+        // Growing is refused, and the length is left untouched by the refusal.
+        let grown = cache.truncate(4);
+        assert!(
+            matches!(&grown, Err(InferenceError::Inference(m)) if m.contains("cannot grow")),
+            "truncate must refuse to grow, got {grown:?}"
+        );
+        assert_eq!(
+            cache.len(),
+            2,
+            "a refused truncate must not move the length"
+        );
+
+        // Truncating to the current length is a no-op, not an error.
+        cache.truncate(2).unwrap();
+        assert_eq!(cache.len(), 2);
+        cache.truncate(0).unwrap();
+        assert!(cache.is_empty());
+    }
+
+    /// The model-bound constructor must produce exactly the layout the hand-built
+    /// one does -- otherwise it trades a duplicated calculation for a divergent
+    /// one, which is worse than the problem it solves.
+    #[test]
+    fn kv_model_bound_cache_matches_the_hand_built_layout() {
+        let (cfg, model) = equiv_model();
+        let built = model.new_kv_cache(8).unwrap();
+        let hand = kv_test_cache(&model, 8);
+        assert_eq!(built.layers(), hand.layers());
+        assert_eq!(built.kv_dim(), hand.kv_dim());
+        assert_eq!(built.capacity(), hand.capacity());
+        assert!(built.is_empty());
+        // And it agrees with the config's own checked derivation.
+        assert_eq!(built.kv_dim(), cfg.kv_dim().unwrap());
+        assert_eq!(built.layers(), cfg.num_hidden_layers);
+        // A cache from this path is usable by prefill -- the layout check inside
+        // kv_prefill is what would reject a wrong one.
+        let h = cfg.hidden_size;
+        let embeds: Vec<f32> = pseudo_random_vec(2 * h, 0x51ed_c0de_c1ea_0005);
+        let positions: Vec<[u32; 3]> = (0..2u32).map(|i| [i, i, i]).collect();
+        let mut built = built;
+        model.kv_prefill(&embeds, &positions, &mut built).unwrap();
+        assert_eq!(built.len(), 2);
     }
 
     /// The prefill's returned logits are the full forward's last row —
