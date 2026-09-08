@@ -60,3 +60,63 @@ Run the miner's fixture tests with:
 uv run --no-project python -m unittest discover \
   -s scripts/microlora -p 'test_mine_commit_msg.py'
 ```
+
+## Natural-language requests to DSL
+
+Capture the complete live registry using `verbs()`, then capture each listed verb
+with `<verb>(help=true)`. Store the unchanged result objects in a local directory
+named by `SCHEMA_DIR`: `_verbs.json` for the registry and `<verb>.json` for every
+help result. Keep the original response envelopes alongside the capture when
+available. The generator requires every registered schema and records input hashes.
+
+Build the parser validator against a local runtime checkout. Set `VALIDATOR` to an
+executable output path outside that runtime checkout:
+
+```sh
+uv run --no-project scripts/microlora/build_dsl_validator.py \
+  --runtime-repo "$RUNTIME_REPO" \
+  --out "$VALIDATOR"
+
+uv run --no-project scripts/microlora/synth_khive_dsl.py \
+  --schemas "$SCHEMA_DIR" \
+  --validator "$VALIDATOR" \
+  --out "$DATA_DIR/khive-dsl"
+```
+
+The builder uses an ephemeral Cargo project and cached dependencies with
+`cargo build --offline`; it does not add a crate to either workspace. An optional
+`--target-dir` retains a dedicated build cache. The default temporary build cache
+is removed after the executable, lockfile, build log, and source-hash receipt are
+saved. Rebuilding at the same output path reuses the saved lockfile with `--locked`.
+
+The validator calls the runtime's real request parser and round-trips its AST.
+It never dispatches operations. The generator checks registered verbs, required
+parameters, parameter types, intended AST equality, and every file after readback.
+These checks establish syntax and the stated schema contracts; they do not prove
+record existence, authorization, or successful execution against a database.
+
+Output includes the three JSONL splits, matching `.provenance.jsonl` sidecars, and
+`CURATION.md`. It must be local storage outside tracked paths; repository locations
+must be ignored and untracked. Generated data is never part of the source commit.
+The fixed partition assigns whole verbs to splits, with the entire `schedule` pack
+held out for testing. Batches, chains, and embedded scheduled actions must stay
+within one partition. The report lists actual small-pack proportions, unsupported
+verbs, template counts, and validation limits.
+
+To include recorded calls, add `--merge-real "$REAL_JSONL"`. Each input row must
+contain string `ops`, boolean `ok`, and optionally `error` and `corrected_ops`.
+Successful calls become rendering-reference exercises because this input format
+contains no observed natural-language request. Failed calls need an explicit
+correction or one uniquely recognized parameter-name correction; other failures
+are skipped with reasons. Recorded calls receive the same parser and split checks.
+
+Run all DSL tests, including the actual parser and full dataset generation, with:
+
+```sh
+uv run --no-project scripts/microlora/test_synth_khive_dsl.py \
+  --schemas "$SCHEMA_DIR" \
+  --validator "$VALIDATOR"
+```
+
+The DSL generator also uses character budgets rather than tokenization. Check
+the final prompt-plus-completion tokens with the target model before training.
