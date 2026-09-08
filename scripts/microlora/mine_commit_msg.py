@@ -167,6 +167,39 @@ def pin_source(path: Path) -> Source:
     return Source(path, match[1], sha, origin)
 
 
+def apply_main_pins(sources: list[Source], entries: list[str]) -> list[Source]:
+    by_name = {source.name: source for source in sources}
+    pins = {}
+    for entry in entries:
+        match = re.fullmatch(r"([a-z0-9_-]+)=([0-9a-f]{40}|[0-9a-f]{64})", entry)
+        if not match or match[1] not in by_name or match[1] in pins:
+            raise CurationError(
+                "main pins require distinct selected repository names and full lowercase commit hashes"
+            )
+        pins[match[1]] = match[2]
+    pinned = []
+    for source in sources:
+        if source.name not in pins:
+            pinned.append(source)
+            continue
+        sha = pins[source.name]
+        if (
+            git(source.path, "rev-parse", "--verify", f"{sha}^{{commit}}").strip()
+            != sha
+        ):
+            raise CurationError(
+                f"{source.name}: pin does not identify a full commit hash"
+            )
+        try:
+            git(source.path, "merge-base", "--is-ancestor", sha, source.sha)
+        except CurationError as exc:
+            raise CurationError(
+                f"{source.name}: requested pin is not a verified ancestor of local main"
+            ) from exc
+        pinned.append(Source(source.path, source.name, sha, source.origin))
+    return pinned
+
+
 def time_split(authored: datetime) -> str:
     if authored.tzinfo is None:
         raise CurationError("author date has no timezone")
@@ -493,7 +526,7 @@ def write_outputs(
         "",
         "Sources are local clones of the three approved public repositories. Origin allowlisting is a local identity check, not a fresh remote visibility check. No fetch or source checkout changes are performed.",
         "",
-        "| Repository | Local path | Pinned local main | Origin |",
+        "| Repository | Local path | Pinned main snapshot | Origin |",
         "| --- | --- | --- | --- |",
     ]
     report.extend(
@@ -504,7 +537,7 @@ def write_outputs(
             "",
             "## Recipe",
             "",
-            "Walk each pinned main with `git log --first-parent --no-merges` in a temporary bare reader sharing only the source object store. Render attributes from the pinned main tree; source worktree/index/info attributes and source/global/system config cannot affect the reader. Splits use author timestamps normalized to UTC: train before 2026-07-15T00:00:00Z; valid from then until 2026-08-15T00:00:00Z; test thereafter. Committer date is not used.",
+            "Walk each pinned main with `git log --first-parent --no-merges` in a temporary bare reader sharing only the source object store. Replay with `--pin-main name=full-sha` for every repository in the source table; explicit pins must identify commits reachable from the current local main. Render attributes from the pinned main tree; source worktree/index/info attributes and source/global/system config cannot affect the reader. Splits use author timestamps normalized to UTC: train before 2026-07-15T00:00:00Z; valid from then until 2026-08-15T00:00:00Z; test thereafter. Committer date is not used.",
             "",
             "Keep conventional subjects with at least eight description characters; remove PR-number suffixes and Co-Authored-By, Claude-Session, Signed-off-by trailer lines plus their continuations. Exclude the two named bots. Include a nonempty body only below 200 characters and when the completion fits 300 characters; otherwise keep the subject alone.",
             "",
@@ -657,6 +690,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument(
+        "--pin-main",
+        action="append",
+        default=[],
+        metavar="REPO=SHA",
+        help="Replay a full main commit snapshot for a selected repository; repeat per repository.",
+    )
+    parser.add_argument(
         "--reject-pairs",
         type=Path,
         help="JSON array of exact pair SHA-256 hashes rejected by a separate tokenizer check.",
@@ -668,6 +708,7 @@ def main(argv: list[str] | None = None) -> int:
         ]
         if len({s.name for s in sources}) != len(sources):
             raise CurationError("provide each public repository at most once")
+        sources = apply_main_pins(sources, args.pin_main)
         counts: dict[str, Counter] = {s.name: Counter() for s in sources}
         rejections: set[str] = set()
         rejection_note = None

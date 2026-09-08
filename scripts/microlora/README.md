@@ -28,6 +28,12 @@ Git must support `--attr-source`. An isolated temporary bare repository reads th
 source objects and the pinned tree's attributes, so local configuration, untracked
 attributes, and the source index cannot change the rendered patches.
 
+For a later replay, supply the full recorded commit ID for every repository with
+repeated `--pin-main name=full-sha` arguments, using names `lattice`, `khive`, and
+`lionagi`. Each revision must be a commit reachable from that repository's current
+local `main`. Explicit pins keep a moving branch from changing the corpus; no
+source branch or checkout is modified.
+
 The author timestamp determines the split:
 
 | Split | Author timestamp in UTC       |

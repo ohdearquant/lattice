@@ -333,6 +333,44 @@ class GitFixtureTests(unittest.TestCase):
         ):
             self.assertEqual(miner.mine(source, Counter()), baseline)
 
+    def test_explicit_main_snapshot_survives_advance_and_rejects_invalid_pins(self):
+        self.commit(
+            "first.rs",
+            "pub fn first() {}\n",
+            "feat: introduce first snapshot",
+            "2026-07-01T00:00:00+00:00",
+        )
+        original = miner.pin_source(self.repo)
+        baseline = miner.mine(original, Counter())
+        self.commit(
+            "second.rs",
+            "pub fn second() {}\n",
+            "feat: advance local main snapshot",
+            "2026-08-20T00:00:00+00:00",
+        )
+        current = miner.pin_source(self.repo)
+        replay = miner.apply_main_pins([current], [f"lattice={original.sha}"])[0]
+        self.assertEqual(miner.mine(replay, Counter()), baseline)
+        self.assertEqual(len(miner.mine(current, Counter())), 2)
+        self.run_git("checkout", "-b", "side", original.sha)
+        self.commit(
+            "side.rs",
+            "pub fn side() {}\n",
+            "feat: introduce unmerged side snapshot",
+            "2026-08-21T00:00:00+00:00",
+        )
+        side_sha = self.run_git("rev-parse", "HEAD")
+        for entries in (
+            [f"lattice={side_sha}"],
+            ["lattice=" + "0" * 40],
+            ["lattice=HEAD"],
+            [f"unknown={original.sha}"],
+            [f"khive={original.sha}"],
+            [f"lattice={original.sha}", f"lattice={original.sha}"],
+        ):
+            with self.subTest(entries=entries), self.assertRaises(miner.CurationError):
+                miner.apply_main_pins([current], entries)
+
 
 if __name__ == "__main__":
     unittest.main()
