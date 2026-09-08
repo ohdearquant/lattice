@@ -704,10 +704,12 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             Ok(vs) if !vs.is_empty() => {
                 check_cache_budget(&vs, dims.hidden, dims.rope_dim, "valid")?;
                 check_valid_logits_budget(&vs, dims.vocab, gradcheck)?;
+                let tvalid = Instant::now();
                 let (vc, vpos) = build_caches(&model, &vs, first_layer)?;
                 println!(
-                    "  held-out: {vpos} completion positions across {} valid samples",
-                    vc.len()
+                    "  held-out: {vpos} completion positions across {} valid samples in {:.1}s",
+                    vc.len(),
+                    tvalid.elapsed().as_secs_f64()
                 );
                 vc
             }
@@ -728,6 +730,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         .map(|_| GdnLoraParams::zeros(rank, dims.hidden, &gdn_dims))
         .collect::<Result<Vec<_>, _>>()?;
     {
+        let ttbv = Instant::now();
         let s0 = &train_samples[0];
         let model_nlls = model.compute_token_nlls(&s0.tokens)?;
         let start = s0.completion_start - 1;
@@ -747,8 +750,9 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             chain_masked,
         )?;
         println!(
-            "\n  TBV (sample 0): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}",
-            observation.diff
+            "\n  TBV (sample 0): model={model_masked:.5}  chain={chain_masked:.5}  diff={:.2e}  in {:.1}s",
+            observation.diff,
+            ttbv.elapsed().as_secs_f64()
         );
     }
 
@@ -1030,8 +1034,20 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         )?))
     };
 
+    // These two passes are reported because they are real work that used to print nothing at all.
+    // Measured on a representative run, the phases outside the step-loop clock cover roughly 46% of
+    // the run, so a cost model built from the step loop alone understates by a term that grows with
+    // the pool and the held-out size. Every phase now states its own duration, which makes an
+    // external wall clock a CHECK on this log rather than the only place the time can be found.
+    let tbase_train = Instant::now();
     let base_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+    let base_train_secs = tbase_train.elapsed().as_secs_f64();
+    let tbase_valid = Instant::now();
     let base_valid = eval_valid(&loras, &gdn_loras)?;
+    let base_valid_secs = tbase_valid.elapsed().as_secs_f64();
+    println!(
+        "  baseline scoring: train pass {base_train_secs:.1}s, held-out pass {base_valid_secs:.1}s"
+    );
     match base_valid {
         Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
         None => println!("\n  step    0  train NLL: {base_nll:.4}"),
