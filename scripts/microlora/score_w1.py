@@ -50,7 +50,7 @@ def read_log(path: Path) -> dict:
             "ho_drop": (ho[0] - ho[-1]) / ho[0]}
 
 
-def verdict(real: list[dict], perm: list[dict], thr: float) -> tuple[str, str]:
+def verdict(real: list[dict], perm: list[dict], bar: float) -> tuple[str, str]:
     if not real:
         return "REFUSED", "no real-label arm was supplied; there is nothing to decide"
     if not perm:
@@ -59,13 +59,13 @@ def verdict(real: list[dict], perm: list[dict], thr: float) -> tuple[str, str]:
                           "real-arm drop alone cannot be read")
     r = st.mean(d["ho_drop"] for d in real)
     p = st.mean(d["ho_drop"] for d in perm)
-    if p >= thr:
-        return "KILL", (f"the permuted arm reached {p:.1%}, at or above the {thr:.0%} bar. Training "
+    if p >= bar:
+        return "KILL", (f"the permuted arm reached {p:.1%}, at or above the {bar:.0%} bar. Training "
                         f"on scrambled labels produces a passing score, so this metric is measuring "
                         f"format acquisition and cannot decide W1 on this task")
-    if r < thr:
-        return "FAIL", f"the real arm reached {r:.1%}, below the {thr:.0%} bar"
-    return "PASS", (f"real {r:.1%} clears {thr:.0%} while permuted {p:.1%} does not; "
+    if r < bar:
+        return "FAIL", f"the real arm reached {r:.1%}, below the {bar:.0%} bar"
+    return "PASS", (f"real {r:.1%} clears {bar:.0%} while permuted {p:.1%} does not; "
                     f"margin {r - p:+.1%}")
 
 
