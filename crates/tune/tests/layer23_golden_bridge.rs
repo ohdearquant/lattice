@@ -248,6 +248,7 @@ fn compatibility_shim_matches_legacy_layer23_golden() {
         seq_len_cap: 32,
         max_train: 1,
         max_valid: 0,
+        seed: 0xFEED_FACEu64,
         log_every: 1,
         gradcheck: true,
         gradcheck_strided_probes: false,

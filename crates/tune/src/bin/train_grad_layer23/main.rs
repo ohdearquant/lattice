@@ -81,6 +81,7 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3),
         max_valid: 0,
+        seed: 0xFEED_FACEu64,
         log_every,
         gradcheck: false,
         gradcheck_strided_probes: false,

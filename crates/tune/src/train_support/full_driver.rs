@@ -130,6 +130,38 @@ fn zero_b_gdn_loras(
         .collect()
 }
 
+fn training_lora(dims: &Dims, rank: usize, rng: &mut u64, init_amp: f32) -> LoraParams {
+    LoraParams {
+        a_q: rand_fill(rng, rank * dims.hidden, init_amp),
+        b_q: vec![0.0; 2 * dims.q_dim * rank],
+        a_v: rand_fill(rng, rank * dims.hidden, init_amp),
+        b_v: vec![0.0; dims.kv_dim * rank],
+    }
+}
+
+/// Draw the training LoRA slots from `seed`, returning them with the advanced RNG
+/// state so the GDN initializer can continue the same stream.
+///
+/// THE SEED ARRIVES AS AN ARGUMENT AND THE CALLER KEEPS NO GENERATOR OF ITS OWN.
+/// The earlier shape left `let mut rng = seed;` inline in [`run`], one line that no
+/// test could reach: a test calling the per-slot helper directly still passed with
+/// that line changed back to a literal, which was measured. Folding the whole step
+/// into one seeded function removes the untestable line rather than testing around
+/// it, so re-hardcoding the seed anywhere on this path now fails a test.
+fn initial_training_loras(
+    seed: u64,
+    num_slots: usize,
+    dims: &Dims,
+    rank: usize,
+    init_amp: f32,
+) -> (Vec<LoraParams>, u64) {
+    let mut rng = seed;
+    let loras: Vec<LoraParams> = (0..num_slots)
+        .map(|_| training_lora(dims, rank, &mut rng, init_amp))
+        .collect();
+    (loras, rng)
+}
+
 /// Fully resolved options for the shared multi-layer training driver.
 #[derive(Debug)]
 pub struct FullDriverConfig {
@@ -143,6 +175,8 @@ pub struct FullDriverConfig {
     pub seq_len_cap: usize,
     pub max_train: usize,
     pub max_valid: usize,
+    /// LoRA initialization seed for training; gradcheck uses its fixed seed.
+    pub seed: u64,
     pub log_every: usize,
     pub gradcheck: bool,
     /// Whether gradcheck supplements top-gradient entries with deterministic
@@ -452,6 +486,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         seq_len_cap,
         max_train,
         max_valid,
+        seed,
         log_every,
         gradcheck,
         gradcheck_strided_probes,
@@ -497,7 +532,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     println!("data-dir:   {}", data_dir.display());
     println!("steps:      {steps}  lr: {lr}  rank: {rank}  alpha: {alpha}");
     println!(
-        "max-train:  {max_train}  seq-len: {seq_len_cap}  mode: {}",
+        "max-train:  {max_train}  seq-len: {seq_len_cap}  seed: {seed}  mode: {}",
         if gradcheck { "gradcheck" } else { "train" }
     );
     println!();
@@ -971,15 +1006,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         Some(amplitude) => amplitude,
         None => 1.0 / (dims.hidden as f32).sqrt(),
     };
-    let mut rng = 0xFEED_FACEu64;
-    let mut loras: Vec<LoraParams> = (0..num_slots)
-        .map(|_| LoraParams {
-            a_q: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_q: vec![0.0; 2 * dims.q_dim * rank],
-            a_v: rand_fill(&mut rng, rank * dims.hidden, init_amp),
-            b_v: vec![0.0; dims.kv_dim * rank],
-        })
-        .collect();
+    let (mut loras, rng) = initial_training_loras(seed, num_slots, &dims, rank, init_amp);
     // Reuses `rng`'s current stream position as the seed (matches the prior
     // inline behavior of drawing from the same generator as `loras` above).
     let mut gdn_loras: Vec<GdnLoraParams> =
@@ -1191,6 +1218,7 @@ mod run_bounds_tests {
             seq_len_cap: 64,
             max_train: 3,
             max_valid: 0,
+            seed: 0xFEED_FACEu64,
             log_every: 5,
             gradcheck: false,
             gradcheck_strided_probes: false,
@@ -1199,6 +1227,48 @@ mod run_bounds_tests {
             save_path: None,
             a_init_amp: None,
         }
+    }
+
+    #[test]
+    fn training_seed_controls_initial_a_q_bytes() {
+        let dims = Dims {
+            hidden: 4,
+            q_dim: 2,
+            kv_dim: 2,
+            ..tape_test_dims()
+        };
+        // Goes through the same function `run` calls, so re-hardcoding the seed on
+        // that path fails here. Calling the per-slot helper instead would not: that
+        // version passed with `run`'s wiring reverted.
+        let init = |config: &FullDriverConfig| {
+            let (loras, next_rng) = initial_training_loras(config.seed, 2, &dims, config.rank, 0.5);
+            let bytes: Vec<u8> = loras
+                .into_iter()
+                .flat_map(|l| l.a_q)
+                .flat_map(f32::to_ne_bytes)
+                .collect();
+            (bytes, next_rng)
+        };
+        let config = base_config();
+        let mut other = base_config();
+        other.seed = 42;
+        assert_eq!(
+            init(&config),
+            init(&base_config()),
+            "same seed must reproduce bytes"
+        );
+        assert_ne!(
+            init(&config).0,
+            init(&other).0,
+            "different seeds must differ"
+        );
+        // The GDN slots continue this stream, so the advanced state must move with
+        // the seed as well; otherwise only half the adapter would be reproducible.
+        assert_ne!(
+            init(&config).1,
+            init(&other).1,
+            "advanced RNG state must follow the seed"
+        );
     }
 
     /// `FullDriverOutcome` has no `Debug` impl, so `Result::unwrap_err` isn't

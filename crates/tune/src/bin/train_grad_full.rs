@@ -20,6 +20,7 @@ Options:
   --alpha       <F>      LoRA alpha (default: 16.0)
   --seq-len     <N>      Max tokens per sample (default: 64)
   --max-train   <N>      Training samples cap (default: 3)
+  --seed        <N>      LoRA initialization seed (default: 4277009102)
   --max-valid   <N>      Held-out valid.jsonl samples for eval, 0=off (default: 16)
   --log-every   <N>      Print NLL every N steps (default: 5)
   --save        <PATH>   Save trained adapter as a PEFT safetensors file (requires --features safetensors)
@@ -76,6 +77,10 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
             .arg("--max-valid")
             .and_then(|s| s.parse().ok())
             .unwrap_or(16),
+        seed: argv
+            .arg("--seed")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0xFEED_FACEu64),
         log_every,
         gradcheck: argv.flag("--gradcheck"),
         gradcheck_strided_probes: true,
@@ -124,6 +129,7 @@ mod tests {
         assert_eq!(cfg.alpha, 16.0);
         assert_eq!(cfg.seq_len_cap, 64);
         assert_eq!(cfg.max_train, 3);
+        assert_eq!(cfg.seed, 0xFEED_FACEu64);
         assert_eq!(cfg.max_valid, 16);
         assert_eq!(cfg.log_every, 5);
         assert!(!cfg.gradcheck);
@@ -158,6 +164,8 @@ mod tests {
             "1",
             "--max-valid",
             "0",
+            "--seed",
+            "42",
             "--log-every",
             "3",
             "--gradcheck",
@@ -178,6 +186,7 @@ mod tests {
         assert_eq!(cfg.alpha, 32.0);
         assert_eq!(cfg.seq_len_cap, 48);
         assert_eq!(cfg.max_train, 1);
+        assert_eq!(cfg.seed, 42);
         assert_eq!(cfg.max_valid, 0);
         assert_eq!(cfg.log_every, 3);
         assert!(cfg.gradcheck);
