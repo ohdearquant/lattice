@@ -1073,7 +1073,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     // just scored, recomputing an identical value from an unchanged state: a full train pass plus a
     // full held-out pass, 558s at the sizes above, paid once per run for nothing. Carry the loop's
     // own last scoring forward instead of repeating it.
-    let mut last_scored: Option<(f64, Option<f64>)> = None;
+    let mut last_scored: Option<(f32, Option<f32>)> = None;
     let tstep = Instant::now();
     for step in 1..=steps {
         let tone = Instant::now();
