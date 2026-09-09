@@ -52,8 +52,13 @@ done
 [ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 2; }
 TIMER="$(cd "$(dirname "$0")" && pwd)/time_run.sh"
 # The trainer's own "in Xs" figure is its step loop only and omits the model load, the held-out
-# cache build and both baseline scoring passes; measured on a representative run it covered 42%
-# of the wall clock. Any duration this script leaves behind must therefore come from an external clock.
+# cache build and both baseline scoring passes. Any duration this script leaves behind must
+# therefore come from an external clock.
+#
+# The "42% of the wall clock" figure this line used to carry is WITHDRAWN. It was a ratio of the
+# trainer's own clock to WALL clock, measured on a machine that thermally sleeps under load; a
+# sleep inflates wall while the trainer's clock does not advance, so the ratio measured the box as
+# much as the trainer. The omission it described is real and was verified against the source.
 [ -x "$TIMER" ] || { echo "REFUSED: $TIMER missing; wall clocks would be loop-only" >&2; exit 2; }
 [ -f "$DATA/train.jsonl" ] && [ -f "$DATA/valid.jsonl" ] || { echo "need train.jsonl and valid.jsonl under $DATA" >&2; exit 2; }
 

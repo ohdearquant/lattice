@@ -1035,10 +1035,24 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     };
 
     // These two passes are reported because they are real work that used to print nothing at all.
-    // Measured on a representative run, the phases outside the step-loop clock cover roughly 46% of
-    // the run, so a cost model built from the step loop alone understates by a term that grows with
-    // the pool and the held-out size. Every phase now states its own duration, which makes an
-    // external wall clock a CHECK on this log rather than the only place the time can be found.
+    // A cost model built from the step-loop clock alone understates by a term that grows with the
+    // pool and the held-out size, so every phase states its own duration and an external wall clock
+    // becomes a CHECK on this log rather than the only place the time can be found.
+    //
+    // THE "ROUGHLY 46% OF THE RUN" FIGURE THIS COMMENT CARRIED IS WITHDRAWN. It was a ratio of
+    // phase time to WALL time taken on a machine that thermally sleeps under load, and a sleep
+    // inflates the denominator without touching the numerator: `Instant` is `mach_absolute_time`
+    // and does not advance while the machine is asleep. That ratio therefore measured the box's
+    // thermal behaviour mixed with this code's instrumentation gap, and the two cannot be
+    // separated after the fact. The gap it described is real and was verified at source; only its
+    // size came from the bad instrument.
+    //
+    // Replacement, from one externally stamped run at max-train 32 / max-valid 22 — named rather
+    // than called "representative", because that word is not checkable: prologue phases totalled
+    // 1895.4s (model load 3.7, prefix cache 959.9, held-out cache 350.5, consistency check 23.2,
+    // baseline train 354.6, baseline held-out 203.5) against 533s inside the step loop. The phases
+    // outside the loop are the large majority of the work, which is a stronger claim than the
+    // withdrawn one rather than a weaker one.
     let tbase_train = Instant::now();
     let base_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
     let base_train_secs = tbase_train.elapsed().as_secs_f64();
