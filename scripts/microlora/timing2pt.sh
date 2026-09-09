@@ -11,10 +11,19 @@
 #
 # WHAT THIS VERSION FIXES, and it would have produced a confidently wrong number. The previous
 # version reported `total=${t}s` where t was scraped from the trainer's own `in Xs ===` line. That
-# figure is the STEP LOOP ONLY. Measured on a representative run: model load 4.3s, prefix cache
-# 312.9s, step loop 1088.8s, total accounted 1406.0s against a wall span of about 2590s. The
-# held-out cache build and both baseline scoring passes print NO duration at all, so roughly 1184s,
-# 46% of the arm, was invisible, and the self-report covered 42% of the run.
+# figure is the STEP LOOP ONLY: the held-out cache build and both baseline scoring passes printed
+# no duration at all, which was verified by reading the driver rather than inferred from a clock.
+#
+# THE ARITHMETIC THIS PARAGRAPH CARRIED IS WITHDRAWN: "total accounted 1406.0s against a wall span
+# of about 2590s, so roughly 1184s, 46% of the arm, was invisible, and the self-report covered 42%
+# of the run." The 1184s was a wall-minus-accounted residual on a machine that thermally sleeps
+# under load, and that machine's own sleep log records single events of 388s, 556s and 864s on the
+# day in question. A residual of that size in a span of that size is indistinguishable from one or
+# two sleeps, so it cannot be attributed to missing instrumentation. `Instant` does not advance
+# while the machine sleeps, so a sleep enlarges the residual by its full duration.
+#
+# What survives, and it is the part this script acts on: the reported figure covers the step loop
+# only, so a total must come from an external clock around the whole process.
 #
 # The failure would not have looked like a failure: both points would have been understated by their
 # own prologues while the DIFFERENCE still isolated scoring passes correctly inside the timed
