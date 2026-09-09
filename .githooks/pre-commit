@@ -144,4 +144,10 @@ fi
 # this check exists for, so it must never ride on the skip above.
 ./scripts/lint-docs.sh
 
+# Also on both branches, and for the same reason in reverse: this one is about
+# the Rust files the workspace gates cannot see, so a commit that skipped those
+# gates is precisely when it still needs to run. It needs rustfmt and one
+# `cargo metadata` read (measured 0.15s), never a build.
+./scripts/lint-rust-fmt-coverage.sh
+
 echo "Pre-commit checks passed."
