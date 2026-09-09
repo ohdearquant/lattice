@@ -12,6 +12,12 @@ export LATTICE_REQUIRE_FIXTURES
 echo "=== Format Check ==="
 cargo fmt --all -- --check
 
+# `cargo fmt --all` covers workspace members only, so a tracked .rs outside every
+# member is formatted by nothing. This names that set and rustfmt-checks it.
+echo "=== Rust Format Coverage ==="
+./scripts/lint-rust-fmt-coverage.sh --selftest
+./scripts/lint-rust-fmt-coverage.sh
+
 echo "=== Clippy ==="
 cargo clippy --workspace -- -D warnings
 
