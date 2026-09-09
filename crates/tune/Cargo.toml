@@ -41,6 +41,7 @@ chrono.workspace = true
 sha2.workspace = true
 arc-swap.workspace = true
 parking_lot.workspace = true
+rayon = { workspace = true }
 
 # GPU dependencies (optional)
 wgpu = { version = "23.0", optional = true }
