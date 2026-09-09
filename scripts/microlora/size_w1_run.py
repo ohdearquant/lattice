@@ -5,7 +5,7 @@ The exact-gradient CPU trainer has three cost terms and only one of them is the 
 itself. Reading them off a real run matters because the two overheads dominate:
 
   CACHE   building the frozen-prefix cache, once per run, linear in the number of TRAIN
-          samples. It is not persisted, so every arm of a multi-seat experiment pays it again.
+          samples. It is not persisted, so every arm of a multi-arm experiment pays it again.
   SCORE   a scoring pass over EVERY train cache plus every held-out cache. It fires at the
           baseline, at each `--log-every` boundary, at the last step, and once more at the
           end, so a run pays for at least three of them however the flag is set.
