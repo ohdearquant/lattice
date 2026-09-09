@@ -73,256 +73,259 @@ use std::sync::Arc;
 #[napi(object)]
 #[allow(non_snake_case)]
 pub struct LoadOptions {
-  pub modelPath: String,
-  pub modelId: Option<String>,
-  pub normalize: Option<bool>,
+    pub modelPath: String,
+    pub modelId: Option<String>,
+    pub normalize: Option<bool>,
 }
 
 #[napi(object)]
 pub struct EmbeddingBatch {
-  pub data: Float32Array,
-  pub rows: u32,
-  pub dimensions: u32,
-  pub normalized: bool,
+    pub data: Float32Array,
+    pub rows: u32,
+    pub dimensions: u32,
+    pub normalized: bool,
 }
 
 #[napi]
 pub struct EmbeddingModel {
-  model: Arc<BertModel>,
-  dimension: u32,
+    model: Arc<BertModel>,
+    dimension: u32,
 }
 
 #[napi]
 impl EmbeddingModel {
-  #[napi(constructor)]
-  pub fn new(options: LoadOptions) -> Result<Self> {
-    Self::from_options(options)
-  }
+    #[napi(constructor)]
+    pub fn new(options: LoadOptions) -> Result<Self> {
+        Self::from_options(options)
+    }
 
-  #[napi(getter)]
-  pub fn dimension(&self) -> u32 {
-    self.dimension
-  }
+    #[napi(getter)]
+    pub fn dimension(&self) -> u32 {
+        self.dimension
+    }
 
-  /// Always `true` in this v0 binding; see the module doc comment's
-  /// "Known v0 limitation" section for why `normalize: false` is rejected
-  /// at load time rather than silently ignored here.
-  #[napi(getter)]
-  pub fn normalized(&self) -> bool {
-    true
-  }
+    /// Always `true` in this v0 binding; see the module doc comment's
+    /// "Known v0 limitation" section for why `normalize: false` is rejected
+    /// at load time rather than silently ignored here.
+    #[napi(getter)]
+    pub fn normalized(&self) -> bool {
+        true
+    }
 
-  #[napi]
-  pub fn embed_sync(&self, text: String) -> Result<Float32Array> {
-    validate_text(&text, 0)?;
-    let output = encode_one(&self.model, &text)?;
-    Ok(output.into())
-  }
+    #[napi]
+    pub fn embed_sync(&self, text: String) -> Result<Float32Array> {
+        validate_text(&text, 0)?;
+        let output = encode_one(&self.model, &text)?;
+        Ok(output.into())
+    }
 
-  #[napi]
-  pub fn embed(&self, text: String) -> Result<AsyncTask<EmbedTask>> {
-    validate_text(&text, 0)?;
-    Ok(AsyncTask::new(EmbedTask {
-      model: Arc::clone(&self.model),
-      text,
-    }))
-  }
+    #[napi]
+    pub fn embed(&self, text: String) -> Result<AsyncTask<EmbedTask>> {
+        validate_text(&text, 0)?;
+        Ok(AsyncTask::new(EmbedTask {
+            model: Arc::clone(&self.model),
+            text,
+        }))
+    }
 
-  #[napi]
-  pub fn embed_batch_sync(&self, texts: Vec<String>) -> Result<EmbeddingBatch> {
-    validate_texts(&texts)?;
-    let output = encode_many(&self.model, &texts, self.dimension)?;
-    Ok(output.into_napi())
-  }
+    #[napi]
+    pub fn embed_batch_sync(&self, texts: Vec<String>) -> Result<EmbeddingBatch> {
+        validate_texts(&texts)?;
+        let output = encode_many(&self.model, &texts, self.dimension)?;
+        Ok(output.into_napi())
+    }
 
-  #[napi]
-  pub fn embed_batch(&self, texts: Vec<String>) -> Result<AsyncTask<BatchTask>> {
-    validate_texts(&texts)?;
-    Ok(AsyncTask::new(BatchTask {
-      model: Arc::clone(&self.model),
-      texts,
-      dimension: self.dimension,
-    }))
-  }
+    #[napi]
+    pub fn embed_batch(&self, texts: Vec<String>) -> Result<AsyncTask<BatchTask>> {
+        validate_texts(&texts)?;
+        Ok(AsyncTask::new(BatchTask {
+            model: Arc::clone(&self.model),
+            texts,
+            dimension: self.dimension,
+        }))
+    }
 }
 
 impl EmbeddingModel {
-  fn from_options(options: LoadOptions) -> Result<Self> {
-    if options.modelPath.trim().is_empty() {
-      return Err(invalid_arg("FL_EMBED_BAD_OPTIONS", "modelPath must not be empty"));
-    }
+    fn from_options(options: LoadOptions) -> Result<Self> {
+        if options.modelPath.trim().is_empty() {
+            return Err(invalid_arg(
+                "FL_EMBED_BAD_OPTIONS",
+                "modelPath must not be empty",
+            ));
+        }
 
-    // `normalize: false` cannot be honored honestly in this v0 binding --
-    // see the module doc comment. Any other value (omitted, or explicitly
-    // `true`) proceeds; the engine always L2-normalizes regardless.
-    if options.normalize == Some(false) {
-      return Err(invalid_arg(
-        "FL_EMBED_BAD_OPTIONS",
-        "normalize: false is not supported in this v0 binding -- \
+        // `normalize: false` cannot be honored honestly in this v0 binding --
+        // see the module doc comment. Any other value (omitted, or explicitly
+        // `true`) proceeds; the engine always L2-normalizes regardless.
+        if options.normalize == Some(false) {
+            return Err(invalid_arg(
+                "FL_EMBED_BAD_OPTIONS",
+                "normalize: false is not supported in this v0 binding -- \
          BertModel::encode/encode_batch always L2-normalize their output \
          and there is no public non-normalizing path in lattice-inference \
          yet; omit `normalize` or set it to true",
-      ));
-    }
+            ));
+        }
 
-    let model_path = Path::new(&options.modelPath);
-    if !model_path.is_dir() {
-      return Err(invalid_arg(
-        "FL_EMBED_BAD_MODEL",
-        format!(
-          "modelPath does not exist or is not a directory: {}",
-          options.modelPath
-        ),
-      ));
-    }
+        let model_path = Path::new(&options.modelPath);
+        if !model_path.is_dir() {
+            return Err(invalid_arg(
+                "FL_EMBED_BAD_MODEL",
+                format!(
+                    "modelPath does not exist or is not a directory: {}",
+                    options.modelPath
+                ),
+            ));
+        }
 
-    // Family (-> pooling strategy) is resolved from an explicit `modelId`
-    // override if given, else from modelPath's final path component. Both
-    // go through the same `lattice_embed::EmbeddingModel::from_str`, the
-    // real production parser (case-insensitive, accepts display names,
-    // short names, and HuggingFace ids -- see crates/embed/src/model.rs).
-    let family_hint = options
-      .modelId
-      .as_deref()
-      .filter(|s| !s.trim().is_empty())
-      .map(|s| s.to_string())
-      .or_else(|| {
-        model_path
-          .file_name()
-          .and_then(|name| name.to_str())
-          .map(|s| s.to_string())
-      })
-      .ok_or_else(|| {
-        invalid_arg(
-          "FL_EMBED_BAD_MODEL",
-          "could not determine a model identifier from modelId or modelPath's \
+        // Family (-> pooling strategy) is resolved from an explicit `modelId`
+        // override if given, else from modelPath's final path component. Both
+        // go through the same `lattice_embed::EmbeddingModel::from_str`, the
+        // real production parser (case-insensitive, accepts display names,
+        // short names, and HuggingFace ids -- see crates/embed/src/model.rs).
+        let family_hint = options
+            .modelId
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                model_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|s| s.to_string())
+            })
+            .ok_or_else(|| {
+                invalid_arg(
+                    "FL_EMBED_BAD_MODEL",
+                    "could not determine a model identifier from modelId or modelPath's \
            final path component",
-        )
-      })?;
+                )
+            })?;
 
-    let family = ModelFamily::from_str(&family_hint).map_err(|err| {
-      invalid_arg(
-        "FL_EMBED_BAD_MODEL",
-        format!("unrecognized model identifier \"{family_hint}\": {err}"),
-      )
-    })?;
+        let family = ModelFamily::from_str(&family_hint).map_err(|err| {
+            invalid_arg(
+                "FL_EMBED_BAD_MODEL",
+                format!("unrecognized model identifier \"{family_hint}\": {err}"),
+            )
+        })?;
 
-    let pooling = family.bert_pooling().ok_or_else(|| {
-      invalid_arg(
-        "FL_EMBED_BAD_MODEL",
-        format!(
-          "model family \"{family}\" is not a BERT-family encoder model; \
+        let pooling = family.bert_pooling().ok_or_else(|| {
+            invalid_arg(
+                "FL_EMBED_BAD_MODEL",
+                format!(
+                    "model family \"{family}\" is not a BERT-family encoder model; \
            this v0 native binding only supports BGE/E5/MiniLM-family models \
            (Qwen and remote-API models are out of scope)"
-        ),
-      )
-    })?;
+                ),
+            )
+        })?;
 
-    let mut model = BertModel::from_directory(model_path).map_err(|err| {
-      invalid_arg(
-        "FL_EMBED_BAD_MODEL",
-        format!("failed to load model from {}: {err}", options.modelPath),
-      )
-    })?;
-    model.set_pooling(pooling);
+        let mut model = BertModel::from_directory(model_path).map_err(|err| {
+            invalid_arg(
+                "FL_EMBED_BAD_MODEL",
+                format!("failed to load model from {}: {err}", options.modelPath),
+            )
+        })?;
+        model.set_pooling(pooling);
 
-    let dimension = u32::try_from(model.dimensions()).map_err(|_| {
-      invalid_arg(
-        "FL_EMBED_BAD_MODEL",
-        "model dimension does not fit in a u32",
-      )
-    })?;
+        let dimension = u32::try_from(model.dimensions()).map_err(|_| {
+            invalid_arg(
+                "FL_EMBED_BAD_MODEL",
+                "model dimension does not fit in a u32",
+            )
+        })?;
 
-    Ok(Self {
-      model: Arc::new(model),
-      dimension,
-    })
-  }
+        Ok(Self {
+            model: Arc::new(model),
+            dimension,
+        })
+    }
 }
 
 pub struct LoadModelTask {
-  options: LoadOptions,
+    options: LoadOptions,
 }
 
 #[napi]
 impl Task for LoadModelTask {
-  type Output = EmbeddingModel;
-  type JsValue = EmbeddingModel;
+    type Output = EmbeddingModel;
+    type JsValue = EmbeddingModel;
 
-  fn compute(&mut self) -> Result<Self::Output> {
-    EmbeddingModel::from_options(self.options.clone())
-  }
+    fn compute(&mut self) -> Result<Self::Output> {
+        EmbeddingModel::from_options(self.options.clone())
+    }
 
-  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    Ok(output)
-  }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
 }
 
 #[napi]
 pub fn load_model_sync(options: LoadOptions) -> Result<EmbeddingModel> {
-  EmbeddingModel::from_options(options)
+    EmbeddingModel::from_options(options)
 }
 
 #[napi]
 pub fn load_model(options: LoadOptions) -> Result<AsyncTask<LoadModelTask>> {
-  Ok(AsyncTask::new(LoadModelTask { options }))
+    Ok(AsyncTask::new(LoadModelTask { options }))
 }
 
 pub struct EmbedTask {
-  model: Arc<BertModel>,
-  text: String,
+    model: Arc<BertModel>,
+    text: String,
 }
 
 #[napi]
 impl Task for EmbedTask {
-  type Output = Vec<f32>;
-  type JsValue = Float32Array;
+    type Output = Vec<f32>;
+    type JsValue = Float32Array;
 
-  fn compute(&mut self) -> Result<Self::Output> {
-    encode_one(&self.model, &self.text)
-  }
+    fn compute(&mut self) -> Result<Self::Output> {
+        encode_one(&self.model, &self.text)
+    }
 
-  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    Ok(output.into())
-  }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output.into())
+    }
 }
 
 pub struct BatchTask {
-  model: Arc<BertModel>,
-  texts: Vec<String>,
-  dimension: u32,
+    model: Arc<BertModel>,
+    texts: Vec<String>,
+    dimension: u32,
 }
 
 #[napi]
 impl Task for BatchTask {
-  type Output = BatchOutput;
-  type JsValue = EmbeddingBatch;
+    type Output = BatchOutput;
+    type JsValue = EmbeddingBatch;
 
-  fn compute(&mut self) -> Result<Self::Output> {
-    encode_many(&self.model, &self.texts, self.dimension)
-  }
+    fn compute(&mut self) -> Result<Self::Output> {
+        encode_many(&self.model, &self.texts, self.dimension)
+    }
 
-  fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
-    Ok(output.into_napi())
-  }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output.into_napi())
+    }
 }
 
 pub struct BatchOutput {
-  data: Vec<f32>,
-  rows: u32,
-  dimensions: u32,
-  normalized: bool,
+    data: Vec<f32>,
+    rows: u32,
+    dimensions: u32,
+    normalized: bool,
 }
 
 impl BatchOutput {
-  fn into_napi(self) -> EmbeddingBatch {
-    EmbeddingBatch {
-      data: self.data.into(),
-      rows: self.rows,
-      dimensions: self.dimensions,
-      normalized: self.normalized,
+    fn into_napi(self) -> EmbeddingBatch {
+        EmbeddingBatch {
+            data: self.data.into(),
+            rows: self.rows,
+            dimensions: self.dimensions,
+            normalized: self.normalized,
+        }
     }
-  }
 }
 
 /// Encodes a single text through the real engine. `BertModel::encode` is
@@ -331,9 +334,9 @@ impl BatchOutput {
 /// `self`, so concurrent calls through the same `Arc<BertModel>` (e.g. many
 /// in-flight `embed()` AsyncTasks on napi's worker pool) never race.
 fn encode_one(model: &BertModel, text: &str) -> Result<Vec<f32>> {
-  model
-    .encode(text)
-    .map_err(|err| invalid_arg("FL_EMBED_BAD_MODEL", format!("encode failed: {err}")))
+    model
+        .encode(text)
+        .map_err(|err| invalid_arg("FL_EMBED_BAD_MODEL", format!("encode failed: {err}")))
 }
 
 /// Encodes a batch through the real engine's fused batched forward path
@@ -345,84 +348,84 @@ fn encode_one(model: &BertModel, text: &str) -> Result<Vec<f32>> {
 /// actual per-row output length and this wrapper's own bookkeeping, not a
 /// value this function assumes.
 fn encode_many(model: &BertModel, texts: &[String], dimension: u32) -> Result<BatchOutput> {
-  let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-  let rows_out = model
-    .encode_batch(&text_refs)
-    .map_err(|err| invalid_arg("FL_EMBED_BAD_MODEL", format!("encode_batch failed: {err}")))?;
+    let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let rows_out = model
+        .encode_batch(&text_refs)
+        .map_err(|err| invalid_arg("FL_EMBED_BAD_MODEL", format!("encode_batch failed: {err}")))?;
 
-  let rows = u32::try_from(rows_out.len()).map_err(|_| {
-    invalid_arg(
-      "FL_EMBED_BAD_BATCH",
-      "batch has more rows than can be represented as u32",
-    )
-  })?;
+    let rows = u32::try_from(rows_out.len()).map_err(|_| {
+        invalid_arg(
+            "FL_EMBED_BAD_BATCH",
+            "batch has more rows than can be represented as u32",
+        )
+    })?;
 
-  let mut data = Vec::with_capacity(rows_out.len() * dimension as usize);
-  for row in &rows_out {
-    data.extend_from_slice(row);
-  }
+    let mut data = Vec::with_capacity(rows_out.len() * dimension as usize);
+    for row in &rows_out {
+        data.extend_from_slice(row);
+    }
 
-  Ok(BatchOutput {
-    data,
-    rows,
-    dimensions: dimension,
-    normalized: true,
-  })
+    Ok(BatchOutput {
+        data,
+        rows,
+        dimensions: dimension,
+        normalized: true,
+    })
 }
 
 fn validate_text(text: &str, index: usize) -> Result<()> {
-  if text.is_empty() {
-    return Err(invalid_arg(
-      "FL_EMBED_EMPTY_INPUT",
-      format!("text at index {index} must not be empty"),
-    ));
-  }
+    if text.is_empty() {
+        return Err(invalid_arg(
+            "FL_EMBED_EMPTY_INPUT",
+            format!("text at index {index} must not be empty"),
+        ));
+    }
 
-  // Mirrors the production enforcement point
-  // (`crates/embed/src/service/native.rs`, `if text.len() > MAX_TEXT_BYTES`):
-  // `str::len()` is UTF-8 BYTE length, not `chars().count()`, so a
-  // multi-byte string near the boundary is accepted/rejected identically
-  // by this binding and by `NativeEmbeddingService`/`CachedEmbeddingService`.
-  if text.len() > MAX_TEXT_BYTES {
-    return Err(invalid_arg(
-      "FL_EMBED_INPUT_TOO_LARGE",
-      format!(
-        "text at index {index} is {} bytes, exceeding the maximum of {MAX_TEXT_BYTES} bytes",
-        text.len()
-      ),
-    ));
-  }
+    // Mirrors the production enforcement point
+    // (`crates/embed/src/service/native.rs`, `if text.len() > MAX_TEXT_BYTES`):
+    // `str::len()` is UTF-8 BYTE length, not `chars().count()`, so a
+    // multi-byte string near the boundary is accepted/rejected identically
+    // by this binding and by `NativeEmbeddingService`/`CachedEmbeddingService`.
+    if text.len() > MAX_TEXT_BYTES {
+        return Err(invalid_arg(
+            "FL_EMBED_INPUT_TOO_LARGE",
+            format!(
+                "text at index {index} is {} bytes, exceeding the maximum of {MAX_TEXT_BYTES} bytes",
+                text.len()
+            ),
+        ));
+    }
 
-  Ok(())
+    Ok(())
 }
 
 fn validate_texts(texts: &[String]) -> Result<()> {
-  if texts.is_empty() {
-    return Err(invalid_arg(
-      "FL_EMBED_BAD_BATCH",
-      "texts must contain at least one item",
-    ));
-  }
+    if texts.is_empty() {
+        return Err(invalid_arg(
+            "FL_EMBED_BAD_BATCH",
+            "texts must contain at least one item",
+        ));
+    }
 
-  // Checked before per-item validation below so an oversized batch fails
-  // fast on item count alone, without walking every item first.
-  if texts.len() > DEFAULT_MAX_BATCH_SIZE {
-    return Err(invalid_arg(
-      "FL_EMBED_BAD_BATCH",
-      format!(
-        "batch has {} items, exceeding the maximum of {DEFAULT_MAX_BATCH_SIZE}",
-        texts.len()
-      ),
-    ));
-  }
+    // Checked before per-item validation below so an oversized batch fails
+    // fast on item count alone, without walking every item first.
+    if texts.len() > DEFAULT_MAX_BATCH_SIZE {
+        return Err(invalid_arg(
+            "FL_EMBED_BAD_BATCH",
+            format!(
+                "batch has {} items, exceeding the maximum of {DEFAULT_MAX_BATCH_SIZE}",
+                texts.len()
+            ),
+        ));
+    }
 
-  for (index, text) in texts.iter().enumerate() {
-    validate_text(text, index)?;
-  }
+    for (index, text) in texts.iter().enumerate() {
+        validate_text(text, index)?;
+    }
 
-  Ok(())
+    Ok(())
 }
 
 fn invalid_arg(code: &str, message: impl AsRef<str>) -> Error {
-  Error::new(Status::InvalidArg, format!("{code}: {}", message.as_ref()))
+    Error::new(Status::InvalidArg, format!("{code}: {}", message.as_ref()))
 }
