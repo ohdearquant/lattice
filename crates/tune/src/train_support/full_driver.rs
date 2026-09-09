@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use lattice_inference::model::qwen35::Qwen35Model;
 use lattice_inference::tokenizer::Tokenizer;
+use rayon::prelude::*;
 
 use crate::lora::AdamState;
 use crate::lora::train_core::{
@@ -15,6 +16,11 @@ use crate::lora::train_core::{
 
 use super::{Sample, load_jsonl, verify_tbv};
 
+const _: () = {
+    const fn _assert_sync<T: Sync>() {}
+    _assert_sync::<Qwen35Model>();
+};
+
 /// Capture the frozen-prefix output (h_in entering `first_layer`) and RoPE
 /// tables per sample, yielding the `SeqCtx` set the tape forward consumes.
 /// Returns the caches plus the total number of masked completion positions.
@@ -23,22 +29,23 @@ fn build_caches(
     samples: &[Sample],
     first_layer: usize,
 ) -> Result<(Vec<SeqCtx>, usize), Box<dyn std::error::Error>> {
-    let mut caches = Vec::with_capacity(samples.len());
-    let mut total_positions = 0usize;
-    for s in samples {
-        let (h_in, _real_out) = model.capture_attn_io(&s.tokens, first_layer)?;
-        let seq_len = s.tokens.len();
-        let (cos, sin) = model.rope_cos_sin_tables(seq_len)?;
-        total_positions += seq_len - s.completion_start;
-        caches.push(SeqCtx {
-            h_in,
-            cos,
-            sin,
-            tokens: s.tokens.clone(),
-            completion_start: s.completion_start,
-            seq_len,
-        });
-    }
+    let caches = samples
+        .par_iter()
+        .map(|s| {
+            let (h_in, _real_out) = model.capture_attn_io(&s.tokens, first_layer)?;
+            let seq_len = s.tokens.len();
+            let (cos, sin) = model.rope_cos_sin_tables(seq_len)?;
+            Ok(SeqCtx {
+                h_in,
+                cos,
+                sin,
+                tokens: s.tokens.clone(),
+                completion_start: s.completion_start,
+                seq_len,
+            })
+        })
+        .collect::<Result<Vec<_>, lattice_inference::InferenceError>>()?;
+    let total_positions = caches.iter().map(|s| s.seq_len - s.completion_start).sum();
     Ok((caches, total_positions))
 }
 
@@ -687,10 +694,11 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     let tcache = Instant::now();
     let (caches, total_positions) = build_caches(&model, &train_samples, first_layer)?;
     println!(
-        "  {} completion positions across {} samples in {:.1}s",
+        "  {} completion positions across {} samples in {:.1}s ({} threads)",
         total_positions,
         caches.len(),
-        tcache.elapsed().as_secs_f64()
+        tcache.elapsed().as_secs_f64(),
+        rayon::current_num_threads()
     );
 
     // Hold out valid.jsonl from training; compare its NLL to the training NLL.
@@ -707,9 +715,10 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
                 let tvalid = Instant::now();
                 let (vc, vpos) = build_caches(&model, &vs, first_layer)?;
                 println!(
-                    "  held-out: {vpos} completion positions across {} valid samples in {:.1}s",
+                    "  held-out: {vpos} completion positions across {} valid samples in {:.1}s ({} threads)",
                     vc.len(),
-                    tvalid.elapsed().as_secs_f64()
+                    tvalid.elapsed().as_secs_f64(),
+                    rayon::current_num_threads()
                 );
                 vc
             }
