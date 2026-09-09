@@ -113,9 +113,15 @@ if printf '%s' "$STAGED" | needs_rust_gates; then
         else
             rc=$?
             if [ "$rc" -eq 75 ]; then
-                echo "Did not get the build lock at $LOCK within 1800s. Holder:"
+                echo "Did not get the build lock at $LOCK within 1800s."
+                # NOT "the holder": lsof reports every process with the lock file
+                # OPEN, and a waiter opens the file before it blocks in flock(2).
+                # Measured on the fleet lock: four flock processes listed, one
+                # holding. So this is a candidate list, and the oldest elapsed
+                # time is a hint, not the answer.
+                echo "Processes with $LOCK open (holder + waiters, in no order):"
                 /usr/sbin/lsof "$LOCK" 2>/dev/null || lsof "$LOCK" 2>/dev/null || \
-                    echo "  (could not read the holder; lsof unavailable)"
+                    echo "  (could not list them; lsof unavailable)"
                 exit 1
             fi
             exit "$rc"
