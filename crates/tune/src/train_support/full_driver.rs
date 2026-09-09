@@ -1053,8 +1053,30 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         None => println!("\n  step    0  train NLL: {base_nll:.4}"),
     }
 
+    // THREE CLOCKS, NOT ONE, AND A STEP COST THAT IS READ RATHER THAN DERIVED.
+    //
+    // What this replaces: a single clock started before the loop and read AFTER the epilogue's
+    // extra train pass but BEFORE the epilogue's held-out pass. Its `in {secs}s` figure therefore
+    // carried one whole scoring pass it never named and omitted a second one. Anybody recovering a
+    // per-step cost from it — loop figure minus the in-loop scoring points, divided by steps —
+    // subtracts from a quantity with an invisible term in it and gets an answer too large by that
+    // term over the step count. Measured at 32-train/22-valid on a 2-step run: the unnamed pass was
+    // 314.7s, inflating a step by ~157s against a true cost of tens of seconds. The reported
+    // 847.7s decomposed exactly as 533s of loop plus that 314.7s, which is how the term was found.
+    //
+    // Each quantity now accumulates on its own clock and prints on its own line.
+    let mut train_step_secs = 0.0f64;
+    let mut in_loop_score_secs = 0.0f64;
+    let mut score_points = 0usize;
+    // The final step ALWAYS scores, because `step == steps` forces the log even when log_every does
+    // not divide it. So after any run with steps >= 1 the epilogue re-scored weights the loop had
+    // just scored, recomputing an identical value from an unchanged state: a full train pass plus a
+    // full held-out pass, 558s at the sizes above, paid once per run for nothing. Carry the loop's
+    // own last scoring forward instead of repeating it.
+    let mut last_scored: Option<(f32, Option<f32>)> = None;
     let tstep = Instant::now();
     for step in 1..=steps {
+        let tone = Instant::now();
         let ctx = &caches[(step - 1) % caches.len()];
         let (_nll, _n, grads, gdn_grads) = {
             let fwd = forward_full(ctx, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
@@ -1063,10 +1085,16 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
 
         apply_adam_updates(&mut adam, &mut loras, &grads, &train_ctx);
         apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train_ctx);
+        train_step_secs += tone.elapsed().as_secs_f64();
 
         if step % log_every == 0 || step == steps {
+            let tscore = Instant::now();
             let mean_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
-            match eval_valid(&loras, &gdn_loras)? {
+            let valid_nll = eval_valid(&loras, &gdn_loras)?;
+            in_loop_score_secs += tscore.elapsed().as_secs_f64();
+            score_points += 1;
+            last_scored = Some((mean_nll, valid_nll));
+            match valid_nll {
                 Some(v) => println!(
                     "  step {step:4}  train NLL: {mean_nll:.4}  held-out NLL: {v:.4}  (train d {:+.4})",
                     mean_nll - base_nll
@@ -1078,10 +1106,35 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             }
         }
     }
-
-    let final_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
     let secs = tstep.elapsed().as_secs_f64();
-    match (base_valid, eval_valid(&loras, &gdn_loras)?) {
+
+    // steps == 0 leaves the loop with nothing to have scored, so the epilogue still has to. That is
+    // the only path on which this clock is nonzero, and it prints either way so that a reader can
+    // see the redundant pass is gone rather than take it on trust.
+    let mut epilogue_score_secs = 0.0f64;
+    let (final_nll, final_valid) = match last_scored {
+        Some(pair) => pair,
+        None => {
+            let tepi = Instant::now();
+            let n = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
+            let v = eval_valid(&loras, &gdn_loras)?;
+            epilogue_score_secs = tepi.elapsed().as_secs_f64();
+            (n, v)
+        }
+    };
+
+    let per_step = if steps > 0 {
+        format!("{:.2}s/step", train_step_secs / steps as f64)
+    } else {
+        "no steps".to_string()
+    };
+    println!(
+        "  step loop: {steps} steps in {train_step_secs:.1}s ({per_step}), \
+in-loop scoring {in_loop_score_secs:.1}s over {score_points} point(s), \
+epilogue re-scoring {epilogue_score_secs:.1}s"
+    );
+
+    match (base_valid, final_valid) {
         (Some(b), Some(f)) => println!(
             "\n=== done: train {base_nll:.4}→{final_nll:.4} ({:+.4})  |  held-out {b:.4}→{f:.4} ({:+.4})  in {secs:.1}s ===",
             final_nll - base_nll,
