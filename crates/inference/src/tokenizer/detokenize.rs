@@ -26,6 +26,18 @@ fn append_token_bytes(
 }
 
 /// Decode token IDs back to text using the BPE tokenizer's reverse lookup.
+///
+/// **Lossy by contract, and silently so.** Byte-level BPE can emit any byte sequence, so
+/// the assembled bytes are converted with `String::from_utf8_lossy`: anything not
+/// well-formed UTF-8 becomes `U+FFFD`, and the return type carries no signal that any
+/// substitution happened.
+///
+/// That matters under grammar-constrained decoding, because the grammar validates BYTES.
+/// A GBNF grammar using `.` or `[^...]` can accept a non-UTF-8 sequence, and the string
+/// returned here is then not the sequence the grammar accepted, so it may not re-validate
+/// against that same grammar. JSON-schema-constrained output is unaffected: that compiler
+/// models well-formed UTF-8 explicitly, so no substitution can occur. The full statement
+/// of the seam is in the `grammar::pda` module documentation.
 pub(crate) fn decode_tokens(tokenizer: &BpeTokenizer, ids: &[u32]) -> String {
     let byte_decoder = build_byte_decoder();
     let mut bytes = Vec::new();

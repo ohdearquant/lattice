@@ -28,6 +28,34 @@
 //!
 //! The root rule has id 0 (by convention enforced by `CompiledGrammar`).
 //!
+//! # The UTF-8 contract, and where it stops
+//!
+//! **This automaton matches BYTES, not characters.** `Symbol::AnyByte`, which is what
+//! GBNF `.` and `[^...]` compile to, accepts any of the 256 byte values. That includes
+//! `0xFF`, which is not legal anywhere in UTF-8, and lone `0x80..=0xBF` continuation
+//! bytes. It is deliberate: byte-level `.` is GBNF's established meaning, and narrowing
+//! it to "one UTF-8 scalar" would silently change the language accepted by every grammar
+//! ported from a byte-level GBNF implementation.
+//!
+//! The consequence is a seam that neither side of it used to name. A grammar built from
+//! `.` or `[^...]` can accept a byte sequence that is not well-formed UTF-8; the
+//! detokenizer then renders those bytes through `String::from_utf8_lossy`, substituting
+//! `U+FFFD`. **So the returned string is not necessarily the byte sequence this automaton
+//! validated, and re-validating that string against the same grammar can fail.** What
+//! grammar-constrained decoding guarantees is a property of the emitted bytes, not of the
+//! decoded string.
+//!
+//! Two things bound that in practice, and both are checkable rather than hoped for:
+//!
+//! * A grammar that uses neither `.` nor a negated class cannot reach the case at all,
+//!   because every other terminal names one specific byte.
+//! * The JSON-schema compiler does not use `AnyByte` for string contents. It models
+//!   well-formed 2/3/4-byte UTF-8 with the correct lead and continuation ranges
+//!   (issue #931), so schema-constrained output is valid UTF-8 by construction and its
+//!   decoded string does re-validate.
+//!
+//! The other end of the seam is documented on `tokenizer::detokenize::decode_tokens`.
+//!
 //! # State machine encoding
 //!
 //! A `GrammarState` encodes the full PDA configuration:
