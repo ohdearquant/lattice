@@ -1,0 +1,12 @@
+# Tracked Rust files that no workspace member owns.
+#
+# Row format: <path> <edition> <reason...>
+#
+# The edition is stated per row, not inherited from the nearest Cargo.toml,
+# because for an out-of-tree file the nearest manifest is not the one it is
+# compiled under. Being listed here is not an exemption:
+# scripts/lint-rust-fmt-coverage.sh runs `rustfmt --check` on every row, which is
+# the coverage `cargo fmt --all` cannot give these files.
+
+npm/lattice-embed-native/build.rs   2024  napi module published to npm from its own manifest, deliberately outside the workspace so the published crate resolves its own dependency tree
+npm/lattice-embed-native/src/lib.rs 2024  napi module published to npm from its own manifest, see the row above
