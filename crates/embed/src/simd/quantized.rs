@@ -1100,7 +1100,7 @@ mod simd_parity_tests {
 
             let diff = (neon - scalar).abs();
             assert!(
-                diff <= 1.0,
+                diff == 0.0,
                 "NEON vs scalar i8 dot product dim={dim}: neon={neon} scalar={scalar} diff={diff}"
             );
         }
@@ -1126,10 +1126,12 @@ mod simd_parity_tests {
 
                 let diff = (avx2 - scalar).abs();
                 assert!(
-                    diff <= 1.0,
+                    diff == 0.0,
                     "AVX2 vs scalar i8 dot product dim={dim}: avx2={avx2} scalar={scalar} diff={diff}"
                 );
             }
+        } else {
+            eprintln!("skipping AVX2 parity test: avx2 not available");
         }
     }
 
@@ -1159,10 +1161,12 @@ mod simd_parity_tests {
 
                 let diff = (vnni - scalar).abs();
                 assert!(
-                    diff <= 1.0,
+                    diff == 0.0,
                     "VNNI vs scalar i8 dot product dim={dim}: vnni={vnni} scalar={scalar} diff={diff}"
                 );
             }
+        } else {
+            eprintln!("skipping VNNI parity test: avx512f/bw/vnni not available");
         }
     }
 }
