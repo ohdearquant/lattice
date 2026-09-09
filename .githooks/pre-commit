@@ -1,27 +1,141 @@
 #!/bin/sh
 set -e
 
+# `cargo clippy --workspace --all-targets` compiles the whole workspace. Paying
+# that to commit a markdown file costs minutes, and on a shared machine it
+# competes with every other build running there. So this hook decides whether the
+# staged changes can reach the Rust gates at all, and when they can, it takes a
+# lock itself rather than trusting every call site to remember one.
+#
+# The lock path is configurable and defaults to a repo-local name in the system
+# temp dir. Set LATTICE_BUILD_LOCK to join a wider lane -- a machine that also
+# runs other heavy Rust builds wants them all on one lock, not one per repo.
+
+LOCK_EXPLICIT=${LATTICE_BUILD_LOCK+set}
+LOCK_DIR="${TMPDIR:-/tmp}"
+LOCK="${LATTICE_BUILD_LOCK:-${LOCK_DIR%/}/lattice-build.lock}"
+
+# Reads staged path names on stdin, one per line. Exit 0 means "the Rust gates
+# can see this commit".
+#
+# An EMPTY or blank-only list also exits 0, deliberately. A discovery that can be
+# silently emptied is a gate that skips itself, and here the two failure
+# directions are not symmetric: running the build when it was not needed wastes
+# minutes, while skipping it when it WAS needed lands unformatted code with no
+# signal that anything was skipped.
+needs_rust_gates() {
+    names=$(cat)
+    if ! printf '%s\n' "$names" | grep -q '[^[:space:]]'; then
+        return 0
+    fi
+    printf '%s\n' "$names" | grep -qE \
+        '\.rs$|(^|/)(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|rustfmt\.toml|clippy\.toml)$|(^|/)\.cargo/config(\.toml)?$'
+}
+
+# Invoked by the flock wrapper below as a fresh process, which is why it is a
+# flag on this script rather than a shell function: flock runs a command, and a
+# command cannot be a function of the caller.
+if [ "${1:-}" = "--run-rust-gates" ]; then
+    if ! cargo fmt --all -- --check; then
+        echo "Format check failed. Run 'make fmt' to fix."
+        exit 1
+    fi
+    if ! cargo clippy --workspace --all-targets -- -D warnings; then
+        echo "Clippy check failed. Fix warnings before committing."
+        exit 1
+    fi
+    exit 0
+fi
+
+# --selftest exercises the decision against fixed inputs and exits. It runs no
+# cargo and takes no lock, so it is safe on a loaded machine and in CI.
+if [ "${1:-}" = "--selftest" ]; then
+    fail=0
+    check() {
+        if [ "$2" = "$3" ]; then printf '  PASS  %s\n' "$1"
+        else printf '  FAIL  %s: expected %s, got %s\n' "$1" "$2" "$3"; fail=1; fi
+    }
+    decide() { printf '%s' "$1" | { needs_rust_gates && echo rust || echo docs; }; }
+
+    for row in \
+        'src/lib.rs|rust' \
+        'crates/inference/src/model/qwen35/eval.rs|rust' \
+        'Cargo.toml|rust' \
+        'Cargo.lock|rust' \
+        'crates/tune/Cargo.toml|rust' \
+        'rust-toolchain.toml|rust' \
+        'rustfmt.toml|rust' \
+        'clippy.toml|rust' \
+        '.cargo/config.toml|rust' \
+        'README.md|docs' \
+        'docs/adr/ADR-058.md|docs' \
+        '.githooks/pre-commit|docs' \
+        'scripts/lint-docs.sh|docs' \
+        'notes/rustacean.md|docs' \
+        'src/rsync-notes.txt|docs' \
+        'src.rs.backup/readme.md|docs' \
+        ; do
+        want=${row#*|}
+        check "${row%|*}" "$want" "$(decide "${row%|*}")"
+    done
+    # A docs-only commit must stay docs even when it is large, and one Rust file
+    # anywhere in a large docs commit must flip it. Both directions, because a
+    # matcher that always says "rust" would pass every arm above.
+    check "many docs files stay docs" "docs" "$(decide 'a.md
+b.md
+c.txt')"
+    check "one .rs among docs flips to rust" "rust" "$(decide 'a.md
+b.md
+crates/x/src/y.rs')"
+    # The arm that protects the gate from itself.
+    check "EMPTY staged list runs the full build" "rust" "$(decide '')"
+    check "blank-only staged list runs the full build" "rust" "$(decide '
+
+')"
+    if [ "$fail" -eq 0 ]; then echo "all selftest arms passed"; else echo "SELFTEST FAILED"; fi
+    exit "$fail"
+fi
+
 echo "Running pre-commit checks..."
 
-# Tooling
 if ! cargo fmt --version >/dev/null 2>&1 || ! cargo clippy --version >/dev/null 2>&1; then
     echo "rustfmt or clippy is unavailable. Run 'make setup' to install both."
     exit 1
 fi
 
-# Format check
-if ! cargo fmt --all -- --check; then
-    echo "Format check failed. Run 'make fmt' to fix."
-    exit 1
+STAGED=$(git diff --cached --name-only --diff-filter=ACMRD) || STAGED=""
+
+if printf '%s' "$STAGED" | needs_rust_gates; then
+    if command -v flock >/dev/null 2>&1; then
+        echo "  Rust gates REQUIRED for these changes; waiting up to 1800s for $LOCK"
+        if flock -o -w 1800 -E 75 "$LOCK" "$0" --run-rust-gates; then
+            :
+        else
+            rc=$?
+            if [ "$rc" -eq 75 ]; then
+                echo "Did not get the build lock at $LOCK within 1800s. Holder:"
+                /usr/sbin/lsof "$LOCK" 2>/dev/null || lsof "$LOCK" 2>/dev/null || \
+                    echo "  (could not read the holder; lsof unavailable)"
+                exit 1
+            fi
+            exit "$rc"
+        fi
+    elif [ -n "$LOCK_EXPLICIT" ]; then
+        # Refusing rather than proceeding: someone named a lock, so something is
+        # being protected, and running unlocked would defeat it silently.
+        echo "LATTICE_BUILD_LOCK is set to $LOCK but no flock binary is on PATH."
+        echo "Install flock (util-linux) or unset LATTICE_BUILD_LOCK to build unlocked."
+        exit 1
+    else
+        echo "  Rust gates REQUIRED for these changes; no flock on PATH, running UNLOCKED"
+        "$0" --run-rust-gates
+    fi
+else
+    echo "  Rust gates SKIPPED: no .rs, Cargo, toolchain or lint-config file is staged"
 fi
 
-# Clippy
-if ! cargo clippy --workspace --all-targets -- -D warnings; then
-    echo "Clippy check failed. Fix warnings before committing."
-    exit 1
-fi
-
-# Doc lint
+# Runs on BOTH branches. A commit with no Rust in it is exactly the markdown case
+# this check exists for, so it must never ride on the skip above.
 ./scripts/lint-docs.sh
 
 echo "Pre-commit checks passed."
