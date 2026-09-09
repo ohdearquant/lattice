@@ -10,3 +10,4 @@
 
 npm/lattice-embed-native/build.rs   2024  napi module published to npm from its own manifest, deliberately outside the workspace so the published crate resolves its own dependency tree
 npm/lattice-embed-native/src/lib.rs 2024  napi module published to npm from its own manifest, see the row above
+scripts/microlora/dsl_validator.rs  2021  links the request-parser crate from a checkout that is not a dependency of this repository; build_dsl_validator.py compiles it in an ephemeral cargo project at edition 2021, so it cannot be a workspace member here and must not be checked at the workspace edition
