@@ -64,6 +64,97 @@ fn e2e_forward_matches_hf_reference() {
     gate::run();
 }
 
+/// The greedy comparison above holds all 24 steps to exact token equality.
+/// That is only sound while every step is decided by a margin wider than the
+/// numerical disagreement this test already tolerates elsewhere: with
+/// `ATOL = RTOL = 2e-3` and top-1 logits around 14 to 25, the admitted
+/// movement is roughly 0.03 to 0.05 per logit, and both the top-1 and the
+/// top-2 can move, so the bound is twice that. A fixture step tighter than
+/// its own bound would make "the tokens differ" and "the arithmetic drifted"
+/// the same observation.
+///
+/// This needs no checkpoint and no `f16`: it is arithmetic over the committed
+/// fixture, so it runs in every configuration, including the ones where the
+/// gate above skips.
+///
+/// Measured at the committed fixture: the tightest step is 6, margin 0.2488
+/// against a bound of 0.0617, so 4.03x. Steps 5 and 6 are also exactly where
+/// an independent f16 stack (the same checkpoint converted to GGUF, decoded by
+/// llama.cpp) picks the other candidate of the same pair — which is what a
+/// margin this narrow predicts, and why the number is worth holding.
+#[test]
+fn greedy_fixture_decides_every_step_by_more_than_tolerance() {
+    #[derive(serde::Deserialize)]
+    struct Step {
+        top1: f32,
+        top2: f32,
+    }
+
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/paddleocr_vl/e2e/e2e_goldens.json");
+    let raw =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let doc: serde_json::Value =
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    let steps: Vec<Step> = serde_json::from_value(doc["greedy"]["steps"].clone())
+        .expect("greedy.steps missing or not {top1, top2} records");
+
+    // An empty or truncated `steps` array would satisfy every assertion in the
+    // loop below by vacuity, which is the shape this whole test exists to
+    // reject, so the population is asserted before it is judged.
+    let expected = doc["greedy"]["tokens"]
+        .as_array()
+        .expect("greedy.tokens missing")
+        .len();
+    assert_eq!(
+        steps.len(),
+        expected,
+        "greedy.steps has {} records for {expected} tokens; a short array would pass \
+         the margin check vacuously",
+        steps.len()
+    );
+
+    // ATOL and RTOL are the gated module's, duplicated here because that module
+    // is `f16`-only and this test deliberately is not. A duplicated constant
+    // drifts, so where both exist the equality is checked rather than trusted.
+    const ATOL: f32 = 2e-3;
+    const RTOL: f32 = 2e-3;
+    #[cfg(feature = "f16")]
+    {
+        assert_eq!(
+            (ATOL, RTOL),
+            (crate::gate_types::ATOL, crate::gate_types::RTOL),
+            "this test's tolerance copy has drifted from the gate's, so the bound it \
+             computes no longer describes what the gate tolerates"
+        );
+    }
+
+    let mut tightest: Option<(usize, f32, f32)> = None;
+    for (i, step) in steps.iter().enumerate() {
+        let margin = step.top1 - step.top2;
+        let bound = 2.0 * (ATOL + RTOL * step.top1.abs());
+        assert!(
+            margin > bound,
+            "greedy step {i} is decided by {margin:.4} but this test tolerates {bound:.4} of \
+             logit movement, so an exact token comparison there cannot tell a wrong token \
+             from accumulated arithmetic noise (top1 {:.4}, top2 {:.4})",
+            step.top1,
+            step.top2
+        );
+        let headroom = margin / bound;
+        if tightest.is_none_or(|(_, _, h)| headroom < h) {
+            tightest = Some((i, margin, headroom));
+        }
+    }
+
+    let (i, margin, headroom) = tightest.expect("no steps");
+    println!(
+        "paddleocr_vl_e2e greedy margins: {} steps, tightest step {i} at {margin:.4} \
+         ({headroom:.2}x its tolerance bound)",
+        steps.len()
+    );
+}
+
 /// Everything that needs the `f16` feature (the BF16 checkpoint read and
 /// the golden comparison) lives here so the default-feature build carries
 /// no unreachable items — `cargo clippy --all-targets -D warnings` without
@@ -281,10 +372,17 @@ mod gate {
         ));
 
         // 8. Greedy decode with the KV cache: every token reproduced
-        // exactly. The fixture records per-step top1/top2 margins; the
-        // smallest recorded margin is 3.78 (step 7: 16.072 - 12.289), far
-        // above the 0.05 threshold, so all 24 steps are compared exactly
-        // with no early stop.
+        // exactly, all 24 steps, with no early stop. What licenses the
+        // exact comparison is that no step is a near-tie this test's own
+        // tolerance could flip, and that property is asserted rather than
+        // described — see `greedy_fixture_decides_every_step_by_more_than_tolerance`
+        // above, which derives it from the fixture on every run.
+        //
+        // (This comment used to say the smallest recorded top1/top2 margin
+        // was 3.78 at step 7. It is not: the minimum is 0.2488 at step 6,
+        // step 5 is 0.3601, and step 7's 3.78 is only the fourth smallest.
+        // The conclusion held, the number did not, and nothing computed it
+        // because `steps` was never read. That is why it is a test now.)
         let t1 = std::time::Instant::now();
         let generated = model
             .generate_greedy(
