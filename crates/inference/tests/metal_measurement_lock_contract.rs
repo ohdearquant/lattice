@@ -56,6 +56,222 @@ const ADDITIONAL_GUARDED_ENTRYPOINTS: &[(&str, CallSelector)] = &[
         CallSelector::Path(&["MetalForwardPass", "new"]),
     ),
 ];
+
+struct BenchHarnessCall {
+    selector: CallSelector,
+    callers: &'static [&'static str],
+    guarded: bool,
+}
+
+struct BenchHarness {
+    path: &'static str,
+    registered: &'static [&'static str],
+    calls: &'static [BenchHarnessCall],
+    constructions: &'static [(&'static str, CallSelector)],
+}
+
+// These are finite, reviewed caller chains, not Rust name resolution. The
+// syntax check below rejects aliases, deferred calls, and other spellings of
+// these names rather than silently losing the ownership proof.
+const BENCH_HARNESSES: &[BenchHarness] = &[
+    BenchHarness {
+        path: "benches/metal_decode_bench.rs",
+        registered: &["bench_locked_metal_decode"],
+        calls: &[
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_metal_decode_q4"]),
+                callers: &["bench_locked_metal_decode"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_metal_decode_q8"]),
+                callers: &["bench_locked_metal_decode"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_metal_prefill_q4"]),
+                callers: &["bench_locked_metal_decode"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["load_q4_state"]),
+                callers: &["bench_metal_decode_q4", "bench_metal_prefill_q4"],
+                guarded: false,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["load_q8_state"]),
+                callers: &["bench_metal_decode_q8"],
+                guarded: false,
+            },
+        ],
+        constructions: &[
+            (
+                "load_q4_state",
+                CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
+            ),
+            (
+                "load_q8_state",
+                CallSelector::Path(&["MetalQwen35State", "new"]),
+            ),
+        ],
+    },
+    BenchHarness {
+        path: "benches/cross_turn_prefix_cache_bench.rs",
+        registered: &["bench_locked_cross_turn_prefix_cache"],
+        calls: &[
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_cross_turn_prefix_cache"]),
+                callers: &["bench_locked_cross_turn_prefix_cache"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["load_state_and_tokenizer"]),
+                callers: &["bench_cross_turn_prefix_cache"],
+                guarded: false,
+            },
+        ],
+        constructions: &[(
+            "load_state_and_tokenizer",
+            CallSelector::Path(&["MetalQwen35State", "new"]),
+        )],
+    },
+    BenchHarness {
+        path: "benches/lm_head_bench.rs",
+        registered: &["bench_locked_lm_head"],
+        calls: &[
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_lm_head"]),
+                callers: &["bench_locked_lm_head"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["real", "bench_lm_head"]),
+                callers: &["bench_lm_head"],
+                guarded: false,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["setup_lm_head_fixture"]),
+                callers: &["real::bench_lm_head"],
+                guarded: false,
+            },
+        ],
+        constructions: &[
+            (
+                "real::setup_lm_head_fixture",
+                CallSelector::Path(&["MetalQwen35State", "new"]),
+            ),
+            (
+                "real::setup_lm_head_fixture",
+                CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
+            ),
+        ],
+    },
+    BenchHarness {
+        path: "benches/mtp_decode.rs",
+        registered: &["bench_locked_mtp_decode"],
+        calls: &[
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_baseline"]),
+                callers: &["bench_locked_mtp_decode"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_mtp"]),
+                callers: &["bench_locked_mtp_decode"],
+                guarded: true,
+            },
+        ],
+        constructions: &[
+            (
+                "bench_baseline",
+                CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
+            ),
+            (
+                "bench_mtp",
+                CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
+            ),
+        ],
+    },
+    BenchHarness {
+        path: "benches/decode_attn_bench.rs",
+        registered: &["bench_locked_metal_decode"],
+        calls: &[
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_reference_decode"]),
+                callers: &["bench_locked_metal_decode"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_flash_decode"]),
+                callers: &["bench_locked_metal_decode"],
+                guarded: true,
+            },
+        ],
+        constructions: &[],
+    },
+    BenchHarness {
+        path: "benches/topk_readback.rs",
+        registered: &["bench_locked_topk_readback"],
+        calls: &[
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_full_logit_readback"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_compact_readback"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_sampling_pipeline"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_topk_selection"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_full_logit_readback_metal"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_compact_readback_metal"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_noop_command_buffer"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_metal_topk_dispatch_only"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_metal_topk_plus_readback"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_topk_parity"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+            BenchHarnessCall {
+                selector: CallSelector::Path(&["bench_candidate_sampler"]),
+                callers: &["bench_locked_topk_readback"],
+                guarded: true,
+            },
+        ],
+        constructions: &[],
+    },
+];
 const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "benches/cross_turn_prefix_cache_bench.rs",
     "benches/decode_attn_bench.rs",
@@ -867,6 +1083,7 @@ struct AttributeSpec {
 struct FunctionSpec {
     name: String,
     body: Range<usize>,
+    returns_unit: bool,
     attributes: Vec<AttributeSpec>,
     test_registration: TestRegistration,
     unclassifiable_macro: Option<String>,
@@ -1798,6 +2015,10 @@ impl StructuredSource {
             functions.push(FunctionSpec {
                 name,
                 body: opening + 1..closing,
+                returns_unit: function.sig.asyncness.is_none()
+                    && (matches!(&function.sig.output, syn::ReturnType::Default)
+                        || matches!(&function.sig.output, syn::ReturnType::Type(_, output)
+                        if matches!(&**output, syn::Type::Tuple(tuple) if tuple.elems.is_empty()))),
                 attributes: self.item_attributes_before(item),
                 test_registration: classify_test_attributes(&function.attrs),
                 unclassifiable_macro: macros.error,
@@ -2514,13 +2735,23 @@ impl StructuredSource {
         lock_selector: CallSelector,
         requirement: GuardRequirement,
     ) -> Result<(), String> {
+        self.validate_work_sites_when(work_sites, lock_selector, requirement, &CfgFormula::True)
+    }
+
+    fn validate_work_sites_when(
+        &self,
+        work_sites: &[usize],
+        lock_selector: CallSelector,
+        requirement: GuardRequirement,
+        active: &CfgFormula,
+    ) -> Result<(), String> {
         if work_sites.is_empty() {
             return Err(format!("{}: protected work was not found", self.context));
         }
         let guards = self.guard_bindings(0..self.tokens.len(), lock_selector)?;
         let mut live_work = 0usize;
         for work in work_sites {
-            let work_formula = self.formula_at(*work)?;
+            let work_formula = CfgFormula::all([self.formula_at(*work)?, active.clone()]);
             if !work_formula.satisfiable()? {
                 continue;
             }
@@ -2637,10 +2868,576 @@ impl StructuredSource {
     }
 }
 
+fn tokens_name_any(tokens: &proc_macro2::TokenStream, names: &BTreeSet<String>) -> bool {
+    tokens.clone().into_iter().any(|token| match token {
+        proc_macro2::TokenTree::Ident(ident) => names.contains(&ident.to_string()),
+        proc_macro2::TokenTree::Group(group) => tokens_name_any(&group.stream(), names),
+        _ => false,
+    })
+}
+
+struct BenchHarnessSyntax {
+    names: BTreeSet<String>,
+    call_paths: BTreeSet<String>,
+    caller_scopes: BTreeSet<String>,
+    item_path: Vec<String>,
+    deferred: bool,
+    function_depth: usize,
+    error: Option<String>,
+}
+
+impl<'ast> Visit<'ast> for BenchHarnessSyntax {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = &*call.func {
+            let name = path
+                .path
+                .segments
+                .last()
+                .map(|segment| segment.ident.to_string());
+            if name.is_some_and(|name| self.names.contains(&name))
+                && (self.deferred || !self.call_paths.contains(&path_label(&path.path)))
+            {
+                self.error = Some("unreviewed or deferred call to a protected entrypoint".into());
+            }
+        } else {
+            self.visit_expr(&call.func);
+        }
+        for argument in &call.args {
+            self.visit_expr(argument);
+        }
+    }
+
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| self.names.contains(&segment.ident.to_string()))
+        {
+            self.error = Some("protected entrypoint used as a value or alias".into());
+        }
+    }
+
+    fn visit_expr_closure(&mut self, closure: &'ast syn::ExprClosure) {
+        let previous = self.deferred;
+        self.deferred = true;
+        syn::visit::visit_expr_closure(self, closure);
+        self.deferred = previous;
+    }
+
+    fn visit_expr_async(&mut self, expression: &'ast syn::ExprAsync) {
+        let previous = self.deferred;
+        self.deferred = true;
+        syn::visit::visit_expr_async(self, expression);
+        self.deferred = previous;
+    }
+
+    fn visit_item_fn(&mut self, function: &'ast ItemFn) {
+        if function.sig.asyncness.is_some() && self.names.contains(&function.sig.ident.to_string())
+        {
+            self.error = Some("protected entrypoint must execute synchronously".into());
+        }
+        if self.function_depth > 0 && self.names.contains(&function.sig.ident.to_string()) {
+            self.error = Some("protected entrypoint shadowed by a local function".into());
+        }
+        let previous = self.deferred;
+        self.deferred |= self.function_depth > 0;
+        self.function_depth += 1;
+        self.item_path.push(function.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, function);
+        self.item_path.pop();
+        self.function_depth -= 1;
+        self.deferred = previous;
+    }
+
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        self.item_path.push(module.ident.to_string());
+        syn::visit::visit_item_mod(self, module);
+        self.item_path.pop();
+    }
+
+    fn visit_use_tree(&mut self, tree: &'ast syn::UseTree) {
+        match tree {
+            syn::UseTree::Name(name) if self.names.contains(&name.ident.to_string()) => {
+                self.error =
+                    Some("protected entrypoint imported through an unsupported path".into());
+            }
+            syn::UseTree::Rename(rename)
+                if self.names.contains(&rename.ident.to_string())
+                    || self.names.contains(&rename.rename.to_string()) =>
+            {
+                self.error = Some("protected entrypoint imported through an alias".into());
+            }
+            syn::UseTree::Glob(_)
+                if self.function_depth == 0
+                    || self.caller_scopes.contains(&self.item_path.join("::")) =>
+            {
+                self.error = Some("glob import can shadow a reviewed caller edge".into())
+            }
+            _ => syn::visit::visit_use_tree(self, tree),
+        }
+    }
+
+    fn visit_pat_ident(&mut self, binding: &'ast syn::PatIdent) {
+        if self.names.contains(&binding.ident.to_string()) {
+            self.error = Some("protected entrypoint shadowed by a binding".into());
+        }
+        syn::visit::visit_pat_ident(self, binding);
+    }
+
+    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
+        if self.names.contains(&item.ident.to_string()) {
+            self.error = Some("protected entrypoint shadowed by a constant".into());
+        }
+        syn::visit::visit_item_const(self, item);
+    }
+
+    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
+        if self.names.contains(&item.ident.to_string()) {
+            self.error = Some("protected entrypoint shadowed by a static".into());
+        }
+        syn::visit::visit_item_static(self, item);
+    }
+
+    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
+        if self.names.contains(&item.ident.to_string()) {
+            self.error = Some("protected entrypoint shadowed by a struct constructor".into());
+        }
+        syn::visit::visit_item_struct(self, item);
+    }
+
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        if !mac.path.is_ident("criterion_group")
+            && !mac.path.is_ident("criterion_main")
+            && tokens_name_any(&mac.tokens, &self.names)
+        {
+            self.error = Some("protected entrypoint in an unsupported macro".into());
+        }
+    }
+}
+
+fn validate_bench_wrapper_span(
+    parsed: &StructuredSource,
+    syntax: &syn::File,
+    contract: &BenchHarness,
+    active: &CfgFormula,
+) -> Result<(), String> {
+    if contract.registered.len() != 1 {
+        return Err("benchmark target list must have one registered wrapper".into());
+    }
+    let expected = contract
+        .calls
+        .iter()
+        .filter(|call| call.guarded)
+        .map(|call| call.selector.label().trim_end_matches("()").to_string())
+        .collect::<Vec<_>>();
+    let mut functions = Vec::new();
+    module_functions(&syntax.items, &mut functions);
+    let mut active_wrappers = 0;
+    for function in functions {
+        let body =
+            parsed.token_range_for_block(&function.block, &function.sig.ident.to_string())?;
+        if parsed.enclosing_function_path(body.start) != contract.registered[0] {
+            continue;
+        }
+        let formula = CfgFormula::all([parsed.formula_at(body.start)?, active.clone()]);
+        if !formula.satisfiable()? {
+            continue;
+        }
+        if !parsed
+            .functions
+            .iter()
+            .any(|candidate| candidate.body == body && candidate.returns_unit)
+        {
+            return Err("registered benchmark wrapper must return unit synchronously".into());
+        }
+        active_wrappers += 1;
+        let parameters = function
+            .sig
+            .inputs
+            .iter()
+            .map(|input| match input {
+                syn::FnArg::Typed(input) => match &*input.pat {
+                    syn::Pat::Ident(binding)
+                        if binding.by_ref.is_none() && binding.subpat.is_none() =>
+                    {
+                        Ok(binding.ident.to_string())
+                    }
+                    _ => Err("wrapper parameters must be plain named bindings".to_string()),
+                },
+                _ => Err("wrapper parameters must be plain named bindings".to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut actual = Vec::new();
+        let mut sites = Vec::new();
+        let mut locals = 0;
+        for statement in &function.block.stmts {
+            match statement {
+                syn::Stmt::Local(_) => locals += 1,
+                syn::Stmt::Expr(syn::Expr::Call(call), _) => {
+                    if !call.attrs.is_empty() {
+                        return Err(
+                            "wrapper arms must not have conditional or other call attributes"
+                                .into(),
+                        );
+                    }
+                    if call.args.len() != parameters.len()
+                        || call
+                            .args
+                            .iter()
+                            .zip(&parameters)
+                            .any(|(argument, parameter)| {
+                                !matches!(argument, syn::Expr::Path(path)
+                            if path.attrs.is_empty() && path.qself.is_none()
+                                && path.path.is_ident(parameter.as_str()))
+                            })
+                    {
+                        return Err(
+                            "wrapper arms must pass only unchanged bare wrapper parameters".into(),
+                        );
+                    }
+                    let syn::Expr::Path(path) = &*call.func else {
+                        return Err("wrapper arms must be immediate named calls".into());
+                    };
+                    actual.push(path_label(&path.path));
+                    let offset = path
+                        .path
+                        .segments
+                        .last()
+                        .ok_or("empty wrapper arm path")?
+                        .ident
+                        .span()
+                        .byte_range()
+                        .start;
+                    sites.push(
+                        parsed
+                            .tokens
+                            .iter()
+                            .position(|token| token.offset == offset)
+                            .ok_or("wrapper arm could not be mapped to parsed source")?,
+                    );
+                }
+                _ => {
+                    return Err(
+                        "wrapper must contain only one guard binding and immediate reviewed arms"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if actual != expected {
+            return Err(format!(
+                "wrapper arm order changed: expected {expected:?}, found {actual:?}"
+            ));
+        }
+        let guards = parsed.guard_bindings(body.clone(), SHARED_LOCK_SELECTOR)?;
+        if locals != 1 || guards.len() != 1 {
+            return Err(
+                "one shared-lock binding must span the complete benchmark target list".into(),
+            );
+        }
+        let guard = &guards[0];
+        if guard.used_after_binding
+            || guard.protected.end != body.end
+            || sites.iter().any(|site| !guard.protected.contains(site))
+            || !formula.implies(&guard.formula)?
+        {
+            return Err("the same live guard must cover every arm through wrapper return".into());
+        }
+    }
+    if active_wrappers == 0 {
+        return Err("registered wrapper has no active Metal definition".into());
+    }
+    Ok(())
+}
+
+fn validate_bench_harness(
+    parsed: &StructuredSource,
+    contract: &BenchHarness,
+) -> Result<(), String> {
+    let syntax = syn::parse_file(&parsed.source).map_err(|reason| reason.to_string())?;
+    let mut macros = MacroCollector { macros: Vec::new() };
+    macros.visit_file(&syntax);
+    let registration = |name: &str| -> Result<Vec<String>, String> {
+        let matching = macros
+            .macros
+            .iter()
+            .filter(|mac| mac.path.is_ident(name))
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err(format!("expected one {name}! registration"));
+        }
+        if !syntax.items.iter().any(|item| {
+            matches!(item, syn::Item::Macro(item)
+            if item.mac.path.is_ident(name) && item.attrs.is_empty())
+        }) {
+            return Err(format!(
+                "{name}! must be an unconditional root registration"
+            ));
+        }
+        let arguments = Punctuated::<syn::Ident, Token![,]>::parse_terminated
+            .parse2(matching[0].tokens.clone())
+            .map_err(|reason| format!("unsupported {name}! registration: {reason}"))?;
+        Ok(arguments.iter().map(ToString::to_string).collect())
+    };
+    let group = registration("criterion_group")?;
+    let main = registration("criterion_main")?;
+    if group.is_empty() || main != group[..1] || group[1..] != *contract.registered {
+        return Err(
+            "Criterion must register exactly the reviewed guard owners through its main group"
+                .into(),
+        );
+    }
+    let mut shape = BenchHarnessSyntax {
+        names: contract
+            .registered
+            .iter()
+            .map(|name| (*name).to_string())
+            .chain(
+                contract
+                    .calls
+                    .iter()
+                    .map(|call| call.selector.final_name().to_string()),
+            )
+            .collect(),
+        call_paths: contract
+            .calls
+            .iter()
+            .map(|call| call.selector.label().trim_end_matches("()").to_string())
+            .collect(),
+        caller_scopes: contract
+            .registered
+            .iter()
+            .copied()
+            .chain(
+                contract
+                    .calls
+                    .iter()
+                    .flat_map(|call| call.callers.iter().copied()),
+            )
+            .map(str::to_string)
+            .collect(),
+        item_path: Vec::new(),
+        deferred: false,
+        function_depth: 0,
+        error: None,
+    };
+    shape.visit_file(&syntax);
+    if let Some(error) = shape.error {
+        return Err(error);
+    }
+
+    let constructions = parsed.construction_sites(0..parsed.tokens.len())?;
+    let mut actual = constructions
+        .iter()
+        .map(|(site, selector)| (parsed.enclosing_function_path(*site), selector.label()))
+        .collect::<Vec<_>>();
+    let mut expected = contract
+        .constructions
+        .iter()
+        .map(|(owner, selector)| ((*owner).to_string(), selector.label()))
+        .collect::<Vec<_>>();
+    actual.sort();
+    expected.sort();
+    if actual != expected {
+        return Err(format!(
+            "state construction ownership changed: expected {expected:?}, found {actual:?}"
+        ));
+    }
+    let mut active_sites = constructions
+        .iter()
+        .map(|(site, _)| *site)
+        .collect::<Vec<_>>();
+    for selector in RAW_GPU_SELECTORS {
+        active_sites.extend(parsed.call_sites(0..parsed.tokens.len(), *selector, true)?);
+    }
+    let active = CfgFormula::any(
+        active_sites
+            .iter()
+            .map(|site| parsed.formula_at(*site))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    if !active.satisfiable()? {
+        return Err("benchmark harness has no active Metal work".into());
+    }
+    for call in contract.calls {
+        if call.guarded {
+            let callee = call.selector.label().trim_end_matches("()").to_string();
+            let owners = parsed
+                .functions
+                .iter()
+                .filter(|function| parsed.enclosing_function_path(function.body.start) == callee)
+                .collect::<Vec<_>>();
+            if owners.is_empty() || owners.iter().any(|owner| !owner.returns_unit) {
+                return Err(format!(
+                    "guarded measurement {callee} must complete without returning a live handle"
+                ));
+            }
+        }
+        let sites = parsed.call_sites(0..parsed.tokens.len(), call.selector, true)?;
+        let mut callers = BTreeSet::new();
+        for site in sites {
+            if !CfgFormula::all([parsed.formula_at(site)?, active.clone()]).satisfiable()? {
+                continue;
+            }
+            let caller = parsed.enclosing_function_path(site);
+            if !call.callers.contains(&caller.as_str()) {
+                return Err(format!(
+                    "{} has unreviewed caller {caller}",
+                    call.selector.label()
+                ));
+            }
+            callers.insert(caller);
+            if call.guarded {
+                parsed.validate_work_sites_when(
+                    &[site],
+                    SHARED_LOCK_SELECTOR,
+                    GuardRequirement::Lexical,
+                    &active,
+                )?;
+            }
+        }
+        if callers
+            != call
+                .callers
+                .iter()
+                .map(|caller| (*caller).to_string())
+                .collect()
+        {
+            return Err(format!(
+                "{} does not have exactly its reviewed active callers",
+                call.selector.label()
+            ));
+        }
+    }
+    if !contract.calls.is_empty() {
+        for site in parsed.call_sites(0..parsed.tokens.len(), SHARED_LOCK_SELECTOR, true)? {
+            if !contract
+                .registered
+                .contains(&parsed.enclosing_function_path(site).as_str())
+            {
+                return Err("shared lock must be owned by the registered wrapper, not reacquired by a callee".into());
+            }
+        }
+        validate_bench_wrapper_span(parsed, &syntax, contract, &active)?;
+    }
+    if contract.calls.is_empty() {
+        let mut functions = Vec::new();
+        module_functions(&syntax.items, &mut functions);
+        for (site, _) in constructions {
+            let owner = parsed.enclosing_function_path(site);
+            let body = &parsed
+                .function_paths
+                .iter()
+                .find(|(_, path)| *path == owner)
+                .ok_or_else(|| format!("missing measurement owner {owner}"))?
+                .0;
+            let function = functions
+                .iter()
+                .find(|function| {
+                    parsed
+                        .token_range_for_block(&function.block, &owner)
+                        .as_ref()
+                        == Ok(body)
+                })
+                .ok_or_else(|| format!("missing registered function {owner}"))?;
+            // A cfg-dispatched owner may consist entirely of alternate blocks.
+            // Require one complete active block, not a constructor's short scope.
+            let blocks = function
+                .block
+                .stmts
+                .iter()
+                .map(|statement| match statement {
+                    syn::Stmt::Expr(syn::Expr::Block(block), _) if !block.attrs.is_empty() => {
+                        Some(block)
+                    }
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>();
+            let end = if let Some(blocks) = blocks {
+                let mut active_blocks = Vec::new();
+                for block in blocks {
+                    let formula =
+                        syn_attributes_formula(&block.attrs, parsed.test_cfg, &parsed.context)?;
+                    if CfgFormula::all([active.clone(), formula]).satisfiable()? {
+                        active_blocks.push(parsed.token_range_for_block(&block.block, &owner)?);
+                    }
+                }
+                if active_blocks.len() != 1 || !active_blocks[0].contains(&site) {
+                    return Err(format!(
+                        "registered owner {owner} must have one complete active measurement block"
+                    ));
+                }
+                active_blocks[0].end
+            } else {
+                body.end
+            };
+            parsed.validate_work_sites(
+                &[site],
+                SHARED_LOCK_SELECTOR,
+                GuardRequirement::Function { closing_brace: end },
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_bench_harness_sources(
+    sources: &[ParsedModuleSource],
+    contract: &BenchHarness,
+) -> Result<(), String> {
+    if sources.len() != 1 || sources[0].relative != contract.path {
+        return Err(
+            "reviewed state harness module closure changed; classify its new source paths".into(),
+        );
+    }
+    validate_bench_harness(&sources[0].parsed, contract)
+}
+
+fn validate_bench_harness_inventory(
+    reviewed: &BTreeSet<String>,
+    covered: &BTreeSet<String>,
+) -> Result<(), String> {
+    if reviewed == covered {
+        Ok(())
+    } else {
+        Err("reviewed Metal benchmark lifetime coverage changed".into())
+    }
+}
+
 #[test]
 fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut actual = BTreeSet::new();
+    let reviewed = TARGETS_WITH_RECOGNIZED_METAL_MARKERS
+        .iter()
+        .filter(|path| path.starts_with("benches/"))
+        .map(|path| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    let covered = BENCH_HARNESSES
+        .iter()
+        .map(|contract| contract.path)
+        .map(str::to_string)
+        .collect();
+    validate_bench_harness_inventory(&reviewed, &covered)
+        .unwrap_or_else(|reason| panic!("{reason}"));
+    assert!(
+        BENCH_HARNESSES
+            .iter()
+            .all(|contract| !contract.calls.is_empty() && contract.registered.len() == 1),
+        "every reviewed Metal benchmark needs one complete target-list wrapper"
+    );
+    assert_eq!(
+        BENCH_HARNESSES
+            .iter()
+            .map(|contract| contract.path)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        BENCH_HARNESSES.len(),
+        "state harness ownership records must not repeat paths"
+    );
+    let mut state_actual = BTreeSet::new();
+    let mut violations = Vec::new();
 
     for path in cargo_target_roots(manifest_dir, &["bench", "example", "bin"])
         .unwrap_or_else(|reason| panic!("{reason}"))
@@ -2652,6 +3449,15 @@ fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint(
             .into_owned();
         let sources = parsed_module_closure(manifest_dir, &path, false)
             .unwrap_or_else(|reason| panic!("{reason}"));
+        if let Some(contract) = BENCH_HARNESSES
+            .iter()
+            .find(|contract| contract.path == relative)
+        {
+            state_actual.insert(relative.clone());
+            if let Err(reason) = validate_bench_harness_sources(&sources, contract) {
+                violations.push(format!("{relative}: {reason}"));
+            }
+        }
         let mut has_raw_gpu_work = false;
         for source in &sources {
             for selector in RAW_GPU_SELECTORS {
@@ -2692,6 +3498,377 @@ fn raw_metal_measurement_harnesses_use_live_lock_bindings_across_the_entrypoint(
         actual, expected,
         "raw Metal harness inventory changed; classify every added or removed path explicitly"
     );
+    assert_eq!(
+        state_actual,
+        BENCH_HARNESSES
+            .iter()
+            .map(|contract| contract.path.to_string())
+            .collect(),
+        "state harness ownership records must name current Cargo targets"
+    );
+    assert!(
+        violations.is_empty(),
+        "state Metal measurement ownership violations:\n{}",
+        violations.join("\n")
+    );
+}
+
+const STATE_HARNESS_FIXTURE: BenchHarness = BenchHarness {
+    path: "fixtures/state_harness.rs",
+    registered: &["bench_locked"],
+    calls: &[
+        BenchHarnessCall {
+            selector: CallSelector::Path(&["measure"]),
+            callers: &["bench_locked"],
+            guarded: true,
+        },
+        BenchHarnessCall {
+            selector: CallSelector::Path(&["load"]),
+            callers: &["measure"],
+            guarded: false,
+        },
+    ],
+    constructions: &[("load", CallSelector::Path(&["MetalQwen35State", "new"]))],
+};
+
+const STATE_HARNESS_SOURCE: &str = r#"
+fn load() -> MetalQwen35State { MetalQwen35State::new() }
+fn measure() { let mut state = load(); state.forward_step(); }
+fn bench_locked() {
+    let guard = lattice_inference::measurement::gpu_test_lock();
+    measure();
+}
+criterion_group!(benches, bench_locked);
+criterion_main!(benches);
+"#;
+
+fn state_harness_fixture(source: &str, contract: &BenchHarness) -> Result<(), String> {
+    let parsed = StructuredSource::parse(contract.path, source, false)?;
+    validate_bench_harness(&parsed, contract)
+}
+
+#[test]
+fn state_harness_rejects_setup_only_guard_with_registered_wrapper_intact() {
+    state_harness_fixture(STATE_HARNESS_SOURCE, &STATE_HARNESS_FIXTURE)
+        .expect("caller owns returned state lifetime");
+    let source = STATE_HARNESS_SOURCE
+        .replace("    let guard = lattice_inference::measurement::gpu_test_lock();\n", "")
+        .replace("fn load() -> MetalQwen35State {", "fn load() -> MetalQwen35State { let guard = lattice_inference::measurement::gpu_test_lock();");
+    let error = state_harness_fixture(&source, &STATE_HARNESS_FIXTURE)
+        .expect_err("setup-only guard must fail");
+    assert!(
+        error.contains("no live shared-lock binding"),
+        "wrong failure: {error}"
+    );
+}
+
+#[test]
+fn state_harness_rejects_unreviewed_callers_aliases_and_deferred_work() {
+    for replacement in [
+        "fn extra() { let state = load(); }",
+        "fn extra() { let alias = load; alias(); }",
+        "use other::function as load;",
+        "fn extra(load: fn()) { load(); }",
+    ] {
+        let source = format!("{STATE_HARNESS_SOURCE}\n{replacement}");
+        assert!(
+            state_harness_fixture(&source, &STATE_HARNESS_FIXTURE).is_err(),
+            "accepted {replacement}"
+        );
+    }
+    for replacement in [
+        "let delayed = || measure(); delayed();",
+        "let future = async { measure(); };",
+        "let measure = other; measure();",
+        "fn measure() {} measure();",
+        "const measure: fn() = other; measure();",
+        "static measure: fn() = other; measure();",
+        "struct measure(); measure();",
+    ] {
+        let source = STATE_HARNESS_SOURCE.replace("    measure();", replacement);
+        assert!(
+            state_harness_fixture(&source, &STATE_HARNESS_FIXTURE).is_err(),
+            "accepted {replacement}"
+        );
+    }
+    let asynchronous = STATE_HARNESS_SOURCE.replace("fn measure()", "async fn measure()");
+    assert!(state_harness_fixture(&asynchronous, &STATE_HARNESS_FIXTURE).is_err());
+}
+
+#[test]
+fn state_harness_rejects_extra_or_inactive_criterion_registration() {
+    for registration in [
+        "criterion_group!(benches, bench_locked, measure);",
+        "#[cfg(any())] criterion_group!(benches, bench_locked);",
+        "mod inactive { criterion_group!(benches, bench_locked); }",
+        "criterion_group!(other, bench_locked);",
+    ] {
+        let source =
+            STATE_HARNESS_SOURCE.replace("criterion_group!(benches, bench_locked);", registration);
+        assert!(
+            state_harness_fixture(&source, &STATE_HARNESS_FIXTURE).is_err(),
+            "accepted {registration}"
+        );
+    }
+}
+
+#[test]
+fn state_harness_rejects_guard_decoys_and_nested_reacquisition() {
+    for guard in [
+        "#[cfg(any())] let guard = lattice_inference::measurement::gpu_test_lock();",
+        "let guard = lattice_inference::measurement::gpu_test_lock(); drop(guard);",
+        "{ let guard = lattice_inference::measurement::gpu_test_lock(); }",
+    ] {
+        let source = STATE_HARNESS_SOURCE.replace(
+            "let guard = lattice_inference::measurement::gpu_test_lock();",
+            guard,
+        );
+        assert!(
+            state_harness_fixture(&source, &STATE_HARNESS_FIXTURE).is_err(),
+            "accepted {guard}"
+        );
+    }
+    let nested = STATE_HARNESS_SOURCE.replace("fn load() -> MetalQwen35State {", "fn load() -> MetalQwen35State { let guard = lattice_inference::measurement::gpu_test_lock();");
+    let error = state_harness_fixture(&nested, &STATE_HARNESS_FIXTURE)
+        .expect_err("nested acquisition must fail");
+    assert!(
+        error.contains("reacquired by a callee"),
+        "wrong failure: {error}"
+    );
+}
+
+#[test]
+fn state_harness_accepts_completed_results_but_rejects_setup_scope_escape() {
+    let contract = BenchHarness {
+        path: "fixtures/complete_operation.rs",
+        registered: &["run"],
+        calls: &[],
+        constructions: &[("run", CallSelector::Path(&["MetalQwen35State", "new"]))],
+    };
+    for output in ["", " -> Vec<Metric>"] {
+        let tail = if output.is_empty() { "" } else { "vec![]" };
+        let source = format!(
+            r#"
+fn run(){output} {{
+    let guard = lattice_inference::measurement::gpu_test_lock();
+    let mut state = MetalQwen35State::new();
+    state.forward_step();
+    {tail}
+}}
+criterion_group!(benches, run);
+criterion_main!(benches);
+"#
+        );
+        state_harness_fixture(&source, &contract)
+            .expect("complete operation may return measurements");
+    }
+    let source = r#"
+fn run() {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let mut state;
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))] {
+        let guard = lattice_inference::measurement::gpu_test_lock();
+        state = MetalQwen35State::new();
+    }
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))] {
+        state.chat_completion();
+    }
+}
+criterion_group!(benches, run);
+criterion_main!(benches);
+"#;
+    let error = state_harness_fixture(source, &contract).expect_err("state escaped setup guard");
+    assert!(
+        error.contains("no live shared-lock binding"),
+        "wrong failure: {error}"
+    );
+    let complete_block = source.replace(
+        "    }\n    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))] {\n        state.chat_completion();",
+        "        state.chat_completion();",
+    ).replace("    #[cfg(all(target_os = \"macos\", feature = \"metal-gpu\"))]\n    let mut state;\n", "")
+        .replace("state = MetalQwen35State::new();", "let mut state = MetalQwen35State::new();");
+    state_harness_fixture(&complete_block, &contract)
+        .expect("whole active block owns measurement lifetime");
+}
+
+#[test]
+fn state_harness_inventory_rejects_omitted_stale_and_new_paths() {
+    let reviewed = BTreeSet::from(["benches/known.rs".to_string()]);
+    validate_bench_harness_inventory(&reviewed, &reviewed).expect("exact coverage");
+    for covered in [
+        BTreeSet::new(),
+        BTreeSet::from(["benches/stale.rs".to_string()]),
+        BTreeSet::from(["benches/known.rs".to_string(), "benches/new.rs".to_string()]),
+    ] {
+        assert!(validate_bench_harness_inventory(&reviewed, &covered).is_err());
+    }
+}
+
+const MULTI_ARM_HARNESS_FIXTURE: BenchHarness = BenchHarness {
+    path: "fixtures/whole_target_list.rs",
+    registered: &["bench_locked"],
+    calls: &[
+        BenchHarnessCall {
+            selector: CallSelector::Path(&["measure"]),
+            callers: &["bench_locked"],
+            guarded: true,
+        },
+        BenchHarnessCall {
+            selector: CallSelector::Path(&["cpu"]),
+            callers: &["bench_locked"],
+            guarded: true,
+        },
+        BenchHarnessCall {
+            selector: CallSelector::Path(&["load"]),
+            callers: &["measure"],
+            guarded: false,
+        },
+    ],
+    constructions: &[("load", CallSelector::Path(&["MetalQwen35State", "new"]))],
+};
+
+const COMPLETE_TARGET_LIST: &str =
+    "let guard = lattice_inference::measurement::gpu_test_lock(); measure(); cpu();";
+
+fn multi_arm_harness_source(body: &str) -> String {
+    format!(
+        r#"
+fn load() -> MetalQwen35State {{ MetalQwen35State::new() }}
+fn measure() {{ let mut state = load(); state.forward_step(); }}
+fn cpu() {{ work(); }}
+fn bench_locked() {{ {body} }}
+criterion_group!(benches, bench_locked);
+criterion_main!(benches);
+"#
+    )
+}
+
+#[test]
+fn benchmark_target_list_requires_one_guard_for_every_ordered_arm() {
+    let source = multi_arm_harness_source(COMPLETE_TARGET_LIST);
+    state_harness_fixture(&source, &MULTI_ARM_HARNESS_FIXTURE)
+        .expect("one span covers GPU and CPU arms");
+    let separate_guards = multi_arm_harness_source(
+        "{ let first = lattice_inference::measurement::gpu_test_lock(); measure(); }
+         { let second = lattice_inference::measurement::gpu_test_lock(); cpu(); }",
+    );
+    let error = state_harness_fixture(&separate_guards, &MULTI_ARM_HARNESS_FIXTURE)
+        .expect_err("individual arm guards cannot certify one continuous span");
+    assert!(
+        error.contains("immediate reviewed arms"),
+        "wrong failure: {error}"
+    );
+    for arms in [
+        "cpu(); measure();",
+        "measure();",
+        "measure(); cpu(); cpu();",
+        "measure(); #[cfg(feature = \"extra\")] cpu();",
+    ] {
+        let body = format!("let guard = lattice_inference::measurement::gpu_test_lock(); {arms}");
+        assert!(
+            state_harness_fixture(&multi_arm_harness_source(&body), &MULTI_ARM_HARNESS_FIXTURE)
+                .is_err(),
+            "accepted {arms}"
+        );
+    }
+    let cpu_outside = multi_arm_harness_source(
+        "{ let guard = lattice_inference::measurement::gpu_test_lock(); measure(); } cpu();",
+    );
+    assert!(state_harness_fixture(&cpu_outside, &MULTI_ARM_HARNESS_FIXTURE).is_err());
+    let registered_sibling = source.replace(
+        "criterion_group!(benches, bench_locked);",
+        "criterion_group!(benches, bench_locked, cpu);",
+    );
+    let error = state_harness_fixture(&registered_sibling, &MULTI_ARM_HARNESS_FIXTURE)
+        .expect_err("unprotected CPU sibling registration");
+    assert!(
+        error.contains("Criterion must register exactly"),
+        "wrong failure: {error}"
+    );
+    let asynchronous = source.replace("fn bench_locked()", "async fn bench_locked()");
+    assert!(state_harness_fixture(&asynchronous, &MULTI_ARM_HARNESS_FIXTURE).is_err());
+}
+
+#[test]
+fn benchmark_target_list_checks_every_active_wrapper_definition() {
+    let source = multi_arm_harness_source(COMPLETE_TARGET_LIST);
+    let wrapper = format!("fn bench_locked() {{ {COMPLETE_TARGET_LIST} }}");
+    let variants = |other: &str| {
+        format!(
+            r#"
+#[cfg(feature = "variant")]
+fn bench_locked() {{ {COMPLETE_TARGET_LIST} }}
+#[cfg(not(feature = "variant"))]
+fn bench_locked() {{ {other} }}
+"#
+        )
+    };
+    let valid = source.replace(&wrapper, &variants(COMPLETE_TARGET_LIST));
+    state_harness_fixture(&valid, &MULTI_ARM_HARNESS_FIXTURE)
+        .expect("both active alternatives have complete spans");
+    let invalid = source.replace(
+        &wrapper,
+        &variants(
+            "{ let first = lattice_inference::measurement::gpu_test_lock(); measure(); }
+         { let second = lattice_inference::measurement::gpu_test_lock(); cpu(); }",
+        ),
+    );
+    assert!(
+        state_harness_fixture(&invalid, &MULTI_ARM_HARNESS_FIXTURE).is_err(),
+        "one correct cfg variant cannot certify the other"
+    );
+}
+
+#[test]
+fn benchmark_leaf_globs_cannot_shadow_reviewed_caller_edges() {
+    let source = multi_arm_harness_source(COMPLETE_TARGET_LIST);
+    let leaf = source.replace("fn cpu() {", "fn cpu() { use metal::*;");
+    state_harness_fixture(&leaf, &MULTI_ARM_HARNESS_FIXTURE)
+        .expect("leaf import does not affect the wrapper's lexical scope");
+    for declaration in ["fn bench_locked() {", "fn measure() {"] {
+        let changed = source.replace(declaration, &format!("{declaration} use metal::*;"));
+        let error = state_harness_fixture(&changed, &MULTI_ARM_HARNESS_FIXTURE)
+            .expect_err("glob in caller scope");
+        assert!(
+            error.contains("glob import can shadow"),
+            "wrong failure: {error}"
+        );
+    }
+    assert!(
+        state_harness_fixture(
+            &format!("use metal::*;\n{source}"),
+            &MULTI_ARM_HARNESS_FIXTURE
+        )
+        .is_err()
+    );
+    let extra = format!("{source}\nfn extra() {{ use metal::*; load(); }}");
+    let error = state_harness_fixture(&extra, &MULTI_ARM_HARNESS_FIXTURE)
+        .expect_err("glob does not admit an extra caller");
+    assert!(
+        error.contains("unreviewed caller extra"),
+        "wrong failure: {error}"
+    );
+}
+
+#[test]
+fn benchmark_arm_arguments_cannot_hide_control_flow_or_replace_parameters() {
+    let source = multi_arm_harness_source(
+        "let guard = lattice_inference::measurement::gpu_test_lock(); measure(c); cpu(c);",
+    )
+    .replace("fn bench_locked()", "fn bench_locked(c: &mut Criterion)")
+    .replace("fn measure()", "fn measure(c: &mut Criterion)")
+    .replace("fn cpu()", "fn cpu(c: &mut Criterion)");
+    state_harness_fixture(&source, &MULTI_ARM_HARNESS_FIXTURE)
+        .expect("the original Criterion parameter reaches both arms unchanged");
+    for argument in ["{ return; }", "other", "&mut *c"] {
+        let changed = source.replace("cpu(c);", &format!("cpu({argument});"));
+        let error = state_harness_fixture(&changed, &MULTI_ARM_HARNESS_FIXTURE)
+            .expect_err("arm argument must not change control flow or the passed value");
+        assert!(
+            error.contains("unchanged bare wrapper parameters"),
+            "wrong failure: {error}"
+        );
+    }
 }
 
 /// Matches every Cargo-selected executable target against recognized source markers.
@@ -3780,6 +4957,13 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
             matches!(target.kind.as_str(), "test" | "lib"),
         )
         .unwrap_or_else(|reason| panic!("{reason}"));
+        let caller_owned = BENCH_HARNESSES
+            .iter()
+            .find(|contract| contract.path == target_relative && !contract.calls.is_empty());
+        if let Some(contract) = caller_owned {
+            validate_bench_harness_sources(&sources, contract)
+                .unwrap_or_else(|reason| panic!("{}: {reason}", contract.path));
+        }
         for source in &sources {
             let site_prefix = format!("{}:{}:{}", target.kind, target.name, target_relative);
             let mut ordinals: BTreeMap<(String, String), usize> = BTreeMap::new();
@@ -3835,6 +5019,12 @@ fn metal_qwen35_state_construction_tests_use_function_lifetime_lock_bindings() {
                 ) else {
                     continue;
                 };
+                if caller_owned.is_some() {
+                    // The same gate verifies the exact construction inventory,
+                    // all caller edges, live owner guards, and registration.
+                    tally.classified.insert(site);
+                    continue;
+                }
                 match source.parsed.validate_work_sites(
                     &[construction],
                     SHARED_LOCK_SELECTOR,

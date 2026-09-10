@@ -173,7 +173,6 @@ mod real {
                 };
                 let model = Qwen35Model::from_safetensors(dir)
                     .map_err(|err| format!("load Q8 safetensors from {}: {err}", dir.display()))?;
-                let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
                 let state = MetalQwen35State::new(model.weights(), model.config(), MAX_CACHE_LEN)
                     .map_err(|err| {
                     format!("create Q8 Metal state from {}: {err}", dir.display())
@@ -202,7 +201,6 @@ mod real {
                 };
                 let cfg = Qwen35Config::from_config_json(&dir.join("config.json"))
                     .map_err(|err| format!("parse Q4 config from {}: {err}", dir.display()))?;
-                let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
                 let state =
                     MetalQwen35State::from_q4_dir(dir, &tokenizer_path, &cfg, MAX_CACHE_LEN)
                         .map_err(|err| {
@@ -271,5 +269,27 @@ fn bench_lm_head(c: &mut Criterion) {
     real::bench_lm_head(c);
 }
 
-criterion_group!(benches, bench_lm_head);
+#[cfg(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "f16",
+    feature = "bench-internals"
+))]
+fn bench_locked_lm_head(c: &mut Criterion) {
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
+    bench_lm_head(c);
+}
+
+#[cfg(not(all(
+    target_os = "macos",
+    feature = "metal-gpu",
+    feature = "f16",
+    feature = "bench-internals"
+)))]
+fn bench_locked_lm_head(c: &mut Criterion) {
+    bench_lm_head(c);
+}
+
+criterion_group!(benches, bench_locked_lm_head);
 criterion_main!(benches);

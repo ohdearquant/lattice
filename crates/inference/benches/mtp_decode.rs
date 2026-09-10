@@ -75,8 +75,6 @@ fn bench_baseline(c: &mut Criterion) {
         use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
         use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
-        let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
-
         let Some(dir) = q4_model_dir() else {
             eprintln!("SKIP mtp_decode/baseline: Q4 model not found (need mtp_fc_weight.q4)");
             return;
@@ -171,8 +169,6 @@ fn bench_mtp(c: &mut Criterion) {
         use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
         use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
-        let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
-
         let Some(dir) = q4_model_dir() else {
             eprintln!("SKIP mtp_decode/mtp: Q4 model not found (need mtp_fc_weight.q4)");
             return;
@@ -261,5 +257,13 @@ fn bench_mtp(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_baseline, bench_mtp);
+fn bench_locked_mtp_decode(c: &mut Criterion) {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
+    bench_baseline(c);
+    bench_mtp(c);
+}
+
+criterion_group!(benches, bench_locked_mtp_decode);
 criterion_main!(benches);

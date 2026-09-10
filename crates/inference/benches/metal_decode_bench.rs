@@ -88,7 +88,6 @@ fn load_q4_state() -> Result<(MetalQwen35State, Qwen35Config), Q4SetupError> {
     let tok = tokenizer_path_checked()?;
     let cfg = Qwen35Config::from_config_json(&dir.join("config.json"))
         .map_err(|error| Q4SetupError::Config(error.to_string()))?;
-    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let state =
         MetalQwen35State::from_q4_dir(&dir, &tok, &cfg, 4096).map_err(Q4SetupError::State)?;
     Ok((state, cfg))
@@ -100,7 +99,6 @@ fn load_q8_state() -> Option<(MetalQwen35State, Qwen35Config)> {
     let dir = safetensors_model_dir()?;
     let model = Qwen35Model::from_safetensors(&dir).ok()?;
     let cfg = model.config().clone();
-    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let state = MetalQwen35State::new(model.weights(), &cfg, 4096).ok()?;
     Some((state, cfg))
 }
@@ -366,10 +364,14 @@ fn bench_metal_prefill_q4(c: &mut Criterion) {
     }
 }
 
-criterion_group!(
-    benches,
-    bench_metal_decode_q4,
-    bench_metal_decode_q8,
-    bench_metal_prefill_q4
-);
+fn bench_locked_metal_decode(c: &mut Criterion) {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
+    bench_metal_decode_q4(c);
+    bench_metal_decode_q8(c);
+    bench_metal_prefill_q4(c);
+}
+
+criterion_group!(benches, bench_locked_metal_decode);
 criterion_main!(benches);
