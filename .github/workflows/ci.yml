@@ -275,6 +275,35 @@ jobs:
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: tune — train-backward (compile tests)
         run: cargo test -p lattice-tune --features train-backward --no-run
+      # That step compiles the train-backward surface and executes none of it,
+      # which is the whole gap for the GDN module-selection guards added in #1516.
+      # `crates/tune/src/lora/mod.rs` declares `pub mod train_core;` under
+      # `#[cfg(feature = "train-backward")]` while tune's defaults are
+      # `["std", "sqlite"]`, so `cargo test --workspace` never compiles that file
+      # and the step above never runs it: the arms proving a `Served` adapter's
+      # frozen factors stay exactly zero, and that the servable set is the one the
+      # Metal loader accepts, were enforced by nothing. Same treatment as the
+      # `validate_against`, `mixture` and `simulated-teacher` steps. Placed
+      # immediately after the compile step so the lib test binary is already built:
+      # the six tests are self-contained (synthetic dims and gradients, no
+      # checkpoint, no filesystem) and executed in 0.00s locally, so what this adds
+      # to the job is the assertions below, not build time.
+      - name: tune — GDN module selection guards (build + run)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/gdn-module-selection-tests.log"
+          if cargo test -p lattice-tune --lib --features train-backward \
+            gdn_lora_tests >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -q 'test lora::train_core::gdn_lora_tests::served_selection_leaves_the_fused_kernel_factors_exactly_zero ... ok' "$log"
+          grep -q 'test lora::train_core::gdn_lora_tests::served_selection_is_exactly_the_modules_metal_can_load ... ok' "$log"
+          grep -q 'test lora::train_core::gdn_lora_tests::all_selection_moves_the_fused_kernel_factors ... ok' "$log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # The `mixture` feature gates the experimental online router-refit module
       # (crates/tune/src/lora/router_update.rs) behind lattice-fann/online-router.
       # It is off by default, so the required `ci` job never compiles or RUNS its
