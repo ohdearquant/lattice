@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use lattice_tune::lora::train_core::GdnModuleSelection;
 use lattice_tune::train_support as train_common;
 use train_common::ArgView;
 use train_common::full_driver::{self, FullDriverConfig};
@@ -24,6 +25,11 @@ Options:
   --max-valid   <N>      Held-out valid.jsonl samples for eval, 0=off (default: 16)
   --log-every   <N>      Print NLL every N steps (default: 5)
   --save        <PATH>   Save trained adapter as a PEFT safetensors file (requires --features safetensors)
+  --gdn-modules <SET>    GDN projections to train: served|all (default: served).
+                         `served` is the set the Metal forward can load. `all`
+                         adds in_proj_a and in_proj_b, which the fused GDN
+                         recurrence kernel consumes: the adapter trains but the
+                         Metal loader refuses it. Use `all` only for CPU-path work.
   --gradcheck            Run finite-difference gradcheck instead of training
   --probe       <N>      Gradcheck entries probed per array per layer (default: 6)
   --fd-eps      <F>      Gradcheck central-difference step (default: 4e-3)
@@ -39,6 +45,19 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
     if log_every == 0 {
         return Err("--log-every must be >= 1".to_string());
     }
+    // An unrecognised value is refused rather than silently defaulted. The whole
+    // point of the flag is that the wrong module set is invisible until load, and
+    // a typo that quietly selects the default would be exactly that failure with
+    // a flag on the command line to say it should not have happened.
+    let gdn_modules = match argv.arg("--gdn-modules").as_deref() {
+        None | Some("served") => GdnModuleSelection::Served,
+        Some("all") => GdnModuleSelection::All,
+        Some(other) => {
+            return Err(format!(
+                "--gdn-modules {other} is not a module set; expected `served` or `all`"
+            ));
+        }
+    };
     Ok(FullDriverConfig {
         model_dir: argv
             .arg("--model-dir")
@@ -94,6 +113,7 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
             .unwrap_or(4e-3),
         save_path: argv.arg("--save"),
         a_init_amp: None,
+        gdn_modules,
     })
 }
 

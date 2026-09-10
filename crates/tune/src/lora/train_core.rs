@@ -1086,13 +1086,74 @@ pub fn apply_adam_updates(
     }
 }
 
-/// Apply Adam updates to all ten factor arrays in each GDN LoRA slot.
+/// Which Gated DeltaNet projections a training run targets.
+///
+/// The trainers used to target all five unconditionally while the Metal forward
+/// accepts three, so an adapter could train to completion and then be refused at
+/// load -- and the loss it minimised included a delta the server would never
+/// apply. The selection therefore has to reach the OPTIMIZER, not just the
+/// writer: dropping the two modules at save time would leave the saved adapter
+/// different from the one the objective was computed for.
+///
+/// Both variants resolve their module names from `lattice_inference::lora_hook`,
+/// which is the only copy of "which GDN modules can be served".
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GdnModuleSelection {
+    /// The set the Metal forward can apply, and the default.
+    ///
+    /// Default because the failure this guards is silent at train time and shows
+    /// up only at load, which is the worst place to learn about it -- after the
+    /// compute has been spent.
+    #[default]
+    Served,
+    /// All five GDN projections, including the two the fused recurrence kernel
+    /// consumes.
+    ///
+    /// Trains a delta the Metal forward cannot serve. Legitimate for CPU-path
+    /// work, which applies every projection, and it is the mutation control that
+    /// proves the default is doing something: under `All` the refusal returns and
+    /// `b_a`/`b_b` stop being zero.
+    All,
+}
+
+impl GdnModuleSelection {
+    /// The GDN module names this selection targets, in the trainers' emission order.
+    #[must_use]
+    pub fn modules(self) -> &'static [&'static str] {
+        match self {
+            Self::Served => &lattice_inference::lora_hook::GDN_LORA_MODULES_SERVABLE,
+            Self::All => &lattice_inference::lora_hook::GDN_LORA_MODULES,
+        }
+    }
+
+    /// Whether the fused-kernel projections `in_proj_a` and `in_proj_b` are trained.
+    ///
+    /// Named after what it decides rather than after the variant, because it is
+    /// read at the four `a_b/b_b/a_a/b_a` optimizer steps and at the two
+    /// `adapter_layers` inserts, and both sites are about those tensors.
+    #[must_use]
+    pub fn trains_fused_kernel_projections(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+/// Apply Adam updates to the GDN LoRA factor arrays selected by `selection`.
+///
+/// Under [`GdnModuleSelection::Served`] the `a_b`/`b_b`/`a_a`/`b_a` steps are
+/// skipped rather than stepped-and-discarded. That is what makes the omission
+/// from the saved adapter provably lossless: every `b_*` array is
+/// zero-initialised, so an unstepped module contributes an exactly-zero delta,
+/// and the adapter that is served is the adapter the loss was minimised for.
+/// Skipping also keeps those tensors out of `AdamState`, so no moment estimates
+/// accumulate for parameters nothing will read.
+///
 /// See [`docs/lora-core.md`](../../docs/lora-core.md#nll_and_grads) for the GDN slot layout.
 pub fn apply_gdn_adam_updates(
     adam: &mut AdamState,
     gdn_loras: &mut [GdnLoraParams],
     gdn_grads: &[GdnLoraParams],
     train: &TrainCtx<'_>,
+    selection: GdnModuleSelection,
 ) {
     let slot_layers = train.gdn_layers();
     let lr = train.learning_rate();
@@ -1120,10 +1181,12 @@ pub fn apply_gdn_adam_updates(
         step!(b_qkv, "b_qkv");
         step!(a_z, "a_z");
         step!(b_z, "b_z");
-        step!(a_b, "a_b");
-        step!(b_b, "b_b");
-        step!(a_a, "a_a");
-        step!(b_a, "b_a");
+        if selection.trains_fused_kernel_projections() {
+            step!(a_b, "a_b");
+            step!(b_b, "b_b");
+            step!(a_a, "a_a");
+            step!(b_a, "b_a");
+        }
         step!(a_out, "a_out");
         step!(b_out, "b_out");
     }
@@ -1176,6 +1239,201 @@ mod gdn_lora_tests {
         // rank so large that rank * hidden overflows usize on any platform.
         let err = GdnLoraParams::zeros(usize::MAX / 2, 16, &gd);
         assert!(err.is_err(), "overflowing rank*hidden should be rejected");
+    }
+
+    /// Run `f` with the `TrainCtx` the GDN optimizer arms share, on the 0.8B preset.
+    ///
+    /// A callback rather than a return, because `TrainCtx` borrows the geometry,
+    /// the config and the slot-layer slices it is built from; returning one would
+    /// hand back references to this function's locals.
+    fn with_gdn_train_ctx<R>(rank: usize, f: impl FnOnce(&TrainCtx<'_>) -> R) -> R {
+        let cfg = Qwen35Config::qwen35_0_8b();
+        let dims = Dims {
+            hidden: cfg.hidden_size,
+            vocab: cfg.vocab_size,
+            num_q_heads: cfg.num_attention_heads,
+            num_kv_heads: cfg.num_key_value_heads,
+            head_dim: cfg.head_dim,
+            rope_dim: cfg.rope_dim(),
+            inter: cfg.intermediate_size,
+            q_dim: cfg.full_q_dim(),
+            kv_dim: cfg.full_kv_dim(),
+            eps: cfg.rms_norm_eps,
+        };
+        let real_gdn_dims = GdnDims::from_cfg(&cfg);
+        assert!(
+            !cfg.is_full_attention(20),
+            "layer 20 must be GDN on the 0.8B preset"
+        );
+        let gqa_layers: [usize; 0] = [];
+        let gdn_layers = [20usize];
+        let train = TrainCtx::try_new(
+            TapeGeometry::new(&dims, &real_gdn_dims, &cfg),
+            rank,
+            (rank as f32) * 2.0,
+            SlotLayout::new(&gqa_layers, &gdn_layers),
+            AdamConfig::new(0.1, 0.9, 0.999, 1e-8),
+        )
+        .expect("valid TrainCtx");
+        f(&train)
+    }
+
+    /// Gradients large enough that a single Adam step cannot leave a parameter at
+    /// its zero init. Every one of the ten arrays is fed, so an array that does
+    /// not move did not move because it was SKIPPED.
+    fn all_ten_grads(rank: usize, hidden: usize, gd: &GdnDims) -> GdnLoraParams {
+        let mut g = GdnLoraParams::zeros(rank, hidden, gd).unwrap();
+        for arr in [
+            &mut g.a_qkv,
+            &mut g.b_qkv,
+            &mut g.a_z,
+            &mut g.b_z,
+            &mut g.a_b,
+            &mut g.b_b,
+            &mut g.a_a,
+            &mut g.b_a,
+            &mut g.a_out,
+            &mut g.b_out,
+        ] {
+            for (i, v) in arr.iter_mut().enumerate() {
+                *v = 0.05 * (i as f32 + 1.0);
+            }
+        }
+        g
+    }
+
+    /// THE ZERO PROOF. Three steps under the default selection, with a non-zero
+    /// gradient on every one of the ten arrays, and `b_a`/`b_b` are still exactly
+    /// `0.0` afterwards.
+    ///
+    /// This is what makes leaving `in_proj_a`/`in_proj_b` out of the saved adapter
+    /// LOSSLESS rather than approximate: a LoRA layer contributes
+    /// `scale * B @ (A @ x)`, `B` is zero-initialised, and an unstepped `B` stays
+    /// exactly zero, so the omitted module's delta is exactly zero -- not small.
+    /// The claim is measured on the tensors here rather than argued from control
+    /// flow, which is the only form that survives a refactor of the step macro.
+    #[test]
+    fn served_selection_leaves_the_fused_kernel_factors_exactly_zero() {
+        let gd = tiny_gdn_dims();
+        let hidden = 16;
+        let rank = 3;
+        let mut gdn_loras = vec![GdnLoraParams::zeros(rank, hidden, &gd).unwrap()];
+        let gdn_grads = vec![all_ten_grads(rank, hidden, &gd)];
+        with_gdn_train_ctx(rank, |train| {
+            let mut adam = AdamState::new();
+            for _ in 0..3 {
+                apply_gdn_adam_updates(
+                    &mut adam,
+                    &mut gdn_loras,
+                    &gdn_grads,
+                    train,
+                    GdnModuleSelection::Served,
+                );
+            }
+        });
+
+        let p = &gdn_loras[0];
+        for (name, arr) in [("b_b", &p.b_b), ("b_a", &p.b_a)] {
+            assert!(
+                arr.iter().all(|&v| v == 0.0),
+                "{name} must be exactly zero after 3 steps under Served, got {arr:?}"
+            );
+        }
+        for (name, arr) in [("a_b", &p.a_b), ("a_a", &p.a_a)] {
+            assert!(
+                arr.iter().all(|&v| v == 0.0),
+                "{name} must be untouched under Served, got {arr:?}"
+            );
+        }
+        // THE CONTROL, in the same arm: the four served arrays DID move under the
+        // same gradients. Without this the test would pass against an optimizer
+        // that stepped nothing at all.
+        for (name, arr) in [
+            ("a_qkv", &p.a_qkv),
+            ("b_qkv", &p.b_qkv),
+            ("a_out", &p.a_out),
+            ("b_out", &p.b_out),
+        ] {
+            assert!(
+                arr.iter().all(|&v| v != 0.0),
+                "{name} must have moved under Served, got {arr:?}"
+            );
+        }
+    }
+
+    /// THE MUTATION. Identical inputs under `All`, and the four fused-kernel
+    /// arrays move. This is what proves the arm above is measuring the selection
+    /// rather than a gradient that happened to be zero, a shape that happened to
+    /// be empty, or an optimizer that stepped nothing.
+    #[test]
+    fn all_selection_moves_the_fused_kernel_factors() {
+        let gd = tiny_gdn_dims();
+        let hidden = 16;
+        let rank = 3;
+        let mut gdn_loras = vec![GdnLoraParams::zeros(rank, hidden, &gd).unwrap()];
+        let gdn_grads = vec![all_ten_grads(rank, hidden, &gd)];
+        with_gdn_train_ctx(rank, |train| {
+            let mut adam = AdamState::new();
+            for _ in 0..3 {
+                apply_gdn_adam_updates(
+                    &mut adam,
+                    &mut gdn_loras,
+                    &gdn_grads,
+                    train,
+                    GdnModuleSelection::All,
+                );
+            }
+        });
+
+        let p = &gdn_loras[0];
+        for (name, arr) in [
+            ("a_b", &p.a_b),
+            ("b_b", &p.b_b),
+            ("a_a", &p.a_a),
+            ("b_a", &p.b_a),
+        ] {
+            assert!(
+                arr.iter().all(|&v| v != 0.0),
+                "{name} must move under All, got {arr:?}"
+            );
+        }
+    }
+
+    /// THE SET PROOF. The default selection names only modules the Metal forward
+    /// can apply, and it reads them from the inference crate's constant rather
+    /// than from a list maintained here.
+    #[test]
+    fn served_selection_is_exactly_the_modules_metal_can_load() {
+        use lattice_inference::lora_hook::{
+            GDN_LORA_MODULES, GDN_LORA_MODULES_SERVABLE, gdn_lora_module_is_servable,
+        };
+
+        assert_eq!(
+            GdnModuleSelection::Served.modules(),
+            GDN_LORA_MODULES_SERVABLE.as_slice()
+        );
+        assert_eq!(
+            GdnModuleSelection::All.modules(),
+            GDN_LORA_MODULES.as_slice()
+        );
+        assert!(GdnModuleSelection::default() == GdnModuleSelection::Served);
+
+        for m in GdnModuleSelection::Served.modules() {
+            assert!(
+                gdn_lora_module_is_servable(m),
+                "Served names {m}, which the Metal forward refuses"
+            );
+        }
+        // And the difference is exactly the two fused-kernel projections, so this
+        // arm fails if either constant grows a module the other does not know.
+        let excluded: Vec<&str> = GDN_LORA_MODULES
+            .iter()
+            .copied()
+            .filter(|m| !gdn_lora_module_is_servable(m))
+            .collect();
+        assert_eq!(excluded, vec!["in_proj_b", "in_proj_a"]);
+        assert!(!GdnModuleSelection::Served.trains_fused_kernel_projections());
+        assert!(GdnModuleSelection::All.trains_fused_kernel_projections());
     }
 
     #[test]
@@ -1232,7 +1490,13 @@ mod gdn_lora_tests {
         .expect("valid TrainCtx");
 
         let mut adam = AdamState::new();
-        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train);
+        apply_gdn_adam_updates(
+            &mut adam,
+            &mut gdn_loras,
+            &gdn_grads,
+            &train,
+            GdnModuleSelection::All,
+        );
 
         // Adam moves params opposite the gradient sign: positive grad -> param
         // decreases from its zero init; negative grad -> param increases.

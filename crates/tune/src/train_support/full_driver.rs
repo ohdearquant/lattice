@@ -9,9 +9,9 @@ use rayon::prelude::*;
 
 use crate::lora::AdamState;
 use crate::lora::train_core::{
-    AdamConfig, Dims, GdnDims, GdnLoraParams, Head, LayerW, LoraParams, MixerKind, SeqCtx,
-    SlotLayout, TOP_LAYER, TapeGeometry, TrainCtx, apply_adam_updates, apply_gdn_adam_updates,
-    eval_chain_nll, forward_full, nll_and_grads, rand_fill, shifted,
+    AdamConfig, Dims, GdnDims, GdnLoraParams, GdnModuleSelection, Head, LayerW, LoraParams,
+    MixerKind, SeqCtx, SlotLayout, TOP_LAYER, TapeGeometry, TrainCtx, apply_adam_updates,
+    apply_gdn_adam_updates, eval_chain_nll, forward_full, nll_and_grads, rand_fill, shifted,
 };
 
 use super::{Sample, load_jsonl, verify_tbv};
@@ -195,6 +195,12 @@ pub struct FullDriverConfig {
     /// Fixed A-factor amplitude for compatibility callers; `None` uses the
     /// full trainer's `1 / sqrt(hidden)` initialization.
     pub a_init_amp: Option<f32>,
+    /// Which GDN projections to train and save.
+    ///
+    /// [`GdnModuleSelection::Served`] is the default everywhere a caller does not
+    /// say otherwise, because an adapter carrying the other two cannot be loaded
+    /// by the Metal forward and nothing says so until load time.
+    pub gdn_modules: GdnModuleSelection,
 }
 
 /// Numeric evidence returned by the shared driver.
@@ -501,6 +507,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         fd_eps,
         save_path,
         a_init_amp,
+        gdn_modules,
     } = config;
 
     if first_layer > TOP_LAYER {
@@ -1107,7 +1114,13 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         };
 
         apply_adam_updates(&mut adam, &mut loras, &grads, &train_ctx);
-        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train_ctx);
+        apply_gdn_adam_updates(
+            &mut adam,
+            &mut gdn_loras,
+            &gdn_grads,
+            &train_ctx,
+            gdn_modules,
+        );
         train_step_secs += tone.elapsed().as_secs_f64();
 
         if step % log_every == 0 || step == steps {
@@ -1199,13 +1212,10 @@ epilogue re-scoring {epilogue_score_secs:.1}s"
             }
             let mut target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
             if num_gdn_slots > 0 {
-                target_modules.extend([
-                    "in_proj_qkv".to_string(),
-                    "in_proj_z".to_string(),
-                    "in_proj_b".to_string(),
-                    "in_proj_a".to_string(),
-                    "out_proj".to_string(),
-                ]);
+                // The list comes from the selection, never from a literal here: a
+                // hand-written list is a second copy of the servable-module set and
+                // drifts from the one the Metal loader refuses by.
+                target_modules.extend(gdn_modules.modules().iter().map(|m| (*m).to_string()));
                 // GDN LoRA (surface-B, ported from lattice PR #202). All five
                 // module names are recognised by `LoraAdapter::validate_against`
                 // (crates/tune/src/lora/mod.rs, inference-hook feature).
@@ -1231,30 +1241,35 @@ epilogue re-scoring {epilogue_score_secs:.1}s"
                             rank,
                         },
                     );
-                    adapter_layers.insert(
-                        (li, "in_proj_b".to_string()),
-                        LoraLayer {
-                            a: g.a_b.clone(),
-                            b: g.b_b.clone(),
-                            d_in: dims.hidden,
-                            // beta is projected per VALUE head (matches the
-                            // shipping gdn_fused forward and the f16 weight
-                            // loader), not per key head (#792).
-                            d_out: gdn_dims.value_heads,
-                            rank,
-                        },
-                    );
-                    adapter_layers.insert(
-                        (li, "in_proj_a".to_string()),
-                        LoraLayer {
-                            a: g.a_a.clone(),
-                            b: g.b_a.clone(),
-                            d_in: dims.hidden,
-                            // alpha is likewise projected per VALUE head.
-                            d_out: gdn_dims.value_heads,
-                            rank,
-                        },
-                    );
+                    // Written only when they were TRAINED. Under the default they
+                    // were never stepped, so `b_b`/`b_a` are still exactly zero and
+                    // the layer would be an identity the loader refuses anyway.
+                    if gdn_modules.trains_fused_kernel_projections() {
+                        adapter_layers.insert(
+                            (li, "in_proj_b".to_string()),
+                            LoraLayer {
+                                a: g.a_b.clone(),
+                                b: g.b_b.clone(),
+                                d_in: dims.hidden,
+                                // beta is projected per VALUE head (matches the
+                                // shipping gdn_fused forward and the f16 weight
+                                // loader), not per key head (#792).
+                                d_out: gdn_dims.value_heads,
+                                rank,
+                            },
+                        );
+                        adapter_layers.insert(
+                            (li, "in_proj_a".to_string()),
+                            LoraLayer {
+                                a: g.a_a.clone(),
+                                b: g.b_a.clone(),
+                                d_in: dims.hidden,
+                                // alpha is likewise projected per VALUE head.
+                                d_out: gdn_dims.value_heads,
+                                rank,
+                            },
+                        );
+                    }
                     adapter_layers.insert(
                         (li, "out_proj".to_string()),
                         LoraLayer {
@@ -1318,6 +1333,7 @@ mod run_bounds_tests {
             fd_eps: 1e-3,
             save_path: None,
             a_init_amp: None,
+            gdn_modules: GdnModuleSelection::default(),
         }
     }
 
