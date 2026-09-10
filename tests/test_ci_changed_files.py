@@ -645,6 +645,7 @@ def _run_required_gate(
     workflow: Path,
     gate_id: str,
     selector_values: dict[str, str],
+    result_values: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     contents = workflow.read_text(encoding="utf-8")
     step = _workflow_step(_workflow_job(contents, gate_id), "Resolve gate")
@@ -661,7 +662,8 @@ def _run_required_gate(
         if expression.startswith(selector_prefix):
             return selector_values.get(expression.removeprefix(selector_prefix), "")
         if expression.startswith("needs.") and expression.endswith(".result"):
-            return "success"
+            job = expression.removeprefix("needs.").removesuffix(".result")
+            return (result_values or {}).get(job, "success")
         if expression == "github.event.pull_request.draft":
             return "false"
         if expression == "github.event_name":
@@ -1921,6 +1923,54 @@ class RequiredGateSelectorTests(unittest.TestCase):
                 )
 
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_required_gates_fail_when_any_needed_job_did_not_succeed(
+        self,
+    ) -> None:
+        """Every job a gate declares in `needs` must be read by its script.
+
+        A gate that lists a job but never inspects its result is decorative:
+        the job can turn red, or be deleted outright, and the required check
+        stays green. So this walks the declared `needs` of each gate rather
+        than a hand-written list of jobs -- a hand-written list would go stale
+        the same way the gate script it is meant to protect would.
+
+        `changes` is excluded because the gates read it through its selector
+        outputs, which the sibling tests above already cover.
+        """
+        for workflow, gate_id, selectors in self._CASES:
+            declared = yaml.safe_load(workflow.read_text(encoding="utf-8"))
+            needs = declared["jobs"][gate_id]["needs"]
+            self.assertIsInstance(needs, list)
+            upstream = [job for job in needs if job != "changes"]
+            self.assertNotEqual(upstream, [])
+
+            for job in upstream:
+                with self.subTest(workflow=workflow.name, job=job):
+                    result = _run_required_gate(
+                        workflow,
+                        gate_id,
+                        {selector: "true" for selector in selectors},
+                        {job: "failure"},
+                    )
+
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"{gate_id} passed while {job} reported failure:\n"
+                        f"{result.stdout}\n{result.stderr}",
+                    )
+                    # A non-zero exit alone would also be produced by an
+                    # unrelated shell error -- an undefined variable under
+                    # `set -u`, say -- so require the gate's own deliberate
+                    # refusal. The gates label upstream jobs by prose rather
+                    # than by job id, so the id itself is not assertable here.
+                    self.assertIn(
+                        "::error::",
+                        f"{result.stdout}\n{result.stderr}",
+                        f"{gate_id} exited non-zero without refusing:\n"
+                        f"{result.stdout}\n{result.stderr}",
+                    )
 
     def test_required_gates_accept_explicit_positive_selector_outputs(
         self,
