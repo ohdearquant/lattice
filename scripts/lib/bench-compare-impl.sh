@@ -52,10 +52,10 @@
 # measured and rendered — the informational section plus the
 # all-measurements table record every number — but classified informational,
 # so they cannot produce a FAIL verdict. This manifest is only the quick-noise
-# policy. Independently, the embed configuration calibration allowlist below
-# keeps every uncalibrated target/feature pair informational at BOTH
-# resolutions. A quick-mode embed result gates only if its exact configuration
-# is calibrated and its target is absent from the quick-noise manifest.
+# policy. Independently, the configuration calibration allowlist below keeps
+# every uncalibrated target/feature pair informational at BOTH resolutions, for
+# both crates. A quick-mode result gates only if its exact configuration is
+# calibrated and its target is absent from the quick-noise manifest.
 #
 # Criterion 0.5 permits `/` in group names and uses the same character to join
 # group/function/parameter in `--list`, so a flat listing cannot recover the
@@ -67,9 +67,10 @@
 # affect one another.
 #
 # --full disables the quick-noise manifest only. It does not grant an
-# uncalibrated embed configuration gating authority: exact default `simd` with
-# no feature override gates at full resolution, while any configuration absent
-# from the calibration allowlist remains informational. Every invocation
+# uncalibrated configuration gating authority in either crate: the exact
+# defaults (`lattice-embed:simd`, `lattice-inference:elementwise_cpu_bench`,
+# each with no feature override) gate at full resolution, while any
+# configuration absent from the calibration allowlist remains informational. Every invocation
 # brackets its measurements in ABBA order (base₁, head₁, head₂, base₂); the gate
 # combines the forward and reverse ratios in log space and widens the result by
 # the measured order-bias envelope. Report-only controls only whether the
@@ -472,9 +473,22 @@ BENCH_HEAD_BASELINE_NAME="compare-head"
 # executes. Additions require reviewed same-configuration A/A calibration and
 # threshold evidence under ADR-087 D3/D5; otherwise the target remains
 # informational at every resolution.
-embed_configuration_has_full_gate_calibration() {
+#
+# The allowlist is keyed by the FULL `<crate>:<target>|<features>` configuration and
+# applies to both crates. It used to be embed-only, and the reason it survived that way
+# is worth keeping: the driver that runs PR-time A/Bs passed group filters and nothing
+# else, so no caller could select another inference target and the asymmetry had no
+# instance. That is a statement about who was calling, not about what the gate would do
+# when someone did. Once the target and features became reachable, the first non-default
+# inference run at full resolution would have voted on thresholds nobody calibrated for
+# it -- and voting is the failure direction, because an uncalibrated PASS reads exactly
+# like a calibrated one.
+#
+# The reason stated above is not crate-specific. Neither is this now.
+configuration_has_full_gate_calibration() {
   case "$1|$2" in
-    'simd|') return 0 ;;
+    'lattice-embed:simd|') return 0 ;;
+    'lattice-inference:elementwise_cpu_bench|') return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -959,10 +973,19 @@ run_target_gate() {
     --order-control-baseline-name "$BENCH_HEAD_BASELINE_NAME"
   )
 
-  if [[ "$target" == lattice-embed:* ]] &&
-     ! embed_configuration_has_full_gate_calibration \
-         "${target#lattice-embed:}" "$CARGO_FEATURES_EMBED"; then
-    # A selected target that has not calibrated this gate is still useful
+  # The features that compiled THIS target, since the two crates carry separate
+  # selections and the allowlist is keyed on the pair. A target whose crate prefix is
+  # neither known one matches no allowlist entry and is therefore informational: an
+  # unrecognized configuration is the case with the least calibration behind it, so it
+  # is also the one that must not vote.
+  local target_features=""
+  case "$target" in
+    lattice-inference:*) target_features="$CARGO_FEATURES_INFERENCE" ;;
+    lattice-embed:*) target_features="$CARGO_FEATURES_EMBED" ;;
+  esac
+
+  if ! configuration_has_full_gate_calibration "$target" "$target_features"; then
+    # A selected configuration that has not calibrated this gate is still useful
     # measurement evidence, but cannot vote at either resolution.
     gate_args+=(--informational-target "$target")
   elif [ -n "$QUICK_FLAGS" ]; then
