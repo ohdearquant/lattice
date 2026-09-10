@@ -349,6 +349,15 @@ impl BertModel {
         &self.config
     }
 
+    // Classification borrows the existing mmap-backed pooler without changing
+    // the independent mean/CLS pooling policy used by embedding callers.
+    pub(crate) fn pooler_parameters(&self) -> (&[f32], &[f32]) {
+        (
+            self.weights.pooler_weight.data,
+            self.weights.pooler_bias.data,
+        )
+    }
+
     /// **Unstable**: tokenizer accessor; exposed for testing only, may be removed.
     pub fn tokenizer(&self) -> &dyn Tokenizer {
         self.tokenizer.as_ref()

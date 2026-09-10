@@ -1,13 +1,16 @@
 //! Cross-encoder reranking model for BERT/MiniLM-style checkpoints.
 //!
 //! Wraps `BertModel` with a scalar classifier head to score (query, document)
-//! pairs. Only supports `BertForSequenceClassification` checkpoints that have
-//! `classifier.weight [1, hidden_size]` and `classifier.bias [1]` tensors.
+//! pairs. Requires `classifier.weight [1, hidden_size]` and `classifier.bias [1]`.
+//! Complete `pooler.dense.weight` / `pooler.dense.bias` pairs apply BERT's learned
+//! dense-plus-tanh pooler before classification. Poolerless checkpoints retain
+//! direct CLS classification for compatibility; incomplete poolers are rejected.
 
 use std::path::Path;
 
 use crate::attention::AttentionBuffers;
 use crate::error::InferenceError;
+use crate::forward::cpu::matmul_bt;
 use crate::lora_hook::LoraHook;
 use crate::model::bert::BertModel;
 use crate::pool::cls_pool;
@@ -15,8 +18,10 @@ use crate::weights::{CrossEncoderWeights, SafetensorsFile};
 
 /// Cross-encoder reranking model.
 ///
-/// Loads a `BertForSequenceClassification` checkpoint and scores
-/// `(query, document)` pairs as sigmoid probabilities.
+/// Loads a BERT-style scalar classification checkpoint and scores
+/// `(query, document)` pairs as sigmoid probabilities. Uses the learned BERT
+/// pooler when present, or direct CLS classification when both pooler tensors
+/// are absent.
 pub struct CrossEncoderModel {
     bert: BertModel,
     classifier: CrossEncoderWeights,
@@ -26,7 +31,8 @@ impl CrossEncoderModel {
     /// Load a cross-encoder from a model directory containing `model.safetensors`.
     ///
     /// Returns `Err(InferenceError::UnsupportedModel)` if the tokenizer does not
-    /// support pair tokenization or if `type_vocab_size < 2`.
+    /// support pair tokenization, if `type_vocab_size < 2`, or if only one of
+    /// `pooler.dense.weight` and `pooler.dense.bias` is present.
     pub fn from_directory(dir: &Path) -> Result<Self, InferenceError> {
         let bert = BertModel::from_directory(dir)?;
 
@@ -38,6 +44,14 @@ impl CrossEncoderModel {
         if bert.config().type_vocab_size < 2 {
             return Err(InferenceError::UnsupportedModel(
                 "BERT cross-encoder pair tokenization requires type_vocab_size >= 2".to_string(),
+            ));
+        }
+
+        let (pooler_weight, pooler_bias) = bert.pooler_parameters();
+        if pooler_weight.is_empty() != pooler_bias.is_empty() {
+            return Err(InferenceError::UnsupportedModel(
+                "cross-encoder pooler requires both pooler.dense.weight and pooler.dense.bias"
+                    .to_string(),
             ));
         }
 
@@ -62,8 +76,8 @@ impl CrossEncoderModel {
             self.bert.config().intermediate_size,
         );
         let hidden = self.bert.forward_tokenized(&input, &mut buffers);
-        let pooled = cls_pool(&hidden, seq_len, hidden_size);
-        let logit = self.classifier.logit(&pooled);
+        let mut pooled = cls_pool(&hidden, seq_len, hidden_size);
+        let logit = self.classifier_logit(&hidden[..hidden_size], &mut pooled);
         sigmoid(logit)
     }
 
@@ -107,8 +121,8 @@ impl CrossEncoderModel {
         let hidden = self
             .bert
             .forward_tokenized_with_hook(&input, &mut buffers, lora);
-        let pooled = cls_pool(&hidden, seq_len, hidden_size);
-        let logit = self.classifier.logit(&pooled);
+        let mut pooled = cls_pool(&hidden, seq_len, hidden_size);
+        let logit = self.classifier_logit(&hidden[..hidden_size], &mut pooled);
         Ok(sigmoid(logit))
     }
 
@@ -136,6 +150,20 @@ impl CrossEncoderModel {
             .iter()
             .map(|doc| self.score_with_hook(query, doc, lora))
             .collect()
+    }
+
+    fn classifier_logit(&self, cls: &[f32], pooled: &mut [f32]) -> f32 {
+        let (weight, bias) = self.bert.pooler_parameters();
+        if weight.is_empty() {
+            return self.classifier.logit(cls);
+        }
+
+        let hidden_size = self.bert.config().hidden_size;
+        matmul_bt(cls, weight, pooled, 1, hidden_size, hidden_size);
+        for (value, &bias) in pooled.iter_mut().zip(bias) {
+            *value = (*value + bias).tanh();
+        }
+        self.classifier.logit(pooled)
     }
 
     /// Ask a hook to check its own declared geometry against this model's BERT
