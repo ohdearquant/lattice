@@ -1,0 +1,12 @@
+{
+  "model_id": "cross-encoder/ms-marco-MiniLM-L6-v2",
+  "revision": "233902d25c440f23af6f7d6e94d2946bac0bee0a",
+  "files": {
+    "config.json": {"git_blob_sha1": "88bc4f74b33a2073abc9a66cb532b889448ac3ed", "size": 794},
+    "model.safetensors": {"sha256": "821d1aa69520101d6e0737f78a042ae25b19e5cb9160701909d10434f4aeb0ae", "size": 90870598},
+    "special_tokens_map.json": {"git_blob_sha1": "7520992f25914d962f0e2fd0e0566fc33d19ec59", "size": 132},
+    "tokenizer.json": {"git_blob_sha1": "688882a79f44442ddc1f60d70334a7ff5df0fb47", "size": 711396},
+    "tokenizer_config.json": {"git_blob_sha1": "a2435fedfac32b9ad70f052d4f84007730cd3109", "size": 1330},
+    "vocab.txt": {"git_blob_sha1": "fb140275c155a9c7c5a3b3e0e77a9e839594a938", "size": 231508}
+  }
+}
