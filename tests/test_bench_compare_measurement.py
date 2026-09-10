@@ -531,6 +531,27 @@ def _add_embeddings_bench_source(root):
     )
 
 
+def _add_inference_bench_source(root):
+    # The cargo fixtures key on the CRATE (`-p lattice-inference`), not the target name, so
+    # they fabricate rms_norm for every inference target. The selected source therefore
+    # declares that group for the harness's declared-vs-measured reconciliation step, exactly
+    # as the embed helper above does.
+    path = root / "crates" / "inference" / "benches" / "f16_convert_bench.rs"
+    path.write_text('let mut group = c.benchmark_group("rms_norm");\n')
+    subprocess.run(
+        [*GIT, "-C", str(root), "add", "-f", str(path)], check=True
+    )
+    subprocess.run(
+        [*GIT, "-C", str(root), "commit", "-qm", "add f16_convert_bench fixture"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+
+
 def _captured_embed_argv(path):
     invocations = [shlex.split(line) for line in path.read_text().splitlines()]
     return [
@@ -1577,6 +1598,97 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"full gate\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn("**ℹ️ 1 informational**", result.stdout)
+
+    def test_uncalibrated_inference_target_is_informational_at_every_resolution(self):
+        """A non-default inference target cannot vote at full resolution either.
+
+        The allowlist used to test ``lattice-embed:*`` only, so at full resolution an
+        inference target outside the calibrated set reached neither demotion path and
+        voted on thresholds nobody calibrated for it. That had no instance while the
+        PR-time driver could pass group filters and nothing else; it acquired one the
+        moment the target and features became reachable.
+
+        Mutation-sensitive: restore the ``[[ "$target" == lattice-embed:* ]] &&``
+        guard on the calibration branch and the fabricated inference regression exits
+        1 at full resolution.
+        """
+        for flags, resolution in (([], "quick"), (["--full"], "full")):
+            with self.subTest(resolution=resolution):
+                with tempfile.TemporaryDirectory() as temporary:
+                    order_file = Path(temporary) / "order.txt"
+                    result = _run(
+                        [*flags, "--fail-on-regression"],
+                        stub_cargo=ORDER_BALANCE_CARGO,
+                        extra_env={
+                            "BENCHES_INFERENCE": "f16_convert_bench",
+                            "STUB_ORDER_FILE": str(order_file),
+                            "STUB_INFERENCE_SCENARIO": "true-regression",
+                            "STUB_EMBED_SCENARIO": "stable",
+                        },
+                        setup=_add_inference_bench_source,
+                    )
+                self.assertEqual(
+                    result.returncode, 0,
+                    f"uncalibrated {resolution} inference target voted on a regression\n"
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn("**ℹ️ 1 informational**", result.stdout)
+                self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
+    def test_feature_changed_default_inference_target_is_not_calibrated(self):
+        """Calibration binds target AND features on the inference side too.
+
+        Same target, different compiled binary: the features are chosen before any
+        benchmark function runs, so the calibrated pair's thresholds say nothing about
+        this one.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--full", "--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "CARGO_FEATURES_INFERENCE": "bench-internals",
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_INFERENCE_SCENARIO": "true-regression",
+                    "STUB_EMBED_SCENARIO": "stable",
+                },
+            )
+        self.assertEqual(
+            result.returncode, 0,
+            "a feature-modified elementwise_cpu_bench inherited the default "
+            f"instrument's full gate\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        self.assertIn("**ℹ️ 1 informational**", result.stdout)
+
+    def test_default_inference_configuration_still_votes_at_full_resolution(self):
+        """The arm that fails if the generalization demoted everything.
+
+        Widening an allowlist to cover a second crate has an obvious failure mode in
+        the safe-looking direction: classify the default pair as uncalibrated too and
+        every assertion above passes while the gate stops gating. This is the same
+        fixture as the two arms above with the default target and no features, and it
+        must exit 1.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--full", "--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_INFERENCE_SCENARIO": "true-regression",
+                    "STUB_EMBED_SCENARIO": "stable",
+                },
+            )
+        self.assertEqual(
+            result.returncode, 1,
+            "the default inference configuration stopped voting\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("gate reported a confirmed regression", result.stderr)
+        self.assertNotIn("**ℹ️ 1 informational**", result.stdout)
 
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):

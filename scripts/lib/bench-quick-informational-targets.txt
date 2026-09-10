@@ -6,18 +6,19 @@
 # scripts/lib/bench-informational-targets.sh (the production shell path) and
 # scripts/perf-bench-gate.py --selftest (the validator) both read THIS file.
 # There is no other copy of this quick-noise demoted-target set anywhere. The
-# independent embed configuration calibration allowlist lives in
-# bench-compare-impl.sh; it is not a second copy of this policy and applies at
-# both resolutions.
+# independent configuration calibration allowlist lives in
+# bench-compare-impl.sh, covers both crates, is not a second copy of this policy,
+# and applies at both resolutions.
 #
 # Semantics: in QUICK mode, every Criterion benchmark of a listed target is
 # reported informationally — fully measured, rendered in the report's
 # informational section and the all-measurements table, excluded only from
 # the gating verdict and exit code. FULL mode (`scripts/bench-compare.sh
 # --full`, or `make bench-gate` against the perf-baselines branch) ignores THIS
-# quick-noise manifest. Full resolution still consults the independent embed
-# configuration calibration allowlist: exact default `simd` with no feature
-# override is eligible to gate, while an uncalibrated target/feature pair stays
+# quick-noise manifest. Full resolution still consults the independent
+# configuration calibration allowlist: the exact defaults `lattice-embed:simd`
+# and `lattice-inference:elementwise_cpu_bench`, each with no feature override,
+# are eligible to gate, while any other target/feature pair stays
 # informational. (`--full` also honors bench-compare.sh's BENCH_GROUPS_*
 # filters, and neither path covers the workspace's full bench set.) Being
 # classified gating is not the same as being enforced: bench-compare.sh
@@ -32,11 +33,11 @@
 # on a regression, so it REPORTS. perf-postmerge-gate.yml runs
 # `bench-compare.sh --full --fail-on-regression` on perf-path merges,
 # against the merged commit's own parent, and fails on a confirmed
-# regression, so it ENFORCES. Under those jobs' default embed configuration,
+# regression, so it ENFORCES. Under those jobs' default configurations,
 # `simd` is therefore reported AND enforced at full resolution; this manifest
 # removes it only from the quick-mode gate. A target absent from this manifest
-# is not automatically gating: an embed configuration must also appear in the
-# independent calibration allowlist.
+# is not automatically gating: its configuration must also appear in the
+# independent calibration allowlist, in either crate.
 #
 # bench-compare keeps each target's Criterion data in a separate output root.
 # That target boundary is required: Criterion permits `/` in group names and

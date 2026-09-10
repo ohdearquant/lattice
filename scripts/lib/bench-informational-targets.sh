@@ -7,9 +7,10 @@
 # therefore stays at the policy's real unit: the `<crate>:<bench-target>` key.
 # bench-compare gives each target its own CRITERION_HOME and passes that exact
 # key to perf-bench-gate.py; this helper only answers whether the target is in
-# the reviewed quick-mode noise-demotion manifest. It does not decide whether
-# an embed target/feature pair has full-gate calibration; bench-compare's
-# independent configuration allowlist owns that policy at both resolutions.
+# the reviewed quick-mode noise-demotion manifest. It does not decide whether a
+# target/feature pair has full-gate calibration, for either crate;
+# bench-compare's independent configuration allowlist owns that policy at both
+# resolutions.
 #
 # `--print-targets` emits the normalized manifest for the selftest. The
 # `--is-informational <target>` predicate exits 0 for a listed target and 1 for
@@ -17,10 +18,11 @@
 # policy cannot silently broaden the informational set.
 #
 # FULL mode (`bench-compare.sh --full`, or `make bench-gate`) ignores THIS
-# quick-noise mechanism. It still consults bench-compare's independent embed
-# configuration calibration allowlist: exact default `simd` with no feature
-# override may gate, while uncalibrated target/feature pairs remain
-# informational. Classification is not enforcement — `bench-compare.sh`
+# quick-noise mechanism. It still consults bench-compare's independent
+# configuration calibration allowlist, which covers both crates: the exact
+# defaults `lattice-embed:simd` and `lattice-inference:elementwise_cpu_bench`,
+# each with no feature override, may gate, while every other target/feature pair
+# remains informational. Classification is not enforcement — `bench-compare.sh`
 # discards its gate's exit status unless the caller passes
 # --fail-on-regression, so a FAIL verdict becomes a non-zero exit only under
 # that flag or via `make bench-gate`. Both bench two selected targets rather
