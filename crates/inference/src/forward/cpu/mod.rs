@@ -1,6 +1,7 @@
 //! CPU forward-kernel module index.
 mod activation;
 mod arch_kernels;
+mod bert_policy;
 mod blas;
 mod elementwise;
 mod gemm_validate;
@@ -20,6 +21,8 @@ pub use activation::{add_bias, add_bias_gelu, gelu};
 pub use arch_kernels::matmul_neon;
 #[cfg(target_arch = "x86_64")]
 pub use arch_kernels::{matmul_avx2, matmul_avx512};
+#[doc(hidden)]
+pub use bert_policy::{BertCpuKernelPolicy, BertCpuKernelProfile};
 pub use blas::{sgemm_bt_strided, sgemm_nn_ab, sgemm_nn_strided};
 pub use elementwise::{elementwise_mul, rms_norm, silu_inplace};
 pub(crate) use gemm_validate::{validate_gemm_bt, validate_gemm_nn, validate_ternary_matvec_args};

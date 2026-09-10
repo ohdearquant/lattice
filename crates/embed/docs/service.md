@@ -6,6 +6,11 @@ generic, query, or document/passage semantic role. Native builds provide two imp
 `NativeEmbeddingService`, which owns a lazily loaded local model, and
 `CachedEmbeddingService`, which wraps any service with a process-local LRU.
 
+Native builds also expose the first dormant contracts for proposed ADR-088:
+`CheckpointAttestor`, `OpaqueAttestationReport`, and `NativeResourceBudget`. These values bound a
+future sealed-preparation protocol, but this slice does not expose a preparer or a prepared service
+and does not change either existing implementation's load or encode path.
+
 The trait is the stable integration surface. Constructors and cache-management APIs on the
 native implementations are marked unstable and may change independently of the trait.
 
@@ -252,19 +257,21 @@ All service methods use `crate::Result<T>`, an alias for `Result<T, EmbedError>`
 also serves model configuration and prepared SIMD APIs, so not every variant originates in a
 native embedding call.
 
-| Error                 | Meaning at this boundary                                                            | Typical caller action                                                            |
-| --------------------- | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `ModelNotLoaded`      | A service requires initialization before use                                        | Initialize/preload the service or surface the configuration issue                |
-| `WrongModelLoaded`    | The loaded model differs from the expected model during a concurrent switch         | Retry with backoff after coordinating the model selection                        |
-| `ModelInitialization` | Model discovery, download/load, or blocking initialization failed                   | Inspect model configuration/files; construct a fresh service after correcting it |
-| `InferenceFailed`     | The inference backend failed, including a cache-wrapper result-count violation      | Surface the backend failure; do not accept a partial batch                       |
-| `TaskFailed`          | A background task was cancelled or panicked                                         | Treat the current call as failed and check service state before retrying         |
-| `InvalidInput`        | Empty/oversized batch, wrong model, invalid configuration, or other invalid request | Correct the request without retrying unchanged input                             |
-| `TextTooLong`         | A text exceeded the service's length check                                          | Chunk or shorten the caller-supplied input                                       |
-| `DimensionMismatch`   | An operation received vectors of different expected and actual dimensions           | Keep model/config/index namespaces consistent                                    |
-| `UnsupportedModel`    | The selected service cannot provide that model                                      | Select a capable service or model                                                |
-| `Internal`            | An invariant failed, such as a missing single-item result                           | Treat as a bug report; do not synthesize a vector                                |
-| `TierMismatch`        | Prepared SIMD quantization data used a different tier than the operation expects    | Reprepare/query with matching quantization metadata                              |
+| Error                    | Meaning at this boundary                                                            | Typical caller action                                                            |
+| ------------------------ | ----------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `ModelNotLoaded`         | A service requires initialization before use                                        | Initialize/preload the service or surface the configuration issue                |
+| `WrongModelLoaded`       | The loaded model differs from the expected model during a concurrent switch         | Retry with backoff after coordinating the model selection                        |
+| `ModelInitialization`    | Model discovery, download/load, or blocking initialization failed                   | Inspect model configuration/files; construct a fresh service after correcting it |
+| `InferenceFailed`        | The inference backend failed, including a cache-wrapper result-count violation      | Surface the backend failure; do not accept a partial batch                       |
+| `TaskFailed`             | A background task was cancelled or panicked                                         | Treat the current call as failed and check service state before retrying         |
+| `InvalidInput`           | Empty/oversized batch, wrong model, invalid configuration, or other invalid request | Correct the request without retrying unchanged input                             |
+| `TextTooLong`            | A text exceeded the service's length check                                          | Chunk or shorten the caller-supplied input                                       |
+| `DimensionMismatch`      | An operation received vectors of different expected and actual dimensions           | Keep model/config/index namespaces consistent                                    |
+| `UnsupportedModel`       | The selected service cannot provide that model                                      | Select a capable service or model                                                |
+| `AttestationReportSize`  | A caller attestor returned fewer than 1 or more than 4,096 report bytes             | Fix or reconfigure the attestor; do not retry the same output unchanged          |
+| `ResourceBudgetOverflow` | Retained and transient-work pool ceilings cannot be summed in `u64`                 | Reduce one or both explicit resource ceilings                                    |
+| `Internal`               | An invariant failed, such as a missing single-item result                           | Treat as a bug report; do not synthesize a vector                                |
+| `TierMismatch`           | Prepared SIMD quantization data used a different tier than the operation expects    | Reprepare/query with matching quantization metadata                              |
 
 Errors are descriptive but not a transaction protocol: if a batch fails after an inner service
 has done work, a caller should assume no usable batch result was returned and decide whether its

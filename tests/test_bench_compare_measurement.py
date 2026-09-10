@@ -17,6 +17,7 @@ shape that used to pass.
 import importlib.util
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -153,6 +154,13 @@ set -euo pipefail
 if [[ "${1:-}" == "--version" ]]; then
   printf '%s\n' 'cargo 1.94.1 (fixture)'
   exit 0
+fi
+
+if [[ -n "${STUB_CARGO_ARGV_FILE:-}" ]]; then
+  {
+    printf '%q ' "$@"
+    printf '\n'
+  } >> "$STUB_CARGO_ARGV_FILE"
 fi
 
 if [[ "${1:-}" == "bench" && "${STUB_REQUIRE_LOCKED:-0}" == "1" ]]; then
@@ -319,6 +327,17 @@ elif [[ "$scenario" == "true-regression" ]]; then
   reverse_point="-0.15"
   reverse_low="-0.152"
   reverse_high="-0.148"
+elif [[ "$scenario" == "stable" ]]; then
+  a1="100.0"
+  b1="100.0"
+  b2="100.0"
+  a2="100.0"
+  forward_point="0.0"
+  forward_low="-0.001"
+  forward_high="0.001"
+  reverse_point="0.0"
+  reverse_low="-0.001"
+  reverse_high="0.001"
 else
   printf 'unknown STUB_SCENARIO=%s\n' "$scenario" >&2
   exit 9
@@ -408,9 +427,9 @@ def _run(
         # crates/<crate>/benches/<target>.rs from the checked-out worktree, so
         # the fixture needs stub sources declaring the same groups the stub
         # cargo fixtures above write results for (rms_norm, simd_dot_product).
-        # Every test defaults to BENCHES_INFERENCE=elementwise_cpu_bench and
-        # BENCHES_EMBED=simd (none override them), so one fixed pair covers
-        # the whole file.
+        # Tests default to BENCHES_INFERENCE=elementwise_cpu_bench and
+        # BENCHES_EMBED=simd. Override cases add and commit their selected
+        # target's fixture source before the detached worktrees are created.
         inference_benches = root / "crates" / "inference" / "benches"
         inference_benches.mkdir(parents=True)
         (inference_benches / "elementwise_cpu_bench.rs").write_text(
@@ -490,6 +509,37 @@ def _run(
         if post_run is not None:
             post_run(root)
         return result
+
+
+def _add_embeddings_bench_source(root):
+    # The cargo fixtures fabricate simd_dot_product for every embed target,
+    # so the selected source declares that group for the harness's
+    # declared-vs-measured reconciliation step.
+    path = root / "crates" / "embed" / "benches" / "embeddings.rs"
+    path.write_text('let mut group = c.benchmark_group("simd_dot_product");\n')
+    subprocess.run(
+        [*GIT, "-C", str(root), "add", "-f", str(path)], check=True
+    )
+    subprocess.run(
+        [*GIT, "-C", str(root), "commit", "-qm", "add embeddings fixture"],
+        check=True,
+        env={
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t",
+        },
+    )
+
+
+def _captured_embed_argv(path):
+    invocations = [shlex.split(line) for line in path.read_text().splitlines()]
+    return [
+        argv
+        for argv in invocations
+        if "-p" in argv
+        and argv.index("-p") + 1 < len(argv)
+        and argv[argv.index("-p") + 1] == "lattice-embed"
+    ]
 
 
 class ClearSelectedBaselineArtifactsSiblingPrune(unittest.TestCase):
@@ -1384,6 +1434,149 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
             f"different BENCHES_INFERENCE values shared a root: "
             f"{inference_first} vs {inference_second}",
         )
+
+    def test_embed_bench_target_honors_caller_override(self):
+        """BENCHES_EMBED selects an existing embed target for the whole run.
+
+        Mutation-sensitive: restore the pre-fix bare ``BENCHES_EMBED="simd"``
+        assignment and all four captured embed commands and roots remain keyed
+        by ``simd`` rather than the caller-selected ``embeddings`` target.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            argv_file = Path(temporary) / "cargo-argv.txt"
+            result = _run(
+                [],
+                stub_cargo=STALE_CHANGE_CARGO,
+                emit_criterion_home=True,
+                extra_env={
+                    "BENCHES_EMBED": "embeddings",
+                    "STUB_CARGO_ARGV_FILE": str(argv_file),
+                },
+                setup=_add_embeddings_bench_source,
+            )
+            embed_argv = _captured_embed_argv(argv_file)
+        self.assertEqual(
+            result.returncode, 0,
+            f"embed target override failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        self.assertEqual(len(embed_argv), 4, embed_argv)
+        for argv in embed_argv:
+            bench_index = argv.index("--bench")
+            self.assertEqual(argv[bench_index + 1], "embeddings", argv)
+            self.assertNotIn("simd", argv)
+            self.assertNotIn("--features", argv)
+        roots = set(re.findall(r"criterion-home=(\S+)", result.stdout))
+        embed_roots = {path for path in roots if "/embed/" in path}
+        self.assertEqual(
+            len(embed_roots), 4,
+            f"expected one embed root per ABBA phase, saw {embed_roots}\n"
+            f"stdout:\n{result.stdout}",
+        )
+        self.assertTrue(
+            all("/embed/embeddings/criterion" in path for path in embed_roots),
+            embed_roots,
+        )
+        self.assertIn(
+            "targets: lattice-inference:elementwise_cpu_bench, "
+            "lattice-embed:embeddings",
+            result.stdout,
+        )
+        self.assertIn("embed features: <none>", result.stdout)
+        self.assertIn("embed_features=<none>", result.stdout)
+
+    def test_embed_features_reach_all_four_abba_commands_and_provenance(self):
+        """CARGO_FEATURES_EMBED is one exact argv value in every embed arm."""
+        with tempfile.TemporaryDirectory() as temporary:
+            argv_file = Path(temporary) / "cargo-argv.txt"
+            captured_provenance = []
+
+            def capture_provenance(root):
+                captured_provenance.append(
+                    (root / ".cache" / "bench-run-provenance.txt").read_text()
+                )
+
+            result = _run(
+                [],
+                stub_cargo=STALE_CHANGE_CARGO,
+                extra_env={
+                    "BENCHES_EMBED": "embeddings",
+                    "CARGO_FEATURES_EMBED": "native,prepared-bench",
+                    "STUB_CARGO_ARGV_FILE": str(argv_file),
+                },
+                setup=_add_embeddings_bench_source,
+                post_run=capture_provenance,
+            )
+            embed_argv = _captured_embed_argv(argv_file)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(embed_argv), 4, embed_argv)
+        for argv in embed_argv:
+            self.assertEqual(argv.count("--features"), 1, argv)
+            feature_index = argv.index("--features")
+            self.assertEqual(argv[feature_index + 1], "native,prepared-bench", argv)
+        self.assertIn("embed features: native,prepared-bench", result.stdout)
+        self.assertIn("embed_features=native,prepared-bench", result.stdout)
+        self.assertEqual(len(captured_provenance), 1)
+        self.assertTrue(
+            captured_provenance[0].startswith(
+                "schema=lattice-bench-provenance-v2\n"
+            ),
+            captured_provenance[0],
+        )
+
+    def test_uncalibrated_embed_target_is_informational_at_every_resolution(self):
+        """A custom embed target cannot inherit simd's calibrated full gate.
+
+        Mutation-sensitive: classify every selected embed target as calibrated
+        and the fabricated +20% custom-target regression exits 1 in both quick
+        and full enforcing modes.
+        """
+        for flags, resolution in (([], "quick"), (["--full"], "full")):
+            with self.subTest(resolution=resolution):
+                with tempfile.TemporaryDirectory() as temporary:
+                    order_file = Path(temporary) / "order.txt"
+                    result = _run(
+                        [*flags, "--fail-on-regression"],
+                        stub_cargo=ORDER_BALANCE_CARGO,
+                        extra_env={
+                            "BENCHES_EMBED": "embeddings",
+                            "STUB_ORDER_FILE": str(order_file),
+                            "STUB_INFERENCE_SCENARIO": "stable",
+                            "STUB_EMBED_SCENARIO": "true-regression",
+                        },
+                        setup=_add_embeddings_bench_source,
+                    )
+                self.assertEqual(
+                    result.returncode, 0,
+                    f"uncalibrated {resolution} target voted on a regression\n"
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn("**ℹ️ 1 informational**", result.stdout)
+                self.assertIn("explicit target policy", result.stdout)
+                self.assertNotIn("re-run `--full` for a gated verdict", result.stdout)
+                self.assertNotIn("informational-only in quick mode", result.stdout)
+                self.assertNotIn("gate reported a confirmed regression", result.stderr)
+
+    def test_feature_changed_default_embed_target_is_not_calibrated(self):
+        """Full-gate calibration binds the target and feature selection."""
+        with tempfile.TemporaryDirectory() as temporary:
+            order_file = Path(temporary) / "order.txt"
+            result = _run(
+                ["--full", "--fail-on-regression"],
+                stub_cargo=ORDER_BALANCE_CARGO,
+                extra_env={
+                    "CARGO_FEATURES_EMBED": "native,local",
+                    "STUB_ORDER_FILE": str(order_file),
+                    "STUB_INFERENCE_SCENARIO": "stable",
+                    "STUB_EMBED_SCENARIO": "true-regression",
+                },
+            )
+        self.assertEqual(
+            result.returncode, 0,
+            "a feature-modified simd target inherited the default instrument's "
+            f"full gate\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("**ℹ️ 1 informational**", result.stdout)
 
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):

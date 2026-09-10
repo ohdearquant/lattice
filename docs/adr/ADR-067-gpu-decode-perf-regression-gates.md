@@ -14,6 +14,47 @@
 > to main while this branch was in flight. This document therefore uses the next free number,
 > **ADR-067**. The content is unchanged by the renumber.
 
+## Amendment 1 (2026-09-03)
+
+One premise in this ADR is false, and the trigger design rests on it.
+
+**The claim.** The Decision section states that the nightly workflow is "dormant by
+construction: GitHub Actions never schedules a job onto a runner-label set with zero
+registered runners." The schedule-only shape, with `workflow_dispatch` deliberately
+omitted, follows from that: a scheduled trigger was considered safe because it was
+believed to be a no-op while the runner is absent.
+
+**What actually happens.** A run is created on every schedule tick. The job sits queued
+waiting for a runner that never appears, and GitHub cancels it at the 24-hour queue
+limit. Measured on run `33631888064`: event `schedule`, created `2026-09-02T12:47:13Z`,
+job cancelled `2026-09-03T12:47:14Z`, labels `["self-hosted", "m2max"]`. That is 24 hours
+and 2 seconds. `GET /repos/ohdearquant/lattice/actions/runners` returns
+`{"total_count": 0, "runners": []}`, so the runner is absent exactly as this ADR
+anticipated; the dormancy mechanism is what was wrong, not the provisioning status.
+
+Nine consecutive nights (2026-08-26 through 2026-09-03) produced a `cancelled` run each.
+Cancelled runs render the same way failed ones do in run listings, so a job specified to
+be silent instead showed a recurring failure on `main`, and each night held a queued slot
+for a full day.
+
+**Amendment.** The workflow's trigger changes from `schedule` to `workflow_dispatch`
+while no runner is registered. The commented-out `schedule:` block stays in the file to
+be restored when one is. This supersedes the "no `pull_request`/`push`/`workflow_dispatch`
+trigger" clause of the Decision section for as long as the runner is absent.
+
+`workflow_dispatch` does not reintroduce the risk the omission was guarding. The
+Consequences section gives the reason for leaving it out as avoiding "a PR-triggerable
+path onto self-hosted hardware," but dispatch is not PR-triggerable: it is manual, it is
+available only to users with write access, and the job's existing
+`if: github.ref == 'refs/heads/main'` guard skips it when dispatched from any other ref.
+The fork-PR hazard comes from `pull_request` and `pull_request_target` triggers, neither
+of which is added here.
+
+Nothing else in this ADR changes. No gate becomes merge-blocking, the gate table is
+untouched, and the workflow still cannot produce a measurement until the runner exists.
+The difference is that its absence is now silent, as originally intended, instead of
+being reported as a nightly failure.
+
 ---
 
 ## Context
@@ -72,10 +113,13 @@ required data reports `INCOMPLETE`, never a silent PASS.
 2. **`tests/test_adr064_gpu_decode_gate.py`** — 18 unit tests: one synthetic fixture per gate-table
    row that trips only that row, a no-change fixture, a within-CI-noise fixture that must stay
    green, and missing-data fixtures proving `INCOMPLETE` never silently passes.
-3. **`.github/workflows/adr064-gpu-decode-nightly.yml`** — schedule-only (`cron: '17 8 * * *'`),
-   `runs-on: [self-hosted, m2max]`, no `pull_request`/`push`/`workflow_dispatch` trigger, guarded
-   to `main` only, `permissions: contents: read`. Dormant by construction: GitHub Actions never
-   schedules a job onto a runner-label set with zero registered runners.
+3. **`.github/workflows/adr064-gpu-decode-nightly.yml`** — `runs-on: [self-hosted, m2max]`, no
+   `pull_request`/`push` trigger, guarded to `main` only, `permissions: contents: read`.
+   Originally specified as schedule-only (`cron: '17 8 * * *'`) with no `workflow_dispatch`,
+   on the premise that GitHub Actions never schedules a job onto a runner-label set with zero
+   registered runners. **That premise is false and the trigger is now `workflow_dispatch`; see
+   Amendment 1.** The `schedule:` block is retained commented-out in the workflow, to be
+   restored when a runner is registered.
 
 ### Harness JSON shape (input contract for the gate script)
 
@@ -120,9 +164,11 @@ implemented, everything that does remains dormant and clearly marked as such.
 
 **DORMANT — pending sign-off on the self-hosted runner:**
 
-1. `.github/workflows/adr064-gpu-decode-nightly.yml` — schedule-only, non-required, no PR trigger,
-   targets `runs-on: [self-hosted, m2max]`. Committed now so it activates the moment the runner is
-   provisioned, but it cannot run before then; this is expected, not a defect.
+1. `.github/workflows/adr064-gpu-decode-nightly.yml` — non-required, no PR trigger, targets
+   `runs-on: [self-hosted, m2max]`. Committed now so it activates the moment the runner is
+   provisioned, but it cannot run before then; this is expected, not a defect. Its trigger is
+   `workflow_dispatch` while the runner is absent, because the original schedule-only shape did
+   not stay dormant in practice — see Amendment 1.
 2. Wiring the harness's currently-null fields (TTFT, PPL deltas, greedy/top-k agreement,
    contention loss, KV-layout assertion) into `scripts/bench_decode_slopefit.py` — out of scope
    for this change; the gate script already handles their absence honestly via `INCOMPLETE`.
@@ -142,7 +188,8 @@ merge-blocking by this change. Everything above is additive.
 - **Positive**: `INCOMPLETE` as a first-class verdict prevents the common perf-harness failure mode
   of a null/zero field being silently read as "passed."
 - **Negative / accepted**: the nightly workflow is unverifiable in CI until the runner exists — its
-  correctness rests on the unit tests and a manual `workflow_dispatch`-style dry run once the
-  runner is available (not added here, to avoid a PR-triggerable path onto self-hosted hardware).
+  correctness rests on the unit tests and a manual dispatch dry run once the runner is available.
+  This originally read "not added here, to avoid a PR-triggerable path onto self-hosted hardware";
+  `workflow_dispatch` is not PR-triggerable, and Amendment 1 adds it for the reason given there.
 - **Follow-up**: once the runner is live, the first several nightly runs should be reviewed by a
   human before any row is proposed for required-status promotion.

@@ -991,31 +991,39 @@ fn bench_attention_kernel(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Head-batched attention kernel benchmark (#702)
+// Packed-batch attention kernel benchmark
 //
 // `bench_attention_kernel` above exercises `multi_head_attention`, the
-// single-sequence per-head path. Until this group existed, NO declared bench
-// target in this crate called `multi_head_attention_batched` -- the
-// packed-batch path #702 changed to stack every head's Q@K^T and scores@V
-// into one `matmul_bt` call per sequence -- directly; the only route that
-// reached it at all was `e2e_bench`, transitively through
-// `BertModel::forward_batch`, whose inputs top out around 100 tokens. That
-// gap is why the group below exists, and the group itself is now the direct
-// caller, so a coverage audit reading this comment should count it as one.
+// single-sequence per-head path. No other declared bench target in this crate
+// calls `multi_head_attention_batched`, the packed-batch path that
+// `BertModel::forward_batch` uses: the only route that reaches it is
+// `e2e_bench`, transitively and only at that binary's own input sizes, which
+// top out around 100 tokens. The group below is the direct caller that closes
+// that gap -- so a coverage audit reading this comment should count it as one.
 //
-// Sweep geometry: the head-batched matmuls compute `num_heads`x the summed
-// per-head FLOPs (both scale as O(seq_len^2 * head_dim) in the shared
-// score/context term), while collapsing `num_heads` small `matmul_bt`
-// dispatches into one per sequence. The crossover between "dispatch savings
-// win" and "extra arithmetic dominates" is where the fixed per-dispatch cost
-// saved, `(num_heads - 1) * dispatch_overhead`, balances the extra compute,
+// It is not in any default bench workflow: `scripts/bench-ci.sh` and
+// `scripts/bench-gate.sh` both select `elementwise_cpu_bench` with no features,
+// so comparing this group requires naming the target
+// (`lattice-inference:inference_bench`) and enabling `bench-internals`
+// explicitly. Without both, this group's body is a no-op and the comparison is
+// silently empty.
+//
+// Sweep geometry: attention cost in this path is dominated by the score and
+// context products, both O(num_heads * seq_len^2 * head_dim) for a fixed model
+// shape, and by the per-`matmul_bt` dispatch cost, which scales with the
+// number of calls rather than their size. Those two terms move in opposite
+// directions as `seq_len` grows, so any change to how the per-head products
+// are issued has a crossover somewhere in `seq_len`, and a single point
+// measurement cannot locate it. Head-batching is exactly such a change: it
+// collapses `num_heads` small `matmul_bt` dispatches into one per sequence at
+// the cost of `num_heads`x the summed per-head FLOPs, so the crossover sits
+// where `(num_heads - 1) * dispatch_overhead` balances
 // `(num_heads - 1) * num_heads * seq_len^2 * head_dim * flop_cost` -- i.e. it
-// scales with `seq_len^2` for a fixed model shape. `seq_len` in `[16, 128]`
-// (bge-small's HIDDEN_SIZE=384/NUM_HEADS=12/HEAD_DIM=32 shape) is exactly
-// the range `attention_kernel` above and `e2e_bench` already exercise
-// without this change being flagged as a regression there, so this sweep
-// brackets that known short end against the long end, up to `MAX_SEQ_LEN`
-// (512), bge-small's `max_position_embeddings` limit.
+// moves with `seq_len^2` for a fixed model shape. `seq_len` in `[16, 128]`
+// (bge-small's HIDDEN_SIZE=384/NUM_HEADS=12/HEAD_DIM=32 shape) is the range
+// `attention_kernel` above and `e2e_bench` already cover; this sweep brackets
+// that known short end against the long end, up to 512, bge-small's
+// `max_position_embeddings` limit.
 //
 // Requires `--features bench-internals` to reach
 // `multi_head_attention_batched`, which stays `pub(crate)` otherwise; the

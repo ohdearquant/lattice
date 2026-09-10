@@ -21,6 +21,8 @@
 # Optional Criterion filters:
 #   BENCH_GROUPS_INFERENCE="rms_norm|gelu" scripts/bench-compare.sh
 #   BENCH_GROUPS_EMBED="simd_dot_product|int8_raw" scripts/bench-compare.sh
+# Optional bench target selection:
+#   BENCHES_EMBED="embeddings" CARGO_FEATURES_EMBED="native" scripts/bench-compare.sh
 # Unset filters run all groups in the default bench targets:
 #   lattice-inference: elementwise_cpu_bench
 #   lattice-embed: simd
@@ -49,8 +51,11 @@
 # scripts/perf-bench-gate.py --selftest); their benchmarks are still fully
 # measured and rendered — the informational section plus the
 # all-measurements table record every number — but classified informational,
-# so they cannot produce a FAIL verdict. Every non-demoted target this script
-# benches (the lattice-inference one) is classified gating in --quick.
+# so they cannot produce a FAIL verdict. This manifest is only the quick-noise
+# policy. Independently, the embed configuration calibration allowlist below
+# keeps every uncalibrated target/feature pair informational at BOTH
+# resolutions. A quick-mode embed result gates only if its exact configuration
+# is calibrated and its target is absent from the quick-noise manifest.
 #
 # Criterion 0.5 permits `/` in group names and uses the same character to join
 # group/function/parameter in `--list`, so a flat listing cannot recover the
@@ -61,13 +66,15 @@
 # guessed string prefix, and same-named groups in different targets cannot
 # affect one another.
 #
-# --full applies no informational demotion: every group it benches is
-# classified gating, simd included. Every invocation brackets its measurements
-# in ABBA order (base₁, head₁, head₂, base₂); the gate combines the forward and
-# reverse ratios in log space and widens the result by the measured order-bias
-# envelope. Report-only controls only whether the verdict is propagated, not
-# which evidence is collected. Three caveats keep full mode from meaning "a
-# regression cannot get past this".
+# --full disables the quick-noise manifest only. It does not grant an
+# uncalibrated embed configuration gating authority: exact default `simd` with
+# no feature override gates at full resolution, while any configuration absent
+# from the calibration allowlist remains informational. Every invocation
+# brackets its measurements in ABBA order (base₁, head₁, head₂, base₂); the gate
+# combines the forward and reverse ratios in log space and widens the result by
+# the measured order-bias envelope. Report-only controls only whether the
+# verdict is propagated, not which evidence is collected. Three caveats keep
+# full mode from meaning "a regression cannot get past this".
 #
 # Enforcement: neither mode enforces BY DEFAULT. The gate's exit status is
 # captured into GATE_RC at the bottom and re-raised only under
@@ -83,11 +90,17 @@
 # `make bench-gate` runs the same two default targets unfiltered against the
 # perf-baselines branch and returns perf-bench-gate.py's status directly.
 #
-# Scope: this script benches two targets, not the workspace's full bench set
-# — lattice-inference:$BENCHES_INFERENCE (default elementwise_cpu_bench) and
-# lattice-embed:simd. The optional BENCH_GROUPS_* filters above narrow it
-# further, so a filtered --full run classifies only the selected groups of
-# those two.
+# Scope: this script benches two caller-selectable targets, not the workspace's
+# full bench set — lattice-inference:$BENCHES_INFERENCE (default
+# elementwise_cpu_bench) and lattice-embed:$BENCHES_EMBED (default simd). The
+# optional BENCH_GROUPS_* filters above narrow it further, so a filtered --full
+# run classifies only the selected groups of those two.
+#
+# A non-default embed target or feature selection is measured and reported
+# informationally at both resolutions until its exact configuration is added to
+# the explicit full-gate calibration predicate below with reviewed A/A evidence.
+# Selecting a target widens the instrument; existence gives it no gating
+# authority.
 #
 # Automation: bench-update.yml runs those targets at full resolution on main
 # — on every push touching the perf paths (which include embed's simd source
@@ -441,26 +454,39 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Bench list (same as ADR-058 Phase 1) ---
-# BENCHES_INFERENCE / CARGO_FEATURES_INFERENCE are overridable so a PR can
-# point this script at a different inference bench target (e.g. one gated
-# behind `bench-internals`) without hand-rolling a separate A/B script.
+# BENCHES_INFERENCE / BENCHES_EMBED are overridable so a PR can point this
+# script at a different existing bench target without hand-rolling a separate
+# A/B script. The matching CARGO_FEATURES_* value supports targets gated behind
+# crate features and is passed as one exact `--features` argument in every arm.
 BENCHES_INFERENCE="${BENCHES_INFERENCE:-elementwise_cpu_bench}"
 CARGO_FEATURES_INFERENCE="${CARGO_FEATURES_INFERENCE:-}"
-BENCHES_EMBED="simd"
+BENCHES_EMBED="${BENCHES_EMBED:-simd}"
+CARGO_FEATURES_EMBED="${CARGO_FEATURES_EMBED:-}"
 BENCH_GROUPS_INFERENCE="${BENCH_GROUPS_INFERENCE:-}"
 BENCH_GROUPS_EMBED="${BENCH_GROUPS_EMBED:-}"
 BENCH_BASELINE_NAME="compare-base"
 BENCH_HEAD_BASELINE_NAME="compare-head"
 
+# Full-resolution gating is an allowlist because choosing another target or
+# feature selection changes the instrument before any benchmark function
+# executes. Additions require reviewed same-configuration A/A calibration and
+# threshold evidence under ADR-087 D3/D5; otherwise the target remains
+# informational at every resolution.
+embed_configuration_has_full_gate_calibration() {
+  case "$1|$2" in
+    'simd|') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Keep Criterion evidence target-qualified without giving up Cargo's shared
 # compilation target. CRITERION_HOME controls only Criterion's report/baseline
 # tree; Cargo continues to use each worktree's normal target directory.
 #
-# Root paths are keyed by BENCH TARGET, not just by crate: BENCHES_INFERENCE
-# is caller-overridable (BENCHES_EMBED is a fixed "simd" today, keyed the same
-# way for consistency should that change), so two runs that pick different
-# targets must never share a directory — Criterion's own report tree keys by
-# group/function only, and two different bench targets can and do declare
+# Root paths are keyed by BENCH TARGET, not just by crate: both target names
+# are caller-overridable, so two runs that pick different targets must never
+# share a directory — Criterion's own report tree keys by group/function only,
+# and two different bench targets can and do declare
 # same-named or different groups into what would otherwise be one shared
 # directory. A target name reaches the filesystem as a path component here,
 # so it is sanitized first: anything outside [A-Za-z0-9._-] becomes '_', and
@@ -618,7 +644,7 @@ BASE_PHASE_RC=0
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $BASE_SHA — skipping)"
   fi
-  run_bench "time:" env CRITERION_HOME="$BASE_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:" env CRITERION_HOME="$BASE_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_PHASE_RC=$?
 # `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
@@ -687,7 +713,7 @@ HEAD_PHASE_RC=0
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
     echo "  ($BENCHES_INFERENCE not present on $HEAD_SHA — skipping)"
   fi
-  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
@@ -703,7 +729,7 @@ HEAD_CONTROL_PHASE_RC=0
   cd "$HEAD_DIR"
   run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
-  run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_CONTROL_PHASE_RC=$?
 if [ "$HEAD_CONTROL_PHASE_RC" -ne 0 ]; then exit "$HEAD_CONTROL_PHASE_RC"; fi
@@ -726,7 +752,7 @@ BASE_CONTROL_PHASE_RC=0
   cd "$WT"
   run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
-  run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_CONTROL_PHASE_RC=$?
 if [ "$BASE_CONTROL_PHASE_RC" -ne 0 ]; then exit "$BASE_CONTROL_PHASE_RC"; fi
@@ -750,7 +776,7 @@ write_run_provenance() {
 
   mkdir -p "$(dirname "$PROVENANCE_FILE")"
   {
-    printf 'schema=lattice-bench-provenance-v1\n'
+    printf 'schema=lattice-bench-provenance-v2\n'
     printf 'started_utc=%s\n' "$RUN_STARTED_UTC"
     printf 'finished_utc=%s\n' "$finished_utc"
     printf 'host_id=%s\n' "$RUN_HOST_ID"
@@ -771,6 +797,7 @@ write_run_provenance() {
     printf 'targets=lattice-inference:%s, lattice-embed:%s\n' \
       "$BENCHES_INFERENCE" "$BENCHES_EMBED"
     printf 'inference_features=%s\n' "${CARGO_FEATURES_INFERENCE:-<none>}"
+    printf 'embed_features=%s\n' "${CARGO_FEATURES_EMBED:-<none>}"
     printf "filters=inference='%s' embed='%s'\n" \
       "${BENCH_GROUPS_INFERENCE:-<all>}" "${BENCH_GROUPS_EMBED:-<all>}"
     printf 'enforcement=%s\n' "$enforcement"
@@ -802,6 +829,7 @@ print_execution_provenance
 echo "  resolution: ${QUICK_FLAGS:---full}"
 echo "  targets: lattice-inference:$BENCHES_INFERENCE, lattice-embed:$BENCHES_EMBED"
 echo "  inference features: ${CARGO_FEATURES_INFERENCE:-<none>}"
+echo "  embed features: ${CARGO_FEATURES_EMBED:-<none>}"
 echo "  filters: inference='${BENCH_GROUPS_INFERENCE:-<all>}' embed='${BENCH_GROUPS_EMBED:-<all>}'"
 echo "  enforcement: $([ "$FAIL_ON_REGRESSION" = "1" ] && echo "--fail-on-regression (regression status propagated)" || echo "report-only (regressions reported; measurement failures still refuse)")"
 echo "  arm order: ABBA (base₁ → head₁ → head₂ → base₂)"
@@ -931,7 +959,13 @@ run_target_gate() {
     --order-control-baseline-name "$BENCH_HEAD_BASELINE_NAME"
   )
 
-  if [ -n "$QUICK_FLAGS" ]; then
+  if [[ "$target" == lattice-embed:* ]] &&
+     ! embed_configuration_has_full_gate_calibration \
+         "${target#lattice-embed:}" "$CARGO_FEATURES_EMBED"; then
+    # A selected target that has not calibrated this gate is still useful
+    # measurement evidence, but cannot vote at either resolution.
+    gate_args+=(--informational-target "$target")
+  elif [ -n "$QUICK_FLAGS" ]; then
     if "$REPO/scripts/lib/bench-informational-targets.sh" \
          --is-informational "$target"; then
       gate_args+=(--informational-target "$target")

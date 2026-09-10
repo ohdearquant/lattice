@@ -20,6 +20,48 @@ use std::fs;
 use std::path::Path;
 use tracing::warn;
 
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_facts;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_config;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_tensor_inventory;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_tokenizer_selection;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_file_presence;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_tokenizer_config;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_sequence_cap;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_sequence_cap_adapter;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_sequence_cap_finalizer;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_tokenizer_json_model;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_vocab_txt;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_wordpiece_vocab_match;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_merges_txt;
+
+#[cfg_attr(not(test), allow(dead_code))]
+mod prepared_bpe_vocab_match;
+
 /// Per-layer fused Q/K/V weight+bias, built once at model-load time from a
 /// `TransformerLayerWeights` layer's separate `query`/`key`/`value` tensors.
 ///

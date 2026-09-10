@@ -1,7 +1,7 @@
 name: 'Provision PaddleOCR-VL-1.6 (pinned + hash-verified)'
 description: >-
   Downloads PaddlePaddle/PaddleOCR-VL-1.6 at a pinned revision and verifies the
-  snapshot before the decoder differential test consumes it: both files must
+  snapshot before the differential gates consume it: every listed file must
   match their expected digest, and the directory must contain nothing else.
 outputs:
   model-dir:
@@ -28,11 +28,12 @@ runs:
         print(snapshot_download('PaddlePaddle/PaddleOCR-VL-1.6', revision='$PADDLEOCR_VL_REVISION', allow_patterns=[
             'config.json',
             'model.safetensors',
+            'preprocessor_config.json',
         ]))
         ")
         echo "model_dir=$MODEL_CACHE" >> "$GITHUB_OUTPUT"
 
-    # The digest checks prove that both expected files are present and
+    # The digest checks prove that every expected file is present and
     # unmodified. The exact-set check also rejects hidden files, directories,
     # and other additions that could affect model loading.
     - id: verify
@@ -47,6 +48,7 @@ runs:
         cat > "$MANIFEST" <<'HASHES'
         ce7f4565f8b1db78532ad5d1b9ebe55c2139d49bd4cb04778b580a08a598f171  config.json
         85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db  model.safetensors
+        111872ab1e8bb7fd040ac5087bfced7ab8f011f02139b088cba294964c3b1d0e  preprocessor_config.json
         HASHES
 
         shasum -a 256 -c "$MANIFEST"

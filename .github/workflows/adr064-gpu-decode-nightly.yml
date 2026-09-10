@@ -2,9 +2,22 @@ name: ADR-064 GPU decode perf nightly (informational)
 #
 # DORMANT — this workflow is committed but INERT until a maintainer provisions a
 # self-hosted runner labeled [self-hosted, m2max]. No such runner exists as of
-# this commit. GitHub Actions never schedules a job onto a label set with zero
-# registered runners, so `schedule` events for this workflow will simply not
-# start any job; this is expected and intentional, not a bug.
+# this commit.
+#
+# The trigger is `workflow_dispatch` and not `schedule`, because a scheduled run
+# does NOT no-op while the label set has zero registered runners. The run is
+# created, the job sits queued waiting for a runner that never appears, and
+# GitHub cancels it at the 24-hour queue limit. Measured on run 33631888064:
+# created 2026-09-02T12:47:13Z, job cancelled 2026-09-03T12:47:14Z, labels
+# ["self-hosted", "m2max"]. Nine consecutive nights did this, each leaving a
+# `cancelled` run that renders as a failure in run listings. See ADR-067
+# Amendment 1.
+#
+# Dispatch does not reintroduce the fork-PR risk the schedule-only shape was
+# guarding. It cannot be triggered by a pull request, only by a user with write
+# access, and the `if: github.ref == 'refs/heads/main'` guard below skips the job
+# when dispatched from any other ref. Restore the `schedule:` block below once a
+# runner is registered.
 #
 # Once the runner exists this workflow measures decode tok/s + slope/intercept
 # on Metal (see scripts/bench_decode_slopefit.sh) and applies the ADR-064
@@ -18,8 +31,10 @@ name: ADR-064 GPU decode perf nightly (informational)
 # and must not become merge-blocking without explicit maintainer sign-off.
 
 on:
-  schedule:
-    - cron: '17 8 * * *'
+  # Restore when a [self-hosted, m2max] runner is registered:
+  #   schedule:
+  #     - cron: '17 8 * * *'
+  workflow_dispatch:
 
 permissions:
   contents: read

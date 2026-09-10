@@ -66,6 +66,28 @@ pub enum EmbedError {
     #[error("model not supported: {0}")]
     UnsupportedModel(String),
 
+    /// An attestation report is outside the closed public byte bound.
+    #[error("attestation report size {length} bytes is outside {min}..={max}")]
+    AttestationReportSize {
+        /// Actual report length in bytes.
+        length: usize,
+        /// Smallest accepted report length in bytes.
+        min: usize,
+        /// Largest accepted report length in bytes.
+        max: usize,
+    },
+
+    /// The independent retained and transient-work pools overflow aggregate accounting.
+    #[error(
+        "resource budget overflow: retained {retained_bytes} bytes plus transient work {transient_work_bytes} bytes"
+    )]
+    ResourceBudgetOverflow {
+        /// Retained-pool byte ceiling.
+        retained_bytes: u64,
+        /// Transient-work-pool byte ceiling.
+        transient_work_bytes: u64,
+    },
+
     /// Internal logic error (count mismatch, unexpected state).
     #[error("internal error: {0}")]
     Internal(String),

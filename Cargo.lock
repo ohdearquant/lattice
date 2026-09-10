@@ -1656,6 +1656,7 @@ dependencies = [
  "lattice-inference",
  "parking_lot",
  "proptest",
+ "rayon",
  "rusqlite",
  "safetensors",
  "serde",
