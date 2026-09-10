@@ -39,7 +39,27 @@ fi
 source "$REPO/scripts/lib/bench-python.sh"
 PYTHON_BIN="$(bench_require_python3 "bench-compare.sh")" || exit 1
 export PYTHON_BIN
+GPU_HANDOFF=()
+COMPARE_ARGS=()
+PARSING_FLAGS=1
+for arg in "$@"; do
+  if [ "$PARSING_FLAGS" = "1" ] && [ "$arg" = "--gpu-handoff" ]; then
+    if [ "${#GPU_HANDOFF[@]}" -ne 0 ]; then
+      echo "bench-compare: repeated --gpu-handoff" >&2
+      exit 2
+    fi
+    GPU_HANDOFF=(--gpu-handoff compare)
+  else
+    COMPARE_ARGS+=("$arg")
+    case "$arg" in
+      --) PARSING_FLAGS=0 ;;
+      --full|--fail-on-regression) ;;
+      *) PARSING_FLAGS=0 ;;
+    esac
+  fi
+done
+# Bash 3 treats an empty array as unset under nounset.
 exec "$PYTHON_BIN" "$REPO/scripts/lib/bench_supervision.py" run \
   --label "bench-compare" \
-  --entrypoint \
-  -- "$REPO/scripts/lib/bench-compare-impl.sh" "$@"
+  --entrypoint ${GPU_HANDOFF[@]+"${GPU_HANDOFF[@]}"} \
+  -- "$REPO/scripts/lib/bench-compare-impl.sh" ${COMPARE_ARGS[@]+"${COMPARE_ARGS[@]}"}

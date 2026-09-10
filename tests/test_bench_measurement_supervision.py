@@ -33,6 +33,9 @@ SPECIAL_ENTRYPOINTS = {
 INTERNAL_OR_TEST = {
     "scripts/ensure-noindex-marker-selftest.sh",
     "scripts/lib/bench-compare-impl.sh",
+    # These typed helpers require the frozen plan and private owner service.
+    "scripts/lib/bench_admission.py",
+    "scripts/lib/bench_handoff.py",
 }
 MEASUREMENT_SIGNAL = re.compile(
     r"perf_counter(?:_ns)?\(|hrtime\.bigint\(|cargo bench|tok_per_sec|"
@@ -100,6 +103,10 @@ EXPLICIT_SCRIPT_EXCLUSIONS = frozenset(
         "scripts/lib/bench-quick-informational-targets.txt",
         "scripts/lib/bench-supervision.sh",
         "scripts/lib/bench_supervision.py",
+        # Typed admission and its private retained-owner service are internal;
+        # neither offers a standalone arbitrary measurement entry point.
+        "scripts/lib/bench_admission.py",
+        "scripts/lib/bench_handoff.py",
         "scripts/lib/ensure-noindex-marker.sh",
         "scripts/lib/machine-state-probe.py",
         "scripts/lib/quiet-probe.py",
@@ -2709,6 +2716,271 @@ class ImplBodyInheritsResolvedPythonInterpreter(unittest.TestCase):
         self.assertIn(
             "no Python >= 3.11 found on PATH", result.stderr, result.stderr
         )
+
+
+class GpuHandoffProtocol(unittest.TestCase):
+    """Exercise the shipping service with CPU-only canonical-lock fixtures."""
+
+    @classmethod
+    def setUpClass(cls):
+        import runpy
+
+        cls.module = runpy.run_path(str(REPO / "scripts" / "lib" / "bench_handoff.py"))
+
+    def _run_fixture(
+        self, *, target_mode="ready", requested_entry="command", quiet_ok=True,
+        disconnect=False, replay=False, disconnect_after_ready=False,
+    ):
+        import json
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            gpu_path = root / "gpu.lock"
+            result_path = root / "output"
+            work_marker = root / "measured"
+            descendant_pid = root / "descendant.pid"
+            request_path = root / "request.json"
+            target_code = """
+import fcntl, json, os, pathlib, socket, subprocess, sys, time
+assert os.environ["LATTICE_GPU_HANDOFF_FD"] == "0"
+gpu = pathlib.Path(os.environ["FIXTURE_GPU"])
+assert os.fstat(0).st_ino == gpu.stat().st_ino
+with gpu.open("r+") as independent:
+    try:
+        fcntl.flock(independent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise AssertionError("supervisor GPU ownership was absent")
+fcntl.flock(0, fcntl.LOCK_EX | fcntl.LOCK_NB)
+if os.environ["FIXTURE_TARGET_MODE"] == "missing":
+    print("time: 1 ns")
+    raise SystemExit(0)
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect(os.environ["LATTICE_GPU_HANDOFF_CONTROL"])
+message = dict(protocol=1, token=os.environ["LATTICE_GPU_HANDOFF_TOKEN"],
+               pid=os.getpid(), exe=os.path.realpath(sys.executable))
+if os.environ["FIXTURE_TARGET_MODE"] == "wrong-pid":
+    message["pid"] += 1
+client.sendall(json.dumps(message).encode() + b"\\n")
+reply = client.makefile("rb").readline()
+assert json.loads(reply)["status"] == "ready", reply
+pathlib.Path(os.environ["FIXTURE_WORK"]).write_text("measured")
+if os.environ["FIXTURE_TARGET_MODE"] == "silent":
+    time.sleep(10)
+if os.environ["FIXTURE_TARGET_MODE"] == "inherited-output":
+    descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+    pathlib.Path(os.environ["FIXTURE_DESCENDANT_PID"]).write_text(str(descendant.pid))
+print("time: 1 ns; measured after ACK")
+"""
+            helper_code = """
+import base64, json, os, pathlib, socket, sys, time
+gpu = pathlib.Path(os.environ["FIXTURE_GPU"]).stat()
+for fd in range(256):
+    try:
+        opened = os.fstat(fd)
+    except OSError:
+        continue
+    assert (opened.st_dev, opened.st_ino) != (gpu.st_dev, gpu.st_ino), fd
+request = json.loads(pathlib.Path(os.environ["FIXTURE_REQUEST"]).read_text())
+request.update(protocol=1, token=os.environ["LATTICE_GPU_HANDOFF_BROKER_TOKEN"])
+status = 0
+for attempt in range(2 if os.environ["FIXTURE_REPLAY"] == "1" else 1):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.connect(os.environ["LATTICE_GPU_HANDOFF_BROKER"])
+    client.sendall(json.dumps(request).encode() + b"\\n")
+    if os.environ["FIXTURE_DISCONNECT"] == "1":
+        client.close()
+        raise SystemExit(0)
+    if os.environ["FIXTURE_DISCONNECT_AFTER_READY"] == "1":
+        deadline = time.monotonic() + 3
+        while not pathlib.Path(os.environ["FIXTURE_WORK"]).exists():
+            if time.monotonic() >= deadline:
+                raise AssertionError("target did not enter its measured phase")
+            time.sleep(0.01)
+        client.close()
+        time.sleep(10)
+        raise SystemExit(0)
+    with client.makefile("rb") as stream:
+        for line in stream:
+            frame = json.loads(line)
+            if "output" in frame:
+                with pathlib.Path(os.environ["FIXTURE_OUTPUT"]).open("ab") as output:
+                    output.write(base64.b64decode(frame["output"]))
+            if "status" in frame:
+                status = frame["status"]
+                break
+    client.close()
+raise SystemExit(status)
+"""
+            entry = {
+                "id": "command", "revision": "a" * 40,
+                "package": "lattice-inference", "target": "metal_decode_bench",
+                "features": "f16,metal-gpu", "feature_set": ["f16", "metal-gpu"],
+                "cwd": str(root), "run_cwd": str(root),
+                "criterion_home": str(root / "criterion"),
+                "argv": ["-c", target_code],
+            }
+            plan = {
+                "version": 1, "mode": "command", "repo": str(root),
+                "entries": [entry], "environment": {},
+                "command": [sys.executable, "-c", helper_code],
+            }
+            request_path.write_text(json.dumps({"entry": requested_entry}))
+            env = {
+                **os.environ,
+                "FIXTURE_GPU": str(gpu_path), "FIXTURE_REQUEST": str(request_path),
+                "FIXTURE_OUTPUT": str(result_path), "FIXTURE_WORK": str(work_marker),
+                "FIXTURE_TARGET_MODE": target_mode,
+                "FIXTURE_DISCONNECT": str(int(disconnect)),
+                "FIXTURE_DISCONNECT_AFTER_READY": str(int(disconnect_after_ready)),
+                "FIXTURE_DESCENDANT_PID": str(descendant_pid),
+                "FIXTURE_REPLAY": str(int(replay)),
+            }
+            quiet_calls = []
+            def quiet(label, mode):
+                self.assertFalse(work_marker.exists(), "work began before quiet certification")
+                quiet_calls.append((label, mode))
+                return quiet_ok, "inside measured-phase quiet sample\n"
+
+            with gpu_path.open("w+") as gpu:
+                fcntl.flock(gpu, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                service = self.module["HandoffService"](
+                    plan, gpu.fileno(), lambda: None, quiet,
+                    validate_request=lambda _entry, _request: Path(sys.executable),
+                    ready_timeout=3,
+                )
+                self.assertLess(len(os.fsencode(service.broker_path)), 104)
+                started = time.monotonic()
+                try:
+                    status = service.run(plan["command"], env, ())
+                finally:
+                    if descendant_pid.exists():
+                        try:
+                            os.kill(int(descendant_pid.read_text()), signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                elapsed = time.monotonic() - started
+                with gpu_path.open("r+") as independent:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(independent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                receipt = service.receipt_path.read_text()
+            return {
+                "status": status,
+                "worked": work_marker.exists(),
+                "quiet_calls": quiet_calls,
+                "receipt": receipt,
+                "output": result_path.read_text() if result_path.exists() else "",
+                "elapsed": elapsed,
+            }
+
+    def test_selected_target_proves_lock_then_quiet_then_ack(self):
+        result = self._run_fixture()
+        self.assertEqual(0, result["status"])
+        self.assertTrue(result["worked"])
+        self.assertEqual(1, len(result["quiet_calls"]))
+        self.assertIn("measured after ACK", result["output"])
+        self.assertIn('"status": "ready"', result["receipt"])
+        self.assertIn("inside measured-phase quiet", result["receipt"])
+
+    def test_successful_process_without_ready_cannot_certify(self):
+        result = self._run_fixture(target_mode="missing")
+        self.assertEqual(2, result["status"])
+        self.assertFalse(result["worked"])
+        self.assertFalse(result["quiet_calls"])
+
+    def test_wrong_pid_refuses_before_quiet_or_work(self):
+        result = self._run_fixture(target_mode="wrong-pid")
+        self.assertEqual(2, result["status"])
+        self.assertFalse(result["worked"])
+        self.assertFalse(result["quiet_calls"])
+
+    def test_busy_measured_phase_refuses_before_work(self):
+        result = self._run_fixture(quiet_ok=False)
+        self.assertEqual(2, result["status"])
+        self.assertFalse(result["worked"])
+        self.assertIn('"status": "refused"', result["receipt"])
+
+    def test_unknown_invocation_never_launches_target(self):
+        result = self._run_fixture(requested_entry="head1")
+        self.assertEqual(2, result["status"])
+        self.assertFalse(result["worked"])
+        self.assertFalse(result["quiet_calls"])
+
+    def test_replay_cannot_make_completed_plan_succeed(self):
+        result = self._run_fixture(replay=True)
+        self.assertEqual(2, result["status"])
+        self.assertEqual(1, len(result["quiet_calls"]))
+
+    def test_disconnected_helper_cannot_certify(self):
+        result = self._run_fixture(disconnect=True)
+        self.assertEqual(2, result["status"])
+
+    def test_exited_target_with_inherited_stdout_refuses_within_drain_bound(self):
+        result = self._run_fixture(target_mode="inherited-output")
+        self.assertEqual(2, result["status"])
+        self.assertTrue(result["worked"])
+        self.assertIn("inherited output still open", result["output"])
+        self.assertLess(result["elapsed"], 5)
+
+    def test_disconnected_live_helper_stops_a_silent_benchmark(self):
+        result = self._run_fixture(target_mode="silent", disconnect_after_ready=True)
+        self.assertEqual(2, result["status"])
+        self.assertTrue(result["worked"])
+        self.assertLess(result["elapsed"], 5)
+
+    def test_receive_deadline_is_not_extended_by_partial_frame_progress(self):
+        import socket
+        import threading
+
+        sender, receiver = socket.socketpair()
+        release = threading.Event()
+        def trickle():
+            finish = time.monotonic() + 0.5
+            try:
+                while not release.wait(0.01) and time.monotonic() < finish:
+                    sender.sendall(b" ")
+            except OSError:
+                pass
+            finally:
+                sender.close()
+        worker = threading.Thread(target=trickle)
+        worker.start()
+        started = time.monotonic()
+        try:
+            with self.assertRaises((self.module["HandoffError"], TimeoutError)):
+                self.module["_receive"](receiver, 4096, started + 0.05)
+            self.assertLess(time.monotonic() - started, 0.4)
+        finally:
+            release.set()
+            sender.close()
+            receiver.close()
+            worker.join(timeout=0.5)
+
+    def test_frozen_plan_rejects_changes_and_partial_signals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            plan = {
+                "version": 1, "mode": "command", "repo": str(root),
+                "entries": [{"id": "command"}], "environment": {},
+                "command": ["typed-helper"],
+            }
+            path, digest = self.module["write_frozen_plan"](root, plan)
+            names = {
+                self.module["PLAN_ENV"]: str(path),
+                self.module["PLAN_DIGEST_ENV"]: digest,
+            }
+            with mock.patch.dict(os.environ, names, clear=True):
+                self.assertEqual(
+                    plan,
+                    self.module["read_frozen_plan"](root, "command", ["typed-helper"]),
+                )
+                path.write_bytes(path.read_bytes() + b" ")
+                with self.assertRaisesRegex(self.module["HandoffError"], "changed"):
+                    self.module["read_frozen_plan"](root)
+            with mock.patch.dict(os.environ, {self.module["PLAN_ENV"]: str(path)}, clear=True):
+                with self.assertRaisesRegex(self.module["HandoffError"], "missing"):
+                    self.module["read_frozen_plan"](root)
 
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):
