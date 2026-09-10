@@ -3770,7 +3770,16 @@ mod inner {
         ) -> Result<(usize, usize), crate::error::InferenceError> {
             use crate::error::InferenceError;
 
-            if matches!(module, "in_proj_b" | "in_proj_a") {
+            // The refusal set is DERIVED from the servable set rather than spelled
+            // again here. Written out, this list was a second copy of a fact the
+            // trainers also hold, and two independently maintained copies of
+            // "which GDN modules can be served" drift silently: the adapter
+            // trains, the loss is minimised for a delta this kernel will never
+            // apply, and nothing says so until load. `crates/inference/src/
+            // lora_hook.rs` is the one copy; both ends read it.
+            if crate::lora_hook::GDN_LORA_MODULES.contains(&module)
+                && !crate::lora_hook::gdn_lora_module_is_servable(module)
+            {
                 if cfg.is_full_attention(layer_idx) {
                     return Err(InferenceError::Inference(format!(
                         "unknown LoRA module '{module}'"

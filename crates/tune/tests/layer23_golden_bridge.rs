@@ -256,6 +256,13 @@ fn compatibility_shim_matches_legacy_layer23_golden() {
         fd_eps: 4e-3,
         save_path: None,
         a_init_amp: Some(0.02),
+        // `All`, not the default, and deliberately: this test's subject is the
+        // shared driver reproducing the LEGACY layer-23 path, which predates any
+        // module selection and trained every GDN projection. Pinning `All` keeps
+        // the comparison about the driver. If layer 23 carries no GDN slot in this
+        // fixture the choice is inert, which is also fine -- what it must never be
+        // is a silent change to what is being compared.
+        gdn_modules: lattice_tune::lora::train_core::GdnModuleSelection::All,
     })
     .unwrap();
     let worst_relative_error = gradcheck
