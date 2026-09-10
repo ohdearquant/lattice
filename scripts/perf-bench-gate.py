@@ -57,8 +57,9 @@ every target in the run. Excessive order bias is the other exit-3 cause.
 Criterion output root and passes that root's exact key through --target. A
 reviewed caller policy may mark that same key informational: the quick-mode
 noise-demotion manifest does this for lattice-embed's `simd` target (#714),
-and the embed target/feature calibration allowlist does it at either resolution
-for selected configurations that have not calibrated the gate. Every result in
+and the target/feature calibration allowlist -- which covers both crates -- does
+it at either resolution for selected configurations that have not calibrated the
+gate. Every result in
 an informational root is still measured and reported, but excluded from the
 FAIL/WARN verdict and exit code. This classifier validates exact target identity;
 the caller owns the policy decision to withhold gating authority.
