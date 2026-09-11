@@ -30,7 +30,7 @@ Before re-running a corrupted A/B, check structural reachability first, and run 
 
 To be precise about how this interacts with the "no exceptions" rule above: the bench-compare disposition section of the PR is still mandatory for every `crates/inference/`, `crates/embed/`, or `crates/fann/` PR. An unreachability proof is the one narrow case where that section may contain a structural argument instead of an A/B table, and it carries a heavier burden than the old compiled-out wording did.
 
-The proof must name the population it searched, because the two targets `bench-compare` runs by default are not the population. `crates/inference` declares 23 bench targets and the default disposition path runs one of them, so "the default A/B showed nothing" is a statement about coverage, not about the change. Search every declared bench target for one that reaches the changed code — Cargo selects bench targets by `required-features` as well as by `cfg`, so search both. If a reachable target exists, run it (`--bench <name>`, plus whatever features its `cfg` gate or `required-features` entry require) instead of claiming a waiver. Only when no declared target reaches the change does the waiver apply, and then the proof states which targets were searched, and either names the `cfg` gate or `required-features` entry together with the bench build's feature set, or names the call path that does not exist. State the residual risk in the same paragraph: an unreachable change is not a safe change, it is an unmeasured one, and saying so is the point of the disposition.
+The proof must name the population it searched, because the two targets `bench-compare` runs by default are not the population. `crates/inference` declares many more bench targets than the default disposition path runs — it runs one — so "the default A/B showed nothing" is a statement about coverage, not about the change. Count them at the ref you are working from rather than trusting a number written here, and pass the ref through a quoted variable (`REF='<ref>'`, then `git show "$REF:crates/inference/Cargo.toml" | grep -c '^\[\[bench\]\]'`) rather than pasting it straight into the command. Git rejects a space in a ref name but permits `;`, `&&`, `|` and backticks, so a branch name — which on a fork is chosen by someone else — can carry a shell payload, and the unquoted form runs it. This sentence used to carry a literal, and it was wrong: it said 23 while the manifest declared 25. A count in prose is never re-derived by the people who add targets, so it can only decay, and the argument does not need it. Search every declared bench target for one that reaches the changed code — Cargo selects bench targets by `required-features` as well as by `cfg`, so search both. If a reachable target exists, run it (`--bench <name>`, plus whatever features its `cfg` gate or `required-features` entry require) instead of claiming a waiver. Only when no declared target reaches the change does the waiver apply, and then the proof states which targets were searched, and either names the `cfg` gate or `required-features` entry together with the bench build's feature set, or names the call path that does not exist. State the residual risk in the same paragraph: an unreachable change is not a safe change, it is an unmeasured one, and saying so is the point of the disposition.
 
 "Run it" assumes the reachable target sits inside `bench-compare`'s paired machinery. It doesn't always: `scripts/lib/bench-compare-impl.sh` drives exactly two packages, `lattice-inference` and `lattice-embed`, each through `cargo bench`'s Criterion `--save-baseline`/`--baseline` pair, and `Makefile`'s `bench-compare` target reaches only that script. A reachable target outside those two packages, or one that never calls into Criterion in the first place (a plain `fn main()` binary, not `criterion_group!`/`criterion_main!`, so there is no baseline to save or diff against), has no route through that pair — `crates/fann`'s `router_online` is both at once: it lives in `lattice-fann`, not `lattice-inference`/`lattice-embed`, and its body is a plain `fn main()` (`crates/fann/benches/router_online.rs:412`) with no Criterion dependency anywhere in `lattice-fann`'s manifest. For that target, the disposition still requires a before/after comparison; it's just not `bench-compare`'s. Check out base, run the target once under `scripts/bench-command.sh --label <name> --durable -- <command>` (`--durable` is required for this: it takes the same two machine-wide locks `bench-compare.sh` uses, plus a CPU-idle floor check before the command; the after-check runs only if the command exits zero — a nonzero exit returns that status immediately and skips the after-sample, so a failed run is gated only on entry — omitting `--durable` still takes both locks but runs no idle check at all. Even with `--durable`, this is a narrower gate than `bench-compare.sh`'s — it has no macOS cooldown, AC-power, thermal, or HID-idle checkpoint, so treat it as lock-serialized and CPU-idle-gated, not as the full quiet-machine discipline), record its output, then repeat at head and diff the two outputs by hand. A single run of such a target — head only, or base only — is supplemental: it shows the change executes, not how it moved anything, and it does not substitute for the paired before/after comparison the disposition requires.
 
@@ -106,6 +106,52 @@ This split a two-test failure report cleanly: one test failed deterministically 
 ### Machine-Wide GPU Test Lock
 
 Metal lock coverage is enforced by `crates/inference/tests/metal_measurement_lock_contract.rs`: discovered `MetalQwen35State` construction sites must acquire the shared lock before construction or name an explicit exemption, while raw measurement markers use an exact inventory. This is not a claim that every Metal-touching target is locked; long-running processes and explicitly listed legacy targets are exempt. Locking callers serialize through the single `gpu_test_lock()` implementation in `crates/inference/src/measurement.rs`. The module is a `#[doc(hidden)]`, Metal-only export because Cargo builds integration tests, benches, examples, and binaries as crates separate from `lattice-inference`; it is not production API. The guard holds two locks: an in-process mutex (thread serialization within one test binary) and an exclusive advisory flock on `/tmp/lion-metal-gpu-test.lock` (cross-process serialization, machine-wide convention). Any harness on this machine that drives the GPU for measurements — other repos' test suites, bench runners, one-off scripts — should acquire the same flock before touching Metal. Concurrent GPU work corrupts both timing and numerics: contended confirmation batches inflated top-k logit margins enough to produce false failure reports (#628, #629).
+
+All reviewed Metal benchmarks additionally validate Criterion registration and explicit caller chains. One registered wrapper must hold the same guard across the entire ordered target list, including compared arms and CPU groups in mixed benchmarks. Helper-local and separate per-arm guards do not establish that span. Constructor coverage in those benchmarks depends on the same ownership check. This target-owned span applies to the active Metal configuration; it does not establish GPU exclusion for CPU-only builds.
+
+The explicit `--gpu-handoff` mode on `scripts/bench-command.sh` and
+`scripts/bench-compare.sh` admits the six declared Metal benchmark targets under
+continuous supervisor ownership. Admission checks each measured revision and its
+effective features before acquiring the benchmark window. A historical revision
+without the protocol is refused; a newer invoking checkout does not make an old
+binary participate. Both comparison arms must be eligible.
+
+Cargo compiles the selected target without lock descriptors. The supervisor then
+launches that exact executable with the held GPU descriptor on stdin and a private
+invocation channel. The Rust guard verifies canonical file identity and the shared
+exclusive capability, then waits while the supervisor checks the launched process
+and samples quiet conditions. A valid acknowledgement permits measurement. No
+handoff signal preserves ordinary acquisition; a partial or unverifiable handoff
+refuses instead of bypassing or reacquiring. The supervisor retains both original
+locks throughout ABBA and cooperative descendant cleanup, including ordinary embed
+arms. The comparison statistics and Criterion evidence directories are unchanged.
+The target guard releases its duplicate by closing it only: it must never explicitly
+unlock that shared description, which would also release the supervisor's hold.
+
+Only an admitted executable receives the GPU capability. Arbitrary commands,
+Cargo/build scripts and the comparison shell remain descriptor-free. The admitted
+executable can deliberately unlock its shared descriptor, and stdin could reach
+future descendants, so this remains a cooperative reviewed-target contract. Entry
+checks do not authenticate a hostile same-user caller, prove past uninterrupted
+ownership, prevent pathname replacement, or establish crash-time GPU quiescence.
+Quiet samples and invocation identities are recorded in a separate phase receipt;
+quote that receipt with the existing run-conditions block. The command route checks
+CPU idle inside its guard; the comparison route also repeats its machine-state
+checkpoint there.
+
+For a supported, committed macOS checkout, a scoped example is:
+
+```bash
+scripts/bench-command.sh --gpu-handoff --label decode-reference -- \
+  cargo bench --locked -p lattice-inference --bench decode_attn_bench \
+  --features metal-gpu,f16 -- decode_attention_reference --quick
+```
+
+For paired measurements, select the same target and features with
+`BENCHES_INFERENCE` and `CARGO_FEATURES_INFERENCE`, narrow its groups through
+`BENCH_GROUPS_INFERENCE`, and pass `--gpu-handoff` to `scripts/bench-compare.sh`.
+Ordinary invocations retain their existing behavior; an opt-in flag is not a
+replacement for successful admission.
 
 The lock blocks for up to 30 minutes, then panics with an `lsof /tmp/lion-metal-gpu-test.lock` hint rather than hanging silently. If a run appears stuck at test start, another process is holding the GPU; check who with `lsof` before killing anything.
 

@@ -88,6 +88,8 @@ fn parse_config(argv: &ArgView<'_>) -> Result<FullDriverConfig, String> {
         probe: 6,
         fd_eps: 4e-3,
         save_path: argv.arg("--save"),
+        // Deprecated shim: no flag, and the default is the servable set.
+        gdn_modules: lattice_tune::lora::train_core::GdnModuleSelection::Served,
         a_init_amp: Some(LEGACY_A_INIT_AMP),
     })
 }

@@ -6,7 +6,8 @@ use crate::weights::safetensors_layout::{
 };
 use memmap2::Mmap;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -560,60 +561,74 @@ impl SafetensorsFile {
     /// **Unstable**: load BERT weights; tensor name conventions and signature may change.
     ///
     /// Load all BERT weights from the safetensors file.
+    ///
+    /// Encoder tensors may be flat or share one dot-delimited namespace.
+    /// Mixed encoder namespaces are rejected, including misplaced pooler tensors.
     pub fn load_bert_weights(
         &self,
         num_layers: usize,
         hidden_size: usize,
     ) -> Result<BertWeights<'_>, InferenceError> {
-        let word_shape = self.require_shape("embeddings.word_embeddings.weight")?;
-        let position_shape = self.require_shape("embeddings.position_embeddings.weight")?;
-        let token_type_shape = self.require_shape("embeddings.token_type_embeddings.weight")?;
+        let encoder = BertTensorReader::new(self)?;
+        let word_shape = encoder.require_shape("embeddings.word_embeddings.weight")?;
+        let position_shape = encoder.require_shape("embeddings.position_embeddings.weight")?;
+        let token_type_shape = encoder.require_shape("embeddings.token_type_embeddings.weight")?;
 
         if word_shape.len() != 2 || word_shape[1] != hidden_size {
             return Err(InferenceError::ShapeMismatch {
-                name: "embeddings.word_embeddings.weight".into(),
+                name: encoder
+                    .name("embeddings.word_embeddings.weight")
+                    .into_owned(),
                 expected: vec![word_shape[0], hidden_size],
                 actual: word_shape.to_vec(),
             });
         }
         if position_shape.len() != 2 || position_shape[1] != hidden_size {
             return Err(InferenceError::ShapeMismatch {
-                name: "embeddings.position_embeddings.weight".into(),
+                name: encoder
+                    .name("embeddings.position_embeddings.weight")
+                    .into_owned(),
                 expected: vec![position_shape[0], hidden_size],
                 actual: position_shape.to_vec(),
             });
         }
         if token_type_shape.len() != 2 || token_type_shape[1] != hidden_size {
             return Err(InferenceError::ShapeMismatch {
-                name: "embeddings.token_type_embeddings.weight".into(),
+                name: encoder
+                    .name("embeddings.token_type_embeddings.weight")
+                    .into_owned(),
                 expected: vec![token_type_shape[0], hidden_size],
                 actual: token_type_shape.to_vec(),
             });
         }
 
-        let word_embeddings = self.tensor2d(
+        let word_embeddings = encoder.tensor2d(
             "embeddings.word_embeddings.weight",
             word_shape[0],
             word_shape[1],
         )?;
-        let position_embeddings = self.tensor2d(
+        let position_embeddings = encoder.tensor2d(
             "embeddings.position_embeddings.weight",
             position_shape[0],
             position_shape[1],
         )?;
-        let token_type_embeddings = self.tensor2d(
+        let token_type_embeddings = encoder.tensor2d(
             "embeddings.token_type_embeddings.weight",
             token_type_shape[0],
             token_type_shape[1],
         )?;
         let embedding_layer_norm_weight =
-            self.tensor1d("embeddings.LayerNorm.weight", hidden_size)?;
-        let embedding_layer_norm_bias = self.tensor1d("embeddings.LayerNorm.bias", hidden_size)?;
+            encoder.tensor1d("embeddings.LayerNorm.weight", hidden_size)?;
+        let embedding_layer_norm_bias =
+            encoder.tensor1d("embeddings.LayerNorm.bias", hidden_size)?;
 
-        let intermediate_shape = self.require_shape("encoder.layer.0.intermediate.dense.weight")?;
+        let intermediate_shape =
+            encoder.require_shape("encoder.layer.0.intermediate.dense.weight")?;
         if intermediate_shape.len() != 2 || intermediate_shape[1] != hidden_size {
             return Err(InferenceError::ShapeMismatch {
-                name: "encoder.layer.0.intermediate.dense.weight".into(),
+                name: encoder
+                    .name("encoder.layer.0.intermediate.dense.weight")
+                    .into_owned(),
                 expected: vec![intermediate_shape[0], hidden_size],
                 actual: intermediate_shape.to_vec(),
             });
@@ -624,70 +639,70 @@ impl SafetensorsFile {
         for i in 0..num_layers {
             let prefix = format!("encoder.layer.{i}");
             layers.push(TransformerLayerWeights {
-                query_weight: self.tensor2d(
+                query_weight: encoder.tensor2d(
                     &format!("{prefix}.attention.self.query.weight"),
                     hidden_size,
                     hidden_size,
                 )?,
-                query_bias: self
+                query_bias: encoder
                     .tensor1d(&format!("{prefix}.attention.self.query.bias"), hidden_size)?,
-                key_weight: self.tensor2d(
+                key_weight: encoder.tensor2d(
                     &format!("{prefix}.attention.self.key.weight"),
                     hidden_size,
                     hidden_size,
                 )?,
-                key_bias: self
+                key_bias: encoder
                     .tensor1d(&format!("{prefix}.attention.self.key.bias"), hidden_size)?,
-                value_weight: self.tensor2d(
+                value_weight: encoder.tensor2d(
                     &format!("{prefix}.attention.self.value.weight"),
                     hidden_size,
                     hidden_size,
                 )?,
-                value_bias: self
+                value_bias: encoder
                     .tensor1d(&format!("{prefix}.attention.self.value.bias"), hidden_size)?,
-                attn_output_weight: self.tensor2d(
+                attn_output_weight: encoder.tensor2d(
                     &format!("{prefix}.attention.output.dense.weight"),
                     hidden_size,
                     hidden_size,
                 )?,
-                attn_output_bias: self.tensor1d(
+                attn_output_bias: encoder.tensor1d(
                     &format!("{prefix}.attention.output.dense.bias"),
                     hidden_size,
                 )?,
-                attn_layer_norm_weight: self.tensor1d(
+                attn_layer_norm_weight: encoder.tensor1d(
                     &format!("{prefix}.attention.output.LayerNorm.weight"),
                     hidden_size,
                 )?,
-                attn_layer_norm_bias: self.tensor1d(
+                attn_layer_norm_bias: encoder.tensor1d(
                     &format!("{prefix}.attention.output.LayerNorm.bias"),
                     hidden_size,
                 )?,
-                ffn_intermediate_weight: self.tensor2d(
+                ffn_intermediate_weight: encoder.tensor2d(
                     &format!("{prefix}.intermediate.dense.weight"),
                     intermediate_size,
                     hidden_size,
                 )?,
-                ffn_intermediate_bias: self.tensor1d(
+                ffn_intermediate_bias: encoder.tensor1d(
                     &format!("{prefix}.intermediate.dense.bias"),
                     intermediate_size,
                 )?,
-                ffn_output_weight: self.tensor2d(
+                ffn_output_weight: encoder.tensor2d(
                     &format!("{prefix}.output.dense.weight"),
                     hidden_size,
                     intermediate_size,
                 )?,
-                ffn_output_bias: self
+                ffn_output_bias: encoder
                     .tensor1d(&format!("{prefix}.output.dense.bias"), hidden_size)?,
-                ffn_layer_norm_weight: self
+                ffn_layer_norm_weight: encoder
                     .tensor1d(&format!("{prefix}.output.LayerNorm.weight"), hidden_size)?,
-                ffn_layer_norm_bias: self
+                ffn_layer_norm_bias: encoder
                     .tensor1d(&format!("{prefix}.output.LayerNorm.bias"), hidden_size)?,
             });
         }
 
         let pooler_weight =
-            self.tensor2d_optional("pooler.dense.weight", hidden_size, hidden_size)?;
-        let pooler_bias = self.tensor1d_optional("pooler.dense.bias", hidden_size)?;
+            encoder.tensor2d_optional("pooler.dense.weight", hidden_size, hidden_size)?;
+        let pooler_bias = encoder.tensor1d_optional("pooler.dense.bias", hidden_size)?;
 
         Ok(BertWeights {
             word_embeddings,
@@ -704,7 +719,8 @@ impl SafetensorsFile {
     /// Load classifier head weights from a `BertForSequenceClassification` safetensors file.
     ///
     /// Accepts `classifier.weight` shaped `[1, hidden_size]` or `[hidden_size]` and
-    /// `classifier.bias` shaped `[1]`.
+    /// `classifier.bias` shaped `[1]`. Classifier tensors must remain at the top
+    /// level, independently of the BERT encoder namespace.
     pub fn load_cross_encoder_weights(
         &self,
         hidden_size: usize,
@@ -797,6 +813,80 @@ impl SafetensorsFile {
         }
     }
 }
+
+struct BertTensorReader<'a> {
+    file: &'a SafetensorsFile,
+    prefix: &'a str,
+}
+
+impl<'a> BertTensorReader<'a> {
+    fn new(file: &'a SafetensorsFile) -> Result<Self, InferenceError> {
+        let mut prefixes = BTreeSet::new();
+        for name in file.tensors.keys() {
+            // Head shadows cannot establish an encoder namespace.
+            if name.ends_with(".classifier.weight") || name.ends_with(".classifier.bias") {
+                continue;
+            }
+            let offset = ["embeddings.", "encoder.layer.", "pooler."]
+                .into_iter()
+                .flat_map(|family| name.match_indices(family))
+                .map(|(offset, _)| offset)
+                .filter(|&offset| offset == 0 || name.as_bytes()[offset - 1] == b'.')
+                .max();
+            if let Some(offset) = offset {
+                prefixes.insert(&name[..offset]);
+            }
+        }
+        if prefixes.len() > 1 {
+            return Err(InferenceError::InvalidSafetensors(format!(
+                "mixed BERT encoder namespaces: {prefixes:?} (empty prefix is unprefixed)"
+            )));
+        }
+        let prefix = prefixes.into_iter().next().unwrap_or("");
+        Ok(Self { file, prefix })
+    }
+
+    fn name<'n>(&self, name: &'n str) -> Cow<'n, str> {
+        if self.prefix.is_empty() {
+            Cow::Borrowed(name)
+        } else {
+            Cow::Owned(format!("{}{name}", self.prefix))
+        }
+    }
+
+    fn require_shape(&self, name: &str) -> Result<&'a [usize], InferenceError> {
+        self.file.require_shape(&self.name(name))
+    }
+
+    fn tensor1d(&self, name: &str, len: usize) -> Result<Tensor1D<'a>, InferenceError> {
+        self.file.tensor1d(&self.name(name), len)
+    }
+
+    fn tensor2d(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Tensor2D<'a>, InferenceError> {
+        self.file.tensor2d(&self.name(name), rows, cols)
+    }
+
+    fn tensor1d_optional(&self, name: &str, len: usize) -> Result<Tensor1D<'a>, InferenceError> {
+        self.file.tensor1d_optional(&self.name(name), len)
+    }
+
+    fn tensor2d_optional(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Tensor2D<'a>, InferenceError> {
+        self.file.tensor2d_optional(&self.name(name), rows, cols)
+    }
+}
+
+#[cfg(test)]
+mod bert_namespace_tests;
 
 /// **Unstable**: per-layer Qwen3 decoder weights; field set may change with model variants.
 ///

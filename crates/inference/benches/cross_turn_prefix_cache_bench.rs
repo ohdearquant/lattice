@@ -61,7 +61,6 @@ fn load_state_and_tokenizer() -> Option<(MetalQwen35State, BpeTokenizer)> {
     let dir = safetensors_model_dir()?;
     let model = Qwen35Model::from_safetensors(&dir).ok()?;
     let cfg = model.config().clone();
-    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
     let state = MetalQwen35State::new(model.weights(), &cfg, 4096).ok()?;
     let tokenizer = BpeTokenizer::from_tokenizer_json(&dir.join("tokenizer.json")).ok()?;
     Some((state, tokenizer))
@@ -225,5 +224,12 @@ fn bench_cross_turn_prefix_cache(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_cross_turn_prefix_cache);
+fn bench_locked_cross_turn_prefix_cache(c: &mut Criterion) {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let _gpu_lock = lattice_inference::measurement::gpu_test_lock();
+
+    bench_cross_turn_prefix_cache(c);
+}
+
+criterion_group!(benches, bench_locked_cross_turn_prefix_cache);
 criterion_main!(benches);

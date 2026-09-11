@@ -52,10 +52,10 @@
 # measured and rendered — the informational section plus the
 # all-measurements table record every number — but classified informational,
 # so they cannot produce a FAIL verdict. This manifest is only the quick-noise
-# policy. Independently, the embed configuration calibration allowlist below
-# keeps every uncalibrated target/feature pair informational at BOTH
-# resolutions. A quick-mode embed result gates only if its exact configuration
-# is calibrated and its target is absent from the quick-noise manifest.
+# policy. Independently, the configuration calibration allowlist below keeps
+# every uncalibrated target/feature pair informational at BOTH resolutions, for
+# both crates. A quick-mode result gates only if its exact configuration is
+# calibrated and its target is absent from the quick-noise manifest.
 #
 # Criterion 0.5 permits `/` in group names and uses the same character to join
 # group/function/parameter in `--list`, so a flat listing cannot recover the
@@ -67,9 +67,10 @@
 # affect one another.
 #
 # --full disables the quick-noise manifest only. It does not grant an
-# uncalibrated embed configuration gating authority: exact default `simd` with
-# no feature override gates at full resolution, while any configuration absent
-# from the calibration allowlist remains informational. Every invocation
+# uncalibrated configuration gating authority in either crate: the exact
+# defaults (`lattice-embed:simd`, `lattice-inference:elementwise_cpu_bench`,
+# each with no feature override) gate at full resolution, while any
+# configuration absent from the calibration allowlist remains informational. Every invocation
 # brackets its measurements in ABBA order (base₁, head₁, head₂, base₂); the gate
 # combines the forward and reverse ratios in log space and widens the result by
 # the measured order-bias envelope. Report-only controls only whether the
@@ -230,6 +231,10 @@ if [[ "$supervisor_fd" =~ ^[0-9]+$ ]]; then
   eval "exec ${supervisor_fd}<&-"
 fi
 unset LATTICE_BENCH_SUPERVISOR_FD
+# Only the typed helper receives the broker capability; Cargo and embed do not.
+handoff_broker="${LATTICE_GPU_HANDOFF_BROKER:-}"
+handoff_token="${LATTICE_GPU_HANDOFF_BROKER_TOKEN:-}"
+unset LATTICE_GPU_HANDOFF_BROKER LATTICE_GPU_HANDOFF_BROKER_TOKEN
 
 # --- Machine-state and ambient-load gates ---
 # A lock excludes peers; it says nothing about ambient load, thermal pressure,
@@ -333,18 +338,23 @@ if [ "$#" -gt 2 ]; then
   exit 2
 fi
 
-# Resolve both display and audit identities before measuring.
-if ! BASE_FULL_SHA="$(
-  git -C "$REPO" rev-parse --verify --end-of-options "${BASE_REF}^{commit}" 2>/dev/null
-)"; then
-  echo "bench-compare: base ref '$BASE_REF' is not a commit — refusing." >&2
-  exit 2
-fi
-if ! HEAD_FULL_SHA="$(
-  git -C "$REPO" rev-parse --verify --end-of-options "${HEAD_REF}^{commit}" 2>/dev/null
-)"; then
-  echo "bench-compare: head ref '$HEAD_REF' is not a commit — refusing." >&2
-  exit 2
+# Explicit admission freezes refs before the supervisor enters its lock window.
+if [ -n "$handoff_broker" ]; then
+  BASE_FULL_SHA="${LATTICE_GPU_HANDOFF_BASE_SHA:?missing admitted base SHA}"
+  HEAD_FULL_SHA="${LATTICE_GPU_HANDOFF_HEAD_SHA:?missing admitted head SHA}"
+else
+  if ! BASE_FULL_SHA="$(
+    git -C "$REPO" rev-parse --verify --end-of-options "${BASE_REF}^{commit}" 2>/dev/null
+  )"; then
+    echo "bench-compare: base ref '$BASE_REF' is not a commit — refusing." >&2
+    exit 2
+  fi
+  if ! HEAD_FULL_SHA="$(
+    git -C "$REPO" rev-parse --verify --end-of-options "${HEAD_REF}^{commit}" 2>/dev/null
+  )"; then
+    echo "bench-compare: head ref '$HEAD_REF' is not a commit — refusing." >&2
+    exit 2
+  fi
 fi
 BASE_SHA="${BASE_FULL_SHA:0:10}"
 HEAD_SHA="${HEAD_FULL_SHA:0:10}"
@@ -411,7 +421,7 @@ WT="$REPO/.cache/bench-compare-base"
 if [ -d "$WT" ]; then
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
 fi
-git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_REF" 2>&1 | tail -1
+git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_FULL_SHA" 2>&1 | tail -1
 
 command_version() {
   local directory="$1"; shift
@@ -472,9 +482,22 @@ BENCH_HEAD_BASELINE_NAME="compare-head"
 # executes. Additions require reviewed same-configuration A/A calibration and
 # threshold evidence under ADR-087 D3/D5; otherwise the target remains
 # informational at every resolution.
-embed_configuration_has_full_gate_calibration() {
+#
+# The allowlist is keyed by the FULL `<crate>:<target>|<features>` configuration and
+# applies to both crates. It used to be embed-only, and the reason it survived that way
+# is worth keeping: the driver that runs PR-time A/Bs passed group filters and nothing
+# else, so no caller could select another inference target and the asymmetry had no
+# instance. That is a statement about who was calling, not about what the gate would do
+# when someone did. Once the target and features became reachable, the first non-default
+# inference run at full resolution would have voted on thresholds nobody calibrated for
+# it -- and voting is the failure direction, because an uncalibrated PASS reads exactly
+# like a calibrated one.
+#
+# The reason stated above is not crate-specific. Neither is this now.
+configuration_has_full_gate_calibration() {
   case "$1|$2" in
-    'simd|') return 0 ;;
+    'lattice-embed:simd|') return 0 ;;
+    'lattice-inference:elementwise_cpu_bench|') return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -638,7 +661,17 @@ BASE_PHASE_RC=0
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
   # same channel and one of them silently deletes half the comparison.
   if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    if [ -n "$handoff_broker" ]; then
+      run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" \
+        LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
+        LATTICE_GPU_HANDOFF_BROKER_TOKEN="$handoff_token" \
+        "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
+        --entry base1 --revision "$BASE_FULL_SHA" --target "$BENCHES_INFERENCE" \
+        --features "$CARGO_FEATURES_INFERENCE" -- \
+        ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    else
+      run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    fi
     require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
@@ -707,7 +740,17 @@ HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
   if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    if [ -n "$handoff_broker" ]; then
+      run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" \
+        LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
+        LATTICE_GPU_HANDOFF_BROKER_TOKEN="$handoff_token" \
+        "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
+        --entry head1 --revision "$HEAD_FULL_SHA" --target "$BENCHES_INFERENCE" \
+        --features "$CARGO_FEATURES_INFERENCE" -- \
+        ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    else
+      run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    fi
     require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
@@ -727,7 +770,17 @@ echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
 HEAD_CONTROL_PHASE_RC=0
 (
   cd "$HEAD_DIR"
-  run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  if [ -n "$handoff_broker" ]; then
+    run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
+      LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
+      LATTICE_GPU_HANDOFF_BROKER_TOKEN="$handoff_token" \
+      "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
+      --entry head2 --revision "$HEAD_FULL_SHA" --target "$BENCHES_INFERENCE" \
+      --features "$CARGO_FEATURES_INFERENCE" -- \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  else
+    run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   require_measured "head control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
@@ -750,7 +803,17 @@ echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
 BASE_CONTROL_PHASE_RC=0
 (
   cd "$WT"
-  run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  if [ -n "$handoff_broker" ]; then
+    run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
+      LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
+      LATTICE_GPU_HANDOFF_BROKER_TOKEN="$handoff_token" \
+      "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
+      --entry base2 --revision "$BASE_FULL_SHA" --target "$BENCHES_INFERENCE" \
+      --features "$CARGO_FEATURES_INFERENCE" -- \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  else
+    run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   require_measured "base control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
@@ -959,10 +1022,19 @@ run_target_gate() {
     --order-control-baseline-name "$BENCH_HEAD_BASELINE_NAME"
   )
 
-  if [[ "$target" == lattice-embed:* ]] &&
-     ! embed_configuration_has_full_gate_calibration \
-         "${target#lattice-embed:}" "$CARGO_FEATURES_EMBED"; then
-    # A selected target that has not calibrated this gate is still useful
+  # The features that compiled THIS target, since the two crates carry separate
+  # selections and the allowlist is keyed on the pair. A target whose crate prefix is
+  # neither known one matches no allowlist entry and is therefore informational: an
+  # unrecognized configuration is the case with the least calibration behind it, so it
+  # is also the one that must not vote.
+  local target_features=""
+  case "$target" in
+    lattice-inference:*) target_features="$CARGO_FEATURES_INFERENCE" ;;
+    lattice-embed:*) target_features="$CARGO_FEATURES_EMBED" ;;
+  esac
+
+  if ! configuration_has_full_gate_calibration "$target" "$target_features"; then
+    # A selected configuration that has not calibrated this gate is still useful
     # measurement evidence, but cannot vote at either resolution.
     gate_args+=(--informational-target "$target")
   elif [ -n "$QUICK_FLAGS" ]; then

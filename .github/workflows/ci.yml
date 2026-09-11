@@ -275,6 +275,35 @@ jobs:
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: tune — train-backward (compile tests)
         run: cargo test -p lattice-tune --features train-backward --no-run
+      # That step compiles the train-backward surface and executes none of it,
+      # which is the whole gap for the GDN module-selection guards added in #1516.
+      # `crates/tune/src/lora/mod.rs` declares `pub mod train_core;` under
+      # `#[cfg(feature = "train-backward")]` while tune's defaults are
+      # `["std", "sqlite"]`, so `cargo test --workspace` never compiles that file
+      # and the step above never runs it: the arms proving a `Served` adapter's
+      # frozen factors stay exactly zero, and that the servable set is the one the
+      # Metal loader accepts, were enforced by nothing. Same treatment as the
+      # `validate_against`, `mixture` and `simulated-teacher` steps. Placed
+      # immediately after the compile step so the lib test binary is already built:
+      # the six tests are self-contained (synthetic dims and gradients, no
+      # checkpoint, no filesystem) and executed in 0.00s locally, so what this adds
+      # to the job is the assertions below, not build time.
+      - name: tune — GDN module selection guards (build + run)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/gdn-module-selection-tests.log"
+          if cargo test -p lattice-tune --lib --features train-backward \
+            gdn_lora_tests >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -q 'test lora::train_core::gdn_lora_tests::served_selection_leaves_the_fused_kernel_factors_exactly_zero ... ok' "$log"
+          grep -q 'test lora::train_core::gdn_lora_tests::served_selection_is_exactly_the_modules_metal_can_load ... ok' "$log"
+          grep -q 'test lora::train_core::gdn_lora_tests::all_selection_moves_the_fused_kernel_factors ... ok' "$log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # The `mixture` feature gates the experimental online router-refit module
       # (crates/tune/src/lora/router_update.rs) behind lattice-fann/online-router.
       # It is off by default, so the required `ci` job never compiles or RUNS its
@@ -841,6 +870,83 @@ jobs:
       - name: workspace — check at MSRV (f16,metal-gpu, all targets)
         run: cargo check --workspace --features f16,metal-gpu --all-targets
 
+  # iOS cross-compilation cross-check. lattice-inference is expected to build
+  # for aarch64-apple-ios with `std,f16` and no default features. That property
+  # held when it was measured by hand, but nothing in CI held it, so the first
+  # dependency bump or `cfg` change to break it would have broken it silently.
+  #
+  # Scope, stated so a green check is not read as more than it is: this job
+  # COMPILES the library and attests the artifact's compile target. It links
+  # nothing, runs nothing on a device or a simulator, and tests no behaviour.
+  #
+  # The attestation is a whole-population check over the archive's Mach-O
+  # members, not a spot check on one of them, and both of its arms were
+  # measured before it was written. Against the iOS rlib: 256 object members,
+  # 256 carrying LC_VERSION_MIN_IPHONEOS, and no macOS platform load command.
+  # Against a host rlib built from the same tree with the same feature flags:
+  # zero iOS load commands and 257 macOS ones. (257 rather than 256 because
+  # otool also walks the `lib.rmeta` wrapper object, which carries no platform
+  # load command on the iOS side -- which is why the iOS arm counts `.o`
+  # members rather than every Mach-O header.) So a host build substituted for
+  # the iOS one fails this step instead of passing it.
+  #
+  # If a future toolchain encodes the iOS platform as LC_BUILD_VERSION
+  # platform 2 rather than LC_VERSION_MIN_IPHONEOS, this step fails loudly and
+  # the predicate wants widening. That direction is deliberate: the macOS
+  # branch below is what rejects a host build, and it holds under either
+  # encoding.
+  #
+  # Gated on the existing `code` selector rather than a narrower
+  # `crates/inference/**` one: the `changes` job's selector set is pinned
+  # statement-for-statement by tests/test_ci_changed_files.py, so minting a
+  # selector for a single job is a larger change than the narrowing buys.
+  ios-cross:
+    name: ios-cross (aarch64-apple-ios lib)
+    needs: changes
+    # macOS and not matrix-driven, so the oslist selector that defers `ci` and
+    # `feature-matrix` on drafts does not reach it. It carries the draft
+    # condition directly, the same way `msrv` above does. ci-gate's draft
+    # branch exits before it reads this job's result, so skipping here cannot
+    # produce a false green.
+    if: needs.changes.outputs.code == 'true' && github.event.pull_request.draft != true
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          targets: aarch64-apple-ios
+          shared-key: ios-cross
+          cache-on-failure: true
+      - name: build lattice-inference for aarch64-apple-ios
+        run: |
+          cargo build -p lattice-inference --target aarch64-apple-ios \
+            --no-default-features --features std,f16 --lib
+      - name: assert the artifact targets iOS and not the host
+        run: |
+          RLIB=target/aarch64-apple-ios/debug/liblattice_inference.rlib
+          if [ ! -f "$RLIB" ]; then
+            echo "::error::$RLIB was not produced, so there is nothing to attest."
+            exit 1
+          fi
+          OBJECTS="$(ar t "$RLIB" | grep -c '\.o$' || true)"
+          IOS="$(otool -l "$RLIB" | grep -c 'LC_VERSION_MIN_IPHONEOS' || true)"
+          MACOS="$(otool -l "$RLIB" | grep -A2 'LC_BUILD_VERSION' \
+            | grep -c 'platform 1$' || true)"
+          echo "objects=$OBJECTS ios_load_commands=$IOS macos_load_commands=$MACOS"
+          if [ "$OBJECTS" -eq 0 ]; then
+            echo "::error::the archive holds no object members, so these counts attest nothing."
+            exit 1
+          fi
+          if [ "$MACOS" -ne 0 ]; then
+            echo "::error::$MACOS macOS platform load commands found in an artifact that must target iOS."
+            exit 1
+          fi
+          if [ "$IOS" -ne "$OBJECTS" ]; then
+            echo "::error::$IOS of $OBJECTS object members carry LC_VERSION_MIN_IPHONEOS; every one must."
+            exit 1
+          fi
+          echo "All $OBJECTS object members target iOS; no macOS platform load command present."
+
   # Supply-chain gate. licenses/bans/sources are deterministic and REQUIRED:
   # a green main cannot turn red without a manifest/lockfile change. Advisories
   # run separately as informational (continue-on-error) because fresh RUSTSEC
@@ -1136,7 +1242,16 @@ jobs:
   # `app-binaries-gate` in app-binaries.yml.
   ci-gate:
     name: ci-gate
-    needs: [changes, ci, feature-matrix, msrv, semver-checks, decode-harness-unit-tests]
+    needs:
+      [
+        changes,
+        ci,
+        feature-matrix,
+        msrv,
+        ios-cross,
+        semver-checks,
+        decode-harness-unit-tests,
+      ]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -1147,9 +1262,10 @@ jobs:
           CI_RESULT="${{ needs.ci.result }}"
           FEATURE_MATRIX_RESULT="${{ needs.feature-matrix.result }}"
           MSRV_RESULT="${{ needs.msrv.result }}"
+          IOS_CROSS_RESULT="${{ needs.ios-cross.result }}"
           SEMVER_RESULT="${{ needs.semver-checks.result }}"
           DECODE_HARNESS_RESULT="${{ needs.decode-harness-unit-tests.result }}"
-          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT semver-checks=$SEMVER_RESULT decode-harness-unit-tests=$DECODE_HARNESS_RESULT"
+          echo "changes=$CHANGES_RESULT code=$CODE ci=$CI_RESULT feature-matrix=$FEATURE_MATRIX_RESULT msrv=$MSRV_RESULT ios-cross=$IOS_CROSS_RESULT semver-checks=$SEMVER_RESULT decode-harness-unit-tests=$DECODE_HARNESS_RESULT"
           if [ "$CHANGES_RESULT" != "success" ]; then
             echo "::error::change-detection did not succeed, failing closed."
             exit 1
@@ -1188,9 +1304,13 @@ jobs:
             echo "::error::msrv did not succeed (result=$MSRV_RESULT)."
             exit 1
           fi
+          if [ "$IOS_CROSS_RESULT" != "success" ]; then
+            echo "::error::ios-cross did not succeed (result=$IOS_CROSS_RESULT)."
+            exit 1
+          fi
           if [ "$SEMVER_RESULT" != "success" ]; then
             echo "::error::semver-checks did not succeed (result=$SEMVER_RESULT)."
             exit 1
           fi
-          echo "Code changed; ci, feature-matrix, msrv, semver-checks, and decode-harness-unit-tests all PASSED."
+          echo "Code changed; ci, feature-matrix, msrv, ios-cross, semver-checks, and decode-harness-unit-tests all PASSED."
           exit 0

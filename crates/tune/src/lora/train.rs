@@ -13,9 +13,9 @@ use lattice_inference::model::qwen35::Qwen35Model;
 
 use crate::error::{Result, TuneError};
 use crate::lora::train_core::{
-    AdamConfig, Dims, GdnDims, GdnLoraParams, Head, LayerW, LoraParams, MixerKind, SeqCtx,
-    SlotLayout, TapeGeometry, TrainCtx, apply_adam_updates, apply_gdn_adam_updates, forward_full,
-    nll_and_grads, rand_fill, shifted,
+    AdamConfig, Dims, GdnDims, GdnLoraParams, GdnModuleSelection, Head, LayerW, LoraParams,
+    MixerKind, SeqCtx, SlotLayout, TapeGeometry, TrainCtx, apply_adam_updates,
+    apply_gdn_adam_updates, forward_full, nll_and_grads, rand_fill, shifted,
 };
 use crate::lora::{AdamState, LoraAdapter, LoraConfig, LoraLayer};
 
@@ -236,7 +236,7 @@ pub fn train_micro_lora(
     pairs: &[TrainingPair],
     config: &MicroLoraConfig,
 ) -> Result<LoraAdapter> {
-    train_micro_lora_impl(model, pairs, config, false)
+    train_micro_lora_impl(model, pairs, config, false, GdnModuleSelection::default())
 }
 
 /// Train GQA `q_proj`/`v_proj` LoRA weights, and — when `train_gdn` is
@@ -260,7 +260,35 @@ pub fn train_micro_lora_with_gdn(
     config: &MicroLoraConfig,
     train_gdn: bool,
 ) -> Result<LoraAdapter> {
-    train_micro_lora_impl(model, pairs, config, train_gdn)
+    train_micro_lora_impl(
+        model,
+        pairs,
+        config,
+        train_gdn,
+        GdnModuleSelection::default(),
+    )
+}
+
+/// As [`train_micro_lora_with_gdn`], with the GDN module set chosen explicitly.
+///
+/// The default is [`GdnModuleSelection::Served`], and this is the way to ask for
+/// [`GdnModuleSelection::All`]: five modules train, two of which the Metal
+/// forward refuses to load. Legitimate on the CPU path, which applies every
+/// projection, and required by the mutation control that proves the default set
+/// is doing something.
+///
+/// A sibling function rather than a fifth parameter on
+/// [`train_micro_lora_with_gdn`], for the same reason `train_gdn` itself is a
+/// sibling of [`train_micro_lora`]: changing an exported signature is a breaking
+/// change that `cargo-semver-checks` gates, and there is no major-version bump
+/// available this cycle.
+pub fn train_micro_lora_with_gdn_modules(
+    model: &Qwen35Model,
+    pairs: &[TrainingPair],
+    config: &MicroLoraConfig,
+    selection: GdnModuleSelection,
+) -> Result<LoraAdapter> {
+    train_micro_lora_impl(model, pairs, config, true, selection)
 }
 
 fn train_micro_lora_impl(
@@ -268,6 +296,7 @@ fn train_micro_lora_impl(
     pairs: &[TrainingPair],
     config: &MicroLoraConfig,
     train_gdn: bool,
+    gdn_modules: GdnModuleSelection,
 ) -> Result<LoraAdapter> {
     // Validate caller-controlled bounds before model access or allocation.
     let vocab_size = model.config().vocab_size;
@@ -484,7 +513,13 @@ fn train_micro_lora_impl(
         let (_nll, _n, grads, gdn_grads) = nll_and_grads(&fwd, &layers, &loras, &head, &train_ctx)?;
 
         apply_adam_updates(&mut adam, &mut loras, &grads, &train_ctx);
-        apply_gdn_adam_updates(&mut adam, &mut gdn_loras, &gdn_grads, &train_ctx);
+        apply_gdn_adam_updates(
+            &mut adam,
+            &mut gdn_loras,
+            &gdn_grads,
+            &train_ctx,
+            gdn_modules,
+        );
     }
 
     // Assemble LoraAdapter from trained slot params.
@@ -513,13 +548,10 @@ fn train_micro_lora_impl(
     }
     let mut target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
     if num_gdn_slots > 0 {
-        target_modules.extend([
-            "in_proj_qkv".to_string(),
-            "in_proj_z".to_string(),
-            "in_proj_b".to_string(),
-            "in_proj_a".to_string(),
-            "out_proj".to_string(),
-        ]);
+        // From the selection, never a literal: a hand-written list here would be a
+        // second copy of the servable-module set and would drift from the one the
+        // Metal loader refuses by.
+        target_modules.extend(gdn_modules.modules().iter().map(|m| (*m).to_string()));
         for (s, &li) in gdn_slot_layers.iter().enumerate() {
             let g = &gdn_loras[s];
             adapter_layers.insert(
@@ -542,30 +574,35 @@ fn train_micro_lora_impl(
                     rank,
                 },
             );
-            adapter_layers.insert(
-                (li, "in_proj_b".to_string()),
-                LoraLayer {
-                    a: g.a_b.clone(),
-                    b: g.b_b.clone(),
-                    d_in: dims.hidden,
-                    // beta is projected per VALUE head (matches the shipping
-                    // gdn_fused forward and the f16 weight loader), not per
-                    // key head (#792).
-                    d_out: gdn_dims.value_heads,
-                    rank,
-                },
-            );
-            adapter_layers.insert(
-                (li, "in_proj_a".to_string()),
-                LoraLayer {
-                    a: g.a_a.clone(),
-                    b: g.b_a.clone(),
-                    d_in: dims.hidden,
-                    // alpha is likewise projected per VALUE head.
-                    d_out: gdn_dims.value_heads,
-                    rank,
-                },
-            );
+            // Written only when they were TRAINED. Under the default they were
+            // never stepped, so `b_b`/`b_a` are still exactly zero and the layer
+            // would be an identity the loader refuses anyway.
+            if gdn_modules.trains_fused_kernel_projections() {
+                adapter_layers.insert(
+                    (li, "in_proj_b".to_string()),
+                    LoraLayer {
+                        a: g.a_b.clone(),
+                        b: g.b_b.clone(),
+                        d_in: dims.hidden,
+                        // beta is projected per VALUE head (matches the shipping
+                        // gdn_fused forward and the f16 weight loader), not per
+                        // key head (#792).
+                        d_out: gdn_dims.value_heads,
+                        rank,
+                    },
+                );
+                adapter_layers.insert(
+                    (li, "in_proj_a".to_string()),
+                    LoraLayer {
+                        a: g.a_a.clone(),
+                        b: g.b_a.clone(),
+                        d_in: dims.hidden,
+                        // alpha is likewise projected per VALUE head.
+                        d_out: gdn_dims.value_heads,
+                        rank,
+                    },
+                );
+            }
             adapter_layers.insert(
                 (li, "out_proj".to_string()),
                 LoraLayer {

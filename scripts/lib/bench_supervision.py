@@ -5,7 +5,10 @@ Measurement entry points call :func:`ensure_python_entrypoint` before doing
 work. Shell and Node entry points invoke the ``run``/``verify`` CLI below.
 On the ordinary wrapper route, ``bench-locks.py`` retains the lock descriptors
 while an entry point receives only a liveness pipe; measurement code never
-receives a descriptor capable of releasing the locks. The handoff samples
+receives a descriptor capable of releasing the locks. Explicit GPU admission
+uses a private planned launcher: only its selected benchmark receives the GPU
+descriptor, and the original owner retains its copies through group cleanup.
+The ordinary handoff samples
 caller-supplied state and does not authenticate a deliberate same-user caller.
 """
 
@@ -40,6 +43,7 @@ import runpy
 import select
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -253,12 +257,74 @@ def _quiet(label: str) -> bool:
     return result.returncode == 0
 
 
+def _handoff_quiet(label: str, mode: str) -> tuple[bool, str]:
+    """Sample admitted work inside its guard, with the caller's quiet contract."""
+    commands = []
+    if mode == "compare":
+        if sys.platform == "darwin":
+            commands.append(
+                [
+                    sys.executable,
+                    str(REPO / "scripts" / "perf_governor.py"),
+                    "--checkpoint",
+                    "--label",
+                    label,
+                    "--cooldown",
+                    "30",
+                    "--afk-threshold",
+                    "30",
+                ]
+            )
+        else:
+            commands.append(
+                [
+                    sys.executable,
+                    str(REPO / "scripts" / "lib" / "machine-state-probe.py"),
+                    "--label",
+                    label,
+                ]
+            )
+    commands.append([sys.executable, str(QUIET_PROBE), "--label", label])
+    deadline = time.monotonic() + 100
+    output: list[str] = []
+    probe_env = os.environ.copy()
+    for name in (
+        FDS_ENV,
+        SUPERVISOR_FD_ENV,
+        "LATTICE_GPU_HANDOFF_FD",
+        "LATTICE_GPU_HANDOFF_CONTROL",
+        "LATTICE_GPU_HANDOFF_TOKEN",
+        "LATTICE_GPU_HANDOFF_BROKER",
+        "LATTICE_GPU_HANDOFF_BROKER_TOKEN",
+    ):
+        probe_env.pop(name, None)
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=probe_env,
+                timeout=max(0.01, deadline - time.monotonic()),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            output.append(f"{label}: quiet checkpoint failed: {exc}\n")
+            return False, "".join(output)
+        output.extend((result.stdout, result.stderr))
+        if result.returncode != 0 or not result.stdout.strip():
+            output.append(f"{label}: quiet checkpoint failed or produced no record\n")
+            return False, "".join(output)
+    return True, "".join(output)
+
+
 def run_supervised(
     label: str,
     command: list[str],
     *,
     quiet: bool,
     entrypoint: bool = False,
+    gpu_handoff: str | None = None,
 ) -> int:
     """Acquire both locks if needed, then run ``command`` under their receipt."""
 
@@ -277,6 +343,25 @@ def run_supervised(
             )
             return REFUSAL_EXIT
         env = os.environ.copy()
+        if gpu_handoff is not None:
+            try:
+                from bench_admission import plan_command, plan_compare
+                from bench_handoff import PLAN_DIGEST_ENV, PLAN_ENV, write_frozen_plan
+
+                if PLAN_ENV in env or PLAN_DIGEST_ENV in env:
+                    raise SupervisionError("stale GPU admission plan before preflight")
+                if gpu_handoff == "compare":
+                    plan = plan_compare(REPO, command[1:], env)
+                elif gpu_handoff == "command":
+                    plan = plan_command(REPO, command, env)
+                else:
+                    raise SupervisionError("unknown GPU admission mode")
+                frozen_path, digest = write_frozen_plan(REPO, plan)
+                env[PLAN_ENV] = str(frozen_path)
+                env[PLAN_DIGEST_ENV] = digest
+                command = plan["command"]
+            except Exception as exc:
+                raise SupervisionError(f"GPU admission preflight failed: {exc}") from exc
         env[STATUS_ENV] = str(status)
         if quiet:
             env[QUIET_ENV] = "1"
@@ -301,10 +386,20 @@ def run_supervised(
             argv.append("--quiet")
         if entrypoint:
             argv.append("--entrypoint")
+        if gpu_handoff is not None:
+            argv.extend(["--gpu-handoff", gpu_handoff])
         argv.extend(["--", *command])
         os.execvpe(sys.executable, argv, env)
 
     _, inherited_fds, paths = verify_supervision()
+    plan = None
+    if gpu_handoff is not None:
+        try:
+            from bench_handoff import read_frozen_plan
+
+            plan = read_frozen_plan(REPO, gpu_handoff, command)
+        except Exception as exc:
+            raise SupervisionError(f"GPU frozen admission failed: {exc}") from exc
     if quiet and not _quiet(f"{label}: before"):
         print(
             f"bench-supervision: machine was not quiet before {label}; "
@@ -316,6 +411,8 @@ def run_supervised(
     child_env = os.environ.copy()
     child_env.pop(FDS_ENV, None)
     child_env.pop(SUPERVISOR_FD_ENV, None)
+    if plan is not None:
+        child_env.update(plan["environment"])
     if quiet:
         child_env[QUIET_ENV] = "1"
 
@@ -328,16 +425,41 @@ def run_supervised(
             pass_fds = (read_fd,)
         else:
             pass_fds = ()
-        result = subprocess.run(
-            command,
-            check=False,
-            env=child_env,
-            pass_fds=pass_fds,
-        )
+        if plan is None:
+            result = subprocess.run(
+                command,
+                check=False,
+                env=child_env,
+                pass_fds=pass_fds,
+            )
+        else:
+            try:
+                from bench_handoff import HandoffService
+
+                service = HandoffService(
+                    plan,
+                    inherited_fds[1],
+                    lambda: _sample_path_identities(
+                        inherited_fds, paths, phase="at the measured-phase handoff"
+                    ),
+                    _handoff_quiet,
+                )
+                result = subprocess.CompletedProcess(
+                    command, service.run(command, child_env, pass_fds)
+                )
+            except Exception as exc:
+                raise SupervisionError(f"GPU measurement handoff failed: {exc}") from exc
     finally:
         if handoff_pipe_fds is not None:
             for fd in handoff_pipe_fds:
                 os.close(fd)
+        if plan is not None:
+            try:
+                from bench_handoff import remove_frozen_plan
+
+                remove_frozen_plan(REPO)
+            except Exception as exc:
+                raise SupervisionError(f"cannot remove GPU admission plan: {exc}") from exc
 
     # This endpoint sample catches a persistent pathname mismatch. The flock
     # contract is cooperative and does not claim rename-and-restore resistance.
@@ -389,6 +511,7 @@ def main(argv: list[str] | None = None) -> int:
     run = sub.add_parser("run")
     run.add_argument("--label", required=True)
     run.add_argument("--quiet", action="store_true")
+    run.add_argument("--gpu-handoff", choices=("compare", "command"))
     run.add_argument(
         "--entrypoint",
         action="store_true",
@@ -426,6 +549,7 @@ def main(argv: list[str] | None = None) -> int:
             measurement,
             quiet=args.quiet,
             entrypoint=args.entrypoint,
+            gpu_handoff=args.gpu_handoff,
         )
     except SupervisionError as exc:
         print(f"bench-supervision: {exc}; refusing to measure", file=sys.stderr)
