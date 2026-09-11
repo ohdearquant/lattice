@@ -50,6 +50,18 @@ def rows_for(root: pathlib.Path, max_bytes: int):
         receipt["command"] = G.unknown("a gate log does not record the invocation that produced it; pass --command")
         receipt["source_hash"] = G.unknown("a gate log does not record the ref it was produced from; pass --source-hash")
         receipt["executed_generated_command"] = G.value(False)
+        if truncated:
+            # `outcome` is an ALL-quantified claim over the log's binaries -- "ok" means
+            # every one of them said ok. Truncation removes binaries from view, so the
+            # quantifier can no longer be established and the field must not carry a
+            # value. Measured on a real 4.6MB CI log whose run CONCLUSION was failure:
+            # the first 2MB contained 260 passing binaries and no failing one, so the
+            # truncated read said "ok" about a run that failed. The counts stay, because
+            # they are sums over the `test result:` lines actually read, which is what
+            # they are in every log; only the universal claim is withdrawn.
+            receipt["outcome"] = G.unknown(
+                f"log truncated at {max_bytes} of {len(raw)} bytes; binaries after the cut "
+                "are unread, so 'every binary was ok' cannot be established")
         yield f, receipt, truncated
 
 
@@ -114,6 +126,16 @@ def _self_test() -> int:
                       small["big.log"][1] is True and small["big.log"][0]["log"]["value"]["truncated"] is True))
         cases.append(("a truncated read does not invent counts",
                       not G.is_known(small["big.log"][0]["passed"])))
+        okbig = root / "okbig.log"
+        okbig.write_text("   Compiling x v0.1.0\n"
+                         "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.0s\n"
+                         + "filler\n" * 200)
+        cut = {f.name: (r, t) for f, r, t in rows_for(root, 120)}
+        cases.append(("a truncated log does NOT claim outcome ok, because 'all ok' needs all",
+                      cut["okbig.log"][1] is True and not G.is_known(cut["okbig.log"][0]["outcome"])))
+        whole = {f.name: (r, t) for f, r, t in rows_for(root, 10_000_000)}
+        cases.append(("...and the same log read WHOLE does report its outcome",
+                      whole["okbig.log"][0]["outcome"]["value"] == "ok"))
     bad = [n for n, ok in cases if not ok]
     for n, ok in cases:
         print(f"  {'ok  ' if ok else 'FAIL'}  {n}")

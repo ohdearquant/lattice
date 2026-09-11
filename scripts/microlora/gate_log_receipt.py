@@ -57,6 +57,37 @@ _RC = re.compile(r"^(?P<name>[A-Z][A-Z0-9_]*_RC)=(?P<rc>-?\d+)\s*$", re.M)
 
 COUNTERS = ("passed", "failed", "ignored", "measured", "filtered_out")
 
+# CI logs are the same cargo output wearing a wrapper. `gh run view --log` emits
+# "<job>\t<step>\t<ISO8601Z> <content>" and cargo colours its own output, so every
+# line-anchored pattern below misses on a CI log while matching the identical local log.
+# Measured: four real CI runs carrying 100, 0, 100 and 1263 marker lines by an unanchored
+# grep were all read as "not cargo output" before this existed.
+# Both spellings. `gh run view --log` writes the escape in CARET NOTATION -- the two
+# ASCII characters "^" and "[", not byte 0x1b -- so a pattern written for the real
+# control character matches nothing and the log reads as "not cargo output".
+# Measured on a real CI log: 0 bytes of 0x1b, 1738 literal "^[" sequences.
+_ANSI = re.compile(r"(?:\x1b|\^\[)\[[0-9;]*[A-Za-z]")
+_TS = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z ")
+
+
+def strip_log_decoration(text: str) -> str:
+    """Reduce a CI-wrapped log to the bytes the tool actually wrote.
+
+    Conservative on purpose: the tab-separated prefix is removed ONLY when the final
+    field starts with an ISO timestamp, so a raw log whose line merely contains a tab
+    is left alone. Stripping unconditionally would silently eat real content.
+    """
+    out = []
+    for line in text.split("\n"):
+        line = _ANSI.sub("", line)
+        if "\t" in line:
+            tail = line.rsplit("\t", 1)[-1]
+            if _TS.match(tail):
+                line = tail
+        out.append(_TS.sub("", line, count=1))
+    return "\n".join(out)
+
+
 # Evidence that this log is cargo output at all. A cargo run that executed ZERO test
 # binaries still emits these, so requiring one does not cost the `binaries` discriminator
 # below; it costs only the logs that were never cargo output in the first place.
@@ -78,6 +109,7 @@ def is_known(field: dict) -> bool:
 
 def parse_cargo_test_log(text: str) -> dict:
     """Receipt fields derivable from the log text alone."""
+    text = strip_log_decoration(text)
     rows = [m.groupdict() for m in _RESULT.finditer(text)]
 
     # `format` is DERIVED, never assumed. Asserting "cargo-test" over a log that is not
