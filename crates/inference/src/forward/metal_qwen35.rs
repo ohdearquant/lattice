@@ -24358,6 +24358,58 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             assert!(result.is_err(), "should reject empty layers");
         }
 
+        /// A second `load_lora_adapter` while one is already loaded is
+        /// rejected, and the adapter that was already there is still loaded
+        /// afterwards.
+        ///
+        /// The second half is the part worth a test. The rejection is written
+        /// as an early return before any mutation of `self`, so "the previous
+        /// adapter keeps serving" is a property of where that check sits in
+        /// the function, not of anything the check itself does -- exactly the
+        /// kind of property that survives a refactor silently until something
+        /// reads it. Every sibling test above asserts only `is_err()`; this
+        /// one asserts the state as well.
+        ///
+        /// `has_lora_adapter` reports presence, not identity, so what this
+        /// pins is that the rejected load left an adapter loaded. Proving it
+        /// is the *same* adapter would need an observable the type does not
+        /// expose today; the mutation this guards against -- moving the check
+        /// below the first line that touches `self.lora` -- is caught by
+        /// presence alone, because that line assigns.
+        #[test]
+        fn load_lora_adapter_rejects_second_load_and_keeps_the_first() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+
+            state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 1)], 1.0, None)
+                .expect("first load should succeed");
+            assert!(state.has_lora_adapter(), "first load should have landed");
+
+            let err = state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 2)], 1.0, None)
+                .expect_err("a second load must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("LoRA adapter already loaded; call unload_lora_adapter first"),
+                "the rejection should name the remedy, got: {err}"
+            );
+            assert!(
+                state.has_lora_adapter(),
+                "the rejected load must leave the previous adapter loaded"
+            );
+
+            state.unload_lora_adapter();
+            assert!(!state.has_lora_adapter());
+            state
+                .load_lora_adapter(vec![make_valid_layer(cfg.hidden_size, 2)], 1.0, None)
+                .expect("after an unload the same load succeeds");
+        }
+
         #[test]
         fn load_lora_adapter_rejects_non_finite_scale() {
             let _gpu_guard = gpu_test_lock();
