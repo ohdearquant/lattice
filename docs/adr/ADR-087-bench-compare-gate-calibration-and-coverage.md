@@ -488,9 +488,12 @@ single checkout-relative read inside a ref-qualified list is invisible precisely
 surrounding commands are correct. Every read below is now ref-qualified in the command itself, so
 the discipline is checkable from the commands rather than from the sentence introducing them.
 
-    # bench imports, both default targets
-    git show <ref>:crates/inference/benches/elementwise_cpu_bench.rs | grep -n '^use '
-    git show <ref>:crates/embed/benches/simd.rs                     | grep -n '^use '
+    # bench imports, both default targets. The ref goes in a quoted variable: git
+    # rejects a space in a ref name but permits ; && | and backticks, so an
+    # externally-chosen branch name pasted into an unquoted command is executed.
+    REF='<ref>'
+    git show "$REF:crates/inference/benches/elementwise_cpu_bench.rs" | grep -n '^use '
+    git show "$REF:crates/embed/benches/simd.rs"                     | grep -n '^use '
 
     # surface file counts
     git ls-tree -r --name-only origin/main -- crates/inference/src/forward/cpu/ | grep -c '\.rs$'
