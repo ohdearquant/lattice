@@ -97,6 +97,7 @@ EXPLICIT_SCRIPT_EXCLUSIONS = frozenset(
         "scripts/bench_evidence/pr882/report_ctx1024.json",
         "scripts/bench_evidence/pr882/report_ctx512.json",
         "scripts/bench_expected_cells.toml",
+        "scripts/cross-encoder-checkpoint.json",
         "scripts/lib/bench-host-id.py",
         "scripts/lib/bench-informational-targets.sh",
         "scripts/lib/bench-locks.py",
