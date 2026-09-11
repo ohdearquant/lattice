@@ -2740,6 +2740,9 @@ class GpuHandoffProtocol(unittest.TestCase):
             work_marker = root / "measured"
             descendant_pid = root / "descendant.pid"
             request_path = root / "request.json"
+            helper_trace_path = root / "helper-trace.jsonl"
+            refusal_state_path = root / "refusal-state"
+            service_trace = []
             target_code = """
 import fcntl, json, os, pathlib, socket, subprocess, sys, time
 assert os.environ["LATTICE_GPU_HANDOFF_FD"] == "0"
@@ -2775,6 +2778,10 @@ print("time: 1 ns; measured after ACK")
 """
             helper_code = """
 import base64, json, os, pathlib, socket, sys, time
+def diagnostic(event, **fields):
+    if os.environ["FIXTURE_TARGET_MODE"] == "inherited-output":
+        with pathlib.Path(os.environ["FIXTURE_HELPER_TRACE"]).open("a") as trace:
+            trace.write(json.dumps(dict(event=event, when=time.monotonic(), **fields)) + "\\n")
 gpu = pathlib.Path(os.environ["FIXTURE_GPU"]).stat()
 for fd in range(256):
     try:
@@ -2804,11 +2811,31 @@ for attempt in range(2 if os.environ["FIXTURE_REPLAY"] == "1" else 1):
     with client.makefile("rb") as stream:
         for line in stream:
             frame = json.loads(line)
+            diagnostic("helper_frame_read", kind="output" if "output" in frame else "status")
             if "output" in frame:
+                payload = base64.b64decode(frame["output"])
+                if b"inherited output still open" in payload:
+                    state = pathlib.Path(os.environ["FIXTURE_REFUSAL_STATE"])
+                    schedule = os.environ["FIXTURE_CONSUMER_SCHEDULE"]
+                    state.write_text("received")
+                    diagnostic("helper_refusal_received", schedule=schedule)
+                    if schedule in {"delay-250ms", "never-finish"}:
+                        state.write_text("waiting-before-persist")
+                        diagnostic("helper_wait_before_persist", schedule=schedule)
+                        if schedule == "never-finish":
+                            while True:
+                                time.sleep(10)
+                        time.sleep(0.25)
+                        state.write_text("released-before-persist")
+                        diagnostic("helper_delay_released")
+                    elif schedule != "immediate":
+                        raise AssertionError("unknown fixture consumer schedule")
                 with pathlib.Path(os.environ["FIXTURE_OUTPUT"]).open("ab") as output:
                     output.write(base64.b64decode(frame["output"]))
+                diagnostic("helper_output_saved", text=base64.b64decode(frame["output"]).decode())
             if "status" in frame:
                 status = frame["status"]
+                diagnostic("helper_status_read", status=status)
                 break
     client.close()
 raise SystemExit(status)
@@ -2832,6 +2859,9 @@ raise SystemExit(status)
                 "FIXTURE_GPU": str(gpu_path), "FIXTURE_REQUEST": str(request_path),
                 "FIXTURE_OUTPUT": str(result_path), "FIXTURE_WORK": str(work_marker),
                 "FIXTURE_TARGET_MODE": target_mode,
+                "FIXTURE_HELPER_TRACE": str(helper_trace_path),
+                "FIXTURE_REFUSAL_STATE": str(refusal_state_path),
+                "FIXTURE_CONSUMER_SCHEDULE": os.environ.get("DRAIN_CONSUMER_SCHEDULE", "immediate"),
                 "FIXTURE_DISCONNECT": str(int(disconnect)),
                 "FIXTURE_DISCONNECT_AFTER_READY": str(int(disconnect_after_ready)),
                 "FIXTURE_DESCENDANT_PID": str(descendant_pid),
@@ -2843,17 +2873,82 @@ raise SystemExit(status)
                 quiet_calls.append((label, mode))
                 return quiet_ok, "inside measured-phase quiet sample\n"
 
+            class DiagnosticService(self.module["HandoffService"]):
+                def _launch(self, client, entry, request):
+                    try:
+                        return super()._launch(client, entry, request)
+                    except Exception as exc:
+                        service_trace.append({
+                            "event": "launch_exception", "when": time.monotonic(),
+                            "type": type(exc).__name__, "repr": repr(exc),
+                            "message": str(exc), "client_timeout": client.gettimeout(),
+                        })
+                        raise
+
+                def _output(self, client, output):
+                    if target_mode != "inherited-output":
+                        return super()._output(client, output)
+                    service_trace.append({
+                        "event": "service_output_start", "when": time.monotonic(),
+                        "text": output.decode(errors="replace"),
+                        "client_timeout": client.gettimeout(), "failure": self.failure,
+                    })
+                    try:
+                        result = super()._output(client, output)
+                    except Exception as exc:
+                        service_trace.append({
+                            "event": "service_output_exception", "when": time.monotonic(),
+                            "type": type(exc).__name__, "repr": repr(exc),
+                        })
+                        raise
+                    service_trace.append({
+                        "event": "service_output_sent", "when": time.monotonic(),
+                    })
+                    return result
+
+                def _serve(self):
+                    try:
+                        return super()._serve()
+                    finally:
+                        service_trace.append({
+                            "event": "service_thread_finished", "when": time.monotonic(),
+                            "failure": self.failure,
+                        })
+
             with gpu_path.open("w+") as gpu:
                 fcntl.flock(gpu, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                service = self.module["HandoffService"](
+                service = DiagnosticService(
                     plan, gpu.fileno(), lambda: None, quiet,
                     validate_request=lambda _entry, _request: Path(sys.executable),
                     ready_timeout=3,
                 )
                 self.assertLess(len(os.fsencode(service.broker_path)), 104)
+                service_globals = service.run.__globals__
+                original_terminate = service_globals["_terminate"]
+                def trace_terminate(proc):
+                    role = "none" if proc is None else (
+                        "outer_helper" if proc.args == plan["command"] else "selected_target"
+                    )
+                    service_trace.append({
+                        "event": "terminate_enter", "when": time.monotonic(),
+                        "role": role, "pid": None if proc is None else proc.pid,
+                        "returncode": None if proc is None else proc.poll(),
+                        "failure": service.failure,
+                        "refusal_state": refusal_state_path.read_text() if refusal_state_path.exists() else None,
+                    })
+                    try:
+                        return original_terminate(proc)
+                    finally:
+                        service_trace.append({
+                            "event": "terminate_return", "when": time.monotonic(),
+                            "role": role, "pid": None if proc is None else proc.pid,
+                            "returncode": None if proc is None else proc.poll(),
+                        })
                 started = time.monotonic()
                 try:
-                    status = service.run(plan["command"], env, ())
+                    with mock.patch.dict(service_globals, {"_terminate": trace_terminate}):
+                        status = service.run(plan["command"], env, ())
+                    service_trace.append({"event": "run_returned", "when": time.monotonic(), "status": status})
                 finally:
                     if descendant_pid.exists():
                         try:
@@ -2865,8 +2960,16 @@ raise SystemExit(status)
                     with self.assertRaises(BlockingIOError):
                         fcntl.flock(independent, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 receipt = service.receipt_path.read_text()
+            if target_mode == "inherited-output":
+                helper_trace = [
+                    json.loads(line) for line in helper_trace_path.read_text().splitlines()
+                ] if helper_trace_path.exists() else []
             return {
                 "status": status,
+                "failure": service.failure,
+                "service_trace": service_trace,
+                "helper_trace": helper_trace if target_mode == "inherited-output" else [],
+                "refusal_state": refusal_state_path.read_text() if refusal_state_path.exists() else None,
                 "worked": work_marker.exists(),
                 "quiet_calls": quiet_calls,
                 "receipt": receipt,
@@ -2922,6 +3025,79 @@ raise SystemExit(status)
         self.assertTrue(result["worked"])
         self.assertIn("inherited output still open", result["output"])
         self.assertLess(result["elapsed"], 5)
+
+    def test_delayed_refusal_consumer_persists_reason_before_cleanup(self):
+        with mock.patch.dict(os.environ, {"DRAIN_CONSUMER_SCHEDULE": "delay-250ms"}):
+            result = self._run_fixture(target_mode="inherited-output")
+        self.assertEqual(2, result["status"])
+        self.assertTrue(result["worked"])
+        self.assertIn("inherited output still open", result["output"])
+        self.assertLess(result["elapsed"], 5)
+        events = result["helper_trace"]
+        names = [event["event"] for event in events]
+        self.assertIn("helper_refusal_received", names)
+        self.assertIn("helper_wait_before_persist", names)
+        self.assertIn("helper_delay_released", names)
+        refusal_saved = [event for event in events
+                         if event["event"] == "helper_output_saved"
+                         and "inherited output still open" in event["text"]]
+        self.assertEqual(1, len(refusal_saved))
+        received = next(event for event in events if event["event"] == "helper_refusal_received")
+        waiting = next(event for event in events if event["event"] == "helper_wait_before_persist")
+        released = next(event for event in events if event["event"] == "helper_delay_released")
+        self.assertEqual("delay-250ms", received["schedule"])
+        self.assertLess(received["when"], waiting["when"])
+        self.assertLess(waiting["when"], released["when"])
+        self.assertLess(released["when"], refusal_saved[0]["when"])
+        self.assertEqual("released-before-persist", result["refusal_state"])
+        status_read = [event for event in events if event["event"] == "helper_status_read"]
+        self.assertEqual(1, len(status_read))
+        self.assertEqual(2, status_read[0]["status"])
+        helper_end = [event for event in result["service_trace"]
+                      if event["event"] == "terminate_return" and event["role"] == "outer_helper"]
+        self.assertEqual(1, len(helper_end))
+        self.assertEqual(2, helper_end[0]["returncode"])
+
+    def test_nonfinishing_refusal_consumer_reports_completion_expiry(self):
+        import contextlib
+        import io
+
+        supervisor_stderr = io.StringIO()
+        with contextlib.redirect_stderr(supervisor_stderr):
+            with mock.patch.dict(os.environ, {"DRAIN_CONSUMER_SCHEDULE": "never-finish"}):
+                result = self._run_fixture(target_mode="inherited-output")
+        self.assertIn(
+            "bench-supervision: refusal-completion deadline expired after 1.000s; forcing helper cleanup",
+            supervisor_stderr.getvalue(),
+        )
+        self.assertIn(
+            "selected benchmark exited with inherited output still open; refusing to certify",
+            supervisor_stderr.getvalue(),
+        )
+        self.assertEqual(2, result["status"])
+        self.assertTrue(result["worked"])
+        self.assertEqual(
+            "selected benchmark exited with inherited output still open", result["failure"]
+        )
+        self.assertLess(result["elapsed"], 5)
+        self.assertEqual("waiting-before-persist", result["refusal_state"])
+        helper_events = result["helper_trace"]
+        received = [event for event in helper_events if event["event"] == "helper_refusal_received"]
+        waiting = [event for event in helper_events if event["event"] == "helper_wait_before_persist"]
+        self.assertEqual(1, len(received))
+        self.assertEqual("never-finish", received[0]["schedule"])
+        self.assertEqual(1, len(waiting))
+        self.assertLess(received[0]["when"], waiting[0]["when"])
+        self.assertFalse(any(event["event"] == "helper_delay_released" for event in helper_events))
+        self.assertFalse(any(event["event"] == "helper_output_saved"
+                             and "inherited output still open" in event["text"]
+                             for event in helper_events))
+        helper_end = [event for event in result["service_trace"]
+                      if event["event"] == "terminate_return" and event["role"] == "outer_helper"]
+        self.assertEqual(1, len(helper_end))
+        self.assertEqual(-signal.SIGTERM, helper_end[0]["returncode"])
+        self.assertTrue(any(event["event"] == "service_thread_finished"
+                            for event in result["service_trace"]))
 
     def test_disconnected_live_helper_stops_a_silent_benchmark(self):
         result = self._run_fixture(target_mode="silent", disconnect_after_ready=True)

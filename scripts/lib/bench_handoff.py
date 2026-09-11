@@ -39,6 +39,8 @@ MAX_PLAN_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 65536
 MAX_READY_BYTES = 4096
 OUTPUT_DRAIN_TIMEOUT = 1.0
+# Provisional policy budget to bound cleanup delay; CI latency is not calibrated.
+REFUSAL_COMPLETION_TIMEOUT = 1.0
 
 
 class HandoffError(RuntimeError):
@@ -468,6 +470,14 @@ class HandoffService:
                 time.sleep(0.02)
             if self.failure is not None:
                 print(f"bench-supervision: {self.failure}; refusing to certify", file=sys.stderr)
+                try:
+                    outer.wait(timeout=REFUSAL_COMPLETION_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    print(
+                        "bench-supervision: refusal-completion deadline expired "
+                        f"after {REFUSAL_COMPLETION_TIMEOUT:.3f}s; forcing helper cleanup",
+                        file=sys.stderr,
+                    )
                 return REFUSAL_EXIT
             if outer.returncode != 0:
                 return outer.returncode
