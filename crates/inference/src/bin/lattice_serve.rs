@@ -130,7 +130,7 @@ mod imp {
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::Semaphore;
     /// Only used by the test module's raw job-channel helpers
-    /// (`mpsc::UnboundedReceiver<WorkerJob>` etc. -- see
+    /// (`mpsc::UnboundedReceiver<WorkerMessage>` etc. -- see
     /// `lattice_inference::serve::metal_worker`'s `test-utils`-gated
     /// surface); production code only ever holds a `MetalWorkerClient`.
     #[cfg(all(test, feature = "metal-gpu", feature = "test-utils"))]
@@ -3526,7 +3526,7 @@ mod imp {
         use lattice_inference::serve::ApiError;
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use lattice_inference::serve::metal_worker::{
-            WorkerJob, spawn_fake, spawn_fake_with_vision, test_client_and_jobs,
+            WorkerMessage, spawn_fake, spawn_fake_with_vision, test_client_and_jobs,
         };
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use std::sync::Arc;
@@ -4880,7 +4880,7 @@ mod imp {
         async fn chat_completions_structured_blocked_constraint_500() {
             let (jobs, mut jobs_rx) = test_client_and_jobs();
             tokio::spawn(async move {
-                if let Some(job) = jobs_rx.recv().await {
+                if let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await {
                     let _ = job.reply(WorkerEvent::ConstraintBlocked(
                         "grammar constraint blocked every token; \
                          no legal continuation exists in the current grammar state"
@@ -4920,7 +4920,7 @@ mod imp {
         async fn chat_completions_structured_failed_with_blocked_wording_stays_internal_error() {
             let (jobs, mut jobs_rx) = test_client_and_jobs();
             tokio::spawn(async move {
-                if let Some(job) = jobs_rx.recv().await {
+                if let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await {
                     let _ = job.reply(WorkerEvent::Failed(
                         "grammar constraint blocked every token; \
                          no legal continuation exists in the current grammar state"
@@ -5795,8 +5795,14 @@ mod imp {
         /// tests can stand in for the worker: reply with whatever
         /// `WorkerEvent` sequence the test wants (via `WorkerJob::reply`,
         /// also `test-utils`-gated) without a real GPU/model.
+        ///
+        /// The channel carries `WorkerMessage`, not `WorkerJob`: the worker's
+        /// single receiver also carries adapter control commands. A caller
+        /// matching only `WorkerMessage::Generate` replies to nothing if a
+        /// control command arrives instead, which fails the test loudly rather
+        /// than passing over a message it ignored.
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
-        fn test_app_state_with_jobs() -> (AppState, mpsc::UnboundedReceiver<WorkerJob>) {
+        fn test_app_state_with_jobs() -> (AppState, mpsc::UnboundedReceiver<WorkerMessage>) {
             let (jobs, jobs_rx) = test_client_and_jobs();
             let state = AppState {
                 jobs,
@@ -5821,7 +5827,7 @@ mod imp {
         async fn non_streaming_finish_reason_for(stopped: bool) -> String {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
-                if let Some(job) = jobs_rx.recv().await {
+                if let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await {
                     let _ = job.reply(WorkerEvent::Delta("hi".to_string()));
                     let _ = job.reply(WorkerEvent::Complete(GenerateOutput {
                         text: "hi".to_string(),
@@ -5875,7 +5881,7 @@ mod imp {
         async fn metrics_endpoint_reports_requests_tokens_and_errors() {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
-                if let Some(job) = jobs_rx.recv().await {
+                if let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await {
                     let _ = job.reply(WorkerEvent::Complete(GenerateOutput {
                         text: "hi".to_string(),
                         token_ids: vec![0],
@@ -5941,7 +5947,7 @@ mod imp {
         async fn streaming_finish_reason_for(stopped: bool) -> String {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
-                if let Some(job) = jobs_rx.recv().await {
+                if let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await {
                     let _ = job.reply(WorkerEvent::Delta("hi".to_string()));
                     let _ = job.reply(WorkerEvent::Complete(GenerateOutput {
                         text: "hi".to_string(),
@@ -5991,7 +5997,7 @@ mod imp {
         async fn chat_completions_streaming_failure_emits_error_event() {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
-                if let Some(job) = jobs_rx.recv().await {
+                if let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await {
                     let _ = job.reply(WorkerEvent::Delta("partial".to_string()));
                     let _ = job.reply(WorkerEvent::Failed("blocked by grammar".to_string()));
                 }
@@ -6039,7 +6045,7 @@ mod imp {
         async fn chat_completions_streaming_failure_records_failed_metric() {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
-                if let Some(job) = jobs_rx.recv().await {
+                if let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await {
                     let _ = job.reply(WorkerEvent::Delta("partial".to_string()));
                     let _ = job.reply(WorkerEvent::Failed("blocked by grammar".to_string()));
                 }
@@ -6123,7 +6129,7 @@ mod imp {
         async fn chat_completions_streaming_context_overflow_returns_400_before_committing_sse() {
             let (state, mut jobs_rx) = test_app_state_with_jobs();
             tokio::spawn(async move {
-                if let Some(job) = jobs_rx.recv().await {
+                if let Some(WorkerMessage::Generate(job)) = jobs_rx.recv().await {
                     let _ = job.reply(WorkerEvent::Rejected(ApiError::BadRequest {
                         message: "prompt has 4090 tokens, leaving 6 of the 4096-token \
                                   context window for generation, but this request needs \
