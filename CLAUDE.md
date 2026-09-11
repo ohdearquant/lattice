@@ -109,6 +109,50 @@ Metal lock coverage is enforced by `crates/inference/tests/metal_measurement_loc
 
 All reviewed Metal benchmarks additionally validate Criterion registration and explicit caller chains. One registered wrapper must hold the same guard across the entire ordered target list, including compared arms and CPU groups in mixed benchmarks. Helper-local and separate per-arm guards do not establish that span. Constructor coverage in those benchmarks depends on the same ownership check. This target-owned span applies to the active Metal configuration; it does not establish GPU exclusion for CPU-only builds.
 
+The explicit `--gpu-handoff` mode on `scripts/bench-command.sh` and
+`scripts/bench-compare.sh` admits the six declared Metal benchmark targets under
+continuous supervisor ownership. Admission checks each measured revision and its
+effective features before acquiring the benchmark window. A historical revision
+without the protocol is refused; a newer invoking checkout does not make an old
+binary participate. Both comparison arms must be eligible.
+
+Cargo compiles the selected target without lock descriptors. The supervisor then
+launches that exact executable with the held GPU descriptor on stdin and a private
+invocation channel. The Rust guard verifies canonical file identity and the shared
+exclusive capability, then waits while the supervisor checks the launched process
+and samples quiet conditions. A valid acknowledgement permits measurement. No
+handoff signal preserves ordinary acquisition; a partial or unverifiable handoff
+refuses instead of bypassing or reacquiring. The supervisor retains both original
+locks throughout ABBA and cooperative descendant cleanup, including ordinary embed
+arms. The comparison statistics and Criterion evidence directories are unchanged.
+The target guard releases its duplicate by closing it only: it must never explicitly
+unlock that shared description, which would also release the supervisor's hold.
+
+Only an admitted executable receives the GPU capability. Arbitrary commands,
+Cargo/build scripts and the comparison shell remain descriptor-free. The admitted
+executable can deliberately unlock its shared descriptor, and stdin could reach
+future descendants, so this remains a cooperative reviewed-target contract. Entry
+checks do not authenticate a hostile same-user caller, prove past uninterrupted
+ownership, prevent pathname replacement, or establish crash-time GPU quiescence.
+Quiet samples and invocation identities are recorded in a separate phase receipt;
+quote that receipt with the existing run-conditions block. The command route checks
+CPU idle inside its guard; the comparison route also repeats its machine-state
+checkpoint there.
+
+For a supported, committed macOS checkout, a scoped example is:
+
+```bash
+scripts/bench-command.sh --gpu-handoff --label decode-reference -- \
+  cargo bench --locked -p lattice-inference --bench decode_attn_bench \
+  --features metal-gpu,f16 -- decode_attention_reference --quick
+```
+
+For paired measurements, select the same target and features with
+`BENCHES_INFERENCE` and `CARGO_FEATURES_INFERENCE`, narrow its groups through
+`BENCH_GROUPS_INFERENCE`, and pass `--gpu-handoff` to `scripts/bench-compare.sh`.
+Ordinary invocations retain their existing behavior; an opt-in flag is not a
+replacement for successful admission.
+
 The lock blocks for up to 30 minutes, then panics with an `lsof /tmp/lion-metal-gpu-test.lock` hint rather than hanging silently. If a run appears stuck at test start, another process is holding the GPU; check who with `lsof` before killing anything.
 
 ### Regression Tests Must Be Mutation-Sensitive

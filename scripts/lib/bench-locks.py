@@ -41,7 +41,11 @@ running descriptor-free measurement children. ``bench_supervision.py`` gives
 cooperating entry points a separate handoff pipe, never an open file description
 that can release either advisory lock. The bench-compare route uses that same
 supervisor boundary, so arbitrary commands and build descendants on these
-wrapper routes never receive the capabilities.
+ordinary wrapper routes never receive the capabilities. Explicit GPU admission
+adds one narrow exception: the verified supervisor itself launches a selected
+benchmark with the GPU descriptor as stdin. Cargo, build scripts, the ABBA body,
+and ordinary embed commands remain descriptor-free. The original descriptors
+stay here through command completion and process-group cleanup.
 
 WHY lsof IS ONLY A DIAGNOSTIC HERE. lsof lists processes that have the lock
 file OPEN, which is a superset of those holding a flock on it, and it does not

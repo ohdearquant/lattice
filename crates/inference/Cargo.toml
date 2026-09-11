@@ -12,6 +12,17 @@ description = "Pure Rust transformer inference engine — safetensors loading, S
 # which are never run from the published crate.
 exclude = ["tests/fixtures/tokenizers", "tests/fixtures/gdn_chunk"]
 
+[package.metadata.gpu-bench-handoff]
+version = 1
+targets = [
+    "cross_turn_prefix_cache_bench",
+    "decode_attn_bench",
+    "lm_head_bench",
+    "metal_decode_bench",
+    "mtp_decode",
+    "topk_readback",
+]
+
 [features]
 default = ["std", "download", "serve"]
 # HTTP serving stack (axum/tokio/futures) for the `lattice` CLI's serve

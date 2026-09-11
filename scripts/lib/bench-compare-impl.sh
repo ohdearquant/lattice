@@ -231,6 +231,10 @@ if [[ "$supervisor_fd" =~ ^[0-9]+$ ]]; then
   eval "exec ${supervisor_fd}<&-"
 fi
 unset LATTICE_BENCH_SUPERVISOR_FD
+# Only the typed helper receives the broker capability; Cargo and embed do not.
+handoff_broker="${LATTICE_GPU_HANDOFF_BROKER:-}"
+handoff_token="${LATTICE_GPU_HANDOFF_BROKER_TOKEN:-}"
+unset LATTICE_GPU_HANDOFF_BROKER LATTICE_GPU_HANDOFF_BROKER_TOKEN
 
 # --- Machine-state and ambient-load gates ---
 # A lock excludes peers; it says nothing about ambient load, thermal pressure,
@@ -334,18 +338,23 @@ if [ "$#" -gt 2 ]; then
   exit 2
 fi
 
-# Resolve both display and audit identities before measuring.
-if ! BASE_FULL_SHA="$(
-  git -C "$REPO" rev-parse --verify --end-of-options "${BASE_REF}^{commit}" 2>/dev/null
-)"; then
-  echo "bench-compare: base ref '$BASE_REF' is not a commit — refusing." >&2
-  exit 2
-fi
-if ! HEAD_FULL_SHA="$(
-  git -C "$REPO" rev-parse --verify --end-of-options "${HEAD_REF}^{commit}" 2>/dev/null
-)"; then
-  echo "bench-compare: head ref '$HEAD_REF' is not a commit — refusing." >&2
-  exit 2
+# Explicit admission freezes refs before the supervisor enters its lock window.
+if [ -n "$handoff_broker" ]; then
+  BASE_FULL_SHA="${LATTICE_GPU_HANDOFF_BASE_SHA:?missing admitted base SHA}"
+  HEAD_FULL_SHA="${LATTICE_GPU_HANDOFF_HEAD_SHA:?missing admitted head SHA}"
+else
+  if ! BASE_FULL_SHA="$(
+    git -C "$REPO" rev-parse --verify --end-of-options "${BASE_REF}^{commit}" 2>/dev/null
+  )"; then
+    echo "bench-compare: base ref '$BASE_REF' is not a commit — refusing." >&2
+    exit 2
+  fi
+  if ! HEAD_FULL_SHA="$(
+    git -C "$REPO" rev-parse --verify --end-of-options "${HEAD_REF}^{commit}" 2>/dev/null
+  )"; then
+    echo "bench-compare: head ref '$HEAD_REF' is not a commit — refusing." >&2
+    exit 2
+  fi
 fi
 BASE_SHA="${BASE_FULL_SHA:0:10}"
 HEAD_SHA="${HEAD_FULL_SHA:0:10}"
@@ -412,7 +421,7 @@ WT="$REPO/.cache/bench-compare-base"
 if [ -d "$WT" ]; then
   git -C "$REPO" worktree remove --force "$WT" 2>/dev/null || rm -rf "$WT"
 fi
-git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_REF" 2>&1 | tail -1
+git -C "$REPO" worktree add --detach --end-of-options "$WT" "$BASE_FULL_SHA" 2>&1 | tail -1
 
 command_version() {
   local directory="$1"; shift
@@ -652,7 +661,17 @@ BASE_PHASE_RC=0
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
   # same channel and one of them silently deletes half the comparison.
   if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    if [ -n "$handoff_broker" ]; then
+      run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" \
+        LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
+        LATTICE_GPU_HANDOFF_BROKER_TOKEN="$handoff_token" \
+        "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
+        --entry base1 --revision "$BASE_FULL_SHA" --target "$BENCHES_INFERENCE" \
+        --features "$CARGO_FEATURES_INFERENCE" -- \
+        ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    else
+      run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    fi
     require_measured "base lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "base lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
@@ -721,7 +740,17 @@ HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
   if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
-    run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    if [ -n "$handoff_broker" ]; then
+      run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" \
+        LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
+        LATTICE_GPU_HANDOFF_BROKER_TOKEN="$handoff_token" \
+        "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
+        --entry head1 --revision "$HEAD_FULL_SHA" --target "$BENCHES_INFERENCE" \
+        --features "$CARGO_FEATURES_INFERENCE" -- \
+        ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    else
+      run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_BASELINE_NAME" --noplot $QUICK_FLAGS
+    fi
     require_measured "head lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   else
     require_measured "head lattice-inference:$BENCHES_INFERENCE build (--no-run)" 1
@@ -741,7 +770,17 @@ echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
 HEAD_CONTROL_PHASE_RC=0
 (
   cd "$HEAD_DIR"
-  run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  if [ -n "$handoff_broker" ]; then
+    run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
+      LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
+      LATTICE_GPU_HANDOFF_BROKER_TOKEN="$handoff_token" \
+      "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
+      --entry head2 --revision "$HEAD_FULL_SHA" --target "$BENCHES_INFERENCE" \
+      --features "$CARGO_FEATURES_INFERENCE" -- \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  else
+    run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   require_measured "head control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --save-baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "head control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
@@ -764,7 +803,17 @@ echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
 BASE_CONTROL_PHASE_RC=0
 (
   cd "$WT"
-  run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  if [ -n "$handoff_broker" ]; then
+    run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
+      LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
+      LATTICE_GPU_HANDOFF_BROKER_TOKEN="$handoff_token" \
+      "$PYTHON_BIN" "$REPO/scripts/lib/bench_admission.py" measure \
+      --entry base2 --revision "$BASE_FULL_SHA" --target "$BENCHES_INFERENCE" \
+      --features "$CARGO_FEATURES_INFERENCE" -- \
+      ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  else
+    run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} -- ${BENCH_GROUPS_INFERENCE:+"$BENCH_GROUPS_INFERENCE"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
+  fi
   require_measured "base control lattice-inference:$BENCHES_INFERENCE" "$BENCH_RC" "$BENCH_LINES"
   run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_EMBED_CRITERION_ROOT" cargo bench --locked -p lattice-embed --bench "$BENCHES_EMBED" ${CARGO_FEATURES_EMBED:+--features "$CARGO_FEATURES_EMBED"} -- ${BENCH_GROUPS_EMBED:+"$BENCH_GROUPS_EMBED"} --baseline "$BENCH_HEAD_BASELINE_NAME" --noplot $QUICK_FLAGS
   require_measured "base control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
