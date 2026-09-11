@@ -57,6 +57,12 @@ _RC = re.compile(r"^(?P<name>[A-Z][A-Z0-9_]*_RC)=(?P<rc>-?\d+)\s*$", re.M)
 
 COUNTERS = ("passed", "failed", "ignored", "measured", "filtered_out")
 
+# Evidence that this log is cargo output at all. A cargo run that executed ZERO test
+# binaries still emits these, so requiring one does not cost the `binaries` discriminator
+# below; it costs only the logs that were never cargo output in the first place.
+_CARGO_MARKER = re.compile(
+    r"^(?: *(?:Compiling|Running|Finished|Fresh|Doc-tests)\b|test result:|error\[E)", re.M)
+
 
 def value(v):
     return {"value": v}
@@ -73,7 +79,22 @@ def is_known(field: dict) -> bool:
 def parse_cargo_test_log(text: str) -> dict:
     """Receipt fields derivable from the log text alone."""
     rows = [m.groupdict() for m in _RESULT.finditer(text)]
-    receipt: dict = {"format": value("cargo-test"), "binaries": value(len(rows))}
+
+    # `format` is DERIVED, never assumed. Asserting "cargo-test" over a log that is not
+    # cargo output is the worst field to get wrong, because it is the one a consumer reads
+    # to decide how to interpret every other field. Measured on a 29-file corpus of real
+    # gate logs: 28 carried no cargo marker at all, so the assumed value was wrong far more
+    # often than it was right, and a 0-byte file claimed a format with no bytes to claim it
+    # from.
+    if _CARGO_MARKER.search(text):
+        receipt: dict = {"format": value("cargo-test"), "binaries": value(len(rows))}
+    else:
+        why = ("no cargo output marker (Compiling/Running/Finished/Doc-tests/test result:) "
+               "in this log, so it is not established as cargo output")
+        # `binaries` goes with it. The count of `test result:` lines only MEANS a count of
+        # test binaries inside a cargo log; outside one it is a count of a string that
+        # happens to be absent, which is not the same fact and must not read as "ran none".
+        receipt = {"format": unknown(why), "binaries": unknown(why)}
 
     if not rows:
         # Empty is not clean. A log with no result lines answers nothing about counts,
@@ -110,9 +131,9 @@ def build(log_path: Path, command: str | None, source_hash: str | None) -> dict:
                             "sha256": hashlib.sha256(text.encode()).hexdigest()[:16]})
     receipt["exit_code"] = rc_from_log(text)
     receipt["command"] = value(command) if command else unknown(
-        "not recoverable from a cargo test log; pass --command with the invocation you ran")
+        "a gate log does not record the invocation that produced it; pass --command")
     receipt["source_hash"] = value(source_hash) if source_hash else unknown(
-        "not recoverable from a cargo test log; pass --source-hash with the ref you built")
+        "a gate log does not record the ref it was produced from; pass --source-hash")
     receipt["executed_generated_command"] = value(False)
     return receipt
 
@@ -140,18 +161,32 @@ def _self_test() -> int:
     # The arm that matters: an empty read must not produce a clean receipt.
     empty = parse_cargo_test_log("warning: unrelated\n")
     cases.append(("empty log -> counts UNKNOWN, not 0", not is_known(empty["passed"])))
-    cases.append(("empty log -> binaries is a known 0, which is the discriminator",
-                  empty["binaries"]["value"] == 0))
     cases.append(("empty log -> outcome UNKNOWN, never 'ok'", not is_known(empty["outcome"])))
     cases.append(("no rc marker -> UNKNOWN, not 0", not is_known(rc_from_log("no markers here"))))
 
-    # Ran-but-empty vs never-built: identical totals, different `binaries`.
+    # A log with no cargo marker is not cargo output, and the receipt must not claim it is.
+    # `format` is the field a consumer reads to decide how to interpret the rest, so an
+    # assumed value here mis-frames every other field at once.
+    cases.append(("non-cargo log -> format UNKNOWN, never claimed as cargo-test",
+                  not is_known(empty["format"])))
+    cases.append(("non-cargo log -> binaries UNKNOWN, because a missing string is not a count",
+                  not is_known(empty["binaries"])))
+    cases.append(("a 0-byte log claims no format at all",
+                  not is_known(parse_cargo_test_log("")["format"])))
+
+    # Ran-but-empty vs never-built: identical totals, different `binaries`. BOTH sides are
+    # real cargo logs -- a cargo run that built and ran no test binary still emits its own
+    # markers -- so deriving `format` above costs this discriminator nothing.
     ran_empty = parse_cargo_test_log(
         "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n")
+    never_built = parse_cargo_test_log(
+        "   Compiling lattice-inference v0.1.0\n    Finished test profile in 4.21s\n")
+    cases.append(("a cargo log that ran NO binary still reports format",
+                  never_built["format"]["value"] == "cargo-test"))
     cases.append(("ran-with-no-tests and never-built have equal totals",
-                  ran_empty["passed"].get("value") == 0 and not is_known(empty["passed"])))
-    cases.append(("...and are separated ONLY by binaries",
-                  ran_empty["binaries"]["value"] == 1 and empty["binaries"]["value"] == 0))
+                  ran_empty["passed"].get("value") == 0 and not is_known(never_built["passed"])))
+    cases.append(("...and are separated ONLY by binaries, both known",
+                  ran_empty["binaries"]["value"] == 1 and never_built["binaries"]["value"] == 0))
 
     # A failing binary anywhere makes the receipt's outcome FAILED.
     mixed = parse_cargo_test_log(
