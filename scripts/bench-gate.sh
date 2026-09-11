@@ -111,13 +111,24 @@ bench_quiet_checkpoint "bench-gate: after measurements"
 echo "UNSUITABLE AS BENCHMARK EVIDENCE: local bench-gate has no run provenance"
 rc=0
 gate_rc=0
+# --baseline-name base, on BOTH calls. The stored baselines are copied in under
+# <group>/base/ (that is how perf-baselines stores them, and it is the name the
+# `cargo bench -- --baseline base` runs above read), while this flag defaults to
+# `compare-base`, which is what bench-compare.sh writes. The gate's help text --
+# "Named-baseline dir to look for when base/ is absent" -- describes the tolerant
+# RENDER path; the strict inventory that --require-measurements consults declines
+# that fallback on purpose, and says so in find_selected_baseline_files' own
+# docstring. Without the flag the gate finds no selected base set at all and
+# refuses with rc=2, so `make bench-gate` exits 2 no matter what the numbers say.
 "$PYTHON_BIN" scripts/perf-bench-gate.py \
     "$inference_root" "$arch-local/lattice-inference:elementwise_cpu_bench" \
     --target lattice-inference:elementwise_cpu_bench \
+    --baseline-name base \
     --require-measurements || rc=$?
 "$PYTHON_BIN" scripts/perf-bench-gate.py \
     "$embed_root" "$arch-local/lattice-embed:simd" \
     --target lattice-embed:simd \
+    --baseline-name base \
     --require-measurements || gate_rc=$?
 if [[ "$rc" -eq 2 || "$gate_rc" -eq 2 ]]; then
     exit 2
