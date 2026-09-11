@@ -112,6 +112,7 @@ EXPLICIT_SCRIPT_EXCLUSIONS = frozenset(
         "scripts/lib/quiet-probe.py",
         "scripts/perf-policy.toml",
         "scripts/perf_governor.README.md",
+        "scripts/requirements-parity.txt",
         "scripts/rust-fmt-coverage.allow",
     }
     | INTERNAL_OR_TEST

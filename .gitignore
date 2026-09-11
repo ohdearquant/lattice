@@ -86,3 +86,14 @@ uv.lock
 
 # Internal workspace artifacts (audits, notes, local tooling) — local-only
 .khive/
+
+# Reference-side environment for scripts/e2e_parity_check.py, created by
+# `uv venv .venv-parity`. uv also writes a self-ignoring .gitignore inside the
+# directory, which would cover it on its own, but this entry is the rule that
+# actually fires (`git check-ignore -v .venv-parity/bin/python` names this line):
+# git stops at the excluded directory and never descends far enough to read uv's
+# file. The duplication is deliberate rather than redundant. What is being avoided
+# is a multi-GB virtualenv offered up for commit in a public repository if that
+# inner file is ever lost, and the price of not depending on another tool's
+# behaviour for that is one line.
+.venv-parity/
