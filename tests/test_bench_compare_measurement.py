@@ -1691,6 +1691,421 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertNotIn("**ℹ️ 1 informational**", result.stdout)
 
 
+class GpuBenchmarkAdmission(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location("bench_admission", LIB / "bench_admission.py")
+        assert spec is not None and spec.loader is not None
+        cls.admission = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = cls.admission
+        spec.loader.exec_module(cls.admission)
+
+    def manifest(self, *, eligible=True):
+        admission = self.admission
+        return {
+            "package": {
+                "name": "lattice-inference", "version": {"workspace": True},
+                "metadata": {"gpu-bench-handoff": {"version": 1, "targets": list(admission.TARGETS)}}
+                if eligible else {},
+            },
+            "features": {
+                "default": ["std", "download", "serve"], "std": [],
+                "download": ["dep:ureq"], "serve": ["dep:axum"], "f16": [],
+                "metal-gpu": ["dep:metal"], "bench-internals": [],
+                "metal-bench": ["metal-gpu", "f16"],
+            },
+            "bench": [{"name": target, "harness": False} for target in admission.TARGETS],
+        }
+
+    def compare(self, *, base_eligible=True, target="decode_attn_bench", features="metal-gpu,f16", args=None):
+        from unittest import mock
+        admission = self.admission
+        base, head = "a" * 40, "b" * 40
+        def manifest(repo, revision, path):
+            if path == "Cargo.toml":
+                return {"workspace": {"package": {"version": "0.0.1"}}}
+            return self.manifest(eligible=base_eligible or revision != base)
+        with mock.patch.object(admission.sys, "platform", "darwin"), \
+             mock.patch.object(admission, "_revision", side_effect=lambda repo, ref: base if ref == "base" else head), \
+             mock.patch.object(admission, "_manifest", side_effect=manifest), \
+             mock.patch.object(admission, "_git", return_value="source"), \
+             mock.patch.object(admission, "_clean_revision"):
+            return admission.plan_compare(Path("/tmp/admission-fixture"), args or ["base", "head"], {
+                "BENCHES_INFERENCE": target, "CARGO_FEATURES_INFERENCE": features,
+                "BENCH_GROUPS_INFERENCE": "reference|flash", "BENCHES_EMBED": "simd",
+            })
+
+    def test_explicit_admission_requires_each_historical_revision(self):
+        with self.assertRaisesRegex(self.admission.AdmissionError, "base1.*no supported GPU handoff"):
+            self.compare(base_eligible=False)
+
+    def test_admission_freezes_all_four_ordered_invocations_and_criterion_arguments(self):
+        plan = self.compare()
+        self.assertEqual([entry["id"] for entry in plan["entries"]], ["base1", "head1", "head2", "base2"])
+        self.assertEqual([entry["revision"] for entry in plan["entries"]], ["a" * 40, "b" * 40, "b" * 40, "a" * 40])
+        self.assertEqual([entry["argv"] for entry in plan["entries"]], [
+            ["--bench", "reference|flash", "--save-baseline", "compare-base", "--noplot", "--quick"],
+            ["--bench", "reference|flash", "--baseline", "compare-base", "--noplot", "--quick"],
+            ["--bench", "reference|flash", "--save-baseline", "compare-head", "--noplot", "--quick"],
+            ["--bench", "reference|flash", "--baseline", "compare-head", "--noplot", "--quick"],
+        ])
+        self.assertEqual(len({entry["criterion_home"] for entry in plan["entries"]}), 4)
+        self.assertEqual({entry["package"] for entry in plan["entries"]}, {"lattice-inference"})
+        self.assertEqual(plan["environment"]["LATTICE_GPU_HANDOFF_BASE_SHA"], "a" * 40)
+
+    def test_every_supported_target_checks_its_active_features(self):
+        for target in self.admission.TARGETS:
+            with self.subTest(target=target):
+                features = "metal-gpu,f16,bench-internals" if target == "lm_head_bench" else "metal-gpu,f16"
+                self.assertEqual(self.compare(target=target, features=features)["entries"][0]["target"], target)
+                with self.assertRaisesRegex(self.admission.AdmissionError, "lacks features"):
+                    self.compare(target=target, features="f16")
+
+    def test_unknown_and_mixed_self_locking_selections_refuse(self):
+        for target in ("future_metal", "decode_attn_bench topk_readback", "decode_attn_bench,topk_readback"):
+            with self.subTest(target=target), self.assertRaises(self.admission.AdmissionError):
+                self.compare(target=target)
+
+    def test_feature_identity_includes_defaults_and_transitive_features(self):
+        entry = self.compare(features="metal-bench")["entries"][0]
+        self.assertEqual(entry["features"], "metal-bench")
+        self.assertEqual(entry["feature_set"], ["default", "download", "f16", "metal-bench", "metal-gpu", "serve", "std"])
+        with self.assertRaisesRegex(self.admission.AdmissionError, "unknown or unsupported"):
+            self.compare(features="metal-gpu,f16,missing")
+
+    def test_full_resolution_preserves_criterion_arguments_without_quick(self):
+        plan = self.compare(args=["--full", "--fail-on-regression", "base", "head"])
+        self.assertTrue(all("--quick" not in entry["argv"] for entry in plan["entries"]))
+        self.assertTrue(all(entry["argv"][-1] == "--noplot" for entry in plan["entries"]))
+
+    def test_command_grammar_refuses_opaque_or_mixed_cargo_selection(self):
+        from unittest import mock
+        admission = self.admission
+        with mock.patch.object(admission.sys, "platform", "darwin"):
+            for command in (["sh", "-c", "cargo bench"],
+                            ["cargo", "bench", "--workspace"],
+                            ["cargo", "bench", "--locked", "-p", "lattice-inference", "--bench", "topk_readback", "--bench", "mtp_decode"]):
+                with self.subTest(command=command), self.assertRaises(admission.AdmissionError):
+                    admission.plan_command(Path.cwd(), command, {})
+
+    def test_command_plan_preserves_the_exact_criterion_arguments(self):
+        from unittest import mock
+        admission = self.admission
+        repo = Path.cwd().resolve()
+        def manifest(directory, revision, path):
+            if path == "Cargo.toml":
+                return {"workspace": {"package": {"version": "0.0.1"}}}
+            return self.manifest()
+        with mock.patch.object(admission.sys, "platform", "darwin"), \
+             mock.patch.object(admission, "_revision", return_value="c" * 40), \
+             mock.patch.object(admission, "_manifest", side_effect=manifest), \
+             mock.patch.object(admission, "_git", return_value="source"), \
+             mock.patch.object(admission, "_clean_revision"):
+            plan = admission.plan_command(repo, ["cargo", "bench", "--locked", "-p", "lattice-inference",
+                "--bench", "topk_readback", "--features", "metal-gpu", "--", "readback", "--quick"],
+                {"CRITERION_HOME": "relative-evidence"})
+        self.assertEqual(plan["entries"][0]["argv"], ["--bench", "readback", "--quick"])
+        self.assertEqual(plan["entries"][0]["revision"], "c" * 40)
+        self.assertEqual(plan["command"][-3:], ["--", "readback", "--quick"])
+        self.assertEqual(plan["entries"][0]["run_cwd"], str(repo / "crates/inference"))
+        self.assertEqual(plan["entries"][0]["criterion_home"],
+                         str(repo / "crates/inference/relative-evidence"))
+
+    def test_command_output_directory_preserves_cargo_target_override(self):
+        admission = self.admission
+        repo = Path("/tmp/admission-output").resolve()
+        self.assertEqual(admission.command_criterion_home(repo, {"CARGO_TARGET_DIR": "cache"}),
+                         repo / "crates/inference/cache/criterion")
+        self.assertEqual(admission.command_criterion_home(repo, {"CARGO_TARGET_DIR": "/tmp/build-cache"}),
+                         Path("/tmp/build-cache/criterion").resolve())
+
+    def test_shipping_compatibility_policy_names_the_six_supported_targets(self):
+        admission = self.admission
+        manifest = admission.tomllib.loads((REPO / "crates/inference/Cargo.toml").read_text())
+        policy = manifest["package"]["metadata"]["gpu-bench-handoff"]
+        self.assertEqual(policy["version"], admission.PROTOCOL)
+        self.assertEqual(sorted(policy["targets"]), sorted(admission.TARGETS))
+
+    def test_cargo_environment_has_no_handoff_capabilities(self):
+        from unittest import mock
+        with mock.patch.dict(os.environ, {
+            "LATTICE_GPU_HANDOFF_BROKER": "/tmp/broker",
+            "LATTICE_GPU_HANDOFF_BROKER_TOKEN": "token",
+            "LATTICE_GPU_HANDOFF_PLAN": "/tmp/plan",
+            "LATTICE_BENCH_LOCK_FDS": "3,4",
+            "LATTICE_BENCH_SUPERVISOR_FD": "5",
+            "LATTICE_MODEL_DIR": "/tmp/model",
+        }):
+            environment = self.admission._cargo_environment()
+        self.assertFalse(any(key.startswith("LATTICE_GPU_HANDOFF_") for key in environment))
+        self.assertNotIn("LATTICE_BENCH_LOCK_FDS", environment)
+        self.assertNotIn("LATTICE_BENCH_SUPERVISOR_FD", environment)
+        self.assertEqual(environment["LATTICE_MODEL_DIR"], "/tmp/model")
+
+    def test_artifact_validation_rejects_changed_source_features_and_output_directory(self):
+        import copy
+        admission = self.admission
+        with tempfile.TemporaryDirectory() as directory:
+            cwd = Path(directory).resolve()
+            executable = cwd / "build" / "selected"
+            executable.parent.mkdir()
+            executable.write_text("fixture")
+            executable.chmod(0o755)
+            entry = {"target": "topk_readback", "source_path": "crates/inference/benches/topk_readback.rs",
+                     "feature_set": ["default", "metal-gpu"], "package_version": "0.0.1",
+                     "target_dir": str(executable.parent)}
+            artifact = {"reason": "compiler-artifact", "target": {
+                "name": "topk_readback", "kind": ["bench"], "src_path": str(cwd / entry["source_path"])},
+                "features": entry["feature_set"], "executable": str(executable),
+                "package_id": f"path+{(cwd / 'crates/inference').as_uri()}#lattice-inference@0.0.1"}
+            self.assertEqual(admission.validate_artifact(entry, artifact, cwd), executable)
+            for field, value in (("features", ["default"]), ("package_id", "other"),
+                                 ("executable", "/bin/sh")):
+                changed = {**artifact, field: value}
+                with self.subTest(field=field), self.assertRaises(admission.AdmissionError):
+                    admission.validate_artifact(entry, changed, cwd)
+            changed = copy.deepcopy(artifact)
+            changed["target"]["src_path"] = str(cwd / "other.rs")
+            with self.assertRaises(admission.AdmissionError):
+                admission.validate_artifact(entry, changed, cwd)
+
+    def test_request_cannot_change_frozen_arguments(self):
+        admission = self.admission
+        entry = self.compare()["entries"][0]
+        request = {"entry": entry["id"], **{name: entry[name] for name in (
+            "cwd", "run_cwd", "revision", "target", "features", "criterion_home", "argv")}}
+        for name in request:
+            changed = {**request, name: [] if name == "argv" else "changed"}
+            with self.subTest(field=name), self.assertRaisesRegex(admission.AdmissionError, "changed admitted"):
+                admission.validate_measurement_request(entry, changed)
+
+
+class SystemBashEntrypoints(unittest.TestCase):
+    def run_wrapper(self, name, args):
+        import json
+
+        with tempfile.TemporaryDirectory(prefix="bench-system-bash-") as temporary:
+            root = Path(temporary)
+            lib = root / "scripts/lib"
+            lib.mkdir(parents=True)
+            shutil.copy2(REPO / "scripts" / name, root / "scripts" / name)
+            shutil.copy2(LIB / "bench-python.sh", lib / "bench-python.sh")
+            # Capture the wrapper boundary without entering a measurement window.
+            (lib / "bench_supervision.py").write_text(
+                "import json,sys\nprint(json.dumps(sys.argv[1:]))\n"
+            )
+            bindir = root / "bin"
+            bindir.mkdir()
+            (bindir / "python3.13").symlink_to(sys.executable)
+            result = subprocess.run(
+                ["/bin/bash", str(root / "scripts" / name), *args],
+                env={**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}"},
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            forwarded = json.loads(result.stdout)
+            return forwarded, str(root / "scripts/lib/bench-compare-impl.sh")
+
+    def test_compare_without_arguments_reaches_supervisor(self):
+        forwarded, implementation = self.run_wrapper("bench-compare.sh", [])
+        self.assertEqual(forwarded, ["run", "--label", "bench-compare", "--entrypoint", "--", implementation])
+
+    def test_compare_handoff_without_refs_reaches_supervisor(self):
+        forwarded, implementation = self.run_wrapper("bench-compare.sh", ["--gpu-handoff"])
+        self.assertEqual(forwarded, ["run", "--label", "bench-compare", "--entrypoint",
+                                     "--gpu-handoff", "compare", "--", implementation])
+
+    def test_compare_handoff_preserves_argument_boundaries(self):
+        args = ["--full", "--", "base ref", ""]
+        forwarded, implementation = self.run_wrapper("bench-compare.sh", ["--gpu-handoff", *args])
+        self.assertEqual(forwarded, ["run", "--label", "bench-compare", "--entrypoint",
+                                     "--gpu-handoff", "compare", "--", implementation, *args])
+
+    def test_ordinary_command_reaches_supervisor_with_exact_arguments(self):
+        command = ["printf", "%s", "two words", ""]
+        for durable in (False, True):
+            with self.subTest(durable=durable):
+                flags = ["--durable"] if durable else []
+                forwarded, _ = self.run_wrapper("bench-command.sh", ["--label", "fixture label", *flags, "--", *command])
+                quiet = ["--quiet"] if durable else []
+                self.assertEqual(forwarded, ["run", "--label", "fixture label", *quiet, "--", *command])
+
+    def test_command_handoff_reaches_supervisor_with_exact_arguments(self):
+        command = ["cargo", "bench", "--", "two words", ""]
+        for durable in (False, True):
+            with self.subTest(durable=durable):
+                flags = ["--durable"] if durable else []
+                forwarded, _ = self.run_wrapper("bench-command.sh", ["--gpu-handoff", "--label", "fixture label", *flags, "--", *command])
+                quiet = ["--quiet"] if durable else []
+                self.assertEqual(forwarded, ["run", "--label", "fixture label", *quiet,
+                                             "--gpu-handoff", "command", "--", *command])
+
+
+class GpuHandoffShippingCommand(unittest.TestCase):
+    def run_fixture(self, *, eligibility="valid", artifact_valid=True):
+        import json
+        with tempfile.TemporaryDirectory(prefix="admission-command-") as temporary:
+            temp = Path(temporary).resolve()
+            root = temp / "repo"
+            lib = root / "scripts/lib"
+            lib.mkdir(parents=True)
+            for name in ("bench_admission.py", "bench_handoff.py", "bench_supervision.py",
+                         "bench-locks.py", "bench-python.sh", "quiet-probe.py"):
+                shutil.copy2(LIB / name, lib / name)
+            shutil.copy2(REPO / "scripts/bench-command.sh", root / "scripts/bench-command.sh")
+            # The fixture substitutes the host/Metal workload, never admission or RPC validation.
+            source = (lib / "bench_admission.py").read_text()
+            self.assertIn('if sys.platform != "darwin":', source)
+            (lib / "bench_admission.py").write_text(source.replace('if sys.platform != "darwin":', 'if False:', 1))
+            lock_names = {"BENCH_WINDOW": temp / "window.lock", "GPU_LOCK": temp / "gpu.lock", "PENDING_DIR": temp / "pending"}
+            source = (lib / "bench-locks.py").read_text()
+            for name, path in lock_names.items():
+                source, count = re.subn(rf'^{name} = "[^"]*"$', f'{name} = "{path}"', source, flags=re.M)
+                self.assertEqual(count, 1)
+            (lib / "bench-locks.py").write_text(source)
+            (lib / "quiet-probe.py").write_text(
+                "import os,pathlib\n"
+                "assert not pathlib.Path(os.environ['FIXTURE_WORK']).exists()\n"
+                "pathlib.Path(os.environ['FIXTURE_QUIET']).write_text('inside guard')\n"
+                "print('fixture inside-guard CPU idle sample')\n")
+            (root / ".gitignore").write_text(".cache/\ntarget/\n__pycache__/\n")
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = ["crates/inference"]\n[workspace.package]\nversion = "0.0.1"\n')
+            (root / "Cargo.lock").write_text("version = 4\n")
+            package = root / "crates/inference"
+            (package / "benches").mkdir(parents=True)
+            targets = ["cross_turn_prefix_cache_bench", "decode_attn_bench", "lm_head_bench",
+                       "metal_decode_bench", "mtp_decode", "topk_readback"]
+            policy = "" if eligibility == "absent" else (
+                '[package.metadata.gpu-bench-handoff]\nversion = ' + ('1' if eligibility == "valid" else '2')
+                + '\ntargets = ' + json.dumps(targets) + '\n')
+            manifest = '[package]\nname = "lattice-inference"\nversion.workspace = true\n' + policy
+            manifest += '[features]\ndefault = ["std"]\nstd = []\nmetal-gpu = []\nf16 = []\nbench-internals = []\n'
+            for target in targets:
+                manifest += f'[[bench]]\nname = "{target}"\nharness = false\n'
+                (package / f"benches/{target}.rs").write_text("fn main() {}\n")
+            (package / "Cargo.toml").write_text(manifest)
+            (package / "fixture-model.txt").write_text("package-relative model")
+            env_git = {**os.environ, "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                       "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
+            subprocess.run([*GIT, "init", "-q", str(root)], check=True, env=env_git)
+            subprocess.run([*GIT, "-C", str(root), "add", "."], check=True, env=env_git)
+            subprocess.run([*GIT, "-C", str(root), "commit", "-qm", "fixture"], check=True, env=env_git)
+            executable_source = temp / "target-fixture.py"
+            executable_source.write_text(f"#!{sys.executable}\n" + r'''
+import fcntl,json,os,pathlib,socket,sys
+package = pathlib.Path(os.environ["FIXTURE_REPO"]) / "crates/inference"
+assert pathlib.Path.cwd() == package, (pathlib.Path.cwd(), package)
+assert pathlib.Path(os.environ["LATTICE_MODEL_DIR"]).read_text() == "package-relative model"
+assert sys.argv[1:] == ["--bench", "lookup", "--quick"], sys.argv
+assert "LATTICE_GPU_HANDOFF_BROKER_TOKEN" not in os.environ
+assert "LATTICE_BENCH_LOCK_FDS" not in os.environ
+gpu = pathlib.Path(os.environ["FIXTURE_GPU"])
+held, canonical = os.fstat(0), gpu.stat()
+assert (held.st_dev, held.st_ino) == (canonical.st_dev, canonical.st_ino)
+with gpu.open("r+") as probe:
+    try:
+        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise AssertionError("GPU lock was not held")
+fcntl.flock(0, fcntl.LOCK_EX | fcntl.LOCK_NB)
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.connect(os.environ["LATTICE_GPU_HANDOFF_CONTROL"])
+    token = os.environ["LATTICE_GPU_HANDOFF_TOKEN"]
+    connection.sendall(json.dumps(dict(protocol=1, token=token, pid=os.getpid(), exe=str(pathlib.Path(__file__).resolve()))).encode() + b"\n")
+    with connection.makefile("rb") as stream:
+        response = json.loads(stream.readline())
+    assert response == dict(protocol=1, token=token, status="ready"), response
+home = pathlib.Path(os.environ["CRITERION_HOME"])
+assert home == package / "relative-evidence", home
+assert pathlib.Path(os.environ["FIXTURE_QUIET"]).exists()
+pathlib.Path(os.environ["FIXTURE_WORK"]).write_text(json.dumps(dict(cwd=str(pathlib.Path.cwd()), criterion_home=str(home))))
+print("lookup time: [1.0 ns 1.1 ns 1.2 ns]", flush=True)
+''')
+            bindir = temp / "bin"
+            bindir.mkdir()
+            for version in ("python3.13", "python3.12", "python3.11", "python3"):
+                (bindir / version).symlink_to(sys.executable)
+            cargo = bindir / "cargo"
+            cargo.write_text(f"#!{sys.executable}\n" + r'''
+import json,os,pathlib,shutil,sys
+assert sys.argv[1] == "bench", sys.argv
+assert "--locked" in sys.argv and "--no-run" in sys.argv and "--message-format=json" in sys.argv
+assert not any(name.startswith("LATTICE_GPU_HANDOFF_") for name in os.environ)
+assert "LATTICE_BENCH_LOCK_FDS" not in os.environ
+assert "LATTICE_BENCH_SUPERVISOR_FD" not in os.environ
+gpu = pathlib.Path(os.environ["FIXTURE_GPU"]).stat()
+for fd in range(256):
+    try:
+        candidate = os.fstat(fd)
+    except OSError:
+        continue
+    assert (candidate.st_dev, candidate.st_ino) != (gpu.st_dev, gpu.st_ino), fd
+pathlib.Path(os.environ["FIXTURE_CARGO"]).write_text("descriptor-free build")
+root = pathlib.Path.cwd()
+target = sys.argv[sys.argv.index("--bench") + 1]
+target_dir = pathlib.Path(sys.argv[sys.argv.index("--target-dir") + 1])
+exe = target_dir / "release/deps" / target
+exe.parent.mkdir(parents=True, exist_ok=True)
+shutil.copyfile(os.environ["FIXTURE_SOURCE"], exe)
+exe.chmod(0o755)
+source = root / "crates/inference/benches" / (target + ".rs")
+if os.environ["FIXTURE_ARTIFACT_VALID"] != "1":
+    source = root / "different.rs"
+print(json.dumps(dict(reason="compiler-artifact", package_id="path+" + (root / "crates/inference").as_uri() + "#lattice-inference@0.0.1",
+    target=dict(name=target,kind=["bench"],src_path=str(source)), features=["default","metal-gpu","std"], executable=str(exe))))
+''')
+            cargo.chmod(0o755)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith("LATTICE_GPU_HANDOFF_") and key not in (
+                       "LATTICE_BENCH_LOCK_STATUS", "LATTICE_BENCH_LOCK_FDS", "LATTICE_BENCH_SUPERVISOR_FD",
+                       "CARGO_BUILD_TARGET", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS")}
+            env.update({"PATH": f"{bindir}:{env['PATH']}", "PYTHONDONTWRITEBYTECODE": "1",
+                        "CRITERION_HOME": "relative-evidence", "LATTICE_MODEL_DIR": "fixture-model.txt",
+                        "FIXTURE_REPO": str(root), "FIXTURE_GPU": str(lock_names["GPU_LOCK"]),
+                        "FIXTURE_WORK": str(temp / "worked.json"), "FIXTURE_QUIET": str(temp / "quiet"),
+                        "FIXTURE_CARGO": str(temp / "cargo-ran"), "FIXTURE_SOURCE": str(executable_source),
+                        "FIXTURE_ARTIFACT_VALID": str(int(artifact_valid))})
+            result = subprocess.run(["/bin/bash", str(root / "scripts/bench-command.sh"), "--gpu-handoff", "--label", "fixture", "--",
+                "cargo", "bench", "--locked", "-p", "lattice-inference", "--bench", "topk_readback", "--features", "metal-gpu", "--", "lookup", "--quick"],
+                cwd=root, env=env, text=True, capture_output=True, timeout=30)
+            return result, {
+                "cargo": (temp / "cargo-ran").exists(), "worked": (temp / "worked.json").exists(),
+                "quiet": (temp / "quiet").exists(),
+                "locks": [lock_names[name].exists() for name in ("BENCH_WINDOW", "GPU_LOCK")],
+                "work": json.loads((temp / "worked.json").read_text()) if (temp / "worked.json").exists() else None,
+                "run_cwd": str(package), "criterion_home": str(package / "relative-evidence"),
+            }
+
+    def test_shipping_handoff_preserves_package_cwd_and_relative_paths(self):
+        result, evidence = self.run_fixture()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(evidence["cargo"])
+        self.assertTrue(evidence["quiet"])
+        self.assertEqual(evidence["work"], {"cwd": evidence["run_cwd"], "criterion_home": evidence["criterion_home"]})
+        self.assertIn("lookup time:", result.stdout)
+
+    def test_historical_or_invalid_eligibility_refuses_before_locks_or_cargo(self):
+        for eligibility in ("absent", "invalid"):
+            with self.subTest(eligibility=eligibility):
+                result, evidence = self.run_fixture(eligibility=eligibility)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn("no supported GPU handoff declaration", result.stderr)
+                self.assertFalse(evidence["cargo"])
+                self.assertFalse(evidence["worked"])
+                self.assertFalse(evidence["quiet"])
+                self.assertEqual(evidence["locks"], [False, False])
+
+    def test_wrong_cargo_artifact_refuses_before_target_or_quiet(self):
+        result, evidence = self.run_fixture(artifact_valid=False)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Cargo artifact does not match", result.stderr)
+        self.assertTrue(evidence["cargo"])
+        self.assertFalse(evidence["worked"])
+        self.assertFalse(evidence["quiet"])
+
+
 class _FailOnEmptyTestProgram(unittest.TestProgram):
     def runTests(self) -> None:
         if self.test.countTestCases() == 0:

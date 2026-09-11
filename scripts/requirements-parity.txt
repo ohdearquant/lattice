@@ -1,0 +1,29 @@
+# Reference-side dependencies for scripts/e2e_parity_check.py.
+#
+# These four packages, and only these four, are what the checker compares against:
+# REFERENCE_PACKAGES in e2e_parity_check.py names exactly ("torch", "transformers",
+# "tokenizers", "huggingface_hub"), and the frozen reference fixture at
+# crates/inference/tests/fixtures/e2e_parity_reference_v1/reference.json records a
+# version for each. The frozen path refuses to run when an installed version differs
+# from the recorded one, so a floor ("torch>=2.12") is not a pin the checker can use.
+# The versions below are those recorded versions, read from that fixture.
+#
+# Install into an environment dedicated to this check, not into a shared one:
+#
+#     uv venv .venv-parity
+#     uv pip install --python .venv-parity/bin/python -r scripts/requirements-parity.txt
+#
+# The dedicated environment is the point. A shared environment is re-derived from its
+# own project metadata whenever anything runs `uv sync` or `uv run` against it, and
+# these packages are not in that metadata, so they are dropped without a message. That
+# is not hypothetical: the reference side of this check was silently reduced to
+# "No module named 'torch'" that way, and the failure surfaced only in a scheduled
+# run's captured stderr.
+#
+# When the fixture is refreshed, the recorded versions change and this file changes
+# with it. Re-read them from reference.json rather than editing one line here.
+
+torch==2.12.1
+transformers==5.12.1
+tokenizers==0.22.2
+huggingface_hub==1.20.1

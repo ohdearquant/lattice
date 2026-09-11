@@ -50,7 +50,7 @@
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
 use crate::forward::metal_qwen35::{
-    ChatMessage, MetalQwen35State, format_chat_template, push_chat_generation_open,
+    ChatMessage, LoraLayerData, MetalQwen35State, format_chat_template, push_chat_generation_open,
     push_chat_turn_close, push_chat_turn_open,
 };
 use crate::kv_cache::CrossTurnSlotId;
@@ -69,12 +69,14 @@ use crate::vision::multimodal::Qwen35VisionRequest;
 use crate::vision::qwen35_merger::qwen35_merger_forward_with_cancel;
 use crate::vision::qwen35_vit::preprocess_qwen35_image_for_serve;
 use crate::vision::qwen35_vit_metal::qwen35_vit_forward_metal_with_cancel;
+use std::cell::RefCell;
 use std::io::Write as _;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
 /// Default cap on outstanding (queued + in-flight) jobs a [`MetalWorkerClient`]
 /// admits before rejecting new submissions (issue #932). Conservative on
@@ -254,6 +256,95 @@ pub struct WorkerJob {
     _admission_permit: OwnedSemaphorePermit,
 }
 
+/// One adapter state change for the model the worker thread owns.
+///
+/// There is deliberately no `Swap` variant. `MetalQwen35State::load_lora_adapter`
+/// rejects a load while an adapter is present, so a swap can only be
+/// unload-then-load, and a load that fails after the unload leaves the model
+/// serving no adapter at all. Making that atomic would mean building the new
+/// GPU buffers before dropping the old ones, which this type does not do. An
+/// API that offers a rollback it cannot perform is worse than one that makes
+/// the caller sequence the two steps and decide what to do in between.
+pub enum AdapterCommand {
+    /// Load `layers` under `descriptor`, which also supplies the blend scale.
+    /// Fails, leaving any currently-loaded adapter untouched, if one is
+    /// already loaded.
+    Load {
+        layers: Vec<LoraLayerData>,
+        descriptor: Box<lattice_fann::lora::LoraDescriptor>,
+        quarot_seed: Option<u64>,
+    },
+    /// Drop the currently-loaded adapter and its GPU buffers. A no-op when
+    /// none is loaded.
+    Unload,
+}
+
+impl std::fmt::Debug for AdapterCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `LoraLayerData` carries the adapter weights; printing them would
+        // dump megabytes into a log line.
+        match self {
+            Self::Load {
+                layers,
+                descriptor,
+                quarot_seed,
+            } => f
+                .debug_struct("Load")
+                .field("layers", &layers.len())
+                .field("rank", &descriptor.rank)
+                .field("quarot_seed", quarot_seed)
+                .finish(),
+            Self::Unload => f.write_str("Unload"),
+        }
+    }
+}
+
+/// An [`AdapterCommand`] in flight toward the worker thread, with the channel
+/// its outcome comes back on.
+///
+/// The permit is a field of this struct and of [`WorkerJob`], and the two come
+/// from different semaphores: a control request can never consume a generation
+/// admission slot, and a generation can never consume the single control slot,
+/// because neither type can be constructed with the other's permit.
+pub struct ControlRequest {
+    command: AdapterCommand,
+    reply: oneshot::Sender<Result<(), String>>,
+    /// Held from [`MetalWorkerClient::submit_adapter_command`] until the
+    /// worker has finished applying this command and dropped it. Its only job
+    /// is to exist and be dropped, like `WorkerJob::_admission_permit`.
+    _control_permit: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for ControlRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlRequest")
+            .field("command", &self.command)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the worker thread's single channel carries.
+///
+/// One channel rather than two is what makes the ordering contract in
+/// [`run_worker_loop_with_control`]'s doc comment expressible at all: a second
+/// channel would need a select, and the worker thread has no runtime to select
+/// on -- it is a bare `std::thread` blocking on one receiver.
+pub enum WorkerMessage {
+    Generate(WorkerJob),
+    Control(ControlRequest),
+}
+
+impl std::fmt::Debug for WorkerMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `WorkerJob` is deliberately not `Debug`: it holds the caller's
+        // rendered messages. Name the variant and stop.
+        match self {
+            Self::Generate(_) => f.write_str("Generate(..)"),
+            Self::Control(request) => f.debug_tuple("Control").field(request).finish(),
+        }
+    }
+}
+
 /// Shared owner for the dedicated worker thread.
 ///
 /// Production [`MetalWorkerClient`] values retain an owner clone. Each
@@ -377,12 +468,19 @@ impl MetalWorkerOwner {
 /// confined to that thread.
 #[derive(Debug, Clone)]
 pub struct MetalWorkerClient {
-    jobs: Option<mpsc::UnboundedSender<WorkerJob>>,
+    jobs: Option<mpsc::UnboundedSender<WorkerMessage>>,
     /// Bounded-admission cap (issue #932): `Semaphore::new(max_pending)`, one
     /// permit per outstanding job (queued + in-flight, i.e. from `submit`
     /// until `run_worker_loop` is done with it). `Arc`-shared with every
     /// clone of this client so the cap is process-wide, not per-clone.
     admission: Arc<Semaphore>,
+    /// Single-permit gate on adapter control requests, separate from
+    /// `admission` so a control request can never consume a generation slot
+    /// and vice versa. One permit, not a queue: a second concurrent control
+    /// request is refused outright rather than enqueued, because two
+    /// load/unload commands in flight have no meaningful order to a caller
+    /// that has not yet seen the first one's result.
+    control: Arc<Semaphore>,
     vision_supported: Arc<AtomicBool>,
     /// Keeps the worker join owner alive for exactly as long as the queue
     /// can accept jobs. Test-only clients without a worker carry an owner
@@ -392,7 +490,7 @@ pub struct MetalWorkerClient {
 
 impl MetalWorkerClient {
     fn with_owner(
-        jobs: mpsc::UnboundedSender<WorkerJob>,
+        jobs: mpsc::UnboundedSender<WorkerMessage>,
         admission: Arc<Semaphore>,
         vision_supported: Arc<AtomicBool>,
         owner: MetalWorkerOwner,
@@ -400,6 +498,7 @@ impl MetalWorkerClient {
         Self {
             jobs: Some(jobs),
             admission,
+            control: Arc::new(Semaphore::new(1)),
             vision_supported,
             _owner: owner,
         }
@@ -407,7 +506,7 @@ impl MetalWorkerClient {
 
     #[cfg(any(test, feature = "test-utils"))]
     fn unattached_for_test(
-        jobs: mpsc::UnboundedSender<WorkerJob>,
+        jobs: mpsc::UnboundedSender<WorkerMessage>,
         admission: Arc<Semaphore>,
     ) -> Self {
         Self::with_owner(
@@ -462,7 +561,57 @@ impl MetalWorkerClient {
         // simply dropped here, closing `rx` with zero events and freeing
         // the slot immediately -- see the doc comment above.
         if let Some(jobs) = self.jobs.as_ref() {
-            let _ = jobs.send(job);
+            let _ = jobs.send(WorkerMessage::Generate(job));
+        }
+        Ok(rx)
+    }
+
+    /// Submit one adapter state change to the worker thread and return the
+    /// channel its outcome arrives on.
+    ///
+    /// The command is queued on the same channel as generation requests and is
+    /// therefore applied strictly between whole jobs -- never mid-decode. A
+    /// caller that submits this while generations are queued gets a result
+    /// only after those generations have finished, which is the point: the
+    /// alternative is a weight change landing under a decode that has already
+    /// prefilled.
+    ///
+    /// Returns `Err(ApiError::ServiceUnavailable)` when another adapter
+    /// command is already in flight. That is a refusal, not a queue: two
+    /// unresolved load/unload commands have no order a caller can reason
+    /// about, since neither has reported its result yet.
+    ///
+    /// The returned receiver resolves to the loader's own error string on
+    /// failure, unchanged. A failing `Load` leaves whatever was loaded before
+    /// it still loaded and still serving -- every check in
+    /// `MetalQwen35State::load_lora_adapter_with_descriptor` and
+    /// `load_lora_adapter` runs before any mutation of the state.
+    ///
+    /// A closed receiver (the worker thread is gone) is the same signal it is
+    /// for [`Self::submit`]: the command was never applied.
+    pub fn submit_adapter_command(
+        &self,
+        command: AdapterCommand,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, ApiError> {
+        let permit =
+            self.control
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| ApiError::ServiceUnavailable {
+                    message: "an adapter command is already in flight on the inference \
+                              worker; wait for its result before sending another"
+                        .to_string(),
+                })?;
+        let (reply, rx) = oneshot::channel();
+        let request = ControlRequest {
+            command,
+            reply,
+            _control_permit: permit,
+        };
+        // On failure `request` -- including `reply` and the control permit --
+        // is dropped here, closing `rx` and freeing the slot immediately.
+        if let Some(jobs) = self.jobs.as_ref() {
+            let _ = jobs.send(WorkerMessage::Control(request));
         }
         Ok(rx)
     }
@@ -574,16 +723,89 @@ fn check_prompt_fits_window(
 /// next job if it fires; otherwise a call to `generate`, and exactly one
 /// terminal event (`Complete`, `Rejected`, or `Failed`) after zero or more
 /// `Delta` events.
+///
+/// Adapter control messages ([`WorkerMessage::Control`]) share that one FIFO
+/// queue and occupy a whole position in it. A control message is therefore
+/// applied strictly BETWEEN two jobs: after the terminal event of every job
+/// dequeued before it, and before any prompt work of every job dequeued after
+/// it. It never interleaves with a job's prefill or decode, because the single
+/// blocking receive is the only place this loop ever looks at the channel.
+/// That is the property the one-channel design buys, and it is not an
+/// incidental consequence of the current body -- moving control handling
+/// anywhere that can run while `generate` is on the stack breaks it.
+///
+/// A control message produces no [`WorkerEvent`]. Its result goes back on the
+/// request's own reply channel, so the per-job "exactly one terminal event"
+/// contract above is unchanged in both directions: control messages add none,
+/// and consume none.
+///
+/// Production no longer calls this form: [`MetalWorker::spawn_with_vision`]
+/// owns a model and therefore has a real control handler to inject. What is
+/// left is the fake-worker seam and this module's own tests, which is why the
+/// two-argument form is gated to the same configurations those are. Widening
+/// that gate would mean claiming a production caller that does not exist.
+#[cfg(any(test, feature = "test-utils"))]
 fn run_worker_loop(
-    mut job_rx: mpsc::UnboundedReceiver<WorkerJob>,
-    mut generate: impl FnMut(
+    msg_rx: mpsc::UnboundedReceiver<WorkerMessage>,
+    generate: impl FnMut(
         &[ChatMessage],
         &GenerateConfig,
         &mut dyn FnMut(&str, u32) -> bool,
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
 ) {
-    while let Some(job) = job_rx.blocking_recv() {
+    run_worker_loop_with_control(msg_rx, generate, control_unsupported);
+}
+
+/// The error a worker built without adapter support returns for any control
+/// message. Written as a named function rather than a closure at each call
+/// site so every such worker returns the same string.
+#[cfg(any(test, feature = "test-utils"))]
+fn control_unsupported(_command: AdapterCommand) -> Result<(), String> {
+    Err("this inference worker does not support adapter commands".to_string())
+}
+
+/// [`run_worker_loop`] with an injected adapter-control handler.
+///
+/// One loop body, not two. The generation path below is byte-identical to what
+/// [`run_worker_loop`] ran before control messages existed; the two-argument
+/// form is now a call into this one. This module's own header is about two
+/// copies of this loop that drifted apart while only comments kept them in
+/// sync, so a second copy is the one thing this change must not add.
+///
+/// `control` runs on the worker thread with exclusive access to whatever state
+/// that thread owns, at a point where no generation is in flight. It returns
+/// the underlying loader's error string unchanged: across a channel that
+/// string is the entire diagnosis the caller gets.
+fn run_worker_loop_with_control(
+    mut msg_rx: mpsc::UnboundedReceiver<WorkerMessage>,
+    mut generate: impl FnMut(
+        &[ChatMessage],
+        &GenerateConfig,
+        &mut dyn FnMut(&str, u32) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure>,
+    mut control: impl FnMut(AdapterCommand) -> Result<(), String>,
+) {
+    while let Some(message) = msg_rx.blocking_recv() {
+        let job = match message {
+            WorkerMessage::Generate(job) => job,
+            WorkerMessage::Control(request) => {
+                let ControlRequest {
+                    command,
+                    reply,
+                    _control_permit,
+                } = request;
+                let outcome = control(command);
+                // The caller may have dropped its receiver; the command was
+                // still applied, and there is nobody to tell. Dropping
+                // `_control_permit` here frees the control slot for the next
+                // request, in the same statement sequence either way.
+                let _ = reply.send(outcome);
+                continue;
+            }
+        };
+
         // Dequeue-time cancel check, independent of token-callback return
         // values (#744/#606): a client that disconnected while this job was
         // still queued behind an earlier one -- or whose event receiver is
@@ -1116,125 +1338,165 @@ impl MetalWorker {
         if max_pending == 0 || max_pending > Semaphore::MAX_PERMITS {
             return Err(StartupError::InvalidMaxPending { max_pending });
         }
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let admission = Arc::new(Semaphore::new(max_pending));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WorkerMetadata, String>>();
 
         let join_handle = std::thread::spawn(move || match loader() {
-            Ok((mut state, tokenizer, meta)) => {
+            Ok((state, tokenizer, meta)) => {
                 let _ = ready_tx.send(Ok(meta.clone()));
-                run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
-                    if let JobRoute::Vision {
-                        message_index: image_message_index,
-                    } = classify_job(messages)?
-                    {
-                        if should_cancel() {
-                            return Ok(cancelled_output());
-                        }
-                        let config = state.engine.config.clone();
-                        let (request, metal_dispatches, gemm_calls) = match build_vision_request(
-                            &mut vision_runtime,
-                            &config,
-                            &tokenizer,
-                            messages,
-                            image_message_index,
-                            should_cancel,
-                            |prompt_len| {
-                                check_prompt_fits_window(
-                                    meta.context_window_policy,
-                                    meta.model_max_context,
-                                    prompt_len,
-                                    cfg,
-                                )
-                            },
-                        )? {
-                            VisionRequestBuild::Ready {
-                                request,
-                                metal_dispatches,
-                                gemm_calls,
-                            } => (request, metal_dispatches, gemm_calls),
-                            VisionRequestBuild::Cancelled => return Ok(cancelled_output()),
-                        };
-                        if should_cancel() {
-                            return Ok(cancelled_output());
-                        }
-                        eprintln!(
-                            "[metal-worker] route=vision dispatch=multimodal \
+                // `Rc`/`RefCell`, not `Arc`/`Mutex`: both handles are created
+                // here, inside the spawned thread and after `loader()` has run
+                // on it, and neither ever leaves. `!Send` is the correct
+                // property for a handle to `!Send` state -- it is the compiler
+                // checking the confinement this whole module exists to
+                // maintain, not a cost being paid to work around it.
+                //
+                // The two borrows below can never overlap: the loop holds
+                // exactly one message at a time and calls exactly one of the
+                // two closures per message, so `borrow_mut` is uncontended by
+                // construction rather than by convention.
+                let state_rc = Rc::new(RefCell::new(state));
+                let state_for_control = Rc::clone(&state_rc);
+                run_worker_loop_with_control(
+                    job_rx,
+                    move |messages, cfg, on_token, should_cancel| {
+                        let mut guard = state_rc.borrow_mut();
+                        let state = &mut *guard;
+                        if let JobRoute::Vision {
+                            message_index: image_message_index,
+                        } = classify_job(messages)?
+                        {
+                            if should_cancel() {
+                                return Ok(cancelled_output());
+                            }
+                            let config = state.engine.config.clone();
+                            let (request, metal_dispatches, gemm_calls) =
+                                match build_vision_request(
+                                    &mut vision_runtime,
+                                    &config,
+                                    &tokenizer,
+                                    messages,
+                                    image_message_index,
+                                    should_cancel,
+                                    |prompt_len| {
+                                        check_prompt_fits_window(
+                                            meta.context_window_policy,
+                                            meta.model_max_context,
+                                            prompt_len,
+                                            cfg,
+                                        )
+                                    },
+                                )? {
+                                    VisionRequestBuild::Ready {
+                                        request,
+                                        metal_dispatches,
+                                        gemm_calls,
+                                    } => (request, metal_dispatches, gemm_calls),
+                                    VisionRequestBuild::Cancelled => return Ok(cancelled_output()),
+                                };
+                            if should_cancel() {
+                                return Ok(cancelled_output());
+                            }
+                            eprintln!(
+                                "[metal-worker] route=vision dispatch=multimodal \
                              metal_gemm_dispatches={metal_dispatches} \
                              metal_gemm_calls={gemm_calls}"
-                        );
-                        let output = state
-                            .generate_multimodal_vision_with_cancel(
-                                &request,
-                                &tokenizer,
-                                cfg,
-                                should_cancel,
-                            )
-                            .map_err(WorkerFailure::from)?;
-                        if !output.text.is_empty() {
-                            let _ = on_token(&output.text, 0);
+                            );
+                            let output = state
+                                .generate_multimodal_vision_with_cancel(
+                                    &request,
+                                    &tokenizer,
+                                    cfg,
+                                    should_cancel,
+                                )
+                                .map_err(WorkerFailure::from)?;
+                            if !output.text.is_empty() {
+                                let _ = on_token(&output.text, 0);
+                            }
+                            return Ok(output);
                         }
-                        return Ok(output);
-                    }
 
-                    // Render the ChatML prompt exactly once (#828/#832: the
-                    // prior `lattice_serve.rs` path rendered it a second
-                    // time inside its own window preflight); reused for
-                    // both the window check and the generation call below.
-                    let prompt = format_chat_template(messages);
-                    let prompt_len = tokenizer.tokenize(&prompt).real_length;
-                    check_prompt_fits_window(
-                        meta.context_window_policy,
-                        meta.model_max_context,
-                        prompt_len,
-                        cfg,
-                    )
-                    .map_err(WorkerFailure::Rejected)?;
+                        // Render the ChatML prompt exactly once (#828/#832: the
+                        // prior `lattice_serve.rs` path rendered it a second
+                        // time inside its own window preflight); reused for
+                        // both the window check and the generation call below.
+                        let prompt = format_chat_template(messages);
+                        let prompt_len = tokenizer.tokenize(&prompt).real_length;
+                        check_prompt_fits_window(
+                            meta.context_window_policy,
+                            meta.model_max_context,
+                            prompt_len,
+                            cfg,
+                        )
+                        .map_err(WorkerFailure::Rejected)?;
 
-                    // Cache-aware + cancellation-aware call (#462/#744):
-                    // reuses the previous turn's shared token prefix
-                    // instead of a full re-prefill on every request, and
-                    // observes client disconnect before prefill,
-                    // immediately after prefill, and at the top of every
-                    // decode iteration. This worker thread owns one
-                    // `MetalQwen35State` for the whole process lifetime, so
-                    // `CrossTurnSlotId::DEFAULT` is the only slot that
-                    // exists; the planner re-verifies the retained prefix
-                    // against this request's prompt on every call and
-                    // falls back to `PrefixReuseMode::FullRefill` whenever
-                    // they diverge, so correctness never depends on
-                    // distinguishing clients.
-                    //
-                    // DEPLOYMENT ASSUMPTION, stated because it is currently
-                    // true only by the accident that no multi-tenant consumer
-                    // exists: this path assumes a single tenant, or clients
-                    // that mutually trust one another. Reuse-versus-refill is
-                    // externally visible as latency, so while no request can
-                    // read another's content, a client CAN observe that some
-                    // other request recently shared a prefix with its own.
-                    // A shared inference endpoint serving mutually distrusting
-                    // clients must key the slot per tenant via
-                    // `CrossTurnSlotId::new`, not inherit `DEFAULT`.
-                    let cached = state.generate_streaming_with_prefix_cache_and_cancel(
-                        CrossTurnSlotId::DEFAULT,
-                        &prompt,
-                        &tokenizer,
-                        cfg,
-                        on_token,
-                        should_cancel,
-                    );
-                    if let Ok(c) = &cached {
-                        eprintln!(
-                            "[metal-worker] cross-turn cache: mode={:?} reused={} \
-                             prefetched={} prompt={}",
-                            c.cache.mode,
-                            c.cache.reused_tokens,
-                            c.cache.prefetched_tokens,
-                            c.cache.prompt_tokens,
+                        // Cache-aware + cancellation-aware call (#462/#744):
+                        // reuses the previous turn's shared token prefix
+                        // instead of a full re-prefill on every request, and
+                        // observes client disconnect before prefill,
+                        // immediately after prefill, and at the top of every
+                        // decode iteration. This worker thread owns one
+                        // `MetalQwen35State` for the whole process lifetime, so
+                        // `CrossTurnSlotId::DEFAULT` is the only slot that
+                        // exists; the planner re-verifies the retained prefix
+                        // against this request's prompt on every call and
+                        // falls back to `PrefixReuseMode::FullRefill` whenever
+                        // they diverge, so correctness never depends on
+                        // distinguishing clients.
+                        //
+                        // DEPLOYMENT ASSUMPTION, stated because it is currently
+                        // true only by the accident that no multi-tenant consumer
+                        // exists: this path assumes a single tenant, or clients
+                        // that mutually trust one another. Reuse-versus-refill is
+                        // externally visible as latency, so while no request can
+                        // read another's content, a client CAN observe that some
+                        // other request recently shared a prefix with its own.
+                        // A shared inference endpoint serving mutually distrusting
+                        // clients must key the slot per tenant via
+                        // `CrossTurnSlotId::new`, not inherit `DEFAULT`.
+                        let cached = state.generate_streaming_with_prefix_cache_and_cancel(
+                            CrossTurnSlotId::DEFAULT,
+                            &prompt,
+                            &tokenizer,
+                            cfg,
+                            on_token,
+                            should_cancel,
                         );
-                    }
-                    cached.map(|c| c.output).map_err(WorkerFailure::from)
-                });
+                        if let Ok(c) = &cached {
+                            eprintln!(
+                                "[metal-worker] cross-turn cache: mode={:?} reused={} \
+                             prefetched={} prompt={}",
+                                c.cache.mode,
+                                c.cache.reused_tokens,
+                                c.cache.prefetched_tokens,
+                                c.cache.prompt_tokens,
+                            );
+                        }
+                        cached.map(|c| c.output).map_err(WorkerFailure::from)
+                    },
+                    move |command| {
+                        let mut guard = state_for_control.borrow_mut();
+                        let state = &mut *guard;
+                        match command {
+                            AdapterCommand::Load {
+                                layers,
+                                descriptor,
+                                quarot_seed,
+                            } => state
+                                .load_lora_adapter_with_descriptor(layers, &descriptor, quarot_seed)
+                                // The loader's own message, unchanged. Across
+                                // a channel it is the only thing the caller
+                                // receives, so collapsing it to a bool or
+                                // rewording it destroys the diagnosis.
+                                .map_err(|e| e.to_string()),
+                            AdapterCommand::Unload => {
+                                state.unload_lora_adapter();
+                                Ok(())
+                            }
+                        }
+                    },
+                );
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -1293,7 +1555,7 @@ impl WorkerJob {
 /// instead of each rolling its own raw `mpsc::unbounded_channel::<Job>()`
 /// pair.
 #[cfg(any(test, feature = "test-utils"))]
-pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerJob>) {
+pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerMessage>) {
     // A large, effectively-unbounded cap: the overwhelming majority of
     // existing callers of this seam predate the #932 admission cap and
     // exercise request validation / routing / cancellation, not admission
@@ -1309,8 +1571,8 @@ pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<Wor
 #[cfg(any(test, feature = "test-utils"))]
 pub fn test_client_and_jobs_with_cap(
     max_pending: usize,
-) -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerJob>) {
-    let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+) -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerMessage>) {
+    let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
     (
         MetalWorkerClient::unattached_for_test(job_tx, Arc::new(Semaphore::new(max_pending))),
         job_rx,
@@ -1448,7 +1710,7 @@ fn spawn_fake_with_capability(
     + Send
     + 'static,
 ) -> MetalWorkerClient {
-    let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+    let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
     let join_handle = std::thread::spawn(move || {
         run_worker_loop(job_rx, move |messages, cfg, on_token, should_cancel| {
             let prompt = format_chat_template(messages);
@@ -2350,8 +2612,11 @@ mod tests {
     /// guard that cancels it when dropped (the same guard a real handler
     /// moves into the SSE stream / keeps local for non-streaming, standing
     /// in here for "the client is still connected").
+    /// Returns the job already wrapped in its [`WorkerMessage`], because
+    /// every caller sends it straight down the queue and none of them looks
+    /// inside.
     fn make_job() -> (
-        WorkerJob,
+        WorkerMessage,
         mpsc::UnboundedReceiver<WorkerEvent>,
         crate::serve::CancelOnDrop,
     ) {
@@ -2372,12 +2637,258 @@ mod tests {
             cancel: cancel_rx,
             _admission_permit: permit,
         };
-        (job, rx, cancel_guard)
+        (WorkerMessage::Generate(job), rx, cancel_guard)
+    }
+
+    // ─── adapter control messages ────────────────────────────────────────
+
+    /// A generator that reports the value of a shared counter as each token,
+    /// pauses after its first token until released, and then finishes.
+    ///
+    /// The counter stands in for "which adapter is loaded". If an adapter
+    /// command were ever applied while this generator is on the stack, the
+    /// tokens emitted after the pause would carry a different value from the
+    /// ones emitted before it, and the assembled output would say so. A
+    /// generator that could not express that difference would make the
+    /// ordering test unfalsifiable.
+    #[allow(clippy::type_complexity)]
+    fn epoch_reporting_generate(
+        epoch: Arc<AtomicUsize>,
+        tokens: usize,
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Arc<Mutex<Option<std::sync::mpsc::Receiver<()>>>>,
+    ) -> impl FnMut(
+        &[ChatMessage],
+        &GenerateConfig,
+        &mut dyn FnMut(&str, u32) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure> {
+        move |_messages, _cfg, on_token, should_cancel| {
+            let mut text = String::new();
+            for i in 0..tokens {
+                // Polled every iteration, as this module's contract for an
+                // injected generator requires. It is also the call site any
+                // mid-generation channel pump would have to live on, so a
+                // generator that skipped it would make the ordering mutation
+                // unobservable -- which is exactly what happened on the first
+                // attempt at this test.
+                if should_cancel() {
+                    break;
+                }
+                let delta = epoch.load(Ordering::SeqCst).to_string();
+                text.push_str(&delta);
+                on_token(&delta, i as u32);
+                if i == 0 {
+                    let _ = started.try_send(());
+                    if let Some(rx) = lock_unpoisoned(&release).take() {
+                        // Block here long enough that a control message sent
+                        // by the test is definitely sitting in the queue
+                        // while this generation is still running.
+                        let _ = rx.recv();
+                    }
+                }
+            }
+            let generated_tokens = text.len();
+            Ok(GenerateOutput {
+                text,
+                token_ids: vec![0; generated_tokens],
+                prompt_tokens: 1,
+                generated_tokens,
+                stopped: false,
+                stop_reason: None,
+                token_logprobs: vec![],
+            })
+        }
+    }
+
+    /// Drive one generation to completion through the real loop, optionally
+    /// injecting an adapter command while that generation is mid-flight.
+    /// Returns the assembled output text and the epoch value afterwards.
+    fn run_one_generation(inject_control: bool) -> (String, usize) {
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<WorkerMessage>();
+        let epoch = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let release = Arc::new(Mutex::new(Some(release_rx)));
+
+        let (job, mut events, _guard) = make_job();
+        msg_tx.send(job).unwrap();
+
+        let epoch_for_generate = epoch.clone();
+        let epoch_for_control = epoch.clone();
+        let handle = std::thread::spawn(move || {
+            run_worker_loop_with_control(
+                msg_rx,
+                epoch_reporting_generate(epoch_for_generate, 6, started_tx, release),
+                move |command| {
+                    assert!(matches!(command, AdapterCommand::Unload));
+                    epoch_for_control.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+        });
+
+        started_rx.recv().expect("generation should start");
+        let control_reply = if inject_control {
+            let (reply, reply_rx) = oneshot::channel();
+            let permit = Arc::new(Semaphore::new(1))
+                .try_acquire_owned()
+                .expect("fresh semaphore");
+            msg_tx
+                .send(WorkerMessage::Control(ControlRequest {
+                    command: AdapterCommand::Unload,
+                    reply,
+                    _control_permit: permit,
+                }))
+                .unwrap();
+            Some(reply_rx)
+        } else {
+            None
+        };
+        let _ = release_tx.send(());
+
+        let mut text = String::new();
+        loop {
+            match events.blocking_recv() {
+                Some(WorkerEvent::Delta(d)) => text.push_str(&d),
+                Some(WorkerEvent::Complete(_)) | None => break,
+                Some(other) => panic!("unexpected event: {other:?}"),
+            }
+        }
+
+        if let Some(reply_rx) = control_reply {
+            // The command must actually have been applied, not silently
+            // dropped -- otherwise "the generation was unaffected" would be
+            // true for the uninteresting reason.
+            let outcome = reply_rx.blocking_recv().expect("control reply channel");
+            assert_eq!(outcome, Ok(()), "the injected command must have run");
+        }
+
+        drop(msg_tx);
+        handle.join().unwrap();
+        let final_epoch = epoch.load(Ordering::SeqCst);
+        (text, final_epoch)
+    }
+
+    /// An adapter command submitted while a generation is running does not
+    /// change that generation's output.
+    ///
+    /// This asserts the generation is byte-identical to the same generation
+    /// run with no command in flight. A weaker test -- send both, assert no
+    /// error -- passes against a worker that applies the command mid-decode,
+    /// which is the exact failure this design exists to prevent.
+    #[test]
+    fn adapter_command_during_generation_does_not_change_that_generation() {
+        let (baseline_text, baseline_epoch) = run_one_generation(false);
+        let (concurrent_text, concurrent_epoch) = run_one_generation(true);
+
+        assert_eq!(
+            baseline_epoch, 0,
+            "the baseline run must not apply any command"
+        );
+        assert_eq!(
+            concurrent_epoch, 1,
+            "the injected command must have been applied after the generation"
+        );
+        assert_eq!(
+            concurrent_text, baseline_text,
+            "a command queued mid-generation must not reach that generation: \
+             baseline {baseline_text:?} vs concurrent {concurrent_text:?}"
+        );
+        assert_eq!(
+            baseline_text, "000000",
+            "sanity: the baseline reports epoch 0 for every token"
+        );
+    }
+
+    /// The handler's error string reaches the caller unchanged.
+    ///
+    /// Across a channel that string is the entire diagnosis the caller gets,
+    /// so a loop that collapsed it to a bool, or wrapped it in wording of its
+    /// own, would leave the caller unable to tell "already loaded" from
+    /// "rank mismatch".
+    #[test]
+    fn control_error_string_crosses_the_channel_verbatim() {
+        const LOADER_MESSAGE: &str = "LoRA adapter already loaded; call unload_lora_adapter first";
+        let (msg_tx, msg_rx) = mpsc::unbounded_channel::<WorkerMessage>();
+        let handle = std::thread::spawn(move || {
+            run_worker_loop_with_control(
+                msg_rx,
+                fake_generate(
+                    1,
+                    Arc::new(AtomicUsize::new(0)),
+                    Arc::new(AtomicUsize::new(0)),
+                ),
+                |_command| Err(LOADER_MESSAGE.to_string()),
+            );
+        });
+
+        let (reply, reply_rx) = oneshot::channel();
+        let permit = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("fresh semaphore");
+        msg_tx
+            .send(WorkerMessage::Control(ControlRequest {
+                command: AdapterCommand::Unload,
+                reply,
+                _control_permit: permit,
+            }))
+            .unwrap();
+
+        let outcome = reply_rx.blocking_recv().expect("control reply channel");
+        assert_eq!(outcome, Err(LOADER_MESSAGE.to_string()));
+
+        drop(msg_tx);
+        handle.join().unwrap();
+    }
+
+    /// A second adapter command, while the first is still in flight, is
+    /// refused rather than queued.
+    ///
+    /// The client here has no worker draining its queue, so the first
+    /// request stays in flight and keeps its permit, which is precisely the
+    /// state the refusal is about.
+    #[test]
+    fn second_in_flight_adapter_command_is_refused() {
+        let (client, _msg_rx) = test_client_and_jobs();
+
+        let first = client
+            .submit_adapter_command(AdapterCommand::Unload)
+            .expect("the first command should be admitted");
+
+        let second = client.submit_adapter_command(AdapterCommand::Unload);
+        match second {
+            Err(ApiError::ServiceUnavailable { ref message }) => {
+                assert!(
+                    message.contains("already in flight"),
+                    "the refusal should say why, got: {message}"
+                );
+            }
+            other => panic!("a second in-flight command must be refused, got {other:?}"),
+        }
+
+        // Generation admission is a different semaphore and is untouched by
+        // the control refusal: a stuck adapter command must not stop the
+        // model serving.
+        client
+            .submit(
+                vec![ChatMessage::user("hi")],
+                GenerateConfig::default(),
+                crate::serve::cancel_pair().1,
+            )
+            .expect("generation admission is independent of control admission");
+
+        // The permit is not released by dropping the caller's reply
+        // receiver: it lives in the `ControlRequest` still sitting in the
+        // queue, and is released when the worker finishes with it. Nothing
+        // here drains that queue, so there is no "and now it is admitted
+        // again" arm to assert -- the arm that exists is the one above.
+        drop(first);
     }
 
     #[test]
     fn queued_job_cancelled_before_dequeue_sends_exactly_one_cancelled_event() {
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let started = Arc::new(AtomicUsize::new(0));
         let ran_tokens = Arc::new(AtomicUsize::new(0));
 
@@ -2460,7 +2971,7 @@ mod tests {
         // receiver is dropped before the worker ever dequeues it. The
         // dequeue-time check must catch this independently (#832: "cancel
         // OR event_receiver_closed").
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let (tx, rx) = mpsc::unbounded_channel::<WorkerEvent>();
         drop(rx);
         let (_guard, cancel_rx) = crate::serve::cancel_pair();
@@ -2474,7 +2985,7 @@ mod tests {
             cancel: cancel_rx,
             _admission_permit: permit,
         };
-        job_tx.send(job).unwrap();
+        job_tx.send(WorkerMessage::Generate(job)).unwrap();
         drop(job_tx);
 
         let started = Arc::new(AtomicUsize::new(0));
@@ -2495,7 +3006,7 @@ mod tests {
 
     #[test]
     fn running_job_cancelled_midstream_stops_early_and_worker_survives() {
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let started = Arc::new(AtomicUsize::new(0));
         let ran_tokens = Arc::new(AtomicUsize::new(0));
 
@@ -2573,7 +3084,7 @@ mod tests {
 
     #[test]
     fn running_job_cancelled_during_prefill_like_phase_never_calls_on_token() {
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let entered_decode = Arc::new(AtomicBool::new(false));
 
         let (job1, mut rx1, guard1) = make_job();
@@ -2632,7 +3143,7 @@ mod tests {
 
     #[test]
     fn generation_failure_is_reported_as_failed_not_complete() {
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
 
         let (job1, mut rx1, _guard1) = make_job();
         job_tx.send(job1).unwrap();
@@ -2690,7 +3201,7 @@ mod tests {
 
     #[test]
     fn queue_closure_lets_the_worker_thread_exit_and_join() {
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let started = Arc::new(AtomicUsize::new(0));
         let ran_tokens = Arc::new(AtomicUsize::new(0));
         let started2 = started.clone();
@@ -2709,7 +3220,7 @@ mod tests {
 
     #[test]
     fn owner_shutdown_joins_cleanly_once_the_queue_closes() {
-        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let started = Arc::new(AtomicUsize::new(0));
         let ran_tokens = Arc::new(AtomicUsize::new(0));
         let started2 = started.clone();
@@ -2803,7 +3314,7 @@ mod tests {
 
     #[test]
     fn final_client_drop_closes_queue_before_owner_joins() {
-        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, mut job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let (queue_closed_tx, queue_closed_rx) = std::sync::mpsc::sync_channel(1);
         let (allow_exit_tx, allow_exit_rx) = std::sync::mpsc::sync_channel(1);
         let join_handle = std::thread::spawn(move || {
@@ -2860,7 +3371,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("the worker must reach its stuck-backend stand-in");
         let owner = test_owner(join_handle, Duration::from_millis(20));
-        let (job_tx, _job_rx) = mpsc::unbounded_channel::<WorkerJob>();
+        let (job_tx, _job_rx) = mpsc::unbounded_channel::<WorkerMessage>();
         let client = MetalWorkerClient::with_owner(
             job_tx,
             Arc::new(Semaphore::new(1)),

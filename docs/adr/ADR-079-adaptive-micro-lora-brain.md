@@ -1,6 +1,6 @@
 # ADR-079: Adaptive Micro-LoRA Brain — the Composed Train → Govern → Compose → Route → Consume Loop
 
-**Status**: Proposed
+**Status**: Proposed (amended 2026-09-10 — see Amendment 1)
 **Date**: 2026-07-09
 **Crate**: lattice-tune / lattice-inference / lattice-fann
 
@@ -159,3 +159,80 @@ synthesizing record; it references the seven above rather than re-opening any of
 
 When any Gn lands (most likely G1, surface-B GDN grads), record it as a status update / new row on
 this ADR so the traceability chain shows idea → composed-record → gap-closure, not a silent flip.
+
+## Amendment 1 (2026-09-10) — G2's re-entry trigger has fired; the closure contract, fixed before it is built
+
+**G2 has not landed. Its trigger has.** G2 was written to fire "if in-process closure becomes a
+requirement", and it now has: the adaptive-loop work item wires feedback through `update_router`
+inside the serving path, which is the host runtime G2 describes. This amendment records the trigger
+firing and fixes the contract, so the implementation and this ADR agree on what G2 means rather than
+discovering it afterwards. The S-row rider above asks for a status update rather than a silent flip,
+and this is it.
+
+### Source-verified surface (`origin/main @ 04c5d794ab`)
+
+- `update_router(gate_bytes: &[u8], events, replay, fisher, config) -> Result<RouterDelta>` —
+  `crates/tune/src/lora/router_update.rs:242`.
+- `RouterDelta.network_bytes: Vec<u8>` — `router_update.rs:141-147`. Its own doc comment is explicit
+  that this is "a complete network blob produced by `Network::to_bytes()`, not a parameter diff".
+- `AdapterRouter { gate: Network }`, with `new`, `route`, `input_size`, `output_size` —
+  `crates/inference/src/mixture.rs:95-208`. There is no `reload`, which is the gap as stated.
+
+### The closure does not invert the dependency direction, and that is why it is cheap
+
+`update_router` lives in `lattice-tune`; `AdapterRouter` lives in `lattice-inference`; inference does
+not depend on tune. That asymmetry is the real reason the boundary has been caller-owned, and it
+reads like an obstacle to closing it. It is not. `RouterDelta.network_bytes` is a FANN blob and
+`AdapterRouter`'s field is a fann `Network`, so a reload path needs only `Network::from_bytes` —
+already reachable from inference, which takes `lattice-fann` under `mixture`
+(`crates/inference/Cargo.toml:51`). The closure is `inference + fann`, and the leaf-crate rule holds
+unchanged.
+
+**So the contract is:** `AdapterRouter::reload(&mut self, gate_bytes: &[u8]) -> Result<(), _>`,
+accepting exactly the bytes `update_router` returns, in `lattice-inference` under `mixture`. The
+caller still owns persistence; what it no longer owns is the out-of-process round trip.
+
+### Dimension checking at reload is about blast radius, not about safety
+
+The obvious thing to specify here would be that `reload` must reject a mismatched gate because
+`route` would otherwise mis-select. **That is not true, and the reason it is not true is worth
+recording**, because it is the kind of claim an implementer would accept from an ADR without
+re-reading the routing body. `route` already validates both dimensions at use time and fails closed:
+a context vector that does not match the gate's input width returns `RouterError::InputSizeMismatch`
+(`mixture.rs:158-164`), and a gate narrower than the requested `k` returns
+`RouterError::GateTooNarrow` (`mixture.rs:171-178`, whose comment says the check exists so that a
+narrow gate "beats a panic inside `select_nth_unstable`"). A mismatched reload cannot produce a
+wrong adapter selection. There is no memory-safety or correctness hole to close.
+
+What a mismatched reload _does_ produce is a router that fails **every subsequent request** instead
+of failing the one call that caused it. `reload` is the only moment at which the caller can still
+choose to keep serving on the previous gate; after the swap, the old network is gone and each
+inbound route pays the error. So `reload` validates `num_inputs`/`num_outputs` against the live gate
+and returns an error **without mutating `self`** when they differ — the gate either swaps wholly or
+not at all. The requirement is that a bad refit costs one failed reload rather than an outage, and
+the no-partial-mutation clause is the part that makes that true.
+
+One behaviour is deliberately left as it is. A gate narrower than the adapter pool, with `k` small
+enough to stay inside `GateTooNarrow`, silently restricts routing to the first `num_outputs`
+adapters (`n = available.len().min(scores.len())`, `mixture.rs:171`). That is pre-existing — a
+caller can construct such a router today through `new` — and `reload`'s equal-dimension rule means a
+reload cannot introduce it. Widening the pool remains what it already is: a new `AdapterRouter`, not
+a reload.
+
+### What the loop-closure test must show
+
+G2 names the test as "route → collect feedback → refit → reload → route again". Stated as an
+assertion rather than a sequence: the second `route` returns a **different** selection than the
+first, for the same context vector and adapter pool, with the difference attributable to the
+feedback. A test that merely runs the five steps and asserts no error would pass against a `reload`
+that discards its argument, which is the failure this ADR's own follow-on discipline exists to
+prevent. The refit must be mutation-visible at the router, or the loop is not closed. The
+mismatch arm needs its own case: reload a wrong-width gate, assert the error, then assert `route`
+still succeeds on the original gate — that is what pins the no-partial-mutation clause.
+
+### Consequence for the earlier text
+
+The Consequences line reading "a host runtime wiring the adaptive loop knows it owns gate
+persistence/reload until G2 lands" is unchanged and still accurate: G2 has not landed. It stops
+being accurate the moment `reload` merges, and should be revised in that same change rather than
+left to decay.
