@@ -82,11 +82,13 @@ mod inner {
         layer_limit: Option<usize>,
     }
 
+    const FUSED_ATTENTION_SIMD_WIDTH: usize = 32;
+
     /// Validate model shape for Metal fused kernels and return the GQA group count.
     ///
-    /// Enforces structural requirements only — head_dim must be divisible by 4
-    /// (for float4 operations) and nonzero, kv_heads nonzero, and q_heads
-    /// divisible by kv_heads. The exact values are injected into the MSL source
+    /// Enforces the exact head_dim required by the kernel's one-SIMD-lane-per-float4
+    /// mapping, as well as nonzero and float4 divisibility checks, nonzero kv_heads,
+    /// and q_heads divisible by kv_heads. Values are injected into the MSL source
     /// at compile time via `msl_source_for`.
     fn validate_fused_kernel_shape(config: &QwenConfig) -> Result<usize, String> {
         if config.head_dim == 0 {
@@ -95,6 +97,13 @@ mod inner {
         if !config.head_dim.is_multiple_of(4) {
             return Err(format!(
                 "Metal fused attention requires head_dim divisible by 4 (for float4 ops); got {}",
+                config.head_dim
+            ));
+        }
+        if config.head_dim / 4 != FUSED_ATTENTION_SIMD_WIDTH {
+            let required_head_dim = 4 * FUSED_ATTENTION_SIMD_WIDTH;
+            return Err(format!(
+                "Metal fused attention supports head_dim={required_head_dim} only (one SIMD lane per float4, {FUSED_ATTENTION_SIMD_WIDTH} lanes); got {}",
                 config.head_dim
             ));
         }
@@ -835,6 +844,30 @@ mod inner {
         use crate::measurement::gpu_test_lock;
         use crate::weights::{QwenLayerWeights, Tensor1D, Tensor2D};
 
+        #[test]
+        fn validate_fused_kernel_shape_rejects_head_dim_other_than_128() {
+            let mut config = QwenConfig {
+                vocab_size: 8,
+                hidden_size: 32,
+                num_hidden_layers: 1,
+                num_attention_heads: 4,
+                num_key_value_heads: 2,
+                head_dim: 128,
+                intermediate_size: 48,
+                max_position_embeddings: 32,
+                rms_norm_eps: 1e-6,
+                rope_theta: 1_000_000.0,
+            };
+            assert_eq!(validate_fused_kernel_shape(&config), Ok(2));
+
+            for head_dim in [64, 256] {
+                config.head_dim = head_dim;
+                let err = validate_fused_kernel_shape(&config).unwrap_err();
+                assert!(err.contains("head_dim=128"), "{err}");
+                assert!(err.contains(&head_dim.to_string()), "{err}");
+            }
+        }
+
         /// ADR-066 D3.1 / ADR-080 C1 (PR #794): a capability-gated
         /// Metal test must report a distinct skip or fail closed when
         /// `LATTICE_METAL_TEST_ENFORCE=1` is set, never silently early-return `ok` —
@@ -1163,7 +1196,7 @@ kernel void rms_norm_pre_854_oracle(
                 num_hidden_layers: 1,
                 num_attention_heads: 4,
                 num_key_value_heads: 2,
-                head_dim: 8,
+                head_dim: 128,
                 intermediate_size: 48,
                 max_position_embeddings: 32,
                 rms_norm_eps: 1e-6,
