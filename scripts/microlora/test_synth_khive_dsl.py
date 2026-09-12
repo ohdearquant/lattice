@@ -99,6 +99,10 @@ class SplitAndSchemaTests(unittest.TestCase):
         self.assertEqual(
             splits, synth.split_verbs(dict(reversed(list(schemas.items()))))
         )
+        self.assertEqual(
+            {v for v, split in splits.items() if split == "valid"},
+            {"pack.v8", "pack.v4"},
+        )
 
     def test_composition_leakage_is_rejected_even_when_first_verb_is_train(self):
         item = synth.Example(
@@ -108,6 +112,9 @@ class SplitAndSchemaTests(unittest.TestCase):
             synth.add_split_guard(item, {"a": "train", "b": "test"})
         item.verbs = ["a", "a"]
         synth.add_split_guard(item, {"a": "train"})
+        item.verbs = []
+        with self.assertRaisesRegex(synth.CurationError, "Unknown verb"):
+            synth.add_split_guard(item, {"a": "train"})
 
     def test_dedup_and_three_completion_cap(self):
         pool = [
@@ -122,9 +129,35 @@ class SplitAndSchemaTests(unittest.TestCase):
         self.assertEqual(len(selected), 3)
         self.assertEqual(drops["completion_frequency_cap"], 7)
         self.assertEqual(drops["exact_duplicate"], 1)
+        selected, drops = synth.select_candidates(
+            {"kg": pool}, {"get": "train"}, per_pack=2
+        )
+        self.assertEqual(selected, pool[:2])
+        self.assertEqual(dict(drops), {})
 
     def test_schema_names_required_fields_types_and_null_are_checked(self):
         schemas = fixture_schemas()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "_verbs.json").write_text(
+                synth.compact({"total": 1, "verbs": [{"verb": "get", "pack": "kg"}]})
+            )
+            capture = root / "get.json"
+            capture.write_text(synth.compact(schemas["get"]))
+            self.assertEqual(synth.read_schemas(root)[0], {"get": schemas["get"]})
+            for changed in ({"required": "yes"}, {"type": 1}):
+                invalid = {
+                    **schemas["get"],
+                    "params": [{**schemas["get"]["params"][0], **changed}],
+                }
+                capture.write_text(synth.compact(invalid))
+                with (
+                    self.subTest(changed=changed),
+                    self.assertRaisesRegex(
+                        synth.CurationError, "Malformed parameter schema"
+                    ),
+                ):
+                    synth.read_schemas(root)
         for args in (
             {"q": synth.tagged("cache")},
             {"query": synth.tagged(None)},
@@ -165,12 +198,29 @@ class SplitAndSchemaTests(unittest.TestCase):
         self.assertFalse(synth.value_matches([1], "array of string"))
         self.assertFalse(synth.value_matches(True, "float"))
         self.assertFalse(synth.value_matches(float("inf"), "number"))
+        self.assertTrue(
+            synth.value_matches("12345678-1234-5678-9234-567812345678", "uuid")
+        )
+        self.assertTrue(synth.value_matches("1234abcd", "uuid"))
+        self.assertFalse(synth.value_matches("not-a-uuid", "uuid"))
+        self.assertFalse(synth.value_matches(12345678, "uuid"))
+        self.assertTrue(synth.value_matches([], "array"))
+        self.assertFalse(synth.value_matches({}, "array"))
+        for typename in ("bool", "boolean"):
+            self.assertTrue(synth.value_matches(False, typename))
+            self.assertFalse(synth.value_matches(0, typename))
+        self.assertTrue(synth.value_matches(1, "integer"))
+        self.assertFalse(synth.value_matches(1.5, "integer"))
+        with self.assertRaisesRegex(synth.CurationError, "Unimplemented schema type"):
+            synth.value_matches("value", "unrecognized")
 
     def test_registry_refusal_names_every_untemplated_verb(self):
         schemas = fixture_schemas()
         self.assertEqual(synth.untemplated_verbs(schemas), [])
         # Names outside every excluded family, so the refusal is about missing templates.
-        schemas["ledger.post"] = schema("ledger.post", "ledger", [("entry", "string", True)])
+        schemas["ledger.post"] = schema(
+            "ledger.post", "ledger", [("entry", "string", True)]
+        )
         schemas["ledger.void"] = schema("ledger.void", "ledger", [("id", "uuid", True)])
         self.assertNotIn("ledger.post", synth.EXCLUSIONS)
         with self.assertRaisesRegex(
@@ -186,6 +236,21 @@ class SplitAndSchemaTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(synth.CurationError, "complete schema"):
                 synth.read_schemas(root)
+            (root / "get.json").write_text(synth.compact(fixture_schemas()["get"]))
+            for total, entries in (
+                (2, [{"verb": "get", "pack": "kg"}]),
+                (2, [{"verb": "get", "pack": "kg"}] * 2),
+            ):
+                (root / "_verbs.json").write_text(
+                    synth.compact({"total": total, "verbs": entries})
+                )
+                with (
+                    self.subTest(total=total, entries=entries),
+                    self.assertRaisesRegex(
+                        synth.CurationError, "Registry count or duplicate"
+                    ),
+                ):
+                    synth.read_schemas(root)
 
     def test_output_refuses_tracked_and_nonignored_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -202,6 +267,12 @@ class SplitAndSchemaTests(unittest.TestCase):
                 synth.safe_output(root / ".khive" / "data"),
                 (root / ".khive" / "data").resolve(),
             )
+            out = root / ".khive" / "data"
+            out.mkdir(parents=True)
+            (out / "unrelated.txt").write_text("keep")
+            with self.assertRaisesRegex(synth.CurationError, "unrelated files"):
+                synth.safe_output(out)
+            self.assertEqual((out / "unrelated.txt").read_text(), "keep")
 
     def test_unverified_prev_ref_is_rejected(self):
         schemas = fixture_schemas()
@@ -214,6 +285,23 @@ class SplitAndSchemaTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(synth.CurationError, "Unverified previous"):
             synth.validate_ast(parsed, schemas)
+        schemas["comm.probe"] = schema(
+            "comm.probe", "comm", [("since_us", "integer", False)]
+        )
+        parsed["ops"] = [
+            synth.op_ast("comm.probe", {}),
+            synth.op_ast("comm.probe", {"since_us": synth.Prev("cursor_us")}),
+        ]
+        synth.validate_ast(parsed, schemas)
+        for path in ("id", "cursor", "cursor_us.id", "results"):
+            parsed["ops"][1] = synth.op_ast(
+                "comm.probe", {"since_us": synth.Prev(path)}
+            )
+            with (
+                self.subTest(path=path),
+                self.assertRaisesRegex(synth.CurationError, "Unverified previous"),
+            ):
+                synth.validate_ast(parsed, schemas)
 
     def test_trap_correction_is_unique_and_keeps_values(self):
         schemas = fixture_schemas()
@@ -234,6 +322,17 @@ class SplitAndSchemaTests(unittest.TestCase):
                     {"mode": "single", "ops": [synth.op_ast(verb, args)]}, schemas
                 )
                 self.assertIn(expected, fixed)
+                aliases = {
+                    "q": "query",
+                    "thread_id": "id",
+                    "slugs": "ids",
+                    "due": "at",
+                    "properties": "metadata",
+                }
+                self.assertEqual(
+                    fixed,
+                    synth.call(verb, {aliases.get(k, k): v for k, v in args.items()}),
+                )
         ambiguous = {
             "mode": "single",
             "ops": [synth.op_ast("memory.recall", {"q": "cache", "query": "other"})],
@@ -249,11 +348,13 @@ class ValidatorProtocolTests(unittest.TestCase):
             self.completion, [synth.op_ast("memory.recall", {"query": "cache"})]
         )
 
-    def invoke(self, records, code=0, completions=None):
+    def invoke(self, records, code=0, completions=None, allow_invalid=False):
         output = "".join(synth.compact(record) + "\n" for record in records)
         response = subprocess.CompletedProcess([], code, output, "")
         with patch.object(synth.subprocess, "run", return_value=response) as run:
-            result = self.validator.parse(completions or [self.completion])
+            result = self.validator.parse(
+                completions or [self.completion], allow_invalid
+            )
             self.assertEqual(
                 run.call_args.args[0], [str(Path(sys.executable).resolve())]
             )
@@ -263,10 +364,18 @@ class ValidatorProtocolTests(unittest.TestCase):
     def test_missing_validator(self):
         with self.assertRaisesRegex(synth.CurationError, "missing"):
             synth.Validator("/definitely-absent/khive-validator")
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "validator"
+            binary.write_text("not executable")
+            binary.chmod(0o600)
+            with self.assertRaisesRegex(synth.CurationError, "not executable"):
+                synth.Validator(binary)
 
     def test_no_output_fails_even_with_exit_zero(self):
         with self.assertRaisesRegex(synth.CurationError, "incomplete"):
             self.invoke([])
+        with self.assertRaisesRegex(synth.CurationError, "Validator exit 2:"):
+            self.invoke([self.record], code=2)
 
     def test_missing_marker_changed_completion_or_execution_fails(self):
         for changed in (
@@ -275,6 +384,7 @@ class ValidatorProtocolTests(unittest.TestCase):
             {"completion": self.completion + " "},
             {"completion_parsed_unchanged": False},
             {"parser_roundtrip_equal": False},
+            {"ast_json_roundtrip_equal": False},
             {"parser_source_sha256": None},
             {"line": 2},
         ):
@@ -287,9 +397,38 @@ class ValidatorProtocolTests(unittest.TestCase):
                 [{**self.record, "line": 2}, self.record],
                 completions=[self.completion] * 2,
             )
+        failure = {**self.record, "ok": False, "error": "invalid syntax"}
+        self.assertEqual(self.invoke([failure], code=1, allow_invalid=True), [failure])
+        for error in (None, 7, {}, []):
+            with (
+                self.subTest(error=error),
+                self.assertRaisesRegex(
+                    synth.CurationError, "Invalid validator failure record"
+                ),
+            ):
+                self.invoke([{**failure, "error": error}], code=1, allow_invalid=True)
 
     def test_wrong_ast_cannot_certify_a_synthetic_row(self):
         schemas = fixture_schemas()
+        generated = synth.make_single(
+            "memory.recall", 0, schemas, {"memory.recall": "train"}
+        )
+        self.assertEqual(
+            generated.prompt,
+            'Find up to 3 memories about "tokenizer regression tests".\nReturn only the request ops string.',
+        )
+        self.assertEqual(
+            generated.completion,
+            'memory.recall(query="tokenizer regression tests",limit=3)',
+        )
+        self.assertEqual(
+            generated.ops,
+            [
+                synth.op_ast(
+                    "memory.recall", {"query": "tokenizer regression tests", "limit": 3}
+                )
+            ],
+        )
         example = synth.Example(
             "Recall cache",
             self.completion,
@@ -373,6 +512,63 @@ class ValidatorProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(synth.CurationError, "Malformed real row"):
                 synth.merge_real(path, [], self.validator, fixture_schemas(), {})
 
+    def test_literal_rejection_without_external_validator(self):
+        RealParserTests.test_unrepresentable_single_backslash_literal_is_rejected(self)
+
+    def test_dataset_rollback_without_external_validator(self):
+        def parse(completions):
+            return [
+                parser_record(
+                    completion,
+                    [synth.op_ast("memory.recall", {"query": "cache"})],
+                    line=line,
+                )
+                for line, completion in enumerate(completions, 1)
+            ]
+
+        with patch.object(self.validator, "parse", side_effect=parse):
+            RealParserTests.test_failed_readback_preserves_previous_dataset(self)
+
+    def test_real_merge_filtering_without_external_validator(self):
+        token = "ghp_" + "A" * 36
+        operations = [
+            ("memory.recall", {"q": "cache"}),
+            ("memory.recall", {"q": token}),
+            ("memory.recall", {"q": "cache", "query": "other"}),
+            ("exec.run", {"cmd": "unsafe"}),
+            ("schedule.remind", {"content": "check", "at": "2027-01-01T00:00:00Z"}),
+            *[
+                ("memory.recall", {"query": query})
+                for query in ("cache", "storage", "index", "bad")
+            ],
+        ]
+        records = {
+            synth.call(verb, args): parser_record(
+                synth.call(verb, args), [synth.op_ast(verb, args)]
+            )
+            for verb, args in operations
+        }
+        completion = f'[get(id="{synth.fixture(0)["id"]}"),schedule.agenda()]'
+        records[completion] = parser_record(
+            completion,
+            [
+                synth.op_ast("get", {"id": synth.fixture(0)["id"]}),
+                synth.op_ast("schedule.agenda", {}),
+            ],
+            mode="parallel",
+        )
+
+        def parse(completions, allow_invalid=False):
+            return [
+                {**records[completion], "line": line}
+                for line, completion in enumerate(completions, 1)
+            ]
+
+        with patch.object(self.validator, "parse", side_effect=parse):
+            RealParserTests.test_real_merge_skips_unknown_ambiguous_and_partition_crossing_rows(
+                self
+            )
+
 
 class RealParserTests(unittest.TestCase):
     def setUp(self):
@@ -389,6 +585,11 @@ class RealParserTests(unittest.TestCase):
             result["ops"], [synth.op_ast("memory.recall", {"query": text})]
         )
         self.assertEqual(result["completion"], completion)
+        self.assertEqual(result["canonical_format"], "json_request")
+        self.assertEqual(
+            json.loads(result["canonical_request"]),
+            {"tool": "memory.recall", "args": {"query": text}},
+        )
 
     def test_leading_reserved_literal_prefixes_and_nested_values(self):
         values = [
@@ -412,9 +613,32 @@ class RealParserTests(unittest.TestCase):
                     result["ops"],
                     [synth.op_ast("create", {"properties": {"value": value}})],
                 )
+                for marker in (
+                    "ok",
+                    "completion_parsed_unchanged",
+                    "ast_json_roundtrip_equal",
+                    "parser_roundtrip_equal",
+                ):
+                    self.assertIs(result[marker], True)
+                self.assertIs(result["executed"], False)
+                self.assertEqual(result["parser"], synth.PARSER)
+                self.assertEqual(
+                    result["parser_source_sha256"], self.validator.source_hash
+                )
+                self.assertEqual(result["line"], values.index(value) + 1)
+                self.assertEqual(
+                    result["completion"],
+                    synth.call("create", {"properties": {"value": value}}),
+                )
 
     def test_unrepresentable_single_backslash_literal_is_rejected(self):
-        for value in (r"\$prev.id", [r"\$prev"], {"nested": r"\$prev[0]"}):
+        for value in (
+            r"\$prev.id",
+            [r"\$prev"],
+            {"nested": r"\$prev[0]"},
+            r"\$prev[1]",
+            {"nested": [r"\$prev[1].id"]},
+        ):
             with (
                 self.subTest(value=value),
                 self.assertRaisesRegex(synth.CurationError, "cannot be preserved"),
@@ -425,6 +649,7 @@ class RealParserTests(unittest.TestCase):
         schemas = fixture_schemas()
         splits = synth.split_verbs(schemas)
         uid = synth.fixture(0)["id"]
+        token = "ghp_" + "A" * 36
         rows = [
             {"ops": 'memory.recall(q="cache")', "ok": False, "error": "unknown q"},
             {"ops": 'memory.recall(query="storage")', "ok": True, "error": None},
@@ -437,6 +662,12 @@ class RealParserTests(unittest.TestCase):
                 "corrected_ops": 'schedule.remind(content="check",at="2027-01-01T00:00:00Z")',
             },
             {"ops": f'[get(id="{uid}"),schedule.agenda()]', "ok": True},
+            {"ops": 'memory.recall(q="cache")', "ok": False, "error": token},
+            {
+                "ops": synth.call("memory.recall", {"q": token}),
+                "ok": False,
+                "corrected_ops": 'memory.recall(query="cache")',
+            },
         ]
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "real.jsonl"
@@ -445,7 +676,11 @@ class RealParserTests(unittest.TestCase):
                 path, [], self.validator, schemas, splits
             )
         self.assertEqual(len(accepted), 2)
-        self.assertEqual(sum(skips.values()), 5)
+        self.assertEqual(sum(skips.values()), 7)
+        self.assertEqual(skips["screened_secret_pattern"], 2)
+        self.assertTrue(
+            all(token not in item.prompt + item.completion for item in accepted)
+        )
         self.assertEqual(accepted[0].completion, 'memory.recall(query="cache")')
         synth.validate_examples(accepted, self.validator, schemas, splits)
 
@@ -529,7 +764,7 @@ class RealParserTests(unittest.TestCase):
 
     def test_failed_readback_preserves_previous_dataset(self):
         schemas = fixture_schemas()
-        splits = {"memory.recall": "train"}
+        splits = synth.split_verbs(schemas)
         completion = 'memory.recall(query="cache")'
         example = synth.Example(
             "Recall cache",
@@ -558,6 +793,33 @@ class RealParserTests(unittest.TestCase):
                     out, [example], self.validator, schemas, {}, splits, {}, {}, None
                 )
             self.assertEqual((out / "CURATION.md").read_text(), "previous evidence")
+            rename = Path.rename
+            calls = []
+
+            def fail_stage(source, destination):
+                calls.append((source.name, Path(destination).name))
+                if source.name == "dataset" and source != out.resolve():
+                    raise OSError("dataset replacement refused")
+                return rename(source, destination)
+
+            with (
+                patch.object(Path, "rename", new=fail_stage),
+                self.assertRaisesRegex(OSError, "dataset replacement refused"),
+            ):
+                synth.write_dataset(
+                    out, [example], self.validator, schemas, {}, splits, {}, {}, None
+                )
+            self.assertEqual(
+                calls,
+                [
+                    ("dataset", "previous"),
+                    ("dataset", "dataset"),
+                    ("previous", "dataset"),
+                ],
+            )
+            self.assertTrue(out.is_dir(), "Previous dataset directory was not restored")
+            self.assertEqual((out / "CURATION.md").read_text(), "previous evidence")
+            self.assertEqual({p.name for p in out.iterdir()}, {"CURATION.md"})
 
 
 if __name__ == "__main__":
