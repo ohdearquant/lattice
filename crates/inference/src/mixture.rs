@@ -25,9 +25,24 @@ pub type AdapterId = String;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RouterError {
-    /// The fann network forward pass failed.
+    /// The fann network parsing or forward pass failed.
     #[error("gate network error: {0}")]
     Gate(#[from] FannError),
+
+    /// The replacement gate dimensions differ from the live gate.
+    #[error(
+        "replacement gate dimensions {got_inputs} -> {got_outputs} do not match live gate {expected_inputs} -> {expected_outputs}"
+    )]
+    GateDimensionMismatch {
+        /// Live gate input width.
+        expected_inputs: usize,
+        /// Live gate output width.
+        expected_outputs: usize,
+        /// Replacement gate input width.
+        got_inputs: usize,
+        /// Replacement gate output width.
+        got_outputs: usize,
+    },
 
     /// The requested `k` exceeds the number of available adapters.
     #[error("k={k} exceeds available adapter count {available}")]
@@ -105,6 +120,29 @@ impl AdapterRouter {
     /// expected pool size.
     pub fn new(gate: Network) -> Self {
         Self { gate }
+    }
+
+    /// Replace the gate from a complete [`Network::to_bytes`] blob.
+    ///
+    /// Parsing and both dimensions must validate before any mutation: a failed
+    /// reload leaves the live gate intact so a bad refit fails once, rather than
+    /// disrupting subsequent requests.
+    pub fn reload(&mut self, gate_bytes: &[u8]) -> Result<(), RouterError> {
+        let gate = Network::from_bytes(gate_bytes)?;
+        let expected_inputs = self.gate.num_inputs();
+        let expected_outputs = self.gate.num_outputs();
+        let got_inputs = gate.num_inputs();
+        let got_outputs = gate.num_outputs();
+        if got_inputs != expected_inputs || got_outputs != expected_outputs {
+            return Err(RouterError::GateDimensionMismatch {
+                expected_inputs,
+                expected_outputs,
+                got_inputs,
+                got_outputs,
+            });
+        }
+        self.gate = gate;
+        Ok(())
     }
 
     /// Select the top-`k` adapters for the given context and assign each
@@ -219,6 +257,63 @@ mod tests {
             .build()
             .unwrap();
         AdapterRouter::new(net)
+    }
+
+    fn fixed_gate(inputs: usize, outputs: usize, preferred: usize) -> Network {
+        let mut layer = lattice_fann::Layer::zeros(inputs, outputs, Activation::Linear).unwrap();
+        layer.biases_mut()[preferred] = 1.0;
+        Network::new(vec![layer]).unwrap()
+    }
+
+    #[test]
+    fn reload_changes_selection() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let pool = vec!["first".into(), "second".into()];
+        let context = [1.0, 0.5];
+        let before = router.route(&context, &pool, 1).unwrap();
+        assert_eq!(before, vec![(pool[0].clone(), 1.0)]);
+        router.reload(&fixed_gate(2, 2, 1).to_bytes()).unwrap();
+        let after = router.route(&context, &pool, 1).unwrap();
+        assert_ne!(before, after, "reload must replace the live gate");
+        assert_eq!(after, vec![(pool[1].clone(), 1.0)]);
+    }
+
+    #[test]
+    fn reload_wrong_dimensions_preserves_selection() {
+        for (inputs, outputs) in [(3, 2), (2, 3), (3, 3)] {
+            let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+            let pool = vec!["first".into(), "second".into()];
+            let context = [1.0, 0.5];
+            let before = router.route(&context, &pool, 1).unwrap();
+            let error = router
+                .reload(&fixed_gate(inputs, outputs, 1).to_bytes())
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                RouterError::GateDimensionMismatch {
+                    expected_inputs: 2,
+                    expected_outputs: 2,
+                    got_inputs,
+                    got_outputs,
+                } if got_inputs == inputs && got_outputs == outputs
+            ));
+            assert_eq!(router.route(&context, &pool, 1).ok(), Some(before));
+            assert_eq!(router.input_size(), 2);
+            assert_eq!(router.output_size(), 2);
+        }
+    }
+
+    #[test]
+    fn reload_malformed_bytes_preserves_selection() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let pool = vec!["first".into(), "second".into()];
+        let context = [1.0, 0.5];
+        let before = router.route(&context, &pool, 1).unwrap();
+        assert!(matches!(
+            router.reload(b"invalid"),
+            Err(RouterError::Gate(_))
+        ));
+        assert_eq!(router.route(&context, &pool, 1).unwrap(), before);
     }
 
     #[test]

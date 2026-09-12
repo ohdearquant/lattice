@@ -91,6 +91,11 @@ name = "gdn_lora_wiring"
 path = "tests/gdn_lora_wiring.rs"
 required-features = ["train-backward"]
 
+[[test]]
+name = "router_loop_closure"
+path = "tests/router_loop_closure.rs"
+required-features = ["mixture", "inference-hook", "serde"]
+
 [dev-dependencies]
 tempfile.workspace = true
 proptest.workspace = true
