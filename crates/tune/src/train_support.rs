@@ -28,6 +28,7 @@ pub struct Sample {
 pub fn load_jsonl(
     path: &Path,
     tokenizer: &dyn Tokenizer,
+    eos_token_id: u32,
     seq_len: usize,
     max_samples: usize,
 ) -> Result<Vec<Sample>, Box<dyn std::error::Error>> {
@@ -49,22 +50,21 @@ pub fn load_jsonl(
         if prompt.is_empty() || completion.is_empty() {
             continue;
         }
-        let mut full = prompt.clone();
-        full.push_str(&completion);
         let prompt_tok = tokenizer.tokenize(&prompt);
-        let full_tok = tokenizer.tokenize(&full);
-        let prompt_ids: Vec<u32> = prompt_tok.input_ids[..prompt_tok.real_length].to_vec();
-        let full_ids: Vec<u32> = full_tok.input_ids[..full_tok.real_length].to_vec();
-        let total = full_ids.len();
+        let completion_tok = tokenizer.tokenize(&completion);
+        let mut tokens = prompt_tok.input_ids[..prompt_tok.real_length].to_vec();
+        let completion_start = tokens.len();
+        tokens.extend_from_slice(&completion_tok.input_ids[..completion_tok.real_length]);
+        tokens.push(eos_token_id);
+        let total = tokens.len();
         if total < 2 || total > seq_len {
             continue;
         }
-        let completion_start = prompt_ids.len();
-        if completion_start == 0 || completion_start >= total {
+        if completion_start == 0 || completion_tok.real_length == 0 {
             continue;
         }
         out.push(Sample {
-            tokens: full_ids,
+            tokens,
             completion_start,
         });
     }
@@ -168,6 +168,85 @@ pub fn verify_tbv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EOS: u32 = 31;
+
+    fn boundary_tokenizer() -> Box<dyn Tokenizer> {
+        lattice_inference::tokenizer::tokenizer_from_json_str(
+            r#"{
+                "model": {
+                    "type": "BPE",
+                    "vocab": {
+                        ".": 0, "m": 1, "e": 2, "o": 3, "r": 4, "y": 5,
+                        "Ġ": 6, "p": 7, "s": 8, "f": 9, "d": 10, "b": 11,
+                        "a": 12, "c": 13, "k": 14, "(": 15, "x": 16, ")": 17,
+                        ".m": 18, ".me": 19, ".mem": 20, ".memo": 21,
+                        ".memor": 22, ".memory": 23, "<eos>": 31
+                    },
+                    "merges": [". m", ".m e", ".me m", ".mem o", ".memo r", ".memor y"]
+                }
+            }"#,
+            128,
+        )
+        .unwrap()
+    }
+
+    fn jsonl_row(prompt: &str, completion: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let row = serde_json::json!({"prompt": prompt, "completion": completion});
+        std::fs::write(file.path(), row.to_string()).unwrap();
+        file
+    }
+
+    #[test]
+    fn load_jsonl_preserves_completion_boundary() {
+        let tokenizer = boundary_tokenizer();
+        let prompt = "... ops.";
+        let completion = "memory.feedback(x)";
+        let prompt_tok = tokenizer.tokenize(prompt);
+        let completion_tok = tokenizer.tokenize(completion);
+        let joint = tokenizer.tokenize(&format!("{prompt}{completion}"));
+        assert!(joint.input_ids[..joint.real_length].contains(&23));
+        assert_ne!(
+            &joint.input_ids[..prompt_tok.real_length],
+            &prompt_tok.input_ids[..prompt_tok.real_length]
+        );
+        let file = jsonl_row(prompt, completion);
+        let samples = load_jsonl(file.path(), tokenizer.as_ref(), EOS, 128, 1).unwrap();
+        assert_eq!(samples.len(), 1);
+        let sample = &samples[0];
+        let mut expected = completion_tok.input_ids[..completion_tok.real_length].to_vec();
+        expected.push(EOS);
+        assert_eq!(&sample.tokens[sample.completion_start..], expected);
+        assert_eq!(sample.completion_start, prompt_tok.real_length);
+        assert_eq!(
+            &sample.tokens[..sample.completion_start],
+            &prompt_tok.input_ids[..prompt_tok.real_length]
+        );
+    }
+
+    #[test]
+    fn load_jsonl_appends_eos() {
+        let tokenizer = boundary_tokenizer();
+        let file = jsonl_row("ops", "memory");
+        let samples = load_jsonl(file.path(), tokenizer.as_ref(), EOS, 128, 1).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].tokens.last(), Some(&EOS));
+        assert!(samples[0].completion_start < samples[0].tokens.len() - 1);
+    }
+
+    #[test]
+    fn load_jsonl_counts_eos_in_length_limit() {
+        let tokenizer = boundary_tokenizer();
+        let file = jsonl_row("ops", "memory");
+        let seq_len =
+            tokenizer.tokenize("ops").real_length + tokenizer.tokenize("memory").real_length;
+        let skipped = load_jsonl(file.path(), tokenizer.as_ref(), EOS, seq_len, 1).unwrap();
+        assert!(skipped.is_empty());
+        let kept = load_jsonl(file.path(), tokenizer.as_ref(), EOS, seq_len + 1, 1).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].tokens.len(), seq_len + 1);
+    }
 
     #[test]
     fn arg_view_first_match_wins() {

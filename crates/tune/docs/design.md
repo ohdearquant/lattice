@@ -232,15 +232,14 @@ defaults differ.
 ### Shared JSONL samples
 
 The loader accepts one JSON object per nonempty line with string `prompt` and
-`completion` fields. It concatenates them, tokenizes the prompt and full text
-separately, and records the number of prompt tokens as `completion_start`:
-
-```text
-Sample {
-  tokens: tokenize(prompt + completion),
-  completion_start: tokenize(prompt).real_length,
-}
-```
+`completion` fields. It tokenizes each field separately, taking only
+`input_ids[..real_length]`, then constructs `tokens = prompt_ids ++ completion_ids
+++ [eos_token_id]` with the model's stop ID supplied by the caller and
+`completion_start = prompt_ids.len()`. Separate tokenization preserves the
+generation-time prompt boundary: a prompt ending in `ops.` followed by
+`memory.feedback(x)` must not merge into `.memory` and leave the completion's
+first token outside the loss mask. Appending EOS teaches the completion to stop;
+the length checked against `--seq-len` includes both fields and this EOS token.
 
 Rows with an empty or missing field, fewer than two full tokens, a full token
 length above `--seq-len`, an empty tokenized prompt, or no completion tokens
