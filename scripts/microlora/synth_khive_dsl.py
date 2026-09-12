@@ -1442,6 +1442,7 @@ def curation_report(
         "",
         "## Validation",
         "",
+        "Parameter validation covers captured name, required, and type fields; it does not check bounds, enumerations, or patterns carried only as description prose, or the result types behind previous-result references, which are admitted by the reviewed allow-list.",
         f"Validator binary SHA-256: `{validator.binary_hash}`.",
         f"Parser marker: `{PARSER}`; source SHA-256: `{validator.source_hash}`.",
         'The validator consumes JSONL `{"completion":"..."}` on stdin and emits one ordered JSONL result per input.',

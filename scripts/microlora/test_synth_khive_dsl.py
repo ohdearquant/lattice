@@ -83,6 +83,24 @@ def parser_record(completion, ops, mode="single", line=1):
 
 
 class SplitAndSchemaTests(unittest.TestCase):
+    def test_report_states_parameter_validation_limits(self):
+        from types import SimpleNamespace
+
+        schemas = fixture_schemas()
+        report = synth.curation_report(
+            [], schemas, {}, synth.split_verbs(schemas),
+            SimpleNamespace(binary_hash="a" * 64, source_hash="b" * 64),
+            {}, {}, None,
+        )
+        validation = report.split("## Validation\n", 1)[1].split("\n## ", 1)[0]
+        self.assertIn(
+            "Parameter validation covers captured name, required, and type fields; "
+            "it does not check bounds, enumerations, or patterns carried only as "
+            "description prose, or the result types behind previous-result references, "
+            "which are admitted by the reviewed allow-list.",
+            validation,
+        )
+
     def test_stratified_assignment_is_stable_and_schedule_is_entirely_test(self):
         schemas = {f"pack.v{i}": schema(f"pack.v{i}", "pack") for i in range(20)}
         schemas.update(

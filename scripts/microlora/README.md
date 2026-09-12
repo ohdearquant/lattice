@@ -110,6 +110,10 @@ It never dispatches operations. The generator checks registered verbs, required
 parameters, parameter types, intended AST equality, and every file after readback.
 These checks establish syntax and the stated schema contracts; they do not prove
 record existence, authorization, or successful execution against a database.
+Parameter validation covers captured name, required, and type fields; it does not
+check bounds, enumerations, or patterns carried only as description prose, or the
+result types behind previous-result references, which are admitted by the reviewed
+allow-list.
 
 Output includes the three JSONL splits, matching `.provenance.jsonl` sidecars, and
 `CURATION.md`. It must be local storage outside tracked paths; repository locations
@@ -122,8 +126,15 @@ listed exclusion stops generation before any row is written, and the refusal nam
 every such verb. The report lists actual small-pack proportions, excluded verbs
 with their reasons, template counts, and validation limits. `check_split_integrity.py`
 checks exact prompt and completion overlap and prompt-length balance between two
-split files; it does not re-derive the verb partition, so a same-verb row in two
-splits passes it.
+split files. Opt in with `--verb-partition` to also reject completion verbs shared
+by both splits (exit 4), with a train-against-itself positive control. Calls inside
+double-quoted literals are ignored; this lexical check does not inspect embedded
+scheduled actions. Without the flag, a same-verb row in two splits still passes.
+
+```sh
+uv run --no-project python3 scripts/microlora/check_split_integrity.py \
+  --dir "$DATA_DIR/khive-dsl" --verb-partition
+```
 
 To include recorded calls, add `--merge-real "$REAL_JSONL"`. Each input row must
 contain string `ops`, boolean `ok`, and optionally `error` and `corrected_ops`.
