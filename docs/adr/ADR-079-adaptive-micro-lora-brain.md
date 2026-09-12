@@ -152,8 +152,7 @@ synthesizing record; it references the seven above rather than re-opening any of
   a rotation-aware trainer (ADR-054) would slot into the TRAIN stage without changing GOVERN/COMPOSE/
   ROUTE/CONSUME, since composition and routing operate on adapter blobs regardless of the basis they
   were trained in.
-- G2's caller-owned loop-closure boundary is documented, not hidden: a host runtime wiring the
-  adaptive loop knows it owns gate persistence/reload until G2 lands.
+- Gate persistence stays caller-owned; `AdapterRouter::reload` closes the adaptive loop in-process.
 
 ## S-row rider
 
@@ -161,6 +160,8 @@ When any Gn lands (most likely G1, surface-B GDN grads), record it as a status u
 this ADR so the traceability chain shows idea → composed-record → gap-closure, not a silent flip.
 
 ## Amendment 1 (2026-09-10) — G2's re-entry trigger has fired; the closure contract, fixed before it is built
+
+**2026-09-12 — G2 landed:** atomic `AdapterRouter::reload` and route → feedback → refit → reload → route regression tests close the in-process loop.
 
 **G2 has not landed. Its trigger has.** G2 was written to fire "if in-process closure becomes a
 requirement", and it now has: the adaptive-loop work item wires feedback through `update_router`
