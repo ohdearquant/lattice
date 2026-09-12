@@ -161,16 +161,20 @@ the final prompt-plus-completion tokens with the target model before training.
 
 `w6_build_sets.py --source TRAIN --schema-dir SCHEMAS` verifies the pinned capture,
 then constructs seeded, within-verb memory and task splits in `w6-input/`.
-`w6_score.py --self-test --validator VALIDATOR` runs gold, wrong-parameter,
+`w6_score.py --self-test --validator VALIDATOR --out SCORES --generations OUTPUT_DIR` runs gold, wrong-parameter,
 wrong-family, and prose controls before scoring any generated output. Both run
 with `uv run --no-project python3`. Inputs, adapters, generations, and logs are
 local artifacts and must not be committed.
 
 Under the repository's machine-lock policy, run `w6_phase.sh` once per phase:
-`train-M`, `train-G`, `gen-base`, `gen-M`, `gen-G`, `route`. It requires
+`train-M`, `train-G`, `gen-base`, `gen-M`, `gen-G`, `route`. Supplementary `gen-S1`
+uses the base model with `<think>\n\n</think>\n\n` appended to each prompt. It requires
 `CARGO_TARGET_DIR` and the four release trainer/generator/router binaries, writes
 full output and start/end conditions into `w6-out/`, and checks duplicate-process
 outputs before accepting selection-based arms. Preserve `w6-out/` across any
 synchronization that deletes destination files. Run `w6_score.py` with
-`--generations OUTPUT_DIR` after all phases. See the prompt-router example's
+`--validator VALIDATOR --out SCORES --generations OUTPUT_DIR` after all phases.
+Add `--supplementary-s1` to score S1 under both first-line and first-non-blank-line
+rules separately from the routing decision. All three paths are explicit, including
+for `--self-test`. See the prompt-router example's
 measurement document for the fixed decision rule and interpretation.

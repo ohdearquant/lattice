@@ -314,15 +314,60 @@ def score_generations(gold, canonical_gold, args):
     print("\n".join(lines))
 
 
+def score_supplementary(gold, args):
+    """Score the closed-thinking base control outside the routing decision."""
+    rows = load(args.generations / "gen-S1.jsonl")
+    if len(rows) != len(gold):
+        raise ValueError("expected 80 supplementary generations")
+    for row, target in zip(rows, gold):
+        if any(row[k] != target[k] for k in ("idx", "family", "prompt")):
+            raise ValueError("supplementary generation identity mismatch")
+        if row.get("generation_prompt") != target["prompt"] + "<think>\n\n</think>\n\n":
+            raise ValueError("supplementary prompt suffix differs")
+    duplicates = load(args.generations / "duplicates-S1.jsonl")
+    if [row["idx"] for row in duplicates] != [0, 1, 40, 41] or any(
+        any(
+            row[k] != rows[row["idx"]][k]
+            for k in ("prompt", "family", "output", "generation_prompt")
+        )
+        for row in duplicates
+    ):
+        raise ValueError("supplementary duplicate outputs differ")
+    summary = {
+        "n": len(rows),
+        "reopened_think": sum("<think>" in row["output"] for row in rows),
+    }
+    for rule in ("first-line", "first-non-blank-line"):
+        pairs = []
+        for row in rows:
+            lines = row["output"].split("\n")
+            completion = (
+                lines[0].strip()
+                if rule == "first-line"
+                else next((line.strip() for line in lines if line.strip()), "")
+            )
+            pairs.append(
+                dict(row, completion=completion, newline_emitted="\n" in row["output"])
+            )
+        scores = validate(pairs, args, "S1-" + rule)
+        summary[rule] = {
+            "parser_ok": sum(row["parser_ok"] for row in scores),
+            "callable": sum(row["callable_on_family"] for row in scores),
+        }
+    (args.out / "supplementary-S1.json").write_text(
+        json.dumps(summary, indent=2) + "\n"
+    )
+    print(json.dumps(summary, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=Path("w6-input"))
-    parser.add_argument("--out", type=Path, default=Path(".khive/leg"))
-    parser.add_argument(
-        "--validator", type=Path, default=Path(".khive/leg/khive-dsl-validator")
-    )
-    parser.add_argument("--generations", type=Path, default=Path(".khive/leg/w6-out"))
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--validator", type=Path, required=True)
+    parser.add_argument("--generations", type=Path, required=True)
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--supplementary-s1", action="store_true")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     args.schema_dir, args.manifest = (
@@ -351,7 +396,9 @@ def main():
     ):
         raise ValueError("expected 80 uniquely indexed, balanced gold rows")
     canonical_gold = controls(gold, args)
-    if not args.self_test:
+    if args.supplementary_s1 and not args.self_test:
+        score_supplementary(gold, args)
+    elif not args.self_test:
         score_generations(gold, canonical_gold, args)
 
 

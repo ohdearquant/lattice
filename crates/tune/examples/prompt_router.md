@@ -99,6 +99,10 @@ comparison. No response quality was measured, and these results support no routi
 
 ### Response quality under routing
 
+Run 2 uses the corrected loader from #1546: prompt and completion tokenize
+separately, and the model EOS token is appended. The split, training flags,
+and scoring rule remain fixed.
+
 The fixed construction uses only the training split of a captured request corpus
 (SHA-256 prefix `6ff089c0e380213e`, 2,806 single-line completions). Its separate
 validation/test splits hold out entire verbs and answer a different generalization
@@ -131,75 +135,55 @@ the prompt's family. Exact match compares canonical requests. All 100 schema JSO
 files, including underscore files, contribute to capture `625b8392f752d63d`
 (98 verbs). The parser source SHA-256 is
 `62992e89258640e2c76752961eda1af42bb0cc097fb713341182b3e9d2d8a915`.
-The control command is `uv run --no-project python3 scripts/microlora/w6_score.py
---self-test`, after preparing the input directory and validator. All controls were
-completed before generation. Family acceptance requires a nonempty set of qualified
-calls outside double-quoted literals, all belonging to the prompt's family.
 
-| Control                            | Expected                                                            | Observed                                                        |
-| ---------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------- |
-| C0 scorer self-test                | PASS, FAIL, REFUSED reachable; capture `625b8392f752d63d`, 98 verbs | Matched                                                         |
-| C1 gold callable-on-family         | 80/80                                                               | 80/80                                                           |
-| C2 wrong first parameter NOT PASS  | 80/80                                                               | 80/80; all parse successfully and fail argument-name validation |
-| C3 wrong family rejected           | 80/80                                                               | 80/80                                                           |
-| C4 prefixed prose parser rejection | 80/80                                                               | 80/80                                                           |
+The control command is `uv run --no-project python3 scripts/microlora/w6_score.py --self-test --input INPUT_DIR --out SCORE_DIR --validator VALIDATOR --generations OUTPUT_DIR`. Controls completed before generation. First-line extraction is `output.split("\n", 1)[0].strip()` and records whether any newline was emitted. Family acceptance requires a nonempty set of qualified calls outside double-quoted literals, all in the prompt's family. C2's 80 mutated completions all parse and are rejected by argument validation.
 
-Base has no adapter. Single-M applies the memory adapter to every prompt;
-single-G applies the task adapter to every prompt. Routed follows the gate,
-oracle follows the true family, and random uses Python `Random(20260912).choice`
-over M/G in held-out input order.
+Base has no adapter. Single-M applies the memory adapter to all prompts; single-G applies the task adapter to all prompts. Routed follows the gate, oracle follows the true family, and random uses Python `Random(20260912).choice` over M/G in held-out order. Selection arms reuse deterministic M/G outputs.
 
-| Arm      | Callable overall | Callable memory | Callable gtd  | Exact overall | Exact memory | Exact gtd     |
-| -------- | ---------------- | --------------- | ------------- | ------------- | ------------ | ------------- |
-| base     | 0/80 (0.0%)      | 0/40 (0.0%)     | 0/40 (0.0%)   | 0/80 (0.0%)   | 0/40 (0.0%)  | 0/40 (0.0%)   |
-| single-M | 8/80 (10.0%)     | 8/40 (20.0%)    | 0/40 (0.0%)   | 8/80 (10.0%)  | 8/40 (20.0%) | 0/40 (0.0%)   |
-| single-G | 20/80 (25.0%)    | 0/40 (0.0%)     | 20/40 (50.0%) | 17/80 (21.2%) | 0/40 (0.0%)  | 17/40 (42.5%) |
-| routed   | 28/80 (35.0%)    | 8/40 (20.0%)    | 20/40 (50.0%) | 25/80 (31.2%) | 8/40 (20.0%) | 17/40 (42.5%) |
-| oracle   | 28/80 (35.0%)    | 8/40 (20.0%)    | 20/40 (50.0%) | 25/80 (31.2%) | 8/40 (20.0%) | 17/40 (42.5%) |
-| random   | 12/80 (15.0%)    | 5/40 (12.5%)    | 7/40 (17.5%)  | 11/80 (13.8%) | 5/40 (12.5%) | 6/40 (15.0%)  |
+| Control                            | Expected                                                            | Observed                                            |
+| ---------------------------------- | ------------------------------------------------------------------- | --------------------------------------------------- |
+| C0 scorer self-test                | PASS, FAIL, REFUSED reachable; capture `625b8392f752d63d`, 98 verbs | Matched                                             |
+| C1 gold callable-on-family         | 80/80                                                               | 80/80                                               |
+| C2 wrong first parameter NOT PASS  | 80/80                                                               | 80/80; all parse, all fail argument-name validation |
+| C3 wrong family rejected           | 80/80                                                               | 80/80                                               |
+| C4 prefixed prose parser rejection | 80/80                                                               | 80/80                                               |
 
-Routing accuracy is 80/80; shuffled-label accuracy is 47/80, within its
-predefined chance interval. All 12 duplicate outputs match byte-for-byte.
-Newline presence is retained per output in the scoring artifacts.
-Under the fixed rule, routing is **USEFUL**: it meets the overall best-single
-minus-five-points bound and strictly exceeds base on each family.
+| arm      | callable overall | memory        | gtd            | exact overall | memory        | gtd           |
+| -------- | ---------------- | ------------- | -------------- | ------------- | ------------- | ------------- |
+| base     | 0/80 (0.0%)      | 0/40 (0.0%)   | 0/40 (0.0%)    | 0/80 (0.0%)   | 0/40 (0.0%)   | 0/40 (0.0%)   |
+| single-M | 39/80 (48.8%)    | 39/40 (97.5%) | 0/40 (0.0%)    | 39/80 (48.8%) | 39/40 (97.5%) | 0/40 (0.0%)   |
+| single-G | 40/80 (50.0%)    | 0/40 (0.0%)   | 40/40 (100.0%) | 38/80 (47.5%) | 0/40 (0.0%)   | 38/40 (95.0%) |
+| routed   | 79/80 (98.8%)    | 39/40 (97.5%) | 40/40 (100.0%) | 77/80 (96.2%) | 39/40 (97.5%) | 38/40 (95.0%) |
+| oracle   | 79/80 (98.8%)    | 39/40 (97.5%) | 40/40 (100.0%) | 77/80 (96.2%) | 39/40 (97.5%) | 38/40 (95.0%) |
+| random   | 42/80 (52.5%)    | 26/40 (65.0%) | 16/40 (40.0%)  | 41/80 (51.2%) | 26/40 (65.0%) | 15/40 (37.5%) |
 
-Memory train NLL: 1.7006 → 0.0077; held-out NLL: 1.2385 → 0.0025.
-Task train NLL: 1.4251 → 0.0036; held-out NLL: 1.7972 → 0.0057.
-Both clear the fixed 50% held-out NLL-reduction threshold.
+Routing accuracy is 80/80; shuffled-label accuracy is 47/80, within its predefined chance interval. All 12 primary-arm duplicate outputs match byte-for-byte.
 
-Timings were recorded on an Apple-silicon desktop. The shared bench window makes
-these timings informational, never a benchmark verdict. Recorded phases used a
-direct Python interpreter entry; the packaged shell wrapper now invokes the same
-standard-library driver through `uv run --no-project python3`. The trainer's `done`
-duration covers the step loop and its scoring, not the full phase; each conditions
-receipt records the full phase elapsed time. Cache and scoring passes are shown
-separately. Each timing below belongs to its named phase's start/end conditions.
+memory: train NLL 2.2866 → 0.0076; held-out NLL 1.8271 → 0.0034 (99.814% reduction).
+gtd: train NLL 1.7828 → 0.0032; held-out NLL 2.2718 → 0.0028 (99.877% reduction).
 
-train-M, with its conditions below:
+Under the fixed rule, routing is **USEFUL**: routed meets the best-single-adapter minus-five-points bound overall and strictly exceeds base on each family.
+
+S1 is supplementary and outside the decision rule, registered before the original adapter outputs existed. It uses the base model with `<think>\n\n</think>\n\n` appended to each verbatim prompt, with the same decode flags. Four separate-process duplicates also match.
+
+| Supplementary arm | First-line parser accepted | First-line callable | First-non-blank-line parser accepted | First-non-blank-line callable | Reopened `<think>` |
+| ----------------- | -------------------------- | ------------------- | ------------------------------------ | ----------------------------- | ------------------ |
+| S1                | 0/80                       | 0/80                | 0/80                                 | 0/80                          | 0/80               |
+
+**Why base reads 0.** In run 1, the raw model opened `<think>` on 70/80 prompts and a code fence on 9/80; its first line was blank on 80/80. With the think block closed (S1), its outputs include prose, SQL, HTTP, and unrelated code, and still parse on 0/80 under both line rules. These controls support attributing the floor to the model not knowing the request DSL, beyond the leading blank line and open thinking block.
+
+**Run 1 (pre-fix).** First-line callable results were routed 28/80 (35.0%), single-M 8/80 (10.0%), single-G 20/80 (25.0%), base 0/80 (0.0%). The old loader merged the prompt/completion boundary on 52/80 held-out rows; all 31 leading-newline memory-adapter outputs across the 80 prompts belonged to merged rows. It also omitted EOS, and memory-adapter outputs on their own family contained glued repeats on 16/40 prompts (issue #1545, fixed by #1546).
+
+Timings were recorded on an Apple-silicon desktop and are informational, never a benchmark verdict: the relay holds the bench window shared. Every timing below carries its producing phase's start/end conditions. The trainer's `done` duration covers the step loop and scoring; the conditions receipt records full phase time. The driver uses `uv run --no-project python3`.
+
+train-M:
 
 ```text
-1182 completion positions across 48 samples in 83.3s (10 threads)
-held-out: 255 completion positions across 8 valid samples in 17.5s (10 threads)
-baseline scoring: train pass 105.6s, held-out pass 22.3s
-step loop: 96 steps in 318.0s (3.31s/step), in-loop scoring 127.6s over 1 point(s), epilogue re-scoring 0.0s
-=== done: train 1.7006→0.0077 (-1.6929)  |  held-out 1.2385→0.0025 (-1.2360)  in 445.6s ===
-```
-
-train-G, with its conditions below:
-
-```text
-1688 completion positions across 48 samples in 110.9s (10 threads)
-held-out: 232 completion positions across 8 valid samples in 16.9s (10 threads)
-baseline scoring: train pass 146.9s, held-out pass 20.3s
-step loop: 96 steps in 437.0s (4.55s/step), in-loop scoring 164.0s over 1 point(s), epilogue re-scoring 0.0s
-=== done: train 1.4251→0.0036 (-1.4215)  |  held-out 1.7972→0.0057 (-1.7914)  in 601.1s ===
-```
-
-Route cost, with the route conditions below:
-
-```text
-warm_embedding_seconds=0.00464475 single_gate_forward_seconds=0.000000458 cold_embedding_seconds=0.302235958
+1259 completion positions across 48 samples in 84.4s (10 threads)
+held-out: 269 completion positions across 8 valid samples in 17.8s (10 threads)
+baseline scoring: train pass 109.4s, held-out pass 22.7s
+step loop: 96 steps in 328.9s (3.43s/step), in-loop scoring 132.1s over 1 point(s), epilogue re-scoring 0.0s
+=== done: train 2.2866→0.0076 (-2.2790)  |  held-out 1.8271→0.0034 (-1.8237)  in 461.0s ===
 ```
 
 ```json
@@ -207,22 +191,32 @@ warm_embedding_seconds=0.00464475 single_gate_forward_seconds=0.000000458 cold_e
   "phase": "train-M",
   "start": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.68 1.78 1.85 }",
+    "vm.loadavg": "{ 1.10 1.17 1.31 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   },
   "window": "shared; informational timing only",
   "ok": true,
-  "elapsed_seconds": 680.5020301659999,
+  "elapsed_seconds": 699.4037639590097,
   "end": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.91 2.57 2.85 }",
+    "vm.loadavg": "{ 1.66 2.00 2.04 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   }
 }
+```
+
+train-G:
+
+```text
+1762 completion positions across 48 samples in 113.1s (10 threads)
+held-out: 246 completion positions across 8 valid samples in 18.6s (10 threads)
+baseline scoring: train pass 152.4s, held-out pass 20.9s
+step loop: 96 steps in 446.0s (4.65s/step), in-loop scoring 169.1s over 1 point(s), epilogue re-scoring 0.0s
+=== done: train 1.7828→0.0032 (-1.7796)  |  held-out 2.2718→0.0028 (-2.2690)  in 615.1s ===
 ```
 
 ```json
@@ -230,63 +224,67 @@ warm_embedding_seconds=0.00464475 single_gate_forward_seconds=0.000000458 cold_e
   "phase": "train-G",
   "start": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.55 2.34 2.75 }",
+    "vm.loadavg": "{ 3.74 2.56 2.24 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   },
   "window": "shared; informational timing only",
   "ok": true,
-  "elapsed_seconds": 906.7692175840001,
+  "elapsed_seconds": 930.964566583978,
   "end": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.62 1.99 2.64 }",
+    "vm.loadavg": "{ 1.78 2.01 2.35 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   }
 }
 ```
+
+gen-base:
 
 ```json
 {
   "phase": "gen-base",
   "start": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 2.74 2.52 2.74 }",
+    "vm.loadavg": "{ 2.09 2.15 2.38 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   },
   "window": "shared; informational timing only",
   "ok": true,
-  "elapsed_seconds": 333.334467208,
+  "elapsed_seconds": 338.5525895419996,
   "end": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.45 1.83 2.33 }",
+    "vm.loadavg": "{ 1.90 1.92 2.18 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   }
 }
 ```
+
+gen-M:
 
 ```json
 {
   "phase": "gen-M",
   "start": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.21 1.73 2.28 }",
+    "vm.loadavg": "{ 1.62 1.85 2.15 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   },
   "window": "shared; informational timing only",
   "ok": true,
-  "elapsed_seconds": 306.585580333,
+  "elapsed_seconds": 210.76446954201674,
   "end": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.74 1.70 2.08 }",
+    "vm.loadavg": "{ 1.75 1.79 2.06 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
@@ -294,27 +292,35 @@ warm_embedding_seconds=0.00464475 single_gate_forward_seconds=0.000000458 cold_e
 }
 ```
 
+gen-G:
+
 ```json
 {
   "phase": "gen-G",
   "start": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.46 1.62 2.04 }",
+    "vm.loadavg": "{ 1.66 1.77 2.04 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   },
   "window": "shared; informational timing only",
   "ok": true,
-  "elapsed_seconds": 321.186848292,
+  "elapsed_seconds": 203.1446277089999,
   "end": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.87 1.70 1.93 }",
+    "vm.loadavg": "{ 1.86 1.74 1.96 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   }
 }
+```
+
+route:
+
+```text
+warm_embedding_seconds=0.004635875 single_gate_forward_seconds=0.000000416 cold_embedding_seconds=0.303303792
 ```
 
 ```json
@@ -322,17 +328,42 @@ warm_embedding_seconds=0.00464475 single_gate_forward_seconds=0.000000458 cold_e
   "phase": "route",
   "start": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.25 1.54 1.84 }",
+    "vm.loadavg": "{ 1.76 1.72 1.95 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"
   },
   "window": "shared; informational timing only",
   "ok": true,
-  "elapsed_seconds": 1.751243125,
+  "elapsed_seconds": 1.7448832500376739,
   "end": {
     "kern.memorystatus_vm_pressure_level": "1",
-    "vm.loadavg": "{ 1.25 1.54 1.84 }",
+    "vm.loadavg": "{ 1.76 1.72 1.95 }",
+    "hw.model": "Mac16,10",
+    "hw.memsize": "17179869184",
+    "machdep.cpu.brand_string": "Apple M4"
+  }
+}
+```
+
+gen-S1:
+
+```json
+{
+  "phase": "gen-S1",
+  "start": {
+    "kern.memorystatus_vm_pressure_level": "1",
+    "vm.loadavg": "{ 1.56 1.68 1.92 }",
+    "hw.model": "Mac16,10",
+    "hw.memsize": "17179869184",
+    "machdep.cpu.brand_string": "Apple M4"
+  },
+  "window": "shared; informational timing only",
+  "ok": true,
+  "elapsed_seconds": 332.17996287497226,
+  "end": {
+    "kern.memorystatus_vm_pressure_level": "1",
+    "vm.loadavg": "{ 1.74 1.66 1.82 }",
     "hw.model": "Mac16,10",
     "hw.memsize": "17179869184",
     "machdep.cpu.brand_string": "Apple M4"

@@ -24,15 +24,16 @@ try:
     if phase in ('train-M', 'train-G'):
         family = 'memory' if phase == 'train-M' else 'gtd'
         run([bin_dir / 'train_grad_full', '--model-dir', model, '--data-dir', f'w6-input/adapter-{family}', '--seq-len', '256', '--steps', '96', '--max-train', '48', '--max-valid', '8', '--first-layer', '19', '--rank', '8', '--alpha', '16', '--lr', '1e-3', '--log-every', '96', '--seed', '4277009102', '--save', out / f'adapter-{family}.safetensors'], out / f'{phase}.log')
-    elif phase in ('gen-base', 'gen-M', 'gen-G'):
+    elif phase in ('gen-base', 'gen-M', 'gen-G', 'gen-S1'):
         arm = phase[4:]
         rows = [json.loads(line) for line in pathlib.Path('w6-input/heldout.jsonl').read_text().splitlines()]
         if len(rows) != 80:
             raise ValueError('expected 80 prompts')
         with open(out / f'gen-{arm}.jsonl', 'w') as dest, open(out / f'duplicates-{arm}.jsonl', 'w') as duplicates:
             for row in rows:
-                cmd = [bin_dir / 'generate_lora', '--model-dir', model, '--prompt', row['prompt'], '--max-tokens', '64', '--temperature', '0', '--seed', '1']
-                if arm != 'base':
+                prompt = row['prompt'] + ('<think>\n\n</think>\n\n' if arm == 'S1' else '')
+                cmd = [bin_dir / 'generate_lora', '--model-dir', model, '--prompt', prompt, '--max-tokens', '64', '--temperature', '0', '--seed', '1']
+                if arm in ('M', 'G'):
                     family = 'memory' if arm == 'M' else 'gtd'
                     cmd += ['--lora', out / f'adapter-{family}.safetensors']
                 for repeat in range(2 if row['idx'] in (0, 1, 40, 41) else 1):
@@ -42,13 +43,15 @@ try:
                     if text.count('--- Output ---\n') != 1 or text.count('\n--- Stats ---') != 1:
                         raise ValueError(f'missing/ambiguous output markers: {log}')
                     output, stats = text.split('--- Output ---\n', 1)[1].split('\n--- Stats ---', 1)
-                    if (arm != 'base') != ('LoRA: ACTIVE' in stats.splitlines()):
+                    if (arm in ('M', 'G')) != ('LoRA: ACTIVE' in stats.splitlines()):
                         raise ValueError(f'adapter activation marker differs from arm: {log}')
                     result = {k: row[k] for k in ('idx', 'family', 'prompt')}
                     result.update(output=output, stats=stats)
+                    if arm == 'S1':
+                        result['generation_prompt'] = prompt
                     if repeat:
                         if output != original:
-                            raise ValueError(f'K5: nondeterministic output {arm} idx={row["idx"]}')
+                            raise ValueError(f'nondeterministic output across two processes: {arm} idx={row["idx"]}')
                         duplicates.write(json.dumps(result) + '\n')
                         duplicates.flush()
                     else:
