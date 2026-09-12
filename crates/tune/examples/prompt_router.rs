@@ -1,6 +1,7 @@
 //! Measure held-out adapter-domain separation and feedback on exported embeddings.
 //! Run with mixture,inference-hook,serde. Arguments: vector JSON and optional arm
-//! (`real`, `shuffled`, `balance`, `loop`, `cost`; default runs all).
+//! (`real`, `shuffled`, `balance`, `loop`, `cost`, `decisions`; default runs all except decisions).
+//! `decisions` fits real labels and prints each held-out prediction in input order.
 
 use lattice_fann::{Activation, BackpropTrainer, Network, NetworkBuilder, Trainer, TrainingConfig};
 use lattice_inference::mixture::AdapterRouter;
@@ -52,7 +53,7 @@ fn majority(labels: &[usize]) -> f64 {
     zero.max(labels.len() - zero) as f64 / labels.len() as f64
 }
 
-fn fit(data: &Data, shuffled: bool) -> Result<f64> {
+fn fit(data: &Data, shuffled: bool, decisions: bool) -> Result<f64> {
     let train: Vec<&Row> = data.rows.iter().filter(|r| r.split == "train").collect();
     let test: Vec<&Row> = data.rows.iter().filter(|r| r.split == "test").collect();
     let mut train_labels: Vec<usize> = train.iter().map(|r| r.label).collect();
@@ -81,9 +82,13 @@ fn fit(data: &Data, shuffled: bool) -> Result<f64> {
     };
     let trained = BackpropTrainer::new().train(&mut network, &inputs, &targets, &config)?;
     let mut correct = 0;
-    for (row, label) in test.iter().zip(test_labels.iter()) {
+    for (idx, (row, label)) in test.iter().zip(test_labels.iter()).enumerate() {
         let scores = network.forward(&row.vector)?;
-        correct += usize::from(usize::from(scores[1] > scores[0]) == *label);
+        let predicted = usize::from(scores[1] > scores[0]);
+        correct += usize::from(predicted == *label);
+        if decisions {
+            println!("decision idx={idx} label={label} predicted={predicted}");
+        }
     }
     let accuracy = correct as f64 / test.len() as f64;
     println!(
@@ -150,7 +155,17 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).ok_or("expected vector JSON path")?;
     let arm = args.get(2).map(String::as_str).unwrap_or("all");
-    if !["all", "real", "shuffled", "balance", "loop", "cost"].contains(&arm) {
+    if ![
+        "all",
+        "real",
+        "shuffled",
+        "balance",
+        "loop",
+        "cost",
+        "decisions",
+    ]
+    .contains(&arm)
+    {
         return Err("unknown arm".into());
     }
     let data: Data = serde_json::from_slice(&std::fs::read(path)?)?;
@@ -201,12 +216,15 @@ fn main() -> Result<()> {
     }
     if arm == "all" || arm == "real" {
         assert!(
-            fit(&data, false)? > floor,
+            fit(&data, false, false)? > floor,
             "real labels do not beat majority floor"
         );
     }
+    if arm == "decisions" {
+        fit(&data, false, true)?;
+    }
     if arm == "all" || arm == "shuffled" {
-        let accuracy = fit(&data, true)?;
+        let accuracy = fit(&data, true, false)?;
         let tolerance = 3.0 * (0.25 / labels.len() as f64).sqrt();
         println!(
             "shuffled acceptance: |accuracy-0.5| <= {tolerance:.6} (balanced corpus required)"
