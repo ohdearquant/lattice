@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
+from curation_guard import safe_output, sensitive_reason
+
 DEFAULT_REPOS = (
     Path.home() / "projects/khive/lattice",
     Path.home() / "projects/khive/khive-oss",
@@ -30,6 +32,7 @@ DEFAULT_REPOS = (
 )
 PUBLIC_REPOS = {"lattice", "khive", "lionagi"}
 SPLITS = ("train", "valid", "test")
+OUTPUT_FILES = frozenset({"CURATION.md"} | {split + ".jsonl" for split in ("train", "valid", "test")})
 TRAIN_END = datetime(2026, 7, 15, tzinfo=UTC)
 VALID_END = datetime(2026, 8, 15, tzinfo=UTC)
 PROMPT_CAP = 1200
@@ -38,17 +41,6 @@ SUBJECT = re.compile(
     r"^(feat|fix|perf|docs|refactor|test|chore|ci|bench|build)(\([^)]*\))?!?: .{8,}$"
 )
 TRAILER = re.compile(r"^(Co-Authored-By|Claude-Session|Signed-off-by):", re.IGNORECASE)
-EMAIL = re.compile(
-    r"(?<![A-Z0-9.!#$%&'*+/=?^_`{|}~-])"
-    r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9.-]*[A-Z0-9])?\.[A-Z]{2,}",
-    re.IGNORECASE,
-)
-SECRET = re.compile(
-    r"-----BEGIN (?:[A-Z ]*PRIVATE KEY|OPENSSH PRIVATE KEY)-----"
-    r"|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b"
-    r"|\bsk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}"
-    r"|(?i:\b(?:password|api[_-]?key|access[_-]?token|client[_-]?secret)\s*[:=]\s*[\"'][^\"'\s]{8,}[\"'])"
-)
 SAFE_PATH = re.compile(r"[A-Za-z0-9_./@+~-]+")
 DIFF_HEADER = re.compile(r"diff --git a/([A-Za-z0-9_./@+~-]+) b/([A-Za-z0-9_./@+~-]+)")
 BLOCKED_DIRS = {
@@ -206,16 +198,6 @@ def time_split(authored: datetime) -> str:
     return (
         "train" if authored < TRAIN_END else "valid" if authored < VALID_END else "test"
     )
-
-
-def sensitive_reason(text: str) -> str | None:
-    if EMAIL.search(text):
-        return "email"
-    if SECRET.search(text):
-        return "secret_pattern"
-    if any(ord(c) < 32 and c not in "\n\t" for c in text) or "\x7f" in text:
-        return "control_character"
-    return None
 
 
 def excluded_path(path: str) -> bool:
@@ -520,6 +502,8 @@ def write_outputs(
     counts: dict[str, Counter],
     rejection_note: str | None = None,
 ) -> None:
+    # Same rule as the DSL lane: inside a repository the output must be ignored and untracked.
+    out = safe_output(out, OUTPUT_FILES)
     out.mkdir(parents=True, exist_ok=True)
     report = [
         "# Commit-message curation",
@@ -604,7 +588,11 @@ def write_outputs(
     for split in SPLITS:
         selected = [row for row in rows if row.split == split]
         path = out / f"{split}.jsonl"
-        with path.open("w", encoding="utf-8") as handle:
+        # Written in place, so a symlink left at the output name must not be followed.
+        descriptor = os.open(
+            path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             for row in selected:
                 handle.write(
                     json.dumps(

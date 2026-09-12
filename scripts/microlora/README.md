@@ -19,6 +19,10 @@ uv run scripts/microlora/mine_commit_msg.py \
 ```
 
 Each repository's `main` is resolved to an immutable commit before mining. The
+miner also requires each checkout's origin URL to name one of the three public
+repositories. That is a wrong-checkout guard, not an authenticity check: whoever
+controls the checkout's git configuration can satisfy it, so a replay is verified
+by the recorded commit IDs, never by the URL match. The
 miner walks non-merge first-parent history, filters conventional commit messages,
 removes excluded diff paths and context lines, and includes the repository name in
 each prompt. Oversized diffs receive an explicit omitted-lines marker. Duplicate
@@ -43,9 +47,13 @@ The author timestamp determines the split:
 | test  | 2026-08-15 onward             |
 
 The output directory contains `train.jsonl`, `valid.jsonl`, `test.jsonl`, and
-`CURATION.md`. The report records source commit IDs, filtering counts, split counts,
-length distributions, and reproducible sample rows. Readback validation rejects
-malformed output. Source paths must exist; pass `--repo` explicitly when your
+`CURATION.md`. Before writing, the miner refuses an output path that a repository
+tracks or does not ignore, and an existing directory holding unrelated files.
+Commits whose message or rendered diff carries an address, a credential shape, or
+a control character are skipped whole; both lanes share one screen in
+`curation_guard.py`. The report records source commit IDs, filtering counts, split
+counts, length distributions, and reproducible sample rows. Readback validation
+rejects malformed output. Source paths must exist; pass `--repo` explicitly when your
 checkout layout differs from the defaults.
 
 Prompt and completion character limits provide a conservative size estimate.
@@ -73,7 +81,9 @@ Capture the complete live registry using `verbs()`, then capture each listed ver
 with `<verb>(help=true)`. Store the unchanged result objects in a local directory
 named by `SCHEMA_DIR`: `_verbs.json` for the registry and `<verb>.json` for every
 help result. Keep the original response envelopes alongside the capture when
-available. The generator requires every registered schema and records input hashes.
+available. The generator requires a help capture for every verb the captured
+registry names and records the capture's input hashes in `CURATION.md`; it cannot
+tell whether that registry was complete when captured.
 
 Build the parser validator against a local runtime checkout. Set `VALIDATOR` to an
 executable output path outside that runtime checkout:
@@ -103,18 +113,27 @@ record existence, authorization, or successful execution against a database.
 
 Output includes the three JSONL splits, matching `.provenance.jsonl` sidecars, and
 `CURATION.md`. It must be local storage outside tracked paths; repository locations
-must be ignored and untracked. Generated data is never part of the source commit.
+must be ignored and untracked, and both lanes refuse to write anywhere else.
+Generated data is never part of the source commit.
 The fixed partition assigns whole verbs to splits, with the entire `schedule` pack
 held out for testing. Batches, chains, and embedded scheduled actions must stay
-within one partition. The report lists actual small-pack proportions, unsupported
-verbs, template counts, and validation limits.
+within one partition. A registered verb with neither a reviewed template nor a
+listed exclusion stops generation before any row is written, and the refusal names
+every such verb. The report lists actual small-pack proportions, excluded verbs
+with their reasons, template counts, and validation limits. `check_split_integrity.py`
+checks exact prompt and completion overlap and prompt-length balance between two
+split files; it does not re-derive the verb partition, so a same-verb row in two
+splits passes it.
 
 To include recorded calls, add `--merge-real "$REAL_JSONL"`. Each input row must
 contain string `ops`, boolean `ok`, and optionally `error` and `corrected_ops`.
 Successful calls become rendering-reference exercises because this input format
 contains no observed natural-language request. Failed calls need an explicit
 correction or one uniquely recognized parameter-name correction; other failures
-are skipped with reasons. Recorded calls receive the same parser and split checks.
+are skipped with reasons. Recorded calls receive the same parser and split checks,
+and a row whose operations, correction, or error text carries an address or a
+credential shape is skipped whole with a counted reason; nothing is redacted,
+because the completion is the recorded text.
 
 Run all DSL tests, including the actual parser and full dataset generation, with:
 

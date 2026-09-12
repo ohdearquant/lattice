@@ -28,7 +28,11 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import curation_guard
+from curation_guard import GuardError, sensitive_reason
+
 SPLITS = ("train", "valid", "test")
+OUTPUT_FILES = frozenset({"CURATION.md"} | {split + suffix for split in SPLITS for suffix in (".jsonl", ".provenance.jsonl")})
 SEED = "khive-dsl-curation-v1"
 PARSER = "khive_request::parse_request"
 DEFAULT_OUT = Path(".khive/inbound/lattice-microlora/khive-dsl")
@@ -42,6 +46,48 @@ EXCLUSIONS = {
     "knowledge.challenge": "Requires a section identity and disambiguation conditions not established by this fixture.",
     "query": "ParamDef does not supply the supported GQL/SPARQL grammar; parser acceptance alone cannot check its query language.",
     "propose": "Changeset domain discriminants and nested mutation semantics require a separate reviewed fixture.",
+    # Packs registered after the reviewed template set was written. Each carries a contract the
+    # schema capture does not specify (materialized trees, receipts, sandbox policy, repository and
+    # platform state, stream ledgers, capability grants); rendering plausible arguments for them
+    # would teach requests whose preconditions no fixture can establish.
+    "exec.events": "Audit rows exist only after runs; a fixture cannot reference a materialized launch history.",
+    "exec.identity": "Reports the host's resolved exec configuration; there is no argument-bearing intent to render.",
+    "exec.receipt": "Requires an existing run receipt id that only a prior exec.run establishes.",
+    "exec.run": "Executes a registered tool over a materialized tree under sandbox policy; side effects are outside schema-only synthesis.",
+    "exec.runs": "Lists receipts for an actor identity that the capture does not establish.",
+    "exec.tree": "Tree entries reference content by blob ref; the refs have no fixture without a prior blob.put.",
+    "exec.tree_diff": "Requires two existing tree manifest references.",
+    "exec.tree_get": "Requires an existing tree manifest reference.",
+    "exec.tree_put": "Edits reference existing tree and blob refs and carry a mode vocabulary not specified by ParamDef.",
+    "git.checkout": "Reads a resolved commit into a tree manifest; the commit and allowlisted repository are host state.",
+    "git.diff": "input_kind discriminates commits from tree manifests with semantics ParamDef does not specify.",
+    "git.gates": "Reads configured repository allowlist rows; nothing to render beyond a host path.",
+    "git.ingest_cursor": "Cursor and checkpoint identities exist only after an ingest run.",
+    "git.init": "Initializes an allowlisted directory; allowlist membership is host configuration, not schema.",
+    "git.log": "Pathspec, decoration and paging contract is specified by the handler, not by ParamDef.",
+    "git.pr_merge": "Platform merge with cross-account approval and expected_head compare; requires live platform state.",
+    "git.pr_open": "Opens a pull request against a configured slug and visibility; requires live platform state.",
+    "git.pr_review": "Submits a platform review bound to expected_head; requires live platform state.",
+    "git.receipts": "Lists caller-owned durable receipts; caller identity is not part of the capture.",
+    "git.reconcile": "Settles an existing unknown receipt using observed evidence that only a prior push produces.",
+    "git.status": "Reads working-tree state of an allowlisted repository; host state, no reviewable intent.",
+    "stream.append": "expected_seq and ledger density are checked against a live stream the capture does not hold.",
+    "stream.batch": "Nested append and keyed-write members carry a member schema ParamDef does not specify.",
+    "stream.read": "Requires an existing stream identity and sequence position.",
+    "stream.stat": "Requires an existing stream identity.",
+    "tool.check": "Policy decisions depend on grant and policy rows that the capture does not establish.",
+    "tool.deny": "Requires an existing grant request id.",
+    "tool.describe": "Requires an existing registry object; the decision field depends on the caller's grants.",
+    "tool.grant": "Requires an existing grant request id; approval semantics need an identity context.",
+    "tool.ingest": "Bulk registration from a live registry or an MCP tools/list payload not present in the capture.",
+    "tool.list": "Lists registry objects; the kind vocabulary is specified by the handler, not by ParamDef.",
+    "tool.policies": "Lists policy rows; nothing to render beyond an empty request.",
+    "tool.policy": "Sets a policy row with actor and tool patterns whose grammar ParamDef does not specify.",
+    "tool.register": "Registers a tool with capabilities, side-effect class and trust origin vocabularies outside ParamDef.",
+    "tool.request": "Opens a grant request against a registry object the capture does not establish.",
+    "tool.requests": "Lists grant requests and grants; nothing to render beyond an empty request.",
+    "tool.revoke": "Requires an existing granted request id.",
+    "tool.suggest": "Search over a registry plus capability graph; hits depend on registry state the capture does not hold.",
 }
 
 
@@ -429,9 +475,15 @@ def recipe(verb, index):
             f"Ingest at most {n} commits of provenance from local repository {compact(f['repo'])}; do not include issues or pull requests.",
         )
     if verb == "git.push":
+        local = digest("fixture-local-sha:" + t)[:40]
         return (
-            {"repo": f["repo"], "branch": "topic/" + slug, "remote": "origin"},
-            f"Push branch {compact('topic/' + slug)} from repository {compact(f['repo'])} to origin.",
+            {
+                "repo": f["repo"],
+                "branch": "topic/" + slug,
+                "expected_local": local,
+                "expected_remote": None,
+            },
+            f"Push branch {compact('topic/' + slug)} from repository {compact(f['repo'])} at exactly local commit {local}, requiring that the branch does not yet exist on the remote.",
         )
     if verb == "gtd.assign":
         priority = ("p0", "p1", "p2", "p3")[index % 4]
@@ -777,9 +829,31 @@ def add_split_guard(example, splits):
         raise CurationError("Composition crosses held-out verb partitions")
 
 
+def untemplated_verbs(schemas):
+    """Registered verbs with neither a reviewed template nor an exclusion, computed up front."""
+    missing = []
+    for verb in sorted(schemas):
+        if verb in EXCLUSIONS:
+            continue
+        try:
+            recipe(verb, 0)
+        except CurationError:
+            missing.append(verb)
+    return missing
+
+
 def candidates(schemas, splits):
     pools = defaultdict(list)
     drops = Counter()
+    # Fail closed on the whole set at once: a refusal naming only the first verb makes every
+    # registry change a sequence of one-verb discoveries.
+    missing = untemplated_verbs(schemas)
+    if missing:
+        raise CurationError(
+            f"No reviewed template for {len(missing)} registered verb(s): "
+            + ", ".join(missing)
+            + "; add a reviewed template or an EXCLUSIONS entry with a reason for each before generating"
+        )
     active = [verb for verb in sorted(schemas) if verb not in EXCLUSIONS]
     # Round robin by verb prevents rich signatures from crowding out small ones.
     for index in range(384):
@@ -938,8 +1012,15 @@ def select_candidates(pools, splits, per_pack=350):
 
 def value_matches(value, typename):
     typename = typename.strip()
-    if " | " in typename:
-        return any(value_matches(value, arm) for arm in typename.split(" | "))
+    # Live captures spell alternatives three ways: "a | b", "a|b" and "a or b".
+    if "|" in typename:
+        return any(value_matches(value, arm) for arm in typename.split("|"))
+    if " or " in typename:
+        return any(value_matches(value, arm) for arm in typename.split(" or "))
+    if typename == "null":
+        return value is None
+    if typename == "JSON value":
+        return value is None or isinstance(value, (bool, int, float, str, list, dict))
     if typename.startswith("array<") and typename.endswith(">"):
         return isinstance(value, list) and all(
             value_matches(v, typename[6:-1]) for v in value
@@ -1220,6 +1301,18 @@ def merge_real(path, examples, validator, schemas, splits):
     originals = validator.parse([row["ops"] for row in data], allow_invalid=True)
     additions = []
     for number, (row, parsed) in enumerate(zip(data, originals, strict=True), 1):
+        # Recorded text reaches both the prompt and the completion verbatim, so a row carrying
+        # an address or a credential in any field is skipped whole; nothing is redacted.
+        screened = sensitive_reason(
+            "\n".join(
+                value
+                for value in (row["ops"], row.get("corrected_ops"), row.get("error"))
+                if isinstance(value, str)
+            )
+        )
+        if screened:
+            skips["screened_" + screened] += 1
+            continue
         if not parsed["ok"]:
             skips["unparseable_original_cannot_prove_verb_partition"] += 1
             continue
@@ -1316,51 +1409,11 @@ def merge_real(path, examples, validator, schemas, splits):
 
 
 def safe_output(path):
-    """Inside a repository, data must be ignored and entirely untracked."""
-    path = Path(path).resolve()
-    ancestor = path
-    while not ancestor.exists():
-        ancestor = ancestor.parent
-    if not ancestor.is_dir():
-        raise CurationError("Output ancestor is not a directory")
-    probe = subprocess.run(
-        ["git", "-C", str(ancestor), "rev-parse", "--show-toplevel"],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if probe.returncode == 0:
-        root = Path(probe.stdout.strip()).resolve()
-        tracked = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "-z", "--", str(path)],
-            capture_output=True,
-            check=False,
-        )
-        ignored = subprocess.run(
-            ["git", "-C", str(root), "check-ignore", "-q", "--", str(path)],
-            capture_output=True,
-            check=False,
-        )
-        if tracked.returncode != 0 or tracked.stdout or ignored.returncode != 0:
-            raise CurationError(
-                "Refusing output in a tracked or non-ignored repository location"
-            )
-    elif probe.returncode != 128:
-        raise CurationError("Could not establish output repository status")
-    if path.exists() and not path.is_dir():
-        raise CurationError("Output path is not a directory")
-    if path.exists():
-        allowed = {"CURATION.md"} | {
-            split + suffix
-            for split in SPLITS
-            for suffix in (".jsonl", ".provenance.jsonl")
-        }
-        unknown = {p.name for p in path.iterdir()} - allowed
-        if unknown:
-            raise CurationError(
-                "Refusing to replace an output directory containing unrelated files"
-            )
-    return path
+    """Inside a repository, data must be ignored and entirely untracked (shared guard)."""
+    try:
+        return curation_guard.safe_output(path, OUTPUT_FILES)
+    except GuardError as error:
+        raise CurationError(str(error)) from error
 
 
 def deciles(numbers):

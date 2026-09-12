@@ -155,9 +155,28 @@ class SplitAndSchemaTests(unittest.TestCase):
         self.assertTrue(synth.value_matches(["a"], "array<string>"))
         self.assertTrue(synth.value_matches([{"name": "a"}], "array of object"))
         self.assertTrue(synth.value_matches(["draft"], "string | array<string>"))
+        self.assertTrue(synth.value_matches(None, "string|null"))
+        self.assertTrue(synth.value_matches("a" * 40, "string|null"))
+        self.assertFalse(synth.value_matches(1, "string|null"))
+        self.assertTrue(synth.value_matches([{"a": 1}], "object or array of object"))
+        self.assertTrue(synth.value_matches({"a": 1}, "object or array of object"))
+        self.assertFalse(synth.value_matches("x", "object or array of object"))
+        self.assertTrue(synth.value_matches({"k": [1]}, "JSON value"))
         self.assertFalse(synth.value_matches([1], "array of string"))
         self.assertFalse(synth.value_matches(True, "float"))
         self.assertFalse(synth.value_matches(float("inf"), "number"))
+
+    def test_registry_refusal_names_every_untemplated_verb(self):
+        schemas = fixture_schemas()
+        self.assertEqual(synth.untemplated_verbs(schemas), [])
+        # Names outside every excluded family, so the refusal is about missing templates.
+        schemas["ledger.post"] = schema("ledger.post", "ledger", [("entry", "string", True)])
+        schemas["ledger.void"] = schema("ledger.void", "ledger", [("id", "uuid", True)])
+        self.assertNotIn("ledger.post", synth.EXCLUSIONS)
+        with self.assertRaisesRegex(
+            synth.CurationError, r"2 registered verb\(s\): ledger\.post, ledger\.void"
+        ):
+            synth.candidates(schemas, synth.split_verbs(schemas))
 
     def test_missing_schema_capture_fails_closed(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -293,6 +312,60 @@ class ValidatorProtocolTests(unittest.TestCase):
                 [example], self.validator, schemas, {"memory.recall": "train"}
             )
 
+    def test_real_merge_skips_rows_carrying_addresses_or_credentials_whole(self):
+        schemas = fixture_schemas()
+        splits = synth.split_verbs(schemas)
+        rows = [
+            {"ops": 'memory.recall(query="mail bob.smith@example.org")', "ok": True},
+            {
+                "ops": 'memory.recall(q="cache")',
+                "ok": False,
+                "error": "refused: token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab",
+                "corrected_ops": 'memory.recall(query="cache")',
+            },
+            {"ops": 'memory.recall(query="storage")', "ok": True},
+        ]
+
+        def parse(completions, allow_invalid=False):
+            records = []
+            for line, completion in enumerate(completions, 1):
+                query = completion.split('="', 1)[1].rsplit('"', 1)[0]
+                key = "q" if completion.startswith("memory.recall(q=") else "query"
+                records.append(
+                    parser_record(
+                        completion,
+                        [synth.op_ast("memory.recall", {key: query})],
+                        line=line,
+                    )
+                )
+            return records
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "real.jsonl"
+            path.write_text("".join(synth.compact(row) + "\n" for row in rows))
+            with patch.object(self.validator, "parse", side_effect=parse):
+                accepted, skips = synth.merge_real(
+                    path, [], self.validator, schemas, splits
+                )
+                self.assertEqual(
+                    [example.completion for example in accepted],
+                    ['memory.recall(query="storage")'],
+                )
+                self.assertEqual(
+                    dict(skips), {"screened_email": 1, "screened_secret_pattern": 1}
+                )
+                # Mutation arm: with the screen disabled the same fixture emits all three.
+                with patch.object(synth, "sensitive_reason", return_value=None):
+                    accepted, skips = synth.merge_real(
+                        path, [], self.validator, schemas, splits
+                    )
+                self.assertEqual(len(accepted), 3)
+                self.assertNotIn("screened_email", skips)
+                leaked = [
+                    e for e in accepted if "bob.smith@" in e.prompt + e.completion
+                ]
+                self.assertEqual(len(leaked), 1)
+
     def test_malformed_real_json_fails_without_adding_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "real.jsonl"
@@ -348,7 +421,7 @@ class RealParserTests(unittest.TestCase):
             ):
                 synth.render_value(value)
 
-    def test_real_merge_skips_unknown_ambiguous_and_leaking_rows(self):
+    def test_real_merge_skips_unknown_ambiguous_and_partition_crossing_rows(self):
         schemas = fixture_schemas()
         splits = synth.split_verbs(schemas)
         uid = synth.fixture(0)["id"]
@@ -375,6 +448,32 @@ class RealParserTests(unittest.TestCase):
         self.assertEqual(sum(skips.values()), 5)
         self.assertEqual(accepted[0].completion, 'memory.recall(query="cache")')
         synth.validate_examples(accepted, self.validator, schemas, splits)
+
+    def test_complete_capture_is_covered_and_every_template_validates(self):
+        if not SCHEMAS:
+            self.skipTest("Pass --schemas to check the capture against the templates")
+        schemas, _ = synth.read_schemas(SCHEMAS)
+        splits = synth.split_verbs(schemas)
+        self.assertEqual(synth.untemplated_verbs(schemas), [])
+        failures = {}
+        templated = 0
+        for verb in sorted(schemas):
+            if verb in synth.EXCLUSIONS:
+                continue
+            templated += 1
+            for index in (0, 1, 383):
+                item = synth.make_single(verb, index, schemas, splits)
+                try:
+                    synth.validate_ast(
+                        {"ok": True, "mode": item.mode, "ops": item.ops}, schemas
+                    )
+                except synth.CurationError as error:
+                    failures[verb] = str(error)
+        self.assertEqual(failures, {})
+        print(
+            f"capture: {len(schemas)} registered verbs, {templated} templated, "
+            f"{len(schemas) - templated} excluded, 0 template/schema mismatches"
+        )
 
     def test_complete_capture_deterministic_generation_and_write_readback(self):
         if not SCHEMAS:

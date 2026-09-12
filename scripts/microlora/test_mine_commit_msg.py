@@ -176,6 +176,66 @@ class MinerTests(unittest.TestCase):
             miner.sensitive_reason(long_line + " person@example.org"), "email"
         )
 
+    def test_sensitive_screen_catches_credential_shapes_without_eating_the_surface(self):
+        # Must-match: shapes the earlier screen missed, plus the shapes it
+        # already caught. Must-not: ordinary diff and prose lines a corpus is full of.
+        # Token probes are assembled at runtime so no line of this file scans as a credential.
+        must_match = {
+            "https://alice:correct-horse-battery-staple@localhost/repo": "secret_pattern",
+            "alice@localhost": "email",
+            "alice@example": "email",
+            "xoxb-" + "1234567890-" + "abcdefghijkl": "secret_pattern",
+            "aws_secret_access_key=abcdefghijklmnopqrstuvwxyz0123456789": "secret_pattern",
+            "stripe " + "sk_live_" + "abcdefghijklmnop": "secret_pattern",
+            "export API_KEY=abcdefghijklmnop": "secret_pattern",
+            "password: hunter2hunter2": "secret_pattern",
+            "token " + "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ab": "secret_pattern",
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abc123def456": "secret_pattern",
+            "git@github.com:owner/repo.git": "email",
+            "https://user@example.com/": "email",
+        }
+        must_not_match = (
+            "@@ -1 +1 @@\n+@decorator\n+import @scope/package",
+            '+@app.route("/x")',
+            "@pytest.mark.parametrize",
+            "https://example.com/path?x=1",
+            "see the docs at docs.example.com",
+            "limit = 20",
+            'name = "alice"',
+            "password = None",
+            "password_hash = sha256(x)",
+            "password = get_password()",
+            'api_key = os.environ["API_KEY"]',
+            "client_secret: ${CLIENT_SECRET}",
+            "reset your password by email",
+            "resolve@2.0.0 in package.json",
+            "@types/node@18.0.0",
+            "the @ sign",
+        )
+        for text, reason in must_match.items():
+            self.assertEqual(miner.sensitive_reason(text), reason, text)
+        for text in must_not_match:
+            self.assertIsNone(miner.sensitive_reason(text), text)
+
+    def test_write_outputs_refuses_tracked_and_nonignored_repository_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitignore").write_text(".khive/\n")
+            (root / "data").mkdir()
+            (root / "data" / "tracked").write_text("source")
+            subprocess.run(["git", "-C", str(root), "add", "data/tracked"], check=True)
+            source = miner.Source(root, "lattice", "a" * 40, "origin")
+            kept = [self.row()]
+            totals = {"lattice": Counter()}
+            for out in (root / "data", root / "new-data"):
+                with self.assertRaisesRegex(ValueError, "tracked"):
+                    miner.write_outputs(out, [source], kept, totals)
+                self.assertFalse((out / "train.jsonl").exists())
+            ignored = root / ".khive" / "data"
+            miner.write_outputs(ignored, [source], kept, totals)
+            self.assertTrue((ignored / "CURATION.md").exists())
+
     def test_readback_fails_for_invalid_rows_and_count(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "train.jsonl"
