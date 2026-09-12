@@ -302,6 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let train_samples = load_jsonl(
         &data_dir.join("train.jsonl"),
         &tokenizer as &dyn Tokenizer,
+        model.config().eos_token_id,
         seq_len,
         max_train,
     )?;

@@ -1,4 +1,12 @@
-//! Real-checkpoint equivalence gate for the layer-23 compatibility command.
+//! Real-checkpoint regression gate for the layer-23 compatibility command.
+//!
+//! The original v1 golden recorded the removed hand-inlined driver's outputs
+//! and proved that the shared-tape shim matched them. Separate prompt/completion
+//! tokenization and EOS in the JSONL loader (#1545) change the sample itself,
+//! so v1 cannot be compared with the new construction. The v2 golden pins the
+//! shared-tape driver's outputs under that new loader at this change. This gate
+//! retains the original tolerances, gradient check, and mutation check as a
+//! regression pin from that point forward.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -6,9 +14,8 @@ use std::process::Command;
 use lattice_tune::lora::LoraAdapter;
 use lattice_tune::train_support as train_common;
 
-// The removed hand-inlined reverse pass and the shared tape accumulate f32
-// gradients in a different order; 1e-5 covers that rounding without accepting
-// the 1e-4 mutation exercised below.
+// Preserve the original bridge's rounding allowance without accepting the
+// 1e-4 mutation exercised below.
 const TENSOR_ABS_TOLERANCE: f32 = 1e-5;
 const NLL_ABS_TOLERANCE: f32 = 1e-4;
 
@@ -134,7 +141,7 @@ fn assert_roundtrip(adapter: &LoraAdapter, path: &Path) {
 }
 
 #[test]
-fn compatibility_shim_matches_legacy_layer23_golden() {
+fn compatibility_shim_matches_layer23_golden() {
     if std::env::var_os("LATTICE_LAYER23_GOLDEN_GATE_ENFORCE").is_none() {
         eprintln!(
             "layer-23 golden bridge skipped; set LATTICE_LAYER23_GOLDEN_GATE_ENFORCE=1 with LATTICE_MODEL_DIR"
@@ -153,7 +160,7 @@ fn compatibility_shim_matches_legacy_layer23_golden() {
     );
 
     let fixture_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/layer23_golden_v1");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/layer23_golden_v2");
     let temp = tempfile::tempdir().unwrap();
     let actual_path = temp.path().join("actual.safetensors");
     let output = Command::new(env!("CARGO_BIN_EXE_train_grad_layer23"))
@@ -256,12 +263,11 @@ fn compatibility_shim_matches_legacy_layer23_golden() {
         fd_eps: 4e-3,
         save_path: None,
         a_init_amp: Some(0.02),
-        // `All`, not the default, and deliberately: this test's subject is the
-        // shared driver reproducing the LEGACY layer-23 path, which predates any
-        // module selection and trained every GDN projection. Pinning `All` keeps
-        // the comparison about the driver. If layer 23 carries no GDN slot in this
-        // fixture the choice is inert, which is also fine -- what it must never be
-        // is a silent change to what is being compared.
+        // `All`, not the default, and deliberately: pin the gradient check to
+        // every GDN projection so its comparison subject stays fixed. If layer
+        // 23 carries no GDN slot in this fixture the choice is inert, which is
+        // also fine -- what it must never be is a silent change to what is
+        // being compared.
         gdn_modules: lattice_tune::lora::train_core::GdnModuleSelection::All,
     })
     .unwrap();

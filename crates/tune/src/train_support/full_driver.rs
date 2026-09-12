@@ -685,6 +685,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     let train_samples = load_jsonl(
         &data_dir.join("train.jsonl"),
         &tokenizer as &dyn Tokenizer,
+        model.config().eos_token_id,
         seq_len_cap,
         max_train,
     )?;
@@ -713,6 +714,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
         match load_jsonl(
             &data_dir.join("valid.jsonl"),
             &tokenizer as &dyn Tokenizer,
+            model.config().eos_token_id,
             seq_len_cap,
             max_valid,
         ) {
