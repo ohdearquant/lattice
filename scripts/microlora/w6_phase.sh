@@ -2,7 +2,7 @@
 # Run one phase under the caller's machine locks and admission checks.
 set -euo pipefail
 phase=${1:?expected phase}
-: "${CARGO_TARGET_DIR:?expected relay target directory}"
+: "${CARGO_TARGET_DIR:?set CARGO_TARGET_DIR before running a phase}"
 mkdir -p w6-out
 UV_CACHE_DIR=w6-out/uv-cache uv run --no-project python3 - "$phase" <<'PY'
 import json, os, pathlib, subprocess, sys, time

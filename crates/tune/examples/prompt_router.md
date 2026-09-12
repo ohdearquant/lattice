@@ -174,7 +174,7 @@ S1 is supplementary and outside the decision rule, registered before the origina
 
 **Run 1 (pre-fix).** First-line callable results were routed 28/80 (35.0%), single-M 8/80 (10.0%), single-G 20/80 (25.0%), base 0/80 (0.0%). The old loader merged the prompt/completion boundary on 52/80 held-out rows; all 31 leading-newline memory-adapter outputs across the 80 prompts belonged to merged rows. It also omitted EOS, and memory-adapter outputs on their own family contained glued repeats on 16/40 prompts (issue #1545, fixed by #1546).
 
-Timings were recorded on an Apple-silicon desktop and are informational, never a benchmark verdict: the relay holds the bench window shared. Every timing below carries its producing phase's start/end conditions. The trainer's `done` duration covers the step loop and scoring; the conditions receipt records full phase time. The driver uses `uv run --no-project python3`.
+Timings were recorded on an Apple-silicon desktop and are informational, never a benchmark verdict: the machine's bench window was held shared, so other work could overlap these phases. Every timing below carries its producing phase's start/end conditions. The trainer's `done` duration covers the step loop and scoring; the conditions receipt records full phase time. The driver uses `uv run --no-project python3`.
 
 train-M:
 
