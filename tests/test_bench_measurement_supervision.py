@@ -81,6 +81,7 @@ SCRIPT_EXTENSION_LANGUAGES = {
 SCRIPT_SHEBANG_LANGUAGES = {
     "#!/bin/bash": "shell",
     "#!/bin/sh": "shell",
+    "#!/usr/bin/env -S uv run --script": "python",
     "#!/usr/bin/env bash": "shell",
     "#!/usr/bin/env node": "node",
     "#!/usr/bin/env python3": "python",
@@ -111,6 +112,8 @@ EXPLICIT_SCRIPT_EXCLUSIONS = frozenset(
         "scripts/lib/ensure-noindex-marker.sh",
         "scripts/lib/machine-state-probe.py",
         "scripts/lib/quiet-probe.py",
+        "scripts/microlora/README.md",
+        "scripts/microlora/dsl_validator.rs",
         "scripts/perf-policy.toml",
         "scripts/perf_governor.README.md",
         "scripts/requirements-parity.txt",
