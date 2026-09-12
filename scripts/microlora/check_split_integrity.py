@@ -2,7 +2,7 @@
 """Check a train/held-out JSONL pair for the leakage that would invalidate a held-out NLL claim.
 
 It reports three distinct things and refuses to collapse them, because they have different
-consequences and only the first is a broken split:
+consequences and only the first is a broken split by default:
 
   PROMPT OVERLAP      a held-out prompt that also appears in train. This is real leakage: the model
                       was trained on the exact input it is being scored on, and any held-out number
@@ -19,13 +19,19 @@ consequences and only the first is a broken split:
                       longer than train is not exchangeable with it, so the held-out number answers
                       a slightly different question than "how well does this generalise".
 
+With --verb-partition, also report distinct completion calls and their crossing set.
+Double-quoted string literals are blanked before extracting pack.verb calls and bare kg verbs.
+Any crossing breaks the whole-verb partition; train against itself must cross on every verb.
+This lexical check does not inspect operations embedded inside string literals.
+
 Every count is printed with its denominator, and a positive control (train against itself) runs in
 the same invocation so an empty overlap cannot be a broken comparison silently reading as clean.
 
-Exit: 0 clean, 2 unreadable input, 3 PROMPT overlap found (the only fail-the-run condition).
+Exit: 0 clean, 2 unreadable input/control failure, 3 PROMPT overlap,
+4 VERB crossing with --verb-partition (takes precedence over prompt overlap).
 
 Usage:
-    uv run python scripts/microlora/check_split_integrity.py --dir DIR [--train train.jsonl] [--valid valid.jsonl]
+    uv run python scripts/microlora/check_split_integrity.py --dir DIR [--train train.jsonl] [--valid valid.jsonl] [--verb-partition]
 """
 
 from __future__ import annotations
@@ -34,6 +40,7 @@ import argparse
 import collections
 import hashlib
 import json
+import re
 import statistics
 import sys
 from pathlib import Path
@@ -47,11 +54,21 @@ def h(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
 
 
+def completion_verbs(rows: list[dict]) -> set[str]:
+    verbs = set()
+    for row in rows:
+        blanked = re.sub(r'"(?:\\.|[^"\\])*"', '""', row["completion"])
+        verbs.update(re.findall(r"\b([a-z_]+\.[a-z_]+)\s*\(", blanked))
+        verbs.update(re.findall(r"(?<![\w.])([a-z_]+)\s*\(", blanked))
+    return verbs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dir", required=True, type=Path)
     ap.add_argument("--train", default="train.jsonl")
     ap.add_argument("--valid", default="valid.jsonl")
+    ap.add_argument("--verb-partition", action="store_true", help="fail on completion verbs shared by both splits")
     args = ap.parse_args()
 
     tp, vp = args.dir / args.train, args.dir / args.valid
@@ -93,6 +110,22 @@ def main() -> int:
     lv = [len(r["prompt"]) for r in va]
     print(f"  prompt length median: train {statistics.median(lt):.0f}B, valid {statistics.median(lv):.0f}B "
           f"(ratio {statistics.median(lv)/statistics.median(lt):.2f})")
+
+    if args.verb_partition:
+        train_verbs, valid_verbs = completion_verbs(tr), completion_verbs(va)
+        verb_control = train_verbs & completion_verbs(tr)
+        crossing = train_verbs & valid_verbs
+        print(f"  VERB count: train {len(train_verbs)} distinct/{len(tr)} rows, "
+              f"valid {len(valid_verbs)} distinct/{len(va)} rows")
+        print(f"  control (train verbs found in train): {len(verb_control)}/{len(train_verbs)}  [must be all]")
+        print(f"  VERB crossing: {len(crossing)}/{len(train_verbs)} train, "
+              f"{len(crossing)}/{len(valid_verbs)} valid: {', '.join(sorted(crossing)) or 'none'}")
+        if verb_control != train_verbs:
+            print("REFUSED: the verb control failed; the comparison itself is broken", file=sys.stderr)
+            return 2
+        if crossing:
+            print("FAIL: completion verbs appear in both splits: " + ", ".join(sorted(crossing)), file=sys.stderr)
+            return 4
 
     print()
     if p_over:
