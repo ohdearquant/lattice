@@ -570,6 +570,86 @@ class ValidatorProtocolTests(unittest.TestCase):
             )
 
 
+class DatasetReplacementTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.out = self.root / "dataset"
+        self.schemas = fixture_schemas()
+        self.splits = synth.split_verbs(self.schemas)
+        self.validator = synth.Validator(sys.executable)
+        self.example = synth.Example(
+            "Recall cache", 'memory.recall(query="cache")', ["memory.recall"],
+            "memory", "train", "fixture", "single",
+            [synth.op_ast("memory.recall", {"query": "cache"})],
+        )
+
+        def parse(completions):
+            return [
+                parser_record(completion, self.example.ops, line=line)
+                for line, completion in enumerate(completions, 1)
+            ]
+
+        parser = patch.object(self.validator, "parse", side_effect=parse)
+        parser.start()
+        self.addCleanup(parser.stop)
+        self.write()
+        self.previous = self.files(self.out)
+        self.example.prompt = "Recall stored cache"
+
+    def write(self):
+        synth.write_dataset(
+            self.out, [self.example], self.validator, self.schemas, {},
+            self.splits, {}, {}, None,
+        )
+
+    def files(self, directory):
+        return {path.name: path.read_bytes() for path in directory.iterdir()}
+
+    def test_failed_replacement_and_restore_preserves_backup(self):
+        rename = Path.rename
+        backups = []
+
+        def fail_replacement_and_restore(source, destination):
+            if source == self.out:
+                backups.append(Path(destination))
+                return rename(source, destination)
+            raise OSError("replacement or restore refused")
+
+        with patch.object(Path, "rename", new=fail_replacement_and_restore):
+            with self.assertRaises((OSError, synth.CurationError)) as raised:
+                self.write()
+        self.assertEqual(len(backups), 1)
+        backup = backups[0]
+        self.assertTrue(backup.is_dir(), "Previous dataset was deleted")
+        self.assertEqual(self.files(backup), self.previous)
+        self.assertEqual(backup.parent, self.root)
+        self.assertIsInstance(raised.exception, synth.CurationError)
+        self.assertIn(str(backup), str(raised.exception))
+        self.assertEqual(set(self.root.iterdir()), {backup})
+
+    def test_successful_replacement_removes_backup(self):
+        self.write()
+        self.assertNotEqual(self.files(self.out), self.previous)
+        self.assertIn(b"Recall stored cache", (self.out / "train.jsonl").read_bytes())
+        self.assertEqual(set(self.root.iterdir()), {self.out})
+
+    def test_failed_replacement_restores_previous_dataset(self):
+        rename = Path.rename
+
+        def fail_replacement(source, destination):
+            if source.name == "dataset" and source != self.out:
+                raise OSError("replacement refused")
+            return rename(source, destination)
+
+        with patch.object(Path, "rename", new=fail_replacement):
+            with self.assertRaisesRegex(OSError, "replacement refused"):
+                self.write()
+        self.assertEqual(self.files(self.out), self.previous)
+        self.assertEqual(set(self.root.iterdir()), {self.out})
+
+
 class RealParserTests(unittest.TestCase):
     def setUp(self):
         if not VALIDATOR:
@@ -809,12 +889,14 @@ class RealParserTests(unittest.TestCase):
                 synth.write_dataset(
                     out, [example], self.validator, schemas, {}, splits, {}, {}, None
                 )
+            backup_name = calls[0][1]
+            self.assertTrue(backup_name.startswith("dataset.previous-"))
             self.assertEqual(
                 calls,
                 [
-                    ("dataset", "previous"),
+                    ("dataset", backup_name),
                     ("dataset", "dataset"),
-                    ("previous", "dataset"),
+                    (backup_name, "dataset"),
                 ],
             )
             self.assertTrue(out.is_dir(), "Previous dataset directory was not restored")
