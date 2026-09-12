@@ -20,6 +20,7 @@ import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1621,15 +1622,23 @@ def write_dataset(
         if (stage / "CURATION.md").read_text() != report:
             raise CurationError("Curation report readback mismatch")
         # All files pass before an existing, dedicated data directory is replaced.
-        backup = Path(temporary) / "previous"
+        backup = None
         if out.exists():
+            backup = out.with_name(out.name + ".previous-" + uuid.uuid4().hex)
             out.rename(backup)
         try:
             stage.rename(out)
         except OSError:
-            if backup.exists():
-                backup.rename(out)
+            if backup is not None:
+                try:
+                    backup.rename(out)
+                except OSError as error:
+                    raise CurationError(
+                        f"Dataset replacement and restore failed; previous dataset preserved at {backup}"
+                    ) from error
             raise
+        if backup is not None:
+            shutil.rmtree(backup)
     return Counter(example.split for example in ordered)
 
 
