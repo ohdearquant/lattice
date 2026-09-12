@@ -147,6 +147,10 @@ path = "crates/inference/examples/ernie45_trace_dump.rs"
 reason = "Correctness instrument: dumps forward-pass activations as raw f32 for offline diffing against the HF reference archive; no timing."
 
 [[non_measurement_surface]]
+path = "crates/inference/examples/load_cross_encoder.rs"
+reason = "Checkpoint identity probe: loads a cross-encoder directory and prints a load-or-error marker so the pinned-checkpoint check can tell the two apart; no timing, no Criterion, no Metal dispatch."
+
+[[non_measurement_surface]]
 path = "crates/inference/src/bin/chat_metal.rs"
 reason = "Long-running interactive product process; process-lifetime, not a finite measurement harness (see metal_measurement_lock_contract.rs long-running exemptions)."
 
