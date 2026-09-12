@@ -330,6 +330,17 @@ path = "scripts/fake_quant_pilot.py"
 role = "measurement"
 supervision = "both-locks+quiet"
 
+# Phase driver for the routing-quality experiment (crates/tune/examples/prompt_router.md,
+# "Response quality under routing"). It trains, generates, and routes, and writes a
+# per-phase receipt with start/end machine conditions and wall-clock elapsed time as
+# provenance; the doc declares every such time informational and never a benchmark
+# verdict. The elapsed field is what the discovery regex matched. Not a measurement
+# entry point: no benchmark is run and no timing is compared or gated.
+[[entry]]
+path = "scripts/microlora/w6_phase.sh"
+role = "consumer"
+supervision = "none"
+
 # Only `--run` is a measurement entry point and self-supervises. `--checkpoint`
 # is a bench-compare-internal gate that inherits bench-compare's held locks.
 [[entry]]
