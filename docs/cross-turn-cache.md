@@ -24,8 +24,8 @@ cancel-aware cache methods** on a single sticky `CrossTurnSlotId::DEFAULT` slot,
 single-worker, single-model binary: its one Metal state, on its one worker thread, calling
 `chat_completion_streaming_with_prefix_cache_and_cancel` instead of unconditionally
 `reset_state()` + `chat_completion_streaming_with_cancel` before every request. A request whose
-messages are not an append onto the currently retained entry (a new conversation, edited history,
-or a second client's unrelated prompt interleaved onto the same slot) still falls back to
+messages neither safely append to the retained entry nor share a valid retained checkpoint
+(for example, an unrelated prompt interleaved onto the same slot) still falls back to
 `FullRefill` — honestly, never incorrectly — exactly like every other cache-miss case in this
 document. Cache stats (`slot`, `prompt_tokens`, `reused_tokens`, `mode`) are logged to stderr per
 request; there is no response-surface (HTTP header/JSON field/SSE event) telemetry yet.
@@ -39,8 +39,8 @@ as vision is routed to `generate_multimodal_vision_with_cancel` and returns befo
 cache-aware call is ever reached (`crates/inference/src/serve/metal_worker.rs`), so image
 requests do not participate in the cross-turn cache. `POST /v1/chat/completions` no
 longer re-prefills the entire prompt from scratch when a text turn is a safe append onto the
-previous one — the same `FullRefill` fallback applies for a new conversation, edited history, or
-an interleaved second client on the same slot. Cache stats (`mode`, `reused_tokens`,
+previous one — an edited history can also replay from a retained checkpoint; without either
+reuse path, the same `FullRefill` fallback applies. Cache stats (`mode`, `reused_tokens`,
 `prefetched_tokens`, `prompt_tokens`) are logged to stderr per request, matching `lattice_serve`'s
 telemetry. This path now has client-disconnect cancellation (ADR-080 C2, issue #744), the same as
 `lattice_serve`'s `_and_cancel` variant — the two binaries no longer differ here.
@@ -51,13 +51,13 @@ document is only about the library-level cache, not the HTTP surface.
 The underlying cache remains a **single-entry** store (see below) — safe for one interactive
 process (or one sticky server slot) talking to one conversation at a time, but a server handling
 several simultaneous, genuinely interleaved conversations will still see the later ones evict the
-earlier ones' retained state, forcing a full re-prefill rather than corrupting anything. Making the
+earlier ones' retained state, forcing a full re-prefill unless a valid shared checkpoint remains. Making the
 cache itself safe for concurrent multi-session residency (a bounded multi-entry store with proven
 KV/GDN ownership) is called out explicitly as follow-up work, not something already done.
 
 So: if you're calling `lattice_serve`'s or `lattice serve`'s HTTP API from one active conversation
 at a time, this cache now helps you; if several conversations interleave through either, expect
-honest fallback to full re-prefill for whichever conversation was not most recently active. The
+honest fallback to full re-prefill when no valid shared checkpoint remains in the retained entry. The
 rest of this document covers exactly what "safely extends" means and where the sharp edges are.
 
 ## The library API
@@ -115,7 +115,7 @@ non-cached `chat_completion_streaming`) — it formats the ChatML prompt interna
 You no longer need to call `reset_state()` yourself before each turn. The old pattern —
 `metal.reset_state(); metal.chat_completion_streaming(&history, ...)` — becomes just
 `metal.chat_completion_streaming_with_prefix_cache(slot_id, &history, ...)`. A first request, a
-divergent/edited history, an adapter change, or any other case where reuse isn't safe falls back
+divergent history with no valid checkpoint, an adapter change, or any other unsafe reuse case falls back
 to a full internal reset-and-reprefill on its own — you don't need to detect that yourself.
 
 ### Reading what happened: `CachedGenerateOutput` / `CachedChatCompletionOutput`
@@ -167,15 +167,19 @@ pub enum PrefixReuseMode {
     /// snapshot is taken at that same boundary — reuse it verbatim.
     ExactAppend,
     /// Reuse only up to an earlier exact GDN checkpoint, then replay/prefill
-    /// forward. v2: no v1 caller currently supplies checkpoints, so this
-    /// variant is never produced by the current Metal integration.
+    /// forward. Produced when the Metal integration retains sparse GDN
+    /// checkpoints at prior turn boundaries (#590) and the new prompt
+    /// diverges mid-history at or after one of them.
     ReplayFromCheckpoint { checkpoint_len: usize },
 }
 ```
 
-In practice, with today's callers, you will only ever see `FullRefill` or `ExactAppend`.
-`ReplayFromCheckpoint` exists in the type for a planned sparse-checkpoint extension but nothing in
-the current Metal integration produces it — don't design around it yet.
+`plan_prefix_reuse` in `crates/inference/src/kv_cache/cross_turn.rs` selects
+`ReplayFromCheckpoint { checkpoint_len }` when the new prompt diverges at or after an exact,
+retained sparse GDN checkpoint boundary — the deepest valid one wins. In
+`crates/inference/src/forward/metal_qwen35.rs`, `plan_cross_turn_reuse` supplies those boundaries;
+`restore_cross_turn_prefix` restores the checkpoint's GDN state, then the Metal path prefills
+from `checkpoint_len`. Divergence with no valid checkpoint falls back to `FullRefill`.
 
 ## What makes a turn "safely extend" the previous one
 
@@ -187,8 +191,8 @@ The planner (`plan_prefix_reuse` in `kv_cache::cross_turn`) only ever claims `Ex
 2. That shared prefix covers the entry's _entire_ represented length (partial mid-history reuse
    without an explicit checkpoint isn't attempted).
 3. The new prompt actually has a nonempty suffix beyond that shared prefix — an exact repeat of
-   the previous prompt with nothing new falls back to `FullRefill` rather than treating a
-   zero-length suffix as a (disallowed) no-op prefill.
+   the previous prompt cannot use `ExactAppend`; replay from an earlier valid checkpoint can
+   supply a nonempty suffix, otherwise the request falls back to `FullRefill`.
 4. A `CrossTurnPrefixMetadata` fingerprint matches exactly between the retained entry and the
    current request:
 
@@ -209,8 +213,8 @@ pub struct CrossTurnPrefixMetadata {
 
 Any mismatch — a different loaded model, a different tokenizer, a LoRA adapter swapped in or out,
 a different KV dtype, RoPE configuration, layer pattern, or chat template version — invalidates
-the entry and forces `FullRefill`. This is deliberately conservative: the module's own doc comment
-puts it as "any divergence falls back to `PrefixReuseMode::FullRefill`" — decline-beats-fabricate
+the entry and forces `FullRefill`. This is deliberately conservative: divergence without a usable
+checkpoint also falls back to `FullRefill` — decline-beats-fabricate
 for token-identity correctness. You do not get a wrong-but-fast answer; you get a slow-but-correct
 one.
 
@@ -219,8 +223,8 @@ Practical implications for structuring a conversation to actually benefit:
 - **Only append to history; don't edit or delete earlier turns.** Editing an earlier user message
   or regenerating an earlier assistant turn changes the token sequence at a position before the
   end, so the longest-common-prefix against the retained entry stops at the edit point (or
-  becomes 0 if the edit is near the start) — every turn after an edit pays a full re-prefill until
-  the next unedited extension.
+  becomes 0 if the edit is near the start) — reuse stops at the deepest valid retained checkpoint
+  at or before that point; without one, the edited turn pays a full re-prefill.
 - **Don't interleave unrelated conversations through the same slot.** See the next section — a
   second conversation on the same slot doesn't get its own separate cache entry, it evicts the
   first one's.
@@ -239,10 +243,10 @@ that's the isolation guarantee. But it also means: if you generate on slot A, th
 slot A again, that third call is a full refill — slot B's generation evicted slot A's entry, it
 did not get its own independent storage alongside it. If your process genuinely interleaves
 multiple concurrent conversations through one `MetalQwen35State`, only the most recently generated
-one benefits from caching at any given moment; the others pay full re-prefill every time they get
-a turn. This is the multi-session thrash a single shared worker sees when several simultaneous
-chats share one sticky slot, as `lattice_serve` and `lattice serve` both now do: correct (a losing
-conversation just gets an honest full re-prefill) but not the multi-session residency a bounded
+entry is available for reuse; a different slot always misses, while the same slot can replay
+from a valid shared checkpoint. This is the multi-session thrash a single shared worker sees when
+several simultaneous chats share one sticky slot, as `lattice_serve` and `lattice serve` both now
+do: correct (no usable checkpoint means a full re-prefill) but not the multi-session residency a bounded
 multi-entry cache would give.
 
 PR #516 originally considered an unbounded per-slot map, but the underlying full-attention KV
@@ -320,15 +324,15 @@ the fallback path alone, and a dedicated Criterion bench,
 
 - The cache is reachable today through direct `MetalQwen35State` calls, `chat_metal`,
   `lattice_serve`, and `lattice serve` (the OpenAI-compatible HTTP server in `lattice.rs`) — all on
-  a sticky `CrossTurnSlotId::DEFAULT` slot, with honest full-refill fallback on any mismatch.
+  a sticky `CrossTurnSlotId::DEFAULT` slot, with honest full-refill fallback when reuse isn't safe.
 - Use `CrossTurnSlotId::DEFAULT` for a single local conversation; only one entry is ever retained
   process-wide, so multiplexing several conversations through distinct slot IDs on one
   `MetalQwen35State` does not give each of them independent caching — the most recent one wins and
   evicts the rest.
 - Reuse requires an exact token-prefix match plus an exact match on a ten-field fingerprint
   (model, tokenizer, adapter, vocab, cache length, KV dtype, RoPE config, layer pattern, chat
-  template version). Any mismatch, or any edit to earlier conversation turns, forces a full
-  re-prefill rather than a wrong answer.
+  template version). A fingerprint mismatch forces a full re-prefill; an edit to earlier turns
+  can replay from a valid retained checkpoint, otherwise it also forces a full re-prefill.
 - Check `cache.mode` and `cache.reused_tokens` on the returned `Cached*Output` (or the
   `chat_metal` stderr log line) to confirm reuse actually happened — don't assume it did just
   because you called the `_with_prefix_cache` method.
