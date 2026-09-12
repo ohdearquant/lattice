@@ -1,6 +1,7 @@
 fixture_model=Qwen/Qwen3.5-0.8B
 fixture_data=tests/fixtures/layer23_golden_v2/train.jsonl
-command=train_grad_layer23 --model-dir "$LATTICE_MODEL_DIR" --data-dir crates/tune/tests/fixtures/layer23_golden_v1 --steps 1 --lr 1e-3 --rank 1 --alpha 2 --seq-len 32 --max-train 1 --log-every 1 --save w6/golden_v2/legacy_adapter.safetensors
+command=train_grad_layer23 --model-dir "$LATTICE_MODEL_DIR" --data-dir crates/tune/tests/fixtures/layer23_golden_v2 --steps 1 --lr 1e-3 --rank 1 --alpha 2 --seq-len 32 --max-train 1 --log-every 1 --save legacy_adapter.safetensors
+regenerated=at the #1545 loader (separate prompt/completion tokenization, supervised EOS); the producing run read a byte-identical copy of this directory's train.jsonl
 seed=0xFEED_FACE
 a_init_amp=0.02
 tbv_model_nll=4.73580

@@ -263,7 +263,11 @@ fn compatibility_shim_matches_layer23_golden() {
         fd_eps: 4e-3,
         save_path: None,
         a_init_amp: Some(0.02),
-        // Preserve the original bridge's coverage of every GDN projection.
+        // `All`, not the default, and deliberately: pin the gradient check to
+        // every GDN projection so its comparison subject stays fixed. If layer
+        // 23 carries no GDN slot in this fixture the choice is inert, which is
+        // also fine -- what it must never be is a silent change to what is
+        // being compared.
         gdn_modules: lattice_tune::lora::train_core::GdnModuleSelection::All,
     })
     .unwrap();
