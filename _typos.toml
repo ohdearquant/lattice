@@ -43,5 +43,6 @@ pn = "pn"       # Metal shader-source string literal variable name
 abd = "abd"     # JSON-schema grammar const-string test fixtures ("abc"/"abd"/"abe")
 fo = "fo"       # truncated-string grammar rejection test ("fo"/"foo"/"food")
 hel = "hel"     # tokenizer BPE merge-algorithm test fixture ("hel" + "l" -> "hell")
+memor = "memor" # merge-chain fragment preceding ".memory" in the tune loader's boundary test fixture
 transfor = "transfor" # progressive-substring bench label building up to "transform"
 artic = "artic"       # progressive-substring bench label building up to "artificial"
