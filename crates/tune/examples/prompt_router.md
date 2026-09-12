@@ -49,3 +49,47 @@ Report real and shuffled accuracy together with class balance, source provenance
 seed policy, model/dimension, and a lexical baseline when domain phrasing might
 explain separation. Preserve failures: a failed real arm is a valid negative
 result, while a successful shuffled classifier invalidates the interpretation.
+
+## Recorded measurements
+
+These local corpora are not committed. All use the classifier and feedback settings
+above, with 160 training and 50 test prompts per label. Bag-of-words (BoW) controls
+use train-only vocabulary and logistic weights on normalized token counts.
+
+Corpus A pairs public-history commit-message prompts containing wrapped diffs with
+curated request prompts, preserving source split boundaries. Its four-word opening
+census found 48 request openings and one commit opening across 210 commit rows.
+The `repo:` prefix rule scores 420/420 across both splits: this corpus is degenerate.
+Train-only BoW scores 100/100; real / shuffled accuracy is 100/100 / 48/100, with
+majority floor .50. No embedding-value claim follows from this template-driven ceiling.
+
+Corpus B pairs memory requests with task-management requests, assigning whole verbs
+to disjoint train/test splits: remember is held out for memory, complete for tasks.
+Family-qualified verb tokens and bare family names were stripped to remove explicit
+label leakage; other vocabulary remains. The unstripped run was confounded by label
+tokens and is not reported here. The stripped census found 17 / 29 four-word openings
+by label, with 4 shared openings covering 306/420 rows. The train-only opening-majority
+rule scores 47/100; train-only BoW scores 50/100. Real / shuffled accuracy is
+88/100 / 52/100, with majority floor .50.
+
+Corpus C pairs brain requests with session requests using the same stripping protocol
+to remove explicit family labels. Whole verbs are held out between train and test:
+register adapter and unbind for brain, export for session. Its census found 31 / 22
+four-word openings, with 2 shared openings covering 131 / 101 rows. The train-only
+opening-majority rule scores 64/100; train-only BoW scores 76/100. Effective held-out
+templates are 6 brain and 7 session normalized skeletons, masking quoted literals,
+UUIDs, numbers and hashes while retaining export formats; these are operational counts,
+not proof of independence. Real / shuffled accuracy is 99/100 / 47/100, floor 50/100.
+All BoW misses are 24 of the 25 held-out register adapter rows. Their content words
+(register, adapter, weights, hash, revision, base, supplied, against) never occur in
+training prompts; a separate logistic model on embeddings places 24 of the 25 correctly.
+
+All corpora reversed selection to the initially unselected adapter after 16 feedback
+events, with replay accuracy 1.0 and an unchanged no-update counterfactual. Both
+opening-majority rules resolve ties and unseen openings to label zero.
+
+Limits: generated phrasing and residual vocabulary, one split and one seed per corpus.
+Test rows are template-generated, so row count overstates the evidence, including for
+A and B; effective test size is the template count, not the row count. Opening counts
+are not template counts. Single-call timings are observational, without a prefill
+comparison. No response quality was measured, and these results support no routing decision.
