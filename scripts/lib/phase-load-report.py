@@ -34,6 +34,8 @@ def main() -> int:
     ap.add_argument("--arm", required=True)
     ap.add_argument("--in", dest="input", required=True)
     ap.add_argument("--floor", type=float, default=70.0)
+    ap.add_argument("--jsonl-out", type=Path,
+                    help="Append this arm's structured load verdict for status consumers")
     args = ap.parse_args()
 
     path = Path(args.input)
@@ -63,6 +65,20 @@ def main() -> int:
     ceiling = 100.0 - args.floor
     loud = max(foreign) > ceiling
     verdict = "LOUD" if loud else "ok"
+    if args.jsonl_out is not None:
+        try:
+            with args.jsonl_out.open("a", encoding="utf-8") as output:
+                output.write(json.dumps({
+                    "schema": "perf-phase-load/v1",
+                    "arm": args.arm,
+                    "verdict": verdict,
+                    "foreign_max_pct": max(foreign),
+                    "floor_pct": args.floor,
+                }, allow_nan=False) + "\n")
+        except (OSError, ValueError) as error:
+            print(f"[phase-load] {args.arm}: cannot record load verdict: {error}",
+                  file=sys.stderr)
+            return 2
     print(
         f"[phase-load] {args.arm}: samples={len(records)} "
         f"idle min/mean={min(idle):.1f}%/{sum(idle) / len(idle):.1f}% "

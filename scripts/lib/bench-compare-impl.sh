@@ -358,8 +358,12 @@ phase_sampler_start() {
 phase_gate() {
   local arm="$1" outfile line rc=0
   outfile="$(phase_load_file "$arm")"
+  local report_args=(--arm "$arm" --in "$outfile" --floor "${BENCH_IDLE_FLOOR:-70}")
+  if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
+    report_args+=(--jsonl-out "$PHASE_LOAD_STATUS_FILE")
+  fi
   line="$("$PYTHON_BIN" "$REPO/scripts/lib/phase-load-report.py" \
-    --arm "$arm" --in "$outfile" --floor "${BENCH_IDLE_FLOOR:-70}")" || rc=$?
+    "${report_args[@]}")" || rc=$?
   rm -f "${outfile}.ready"
   echo "$line"
   PHASE_LOAD_SAMPLES="${PHASE_LOAD_SAMPLES}${PHASE_LOAD_SAMPLES:+
@@ -389,6 +393,11 @@ if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
   AMBIENT_SAMPLES_FILE="$PERF_POSTMERGE_STATUS_DIR/ambient-samples.jsonl"
   if ! { : > "$AMBIENT_SAMPLES_FILE"; } 2>/dev/null; then
     printf 'bench-compare: FATAL: cannot create %s\n' "$AMBIENT_SAMPLES_FILE" >&2 || :
+    exit 2
+  fi
+  PHASE_LOAD_STATUS_FILE="$PERF_POSTMERGE_STATUS_DIR/phase-load-summaries.jsonl"
+  if ! { : > "$PHASE_LOAD_STATUS_FILE"; } 2>/dev/null; then
+    printf 'bench-compare: FATAL: cannot create %s\n' "$PHASE_LOAD_STATUS_FILE" >&2 || :
     exit 2
   fi
 fi
@@ -1169,6 +1178,7 @@ run_target_gate() {
       local status_name="${target//[:\/]/-}"
       gate_args+=(
         --ambient-samples "$AMBIENT_SAMPLES_FILE"
+        --phase-load-summaries "$PHASE_LOAD_STATUS_FILE"
         --status-out "$PERF_POSTMERGE_STATUS_DIR/$status_name.json"
       )
     fi

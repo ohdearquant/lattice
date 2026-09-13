@@ -56,7 +56,7 @@ def _samples(path: Path, values: dict[str, float], extras=()) -> None:
     path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
 
-def _run(root: Path, samples: Path, status: Path, target: str) -> subprocess.CompletedProcess:
+def _run(root: Path, samples: Path, status: Path, target: str, extra_args=()) -> subprocess.CompletedProcess:
     return subprocess.run(
         [
             "python3",
@@ -70,6 +70,7 @@ def _run(root: Path, samples: Path, status: Path, target: str) -> subprocess.Com
             str(samples),
             "--status-out",
             str(status),
+            *extra_args,
         ],
         text=True,
         capture_output=True,
@@ -77,6 +78,49 @@ def _run(root: Path, samples: Path, status: Path, target: str) -> subprocess.Com
 
 
 class PerfBenchGateStatusTests(unittest.TestCase):
+    def test_phase_load_is_optional_and_invalid_streams_are_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "pass", 0.0)
+            samples = root / "ambient.jsonl"
+            _samples(samples, {phase: 100.0 for phase in PHASES})
+            status = root / "status.json"
+            result = _run(criterion, samples, status, "lattice-inference:fixture")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            legacy = json.loads(status.read_text())
+            self.assertNotIn("phase_load", legacy)
+            self.assertNotIn("phase_load_verdict", legacy)
+            valid = [
+                {"schema": "perf-phase-load/v1", "arm": arm, "verdict": "ok",
+                 "foreign_max_pct": 0.0, "floor_pct": 70.0}
+                for arm in ("base1", "head1", "head2", "base2")
+            ]
+            cases = {
+                "missing": None,
+                "empty": [],
+                "incomplete": valid[:3],
+                "duplicate": [valid[0], valid[0], *valid[2:]],
+                "malformed": "{broken}",
+                "contradictory": [{**valid[0], "foreign_max_pct": 45.0}, *valid[1:]],
+                "nonfinite": [{**valid[0], "foreign_max_pct": float("nan")}, *valid[1:]],
+                "overflow": [{**valid[0], "foreign_max_pct": 10 ** 400}, *valid[1:]],
+                "wrong-floor": [{**valid[0], "floor_pct": 0.0}, *valid[1:]],
+            }
+            for name, records in cases.items():
+                with self.subTest(name=name):
+                    stream = root / f"{name}.jsonl"
+                    if records is not None:
+                        stream.write_text(records if isinstance(records, str) else
+                                          "".join(json.dumps(r) + "\n" for r in records))
+                    result = _run(criterion, samples, status, "lattice-inference:fixture",
+                                  ["--phase-load-summaries", str(stream)])
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    payload = json.loads(status.read_text())
+                    self.assertEqual(payload["verdict"], "error")
+                    self.assertEqual(payload["exit_code"], 2)
+                    self.assertEqual(payload["ambient"], legacy["ambient"])
+                    self.assertNotIn("phase_load_verdict", payload)
+
     def test_single_abba_block_cannot_detect_sign_changing_order_effects(
         self,
     ) -> None:
