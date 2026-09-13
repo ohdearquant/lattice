@@ -53,6 +53,11 @@ writes an atomic perf-bench-gate-status/v1 document. Ambient refusal is checked
 before the final exit/status verdict, so exit 3 outranks pass or regression for
 every target in the run. Excessive order bias is the other exit-3 cause.
 
+With --phase-load-summaries, status also carries four ordered phase_load entries
+and phase_load_verdict (ok or LOUD). This records in-phase contamination without
+changing existing verdicts or boundary samples. The fields are absent on legacy
+calls without the option; absence is not evidence of quiet in-phase conditions.
+
 --informational-target: bench-compare isolates each bench target in its own
 Criterion output root and passes that root's exact key through --target. A
 reviewed caller policy may mark that same key informational: the quick-mode
@@ -303,6 +308,46 @@ def assess_ambient_samples(path: Path | None, floor_pct: float) -> AmbientAssess
     return AmbientAssessment(samples, floor_pct, "valid")
 
 
+def load_phase_load_summaries(path: Path, floor_pct: float) -> list[dict]:
+    """Read a complete ABBA verdict stream; never certify absent instrumentation."""
+    records = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                records.append(json.loads(line))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read in-phase load summaries: {error}") from error
+    if len(records) != len(PHASE_LOAD_ARMS):
+        raise ValueError("in-phase load summaries require exactly four ABBA arms")
+    summaries = []
+    for arm, record in zip(PHASE_LOAD_ARMS, records):
+        if (not isinstance(record, dict)
+                or record.get("schema") != "perf-phase-load/v1"
+                or record.get("arm") != arm):
+            raise ValueError(f"invalid in-phase load summary for {arm}")
+        foreign = record.get("foreign_max_pct")
+        floor = record.get("floor_pct")
+        try:
+            finite_foreign = math.isfinite(foreign)
+        except (TypeError, OverflowError):
+            finite_foreign = False
+        if (isinstance(foreign, bool) or not isinstance(foreign, (int, float))
+                or not finite_foreign or foreign < 0
+                or isinstance(floor, bool) or not isinstance(floor, (int, float))
+                or floor != floor_pct):
+            raise ValueError(f"invalid in-phase load figures for {arm}")
+        verdict = record.get("verdict")
+        if verdict != ("LOUD" if foreign > 100.0 - floor else "ok"):
+            raise ValueError(f"inconsistent in-phase load verdict for {arm}")
+        summaries.append({
+            "arm": arm,
+            "verdict": verdict,
+            "foreign_max_pct": foreign,
+            "floor_pct": floor,
+        })
+    return summaries
+
+
 def write_gate_status(
     path: Path,
     *,
@@ -312,6 +357,7 @@ def write_gate_status(
     exit_code: int,
     reason: str,
     ambient: AmbientAssessment | None,
+    phase_load: list[dict] | None = None,
     measurement_count: int | None = None,
     regression_count: int | None = None,
 ) -> None:
@@ -340,6 +386,11 @@ def write_gate_status(
         payload["measurement_count"] = measurement_count
     if regression_count is not None:
         payload["regression_count"] = regression_count
+    if phase_load is not None:
+        payload["phase_load"] = phase_load
+        payload["phase_load_verdict"] = (
+            "LOUD" if any(arm["verdict"] == "LOUD" for arm in phase_load) else "ok"
+        )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -3106,6 +3157,10 @@ def main() -> int:
                          "reading on a valid stream exits 3.")
     ap.add_argument("--status-out", type=Path,
                     help="Atomically write pass/regression/error/not_measurable JSON.")
+    ap.add_argument("--phase-load-summaries", type=Path,
+                    help="Optional ABBA load-verdict JSONL; requires --status-out. "
+                         "Records phase_load and phase_load_verdict without changing "
+                         "the performance verdict or boundary assessment.")
     ap.add_argument("--prepare-head", action="store_true",
                     help="Before a head measurement, remove only new/ and change/ siblings "
                          "of benches in the exact selected baseline set. The root must be a "
@@ -3189,8 +3244,12 @@ def main() -> int:
     if args.ambient_samples is not None and args.status_out is None:
         print("error: --ambient-samples requires --status-out", file=sys.stderr)
         return EXIT_ERROR
+    if args.phase_load_summaries is not None and args.status_out is None:
+        print("error: --phase-load-summaries requires --status-out", file=sys.stderr)
+        return EXIT_ERROR
 
     ambient: AmbientAssessment | None = None
+    phase_load: list[dict] | None = None
 
     def finish(
         verdict: str,
@@ -3211,6 +3270,7 @@ def main() -> int:
                 exit_code=exit_code,
                 reason=reason,
                 ambient=ambient,
+                phase_load=phase_load,
                 measurement_count=measurement_count,
                 regression_count=regression_count,
             )
@@ -3229,6 +3289,12 @@ def main() -> int:
             print(f"error: {error}", file=sys.stderr)
             return finish("error", EXIT_ERROR, str(error))
         ambient = assess_ambient_samples(args.ambient_samples, floor_pct)
+        if args.phase_load_summaries is not None:
+            try:
+                phase_load = load_phase_load_summaries(args.phase_load_summaries, floor_pct)
+            except ValueError as error:
+                print(f"error: {error}", file=sys.stderr)
+                return finish("error", EXIT_ERROR, str(error))
 
     require_measurements = args.require_measurements or args.status_out is not None
 

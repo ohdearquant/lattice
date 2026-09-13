@@ -15,6 +15,7 @@ stub `cargo` on PATH that exits 0 and prints no measurement lines — exactly th
 shape that used to pass.
 """
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -158,6 +159,20 @@ with open(out, "a", encoding="utf-8") as fh:
     while True:
         time.sleep(0.05)
 """
+
+
+STUB_QUIET_STATUS_PROBE = (
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "label = sys.argv[sys.argv.index('--label') + 1]\n"
+        "phase = sys.argv[sys.argv.index('--phase') + 1]\n"
+        "if '--jsonl-out' in sys.argv:\n"
+        "    path = sys.argv[sys.argv.index('--jsonl-out') + 1]\n"
+        "    with open(path, 'a') as out:\n"
+        "        out.write(json.dumps({'schema': 'perf-ambient-sample/v1', "
+        "'phase': phase, 'idle_pct': 100.0}) + '\\n')\n"
+        "print(f'[quiet] {label}: idle 100.0% (floor 70.0%) ok | top: fixture 0.0%')\n"
+)
 
 # Never touches `.ready` for the arm named by DEAD_ARM: a genuinely dead
 # instrument, one that never even signaled it started. Writes `.ready` (and
@@ -530,6 +545,7 @@ def _run(
     emit_criterion_home=False,
     stub_machine_state=None,
     stub_phase_sampler=None,
+    stub_quiet_probe=None,
     post_run=None,
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
@@ -551,6 +567,7 @@ def _run(
             "import sys\n"
             "label = sys.argv[sys.argv.index('--label') + 1]\n"
             "print(f'[quiet] {label}: idle 100.0% (floor 0.0%) ok | top: fixture 0.0%')\n"
+            if stub_quiet_probe is None else stub_quiet_probe
         )
         machine_probe = root / "scripts" / "lib" / "machine-state-probe.py"
         machine_probe.write_text(
@@ -1839,6 +1856,68 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertIn("gate reported a confirmed regression", result.stderr)
         self.assertNotIn("**ℹ️ 1 informational**", result.stdout)
 
+
+    def test_status_records_loud_arm_with_quiet_boundaries(self):
+        documents = {}
+        for foreign_pct in (45, 0):
+            with self.subTest(foreign_pct=foreign_pct):
+                with tempfile.TemporaryDirectory() as status_tmp:
+                    result = _run(
+                        ["--fail-on-regression"],
+                        stub_cargo=STALE_CHANGE_CARGO,
+                        stub_phase_sampler=STUB_PHASE_SAMPLER_LOUD_ON_ONE_ARM,
+                        stub_quiet_probe=STUB_QUIET_STATUS_PROBE,
+                        extra_env={
+                            "PERF_POSTMERGE_STATUS_DIR": status_tmp,
+                            "LOUD_ARM": "head1",
+                            "LOUD_FOREIGN_PCT": str(foreign_pct),
+                            "BENCH_IDLE_FLOOR": "70",
+                        },
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    statuses = sorted(Path(status_tmp).glob("*.json"))
+                    self.assertEqual(len(statuses), 2, result.stdout + result.stderr)
+                    documents[foreign_pct] = [json.loads(p.read_text()) for p in statuses]
+                    for status in documents[foreign_pct]:
+                        self.assertEqual(
+                            status.get("phase_load_verdict"),
+                            "LOUD" if foreign_pct else "ok",
+                            status,
+                        )
+                        self.assertEqual(status["phase_load"], [
+                            {
+                                "arm": arm,
+                                "verdict": "LOUD" if arm == "head1" and foreign_pct else "ok",
+                                "foreign_max_pct": float(foreign_pct) if arm == "head1" else 0.0,
+                                "floor_pct": 70.0,
+                            }
+                            for arm in ("base1", "head1", "head2", "base2")
+                        ])
+                        self.assertEqual(status["ambient"]["assessment"], "valid")
+                        self.assertEqual(status["ambient"]["samples"], {
+                            phase: 100.0
+                            for phase in ("before", "between", "after")
+                        })
+        for quiet, loud in zip(documents[0], documents[45]):
+            for key in ("phase_load", "phase_load_verdict"):
+                quiet.pop(key)
+                loud.pop(key)
+            self.assertEqual(quiet, loud)
+
+    def test_interactive_last_loud_arm_still_refuses(self):
+        result = _run(
+            ["--fail-on-regression"],
+            stub_cargo=STALE_CHANGE_CARGO,
+            stub_phase_sampler=STUB_PHASE_SAMPLER_LOUD_ON_ONE_ARM,
+            extra_env={
+                "LOUD_ARM": "base2",
+                "LOUD_FOREIGN_PCT": "45",
+                "BENCH_IDLE_FLOOR": "70",
+            },
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("in-phase load during 'base2'", result.stderr)
+        self.assertNotIn("Done.", result.stdout)
 
     def test_loud_in_phase_load_refuses_the_run(self):
         """A stub sampler emitting 45% foreign load during head1 only must refuse.
