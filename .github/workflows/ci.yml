@@ -540,9 +540,11 @@ jobs:
       # grammar steps' convention; the exact-count grep guards against a silently
       # zero-matching filter the same way those steps do. The gating command writes
       # its log directly (no pipe) so its exit status gates on its own.
-      # The count is 5 since #854: the shared RMS-norm reduction tests
+      # The count is 6 since the fused_attention head_dim guard: its test
+      # validate_fused_kernel_shape_rejects_head_dim_other_than_128 and
+      # the two shared RMS-norm reduction tests
       # (flash_attention_rms_norm_uses_shared_reduction_helper,
-      # rms_norm_matches_pre_854_oracle_on_finite_input) live in this same
+      # rms_norm_matches_pre_854_oracle_on_finite_input) all live in this same
       # `forward::metal::` module and match the filter. Adding or removing a
       # test in that module requires updating this count in the same PR.
       - name: inference — metal-gpu fused_attention fail-closed gate (macOS only)
@@ -557,7 +559,7 @@ jobs:
             exit 1
           fi
           cat "$log"
-          grep -Eq '^test result: ok\. 5 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+          grep -Eq '^test result: ok\. 6 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # #1263: `compact_metal_candidate_path_applies_min_p` lives in the
       # `#[cfg(all(target_os = "macos", feature = "metal-gpu"))] mod inner`
       # module of metal_qwen35.rs, so the macOS metal-gpu clippy/build legs

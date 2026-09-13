@@ -106,6 +106,7 @@ kernel void fused_attention(
     constexpr uint FA_TILE_Q       = 4u;
     constexpr uint FA_TILE_K       = 16u;
     constexpr uint FA_SIMD_WIDTH   = 32u;
+    static_assert(FA_HEAD_DIM4 == FA_SIMD_WIDTH, "fused_attention maps one SIMD lane to one float4 of the head; head_dim must be 4 * FA_SIMD_WIDTH");
     constexpr uint FA_ROWS_PER_TG  = FA_TILE_Q * FA_GQA_GROUPS;
     constexpr uint FA_THREADS_PER_TG = FA_ROWS_PER_TG * FA_SIMD_WIDTH;
 
