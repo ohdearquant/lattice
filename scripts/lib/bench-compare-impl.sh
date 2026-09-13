@@ -21,6 +21,11 @@
 # Optional Criterion filters:
 #   BENCH_GROUPS_INFERENCE="rms_norm|gelu" scripts/bench-compare.sh
 #   BENCH_GROUPS_EMBED="simd_dot_product|int8_raw" scripts/bench-compare.sh
+# lattice#1515: each of the four ABBA arms is now sampled IN-PHASE (not just at
+# the three phase boundaries) for foreign (non-self) CPU load. Cadence is
+# PHASE_SAMPLE_INTERVAL seconds (default 5); the refusal ceiling is the same
+# BENCH_IDLE_FLOOR the boundary probes use (default 70, so ceiling 30% foreign):
+#   PHASE_SAMPLE_INTERVAL=10 BENCH_IDLE_FLOOR=60 scripts/bench-compare.sh
 # Optional bench target selection:
 #   BENCHES_EMBED="embeddings" CARGO_FEATURES_EMBED="native" scripts/bench-compare.sh
 # Unset filters run all groups in the default bench targets:
@@ -149,6 +154,7 @@ if [ -z "${PYTHON_BIN:-}" ]; then
 fi
 
 QUICK_FLAGS="--quick"  # adaptive two-point samples in each of four ABBA arms
+PHASE_SAMPLE_INTERVAL="${PHASE_SAMPLE_INTERVAL:-5}"
 RUN_STARTED_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 if [ -n "${BENCH_HOST_ID:-}" ]; then
   RUN_HOST_ID="configured:${BENCH_HOST_ID}"
@@ -292,6 +298,84 @@ quiet_gate() {
     echo "bench-compare: machine was not quiet at '$label' — refusing to" \
          "certify this A/B. Set BENCH_IDLE_FLOOR to judge against a" \
          "different floor, and say so wherever the numbers are quoted." >&2
+    exit 2
+  fi
+}
+
+# --- In-phase ambient-load sampling (lattice#1515) ---
+# quiet_gate above samples at three BOUNDARIES; a load that starts and ends
+# between two boundaries is invisible to all three by construction. These
+# helpers sample DURING each of the four measured arms instead. Started
+# immediately before an arm's first run_bench call and stopped by the EXIT
+# trap set inside phase_sampler_start, so both ordinary completion and an
+# early require_measured exit always stop and reap the sampler -- it never
+# races the next arm. phase_gate is called once per arm, after that arm's
+# subshell has already exited (so strictly after the sampler stopped),
+# never mid-arm.
+#
+# READINESS HANDSHAKE (Amendment 2, lattice#1515 CI): on a slower-to-schedule
+# Linux runner, an arm this short can end -- firing the EXIT trap's `kill` --
+# before the freshly-forked sampler's interpreter has reached
+# `signal.signal(SIGTERM, ...)`. The default SIGTERM action then terminates
+# it silently with zero samples, indistinguishable from a dead instrument.
+# The sampler now installs its handlers before anything else and touches
+# `<outfile>.ready` once they're live; phase_sampler_start polls for that
+# marker (100 x 0.1s = 10s budget) before returning, so a kill delivered
+# after phase_sampler_start returns is always handled. A marker that never
+# appears means the sampler failed to even start (crashed, missing
+# interpreter, etc.) -- an instrument fault, refused the same as a dead
+# sampler, never treated as a loud machine.
+PHASE_LOAD_ROOT="$REPO/.cache/bench-compare-criterion/phase-load"
+PHASE_LOAD_SAMPLES=""
+
+phase_load_file() {
+  printf '%s/%s.jsonl' "$PHASE_LOAD_ROOT" "$1"
+}
+
+phase_sampler_start() {
+  local arm="$1" outfile ready_file poll
+  mkdir -p "$PHASE_LOAD_ROOT"
+  outfile="$(phase_load_file "$arm")"
+  ready_file="${outfile}.ready"
+  : > "$outfile"
+  rm -f "$ready_file"
+  "$PYTHON_BIN" "$REPO/scripts/lib/phase-load-sampler.py" \
+    --arm "$arm" --self-pid "$$" --out "$outfile" \
+    --interval "$PHASE_SAMPLE_INTERVAL" &
+  local sampler_pid=$!
+  # shellcheck disable=SC2064 -- expand sampler_pid now, not at trap-fire time
+  trap "kill $sampler_pid 2>/dev/null || true; wait $sampler_pid 2>/dev/null || true" EXIT
+  for ((poll = 0; poll < 100; poll++)); do
+    if [ -f "$ready_file" ]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "bench-compare: in-phase sampler for '$arm' did not start" >&2
+  exit 2
+}
+
+phase_gate() {
+  local arm="$1" outfile line rc=0
+  outfile="$(phase_load_file "$arm")"
+  line="$("$PYTHON_BIN" "$REPO/scripts/lib/phase-load-report.py" \
+    --arm "$arm" --in "$outfile" --floor "${BENCH_IDLE_FLOOR:-70}")" || rc=$?
+  rm -f "${outfile}.ready"
+  echo "$line"
+  PHASE_LOAD_SAMPLES="${PHASE_LOAD_SAMPLES}${PHASE_LOAD_SAMPLES:+
+}$line"
+  if [ "$rc" -eq 2 ]; then
+    echo "bench-compare: in-phase sampler for '$arm' produced no usable samples" \
+         "— refusing to certify this A/B." >&2
+    exit 2
+  fi
+  if [ "$rc" -eq 1 ]; then
+    if [ -n "${PERF_POSTMERGE_STATUS_DIR:-}" ]; then
+      return 0
+    fi
+    echo "bench-compare: in-phase load during '$arm' exceeded the foreign-load" \
+         "ceiling — refusing to certify this A/B. Set BENCH_IDLE_FLOOR to judge" \
+         "against a different floor, and say so wherever the numbers are quoted." >&2
     exit 2
   fi
 }
@@ -660,7 +744,14 @@ BASE_PHASE_RC=0
   # tolerance is right for a human comparing against an old ref and wrong for
   # the enforcing lane, where "absent" and "failed to compile" arrive on the
   # same channel and one of them silently deletes half the comparison.
+  BASE_INFERENCE_PRESENT=0
   if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
+    BASE_INFERENCE_PRESENT=1
+  fi
+  # Sampler starts AFTER the --no-run build check: that build is self load
+  # anyway, but the window boundaries must be the measurement, not the build.
+  phase_sampler_start "base1"
+  if [ "$BASE_INFERENCE_PRESENT" = "1" ]; then
     if [ -n "$handoff_broker" ]; then
       run_bench "time:" env CRITERION_HOME="$BASE_INFERENCE_CRITERION_ROOT" \
         LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
@@ -683,6 +774,7 @@ BASE_PHASE_RC=0
 # `exit` inside `( ... )` leaves the SUBSHELL, so the status has to be caught
 # and re-raised here or the refusal above is itself swallowed.
 if [ "$BASE_PHASE_RC" -ne 0 ]; then exit "$BASE_PHASE_RC"; fi
+phase_gate "base1"
 
 # --- Copy base criterion data to HEAD's target ---
 echo ""
@@ -739,7 +831,12 @@ prepare_target_root \
 HEAD_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  HEAD_INFERENCE_PRESENT=0
   if cargo bench --locked -p lattice-inference --bench "$BENCHES_INFERENCE" ${CARGO_FEATURES_INFERENCE:+--features "$CARGO_FEATURES_INFERENCE"} --no-run 2>/dev/null; then
+    HEAD_INFERENCE_PRESENT=1
+  fi
+  phase_sampler_start "head1"
+  if [ "$HEAD_INFERENCE_PRESENT" = "1" ]; then
     if [ -n "$handoff_broker" ]; then
       run_bench "time:|change:" env CRITERION_HOME="$INFERENCE_CRITERION_ROOT" \
         LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
@@ -760,6 +857,7 @@ HEAD_PHASE_RC=0
   require_measured "head lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_PHASE_RC=$?
 if [ "$HEAD_PHASE_RC" -ne 0 ]; then exit "$HEAD_PHASE_RC"; fi
+phase_gate "head1"
 
 # The midpoint probe separates the two order strata. The enclosing lock
 # remains held throughout all four arms.
@@ -770,6 +868,7 @@ echo "--- Re-benching HEAD for reverse-order control ($HEAD_SHA) ---"
 HEAD_CONTROL_PHASE_RC=0
 (
   cd "$HEAD_DIR"
+  phase_sampler_start "head2"
   if [ -n "$handoff_broker" ]; then
     run_bench "time:" env CRITERION_HOME="$HEAD_CONTROL_INFERENCE_CRITERION_ROOT" \
       LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
@@ -786,6 +885,7 @@ HEAD_CONTROL_PHASE_RC=0
   require_measured "head control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || HEAD_CONTROL_PHASE_RC=$?
 if [ "$HEAD_CONTROL_PHASE_RC" -ne 0 ]; then exit "$HEAD_CONTROL_PHASE_RC"; fi
+phase_gate "head2"
 
 prepare_target_root \
   "lattice-inference:$BENCHES_INFERENCE reverse-order control" \
@@ -803,6 +903,7 @@ echo "--- Re-benching BASE for reverse-order control ($BASE_SHA) ---"
 BASE_CONTROL_PHASE_RC=0
 (
   cd "$WT"
+  phase_sampler_start "base2"
   if [ -n "$handoff_broker" ]; then
     run_bench "time:|change:" env CRITERION_HOME="$BASE_CONTROL_INFERENCE_CRITERION_ROOT" \
       LATTICE_GPU_HANDOFF_BROKER="$handoff_broker" \
@@ -819,6 +920,7 @@ BASE_CONTROL_PHASE_RC=0
   require_measured "base control lattice-embed:$BENCHES_EMBED" "$BENCH_RC" "$BENCH_LINES"
 ) || BASE_CONTROL_PHASE_RC=$?
 if [ "$BASE_CONTROL_PHASE_RC" -ne 0 ]; then exit "$BASE_CONTROL_PHASE_RC"; fi
+phase_gate "base2"
 
 quiet_gate "after final arm" "after"
 require_commit_clean_head
@@ -873,6 +975,9 @@ write_run_provenance() {
     while IFS= read -r line; do
       [ -n "$line" ] && printf 'machine_state=%s\n' "$line"
     done <<< "$MACHINE_STATE_SAMPLES"
+    while IFS= read -r line; do
+      [ -n "$line" ] && printf 'phase_load=%s\n' "$line"
+    done <<< "$PHASE_LOAD_SAMPLES"
   } > "$PROVENANCE_FILE"
 }
 
@@ -902,6 +1007,8 @@ echo "  ambient load:"
 echo "$QUIET_SAMPLES" | sed 's/^/    /'
 echo "  machine state:"
 echo "$MACHINE_STATE_SAMPLES" | sed 's/^/    /'
+echo "  in-phase load (lattice#1515, sampled DURING each arm, not just at boundaries):"
+echo "$PHASE_LOAD_SAMPLES" | sed 's/^/    /'
 
 # --- Reconcile reported groups against the bench target's declared groups ---
 # Path-keying and the clears above stop a stray group from surviving into a

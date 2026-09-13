@@ -48,6 +48,24 @@ SCRIPT = REPO / "scripts" / "bench-compare.sh"
 LIB = REPO / "scripts" / "lib"
 GATE = REPO / "scripts" / "perf-bench-gate.py"
 STATE_PROBE = LIB / "machine-state-probe.py"
+
+# STUB_PHASE_SAMPLER's canonical copy lives in
+# tests/fixtures/bench_phase_sampler_stub.py (shared with
+# test_bench_compare_measurement.py — lattice#1515 Amendment 2: do not
+# duplicate the stub text). _Sandbox drives bench-compare-impl.sh's arms end
+# to end with millisecond stub-cargo, which is exactly the shape that hit the
+# real sampler's "died before installing signal handlers" race on Linux CI;
+# without this stub, _Sandbox would exercise the REAL sampler against
+# whatever load this machine has, which is what test_bench_compare_measurement.py's
+# stub-cargo tests intentionally avoid.
+_PHASE_STUB_SPEC = importlib.util.spec_from_file_location(
+    "bench_phase_sampler_stub",
+    REPO / "tests" / "fixtures" / "bench_phase_sampler_stub.py",
+)
+assert _PHASE_STUB_SPEC is not None and _PHASE_STUB_SPEC.loader is not None
+_phase_stub = importlib.util.module_from_spec(_PHASE_STUB_SPEC)
+_PHASE_STUB_SPEC.loader.exec_module(_phase_stub)
+STUB_PHASE_SAMPLER = _phase_stub.STUB_PHASE_SAMPLER
 HOST_ID = LIB / "bench-host-id.py"
 
 STUB_CARGO = """#!/usr/bin/env bash
@@ -119,6 +137,8 @@ class _Sandbox:
         governor = self.root / "scripts" / "perf_governor.py"
         governor.write_text(STUB_GOVERNOR)
         governor.chmod(0o755)
+        phase_sampler = self.root / "scripts" / "lib" / "phase-load-sampler.py"
+        phase_sampler.write_text(STUB_PHASE_SAMPLER)
         quiet_probe = self.root / "scripts" / "lib" / "quiet-probe.py"
         quiet_probe.write_text(
             "#!/usr/bin/env python3\n"

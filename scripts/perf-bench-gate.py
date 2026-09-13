@@ -99,6 +99,9 @@ PROVENANCE_SCHEMA_V1 = "lattice-bench-provenance-v1"
 PROVENANCE_SCHEMA_V2 = "lattice-bench-provenance-v2"
 MACHINE_STATE_SCHEMA = "lattice-machine-state-v1"
 PHASE_LABELS = ("before first arm", "between order strata", "after final arm")
+# lattice#1515: the ABBA measurement arms themselves, sampled IN-PHASE (not
+# just at the PHASE_LABELS boundaries above) for foreign ambient load.
+PHASE_LOAD_ARMS = ("base1", "head1", "head2", "base2")
 PROVENANCE_FIELDS = (
     "started_utc",
     "finished_utc",
@@ -534,6 +537,7 @@ class RunProvenance:
     locks: tuple[str, ...]
     ambient_samples: tuple[str, ...]
     machine_states: tuple[dict[str, object], ...]
+    phase_load_samples: tuple[str, ...] = ()
 
 
 def parse_utc_timestamp(value: str, field: str) -> datetime:
@@ -680,6 +684,7 @@ def load_run_provenance(path: Path) -> RunProvenance:
         "lock": [],
         "ambient": [],
         "machine_state": [],
+        "phase_load": [],
     }
     allowed = {"schema", *PROVENANCE_FIELDS, *repeated}
 
@@ -826,6 +831,24 @@ def load_run_provenance(path: Path) -> RunProvenance:
                     "must be at least 30 seconds"
                 )
 
+    # lattice#1515: phase_load is optional at the schema level (a provenance
+    # file from before this fix, or a hand-built test fixture, carries none)
+    # but when present must be the full ABBA set in order -- bench-compare
+    # itself never writes a partial set: phase_gate refuses the whole run
+    # before write_run_provenance runs if any arm's sampler failed.
+    if repeated["phase_load"] and len(repeated["phase_load"]) != len(PHASE_LOAD_ARMS):
+        raise ValueError(
+            f"{path}: expected {len(PHASE_LOAD_ARMS)} phase_load samples if any "
+            f"are present, got {len(repeated['phase_load'])}"
+        )
+    phase_load_pattern = re.compile(r"^\[phase-load\] (?P<arm>\S+): .*$")
+    for expected_arm, sample in zip(PHASE_LOAD_ARMS, repeated["phase_load"]):
+        match = phase_load_pattern.fullmatch(sample)
+        if match is None or match.group("arm") != expected_arm:
+            raise ValueError(
+                f"{path}: phase_load arms must be {PHASE_LOAD_ARMS!r} in order"
+            )
+
     fields.pop("schema")
     return RunProvenance(
         schema=schema,
@@ -833,6 +856,7 @@ def load_run_provenance(path: Path) -> RunProvenance:
         locks=tuple(repeated["lock"]),
         ambient_samples=tuple(repeated["ambient"]),
         machine_states=machine_states,
+        phase_load_samples=tuple(repeated["phase_load"]),
     )
 
 
@@ -1350,6 +1374,8 @@ def render_run_provenance(
             lines.append(f"    lock={lock}")
         for sample in provenance.ambient_samples:
             lines.append(f"    ambient={sample}")
+        for sample in provenance.phase_load_samples:
+            lines.append(f"    phase_load={sample}")
         for state in provenance.machine_states:
             lines.append(
                 f"    machine_state[{state['label']}]="
@@ -2688,6 +2714,18 @@ def run_selftest() -> int:
             "ambient=[quiet] before first arm: idle 99.0% (floor 70.0%) ok | top: none",
             "ambient=[quiet] between order strata: idle 98.0% (floor 70.0%) ok | top: none",
             "ambient=[quiet] after final arm: idle 97.0% (floor 70.0%) ok | top: none",
+            "phase_load=[phase-load] base1: samples=6 idle min/mean=95.0%/97.0% "
+            "foreign max/mean=3.0%/1.0% self mean=8.0% (ceiling 30.0%) ok | "
+            "top foreign at max: none 0.0% @ 2026-07-29T12:00:05Z",
+            "phase_load=[phase-load] head1: samples=6 idle min/mean=94.0%/96.0% "
+            "foreign max/mean=4.0%/2.0% self mean=9.0% (ceiling 30.0%) ok | "
+            "top foreign at max: none 0.0% @ 2026-07-29T12:00:12Z",
+            "phase_load=[phase-load] head2: samples=6 idle min/mean=93.0%/95.0% "
+            "foreign max/mean=5.0%/2.0% self mean=9.0% (ceiling 30.0%) ok | "
+            "top foreign at max: none 0.0% @ 2026-07-29T12:00:18Z",
+            "phase_load=[phase-load] base2: samples=6 idle min/mean=92.0%/94.0% "
+            "foreign max/mean=6.0%/3.0% self mean=8.0% (ceiling 30.0%) ok | "
+            "top foreign at max: none 0.0% @ 2026-07-29T12:00:25Z",
             *[
                 f"machine_state={json.dumps(state, separators=(',', ':'), sort_keys=True)}"
                 for state in machine_states
@@ -2719,6 +2757,10 @@ def run_selftest() -> int:
             "criterion_base_samples=4 Linear (1 benchmark)",
             "criterion_head_samples=2 Flat (1 benchmark)",
             "ambient=[quiet] after final arm",
+            "phase_load=[phase-load] base1: samples=6",
+            "phase_load=[phase-load] head1: samples=6",
+            "phase_load=[phase-load] head2: samples=6",
+            "phase_load=[phase-load] base2: samples=6",
             "machine_state[between order strata]=captured",
             "power unavailable (fixture unsupported)",
             "HID idle unavailable (fixture unsupported)",
