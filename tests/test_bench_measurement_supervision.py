@@ -111,6 +111,8 @@ EXPLICIT_SCRIPT_EXCLUSIONS = frozenset(
         "scripts/lib/bench_handoff.py",
         "scripts/lib/ensure-noindex-marker.sh",
         "scripts/lib/machine-state-probe.py",
+        "scripts/lib/phase-load-report.py",
+        "scripts/lib/phase-load-sampler.py",
         "scripts/lib/quiet-probe.py",
         "scripts/microlora/README.md",
         "scripts/microlora/dsl_validator.rs",

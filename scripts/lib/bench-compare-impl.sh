@@ -312,6 +312,19 @@ quiet_gate() {
 # races the next arm. phase_gate is called once per arm, after that arm's
 # subshell has already exited (so strictly after the sampler stopped),
 # never mid-arm.
+#
+# READINESS HANDSHAKE (Amendment 2, lattice#1515 CI): on a slower-to-schedule
+# Linux runner, an arm this short can end -- firing the EXIT trap's `kill` --
+# before the freshly-forked sampler's interpreter has reached
+# `signal.signal(SIGTERM, ...)`. The default SIGTERM action then terminates
+# it silently with zero samples, indistinguishable from a dead instrument.
+# The sampler now installs its handlers before anything else and touches
+# `<outfile>.ready` once they're live; phase_sampler_start polls for that
+# marker (100 x 0.1s = 10s budget) before returning, so a kill delivered
+# after phase_sampler_start returns is always handled. A marker that never
+# appears means the sampler failed to even start (crashed, missing
+# interpreter, etc.) -- an instrument fault, refused the same as a dead
+# sampler, never treated as a loud machine.
 PHASE_LOAD_ROOT="$REPO/.cache/bench-compare-criterion/phase-load"
 PHASE_LOAD_SAMPLES=""
 
@@ -320,16 +333,26 @@ phase_load_file() {
 }
 
 phase_sampler_start() {
-  local arm="$1" outfile
+  local arm="$1" outfile ready_file poll
   mkdir -p "$PHASE_LOAD_ROOT"
   outfile="$(phase_load_file "$arm")"
+  ready_file="${outfile}.ready"
   : > "$outfile"
+  rm -f "$ready_file"
   "$PYTHON_BIN" "$REPO/scripts/lib/phase-load-sampler.py" \
     --arm "$arm" --self-pid "$$" --out "$outfile" \
     --interval "$PHASE_SAMPLE_INTERVAL" &
   local sampler_pid=$!
   # shellcheck disable=SC2064 -- expand sampler_pid now, not at trap-fire time
   trap "kill $sampler_pid 2>/dev/null || true; wait $sampler_pid 2>/dev/null || true" EXIT
+  for ((poll = 0; poll < 100; poll++)); do
+    if [ -f "$ready_file" ]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "bench-compare: in-phase sampler for '$arm' did not start" >&2
+  exit 2
 }
 
 phase_gate() {
@@ -337,6 +360,7 @@ phase_gate() {
   outfile="$(phase_load_file "$arm")"
   line="$("$PYTHON_BIN" "$REPO/scripts/lib/phase-load-report.py" \
     --arm "$arm" --in "$outfile" --floor "${BENCH_IDLE_FLOOR:-70}")" || rc=$?
+  rm -f "${outfile}.ready"
   echo "$line"
   PHASE_LOAD_SAMPLES="${PHASE_LOAD_SAMPLES}${PHASE_LOAD_SAMPLES:+
 }$line"

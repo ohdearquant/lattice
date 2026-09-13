@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -35,6 +36,18 @@ assert _GATE_SPEC is not None and _GATE_SPEC.loader is not None
 gate = importlib.util.module_from_spec(_GATE_SPEC)
 sys.modules[_GATE_SPEC.name] = gate
 _GATE_SPEC.loader.exec_module(gate)
+
+# STUB_PHASE_SAMPLER's canonical copy lives in
+# tests/fixtures/bench_phase_sampler_stub.py; test_bench_locks.py loads the
+# same copy (lattice#1515 Amendment 2 — do not duplicate the stub text).
+_PHASE_STUB_SPEC = importlib.util.spec_from_file_location(
+    "bench_phase_sampler_stub",
+    REPO / "tests" / "fixtures" / "bench_phase_sampler_stub.py",
+)
+assert _PHASE_STUB_SPEC is not None and _PHASE_STUB_SPEC.loader is not None
+_phase_stub = importlib.util.module_from_spec(_PHASE_STUB_SPEC)
+_PHASE_STUB_SPEC.loader.exec_module(_phase_stub)
+STUB_PHASE_SAMPLER = _phase_stub.STUB_PHASE_SAMPLER
 
 # Exits 0 for every subcommand and prints nothing a measurement filter matches.
 STUB_CARGO = """#!/usr/bin/env bash
@@ -100,47 +113,19 @@ print("malformed machine-state fixture")
 raise SystemExit(127)
 """
 
-# A single quiet sample per arm, then idles until SIGTERM/SIGINT -- mirrors
-# what the real phase-load-sampler.py does, without touching the laptop's
-# live load. Overrides the real script the same way quiet-probe.py is
-# overridden below.
-STUB_PHASE_SAMPLER = """#!/usr/bin/env python3
-import json
-import signal
-import sys
-import time
-
-
-def _handle(signum, frame):
-    raise SystemExit(0)
-
-
-signal.signal(signal.SIGTERM, _handle)
-signal.signal(signal.SIGINT, _handle)
-
-arm = sys.argv[sys.argv.index("--arm") + 1]
-out = sys.argv[sys.argv.index("--out") + 1]
-with open(out, "a", encoding="utf-8") as fh:
-    fh.write(json.dumps({
-        "schema": "perf-phase-sample/v1",
-        "arm": arm,
-        "captured_utc": "2026-01-01T00:00:00Z",
-        "idle_pct": 100.0,
-        "foreign_pct": 0.0,
-        "self_pct": 5.0,
-        "top_foreign": "none",
-        "top_foreign_pct": 0.0,
-    }) + "\\n")
-    fh.flush()
-    while True:
-        time.sleep(0.05)
-"""
+# STUB_PHASE_SAMPLER itself is defined once in
+# tests/fixtures/bench_phase_sampler_stub.py (imported above) and shared with
+# test_bench_locks.py. The LOUD/DEAD/READY-BUT-EMPTY variants below build on
+# the same shape but are specific to this file's tests, so they stay local.
 
 # Emits foreign=LOUD_FOREIGN_PCT samples only for the arm named by
-# LOUD_ARM (env vars), quiet samples for every other arm.
+# LOUD_ARM (env vars), quiet samples for every other arm. Writes `.ready`
+# unconditionally (every arm actually starts and samples), matching the real
+# sampler's readiness contract (lattice#1515 Amendment 2).
 STUB_PHASE_SAMPLER_LOUD_ON_ONE_ARM = """#!/usr/bin/env python3
 import json
 import os
+import pathlib
 import signal
 import sys
 import time
@@ -155,6 +140,7 @@ signal.signal(signal.SIGINT, _handle)
 
 arm = sys.argv[sys.argv.index("--arm") + 1]
 out = sys.argv[sys.argv.index("--out") + 1]
+pathlib.Path(out + ".ready").touch()
 loud_arm = os.environ.get("LOUD_ARM")
 foreign = float(os.environ.get("LOUD_FOREIGN_PCT", "45.0")) if arm == loud_arm else 0.0
 with open(out, "a", encoding="utf-8") as fh:
@@ -173,10 +159,15 @@ with open(out, "a", encoding="utf-8") as fh:
         time.sleep(0.05)
 """
 
-# Emits nothing for the arm named by DEAD_ARM; a quiet sample for every other.
+# Never touches `.ready` for the arm named by DEAD_ARM: a genuinely dead
+# instrument, one that never even signaled it started. Writes `.ready` (and
+# a quiet sample) for every other arm. This is the process-never-started
+# case (distinct from STARTED_BUT_NO_SAMPLES below, which does signal ready
+# but then produces nothing).
 STUB_PHASE_SAMPLER_DEAD_ON_ONE_ARM = """#!/usr/bin/env python3
 import json
 import os
+import pathlib
 import signal
 import sys
 import time
@@ -191,6 +182,49 @@ signal.signal(signal.SIGINT, _handle)
 
 arm = sys.argv[sys.argv.index("--arm") + 1]
 out = sys.argv[sys.argv.index("--out") + 1]
+dead_arm = os.environ.get("DEAD_ARM")
+if arm != dead_arm:
+    pathlib.Path(out + ".ready").touch()
+    with open(out, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "schema": "perf-phase-sample/v1",
+            "arm": arm,
+            "captured_utc": "2026-01-01T00:00:00Z",
+            "idle_pct": 100.0,
+            "foreign_pct": 0.0,
+            "self_pct": 5.0,
+            "top_foreign": "none",
+            "top_foreign_pct": 0.0,
+        }) + "\\n")
+        fh.flush()
+while True:
+    time.sleep(0.05)
+"""
+
+# Touches `.ready` for EVERY arm (it started fine) but writes no sample at
+# all for the arm named by DEAD_ARM: a started-but-produced-nothing
+# instrument, which phase-load-report.py's own zero-records check must
+# still refuse ("no usable samples"), distinct from the never-started case
+# above ("did not start").
+STUB_PHASE_SAMPLER_STARTED_BUT_NO_SAMPLES_ON_ONE_ARM = """#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import signal
+import sys
+import time
+
+
+def _handle(signum, frame):
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _handle)
+signal.signal(signal.SIGINT, _handle)
+
+arm = sys.argv[sys.argv.index("--arm") + 1]
+out = sys.argv[sys.argv.index("--out") + 1]
+pathlib.Path(out + ".ready").touch()
 dead_arm = os.environ.get("DEAD_ARM")
 if arm != dead_arm:
     with open(out, "a", encoding="utf-8") as fh:
@@ -1868,16 +1902,23 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                 result.stdout,
             )
 
-    def test_dead_in_phase_sampler_refuses_even_when_the_arm_measures_fine(self):
-        """A sampler that never produces a sample for one arm is a failed instrument.
+    def test_dead_in_phase_sampler_never_starts_and_refuses(self):
+        """A sampler process that never signals readiness for one arm must refuse.
 
-        Zero samples for base2 must refuse even though base2's own cargo
-        measurement succeeds — this is never weaker evidence, it is no
-        evidence.
+        The stub never touches `.ready` for base2 (it never even opens the
+        output file for that arm), reproducing a sampler that crashed or was
+        killed before phase_sampler_start's poll window closed (lattice#1515
+        Amendment 2: the same failure mode a fast-ending Linux CI arm hit
+        against the real sampler, before the do-while-shape + readiness-
+        marker fix). This is refused as "did not start" — an instrument
+        that never started is a distinct failure from one that started and
+        produced nothing (see test_started_but_no_samples below).
 
-        Mutation-sensitive: drop the rc==2 branch from phase_gate in
-        bench-compare-impl.sh (or the zero-records check in
-        phase-load-report.py) and this run flips from exit 2 to exit 0.
+        Mutation-sensitive: drop phase_sampler_start's readiness poll/exit-2
+        in bench-compare-impl.sh and this run flips from exit 2 to hanging
+        (no cargo/arm ever validates readiness) or, if the poll is merely
+        neutered to always succeed, to exit 0 with a fabricated in-phase
+        report despite the sampler having produced zero rows for base2.
         """
         result = _run(
             [],
@@ -1887,11 +1928,39 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         )
         self.assertEqual(
             result.returncode, 2,
-            f"expected exit 2 (dead in-phase instrument), got {result.returncode}\n"
+            f"expected exit 2 (in-phase sampler never started), got {result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertIn("base2", result.stderr)
+        self.assertIn("did not start", result.stderr)
+
+    def test_started_in_phase_sampler_with_no_samples_still_refuses(self):
+        """A sampler that signals ready but writes zero samples is still a failed instrument.
+
+        Distinct from the never-started case above: here `.ready` appears
+        for base2 (phase_sampler_start's poll succeeds, so the harness
+        proceeds to run the arm), but the sampler never wrote a row for it.
+        phase-load-report.py's own zero-records check must still refuse this
+        — starting is necessary but not sufficient evidence.
+
+        Mutation-sensitive: drop the rc==2 branch from phase_gate in
+        bench-compare-impl.sh (or the zero-records check in
+        phase-load-report.py) and this run flips from exit 2 to exit 0.
+        """
+        result = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            stub_phase_sampler=STUB_PHASE_SAMPLER_STARTED_BUT_NO_SAMPLES_ON_ONE_ARM,
+            extra_env={"DEAD_ARM": "base2"},
+        )
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (in-phase sampler produced no usable samples), "
+            f"got {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("base2", result.stderr)
         self.assertIn("no usable samples", result.stderr)
+        self.assertNotIn("did not start", result.stderr)
 
     def test_provenance_carries_four_phase_load_lines_and_preserves_ambient_lines(self):
         """bench-run-provenance.txt gains four phase_load= lines; ambient= is unchanged."""
@@ -1958,6 +2027,54 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         self.assertEqual(
             phase_sampler_direct.parse_top_idle(transcript), expected
         )
+
+    def test_real_sampler_yields_at_least_one_sample_for_a_sub_100ms_arm(self):
+        """The REAL sampler (not a stub) must yield >=1 sample even for a
+        near-instant arm.
+
+        lattice#1515 Amendment 2's do-while shape is what makes this true: a
+        `while not stop:` loop that checks the stop flag BEFORE the first
+        sample would yield zero rows if SIGTERM lands between handler
+        install and loop entry -- exactly what a fast-ending Linux CI arm
+        hit against the real sampler (9/40 test_bench_locks.py failures, all
+        "PROBE FAILED (zero usable samples)"). This is the mutation control
+        for that fix.
+
+        Runs scripts/lib/phase-load-sampler.py directly (subprocess), waits
+        for its `.ready` marker (proving handlers are installed and it is
+        safe to signal), then SIGTERMs it as close to immediately as this
+        harness can drive it, and asserts exactly one JSONL row landed.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "sample.jsonl"
+            proc = subprocess.Popen(
+                [
+                    sys.executable, str(LIB / "phase-load-sampler.py"),
+                    "--arm", "instant", "--self-pid", str(os.getpid()),
+                    "--out", str(out), "--interval", "5",
+                ],
+            )
+            try:
+                ready = Path(str(out) + ".ready")
+                deadline = time.monotonic() + 10
+                while not ready.exists():
+                    if time.monotonic() > deadline:
+                        self.fail("sampler never signaled readiness within 10s")
+                    time.sleep(0.02)
+                proc.terminate()
+                proc.wait(timeout=10)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=10)
+            lines = [
+                line for line in out.read_text().splitlines() if line.strip()
+            ] if out.exists() else []
+            self.assertEqual(
+                len(lines), 1,
+                "expected exactly one sample for a near-instant arm, got "
+                f"{len(lines)}: {lines}",
+            )
 
 
 class GpuBenchmarkAdmission(unittest.TestCase):

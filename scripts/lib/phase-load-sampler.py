@@ -50,6 +50,22 @@ the documented fallback (see CLAUDE.md's bench harness section): the PARSER
 SHARING test in tests/test_bench_compare_measurement.py pins that this copy
 and quiet-probe.py's original agree on the same top(1)/`/proc/stat`
 transcript, so the two cannot silently drift apart.
+
+READINESS AND GUARANTEED FIRST/LAST SAMPLE (lattice#1515 Amendment 2). On
+Linux CI the caller's arm subshell can finish (killing this process via its
+EXIT trap) before the interpreter has reached `signal.signal(...)` -- the
+default SIGTERM action then terminates the process silently with zero
+samples written, which reads identically to a dead instrument. To close
+that: the SIGTERM/SIGINT handlers are installed as the very first action in
+`main()`, before argparse even runs, and once the output file is open this
+process touches `<out>.ready` so the caller (`phase_sampler_start` in
+bench-compare-impl.sh) can poll for that file and know a signal will now be
+handled rather than kill the process outright. The sampling loop then takes
+its first sample unconditionally (do-while shape, not `while not stop:`
+first), so even an arm shorter than one cadence interval yields at least one
+row, and takes one closing sample on stop unless the previous sample
+completed less than half an interval ago (avoiding a near-duplicate at the
+very end of an ordinary-length arm).
 """
 
 from __future__ import annotations
@@ -192,14 +208,10 @@ def sample_once(self_pid: int, cores: int) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--arm", required=True)
-    ap.add_argument("--self-pid", type=int, required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--interval", type=float, default=5.0)
-    args = ap.parse_args()
-
-    cores = logical_cpu_count()
+    # Installed FIRST, before argparse: a SIGTERM landing before this line
+    # runs would otherwise terminate the process via the default action
+    # (lattice#1515 Amendment 2) with zero samples written -- indistinguishable
+    # from a dead instrument to the caller.
     stop = False
 
     def _handle(_signum, _frame):
@@ -209,26 +221,47 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
 
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--arm", required=True)
+    ap.add_argument("--self-pid", type=int, required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--interval", type=float, default=5.0)
+    args = ap.parse_args()
+
+    cores = logical_cpu_count()
+
+    def write_sample(handle) -> float | None:
+        """Take and write one sample; return its wall-clock time, or None on failure."""
+        try:
+            record = sample_once(args.self_pid, cores)
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed silently
+            sys.stderr.write(f"[phase-load] {args.arm}: sample failed: {exc}\n")
+            return None
+        record.update(
+            {
+                "schema": "perf-phase-sample/v1",
+                "arm": args.arm,
+                "captured_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        )
+        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        handle.flush()
+        return time.monotonic()
+
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("a", encoding="utf-8") as handle:
+        # The readiness marker is created only once the output file is open and
+        # the handlers above are installed, so the caller polling for it knows
+        # a SIGTERM from this point on will be handled, not silently kill us.
+        ready_path = out_path.with_name(out_path.name + ".ready")
+        ready_path.touch()
+
+        # Do-while shape: every arm, however short, gets >=1 sample -- `while
+        # not stop:` first would yield zero samples for an arm that finishes
+        # (and signals us) before the loop body ever runs.
+        last_sample_at = write_sample(handle)
         while not stop:
-            try:
-                record = sample_once(args.self_pid, cores)
-            except Exception as exc:  # noqa: BLE001 - reported, never swallowed silently
-                sys.stderr.write(f"[phase-load] {args.arm}: sample failed: {exc}\n")
-            else:
-                record.update(
-                    {
-                        "schema": "perf-phase-sample/v1",
-                        "arm": args.arm,
-                        "captured_utc": time.strftime(
-                            "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
-                        ),
-                    }
-                )
-                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
-                handle.flush()
             # Sleep in short slices so SIGTERM lands within ~0.1s rather than
             # waiting out a full multi-second cadence.
             ticks = max(int(args.interval * 10), 1)
@@ -236,6 +269,16 @@ def main() -> int:
                 if stop:
                     break
                 time.sleep(0.1)
+            if stop:
+                break
+            last_sample_at = write_sample(handle)
+        # Closing-edge sample: skip only if the loop's own last sample is
+        # still fresh (within half an interval), so an ordinary-length arm
+        # doesn't get a near-duplicate final row.
+        if last_sample_at is None or (
+            time.monotonic() - last_sample_at >= args.interval / 2
+        ):
+            write_sample(handle)
     return 0
 
 
