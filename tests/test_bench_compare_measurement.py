@@ -100,6 +100,116 @@ print("malformed machine-state fixture")
 raise SystemExit(127)
 """
 
+# A single quiet sample per arm, then idles until SIGTERM/SIGINT -- mirrors
+# what the real phase-load-sampler.py does, without touching the laptop's
+# live load. Overrides the real script the same way quiet-probe.py is
+# overridden below.
+STUB_PHASE_SAMPLER = """#!/usr/bin/env python3
+import json
+import signal
+import sys
+import time
+
+
+def _handle(signum, frame):
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _handle)
+signal.signal(signal.SIGINT, _handle)
+
+arm = sys.argv[sys.argv.index("--arm") + 1]
+out = sys.argv[sys.argv.index("--out") + 1]
+with open(out, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({
+        "schema": "perf-phase-sample/v1",
+        "arm": arm,
+        "captured_utc": "2026-01-01T00:00:00Z",
+        "idle_pct": 100.0,
+        "foreign_pct": 0.0,
+        "self_pct": 5.0,
+        "top_foreign": "none",
+        "top_foreign_pct": 0.0,
+    }) + "\\n")
+    fh.flush()
+    while True:
+        time.sleep(0.05)
+"""
+
+# Emits foreign=LOUD_FOREIGN_PCT samples only for the arm named by
+# LOUD_ARM (env vars), quiet samples for every other arm.
+STUB_PHASE_SAMPLER_LOUD_ON_ONE_ARM = """#!/usr/bin/env python3
+import json
+import os
+import signal
+import sys
+import time
+
+
+def _handle(signum, frame):
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _handle)
+signal.signal(signal.SIGINT, _handle)
+
+arm = sys.argv[sys.argv.index("--arm") + 1]
+out = sys.argv[sys.argv.index("--out") + 1]
+loud_arm = os.environ.get("LOUD_ARM")
+foreign = float(os.environ.get("LOUD_FOREIGN_PCT", "45.0")) if arm == loud_arm else 0.0
+with open(out, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({
+        "schema": "perf-phase-sample/v1",
+        "arm": arm,
+        "captured_utc": "2026-01-01T00:00:00Z",
+        "idle_pct": 100.0 - foreign,
+        "foreign_pct": foreign,
+        "self_pct": 5.0,
+        "top_foreign": "loud_stub" if foreign else "none",
+        "top_foreign_pct": foreign,
+    }) + "\\n")
+    fh.flush()
+    while True:
+        time.sleep(0.05)
+"""
+
+# Emits nothing for the arm named by DEAD_ARM; a quiet sample for every other.
+STUB_PHASE_SAMPLER_DEAD_ON_ONE_ARM = """#!/usr/bin/env python3
+import json
+import os
+import signal
+import sys
+import time
+
+
+def _handle(signum, frame):
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _handle)
+signal.signal(signal.SIGINT, _handle)
+
+arm = sys.argv[sys.argv.index("--arm") + 1]
+out = sys.argv[sys.argv.index("--out") + 1]
+dead_arm = os.environ.get("DEAD_ARM")
+if arm != dead_arm:
+    with open(out, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "schema": "perf-phase-sample/v1",
+            "arm": arm,
+            "captured_utc": "2026-01-01T00:00:00Z",
+            "idle_pct": 100.0,
+            "foreign_pct": 0.0,
+            "self_pct": 5.0,
+            "top_foreign": "none",
+            "top_foreign_pct": 0.0,
+        }) + "\\n")
+        fh.flush()
+while True:
+    time.sleep(0.05)
+"""
+
+
 STUB_MACHINE_PROBE = """#!/usr/bin/env python3
 import datetime
 import json
@@ -385,6 +495,7 @@ def _run(
     extra_env=None,
     emit_criterion_home=False,
     stub_machine_state=None,
+    stub_phase_sampler=None,
     post_run=None,
 ):
     """Run the shipping bench-compare.sh in a throwaway repo with a stub cargo."""
@@ -412,6 +523,10 @@ def _run(
             STUB_MACHINE_PROBE
             if stub_machine_state is None
             else stub_machine_state
+        )
+        phase_sampler = root / "scripts" / "lib" / "phase-load-sampler.py"
+        phase_sampler.write_text(
+            STUB_PHASE_SAMPLER if stub_phase_sampler is None else stub_phase_sampler
         )
 
         env_git = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
@@ -1689,6 +1804,160 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         )
         self.assertIn("gate reported a confirmed regression", result.stderr)
         self.assertNotIn("**ℹ️ 1 informational**", result.stdout)
+
+
+    def test_loud_in_phase_load_refuses_the_run(self):
+        """A stub sampler emitting 45% foreign load during head1 only must refuse.
+
+        lattice#1515: the three boundary probes above cannot see a load that
+        starts and ends between two of them. This asserts the in-phase gate
+        DOES see it.
+
+        Mutation-sensitive: drop (or neutralize, e.g. by forcing the ceiling
+        to 100) phase_gate's rc==1 refusal branch in bench-compare-impl.sh
+        and this run flips from exit 2 to exit 0 with a rendered report.
+        """
+        result = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            stub_phase_sampler=STUB_PHASE_SAMPLER_LOUD_ON_ONE_ARM,
+            extra_env={
+                "LOUD_ARM": "head1",
+                "LOUD_FOREIGN_PCT": "45",
+                "BENCH_IDLE_FLOOR": "70",
+            },
+        )
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (loud in-phase load), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("head1", result.stderr)
+        self.assertIn("in-phase load", result.stderr)
+        self.assertNotIn("Done.", result.stdout)
+        self.assertNotIn("=== Run conditions ===", result.stdout)
+
+    def test_quiet_in_phase_load_reports_all_four_arms_in_abba_order(self):
+        """A healthy run must render one In-phase load line per arm, in ABBA order.
+
+        Mutation-sensitive: skip phase_gate for any arm (or drop the
+        PHASE_LOAD_SAMPLES accumulation) and the arm count below drops
+        below 4, or the order assertion fails.
+        """
+        result = _run([], stub_cargo=STALE_CHANGE_CARGO, extra_env={"BENCH_IDLE_FLOOR": "70"})
+        self.assertEqual(
+            result.returncode, 0,
+            f"healthy in-phase fixture failed\nstdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}",
+        )
+        arms = re.findall(r"\[phase-load\] (\S+):", result.stdout)
+        # Each arm's line appears four times: once printed live by phase_gate
+        # as the arm completes, once again rendered into the "Run conditions"
+        # summary block at the end of the run, and once more inside EACH of
+        # the two target-qualified gate reports (inference, embed) that
+        # render the shared provenance file's phase_load= lines.
+        self.assertEqual(
+            arms, ["base1", "head1", "head2", "base2"] * 4, result.stdout
+        )
+        self.assertIn("in-phase load", result.stdout)
+        for arm in ("base1", "head1", "head2", "base2"):
+            self.assertIn(
+                f"[phase-load] {arm}: samples=1 idle min/mean=100.0%/100.0% "
+                f"foreign max/mean=0.0%/0.0% self mean=5.0%",
+                result.stdout,
+                result.stdout,
+            )
+
+    def test_dead_in_phase_sampler_refuses_even_when_the_arm_measures_fine(self):
+        """A sampler that never produces a sample for one arm is a failed instrument.
+
+        Zero samples for base2 must refuse even though base2's own cargo
+        measurement succeeds — this is never weaker evidence, it is no
+        evidence.
+
+        Mutation-sensitive: drop the rc==2 branch from phase_gate in
+        bench-compare-impl.sh (or the zero-records check in
+        phase-load-report.py) and this run flips from exit 2 to exit 0.
+        """
+        result = _run(
+            [],
+            stub_cargo=STALE_CHANGE_CARGO,
+            stub_phase_sampler=STUB_PHASE_SAMPLER_DEAD_ON_ONE_ARM,
+            extra_env={"DEAD_ARM": "base2"},
+        )
+        self.assertEqual(
+            result.returncode, 2,
+            f"expected exit 2 (dead in-phase instrument), got {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("base2", result.stderr)
+        self.assertIn("no usable samples", result.stderr)
+
+    def test_provenance_carries_four_phase_load_lines_and_preserves_ambient_lines(self):
+        """bench-run-provenance.txt gains four phase_load= lines; ambient= is unchanged."""
+        captured = []
+
+        def capture_provenance(root):
+            captured.append(
+                (root / ".cache" / "bench-run-provenance.txt").read_text()
+            )
+
+        result = _run(
+            [], stub_cargo=STALE_CHANGE_CARGO, post_run=capture_provenance
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(captured), 1)
+        provenance = captured[0]
+        phase_lines = [
+            line for line in provenance.splitlines() if line.startswith("phase_load=")
+        ]
+        ambient_lines = [
+            line for line in provenance.splitlines() if line.startswith("ambient=")
+        ]
+        self.assertEqual(len(phase_lines), 4, provenance)
+        self.assertEqual(len(ambient_lines), 3, provenance)
+
+    def test_phase_sampler_shares_quiet_probes_idle_parser(self):
+        """The sampler's idle parser is a pinned COPY of quiet-probe.py's own.
+
+        phase-load-sampler.py cannot `importlib`-import quiet-probe.py (see
+        the PARSER SHARING note in its docstring: several existing test
+        fixtures stub quiet-probe.py with unguarded module-level argparse
+        calls that would fire against this process's own argv on import), so
+        it carries a copy of parse_top_idle/parse_proc_stat/linux_idle_pct
+        instead. This test is what keeps that copy honest: both must agree on
+        the idle percentage for the same `top -l 2` transcript.
+
+        Mutation-sensitive: edit either copy's regex/logic without mirroring
+        the change in the other, and this produces a different number for the
+        same transcript below.
+        """
+        quiet_probe_spec = importlib.util.spec_from_file_location(
+            "quiet_probe_direct", LIB / "quiet-probe.py"
+        )
+        assert quiet_probe_spec is not None and quiet_probe_spec.loader is not None
+        quiet_probe_direct = importlib.util.module_from_spec(quiet_probe_spec)
+        quiet_probe_spec.loader.exec_module(quiet_probe_direct)
+
+        phase_sampler_spec = importlib.util.spec_from_file_location(
+            "phase_load_sampler_direct", LIB / "phase-load-sampler.py"
+        )
+        assert phase_sampler_spec is not None and phase_sampler_spec.loader is not None
+        phase_sampler_direct = importlib.util.module_from_spec(phase_sampler_spec)
+        phase_sampler_spec.loader.exec_module(phase_sampler_direct)
+
+        transcript = (
+            "Processes: 400 total\n"
+            "CPU usage: 5.0% user, 3.0% sys, 92.0% idle\n"
+            "\n"
+            "Processes: 401 total\n"
+            "CPU usage: 12.5% user, 4.5% sys, 83.0% idle\n"
+        )
+        expected = quiet_probe_direct.parse_top_idle(transcript)
+        self.assertEqual(expected, 83.0)
+        self.assertEqual(
+            phase_sampler_direct.parse_top_idle(transcript), expected
+        )
 
 
 class GpuBenchmarkAdmission(unittest.TestCase):
