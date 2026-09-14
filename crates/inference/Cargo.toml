@@ -7,10 +7,18 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Pure Rust transformer inference engine — safetensors loading, SIMD matmul, BGE/Qwen3 embeddings"
-# Heavy test-only fixtures (~40MB raw) push the packaged crate past the
-# crates.io 10MB upload limit. They are consumed only by integration tests,
-# which are never run from the published crate.
-exclude = ["tests/fixtures/tokenizers", "tests/fixtures/gdn_chunk"]
+# Heavy test-only fixtures push the packaged crate past the crates.io 10MB
+# upload limit. They are consumed only by integration tests, which are never
+# run from the published crate. The two tokenizer vocabularies below are 43MB
+# raw between them and were worth about 7MB of the compressed archive: with
+# them in, the package measured 10,463,553 bytes against a 10,485,760 byte
+# limit, before the generated Cargo.lock and manifests; with them out, 2.8MB.
+exclude = [
+    "tests/fixtures/tokenizers",
+    "tests/fixtures/gdn_chunk",
+    "tests/fixtures/gemma4/tokenizer",
+    "tests/fixtures/paddleocr_vl/tokenizer",
+]
 
 [package.metadata.gpu-bench-handoff]
 version = 1
