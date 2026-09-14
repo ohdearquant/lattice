@@ -1124,6 +1124,13 @@ jobs:
         run: bash scripts/bench_quality_selftest.sh
       - name: python3 tests/test_bench_targets.py
         run: python3 tests/test_bench_targets.py -v
+      # package-size-check's own fixture self-test. Same "harness plumbing only"
+      # scope: it drives the size bracket against fabricated file lists and
+      # asserts its exit codes, including the two refusals that keep an
+      # unmeasurable package from reading as a small one. No crate is packaged
+      # and no cargo is invoked.
+      - name: bash scripts/package-size-check-selftest.sh
+        run: bash scripts/package-size-check-selftest.sh
 
       # Local benchmark-supervision guards: bench-compare's dedicated supervisor
       # verifies inherited descriptor capabilities; cooperating entrypoints

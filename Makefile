@@ -1,4 +1,4 @@
-.PHONY: setup check clippy test test-timing fmt fmt-check build clean ci publish publish-dry publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
+.PHONY: setup check clippy test test-timing fmt fmt-check build clean ci publish publish-dry package-size-check publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
 
 setup:
 	rustup component add rustfmt clippy
@@ -38,6 +38,12 @@ lint-docs:
 
 ci:
 	./scripts/ci.sh
+
+# Bracket every publishable crate against the crates.io 10 MiB upload limit.
+# `make publish` runs this first; run it standalone as soon as a release branch
+# exists, since the remedy is a manifest change that goes through review.
+package-size-check:
+	./scripts/package-size-check.sh
 
 publish-dry:
 	./scripts/publish.sh --dry-run
