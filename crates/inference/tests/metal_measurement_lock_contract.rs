@@ -1168,8 +1168,10 @@ fn classify_test_meta(meta: &Meta) -> TestRegistration {
             "allow"
                 | "cfg"
                 | "cold"
+                | "deny"
                 | "deprecated"
                 | "doc"
+                | "expect"
                 | "forbid"
                 | "ignore"
                 | "inline"
@@ -4380,6 +4382,40 @@ async fn raw_dispatch() {
         "tests/custom_runtime_dispatch.rs",
         "unclassifiable test function attribute `custom_runtime::test`",
     );
+}
+
+#[test]
+fn lint_level_attributes_are_not_test_registrations() {
+    let source = r#"
+#[expect(clippy::unwrap_used, reason = "the caller established the invariant")]
+fn helper() -> u32 {
+    Some(7u32).unwrap()
+}
+
+#[test]
+#[deny(unused_must_use)]
+#[expect(clippy::unwrap_used, reason = "the fixture owns the queue")]
+fn raw_dispatch() {
+    let _gpu_guard = gpu_test_lock();
+    let _command_buffer = queue.new_command_buffer();
+}
+"#;
+    let parsed = StructuredSource::parse("fixtures/lint_level_attributes.rs", source, true)
+        .expect("parse lint-level attribute fixture");
+    let functions = parsed
+        .test_functions()
+        .expect("classify lint-level attributes as non-registrations");
+    let names: Vec<&str> = functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["raw_dispatch"],
+        "only the #[test] function is a registration"
+    );
+    command_buffer_fixture_result(source, "fixtures/lint_level_attributes.rs")
+        .expect("guarded work under lint-level attributes satisfies the convention");
 }
 
 #[test]
