@@ -346,6 +346,34 @@ jobs:
           AB_RC: ${{ steps.ab.outputs.rc }}
           STATUS_DIR: ${{ runner.temp }}/perf-postmerge-status
         run: |
+          # Annotation failures must not replace the gate's existing outcome.
+          python3 - "$STATUS_DIR" <<'PY' || true
+          import json
+          import pathlib
+          import sys
+
+          for path in sorted(pathlib.Path(sys.argv[1]).glob("*.json")):
+              try:
+                  status = json.loads(path.read_text())
+              except (OSError, ValueError):
+                  continue
+              if not isinstance(status, dict) or status.get("phase_load_verdict") != "LOUD":
+                  continue
+              arms = status.get("phase_load", [])
+              if not isinstance(arms, list):
+                  continue
+              for arm in arms:
+                  if not isinstance(arm, dict) or arm.get("verdict") != "LOUD":
+                      continue
+                  if "arm" not in arm or "foreign_max_pct" not in arm:
+                      continue
+                  detail = (
+                      f"{path.name}: arm={arm['arm']}; "
+                      f"foreign_max_pct={arm['foreign_max_pct']}"
+                  )
+                  detail = detail.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+                  print(f"::warning title=In-phase foreign CPU load::{detail}")
+          PY
           if [ "$AB_RC" = "3" ]; then
             python3 - "$STATUS_DIR" <<'PY'
           import json
