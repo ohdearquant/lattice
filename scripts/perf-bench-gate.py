@@ -155,6 +155,15 @@ PROVENANCE_FIELDS_BY_SCHEMA = {
 # 95% CI's lower bound," not a calibrated one-sided-95% test. Verify against
 # the `criterion` crate's own CI-construction source before relying on the
 # exact number if it ever matters (not independently checked here).
+#
+# These thresholds read the order-bias-widened CI LOWER bound, never the point
+# estimate the report prints beside it. Measured on an A/A comparison (both arms
+# built from identical source, quick resolution, 255 rows on one target): point
+# estimates ranged to +7.97% with a widest interval upper bound of +16.74%, while
+# the lower bound these constants are compared against crossed 3.0% on one row and
+# 7.0% on none. The point column and these constants are differently-computed
+# numbers that share a percent sign, so reading a report's point column against
+# WARN_PCT/FAIL_PCT overstates what the gate would have decided.
 WARN_PCT = 3.0   # CI-lower above this => warning
 FAIL_PCT = 7.0   # CI-lower above this => FAIL
 CELEBRATE_PCT = -3.0  # point estimate below this AND CI-upper<0 => celebrate
