@@ -19,13 +19,13 @@
 //! Before this module existed, the same detection logic (and the same
 //! precedence rule -- a `model.safetensors`/`model.safetensors.index.json`
 //! file always wins over a `.q4` tensor file, and an unreadable or
-//! non-matching directory fails closed to [`ModelFormat::Unknown`]) was
+//! non-matching directory fails closed to [`ModelFormat::Unknown`](crate::model_format::ModelFormat::Unknown)) was
 //! implemented independently in `bin/lattice.rs` (`backend::detect_format`,
 //! enum-valued, with its own unit tests), `bin/lattice_serve.rs`
 //! (`detect_q4`, bool-valued), and `bin/chat_metal.rs` (`is_q4_dir`,
 //! bool-valued, plus a fourth, partial decision site that only re-checked
 //! safetensors absence inside the non-Q4 branch). All three binaries now
-//! match on this single [`ModelFormat`] enum; none re-checks sentinel files
+//! match on this single [`ModelFormat`](crate::model_format::ModelFormat) enum; none re-checks sentinel files
 //! after the match.
 
 use std::path::Path;

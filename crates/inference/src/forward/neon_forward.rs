@@ -1033,6 +1033,10 @@ pub fn generate_q8_neon(
     // Autoregressive decode
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
+        #[expect(
+            clippy::expect_used,
+            reason = "all_ids is seeded with the prompt before the loop and appended to on every iteration"
+        )]
         let last_token = *all_ids
             .last()
             .expect("invariant: prompt or previous sample populated all_ids");

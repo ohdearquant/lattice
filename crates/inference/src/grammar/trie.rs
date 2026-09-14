@@ -51,7 +51,7 @@
 //! live state passed into `mask` has one entry per byte generated so far
 //! in the whole decode — cloning it as the walk root would make every
 //! DFS clone O(stack depth + bytes generated so far) instead. See
-//! [`walk_root_state`] for the fix.
+//! `walk_root_state` for the fix.
 
 use crate::grammar::pda::{CompiledGrammar, GrammarState, StepResult, advance_byte};
 

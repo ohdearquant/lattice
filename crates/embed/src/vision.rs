@@ -198,7 +198,7 @@ impl VisionEmbeddingModel {
     /// across other in-process model instances.
     ///
     /// Raises `tokenizer`'s own truncation cap to `config`'s context window
-    /// when it sits below it (see [`capped_tokenizer`]) -- see that
+    /// when it sits below it (see `capped_tokenizer`) -- see that
     /// function's docs for why: without this, a caller-supplied tokenizer
     /// left at its default cap silently truncates any prompt between 4097
     /// tokens and the checkpoint's real window before it ever reaches the

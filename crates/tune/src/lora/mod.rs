@@ -85,7 +85,7 @@ impl LoraConfig {
     /// necessarily invalid, only unusable until something that knows the
     /// target architecture is asked to install it.
     /// [`LoraAdapter::new_with_descriptor`] and
-    /// [`LoraAdapter::validate_against`]/[`LoraAdapter::validate_against_bert`]
+    /// `LoraAdapter::validate_against`/`LoraAdapter::validate_against_bert`
     /// enforce a known-name check where the architecture is actually known;
     /// see `docs/lora-core.md#adapter-validation`.
     ///

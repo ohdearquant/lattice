@@ -201,7 +201,7 @@ impl GemmaBpeTokenizer {
     /// Fails closed if the declared `model.type`, `normalizer`,
     /// `pre_tokenizer`, `decoder`, or the `model` fields the encode/decode
     /// logic depends on do not match the Gemma shape this path was built
-    /// against (see [`validate_gemma_bpe_shape`] and the module docs) — this
+    /// against (see `validate_gemma_bpe_shape` and the module docs) — this
     /// constructor makes an explicit structural claim about its input,
     /// rather than best-effort adapting.
     pub fn from_tokenizer_json_str(text: &str) -> Result<Self, InferenceError> {
@@ -359,6 +359,10 @@ impl GemmaBpeTokenizer {
                 segment_start = pos;
                 continue;
             }
+            #[expect(
+                clippy::expect_used,
+                reason = "the surrounding while guard proves the index is inside the text"
+            )]
             let ch = text[pos..]
                 .chars()
                 .next()

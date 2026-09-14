@@ -228,6 +228,10 @@ impl LogDomainSinkhornSolver {
                     last_result = Some(result);
                 }
 
+                #[expect(
+                    clippy::expect_used,
+                    reason = "the epsilon schedule always has at least one stage"
+                )]
                 let final_result =
                     last_result.expect("epsilon schedule always has at least one stage");
                 Ok(LogDomainSinkhornResult {

@@ -642,7 +642,7 @@ impl Ernie45Model {
     /// clone the trace keeps for the golden comparison. Every validation
     /// [`Self::forward_embeds_trace`] performs — `MAX_SEQ_LEN`, empty input,
     /// `embeds` length, non-finite `embeds` — runs identically here: both
-    /// entry points share [`Self::forward_embeds_core`]'s front half.
+    /// entry points share `Self::forward_embeds_core`'s front half.
     ///
     /// Intended for a greedy decode loop that re-forwards the whole
     /// sequence per step and only ever reads the last row's logits.
@@ -765,7 +765,7 @@ impl Ernie45Model {
     /// or spliced projector row, of the new token); `position` is its
     /// 3-row mrope position, the same triple the uncached path would have
     /// used for that token. Per layer the arithmetic mirrors
-    /// [`Self::forward_embeds_core`] for a one-token sequence — same
+    /// `Self::forward_embeds_core` for a one-token sequence — same
     /// norm/projection/MLP calls, same exact-exp softmax — except the
     /// attention reads its keys and values from the cache instead of from
     /// this call's own projections, which is precisely the KV-cache

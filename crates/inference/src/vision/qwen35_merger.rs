@@ -18,7 +18,7 @@
 //!
 //! The merger's activation is `nn.GELU()` (exact, erf-based) — NOT
 //! `ACT2FN[config.hidden_act]` ("gelu_pytorch_tanh", the tanh approximation
-//! [`super::vit::gelu`] implements for the ViT block MLPs). This is a
+//! `super::vit::gelu` implements for the ViT block MLPs). This is a
 //! hardcoded HF implementation detail independent of `hidden_act`; using the
 //! tanh approximation here would be a convention mismatch, not just added
 //! imprecision.

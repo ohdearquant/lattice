@@ -2367,7 +2367,7 @@ pub struct GenerateConfig {
     /// to an answer. `None`, `Some(0)`, or [`enable_thinking`](Self::enable_thinking)
     /// `== false` = disabled (no behaviour change) -- with thinking disabled there is
     /// no reasoning block for a forced `</think>` to close, so the budget is inert
-    /// regardless of its value. See [`GenerateConfig::effective_reasoning_budget`].
+    /// regardless of its value. See `GenerateConfig::effective_reasoning_budget`.
     pub reasoning_budget: Option<usize>,
     /// Capture per-token log-probabilities (OpenAI `logprobs`/`top_logprobs`).
     /// `None` (default) disables capture entirely -- no extra allocation or

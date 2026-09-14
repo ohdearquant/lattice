@@ -42,16 +42,16 @@
 //!
 //! ## Fidelity notes
 //!
-//! [`LruPolicy`] mirrors [`crate::forward::moe_expert_cache::ExpertSlotCache`]'s
+//! [`LruPolicy`](crate::moe_admission::LruPolicy) mirrors `crate::forward::moe_expert_cache::ExpertSlotCache`'s
 //! `touch`/`pick_eviction_slot` order exactly, including the within-token
 //! "never evict a slot touched earlier this token" guard (moe_expert_cache.rs
 //! `pick_eviction_slot`, `touch`, `plan_prefetch`). That guard protects
 //! EVERY slot resolved earlier in the current token, not only literal
 //! duplicate ids — production's `resolve` sets the touched flag on every
 //! slot it touches, hit or miss, and `pick_eviction_slot` only ever selects
-//! an untouched one (`moe_expert_cache.rs:47`-`58`, `887`-`912`). [`ArcPolicy`]
+//! an untouched one (`moe_expert_cache.rs:47`-`58`, `887`-`912`). [`ArcPolicy`](crate::moe_admission::ArcPolicy)
 //! implements the equivalent token-local protection via
-//! `protected_this_token` (see its doc comment). [`FreqAdmissionPolicy`]
+//! `protected_this_token` (see its doc comment). [`FreqAdmissionPolicy`](crate::moe_admission::FreqAdmissionPolicy)
 //! needs no explicit guard — see its doc comment for the structural proof —
 //! but both were audited against this invariant, not assumed safe because
 //! `selected_ids` is duplicate-free (duplicate-freedom was never the
@@ -177,7 +177,7 @@ pub trait AdmissionPolicy {
 // ---------------------------------------------------------------------------
 
 /// Faithful mirror of
-/// [`crate::forward::moe_expert_cache::ExpertSlotCache`]'s admission and
+/// `crate::forward::moe_expert_cache::ExpertSlotCache`'s admission and
 /// eviction order (Stage 1, shipped): a fixed pool of `capacity` slots,
 /// each holding at most one expert id, evicted least-recently-used, with
 /// the "never evict a slot touched earlier THIS token" guard from that
@@ -221,6 +221,10 @@ impl LruPolicy {
         self.lru.push_back(slot);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "slot capacity is validated to be at least the number of distinct experts one token requests, so an untouched slot always exists and the position just found is in range"
+    )]
     fn pick_eviction_slot(&mut self) -> usize {
         let pos = self.lru.iter().position(|&s| !self.slot_touched[s]).expect(
             "no untouched slot available for eviction — capacity must be >= the number of \
@@ -672,7 +676,7 @@ impl LayerStats {
 
 /// Run one policy instance over one layer's token-ordered records, calling
 /// `begin_token` once per record before that token's `access` calls — the
-/// same per-token contract [`crate::forward::moe_expert_cache::ExpertSlotCache`]
+/// same per-token contract `crate::forward::moe_expert_cache::ExpertSlotCache`
 /// requires of its own callers.
 pub fn simulate_layer(records: &[TraceRecord], policy: &mut dyn AdmissionPolicy) -> LayerStats {
     let mut stats = LayerStats::default();

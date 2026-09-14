@@ -983,6 +983,10 @@ pub(crate) fn parse_merges_json(
     Ok(merges)
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "the byte-to-unicode table is built from a fixed list of valid scalar values"
+)]
 fn bytes_to_unicode() -> Vec<char> {
     let mut bs = Vec::new();
     bs.extend(33u16..=126);

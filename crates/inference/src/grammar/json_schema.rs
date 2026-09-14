@@ -1147,6 +1147,10 @@ impl<'a> CompileCtx<'a> {
         properties: Option<Vec<(&'a String, &'a Value)>>,
         required: Vec<&'a str>,
     ) -> Result<Vec<Alt>, SchemaError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "the ws rule is reserved when the builder is constructed"
+        )]
         let ws_id = self.builder.rule_id("ws").unwrap();
         match properties {
             None if required.is_empty() => {
@@ -1470,6 +1474,10 @@ impl<'a> CompileCtx<'a> {
 
     /// Compile an `array` schema.
     fn compile_array(&mut self, schema: &'a Value) -> Result<Vec<Alt>, SchemaError> {
+        #[expect(
+            clippy::unwrap_used,
+            reason = "the ws rule is reserved when the builder is constructed"
+        )]
         let ws_id = self.builder.rule_id("ws").unwrap();
         let min_items = schema.get("minItems").and_then(Value::as_u64).unwrap_or(0) as usize;
         let max_items = schema

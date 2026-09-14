@@ -425,7 +425,7 @@ fn inspect_safetensors_dir(dir: &Path, cfg: &Qwen35Config) -> Result<WeightInven
 ///   buffer — 2x.
 /// - `in_proj_a` / `in_proj_b`: Q4 on disk, dequantized to an f16 Metal
 ///   buffer (`load_q4_as_f16_buf` → `make_buffer_f16_from_q4`). A
-///   [`Q4Block`](crate::weights::q4_weights::Q4Block) packs 32 weights
+///   [`Q4Block`](lattice_inference::weights::q4_weights::Q4Block) packs 32 weights
 ///   into 20 bytes (0.625 B/elem); f16 resident is 2 B/elem — 3.2x.
 /// - `in_proj_qkv` / `in_proj_z`: each is mmap'd zero-copy at its own
 ///   size (1x) AND its bytes are duplicated again into the merged

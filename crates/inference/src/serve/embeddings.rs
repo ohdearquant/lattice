@@ -13,7 +13,7 @@
 //! `TextEmbeddingsInput` below, vs. `EmbeddingsRequest`/`EmbeddingsInput` for
 //! the vision-language route).
 //!
-//! The model type here ([`EmbeddingModel`]) loads the same way
+//! The model type here ([`EmbeddingModel`](crate::serve::embeddings::EmbeddingModel)) loads the same way
 //! `lattice-embed`'s `VisionEmbeddingModel` does -- an f16-packed decoder plus
 //! vision-encoder weights from one safetensors checkpoint -- but is defined
 //! in this crate rather than reused from `lattice-embed`, because
@@ -104,7 +104,7 @@ impl EmbeddingModel {
     ///
     /// Raises `tokenizer`'s own truncation cap to this checkpoint's
     /// [`Self::max_context`] window when it sits below it (see
-    /// [`capped_tokenizer`]), so this constructor gives the same guarantee
+    /// `capped_tokenizer`), so this constructor gives the same guarantee
     /// [`Self::from_directory`] does: no `EmbeddingModel`, however
     /// constructed, can have a tokenizer cap below its own `max_context()`.
     /// Without this, a caller passing a default `BpeTokenizer` (whose
@@ -184,7 +184,7 @@ impl EmbeddingModel {
     /// Real (possibly truncated) tokenized length of `text`, used for
     /// `usage.prompt_tokens` -- this must report what the pooled forward
     /// pass actually consumes, not what the caller sent. Never use this for
-    /// a context-window admission check: see [`Self::tokenize_lengths`].
+    /// a context-window admission check: see `Self::tokenize_lengths`.
     pub fn tokenize_len(&self, text: &str) -> usize {
         self.tokenizer.tokenize(text).real_length
     }
@@ -216,7 +216,7 @@ impl EmbeddingModel {
     /// pooled prefill, mirroring the exact cap the chat serving path derives
     /// from the same field for its RoPE table (`Qwen35Model::from_safetensors`:
     /// `config.max_position_embeddings.min(8192)`). Used as the source of
-    /// truth for [`check_item_fits_window`].
+    /// truth for `check_item_fits_window`.
     pub fn max_context(&self) -> usize {
         self.config.max_position_embeddings.min(8192)
     }
@@ -231,7 +231,7 @@ impl EmbeddingModel {
     /// be compared against [`Self::max_context`] the same way a text item is.
     ///
     /// Uses [`Self::tokenize_len`] (the real, possibly-truncated count), not
-    /// the pre-truncation count [`Self::tokenize_lengths`] also exposes, for
+    /// the pre-truncation count `Self::tokenize_lengths` also exposes, for
     /// the `prompt` component -- unlike the text item guard, this is not a
     /// live gap today: this
     /// method's one production call site ([`embed_items`]'s image branch)
@@ -591,7 +591,7 @@ fn check_item_fits_window(
 /// # Errors
 ///
 /// Returns [`ApiError::BadRequest`] (`context_length_exceeded`, via
-/// [`check_item_fits_window`]) for the first item whose scaffold token count
+/// `check_item_fits_window`) for the first item whose scaffold token count
 /// exceeds the loaded model's context window. Otherwise returns the first
 /// item's mapped [`ApiError`] (via [`map_embedding_error`]) on failure;
 /// earlier items' work is discarded rather than partially returned; there is

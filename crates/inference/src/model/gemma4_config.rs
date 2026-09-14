@@ -54,7 +54,7 @@ pub enum Gemma4LayerType {
 /// model variants. Built exclusively via [`Self::from_config_json_str`] (or
 /// its file-path wrappers) or [`Self::e2b`] -- there is no `Deserialize`
 /// impl on this type itself, so a caller cannot bypass the fail-closed raw
-/// parse in [`HfGemma4TextConfig`] by deserializing this struct directly.
+/// parse in `HfGemma4TextConfig` by deserializing this struct directly.
 #[derive(Debug, Clone)]
 pub struct Gemma4Config {
     // --- Core dimensions (G2) ---
@@ -283,7 +283,7 @@ impl Gemma4Config {
 
     /// Parse HF Gemma 4 `config.json` text into a `Gemma4Config`. Fail-closed:
     /// `text_config` and every forward-relevant field within it are required
-    /// by [`HfGemma4TextConfig`]'s schema (no container-level
+    /// by `HfGemma4TextConfig`'s schema (no container-level
     /// `#[serde(default)]`), so a missing or partial `text_config` is a
     /// serde error naming the absent field rather than a silently-completed
     /// E2B preset.

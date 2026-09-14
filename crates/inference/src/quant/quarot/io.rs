@@ -30,7 +30,7 @@
 //! [`has_tensor`]: QuarotTensorReader::has_tensor
 //!
 //! On-disk decode for F32 / F16 / BF16 uses the always-compiled scalar
-//! conversion in [`crate::weights::half_bits`] (independent of the `f16`
+//! conversion in `crate::weights::half_bits` (independent of the `f16`
 //! cargo feature, which only gates *loading permission* elsewhere), then
 //! widens the result to f64 (lossless from f32).
 //!

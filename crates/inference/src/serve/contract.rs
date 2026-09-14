@@ -75,7 +75,7 @@ pub struct ChatRequest {
     #[serde(default)]
     pub model: Option<String>,
     /// Conversation messages. Deserialization itself enforces
-    /// [`MAX_MESSAGE_COUNT`] (see [`deserialize_bounded_messages`]), so the
+    /// [`MAX_MESSAGE_COUNT`] (see `deserialize_bounded_messages`), so the
     /// single authoritative `ChatRequest` parse both counts and materializes
     /// the array in one traversal.
     #[serde(default, deserialize_with = "deserialize_bounded_messages")]
@@ -715,7 +715,7 @@ where
 }
 
 /// True when a `ChatRequest` deserialization failure was raised by
-/// [`deserialize_bounded_messages`]'s count bound, so callers can surface
+/// `deserialize_bounded_messages`'s count bound, so callers can surface
 /// [`message_flood_text`] instead of a generic invalid-JSON-body error.
 pub fn is_message_flood_error(err: &serde_json::Error) -> bool {
     err.to_string().contains(MESSAGE_FLOOD_SENTINEL)
@@ -1048,7 +1048,7 @@ fn normalize_message_content(
 
 /// Decodes an inline `data:image/png;base64,...` or
 /// `data:image/jpeg;base64,...` URI to raw file bytes, enforcing
-/// [`MAX_ENCODED_IMAGE_BYTES`] / [`MAX_DECODED_IMAGE_BYTES`] and that the
+/// `MAX_ENCODED_IMAGE_BYTES` / [`MAX_DECODED_IMAGE_BYTES`] and that the
 /// decoded payload actually is the declared format. Shared with
 /// [`super::embeddings`]'s `/v1/embeddings` image items so both entry points
 /// that accept an inline data URI validate it identically.
@@ -1057,7 +1057,7 @@ fn normalize_message_content(
 ///
 /// Returns [`ApiError::BadRequest`] (`unsupported_image_url_scheme`) for a
 /// non-`data:` URL (remote `http(s)` URLs are not accepted), or
-/// [`ApiError::BadRequest`] (`invalid_image`, via [`invalid_image`]) for a
+/// [`ApiError::BadRequest`] (`invalid_image`, via `invalid_image`) for a
 /// malformed data URI, an oversized payload, invalid base64, or a payload
 /// whose sniffed format does not match its declared media type.
 pub fn decode_inline_image(url: &str) -> Result<Vec<u8>, ApiError> {

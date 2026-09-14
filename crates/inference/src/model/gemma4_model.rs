@@ -552,11 +552,11 @@ impl Gemma4Model {
 
     /// **Unstable**: greedy-decode `max_new_tokens` continuation tokens for
     /// `prompt_ids` (already tokenized, BOS included by the caller). Runs
-    /// prefill and decode through the same single-token [`Self::forward_step`]
+    /// prefill and decode through the same single-token `Self::forward_step`
     /// loop.
     ///
     /// # Errors
-    /// Propagates [`Self::forward_step`] errors (invalid token id, cache
+    /// Propagates `Self::forward_step` errors (invalid token id, cache
     /// bounds/capacity).
     pub fn generate_greedy(
         &self,

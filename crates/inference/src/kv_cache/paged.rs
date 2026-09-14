@@ -1311,11 +1311,19 @@ impl PagedKVCache {
         // FP-049: evict the LRU (oldest) physical page. For single-sequence caches
         // the LRU front always corresponds to logical page 0 (entries[0]), so
         // pop_front_page() removes the correct entry from the page table.
+        #[expect(
+            clippy::expect_used,
+            reason = "the pool is exhausted, so the LRU order holds at least one page"
+        )]
         let evicted = self
             .lru_order
             .pop_front()
             .expect("LRU order empty but pool exhausted");
 
+        #[expect(
+            clippy::expect_used,
+            reason = "the page table holds an LRU page whenever the pool is exhausted"
+        )]
         let removed = self
             .table
             .pop_front_page()

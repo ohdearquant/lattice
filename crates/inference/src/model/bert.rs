@@ -414,7 +414,7 @@ impl BertModel {
     /// stages (embedding lookup, Q/K/V projection, FFN, output projection) are each
     /// one `matmul_bt`/`layer_norm` call over every real row -- no wasted rows for
     /// padding. Only the O(seq_len^2) attention score/context step loops per
-    /// sequence (see [`crate::attention::multi_head_attention_batched`]) are run
+    /// sequence (see `crate::attention::multi_head_attention_batched`) are run
     /// serially, one sequence at a time, over disjoint output slices. The
     /// implementation detail may change without API breakage.
     pub fn encode_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, InferenceError> {

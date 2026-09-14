@@ -5,7 +5,7 @@
 //! activation/RoPE convention here is inherited directly from the CPU
 //! reference — the setup tables (bilinear position-embedding interpolation,
 //! 2-axis vision RoPE `cos`/`sin` construction) are computed by literally
-//! calling [`super::qwen35_vit::build_pos_embed_and_rope_tables`], and the
+//! calling `super::qwen35_vit::build_pos_embed_and_rope_tables`, and the
 //! per-element ops (biased `LayerNorm`, GELU-tanh, RoPE rotate-half
 //! application, fail-closed softmax) reuse the exact CPU reference functions
 //! (`layer_norm`, `gelu`, `apply_rope_inplace`, `softmax_inplace`) rather

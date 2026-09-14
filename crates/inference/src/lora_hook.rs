@@ -178,7 +178,7 @@ pub trait LoraHook: Send + Sync {
     /// **Unstable**: whether this hook has anything to apply for
     /// `(layer_idx, module)`.
     ///
-    /// [`apply_lora_rows`] calls this once per projection, before its
+    /// `apply_lora_rows` calls this once per projection, before its
     /// per-row loop, so a hook with nothing to do for this projection (the
     /// default no-adapter case) skips the loop — and the one virtual call
     /// per token row it would otherwise cost — entirely. Default: `true`
