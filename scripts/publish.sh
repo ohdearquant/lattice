@@ -20,6 +20,14 @@ fi
 # (--dry-run validates only the leaf tier: cargo cannot dry-run a crate whose
 #  internal deps are not yet live on the registry.)
 
+# Every tier below uploads an archive the registry will reject outright if it
+# exceeds 10 MiB, and a rejection in tier 2 leaves tier 1 already published and
+# immutable. `cargo publish --dry-run` does not cover this: it can only validate
+# the leaf tier, because a crate whose internal path dependencies are not yet
+# live on the registry cannot be packaged at all. Measure all five first.
+echo "--- Pre-publish: package size against the crates.io upload limit ---"
+"$(dirname "$0")/package-size-check.sh"
+
 echo "--- Tier 1: leaf crates (no internal deps) ---"
 cargo publish -p lattice-fann $FLAG
 cargo publish -p lattice-transport $FLAG

@@ -43,20 +43,51 @@ make ci  # fmt + clippy + doc lint + test + release build
 
 # 4. Dry-run publish (catches missing fields, version conflicts)
 make publish-dry
+
+# 5. Package size against the crates.io upload limit, all five crates
+scripts/package-size-check.sh
 ```
 
 `make publish-dry` only validates the leaf tier (`lattice-fann`, `lattice-transport`) — Cargo
 cannot dry-run a crate whose internal path dependencies are not yet live on the registry, so
 `lattice-inference`, `lattice-embed`, and `lattice-tune` are not covered by the dry run.
 
+### Package size
+
+That same gap hides the registry's upload limit until publish time, which is the worst moment
+to find it: crates.io rejects an archive over 10 MiB (10,485,760 bytes), and a rejection in
+the second tier leaves the first tier already published and immutable.
+
+`scripts/package-size-check.sh` covers all five crates and needs no registry access. It
+brackets each archive from `cargo package --list`, which builds nothing and names exactly the
+files that would ship, gzipped at level 6 — cargo's default, and the level to use here,
+because level 9 shaves enough off the estimate to flatter a crate that is close to the limit.
+`make publish` runs it before the first tier. Run it yourself as soon as a release branch
+exists, because the remedy is a manifest change that goes through review like any other.
+
+The limit is not theoretical for this workspace. `lattice-inference` published at 7.52 MiB at
+v0.7.1 and 7.70 MiB at v0.9.0. At v0.10.0, two test-only tokenizer fixture directories — 43 MB
+raw between them — took the measured archive to 10,493,367 bytes across 420 files, about 7.6 KB
+over the limit. Adding both to the crate manifest's `exclude` list brought it to 3,010,538
+bytes across 406 files with every other fixture still present. A published crate cannot run its
+integration tests, so their fixtures are dead weight in the archive; `exclude` is the
+instrument, not a smaller fixture.
+
+Two of its behaviours are refusals rather than results, and both exit non-zero. It refuses when
+`cargo package --list` fails, most often on a dirty working tree, which `cargo publish` will
+refuse as well. It also refuses when a listed file is not on disk, which is what a measurement
+taken from the wrong directory looks like: `cargo package --list` prints crate-relative paths,
+so summing sizes from the workspace root finds almost nothing and would otherwise report a
+comfortably small crate. Neither refusal is an absence of a problem.
+
 ## Normal Publish
 
 ```sh
-# 5. Tag
+# 6. Tag
 git tag -a v{VERSION} -m "v{VERSION}"
 git push origin v{VERSION}
 
-# 6. Publish to crates.io in dependency-DAG order, with indexing waits
+# 7. Publish to crates.io in dependency-DAG order, with indexing waits
 make publish
 ```
 
@@ -77,10 +108,10 @@ cargo publish -p lattice-tune
 ```
 
 ```sh
-# 7. Create the tagged GitHub release as a draft
+# 8. Create the tagged GitHub release as a draft
 gh release create v{VERSION} --draft --title "v{VERSION}" --notes-file docs/releases/v{VERSION}.md
 
-# 8. Dispatch the asset workflow from main; it verifies, uploads, and publishes the draft
+# 9. Dispatch the asset workflow from main; it verifies, uploads, and publishes the draft
 gh workflow run release-binaries.yml --repo ohdearquant/lattice --ref main -f tag=v{VERSION}
 ```
 
@@ -126,9 +157,14 @@ for c in lattice-fann lattice-transport lattice-inference lattice-embed lattice-
   cargo yank --version {BROKEN_VERSION} "$c"
 done
 
-# 5. Verify crates.io reflects the yank:
-curl -s https://crates.io/api/v1/crates/{CRATE}
-# should show latest_unyanked={NEW_VERSION} and yanked versions including {BROKEN_VERSION}
+# 5. Verify crates.io reflects the yank, using the registry-check script in the
+#    "Publishing" section of CLAUDE.md. Do not substitute a bare curl: crates.io
+#    refuses a request that does not identify its caller and answers HTTP 403 with
+#    a JSON error object, and code looking for a version in that object finds none,
+#    so a refused read renders as "this version was never published". The script
+#    runs `serde` first as a control for exactly that failure, and reads
+#    `crate.max_stable_version` plus the per-version `yanked` booleans in
+#    `versions[]`. There is no `latest_unyanked` field on the crate object.
 ```
 
 A published GitHub release is not repaired in place by this workflow. Corrections always use the
