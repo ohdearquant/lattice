@@ -32,10 +32,25 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="$(bench_require_python3 "package-size-check.sh")" || exit 1
 BRACKET="${REPO_ROOT}/scripts/lib/package-size-bracket.py"
 
-CRATES=("$@")
-if [ ${#CRATES[@]} -eq 0 ]; then
-    CRATES=(lattice-fann lattice-transport lattice-inference lattice-embed lattice-tune)
-fi
+# One `cargo metadata` read for the whole run, emitting "<name>\t<crate dir>" for
+# every publishable workspace member. Deriving the set beats listing it: a crate
+# added to the workspace is measured without anyone remembering to add it here,
+# and a list maintained separately from the workspace is a gate that can end up
+# checking the wrong set while still reporting success. The resolver refuses an
+# empty set for the same reason — a discovery that can be silently emptied is a
+# gate that skips itself.
+WORKSPACE_CRATES="$(cargo metadata --no-deps --format-version 1 \
+    --manifest-path "${REPO_ROOT}/Cargo.toml" \
+    | "$PYTHON_BIN" -c 'import json, os, sys
+members = []
+for pkg in json.load(sys.stdin)["packages"]:
+    if pkg.get("publish") == []:
+        continue
+    members.append((pkg["name"], os.path.dirname(pkg["manifest_path"])))
+if not members:
+    sys.exit("package-size-check: no publishable workspace members found")
+for name, directory in sorted(members):
+    print(f"{name}\t{directory}")')"
 
 # Expanded below as ${DIRTY_FLAG[@]+"${DIRTY_FLAG[@]}"}: under `set -u`, bash 3.2
 # (the macOS system bash) treats a plain "${arr[@]}" on an empty array as an
@@ -47,17 +62,27 @@ if [ "${PKG_SIZE_ALLOW_DIRTY:-0}" = "1" ]; then
     DIRTY_FLAG=(--allow-dirty)
 fi
 
+# Named crates filter the derived set; naming one that is not in it is an error,
+# not an empty run that reports success.
+if [ "$#" -gt 0 ]; then
+    for wanted in "$@"; do
+        if ! printf '%s\n' "$WORKSPACE_CRATES" | cut -f1 | grep -qx "$wanted"; then
+            echo "package-size-check: no publishable workspace member named ${wanted}" >&2
+            exit 1
+        fi
+    done
+fi
+
 status=0
-for crate in "${CRATES[@]}"; do
-    crate_dir="$(cargo metadata --no-deps --format-version 1 --manifest-path "${REPO_ROOT}/Cargo.toml" \
-        | "$PYTHON_BIN" -c 'import json, os, sys
-name = sys.argv[1]
-for pkg in json.load(sys.stdin)["packages"]:
-    if pkg["name"] == name:
-        print(os.path.dirname(pkg["manifest_path"]))
-        break
-else:
-    sys.exit(f"package-size-check: no workspace member named {name}")' "$crate")"
+while IFS="$(printf '\t')" read -r crate crate_dir; do
+    [ -n "$crate" ] || continue
+    if [ "$#" -gt 0 ]; then
+        wanted_match=0
+        for wanted in "$@"; do
+            [ "$wanted" = "$crate" ] && wanted_match=1
+        done
+        [ "$wanted_match" -eq 1 ] || continue
+    fi
 
     # `cargo package --list` prints paths relative to the crate directory, so the
     # measurement runs from there.
@@ -75,7 +100,9 @@ else:
     (cd "$crate_dir" && "$PYTHON_BIN" "$BRACKET" "$crate" "$list_file" \
         --lockfile "${REPO_ROOT}/Cargo.lock") || status=1
     rm -f "$list_file" "$err_file"
-done
+done <<EOF
+${WORKSPACE_CRATES}
+EOF
 
 if [ "$status" -ne 0 ]; then
     echo >&2

@@ -38,12 +38,28 @@ class Refusal(Exception):
     """The inputs cannot support a size claim."""
 
 
+class _ByteCounter:
+    """Sink that measures the gzip stream without holding it."""
+
+    def __init__(self) -> None:
+        self.total = 0
+
+    def write(self, data: bytes) -> int:
+        self.total += len(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+
 def bracket(crate: str, listed: list[str], lockfile: str | None) -> tuple[int, int]:
     """Return (compressed size, number of listed entries)."""
     if not listed:
         raise Refusal(f"{crate}: empty file list, refusing to report a size")
 
     on_disk = [path for path in listed if path not in GENERATED]
+    # os.path.exists follows symlinks, so a listed but broken link is reported as
+    # absent and refused below rather than measured as an empty file.
     absent = [path for path in on_disk if not os.path.exists(path)]
     if absent:
         raise Refusal(
@@ -51,26 +67,40 @@ def bracket(crate: str, listed: list[str], lockfile: str | None) -> tuple[int, i
             f"(first: {absent[0]}); refusing to report a size"
         )
 
-    buf = io.BytesIO()
+    counter = _ByteCounter()
     prefix = f"{crate}-0.0.0"
-    with tarfile.open(fileobj=buf, mode="w") as tar:
-        for path in on_disk:
-            tar.add(path, arcname=f"{prefix}/{path}")
-        # Bracket the synthesized entries with real content rather than a guess.
-        # Cargo.toml.orig is this crate's manifest, and the packaged Cargo.lock is
-        # a pruned form of the workspace lockfile, so the workspace copy bounds it
-        # from above.
-        sources = [("Cargo.toml.orig", os.path.join(os.getcwd(), "Cargo.toml"))]
-        if lockfile:
-            sources.append(("Cargo.lock", lockfile))
-        for arcname, source in sources:
-            if os.path.exists(source):
-                tar.add(source, arcname=f"{prefix}/{arcname}")
-        info = tarfile.TarInfo(name=f"{prefix}/.cargo_vcs_info.json")
-        info.size = len(VCS_INFO)
-        tar.addfile(info, io.BytesIO(VCS_INFO))
+    # Streamed rather than buffered: the uncompressed tar is several times the
+    # size of the archive being bounded, and holding all of it to measure a
+    # number would make memory scale with the fixtures rather than the answer.
+    #
+    # dereference=True is load-bearing. Cargo follows a symlink and packages its
+    # target's contents, while tarfile's default writes a link header of zero
+    # bytes. Measured on a crate cargo archived at 10,490,174 bytes, over the
+    # limit from one 5 MiB file reached through a link: the buffered default
+    # reported 5,245,520 bytes and passed it. A size gate that undercounts is
+    # worse than no gate, because it answers the question it was installed to
+    # answer and answers it wrong.
+    with gzip.GzipFile(
+        fileobj=counter, mode="wb", compresslevel=COMPRESS_LEVEL, mtime=0
+    ) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w|", dereference=True) as tar:
+            for path in on_disk:
+                tar.add(path, arcname=f"{prefix}/{path}")
+            # Bracket the synthesized entries with real content rather than a
+            # guess. Cargo.toml.orig is this crate's manifest, and the packaged
+            # Cargo.lock is a pruned form of the workspace lockfile, so the
+            # workspace copy bounds it from above.
+            sources = [("Cargo.toml.orig", os.path.join(os.getcwd(), "Cargo.toml"))]
+            if lockfile:
+                sources.append(("Cargo.lock", lockfile))
+            for arcname, source in sources:
+                if os.path.exists(source):
+                    tar.add(source, arcname=f"{prefix}/{arcname}")
+            info = tarfile.TarInfo(name=f"{prefix}/.cargo_vcs_info.json")
+            info.size = len(VCS_INFO)
+            tar.addfile(info, io.BytesIO(VCS_INFO))
 
-    return len(gzip.compress(buf.getvalue(), compresslevel=COMPRESS_LEVEL)), len(listed)
+    return counter.total, len(listed)
 
 
 def main(argv: list[str] | None = None) -> int:
