@@ -577,6 +577,10 @@ impl SentencePieceTokenizer {
                 } else {
                     let segment_start = pos;
                     while pos < text.len() && self.match_added_token(text, pos).is_none() {
+                        #[expect(
+                            clippy::expect_used,
+                            reason = "the surrounding while guard proves the index is inside the text"
+                        )]
                         let ch = text[pos..]
                             .chars()
                             .next()
@@ -639,6 +643,10 @@ impl SentencePieceTokenizer {
 
         let mut start = 0usize;
         while start < size {
+            #[expect(
+                clippy::expect_used,
+                reason = "the surrounding while guard proves the index is inside the text"
+            )]
             let ch = sentence[start..]
                 .chars()
                 .next()
@@ -697,6 +705,10 @@ impl SentencePieceTokenizer {
             let node = &best[end];
             let Some(prev) = node.prev else {
                 results_rev.push(self.inner.unk_id);
+                #[expect(
+                    clippy::expect_used,
+                    reason = "end is greater than zero and lies on a UTF-8 boundary, so the prefix has a last character"
+                )]
                 let ch = sentence[..end]
                     .chars()
                     .last()

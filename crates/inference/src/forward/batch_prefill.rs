@@ -2,7 +2,7 @@
 //!
 //! The canonical [`Qwen35Model::generate`] and [`Qwen35Model::generate_streaming`]
 //! methods delegate their prompt phase to
-//! [`Qwen35Model::prefill_tokens_batched_for_generate`]. The core advances the
+//! `Qwen35Model::prefill_tokens_batched_for_generate`. The core advances the
 //! full-attention KV cache and GatedDeltaNet recurrent states for the whole prompt
 //! before returning the final prompt position's logits.
 //!

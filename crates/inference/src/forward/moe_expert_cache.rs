@@ -45,13 +45,13 @@
 //!    actually executes it.
 //!
 //! Stage 1's chosen scheme is the "evict-only-after-token-boundary" option:
-//! [`ExpertSlotCache::begin_token`] clears a per-slot "touched this token"
-//! flag, [`ExpertSlotCache::resolve`] sets it on every slot it touches (hit
-//! or miss), and eviction ([`ExpertSlotCache::pick_eviction_slot`]) only
+//! `ExpertSlotCache::begin_token` clears a per-slot "touched this token"
+//! flag, `ExpertSlotCache::resolve` sets it on every slot it touches (hit
+//! or miss), and eviction (`ExpertSlotCache::pick_eviction_slot`) only
 //! ever selects an *untouched* slot. This is sufficient — not just
 //! plausible — because [`moe_expert_cache_num_slots`] is required to return
 //! `num_slots >= top_k` (validated at construction, see
-//! [`ExpertSlotCache::new`]), and a single token's routed-expert loop
+//! `ExpertSlotCache::new`), and a single token's routed-expert loop
 //! (`encode_moe_ffn` Step 3) never resolves more than `top_k` distinct
 //! experts. So there are always enough untouched slots left to satisfy every
 //! miss within one token, and no same-token slot ever needs to be evicted
@@ -68,8 +68,8 @@
 //!
 //! `encode_moe_ffn` issues every routed-expert load for the CURRENT token
 //! right after CPU routing decides `selected`, splits into three phases
-//! ([`ExpertSlotCache::plan_prefetch`] → [`ExpertSlotCache::spawn_dequant`]
-//! → [`ExpertSlotCache::apply_prefetch_results`]) so the actual I/O +
+//! (`ExpertSlotCache::plan_prefetch` → `ExpertSlotCache::spawn_dequant`
+//! → `ExpertSlotCache::apply_prefetch_results`) so the actual I/O +
 //! dequant work overlaps with encoding Step 2's shared-expert GEMVs
 //! instead of blocking in front of them:
 //!
@@ -77,7 +77,7 @@
 //!    a hit or miss and commit every slot's ownership bookkeeping (owner,
 //!    `expert_to_slot`, `slot_touched`, LRU position) — see
 //!    `plan_prefetch`'s doc comment. A miss also clears the assigned
-//!    slot's [`ExpertSlotCache::slot_ready`] flag to `false` *before* any
+//!    slot's `ExpertSlotCache::slot_ready` flag to `false` *before* any
 //!    dequant work starts.
 //! 2. **Spawn**: `spawn_dequant` hands the plan's misses to a
 //!    `std::thread::scope`-spawned thread (optionally rayon-parallel

@@ -29,9 +29,17 @@ fn validate_q8_args(
     assert_eq!(k % QK8_0, 0, "k must be a multiple of 32 for Q8_0");
     assert!(x_len >= k, "x_q is shorter than k");
     let blocks = k / QK8_0;
+    #[expect(
+        clippy::expect_used,
+        reason = "an overflowing size means a tensor shape that cannot be addressed; panicking is the intended contract for that, matching the asserts alongside"
+    )]
     let row_stride = blocks
         .checked_mul(Q8_0_BLOCK_BYTES)
         .expect("row stride overflow");
+    #[expect(
+        clippy::expect_used,
+        reason = "an overflowing size means a tensor shape that cannot be addressed; panicking is the intended contract for that, matching the asserts alongside"
+    )]
     let needed = num_rows
         .checked_mul(row_stride)
         .expect("weights size overflow");

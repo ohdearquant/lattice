@@ -170,6 +170,10 @@ impl Network {
                 .chunks_exact(4)
                 .map(|chunk| {
                     // SAFETY: chunks_exact(4) guarantees exactly 4 bytes per chunk
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "chunks_exact(4) yields exactly four bytes per chunk"
+                    )]
                     let arr: [u8; 4] = chunk
                         .try_into()
                         .expect("chunks_exact(4) guarantees 4 bytes");
@@ -188,6 +192,10 @@ impl Network {
                 .chunks_exact(4)
                 .map(|chunk| {
                     // SAFETY: chunks_exact(4) guarantees exactly 4 bytes per chunk
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "chunks_exact(4) yields exactly four bytes per chunk"
+                    )]
                     let arr: [u8; 4] = chunk
                         .try_into()
                         .expect("chunks_exact(4) guarantees 4 bytes");

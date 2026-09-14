@@ -124,6 +124,10 @@ impl EmbeddingCache {
             1 // Disabled caches still need a valid LRU capacity.
         };
 
+        #[expect(
+            clippy::expect_used,
+            reason = "per_shard is clamped to at least 1 on the lines above"
+        )]
         let per_shard_nz = NonZeroUsize::new(per_shard).expect("per_shard is always >= 1");
 
         let shards = (0..NUM_SHARDS)

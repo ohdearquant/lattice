@@ -586,6 +586,10 @@ std::thread_local! {
 /// forbids revisiting a rule id — either way the frames live on `stack`, not
 /// the native stack, so neither shape can overflow it. `MAX_PDA_DEPTH` is a
 /// different bound (the live PDA execution stack) and does not apply here.
+#[expect(
+    clippy::unwrap_used,
+    reason = "the loop body is entered only after stack.last() returned Some"
+)]
 fn remaining_is_nullable(
     grammar: &CompiledGrammar,
     rule_id: usize,

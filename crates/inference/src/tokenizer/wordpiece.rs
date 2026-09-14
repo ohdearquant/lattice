@@ -509,6 +509,10 @@ impl WordPieceTokenizer {
                 } else {
                     let segment_start = pos;
                     while pos < text.len() && self.match_added_token(text, pos).is_none() {
+                        #[expect(
+                            clippy::unwrap_used,
+                            reason = "the surrounding while guard proves pos is inside the text"
+                        )]
                         let ch = text[pos..].chars().next().unwrap();
                         pos += ch.len_utf8();
                     }
@@ -672,6 +676,10 @@ impl Tokenizer for WordPieceTokenizer {
 
                 let mut parts = Vec::with_capacity(handles.len());
                 for handle in handles {
+                    #[expect(
+                        clippy::expect_used,
+                        reason = "the scoped tokenization workers do not panic"
+                    )]
                     parts.push(
                         handle
                             .join()

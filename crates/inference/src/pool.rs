@@ -75,6 +75,10 @@ pub fn mean_pool(
     seq_len: usize,
     hidden_size: usize,
 ) -> Vec<f32> {
+    #[expect(
+        clippy::expect_used,
+        reason = "an overflowing size means a tensor shape that cannot be addressed; panicking is the intended contract for that, matching the asserts alongside"
+    )]
     let expected_hidden = seq_len
         .checked_mul(hidden_size)
         .expect("invariant: seq_len * hidden_size must fit usize");
@@ -367,6 +371,10 @@ pub fn last_token_pool(
     hidden_size: usize,
 ) -> Vec<f32> {
     assert!(seq_len > 0, "seq_len must be non-zero for last_token_pool");
+    #[expect(
+        clippy::expect_used,
+        reason = "an overflowing size means a tensor shape that cannot be addressed; panicking is the intended contract for that, matching the asserts alongside"
+    )]
     let expected_hidden = seq_len
         .checked_mul(hidden_size)
         .expect("invariant: seq_len * hidden_size must fit usize");
@@ -395,6 +403,10 @@ pub fn last_token_pool(
 /// Returns a copy of `hidden_states[0..hidden_size]`.
 pub fn cls_pool(hidden_states: &[f32], seq_len: usize, hidden_size: usize) -> Vec<f32> {
     assert!(seq_len > 0, "seq_len must be non-zero for cls_pool");
+    #[expect(
+        clippy::expect_used,
+        reason = "an overflowing size means a tensor shape that cannot be addressed; panicking is the intended contract for that, matching the asserts alongside"
+    )]
     let expected_hidden = seq_len
         .checked_mul(hidden_size)
         .expect("invariant: seq_len * hidden_size must fit usize");

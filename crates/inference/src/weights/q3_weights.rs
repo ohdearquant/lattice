@@ -72,7 +72,7 @@ use crate::error::InferenceError;
 ///
 /// `scale`/`bias` are stored as raw IEEE-754 f16 bit patterns in `u16` — the
 /// `half` crate is not a dependency of `lattice-inference`. Use
-/// [`q3_f32_to_f16`] / [`q3_f16_to_f32`].
+/// `q3_f32_to_f16` / `q3_f16_to_f32`.
 ///
 /// `packed` holds 32 3-bit values in **plane-split 2+1** layout (see the module
 /// docs): a byte-aligned low-2-bit plane in `packed[0..8]` and a byte-aligned
@@ -747,6 +747,10 @@ pub fn load_q3_file(path: &std::path::Path) -> Result<Q3Tensor, Box<dyn std::err
     let mut raw = vec![0u8; raw_len];
     f.read_exact(&mut raw)?;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "chunks_exact(Q3_BLOCK_BYTES) yields chunks whose tail is exactly the packed-byte length"
+    )]
     let blocks: Vec<Q3Block> = raw
         .chunks_exact(Q3_BLOCK_BYTES)
         .map(|c| Q3Block {

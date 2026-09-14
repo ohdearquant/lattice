@@ -1375,11 +1375,11 @@ const MTP_VERIFY_DEFAULT_SEED: u64 = 0x853c_49e6_748f_ea9b;
 /// - `Some(seed)`: probabilistic rejection sampling draws from an RNG seeded with `seed`.
 ///   Identical inputs and the same `seed` reproduce identical accepted tokens and
 ///   fallback token across runs — thread the caller's `GenerateConfig.seed` here to match
-///   the rest of a reproducible generation run. Note [`SpecRng::new`] maps `seed == 0` to
+///   the rest of a reproducible generation run. Note `SpecRng::new` maps `seed == 0` to
 ///   its internal fallback constant, so `Some(0)` behaves identically to that fallback
 ///   seed rather than as a distinct zero-seeded stream (reproducibility still holds).
-/// - `None`: uses [`MTP_VERIFY_DEFAULT_SEED`], a fixed deterministic default — **not**
-///   [`SpecRng::from_clock`]. This is documented compatibility behavior for
+/// - `None`: uses `MTP_VERIFY_DEFAULT_SEED`, a fixed deterministic default — **not**
+///   `SpecRng::from_clock`. This is documented compatibility behavior for
 ///   [`mtp_verify_draft`], the reverse of the lower-level [`rejection_sample_draft`], whose
 ///   own `seed=None` is intentionally clock-seeded for non-reproducible standalone use.
 ///
@@ -1581,7 +1581,7 @@ pub fn mtp_verify_draft_with_seed<T: MtpTargetVerifier>(
 /// Verify a speculative MTP draft against the target model.
 ///
 /// Compatibility shim over [`mtp_verify_draft_with_seed`] that always passes `seed=None`,
-/// i.e. [`MTP_VERIFY_DEFAULT_SEED`] — see that function's "Seed contract" section for what
+/// i.e. `MTP_VERIFY_DEFAULT_SEED` — see that function's "Seed contract" section for what
 /// `None` means here. Callers that want to thread a caller-controlled seed (e.g. a
 /// `GenerateConfig.seed`) should call [`mtp_verify_draft_with_seed`] directly.
 ///
@@ -2128,6 +2128,10 @@ pub fn rejection_sample_draft(
         // Bonus token after full acceptance: argmax of the position-after-last-draft
         // target distribution.
         if !had_rejection {
+            #[expect(
+                clippy::expect_used,
+                reason = "target_logits carries one distribution per draft position, so it is never empty here"
+            )]
             let last_target_choice = argmax(target_logits.last().expect("n > 0")) as u32;
             bonus_token = Some(last_target_choice);
         }
@@ -2201,6 +2205,10 @@ pub fn rejection_sample_draft(
     } else {
         let r = rng.next_f32();
         // Use target_logits[n-1] — the distribution over what comes after draft[n-1].
+        #[expect(
+            clippy::expect_used,
+            reason = "target_logits carries one distribution per draft position, so it is never empty here"
+        )]
         softmax_into_temperature(
             target_logits.last().expect("n > 0"),
             temperature,
@@ -2209,6 +2217,10 @@ pub fn rejection_sample_draft(
         );
         // Weighted sample from the full target distribution.
         let mut cumsum = 0.0f32;
+        #[expect(
+            clippy::expect_used,
+            reason = "target_logits carries one distribution per draft position, so it is never empty here"
+        )]
         let mut sampled = argmax(target_logits.last().expect("n > 0")) as u32;
         for (j, &prob) in p_buf.iter().enumerate() {
             cumsum += prob;
@@ -2348,6 +2360,10 @@ where
 
     while generated.len() < max_new_tokens {
         let draft = speculator.speculate(&all_tokens);
+        #[expect(
+            clippy::expect_used,
+            reason = "prompt_tokens seeds all_tokens before the loop"
+        )]
         let current = *all_tokens
             .last()
             .expect("invariant: prompt_tokens must seed speculation history");

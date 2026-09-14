@@ -266,6 +266,10 @@ impl PrefixPageCache {
         if self.entries.is_empty() {
             return 0;
         }
+        #[expect(
+            clippy::expect_used,
+            reason = "the empty case returns on the preceding line"
+        )]
         let (_key, entry) = self.entries.shift_remove_index(0).expect("non-empty");
         entry
             .pages

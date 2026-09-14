@@ -970,6 +970,10 @@ pub fn generate_f16(
     // Autoregressive decode
     for _ in 1..gen_cfg.max_new_tokens {
         let pos = kv_cache.seq_len;
+        #[expect(
+            clippy::expect_used,
+            reason = "all_ids is seeded with the prompt before the loop and appended to on every iteration"
+        )]
         let last_token = *all_ids
             .last()
             .expect("invariant: prompt or previous sample populated all_ids");
@@ -1265,6 +1269,10 @@ pub fn generate_multimodal_f16(
     // they diverge whenever the prompt contained an image.
     for _ in 1..gen_cfg.max_new_tokens {
         let physical_pos = kv_cache.seq_len;
+        #[expect(
+            clippy::expect_used,
+            reason = "all_ids is seeded with the prompt before the loop and appended to on every iteration"
+        )]
         let last_token = *all_ids
             .last()
             .expect("invariant: prompt or previous sample populated all_ids");

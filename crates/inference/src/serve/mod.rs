@@ -1087,7 +1087,7 @@ pub struct ProductionAdapterObservation {
     pub prompt_tokens: usize,
     /// Whether the (canned) terminal outcome this capture's caller chose to
     /// report was an explicit stop condition (`true`) vs. exhausting the
-    /// token budget (`false`) -- mirrors [`GenerateOutput::stopped`] /
+    /// token budget (`false`) -- mirrors [`GenerateOutput::stopped`](crate::model::qwen35_config::GenerateOutput::stopped) /
     /// `Ev::Done`'s `stopped` field.
     pub stopped: bool,
 }

@@ -151,6 +151,10 @@ impl NativeEmbeddingService {
     /// Ensures the shared model load has completed.
     ///
     /// See [`docs/service.md`](../../docs/service.md#nativeembeddingservice-implementation-notes) for the cancellation invariant.
+    #[expect(
+        clippy::expect_used,
+        reason = "the OnceCell is initialized by the spawn_blocking call that precedes this read"
+    )]
     async fn ensure_model(&self) -> Result<&LoadedModel> {
         // Fast path: already loaded.
         if let Some(result) = self.model.get() {

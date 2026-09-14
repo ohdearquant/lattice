@@ -487,6 +487,10 @@ impl<'a> Parser<'a> {
                         return Err(GbnfError("empty character class".into()));
                     }
                     if alts.len() == 1 {
+                        #[expect(
+                            clippy::unwrap_used,
+                            reason = "alts.len() == 1 is checked on the preceding line"
+                        )]
                         return Ok(alts.into_iter().next().unwrap());
                     }
                     // Wrap in anon rule.
