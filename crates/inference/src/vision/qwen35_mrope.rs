@@ -193,10 +193,10 @@ pub fn build_position_ids(
 ///
 /// `rope_half = (head_dim as f32 * partial_rotary_factor) as usize / 2`
 /// (32 for Qwen3.5-0.8B). `mrope_section` must have exactly 3 entries
-/// (T, H, W section lengths) summing to `rope_half`. Every lane starts on T;
-/// H then overwrites lanes `1,4,...` up to its declared section length and
-/// W overwrites lanes `2,5,...` up to its declared section length, matching
-/// the reference's saturating strided assignment.
+/// declaring the exact realized (T, H, W) lane counts, summing to `rope_half`.
+/// Every lane starts on T; H overwrites lanes `1,4,...` while `lane / 3 < H`,
+/// and W overwrites lanes `2,5,...` while `lane / 3 < W`. The declaration is
+/// rejected unless this strided assignment realizes all three declared counts.
 /// `inv_freq[i] = theta^(-2*i / rope_dim)`, `rope_dim = 2 * rope_half`.
 pub fn build_cos_sin(
     positions: &MRopePositions,
@@ -246,6 +246,22 @@ pub fn build_cos_sin(
     if section_sum != rope_half {
         return Err(InferenceError::InvalidInput(format!(
             "mrope_section {mrope_section:?} sums to {section_sum}, expected rope_half={rope_half}"
+        )));
+    }
+
+    let mut realized = [0usize; 3];
+    for i in 0..rope_half {
+        let axis = match (i % 3, i / 3) {
+            (1, section_idx) if section_idx < mrope_section[1] => 1,
+            (2, section_idx) if section_idx < mrope_section[2] => 2,
+            _ => 0,
+        };
+        realized[axis] += 1;
+    }
+    if realized != mrope_section {
+        return Err(InferenceError::InvalidInput(format!(
+            "mrope_section {mrope_section:?} does not match realized {realized:?} \
+             for rope_half={rope_half}"
         )));
     }
 
@@ -466,7 +482,6 @@ mod tests {
     fn lane_schedule_matches_hf_saturating_overwrite() {
         for (section, rope_half, expected_counts) in [
             ([11, 11, 10], 32, [11, 11, 10]),
-            ([16, 24, 24], 64, [22, 21, 21]),
             ([22, 21, 21], 64, [22, 21, 21]),
             ([20, 6, 6], 32, [20, 6, 6]),
         ] {
@@ -663,5 +678,92 @@ mod tests {
         // A positive result above u32::MAX is out of range, not "negative".
         let err = decode_position(u32::MAX as usize + 10, 0).unwrap_err();
         assert!(matches!(err, InferenceError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn shipped_config_tables_are_bit_identical() {
+        let cfg = crate::model::qwen35_config::Qwen35Config::from_config_json_str(include_str!(
+            "../../tests/fixtures/qwen35_0_8b_config.json"
+        ))
+        .unwrap();
+        let params = cfg.rope_parameters.as_ref().unwrap();
+        let section = params.mrope_section.as_ref().unwrap();
+        assert_eq!(section, &[11, 11, 10]);
+        let positions = MRopePositions {
+            positions: vec![(0, 0, 0), (2, 3, 5), (4, 11, 11)],
+            rope_delta: 0,
+        };
+        let tables = build_cos_sin(
+            &positions,
+            cfg.head_dim,
+            params.partial_rotary_factor.unwrap(),
+            params.rope_theta as f32,
+            section,
+        )
+        .unwrap();
+        let bits: Vec<u32> = tables
+            .cos
+            .iter()
+            .chain(&tables.sin)
+            .flatten()
+            .map(|x| x.to_bits())
+            .collect();
+        let rope_dim = cfg.head_dim as f32 * params.partial_rotary_factor.unwrap();
+        let mut expected_cos = Vec::new();
+        let mut expected_sin = Vec::new();
+        for &(t, h, w) in &positions.positions {
+            for lane in 0..32 {
+                let inv_freq = (params.rope_theta as f32).powf(-2.0 * lane as f32 / rope_dim);
+                let angle = [t, h, w][lane % 3] as f32 * inv_freq;
+                expected_cos.push(angle.cos().to_bits());
+                expected_sin.push(angle.sin().to_bits());
+            }
+        }
+        expected_cos.extend(expected_sin);
+        assert_eq!(bits, expected_cos);
+    }
+
+    fn assert_rejects_unrealizable_section(section: [usize; 3], realized: [usize; 3]) {
+        let rope_half: usize = section.iter().sum();
+        for positions in [vec![], vec![(2, 3, 5)]] {
+            let positions = MRopePositions {
+                positions,
+                rope_delta: 0,
+            };
+            let err = build_cos_sin(&positions, rope_half * 2, 1.0, 1e7, &section)
+                .expect_err("declared axis counts must match the realized schedule");
+            let InferenceError::InvalidInput(message) = err else {
+                panic!("expected InvalidInput, got {err:?}");
+            };
+            assert!(message.contains(&format!("{section:?}")), "{message}");
+            assert!(
+                message.contains(&format!("realized {realized:?}")),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("rope_half={rope_half}")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unrealizable_section_width_cap() {
+        assert_rejects_unrealizable_section([10, 11, 11], [11, 11, 10]);
+    }
+
+    #[test]
+    fn rejects_unrealizable_section_temporal_remainder() {
+        assert_rejects_unrealizable_section([11, 10, 11], [12, 10, 10]);
+    }
+
+    #[test]
+    fn rejects_unrealizable_section_zero_temporal() {
+        assert_rejects_unrealizable_section([0, 16, 16], [11, 11, 10]);
+    }
+
+    #[test]
+    fn rejects_unrealizable_section_saturated_spatial_caps() {
+        assert_rejects_unrealizable_section([16, 24, 24], [22, 21, 21]);
     }
 }
