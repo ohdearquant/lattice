@@ -183,9 +183,10 @@ impl PaddleOcrVlModel {
     ///
     /// # Errors
     ///
-    /// [`InferenceError::Inference`] when the placeholder count does not
-    /// match `grid_h/merge * grid_w/merge` or the placeholders are not
-    /// contiguous (the reference template always emits one block).
+    /// [`InferenceError::Inference`] when either spatial grid dimension is
+    /// zero, the placeholder count does not match `grid_h/merge * grid_w/merge`,
+    /// or the placeholders are not contiguous (the reference template always
+    /// emits one block).
     pub fn rope_index(
         ids: &[u32],
         grid_thw: (usize, usize, usize),
@@ -198,6 +199,11 @@ impl PaddleOcrVlModel {
         if t != 1 {
             return Err(InferenceError::Inference(format!(
                 "grid_thw temporal {t} != 1: this reference is image-only"
+            )));
+        }
+        if grid_h == 0 || grid_w == 0 {
+            return Err(InferenceError::Inference(format!(
+                "grid dimensions must be positive, got {grid_h}x{grid_w}"
             )));
         }
         if grid_h % merge != 0 || grid_w % merge != 0 {
@@ -583,7 +589,7 @@ mod tests {
             r#"{"hidden_size": 128, "intermediate_size": 256, "num_hidden_layers": 2,
                 "num_attention_heads": 8, "num_key_value_heads": 2, "head_dim": 16,
                 "vocab_size": 300, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
-                "rope_scaling": {"mrope_section": [2, 2, 2, 2]},
+                "rope_scaling": {"mrope_section": [2, 2, 4]},
                 "tie_word_embeddings": false, "use_bias": false}"#,
         )
         .expect("test config");
@@ -712,6 +718,18 @@ mod tests {
         // Text after: max so far = 5 + max(8, 15) = 20, then +1.
         assert_eq!(pos[149], [21, 21, 21]);
         assert_eq!(pos[150], [22, 22, 22]);
+    }
+
+    #[test]
+    fn rope_index_rejects_zero_grid_dimensions() {
+        for grid in [(1, 0, 1), (1, 1, 0), (1, 0, 0)] {
+            let result = PaddleOcrVlModel::rope_index(&[], grid, 1);
+            assert!(
+                matches!(result, Err(InferenceError::Inference(message))
+                    if message.contains("grid dimensions must be positive")),
+                "zero spatial dimensions must be refused: {grid:?}"
+            );
+        }
     }
 
     #[test]

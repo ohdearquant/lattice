@@ -185,6 +185,18 @@ impl Ernie45Config {
                 self.head_dim
             )));
         }
+        if self
+            .rope_scaling
+            .mrope_section
+            .iter()
+            .skip(3)
+            .any(|&width| width != 0)
+        {
+            return Err(InferenceError::Inference(
+                "ernie45 config: mrope_section has a nonzero entry beyond the 3 position axes (T,H,W)"
+                    .into(),
+            ));
+        }
         // The text-only forward reduces sectioned mrope to 1-D RoPE, which is
         // only the reference's own behavior when the sections tile the half
         // dimension exactly (`sum(mrope_section) == head_dim / 2`).
@@ -1639,8 +1651,35 @@ mod tests {
     fn config_rejects_section_layout_that_does_not_tile_half_dim() {
         let bad = test_config(128, &[16, 24]);
         assert!(bad.validate().is_err(), "sum 40 != 64 must be refused");
-        let good = test_config(128, &[16, 24, 24]);
-        assert!(good.validate().is_ok());
+        for sections in [&[64][..], &[32, 32], &[16, 24, 24]] {
+            assert!(test_config(128, sections).validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn config_rejects_nonzero_mrope_sections_beyond_three() {
+        for sections in [&[16, 16, 16, 16][..], &[16, 16, 16, 0, 16]] {
+            let json = serde_json::json!({
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 128,
+                "vocab_size": 300,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1_000_000.0,
+                "rope_scaling": {"mrope_section": sections},
+                "tie_word_embeddings": false,
+                "use_bias": false,
+            });
+            let result = Ernie45Config::from_config_json_str(&json.to_string());
+            assert!(
+                matches!(result, Err(InferenceError::Inference(message))
+                    if message.contains("mrope_section") && message.contains("3 position axes")),
+                "nonzero sections beyond T/H/W must be refused: {sections:?}"
+            );
+        }
     }
 
     /// The sectioned gather must be a no-op when all three position rows
@@ -1722,7 +1761,7 @@ mod tests {
         // sum(mrope) must tile head_dim/2 = 32: fix config for this test.
         let cfg = Ernie45Config {
             rope_scaling: Ernie45RopeScaling {
-                mrope_section: vec![8, 8, 8, 8],
+                mrope_section: vec![8, 8, 16],
             },
             ..cfg
         };
