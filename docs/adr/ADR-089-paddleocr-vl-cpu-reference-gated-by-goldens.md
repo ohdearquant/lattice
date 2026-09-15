@@ -77,6 +77,30 @@ output; restoring its original bits must recover parity. A separate head-width r
 when that guard is removed. Test-only dispatch counters verify the full embedding/layer/head path, and
 enforcement turns missing features, device or checkpoint into failures instead of successful skips.
 
+### Explicit Metal cache entries
+
+The embedding-driven entries preserve the production decoder's input contract without changing its
+backend selection. `kv_prefill(embeds, positions, cache, logits)` accepts contiguous `[sequence, hidden]`
+embeddings and one `[T,H,W]` position triple per token. `kv_decode_step` accepts one embedding and its
+explicit position triple. Both return only the final vocabulary row. Positions are independent of cache
+length; token order determines causality. The existing token-ID prefill retains its all-token output.
+
+`new_kv_cache(capacity)` allocates separate device-side f32 K and V buffers with layout
+`[layers, capacity, kv_dim]`. K is post-RoPE, V is unrotated, and only rows below `len` are live. The cache
+belongs to its exact decoder state, including its weights and device, rather than merely matching its
+geometry. `clear()` resets the live length and retains storage. Decode appends at the old length, attends
+over that row and its prefix, and publishes the new length and caller output only after successful GPU
+completion and finite-output validation. A failed execution may leave an unpublished row; a retry
+replaces it. Invalid inputs must preserve the live prefix and output. Capacity is fixed at construction.
+
+Two separate acceptance invariants apply. Cached K/V rows must equal independent Metal full-forward
+rows bitwise in every layer. Every cached output must also meet the existing componentwise CPU bound
+and agree on argmax. Validation crosses the attention tile boundary over multiple cached steps, compares
+the same growing prefixes, and checks prefix preservation. A deliberate finite V-row perturbation must
+make the unchanged parity assertion fail, and restoring the original row and rebuilding must recover
+parity. Public guard tests require removal-sensitive controls with byte-verified restoration. These
+entries do not select a backend in `generate_greedy`, execute vision, or establish a performance claim.
+
 ## Consequences
 
 - Correctness is established before speed: the end-to-end CPU forward takes minutes per image in a release
