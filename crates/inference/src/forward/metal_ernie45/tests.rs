@@ -68,6 +68,8 @@ mod cache_guards;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "f16"))]
 mod real {
+    mod mrope;
+
     use super::super::MetalErnie45State;
     use crate::InferenceError;
     use crate::measurement::gpu_test_lock;
@@ -79,6 +81,11 @@ mod real {
     const ATOL: f32 = 2e-3;
     const RTOL: f32 = 2e-3;
     const DISPATCHES: (u32, u32, u32, u32, u32, u32, u32) = (127, 37, 36, 18, 36, 1, 18);
+
+    // A single mutation must act on both fixtures without changing either oracle.
+    fn metal_position_for_axis_control(position: [u32; 3]) -> [u32; 3] {
+        position
+    }
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -765,7 +772,16 @@ mod real {
         let mut metal_logits = vec![f32::NAN; vocab];
         let mut full_logits = vec![f32::NAN; vocab];
         state
-            .kv_prefill(&embeds, &positions, &mut cache, &mut metal_logits)
+            .kv_prefill(
+                &embeds,
+                &positions
+                    .iter()
+                    .copied()
+                    .map(metal_position_for_axis_control)
+                    .collect::<Vec<_>>(),
+                &mut cache,
+                &mut metal_logits,
+            )
             .expect("full Metal cached prefill");
         assert_eq!(state.last_dispatch_counts(), COUNTS);
         assert_eq!(cache.len(), PROMPT);
@@ -848,7 +864,12 @@ mod real {
                 .kv_decode_step(next_embed, position, &mut cpu_cache)
                 .expect("full CPU cached step");
             state
-                .kv_decode_step(next_embed, position, &mut cache, &mut metal_logits)
+                .kv_decode_step(
+                    next_embed,
+                    metal_position_for_axis_control(position),
+                    &mut cache,
+                    &mut metal_logits,
+                )
                 .expect("full Metal cached step");
             assert_eq!(state.last_dispatch_counts(), COUNTS);
             assert_eq!(cache.len(), previous_len + 1);
@@ -994,5 +1015,18 @@ mod real {
         eprintln!(
             "SKIP metal_ernie45 full cached decode: requires macOS and metal-gpu,f16 features"
         );
+    }
+
+    mod mrope {
+        #[test]
+        fn metal_ernie45_kv_unequal_axes_match_cpu() {
+            assert!(
+                !super::super::enforce(),
+                "Metal ERNIE unequal-axis parity requires macOS and metal-gpu,f16"
+            );
+            eprintln!(
+                "SKIP metal_ernie45 unequal-axis parity: requires macOS and metal-gpu,f16 features"
+            );
+        }
     }
 }
