@@ -6,6 +6,7 @@ unset GIT_INDEX_FILE GIT_DIR GIT_WORK_TREE
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd)
 script_path="$script_dir/lint-docs.sh"
 mode=${1:-}
+markdown_skipped=0
 
 run_discovery_selftest() {
     index_count_before=$(git ls-files | wc -l | tr -d '[:space:]')
@@ -143,7 +144,11 @@ if command -v deno >/dev/null 2>&1; then
 elif [ "$mode" = "--markdown-only" ]; then
     echo "lint-docs: deno not found; cannot lint Markdown" >&2
     exit 127
+elif [ "${LATTICE_REQUIRE_DENO:-0}" = "1" ]; then
+    echo "lint-docs: LATTICE_REQUIRE_DENO=1 requires deno for Markdown checks" >&2
+    exit 127
 else
+    markdown_skipped=1
     echo "lint-docs: deno not found; skipping Markdown format, lint, and discovery self-test"
 fi
 
@@ -155,4 +160,8 @@ echo "=== Absolute Developer Path Check (#1102) ==="
 "$script_dir/lint-absolute-paths.sh" --selftest
 "$script_dir/lint-absolute-paths.sh"
 
-echo "=== Doc Lint Passed ==="
+if [ "$markdown_skipped" -eq 1 ]; then
+    echo "=== Doc Lint Passed (Markdown checks SKIPPED: deno not found) ==="
+else
+    echo "=== Doc Lint Passed ==="
+fi
