@@ -64,6 +64,9 @@ fn metal_ernie45_rejects_empty_layers_and_invalid_capacity() {
 }
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "f16"))]
+mod cache_guards;
+
+#[cfg(all(target_os = "macos", feature = "metal-gpu", feature = "f16"))]
 mod real {
     use super::super::MetalErnie45State;
     use crate::InferenceError;
@@ -162,6 +165,50 @@ mod real {
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)
             .expect("nonempty vocabulary")
+    }
+
+    fn assert_same_kv_rows(actual: (&[f32], &[f32]), expected: (&[f32], &[f32]), context: &str) {
+        for (name, actual, expected) in [("K", actual.0, expected.0), ("V", actual.1, expected.1)] {
+            assert_eq!(actual.len(), expected.len(), "{context}: {name} row shape");
+            assert!(!actual.is_empty(), "{context}: empty {name} rows");
+            for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    actual.to_bits(),
+                    expected.to_bits(),
+                    "{context}: {name}[{index}] {actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    fn assert_cached_parity(actual: &[f32], expected: &[f32], context: &str) -> Comparison {
+        let comparison = compare(actual, expected);
+        assert_eq!(comparison.mismatches, 0, "{context}: {comparison:?}");
+        assert_eq!(argmax(actual), argmax(expected), "{context}: argmax");
+        comparison
+    }
+
+    fn cache_rows(cache: &super::super::MetalErnie45KvCache) -> Vec<(Vec<f32>, Vec<f32>)> {
+        (0..cache.layers())
+            .map(|layer| cache.layer_rows_for_test(layer))
+            .collect()
+    }
+
+    fn assert_cache_rows(
+        cache: &super::super::MetalErnie45KvCache,
+        expected: &[(Vec<f32>, Vec<f32>)],
+        context: &str,
+    ) {
+        assert_eq!(cache.layers(), expected.len(), "{context}: layer count");
+        assert!(!expected.is_empty(), "{context}: no layer evidence");
+        for (layer, expected) in expected.iter().enumerate() {
+            let actual = cache.layer_rows_for_test(layer);
+            assert_same_kv_rows(
+                (&actual.0, &actual.1),
+                (&expected.0, &expected.1),
+                &format!("{context}, layer {layer}"),
+            );
+        }
     }
 
     fn assert_hf_logits(logits: &[f32], golden: &LogitsGolden, seq: usize, vocab: usize) {
@@ -400,6 +447,523 @@ mod real {
         );
         eprintln!("[METAL_ERNIE45_FULL_GATE] cases=5 controls=5 restored=true");
     }
+
+    #[test]
+    fn metal_ernie45_kv_one_layer_real_weights_match_cpu() {
+        let _gpu_guard = gpu_test_lock();
+        if metal::Device::system_default().is_none() {
+            assert!(!super::enforce(), "Metal device required under enforcement");
+            eprintln!("SKIP metal_ernie45 cached decode: Metal device missing");
+            return;
+        }
+        let Some(dir) = model_dir() else {
+            assert!(
+                !super::enforce(),
+                "checkpoint required; set LATTICE_POCR_MODEL_DIR"
+            );
+            eprintln!("SKIP metal_ernie45 cached decode: checkpoint missing");
+            return;
+        };
+        const CAPACITY: usize = 12;
+        const PROMPT_LEN: usize = 11;
+        const LAYER_DISPATCHES: (u32, u32, u32, u32, u32, u32, u32) = (8, 3, 2, 1, 2, 0, 1);
+        const SENTINEL: f32 = 1234567.0;
+        let golden: Golden = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/paddleocr_vl/decoder/decoder_goldens.json"
+        ))
+        .expect("valid committed decoder fixture");
+        assert_eq!(golden.revision, "c5630abae1d940eafe0697512a0325494b02ab42");
+        let case = golden
+            .cases
+            .iter()
+            .find(|case| case.id == "table_row")
+            .expect("table-row fixture exists");
+        assert_eq!(case.ids.len(), PROMPT_LEN);
+        assert!(!PROMPT_LEN.is_multiple_of(4));
+        assert!(!PROMPT_LEN.is_multiple_of(16));
+        let mut cfg = Ernie45Config::from_config_json(&dir.join("config.json"))
+            .expect("checkpoint configuration loads");
+        assert_eq!(cfg.hidden_size, 1024);
+        assert_eq!(cfg.intermediate_size, 3072);
+        assert_eq!(cfg.num_hidden_layers, 18);
+        assert_eq!(cfg.num_attention_heads, 16);
+        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.vocab_size, 103424);
+        assert_eq!(cfg.rope_scaling.mrope_section, [16, 24, 24]);
+        cfg.num_hidden_layers = 1;
+        let h = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let mut source =
+            SafetensorsFile::open(&dir.join("model.safetensors")).expect("real checkpoint opens");
+        let weights =
+            Ernie45Weights::load(&mut source, &cfg).expect("real layer-zero weights load");
+        drop(source);
+        assert_eq!(weights.layers.len(), 1);
+        assert!(
+            weights.layers[0]
+                .down_proj
+                .iter()
+                .any(|&value| value != 0.0)
+        );
+        let mut embeds = Vec::with_capacity(CAPACITY * h);
+        for &id in &case.ids {
+            assert!((id as usize) < vocab);
+            embeds.extend_from_slice(&weights.embed_tokens[id as usize * h..][..h]);
+        }
+        // Unequal gaps expose an ignored position input even when a uniform shift would cancel.
+        let mut positions: Vec<[u32; 3]> = (0..PROMPT_LEN as u32)
+            .map(|i| [7 + i * (i + 3) / 2; 3])
+            .collect();
+        let mut state =
+            MetalErnie45State::new(&cfg, &weights, CAPACITY).expect("one-layer Metal constructs");
+        let model = Ernie45Model::new(cfg, weights).expect("one-layer CPU model validates");
+        let mut cache = state.new_kv_cache(CAPACITY).expect("Metal cache allocates");
+        let mut cpu_cache = model.new_kv_cache(CAPACITY).expect("CPU cache allocates");
+        assert_eq!(cache.capacity(), CAPACITY);
+        assert!(cache.is_empty());
+        assert_eq!(cache.len(), 0);
+
+        let mut rejected = vec![SENTINEL; vocab];
+        assert!(
+            state
+                .kv_decode_step(&embeds[..h], positions[0], &mut cache, &mut rejected)
+                .is_err(),
+            "decode must refuse an empty cache"
+        );
+        assert!(rejected.iter().all(|&value| value == SENTINEL));
+        assert!(cache.is_empty());
+        assert!(
+            state
+                .kv_prefill(
+                    &embeds[..embeds.len() - 1],
+                    &positions,
+                    &mut cache,
+                    &mut rejected
+                )
+                .is_err(),
+            "prefill must reject a partial embedding row"
+        );
+        assert!(rejected.iter().all(|&value| value == SENTINEL));
+        assert!(cache.is_empty());
+        let mut short_output = vec![SENTINEL; vocab - 1];
+        assert!(
+            state
+                .kv_prefill(&embeds, &positions, &mut cache, &mut short_output)
+                .is_err(),
+            "prefill must reject a short output slice"
+        );
+        assert!(short_output.iter().all(|&value| value == SENTINEL));
+        assert!(cache.is_empty());
+
+        let cpu_prefill = model
+            .kv_prefill(&embeds, &positions, &mut cpu_cache)
+            .expect("CPU cached prefill");
+        let mut metal_prefill = vec![f32::NAN; vocab];
+        state
+            .kv_prefill(&embeds, &positions, &mut cache, &mut metal_prefill)
+            .expect("Metal cached prefill");
+        let prefill_dispatches = state.last_dispatch_counts();
+        assert_eq!(prefill_dispatches, LAYER_DISPATCHES);
+        assert_eq!(cache.len(), PROMPT_LEN);
+        assert_eq!(cpu_cache.len(), PROMPT_LEN);
+        let prefill_comparison = compare(&metal_prefill, &cpu_prefill);
+        assert_eq!(prefill_comparison.mismatches, 0, "{prefill_comparison:?}");
+        assert_eq!(argmax(&metal_prefill), argmax(&cpu_prefill));
+        let prompt_rows = cache.layer_rows_for_test(0);
+        assert_eq!(prompt_rows.0.len(), PROMPT_LEN * kv_dim);
+        assert_eq!(prompt_rows.1.len(), PROMPT_LEN * kv_dim);
+
+        let mut full_logits = vec![f32::NAN; vocab];
+        state
+            .prefill_embeds_for_test(&embeds, &positions, &mut full_logits)
+            .expect("uncached Metal prompt forward");
+        assert_eq!(state.last_dispatch_counts(), LAYER_DISPATCHES);
+        let full_prompt_rows = state.last_layer_rows_for_test(PROMPT_LEN);
+        assert_same_kv_rows(
+            (&prompt_rows.0, &prompt_rows.1),
+            (&full_prompt_rows.0, &full_prompt_rows.1),
+            "cached prefill versus independent Metal prefill",
+        );
+        let prefill_self_comparison = compare(&metal_prefill, &full_logits);
+        assert_eq!(
+            prefill_self_comparison.mismatches, 0,
+            "{prefill_self_comparison:?}"
+        );
+        assert_eq!(argmax(&metal_prefill), argmax(&full_logits));
+        assert!(
+            state
+                .kv_prefill(&embeds, &positions, &mut cache, &mut rejected)
+                .is_err(),
+            "prefill must refuse a nonempty cache"
+        );
+        assert!(rejected.iter().all(|&value| value == SENTINEL));
+        assert_eq!(cache.len(), PROMPT_LEN);
+        let after_rejected_prefill = cache.layer_rows_for_test(0);
+        assert_same_kv_rows(
+            (&after_rejected_prefill.0, &after_rejected_prefill.1),
+            (&prompt_rows.0, &prompt_rows.1),
+            "rejected prefill preserves the cache",
+        );
+
+        let next_id = argmax(&cpu_prefill);
+        let next_embed = &model.embed_tokens()[next_id * h..][..h];
+        let next_index = PROMPT_LEN as u32;
+        let next_position = [7 + next_index * (next_index + 3) / 2; 3];
+        assert!(
+            state
+                .kv_decode_step(
+                    &next_embed[..h - 1],
+                    next_position,
+                    &mut cache,
+                    &mut rejected
+                )
+                .is_err(),
+            "decode must reject a partial embedding row"
+        );
+        assert!(rejected.iter().all(|&value| value == SENTINEL));
+        assert_eq!(cache.len(), PROMPT_LEN);
+        let after_rejected_decode = cache.layer_rows_for_test(0);
+        assert_same_kv_rows(
+            (&after_rejected_decode.0, &after_rejected_decode.1),
+            (&prompt_rows.0, &prompt_rows.1),
+            "rejected decode preserves the cache",
+        );
+
+        let cpu_decode = model
+            .kv_decode_step(next_embed, next_position, &mut cpu_cache)
+            .expect("one CPU cached decode step");
+        let mut metal_decode = vec![f32::NAN; vocab];
+        state
+            .kv_decode_step(next_embed, next_position, &mut cache, &mut metal_decode)
+            .expect("one Metal cached decode step");
+        let decode_dispatches = state.last_dispatch_counts();
+        assert_eq!(decode_dispatches, LAYER_DISPATCHES);
+        assert_eq!(cache.len(), CAPACITY);
+        assert_eq!(cpu_cache.len(), CAPACITY);
+        let decode_comparison = compare(&metal_decode, &cpu_decode);
+        assert_eq!(decode_comparison.mismatches, 0, "{decode_comparison:?}");
+        assert_eq!(argmax(&metal_decode), argmax(&cpu_decode));
+        let decode_rows = cache.layer_rows_for_test(0);
+        assert_eq!(decode_rows.0.len(), CAPACITY * kv_dim);
+        assert_eq!(decode_rows.1.len(), CAPACITY * kv_dim);
+        assert_same_kv_rows(
+            (
+                &decode_rows.0[..PROMPT_LEN * kv_dim],
+                &decode_rows.1[..PROMPT_LEN * kv_dim],
+            ),
+            (&prompt_rows.0, &prompt_rows.1),
+            "one decode step preserves all prompt rows",
+        );
+
+        embeds.extend_from_slice(next_embed);
+        positions.push(next_position);
+        state
+            .prefill_embeds_for_test(&embeds, &positions, &mut full_logits)
+            .expect("uncached Metal growing-prefix forward");
+        assert_eq!(state.last_dispatch_counts(), LAYER_DISPATCHES);
+        let full_decode_rows = state.last_layer_rows_for_test(CAPACITY);
+        assert_same_kv_rows(
+            (&decode_rows.0, &decode_rows.1),
+            (&full_decode_rows.0, &full_decode_rows.1),
+            "cached decode versus independent Metal prefill",
+        );
+        let decode_self_comparison = compare(&metal_decode, &full_logits);
+        assert_eq!(
+            decode_self_comparison.mismatches, 0,
+            "{decode_self_comparison:?}"
+        );
+        assert_eq!(argmax(&metal_decode), argmax(&full_logits));
+
+        assert!(
+            state
+                .kv_decode_step(next_embed, next_position, &mut cache, &mut rejected)
+                .is_err(),
+            "decode must refuse a cache at capacity"
+        );
+        assert!(rejected.iter().all(|&value| value == SENTINEL));
+        assert_eq!(cache.len(), CAPACITY);
+        let after_capacity_refusal = cache.layer_rows_for_test(0);
+        assert_same_kv_rows(
+            (&after_capacity_refusal.0, &after_capacity_refusal.1),
+            (&decode_rows.0, &decode_rows.1),
+            "capacity refusal preserves the cache",
+        );
+        eprintln!(
+            "[METAL_ERNIE45_KV_ONE_LAYER] executed=true layers=1 prompt_len=11 decode_steps=1 cache_len=12 bit_exact_prefill_rows=true bit_exact_decode_rows=true prompt_rows_preserved=true prefill_dispatches={prefill_dispatches:?} decode_dispatches={decode_dispatches:?} prefill={prefill_comparison:?} decode={decode_comparison:?}"
+        );
+    }
+    #[test]
+    fn metal_ernie45_kv_full_model_reuses_every_layer_across_tiles() {
+        let _gpu_guard = gpu_test_lock();
+        if metal::Device::system_default().is_none() {
+            assert!(!super::enforce(), "Metal device required under enforcement");
+            eprintln!("SKIP metal_ernie45 full cached decode: Metal device missing");
+            return;
+        }
+        let Some(dir) = model_dir() else {
+            assert!(
+                !super::enforce(),
+                "checkpoint required; set LATTICE_POCR_MODEL_DIR"
+            );
+            eprintln!("SKIP metal_ernie45 full cached decode: checkpoint missing");
+            return;
+        };
+        const PROMPT: usize = 11;
+        const STEPS: usize = 8;
+        const CAPACITY: usize = PROMPT + STEPS;
+        const COUNTS: (u32, u32, u32, u32, u32, u32, u32) = (127, 37, 36, 18, 36, 0, 18);
+        const SENTINEL: f32 = 1234567.0;
+        let golden: Golden = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/paddleocr_vl/decoder/decoder_goldens.json"
+        ))
+        .expect("committed decoder fixture");
+        assert_eq!(golden.revision, "c5630abae1d940eafe0697512a0325494b02ab42");
+        let case = golden
+            .cases
+            .iter()
+            .find(|case| case.id == "table_row")
+            .expect("table-row fixture");
+        assert_eq!(case.ids.len(), PROMPT);
+        assert!(!PROMPT.is_multiple_of(4) && !CAPACITY.is_multiple_of(4));
+        assert!(!PROMPT.is_multiple_of(16) && !CAPACITY.is_multiple_of(16));
+        let cfg = Ernie45Config::from_config_json(&dir.join("config.json"))
+            .expect("checkpoint configuration");
+        assert_eq!(cfg.num_hidden_layers, 18);
+        assert_eq!(cfg.hidden_size, 1024);
+        assert_eq!(cfg.intermediate_size, 3072);
+        assert_eq!(cfg.num_attention_heads, 16);
+        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.head_dim, 128);
+        assert_eq!(cfg.vocab_size, 103424);
+        assert_eq!(cfg.rope_scaling.mrope_section, [16, 24, 24]);
+        let h = cfg.hidden_size;
+        let vocab = cfg.vocab_size;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let mut source =
+            SafetensorsFile::open(&dir.join("model.safetensors")).expect("real checkpoint opens");
+        let weights = Ernie45Weights::load(&mut source, &cfg).expect("all real layers load");
+        drop(source);
+        assert_eq!(weights.layers.len(), 18);
+        let mut embeds = Vec::with_capacity(CAPACITY * h);
+        for &id in &case.ids {
+            assert!((id as usize) < vocab);
+            embeds.extend_from_slice(&weights.embed_tokens[id as usize * h..][..h]);
+        }
+        let mut positions: Vec<[u32; 3]> = (0..PROMPT as u32)
+            .map(|i| [7 + i * (i + 3) / 2; 3])
+            .collect();
+        let mut state = MetalErnie45State::new(&cfg, &weights, CAPACITY)
+            .expect("full Metal decoder constructs");
+        let model = Ernie45Model::new(cfg, weights).expect("full CPU decoder validates");
+        let mut cache = state.new_kv_cache(CAPACITY).expect("full Metal cache");
+        let mut cpu_cache = model.new_kv_cache(CAPACITY).expect("full CPU cache");
+        let mut cpu_logits = model
+            .kv_prefill(&embeds, &positions, &mut cpu_cache)
+            .expect("full CPU cached prefill");
+        let mut metal_logits = vec![f32::NAN; vocab];
+        let mut full_logits = vec![f32::NAN; vocab];
+        state
+            .kv_prefill(&embeds, &positions, &mut cache, &mut metal_logits)
+            .expect("full Metal cached prefill");
+        assert_eq!(state.last_dispatch_counts(), COUNTS);
+        assert_eq!(cache.len(), PROMPT);
+        let prefill = assert_cached_parity(&metal_logits, &cpu_logits, "full cached prefill CPU");
+        let trace = state
+            .prefill_embeds_trace_for_test(&embeds, &positions, &mut full_logits)
+            .expect("independent full Metal prefill trace");
+        assert_eq!(state.last_dispatch_counts(), COUNTS);
+        assert_cached_parity(&metal_logits, &full_logits, "full cached prefill Metal");
+        assert_cache_rows(&cache, &trace, "prefill cache versus independent trace");
+        eprintln!(
+            "[METAL_ERNIE45_KV_FULL_STEP] step=0 cache_len=11 bit_exact_all_layers=true cpu={prefill:?}"
+        );
+
+        let mut crossed_tile = false;
+        let mut corruption_checked = false;
+        for step in 1..=STEPS {
+            let previous_len = cache.len();
+            let previous_rows = cache_rows(&cache);
+            let next_id = argmax(&cpu_logits);
+            let next_embed = &model.embed_tokens()[next_id * h..][..h];
+            let i = previous_len as u32;
+            let position = [7 + i * (i + 3) / 2; 3];
+            let mut control = if previous_len == 16 {
+                let mut other = state.new_kv_cache(CAPACITY).expect("control cache");
+                let mut other_logits = vec![f32::NAN; vocab];
+                state
+                    .kv_prefill(&embeds, &positions, &mut other, &mut other_logits)
+                    .expect("independent control prefill");
+                assert_cached_parity(
+                    &other_logits,
+                    &metal_logits,
+                    "control starts from clean prefix",
+                );
+                assert_cache_rows(
+                    &other,
+                    &previous_rows,
+                    "control prefix matches all cached layers",
+                );
+                let rows = other.layer_rows_for_test(17);
+                let offset = 15 * kv_dim;
+                let saved = rows.1[offset..offset + kv_dim].to_vec();
+                let changed: Vec<f32> = saved
+                    .iter()
+                    .enumerate()
+                    .map(|(lane, &value)| value + if lane % 2 == 0 { 4096.0 } else { -4096.0 })
+                    .collect();
+                assert!(changed.iter().all(|value| value.is_finite()));
+                other
+                    .replace_value_row_for_test(17, 15, &changed)
+                    .expect("perturb one live V row");
+                let changed_rows = other.layer_rows_for_test(17);
+                assert!(
+                    changed_rows.1[offset..offset + kv_dim]
+                        .iter()
+                        .zip(&saved)
+                        .any(|(a, b)| a.to_bits() != b.to_bits()),
+                    "V-row control did not change any bits"
+                );
+                assert!(
+                    rows.0
+                        .iter()
+                        .zip(&changed_rows.0)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "V perturbation must preserve K bits"
+                );
+                assert!(
+                    rows.1[..offset]
+                        .iter()
+                        .zip(&changed_rows.1[..offset])
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "earlier V row bits changed"
+                );
+                Some((other, saved))
+            } else {
+                None
+            };
+
+            cpu_logits = model
+                .kv_decode_step(next_embed, position, &mut cpu_cache)
+                .expect("full CPU cached step");
+            state
+                .kv_decode_step(next_embed, position, &mut cache, &mut metal_logits)
+                .expect("full Metal cached step");
+            assert_eq!(state.last_dispatch_counts(), COUNTS);
+            assert_eq!(cache.len(), previous_len + 1);
+            assert_eq!(cpu_cache.len(), cache.len());
+            let cpu = assert_cached_parity(&metal_logits, &cpu_logits, "full cached decode CPU");
+            for (layer, previous) in previous_rows.iter().enumerate() {
+                let current = cache.layer_rows_for_test(layer);
+                assert_same_kv_rows(
+                    (
+                        &current.0[..previous_len * kv_dim],
+                        &current.1[..previous_len * kv_dim],
+                    ),
+                    (&previous.0, &previous.1),
+                    &format!("step {step} layer {layer} preserves live prefix"),
+                );
+            }
+
+            if let Some((other, saved)) = control.as_mut() {
+                let mut changed_logits = vec![f32::NAN; vocab];
+                state
+                    .kv_decode_step(next_embed, position, other, &mut changed_logits)
+                    .expect("finite corrupted-cache decode");
+                let changed = compare(&changed_logits, &metal_logits);
+                assert!(
+                    changed.mismatches > 0,
+                    "V-row corruption did not exceed the declared bound: {changed:?}"
+                );
+                let failure = std::panic::catch_unwind(|| {
+                    assert_cached_parity(&changed_logits, &metal_logits, "corrupted cache parity");
+                })
+                .expect_err("the passing parity assertion must reject the corrupted cache");
+                let reason = failure
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| failure.downcast_ref::<&str>().copied())
+                    .unwrap_or("");
+                assert!(
+                    reason.contains("corrupted cache parity"),
+                    "unexpected control panic: {reason}"
+                );
+                eprintln!(
+                    "[METAL_ERNIE45_KV_MUST_DIFFER] layer=17 token=15 cache_len=16 mismatches={} worst_absolute={} worst_normalized={}",
+                    changed.mismatches, changed.worst_absolute, changed.worst_normalized
+                );
+                other
+                    .replace_value_row_for_test(17, 15, saved)
+                    .expect("restore saved V row");
+                let restored_row = other.layer_rows_for_test(17);
+                assert!(
+                    restored_row.1[15 * kv_dim..16 * kv_dim]
+                        .iter()
+                        .zip(saved.iter())
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "restored V row differs by bits"
+                );
+                other.clear();
+                let mut restored = vec![f32::NAN; vocab];
+                state
+                    .kv_prefill(&embeds, &positions, other, &mut restored)
+                    .expect("rebuild restored prefix");
+                assert_cache_rows(other, &previous_rows, "restored prefix cache");
+                state
+                    .kv_decode_step(next_embed, position, other, &mut restored)
+                    .expect("restored control step");
+                assert_cached_parity(&restored, &metal_logits, "restored cache parity");
+                assert_cache_rows(
+                    other,
+                    &cache_rows(&cache),
+                    "restored control matches all clean layers",
+                );
+                corruption_checked = true;
+            }
+
+            embeds.extend_from_slice(next_embed);
+            positions.push(position);
+            let trace = state
+                .prefill_embeds_trace_for_test(&embeds, &positions, &mut full_logits)
+                .expect("independent growing-prefix Metal trace");
+            assert_eq!(state.last_dispatch_counts(), COUNTS);
+            let full = assert_cached_parity(
+                &metal_logits,
+                &full_logits,
+                "cached versus uncached Metal decode",
+            );
+            assert_cache_rows(
+                &cache,
+                &trace,
+                &format!("step {step} independent all-layer trace"),
+            );
+            crossed_tile |= previous_len == 16 && cache.len() == 17;
+            eprintln!(
+                "[METAL_ERNIE45_KV_FULL_STEP] step={step} cache_len={} bit_exact_all_layers=true prompt_rows_preserved=true dispatches={:?} cpu={cpu:?} metal={full:?}",
+                cache.len(),
+                state.last_dispatch_counts()
+            );
+        }
+        assert!(crossed_tile && corruption_checked);
+        assert_eq!(cache.len(), CAPACITY);
+        let before_refusal = cache_rows(&cache);
+        let mut rejected = vec![SENTINEL; vocab];
+        let result = state.kv_decode_step(&embeds[..h], [999; 3], &mut cache, &mut rejected);
+        assert!(
+            matches!(result, Err(InferenceError::InvalidInput(reason)) if reason == "ernie45 Metal: kv decode cache is full")
+        );
+        assert!(rejected.iter().all(|&value| value == SENTINEL));
+        assert_eq!(cache.len(), CAPACITY);
+        assert_cache_rows(
+            &cache,
+            &before_refusal,
+            "capacity refusal preserves every layer",
+        );
+        eprintln!(
+            "[METAL_ERNIE45_KV_FULL_GATE] executed=true layers=18 prompt_len=11 decode_steps=8 cache_len=19 tile_crossed=true bit_exact_all_layers=true prompt_rows_preserved=true must_differ=true restored=true capacity_refused=true"
+        );
+    }
 }
 
 #[cfg(not(all(target_os = "macos", feature = "metal-gpu", feature = "f16")))]
@@ -411,5 +975,24 @@ mod real {
             "Metal ERNIE parity requires macOS and metal-gpu,f16"
         );
         eprintln!("SKIP metal_ernie45: requires macOS and metal-gpu,f16 features");
+    }
+
+    #[test]
+    fn metal_ernie45_kv_one_layer_real_weights_match_cpu() {
+        assert!(
+            !super::enforce(),
+            "Metal ERNIE cached decode requires macOS and metal-gpu,f16"
+        );
+        eprintln!("SKIP metal_ernie45 cached decode: requires macOS and metal-gpu,f16 features");
+    }
+    #[test]
+    fn metal_ernie45_kv_full_model_reuses_every_layer_across_tiles() {
+        assert!(
+            !super::enforce(),
+            "Metal ERNIE full cached decode requires macOS and metal-gpu,f16"
+        );
+        eprintln!(
+            "SKIP metal_ernie45 full cached decode: requires macOS and metal-gpu,f16 features"
+        );
     }
 }

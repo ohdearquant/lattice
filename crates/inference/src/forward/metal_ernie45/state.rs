@@ -1,4 +1,8 @@
-//! Persistent f32 ERNIE text prefill using the shared Metal primitives.
+//! Persistent f32 ERNIE forwards using shared Metal primitives.
+
+mod cached;
+pub(super) use cached::CacheStorage;
+use std::sync::Arc;
 
 #[cfg(all(test, feature = "f16"))]
 use std::cell::Cell;
@@ -16,7 +20,8 @@ const SHADERS: &str = concat!(
     include_str!("../shaders/rms_reduce.metal"),
     include_str!("../shaders/flash_attention.metal"),
     include_str!("../shaders/ernie45_rope.metal"),
-    include_str!("../shaders/ernie45_embed.metal")
+    include_str!("../shaders/ernie45_embed.metal"),
+    include_str!("../shaders/ernie45_decode.metal")
 );
 const ELEMENT_THREADS: u64 = 256;
 const TILE_Q: u32 = 4;
@@ -171,6 +176,7 @@ struct Pipelines {
     matmul: ComputePipelineState,
     norm: ComputePipelineState,
     attention: ComputePipelineState,
+    decode_attention: ComputePipelineState,
     rope: ComputePipelineState,
     silu: ComputePipelineState,
     copy: ComputePipelineState,
@@ -221,15 +227,17 @@ impl Pipelines {
             ));
         }
         let attention = make("fused_attention", attention_threads)?;
-        if attention.thread_execution_width() != u64::from(SIMD_WIDTH) {
-            return Err(runtime(
-                "fused attention requires a 32-lane SIMD execution width",
-            ));
+        let decode_attention = make("ernie45_decode_attention", (groups * 32) as u64)?;
+        if attention.thread_execution_width() != u64::from(SIMD_WIDTH)
+            || decode_attention.thread_execution_width() != u64::from(SIMD_WIDTH)
+        {
+            return Err(runtime("attention requires a 32-lane SIMD execution width"));
         }
         Ok(Self {
             matmul: make("matmul_bt", ELEMENT_THREADS)?,
             norm: make("rms_norm", ELEMENT_THREADS)?,
             attention,
+            decode_attention,
             rope: make("ernie45_rope", ELEMENT_THREADS)?,
             silu: make("silu_mul", ELEMENT_THREADS)?,
             copy: make("copy_buf", ELEMENT_THREADS)?,
@@ -340,11 +348,11 @@ fn upload(device: &Device, values: &[f32], label: &str) -> Result<Buffer, Infere
     Ok(buffer)
 }
 
-/// Metal f32 text prefill with persistent weights and scratch buffers.
+/// Metal f32 prefill and cached decode with persistent weights and scratch.
 ///
-/// Each call starts at position zero and produces contiguous logits for every
-/// input position. This backend requires 128-dimensional heads and does not
-/// retain a KV cache between calls.
+/// The ID entry starts at position zero and returns every logit row. Cached
+/// entries accept embeddings and explicit positions, returning only the last
+/// row. This backend requires 128-dimensional heads.
 pub struct MetalErnie45State {
     _device: Device,
     queue: CommandQueue,
@@ -357,10 +365,16 @@ pub struct MetalErnie45State {
     sin: Buffer,
     cfg: Ernie45Config,
     max_seq_len: usize,
+    cache_owner: Arc<()>,
+    position_cos: Buffer,
+    position_sin: Buffer,
+    inv_freq: Vec<f32>,
     #[cfg(all(test, feature = "f16"))]
     pending_counts: Cell<[u32; 7]>,
     #[cfg(all(test, feature = "f16"))]
     last_counts: [u32; 7],
+    #[cfg(all(test, feature = "f16"))]
+    trace_buffers: Option<cached::TestTraceBuffers>,
 }
 
 impl MetalErnie45State {
@@ -440,6 +454,8 @@ impl MetalErnie45State {
         };
         let cos = upload(&device, &cos_values, "ernie45.rope_cos")?;
         let sin = upload(&device, &sin_values, "ernie45.rope_sin")?;
+        let position_cos = allocate(&device, cos_values.len(), "ernie45.position_cos")?;
+        let position_sin = allocate(&device, sin_values.len(), "ernie45.position_sin")?;
         Ok(Self {
             _device: device,
             queue,
@@ -452,10 +468,16 @@ impl MetalErnie45State {
             sin,
             cfg: cfg.clone(),
             max_seq_len,
+            cache_owner: Arc::new(()),
+            position_cos,
+            position_sin,
+            inv_freq,
             #[cfg(all(test, feature = "f16"))]
             pending_counts: Cell::new([0; 7]),
             #[cfg(all(test, feature = "f16"))]
             last_counts: [0; 7],
+            #[cfg(all(test, feature = "f16"))]
+            trace_buffers: None,
         })
     }
 
@@ -630,19 +652,42 @@ impl MetalErnie45State {
     }
 
     fn encode_layer(&self, encoder: &ComputeCommandEncoderRef, w: &LayerWeights, s: u32) {
+        self.project_qkv(encoder, w, s);
+        self.rope(
+            encoder,
+            &self.activations.q,
+            s,
+            self.cfg.num_attention_heads as u32,
+        );
+        self.rope(
+            encoder,
+            &self.activations.k,
+            s,
+            self.cfg.num_key_value_heads as u32,
+        );
+        let q = (self.cfg.num_attention_heads * self.cfg.head_dim) as u32;
+        let kv = (self.cfg.num_key_value_heads * self.cfg.head_dim) as u32;
+        self.attention(encoder, s, q, kv);
+        self.finish_layer(encoder, w, s);
+    }
+
+    fn project_qkv(&self, encoder: &ComputeCommandEncoderRef, w: &LayerWeights, s: u32) {
         let h = self.cfg.hidden_size as u32;
         let q = (self.cfg.num_attention_heads * self.cfg.head_dim) as u32;
         let kv = (self.cfg.num_key_value_heads * self.cfg.head_dim) as u32;
-        let i = self.cfg.intermediate_size as u32;
         let a = &self.activations;
         self.copy(encoder, &a.hidden, &a.normed, s * h);
         self.norm(encoder, &a.normed, &w.input_norm, s, h);
         self.matmul(encoder, &a.normed, &w.q, &a.q, s, q, h);
         self.matmul(encoder, &a.normed, &w.k, &a.k, s, kv, h);
         self.matmul(encoder, &a.normed, &w.v, &a.v, s, kv, h);
-        self.rope(encoder, &a.q, s, self.cfg.num_attention_heads as u32);
-        self.rope(encoder, &a.k, s, self.cfg.num_key_value_heads as u32);
-        self.attention(encoder, s, q, kv);
+    }
+
+    fn finish_layer(&self, encoder: &ComputeCommandEncoderRef, w: &LayerWeights, s: u32) {
+        let h = self.cfg.hidden_size as u32;
+        let q = (self.cfg.num_attention_heads * self.cfg.head_dim) as u32;
+        let i = self.cfg.intermediate_size as u32;
+        let a = &self.activations;
         self.matmul(encoder, &a.attention, &w.o, &a.attn_proj, s, h, q);
         self.add(encoder, &a.attn_proj, &a.hidden, s * h);
         self.copy(encoder, &a.hidden, &a.normed, s * h);
@@ -744,11 +789,23 @@ impl MetalErnie45State {
     }
 
     fn rope(&self, enc: &ComputeCommandEncoderRef, x: &Buffer, rows: u32, heads: u32) {
+        self.rope_tables(enc, x, rows, heads, &self.cos, &self.sin);
+    }
+
+    fn rope_tables(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        rows: u32,
+        heads: u32,
+        cos: &Buffer,
+        sin: &Buffer,
+    ) {
         let head_dim = self.cfg.head_dim as u32;
         enc.set_compute_pipeline_state(&self.pipelines.rope);
         bind(enc, 0, x);
-        bind(enc, 1, &self.cos);
-        bind(enc, 2, &self.sin);
+        bind(enc, 1, cos);
+        bind(enc, 2, sin);
         scalar(enc, 3, &rows);
         scalar(enc, 4, &heads);
         scalar(enc, 5, &head_dim);
