@@ -228,3 +228,28 @@ yet. These are the planned suite cases, **not executed results**. Formal sign-of
 execution-output artifact with its must-reject control and judge coverage of the admitted set;
 review prose or arithmetic does not substitute for it. This document does not assign numerical
 confidence or power to these contract fixtures.
+
+## Tracked issues
+
+Minted 2026-09-15 when ADR-090 was accepted. The number is the tracking issue; the row's two cells
+above are quoted in its body verbatim.
+
+- R01: #1594
+- R02: #1595
+- R03: #1596
+- R04: #1597
+- R04a: #1598
+- R05: #1599
+- R06: #1600
+- R07: #1601
+- R08: #1602
+- R09: #1603
+- R10: #1604
+- R11: #1605
+- R12: #1606
+- R13: #1607
+- R14: #1608
+- R15: #1609
+- R16: #1610
+- R17: #1611
+- R18: #1612
