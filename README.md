@@ -598,6 +598,24 @@ Tracking issues with first-milestone slices: see the
 
 ---
 
+## Development checks
+
+`make lint-docs` checks tracked Markdown with Deno and runs the capability-fixture
+and path checks. Without Deno, the default command still runs the other checks
+and names the skipped Markdown checks in its final line. `--format` and
+`--markdown-only` always require Deno.
+
+The CI job that installs Deno requires its presence. Other verification machines
+provisioned with Deno should opt in too:
+
+```bash
+LATTICE_REQUIRE_DENO=1 make lint-docs
+```
+
+This opt-in exits 127 when Deno is unavailable. Leaving it unset or setting it
+to 0 preserves the default behavior for contributors without Deno. Export the
+variable when the same requirement should apply to `make ci` or Git hooks.
+
 ## Publishing
 
 Publish order follows the internal dependency DAG (dependencies before dependents): `fann` and

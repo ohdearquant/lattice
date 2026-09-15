@@ -209,6 +209,8 @@ jobs:
           cargo clean -p lattice-tune 2>/dev/null || true
           cargo clean -p lattice-transport 2>/dev/null || true
       - run: ./scripts/ci.sh
+        env:
+          LATTICE_REQUIRE_DENO: '1'
       # Bench compilation, folded in from the former standalone `bench-compile`
       # job. It only ever ran on macOS (metal-gpu), so it maps onto this matrix
       # leg exactly. Folding it here costs one fewer macOS runner slot per PR
@@ -1069,6 +1071,8 @@ jobs:
           version: '1.7.12'
       - name: Install workflow parser
         run: python3 -m pip install "PyYAML==6.0.3"
+      - name: documentation prerequisite tests
+        run: python3 tests/test_lint_docs_modes.py -v
       - name: merge-queue config tests
         run: python3 tests/test_ci_changed_files.py -v
       - name: post-merge benchmark progression tests

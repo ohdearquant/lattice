@@ -106,9 +106,20 @@ fi
 STAGED=$(git diff --cached --name-only --diff-filter=ACMRD) || STAGED=""
 
 if printf '%s' "$STAGED" | needs_rust_gates; then
-    if command -v flock >/dev/null 2>&1; then
+    FLOCK=$(command -v flock 2>/dev/null || :)
+    # Git clients may launch non-login shells without Homebrew on PATH even
+    # when flock is installed; prefer PATH, then the usual installation paths.
+    if [ ! -x "$FLOCK" ]; then
+        for candidate in /opt/homebrew/bin/flock /usr/local/bin/flock /usr/bin/flock /bin/flock; do
+            if [ -x "$candidate" ]; then
+                FLOCK=$candidate
+                break
+            fi
+        done
+    fi
+    if [ -x "$FLOCK" ]; then
         echo "  Rust gates REQUIRED for these changes; waiting up to 1800s for $LOCK"
-        if flock -o -w 1800 -E 75 "$LOCK" "$0" --run-rust-gates; then
+        if "$FLOCK" -o -w 1800 -E 75 "$LOCK" "$0" --run-rust-gates; then
             :
         else
             rc=$?
