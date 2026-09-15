@@ -15061,19 +15061,35 @@ mod inner {
             .unwrap_err();
             assert!(error.contains("path/cfg_attr requires explicit resolution"));
 
-            macro_rules! source {
-                ($path:literal) => {
-                    ($path, include_str!($path))
-                };
-            }
+            // Written as explicit tuples, not a local macro: this file is scanned as
+            // text by tests/metal_measurement_lock_contract.rs, which refuses any macro
+            // it cannot classify in a test-bearing scope. `include_str!` it classifies.
             let included_sources = [
-                source!("metal_qwen35.rs"),
-                source!("metal_qwen35/inner/dispatch.rs"),
-                source!("metal_qwen35/inner/gdn_state.rs"),
-                source!("metal_qwen35/inner/layers/mod.rs"),
-                source!("metal_qwen35/inner/layers/gdn.rs"),
-                source!("metal_qwen35/inner/layers/gqa.rs"),
-                source!("metal_qwen35/mtp_weights.rs"),
+                ("metal_qwen35.rs", include_str!("metal_qwen35.rs")),
+                (
+                    "metal_qwen35/inner/dispatch.rs",
+                    include_str!("metal_qwen35/inner/dispatch.rs"),
+                ),
+                (
+                    "metal_qwen35/inner/gdn_state.rs",
+                    include_str!("metal_qwen35/inner/gdn_state.rs"),
+                ),
+                (
+                    "metal_qwen35/inner/layers/mod.rs",
+                    include_str!("metal_qwen35/inner/layers/mod.rs"),
+                ),
+                (
+                    "metal_qwen35/inner/layers/gdn.rs",
+                    include_str!("metal_qwen35/inner/layers/gdn.rs"),
+                ),
+                (
+                    "metal_qwen35/inner/layers/gqa.rs",
+                    include_str!("metal_qwen35/inner/layers/gqa.rs"),
+                ),
+                (
+                    "metal_qwen35/mtp_weights.rs",
+                    include_str!("metal_qwen35/mtp_weights.rs"),
+                ),
             ];
             let covered = production_module_coverage("metal_qwen35.rs", &included_sources)
                 .unwrap_or_else(|error| panic!("retirement guard population: {error}"));
