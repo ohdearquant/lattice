@@ -4,33 +4,33 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 
 ## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-053)
 
-| ADR                                            | Title                                                 |
-| ---------------------------------------------- | ----------------------------------------------------- |
-| [001](ADR-001-pure-rust-transformer-engine.md) | Pure Rust Transformer Engine                          |
-| [002](ADR-002-simd-dispatch.md)                | SIMD Dispatch Strategy                                |
-| [003](ADR-003-safetensors-loading.md)          | SafeTensors Weight Loading                            |
-| [004](ADR-004-kv-cache.md)                     | KV Cache Design                                       |
-| [005](ADR-005-tokenizer-architecture.md)       | Tokenizer Architecture                                |
-| [006](ADR-006-speculative-decoding.md)         | Speculative Decoding                                  |
-| [007](ADR-007-rope-positional-encoding.md)     | Rotary Positional Encoding (RoPE)                     |
-| [008](ADR-008-lora-injection.md)               | LoRA Injection via Trait Hook                         |
-| [009](ADR-009-model-architectures.md)          | Model Architectures (BERT and Qwen3)                  |
-| [010](ADR-010-attention-mechanisms.md)         | Attention Mechanisms                                  |
-| [011](ADR-011-sampling-strategies.md)          | Sampling Strategies                                   |
-| [040](ADR-040-gated-attention.md)              | Gated Attention (G1 SDPA-Output)                      |
-| [041](ADR-041-differential-attention.md)       | Differential Attention                                |
-| [042](ADR-042-native-sparse-attention.md)      | Native Sparse Attention                               |
-| [043](ADR-043-lora-serving-verification.md)    | LoRA Serving Verification                             |
-| [044](ADR-044-quarot-rotated-quantization.md)  | QuaRot Hadamard-Rotated Quantization                  |
-| [045](ADR-045-quarot-lora-composition.md)      | QuaRot + LoRA Composition                             |
-| [046](ADR-046-structured-output.md)            | Structured Output (JSON Schema Constrained Decoding)  |
-| [047](ADR-047-paged-kv-cache.md)               | Paged KV Cache                                        |
-| [048](ADR-048-continuous-batching.md)          | Continuous Batching with Disaggregated Prefill/Decode |
-| [049](ADR-049-vision-encoder.md)               | Vision Encoder                                        |
-| [050](ADR-050-rejection-sampling.md)           | Rejection Sampling for Speculative Decoding           |
-| [051](ADR-051-quarot-mtp-rotation.md)          | QuaRot-MTP Rotation Reconciliation                    |
-| [052](ADR-052-gdn-speculative-state.md)        | GDN State Management for Speculative Rollback         |
-| [053](ADR-053-moe-metal-dispatch.md)           | MoE Metal Dispatch with Expert Coalescing             |
+| ADR                                            | Title                                                                                                    |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| [001](ADR-001-pure-rust-transformer-engine.md) | Pure Rust Transformer Engine                                                                             |
+| [002](ADR-002-simd-dispatch.md)                | SIMD Dispatch Strategy                                                                                   |
+| [003](ADR-003-safetensors-loading.md)          | SafeTensors Weight Loading                                                                               |
+| [004](ADR-004-kv-cache.md)                     | KV Cache Design                                                                                          |
+| [005](ADR-005-tokenizer-architecture.md)       | Tokenizer Architecture                                                                                   |
+| [006](ADR-006-speculative-decoding.md)         | Speculative Decoding                                                                                     |
+| [007](ADR-007-rope-positional-encoding.md)     | Rotary Positional Encoding (RoPE)                                                                        |
+| [008](ADR-008-lora-injection.md)               | LoRA Injection via Trait Hook                                                                            |
+| [009](ADR-009-model-architectures.md)          | Model Architectures (BERT and Qwen3); proposed clarification [090](ADR-090-shared-decoder-generation.md) |
+| [010](ADR-010-attention-mechanisms.md)         | Attention Mechanisms                                                                                     |
+| [011](ADR-011-sampling-strategies.md)          | Sampling Strategies                                                                                      |
+| [040](ADR-040-gated-attention.md)              | Gated Attention (G1 SDPA-Output)                                                                         |
+| [041](ADR-041-differential-attention.md)       | Differential Attention                                                                                   |
+| [042](ADR-042-native-sparse-attention.md)      | Native Sparse Attention                                                                                  |
+| [043](ADR-043-lora-serving-verification.md)    | LoRA Serving Verification                                                                                |
+| [044](ADR-044-quarot-rotated-quantization.md)  | QuaRot Hadamard-Rotated Quantization                                                                     |
+| [045](ADR-045-quarot-lora-composition.md)      | QuaRot + LoRA Composition                                                                                |
+| [046](ADR-046-structured-output.md)            | Structured Output (JSON Schema Constrained Decoding)                                                     |
+| [047](ADR-047-paged-kv-cache.md)               | Paged KV Cache                                                                                           |
+| [048](ADR-048-continuous-batching.md)          | Continuous Batching with Disaggregated Prefill/Decode                                                    |
+| [049](ADR-049-vision-encoder.md)               | Vision Encoder                                                                                           |
+| [050](ADR-050-rejection-sampling.md)           | Rejection Sampling for Speculative Decoding                                                              |
+| [051](ADR-051-quarot-mtp-rotation.md)          | QuaRot-MTP Rotation Reconciliation                                                                       |
+| [052](ADR-052-gdn-speculative-state.md)        | GDN State Management for Speculative Rollback                                                            |
+| [053](ADR-053-moe-metal-dispatch.md)           | MoE Metal Dispatch with Expert Coalescing                                                                |
 
 ## lattice-embed (ADR-012 to ADR-019)
 
@@ -92,39 +92,40 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 
 ## architecture / research (ADR-059 onward)
 
-| ADR                                                           | Title                                                                                                        | Status   | Depends on                             |
-| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | -------- | -------------------------------------- |
-| [059](ADR-059-composable-layer-architecture.md)               | Composable Layer Architecture                                                                                | Proposed | ADR-010                                |
-| [060](ADR-060-pruning-toolbox.md)                             | Pruning Toolbox                                                                                              | Proposed | ADR-044, 059                           |
-| [061](ADR-061-inference-metrics-infrastructure.md)            | Inference Metrics & Experiment Runner                                                                        | Proposed | ADR-059                                |
-| [062](ADR-062-metal-fa2-prefill.md)                           | Metal FA2 Prefill + KV Cache Quantization                                                                    | Proposed | ADR-047                                |
-| [063](ADR-063-serving-architecture.md)                        | Serving Architecture — CLI, HTTP, API Compat                                                                 | Proposed | ADR-048, 046                           |
-| [064](ADR-064-ci-gate-taxonomy.md)                            | CI Gate Taxonomy and Promotion Policy                                                                        | Proposed | ADR-058                                |
-| [065](ADR-065-feature-promotion-gates.md)                     | Feature promotion gates: merge measured primitives, not ideas                                                | Proposed | ADR-064                                |
-| [066](ADR-066-output-correctness-gate-architecture.md)        | Output-correctness gate architecture                                                                         | Accepted | ADR-064, ADR-065                       |
-| [067](ADR-067-gpu-decode-perf-regression-gates.md)            | GPU/Decode Performance Regression Gate System (Self-Hosted M2 Max)                                           | Proposed | ADR-058, 061, 064                      |
-| [068](ADR-068-grammar-wire-contract.md)                       | Pluggable Custom-Grammar Wire Contract for the OpenAI-Compatible Serving Surface                             | Proposed | ADR-046, 063                           |
-| [069](ADR-069-vision-encoder-qwen35-recalibration.md)         | Vision Encoder Recalibration for Qwen3.5-0.8B                                                                | Proposed | none                                   |
-| [070](ADR-070-cpu-embedding-batched-encode.md)                | CPU Embedding Performance: Fused Batched Encode and the ONNX Parity Gate                                     | Proposed | ADR-058                                |
-| [071](ADR-071-gdn-state-object-priority.md)                   | GDN Recurrent State as a First-Class Serveable Object — Priority and Scope                                   | Proposed | none                                   |
-| [072](ADR-072-weight-quantization-priority.md)                | Weight Quantization Priority (Metal)                                                                         | Proposed | ADR-044, 051                           |
-| [073](ADR-073-kv-cache-quantization-priority.md)              | KV-Cache Quantization Priority (Metal)                                                                       | Proposed | ADR-048, 062, 072                      |
-| [074](ADR-074-mtp-speculative-decoding-priority.md)           | MTP / Speculative-Decoding Priority (Metal)                                                                  | Proposed | ADR-006, 050, 051, 073                 |
-| [075](ADR-075-moe-expert-offload-priority.md)                 | MoE Expert-Offload Priority (Metal)                                                                          | Proposed | ADR-053, 072, 073, 074                 |
-| [076](ADR-076-adaptive-reasoning-priority.md)                 | Adaptive Reasoning-Budget Priority (Metal + CPU)                                                             | Proposed | ADR-073, 074                           |
-| [077](ADR-077-pruning-distill-priority.md)                    | Pruning + Distillation Priority (Metal + CPU)                                                                | Proposed | ADR-060, 073, 076                      |
-| [078](ADR-078-multimodal-serving-deferral-priority.md)        | Multimodal / Vision Serving Priority (Deferral)                                                              | Proposed | ADR-049, 069, 071                      |
-| [079](ADR-079-adaptive-micro-lora-brain.md)                   | Adaptive Micro-LoRA Brain — Composed Train→Govern→Compose→Route→Consume Loop                                 | Proposed | ADR-008/031/043/045/054/056/057        |
-| [080](ADR-080-consolidation-duplicated-contracts.md)          | Consolidation of Duplicated Numeric-Contract Helpers (Softmax, HTTP Serving, Decode Policy, GEMM Validation) | Accepted | ADR-058, ADR-064, ADR-066              |
-| [081](ADR-081-prefill-gemm-optimization-priority.md)          | Prefill GEMM Optimization Priority (Metal)                                                                   | Proposed | none                                   |
-| [082](ADR-082-gemma4-e2b-support.md)                          | Gemma 4 E2B Support — Staged Multimodal Ladder (Vision + Audio)                                              | Accepted | ADR-069                                |
-| [083](ADR-083-backward-simd-dispatch.md)                      | Backward SIMD Dispatch Contract                                                                              | Accepted | ADR-002, ADR-058                       |
-| [084](ADR-084-fallible-inference-validation-helpers.md)       | Fallible Validation for Unstable Inference Helpers                                                           | Accepted | ADR-046                                |
-| [085](ADR-085-explicit-quantization-simd.md)                  | Explicit Quantization SIMD Dispatch                                                                          | Accepted | ADR-058                                |
-| [086](ADR-086-retire-legacy-qwen-decode-api.md)               | Retire the Legacy Generic Qwen Decode API                                                                    | Accepted | ADR-080                                |
-| [087](ADR-087-bench-compare-gate-calibration-and-coverage.md) | Bench-compare Gate Calibration, Coverage, and Admissible Structural Proof                                    | Accepted | ADR-058, ADR-064                       |
-| [088](ADR-088-sealed-native-embedding-attestation.md)         | Sealed Native Embedding Preparation and Attestation                                                          | Proposed | ADR-003, ADR-005, ADR-014–017, ADR-087 |
-| [089](ADR-089-paddleocr-vl-cpu-reference-gated-by-goldens.md) | PaddleOCR-VL: CPU reference forward per slice, each gated by HF goldens, before any accelerated path         | Proposed |                                        |
+| ADR                                                           | Title                                                                                                        | Status   | Depends on                                                                     |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | -------- | ------------------------------------------------------------------------------ |
+| [059](ADR-059-composable-layer-architecture.md)               | Composable Layer Architecture                                                                                | Proposed | ADR-010                                                                        |
+| [060](ADR-060-pruning-toolbox.md)                             | Pruning Toolbox                                                                                              | Proposed | ADR-044, 059                                                                   |
+| [061](ADR-061-inference-metrics-infrastructure.md)            | Inference Metrics & Experiment Runner                                                                        | Proposed | ADR-059                                                                        |
+| [062](ADR-062-metal-fa2-prefill.md)                           | Metal FA2 Prefill + KV Cache Quantization                                                                    | Proposed | ADR-047                                                                        |
+| [063](ADR-063-serving-architecture.md)                        | Serving Architecture — CLI, HTTP, API Compat                                                                 | Proposed | ADR-048, 046                                                                   |
+| [064](ADR-064-ci-gate-taxonomy.md)                            | CI Gate Taxonomy and Promotion Policy                                                                        | Proposed | ADR-058                                                                        |
+| [065](ADR-065-feature-promotion-gates.md)                     | Feature promotion gates: merge measured primitives, not ideas                                                | Proposed | ADR-064                                                                        |
+| [066](ADR-066-output-correctness-gate-architecture.md)        | Output-correctness gate architecture                                                                         | Accepted | ADR-064, ADR-065                                                               |
+| [067](ADR-067-gpu-decode-perf-regression-gates.md)            | GPU/Decode Performance Regression Gate System (Self-Hosted M2 Max)                                           | Proposed | ADR-058, 061, 064                                                              |
+| [068](ADR-068-grammar-wire-contract.md)                       | Pluggable Custom-Grammar Wire Contract for the OpenAI-Compatible Serving Surface                             | Proposed | ADR-046, 063                                                                   |
+| [069](ADR-069-vision-encoder-qwen35-recalibration.md)         | Vision Encoder Recalibration for Qwen3.5-0.8B                                                                | Proposed | none                                                                           |
+| [070](ADR-070-cpu-embedding-batched-encode.md)                | CPU Embedding Performance: Fused Batched Encode and the ONNX Parity Gate                                     | Proposed | ADR-058                                                                        |
+| [071](ADR-071-gdn-state-object-priority.md)                   | GDN Recurrent State as a First-Class Serveable Object — Priority and Scope                                   | Proposed | none                                                                           |
+| [072](ADR-072-weight-quantization-priority.md)                | Weight Quantization Priority (Metal)                                                                         | Proposed | ADR-044, 051                                                                   |
+| [073](ADR-073-kv-cache-quantization-priority.md)              | KV-Cache Quantization Priority (Metal)                                                                       | Proposed | ADR-048, 062, 072                                                              |
+| [074](ADR-074-mtp-speculative-decoding-priority.md)           | MTP / Speculative-Decoding Priority (Metal)                                                                  | Proposed | ADR-006, 050, 051, 073; related [090](ADR-090-shared-decoder-generation.md)    |
+| [075](ADR-075-moe-expert-offload-priority.md)                 | MoE Expert-Offload Priority (Metal)                                                                          | Proposed | ADR-053, 072, 073, 074                                                         |
+| [076](ADR-076-adaptive-reasoning-priority.md)                 | Adaptive Reasoning-Budget Priority (Metal + CPU)                                                             | Proposed | ADR-073, 074                                                                   |
+| [077](ADR-077-pruning-distill-priority.md)                    | Pruning + Distillation Priority (Metal + CPU)                                                                | Proposed | ADR-060, 073, 076                                                              |
+| [078](ADR-078-multimodal-serving-deferral-priority.md)        | Multimodal / Vision Serving Priority (Deferral)                                                              | Proposed | ADR-049, 069, 071                                                              |
+| [079](ADR-079-adaptive-micro-lora-brain.md)                   | Adaptive Micro-LoRA Brain — Composed Train→Govern→Compose→Route→Consume Loop                                 | Proposed | ADR-008/031/043/045/054/056/057                                                |
+| [080](ADR-080-consolidation-duplicated-contracts.md)          | Consolidation of Duplicated Numeric-Contract Helpers (Softmax, HTTP Serving, Decode Policy, GEMM Validation) | Accepted | ADR-058, ADR-064, ADR-066; related [090](ADR-090-shared-decoder-generation.md) |
+| [081](ADR-081-prefill-gemm-optimization-priority.md)          | Prefill GEMM Optimization Priority (Metal)                                                                   | Proposed | none                                                                           |
+| [082](ADR-082-gemma4-e2b-support.md)                          | Gemma 4 E2B Support — Staged Multimodal Ladder (Vision + Audio)                                              | Accepted | ADR-069; related [090](ADR-090-shared-decoder-generation.md)                   |
+| [083](ADR-083-backward-simd-dispatch.md)                      | Backward SIMD Dispatch Contract                                                                              | Accepted | ADR-002, ADR-058                                                               |
+| [084](ADR-084-fallible-inference-validation-helpers.md)       | Fallible Validation for Unstable Inference Helpers                                                           | Accepted | ADR-046                                                                        |
+| [085](ADR-085-explicit-quantization-simd.md)                  | Explicit Quantization SIMD Dispatch                                                                          | Accepted | ADR-058                                                                        |
+| [086](ADR-086-retire-legacy-qwen-decode-api.md)               | Retire the Legacy Generic Qwen Decode API                                                                    | Accepted | ADR-080                                                                        |
+| [087](ADR-087-bench-compare-gate-calibration-and-coverage.md) | Bench-compare Gate Calibration, Coverage, and Admissible Structural Proof                                    | Accepted | ADR-058, ADR-064                                                               |
+| [088](ADR-088-sealed-native-embedding-attestation.md)         | Sealed Native Embedding Preparation and Attestation                                                          | Proposed | ADR-003, ADR-005, ADR-014–017, ADR-087                                         |
+| [089](ADR-089-paddleocr-vl-cpu-reference-gated-by-goldens.md) | PaddleOCR-VL: CPU reference forward per slice, each gated by HF goldens, before any accelerated path         | Proposed |                                                                                |
+| [090](ADR-090-shared-decoder-generation.md)                   | Shared decoder generation with model-owned execution sessions                                                | Proposed | Clarifies 009; inherits 080/082; legacy batch-verifier disposition             |
 
 ## informational
 
