@@ -117,6 +117,16 @@ Support **two primary model families** (BERT encoder and Qwen3 decoder) as first
 
 ---
 
+## Scope clarification: decoder generation control
+
+[ADR-090](ADR-090-shared-decoder-generation.md) separately proposes sharing decoder generation
+control through model-owned execution sessions. This ADR's prohibition on shared forward-pass code
+between BERT and Qwen3 remains unchanged: numerical architecture, weights, cache semantics and
+pooling are not unified by that session boundary. The negative consequence that each new
+architecture needs its own forward pass refers to numerical execution, not a requirement to
+duplicate token-budget, cancellation, sampling-policy and output-stream control. ADR-090 decides
+that new driver explicitly; it does not infer authorization from this clarification or ADR-080.
+
 ## References
 
 - `src/model/bert.rs` — `BertConfig`, `BertModel`, field drop order warning, LayerNorm

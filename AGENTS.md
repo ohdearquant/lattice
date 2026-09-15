@@ -18,7 +18,7 @@ Pure Rust inference engine. MIT OR Apache-2.0. github.com/ohdearquant/lattice
   - `> _Comment authored by Claude (Anthropic agent) on behalf of @ohdearquant._`
   - `> _PR description authored by Codex (OpenAI agent) on behalf of @ohdearquant._`
 
-  The attribution goes at the top of the body, in blockquote-italic form so it renders distinctly on GitHub. Co-authored-by trailers in commits are separate and still required per the commit-message convention.
+  The attribution goes at the top of the body, in blockquote-italic form so it renders distinctly on GitHub. It applies to GitHub prose only: commit messages carry no `Co-authored-by` trailer.
 
 ## Common Rules
 
