@@ -1,8 +1,10 @@
 # R00 rollout and measurement ledger
 
-Companion to ADR-090, accepted 2026-09-15. All issue identifiers R00–R18 are planning labels, not new GitHub
-issues or authorization to edit product code. The accepted round-1 sequence is retained, with the
-explicit D6 batch-verifier exclusion and the prerequisites below. Source baseline:
+Companion to ADR-090, accepted 2026-09-15. Rows R01-R18 are tracked as issues from 2026-09-15, each
+carrying its two cells below verbatim. The row label itself remains a planning label and authorizes
+nothing on its own: what authorizes work on a row is its issue together with the dependencies stated
+in its own cell, and no label grants a measurement waiver. The accepted round-1 sequence is retained,
+with the explicit D6 batch-verifier exclusion and the prerequisites below. Source baseline:
 `292658628f49f16daa04673afe2649eb4f2a5e8d`.
 
 ## Dependencies and per-row disposition
