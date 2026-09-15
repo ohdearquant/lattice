@@ -110,13 +110,18 @@ entries do not select a backend in `generate_greedy`, execute vision, or establi
   goldens through the same capture script and re-runs every gate.
 - Shared helpers widened to `pub(crate)` for reuse (multi-head attention, exact GELU, in-place RoPE) now have
   two callers; a change to them must keep both families' goldens green.
-- One known undiscriminated arm exists: the projector GELU variant swap passes the vision goldens at the
-  current tolerance because the 4608-wide second linear averages the difference down; the end-to-end token
-  gate is the check that catches it today. When the Metal slice opens, a projector-output golden at a tighter
-  tolerance is added so the token gate is not the only catcher.
-- At the time of writing the checkpoint job runs the decoder gate only; the vision and end-to-end goldens
-  join the same job in the workflow change that follows #1463. Until it lands they skip green in every CI
-  job, which is exactly the degraded arm decision 3 removes.
+- The original projector summaries do not discriminate the tanh-GELU substitution. The additional
+  `first_row_max_abs` golden scans all 1024 channels of the first projected row and compares its maximum
+  magnitude with a separate absolute tolerance of `1.25e-4`. The original summary tolerances remain
+  unchanged. This is a first-row statistic, not a full-output elementwise comparison. The second linear
+  is a learned weighted dot product; measurement shows amplification of this mutation, not averaging.
+- `scripts/gen_paddleocr_vision_goldens.py` regenerates the vision fixture from the pinned model and
+  hash-verified reference source. Its runtime pins and output manifest make the capture reproducible;
+  removing only the added projector fields reproduces the original fixture bytes. A changed old field
+  fails generation rather than silently replacing the oracle.
+- The checkpoint job runs decoder, vision and end-to-end goldens with `--release --features f16` and
+  `LATTICE_POCR_GATE_ENFORCE=1`. It preserves Cargo's failure status before checking the execution markers
+  and fixture counts, so a new assertion failure cannot be hidden by the earlier summary lines.
 
 ## Evidence
 
@@ -126,8 +131,25 @@ entries do not select a backend in `generate_greedy`, execute vision, or establi
   the golden fields with about six times headroom; three mutations each redden the gate and the restored file
   is byte-identical.
 - Vision encoder and projector: three synthetic grids (4x4, 6x10, 12x8); worst diffs 4.5e-5, 3.7e-5, 2.6e-4
-  against a 1e-3 tolerance; interpolation and RoPE-phase mutations fail at the first compared checkpoint; the
-  GELU mutation passes (recorded above).
+  on the original sampled checkpoints against `1e-3 + 1e-3 * abs(reference)`; interpolation and RoPE-phase
+  mutations fail at the first compared checkpoint. The GELU mutation passes those original checks.
+- Projector calibration compares unchanged Rust, projector-only tanh-GELU substitution and the pinned HF
+  reference on CPU f32. For the first-row maximum magnitude, mutation signal is `abs(swapped - unchanged)`.
+  A conservative noise bound is the maximum unchanged/HF error over every channel of that same first row:
+
+  | grid | first-row maximum signal | full-first-row noise bound | ratio |
+  | ---- | -----------------------: | -------------------------: | ----: |
+  | 4x4  |               1.25408e-3 |                 3.95775e-5 | 31.69 |
+  | 6x10 |               4.32491e-4 |                 2.09808e-5 | 20.61 |
+  | 12x8 |               6.79016e-4 |                 2.12193e-5 | 32.00 |
+
+  Even the smallest signal divided by the largest noise bound across cases is 10.93. The common
+  `1.25e-4` absolute tolerance leaves 3.16 times the observed noise bound and the smallest mutated/HF
+  residual is 3.29 times that tolerance. These measurements are from one CPU host; byte-identical
+  unchanged/restored outputs establish repeatability there, not a universal floating-point error bound.
+  A tight full-tensor comparator was rejected because its 12x8 case separates maximum signal from
+  maximum noise by only 5.48. Argmax indices do not change under the substitution. The first-row maximum
+  extends the existing first-row sample without selecting individual channels by their measured noise.
 - End to end: a rendered table image, 24 greedy tokens from HF matched exactly; decoder goldens 5 s, vision
   goldens 161 s, end-to-end 527 s in a release build with `--features f16` and the enforce flag set; two
   mutations (M-RoPE row swap, projector row reversal) each redden their gate.

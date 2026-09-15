@@ -1,0 +1,106 @@
+{
+  "cases": [
+    {
+      "grid_h": 4,
+      "grid_w": 4,
+      "id": "g4x4",
+      "projector_sha256": "7fdf90e966e75f913ba44650292c632e86f8cb5c6bd58d8461612d946230eb96",
+      "projector_shape": [
+        4,
+        1024
+      ]
+    },
+    {
+      "grid_h": 6,
+      "grid_w": 10,
+      "id": "g6x10",
+      "projector_sha256": "9599cf7c1b122cd3fcafb4ed71e1f3249080abceaff3d1ae43304d2203ac452e",
+      "projector_shape": [
+        15,
+        1024
+      ]
+    },
+    {
+      "grid_h": 12,
+      "grid_w": 8,
+      "id": "g12x8",
+      "projector_sha256": "96a2fa1a2667b2df82168e97facaf01099105a64c79d276cf75dea913e5e8f89",
+      "projector_shape": [
+        24,
+        1024
+      ]
+    }
+  ],
+  "generator": {
+    "file": "gen_paddleocr_vision_goldens.py",
+    "sha256": "f7bbd6c01b2ae2f656e8f01d9c68540efaf8fc0e9e346540388626749d64054d"
+  },
+  "outputs": {
+    "old_fields": {
+      "byte_identical": true,
+      "sha256": "ea64c6e1cfad2a283ee2c878f2561631362bcff2b13aa3dbe83cdff1ff9d3783"
+    },
+    "vision_goldens.json": {
+      "bytes": 52949,
+      "sha256": "132fbbf90b8c537cf260ffdc2d00e83c0034b460f08ff374bd09cb8d141a9c7f"
+    }
+  },
+  "pixel_formula": "pixel[i,c,py,px] = ((i*7 + c*13 + py*3 + px*5) % 17) / 8 - 1; i = raster patch index",
+  "projector_statistic": "first_row_max_abs = max(abs(projector[0, :])) over all 1024 columns",
+  "runtime": {
+    "attention_implementation": "eager",
+    "blas_info": "accelerate",
+    "deterministic_algorithms": false,
+    "device": "cpu",
+    "dtype": "float32",
+    "float32_matmul_precision": "highest",
+    "num_interop_threads": 12,
+    "num_threads": 8,
+    "packages": {
+      "einops": "0.8.2",
+      "huggingface-hub": "1.20.1",
+      "numpy": "2.4.6",
+      "pillow": "12.3.0",
+      "python": "3.12.14",
+      "safetensors": "0.8.0",
+      "tokenizers": "0.22.2",
+      "torch": "2.13.0",
+      "torchvision": "0.28.0",
+      "transformers": "5.12.1"
+    },
+    "platform": {
+      "machine": "arm64",
+      "release": "27.0.0",
+      "system": "Darwin"
+    },
+    "seed": 0,
+    "torch_config_sha256": "1943041ad11240ec18f123ae0f5aa98ed16a9ebf53b479bb4f0c11ea4c6f12f1"
+  },
+  "schema_version": 1,
+  "source": {
+    "checkpoint": {
+      "config.json": {
+        "bytes": 2059,
+        "sha256": "ce7f4565f8b1db78532ad5d1b9ebe55c2139d49bd4cb04778b580a08a598f171"
+      },
+      "model.safetensors": {
+        "bytes": 1917255968,
+        "sha256": "85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db"
+      }
+    },
+    "model_id": "PaddlePaddle/PaddleOCR-VL-1.6",
+    "reference_sources": {
+      "configuration_paddleocr_vl.py": {
+        "bytes": 8104,
+        "sha256": "753dd93654c3a9c8c85a3eaee1e3092dd12591b0f2dce0305e1abfb7a41ff160",
+        "url": "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6/resolve/c5630abae1d940eafe0697512a0325494b02ab42/configuration_paddleocr_vl.py"
+      },
+      "modeling_paddleocr_vl.py": {
+        "bytes": 103889,
+        "sha256": "c5013dff57ca8b87dc1de64d0fd839a44313de09d230a4fb2d08289d2cad5111",
+        "url": "https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6/resolve/c5630abae1d940eafe0697512a0325494b02ab42/modeling_paddleocr_vl.py"
+      }
+    },
+    "revision": "c5630abae1d940eafe0697512a0325494b02ab42"
+  }
+}
