@@ -524,13 +524,40 @@ jobs:
       # Run the Q4 Metal correctness tests on the Apple-silicon runner.
       # LATTICE_METAL_TEST_ENFORCE=1 makes the dispatch regression fail closed if
       # the runner ever loses its Apple7 GPU, rather than skip-passing silently.
+      # Both steps below select tests by NAME, and a libtest name filter that
+      # matches nothing does not fail: it prints `running 0 tests` and exits 0.
+      # Every other filtered step in this file already guards that with a
+      # `test result:` grep; these two did not, so a rename, a moved module or
+      # a deleted test would have turned them into green no-ops that report
+      # success having executed nothing. The two counts differ in kind on
+      # purpose. The QuaRot filter names exactly one test, so it pins 1 and
+      # will also catch a duplicate. The `q4` filter is a broad substring that
+      # matches many tests, so pinning an exact number there would make this
+      # step a sibling of every q4 test anyone adds later; non-zero is the
+      # property that actually matters and the only one that stays true.
       - name: inference — QuaRot rotated+Q4 composed forward gate
-        run: cargo test -p lattice-inference --lib quarot_rotated_q4_forward_matches_f64_reference -- --nocapture
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/quarot-rotated-q4-forward-test.log"
+          if ! cargo test -p lattice-inference --lib quarot_rotated_q4_forward_matches_f64_reference -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: inference — metal-gpu Q4 tests (macOS only)
         if: runner.os == 'macOS'
         env:
           LATTICE_METAL_TEST_ENFORCE: '1'
-        run: cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-q4-tests.log"
+          if ! cargo test -p lattice-inference --features f16,metal-gpu --lib q4 -- --nocapture >"$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       # ADR-080 C1 / #789: the `forward::metal::` module's assembled-MSL check and the
       # The NaN/+inf fused_attention fail-closed regressions (#789) silently
       # early-returned when no Metal device was present and were never actually run
