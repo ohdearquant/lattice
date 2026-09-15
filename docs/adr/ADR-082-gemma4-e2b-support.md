@@ -175,6 +175,12 @@ change is escalated rather than absorbed silently into the general loader.
 
 ## References
 
+- [ADR-090](ADR-090-shared-decoder-generation.md) — proposed shared generation control for the
+  implemented E2B text CPU profile. Its Gemma adapter inherits Stage 4's per-layer/shared-KV
+  trace, wrong-donor negative, logits/token and sliding-boundary requirements. A text-serving
+  milestone does not imply completion of the vision/audio stages or support for other Gemma
+  variants.
+
 - Tracking: #566 (Gemma 4, anchor), #564 (vision tensors lane), #565 (audio tensors lane).
 - Reference implementation: `transformers` commit `ab1771c9e42891d893189978a8009426d70b4688`,
   `src/transformers/models/gemma4/{modeling_gemma4.py,configuration_gemma4.py,feature_extraction_gemma4.py,processing_gemma4.py}`.

@@ -1,0 +1,205 @@
+# R00 rollout and measurement ledger
+
+Companion to proposed ADR-090. All issue identifiers R00–R18 are planning labels, not new GitHub
+issues or authorization to edit product code. The accepted round-1 sequence is retained, with the
+explicit D6 batch-verifier exclusion and the prerequisites below. Source baseline:
+`292658628f49f16daa04673afe2649eb4f2a5e8d`.
+
+## Dependencies and per-row disposition
+
+**PAIR** requires a real reachable base/head comparison when the actual diff changes a timed path or
+its performance-relevant build inputs. It is a disposition to establish, not a booked job.
+**CANDIDATE** defaults to structural proof for isolated test-only or pure intra-crate moves; all
+ADR-087 D2 conditions and D8's per-diff inventory apply, and a failed proof requires measurement or
+repair. **DOC** is the structural documentation-only disposition. No row label grants a waiver.
+
+**Table-wide ordering constraint:** R03 and R04 must each deliver a real shared-driver token stream
+on the checkpoint named in its acceptance cell before any R14–R18 row or D9 population/probe rebuild
+lands. R01 generation-instrument preparation may precede R03. The full D9 derived-population checker
+gates R14–R17 extractions only; it does not gate either first live CPU milestone.
+
+| Row  | Bounded deliverable and dependencies                                                                                                                                                                                                                  | Measurement disposition and relevant evidence                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R00  | ADR-090, reciprocal ADR/index deltas, profile/lifetime contract and this ledger.                                                                                                                                                                      | DOC. Source/architecture review only. Formal sign-off pending.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| R01  | Characterize existing entry points and prepare generation consumers/counters after R00, before their migrations; may precede R03. D9 population/probe rebuilding waits for both R03/R04 live results.                                                 | CANDIDATE for isolated test-source edits; PAIR if a measurement harness/build input changes. Validate instruments on the common pre-migration base and retain identical consumers on both refs. Keep D4 canonical-method and token-finalization controls.                                                                                                                                                                                                                                                                                                                                                                                                  |
+| R02  | Neutral config/output/policy module with old exports after R01.                                                                                                                                                                                       | CANDIDATE for a provable pure intra-crate move under ADR-087 D2; PAIR if policy behavior or timed build inputs change. Retain downstream output-literal compatibility.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| R03  | Canonical Qwen CPU through the private shared driver after R02; no D9 checker dependency. Its live result must precede R14–R18 and the D9 rebuild.                                                                                                    | LIVE ACCEPTANCE: checkpoint `Qwen/Qwen3.5-0.8B`, actual CPU token stream with shared-driver marker. As part of R03, generate and commit a CPU greedy golden from the unchanged pre-migration entry/checkpoint, then compare the new route on identical inputs, precision and policy. Default ENFORCE on absent checkpoint/feature; bypass and missing-artifact controls must refuse. The Metal QuaRot-Q4 golden is not interchangeable. PAIR: ordinary short/long prompt, seed/config/prefill mode and allocation delta using a real generation consumer.                                                                                                  |
+| R04a | Supported Gemma execution-profile/role preflight after R00/R01; precedes R04 and Gemma R05.                                                                                                                                                           | PAIR if validation is reachable from a loading/preparation measurement; otherwise CANDIDATE only after all-target proof with identical build inputs. Admission hot/cold fixtures must reject changed mode, PLE and role before load.                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| R04  | Gemma E2B text CPU shared-driver session after R03/R04a; no D9 checker dependency. Its live result must precede R14–R18 and the D9 rebuild.                                                                                                           | LIVE ACCEPTANCE: checkpoint `google/gemma-4-E2B-it`, real shared-driver token stream matching the existing stage-5 golden first-three output IDs. Extend `gemma4_e2e_forward_test.rs` with a shared-driver arm against the same committed `tests/fixtures/gemma4/stage5/e2e_golden.json`, retaining the original diagnostic reference arm and ENFORCE default. Require the driver marker; bypass or missing checkpoint/feature must fail. PAIR on comparable output semantics, setup/prefill/decode separately. Retain all ADR-082 Stage-4 trace, shared-family, logits, sliding-boundary and wrong-donor controls; fixed-count diagnostics stay separate. |
+| R05  | Model prompt adapter and neutral HTTP preparation after R03; Gemma depends on R04a.                                                                                                                                                                   | PAIR: real render/tokenize/prepare path and first-token request cost on matched semantics. Canonical Qwen control, supported Gemma positive, unsupported modality/role/option negatives.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| R06  | Ordinary Qwen Metal session after R03 and #1583/#1584 dispositions.                                                                                                                                                                                   | PAIR: full request path reaching new boundary plus focused `metal_decode_bench`/prefill coverage. Preserve compact readback and batching. The low-level forward target alone cannot certify driver overhead.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| R07  | Worker-local factory/runtime after R05/R06; R04 before both-family claim.                                                                                                                                                                             | PAIR: actual queue/request path, same admitted concurrency and startup/warm-state regions. Preserve cancellation, queue refusal and non-Send confinement. #1584 disposition required.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| R08  | Unified CLI server both-family routing after R04/R05/R07.                                                                                                                                                                                             | PAIR: actual HTTP/stream/nonstream requests; driver and selected-backend markers, unsupported Metal-Gemma negative. Fake sessions alone are not accepted.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| R09  | Standalone server same runtime after R07/R08. Keep its existing feature requirements unless separately approved.                                                                                                                                      | PAIR: real standalone request consumer and startup errors under matching features; preserve Qwen Metal and add bounded Gemma CPU selection.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| R10  | F16/Q8/NEON standalone CPU profiles after R03.                                                                                                                                                                                                        | PAIR: each affected wrapper actually called, including its refusals. Canonical Qwen-only coverage is insufficient.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| R11  | Prefix-cache streaming after R06/R07.                                                                                                                                                                                                                 | PAIR: `cross_turn_prefix_cache_bench` is an existing candidate for cache work, plus the shared streaming route. Fresh, exact-append, invalidated and cancelled arms. A cache-only timed region cannot establish streaming policy cost.                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| R12  | Default MTP and self-spec verified progress through shared policy after R11, with D6's batch route explicitly retained outside the shared contract.                                                                                                   | PAIR: `mtp_decode`/real route under declared unset/set selectors, same checkpoint basis and actual output counts. Explicit batch exclusion control, default verifier positive, rejection/rollback/stop controls. No inherited historical throughput claim.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| R13  | Shared-route milestone after R08–R12, with deliberate bypass sentinels and D6 exclusion declaration. Remove only superseded ordinary loops.                                                                                                           | PAIR: end-to-end real family/backend cells on both servers and affected advanced routes. There is no blanket waiver for removal/rerouting of runtime code.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| R14  | Gemma folder grouping after R13 and both R03/R04 live results; D9 derived-population acceptance required. Keep public exports and ERNIE helper edge.                                                                                                  | CANDIDATE for a provable pure intra-crate move under ADR-087 D2; PAIR if timed behavior/build inputs change. Retain ADR-082 regressions, portable build, source coverage and export compatibility.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| R15  | Portable/stub Metal test extraction after R13 and both R03/R04 live results; D9 derived-population acceptance required.                                                                                                                               | CANDIDATE for isolated test-source movement with identical timed/build inputs. Preserve test-name inventory and execute moved tests; no empty discovery or source-probe coverage waiver.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| R16  | Extract first inner test family `rms_reduce_854_parity` from `crates/inference/src/forward/metal_qwen35.rs` (41,331 lines at the pinned ref), after R15 and both R03/R04 live results; D9 coverage required. Later families remain separate children. | CANDIDATE under the isolated-test predicate; PAIR if timed behavior or build inputs change. Preserve raw MSL payload hash, privacy, GPU lock, device marker and derived source-probe controls.                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| R17  | Bounded engine-construction extraction from `crates/inference/src/forward/metal_qwen35.rs` (41,331 lines at the pinned ref), after R16, stable adapters and both R03/R04 live results; D9 coverage and #1583/#1584 dispositions required.             | CANDIDATE for a provable pure intra-crate move under ADR-087 D2; otherwise PAIR on affected engine/load/execution consumers. Separate prerequisite helper moves; no hidden numerical fix or translation-unit change.                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| R18  | One documentation PR after R14–R17 and both R03/R04 live results: remaining per-responsibility child manifests and bounded rename/reorganization plan.                                                                                                | DOC. No authorization for a mass Metal/CLI move. Subsequent children carry their own structural/PAIR disposition.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+
+After both R03/R04 live results, R14–R17 inherit D9's derived production population and
+citation-mapping checks. Earlier driver rows retain their existing guards and local owner/caller
+reconciliation without depending on the full D9 rebuild. An omitted discovered production file must
+fail coverage; there is no test-only waiver of that obligation. C01 remains a separate docs lane for
+existing line-only pins: classify each document's current/historical role, re-derive current-use
+claims to qualified symbol + file + ref, keep immutable historical evidence, and label unresolved
+provenance without inventing a ref. Non-ADR documents need explicit role classification. This
+incorporates the accepted citation addendum without starting C01 or changing the driver ledger's 20
+rows.
+
+### R01 token finalization and later D9 external-owner controls
+
+R01 freezes candidate ID, policy-final ID, metadata prediction/token identity, consumed ID, RNG
+state and raw-event ordering separately. R03 and each affected ordinary/stream/prefix Metal profile
+must retain those observations against its own old entry. Preserve the special first-token path,
+grammar masking and the override → grammar → bookkeeping → EOS → push/logprob → text/stop ordering.
+Do not skip the legacy sampling step when policy will force a token, or draw again when scoring it.
+
+Retain `grammar_budget_forced_close_fails_closed`: with reasoning budget one and grammar
+`root ::= "aa"`, the forced close is rejected and output remains `[1]`. Add a legal forced-close
+continuation with requested logprobs where the sampled candidate differs from the forced token;
+observe metadata for the accepted final ID from the same prediction and the next decode consuming
+that final ID. Mutating grammar advance, scoring or consumption to use the candidate must fail.
+Include stale-prediction and repeated-consumption refusals, first-token and terminal-no-next-decode
+controls, and a separate compact-eligible ordinary positive proving no mandatory dense readback.
+These are planned controls; the existing negative is source-verified, not rerun in this draft.
+
+After both R03/R04 live results, the D9 rebuild prepares its external-owner resolution control
+before R14–R17 extractions can pass. It is not an R01 prerequisite for live generation. Relocate a
+guarded owner to a sibling/shared module declared by its parent and keep only an import or re-export
+from Metal, with no outgoing mod/path/include edge to the new file. Require the resolved destination
+in the read set or refusal. Intentionally dropping it during discovery must fail completeness before
+the negative search. An unresolved destination refuses; a resolved one must detect a bypassed call
+or retired declaration. Freeze before/after owner/caller obligations independently of the directory
+walk. All v2 source-coverage controls remain required.
+
+### Source-probe migration manifest
+
+The seven parent self-source includes at the pinned ref are tracked below by enclosing probe, not as
+a promise that a future source file contains seven includes. The D9 rebuild supplies discovery and
+classification after both R03/R04 live results and before R14–R17 extraction acceptance. Each row
+records its before/after item population, exclusions and reader coverage; unchanged probes get an
+explicit no-impact disposition. Future extractions outside the Metal subtree update
+declaration-based discovery, not a manually curated inclusion list.
+
+| Probe                                                              | Current assumption and responsible rows                                                                                                                                                                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sample_decode_traced_opens_the_decode_sample_interval`            | Parent-local function and exact body terminator. R06/R13 track helper relocation or retained ownership; R15/R16 reconcile the test's new include location.                                                                                                                                                                                                                                                                          |
+| `all_five_decode_loops_call_sample_decode_traced`                  | Parent prefix split at the literal four-space `mod tests`; one definition + calls in `generate`, `generate_multimodal`, `generate_multimodal_vision_impl`, `generate_streaming_with_cancel` and `generate_streaming_with_prefix_cache_and_cancel_inner`. R06/R11/R13 reconcile migrated ordinary/stream/prefix paths; R12 audits interactions; R15/R16 replace delimiter-based classification. Keep unmigrated multimodal coverage. |
+| `retired_closed_call_chains_stay_deleted`                          | Manual union omits `mtp_weights.rs`; parent prefix also cannot represent production items after its first inline test module. R06/R11/R12/R13 retain retired-symbol controls and reconcile locally affected owners; the post-R03/R04 D9 rebuild derives and proves the full union for R14–R17.                                                                                                                                      |
+| `metal_constructors_share_one_pipeline_builder`                    | Same literal prefix plus constructor adjacency/end markers. R17 follows constructors and builder by symbol; R15/R16 preserve the source reader and positive/negative controls.                                                                                                                                                                                                                                                      |
+| `sampling_route_configurator_owns_all_three_generation_call_sites` | Splits at the exact `// Tests` comment, expects three `configure_sampling_route` calls and one route-chooser owner. R06/R11/R13 reconcile the call/owner population; R15/R16 replace the comment-delimited reader.                                                                                                                                                                                                                  |
+| `injected_embedding_never_falls_back_to_token_lookup`              | Searches `match injected_embedding` then `Some(row)`/`None` text in the parent. R15/R16 preserve its reader and behavioral REPLACE control; R06/R17 require a no-impact disposition or remapping if their actual diff relocates the forward item. Text-only scope does not permit deleting vision coverage.                                                                                                                         |
+| `every_public_stateful_scheduling_entry_point_has_preflight`       | Splits the parent between `mod inner` and the target-independent-support comment before discovering public scheduling functions. R06/R11/R12/R13/R17 reconcile relocated entry points and preflight sinks; R15/R16 preserve discovery and lexical controls, including raw strings.                                                                                                                                                  |
+
+This is an acceptance design, not an implemented scanner. Coverage controls include missing file,
+new nested production file, test-only decoy, production after inline tests, raw-string delimiter and
+changed indentation cases. Failed discovery cannot yield an empty passing negative search.
+
+R03–R13 require **eleven dispositions; eleven paired jobs is a ceiling, not a schedule**. D8 selects
+structural proof first for documentation, isolated tests and provable pure moves; only timed changes
+book pairs. R02/R14/R17, R04a, R01 instrumentation, defect experiments/fixes and D6's batch-verifier
+disposition have their own conditional costs. Correctness gates, compilation, admission wait and
+confirmation/calibration jobs add cost. No total wall-clock claim is made without same-target
+measurements on the benchmark host. Existing inventories can be reused as input but must be
+revalidated at every base/head; a waiver cannot be copied across rows.
+
+The complete ledger has **20 rows**: 13 runtime-change rows (R02–R13 plus R04a), one
+characterization/instrument row (R01), four later extraction rows (R14–R17), and two documentation
+rows (R00/R18). R01 is not automatically executed-runtime work: that depends on whether its eventual
+diff remains isolated tests or also supplies a benchmark consumer. Four extractions are not four
+pre-approved waivers; R14/R17 require their exhaustive pure-move proof or a reachable pair. These
+explicit row memberships supersede ambiguous aggregate counts without changing any row's scope.
+
+## What the current targets do and do not establish
+
+Manifest-derived `TARGET_INVENTORY.json` is the complete declared target inventory of inference,
+embed and fann at this baseline, including `required-features`; it also records examples so the
+timed-script survey can find consumers outside the bench directory. A declaration is not proof of
+reachability. A future diff needs the exact changed operation's caller chain inside the timed
+region.
+
+- `e2e_bench` calls encoder embedding paths. It does not become a Qwen/Gemma generation benchmark
+  because it shares a crate.
+- `metal_decode_bench` times `forward_step` and prefill. Use it for affected execution work; add a
+  real ordinary-generation consumer for the new policy/session boundary.
+- `cross_turn_prefix_cache_bench` includes fresh re-prefill and cache-aware append. Verify that the
+  region changed by R11 is inside its timed closure, not merely its untimed setup.
+- `mtp_decode` calls `chat_completion` with `enable_mtp` false/true; missing device, checkpoint,
+  tokenizer or weights can cause early return. Require nonempty registered groups, route markers and
+  actual completed-token counts. A successful cargo exit with SKIP output is not measurement.
+- `bench_decode_ab` is a manifest-declared plain binary reaching `chat_completion`. Its internal
+  output-budget comparison is not itself a source-ref comparison; invoke identically at base/head.
+- The complete inventory includes targets such as fann's `router_online`; do not assume the default
+  inference/embed Criterion runner can drive every declared target.
+
+## Serialized host plan and bounded uncertainty
+
+All performance work runs on one maintainer-designated benchmark host, never the development laptop.
+The maintainer admits each run; repository runners serialize through `/tmp/lion-bench-window.lock`
+and `/tmp/lion-metal-gpu-test.lock`. Source and document preparation may run elsewhere. Existing
+admitted host work remains separate; the presence of a lock or a previously green host reading is
+not admission now.
+
+1. **Preparation outside a booked measurement window:** enumerate targets and changed call chains,
+   select artifact/config/feature cells, inspect required runner options, freeze route/count/counter
+   assertions, and build a per-job manifest. Checkpoints, compiled binaries and worktrees must be
+   prepared without overlapping another quiet measurement. Do not copy/checkout during a booked run.
+2. **Instrument phase:** add missing real consumers in an independent characterization change. Base
+   and head of subsequent migration measurements both contain this consumer unchanged. Verify
+   nonempty outputs and a deliberately bypassed route fails; calibrate any new gating target/feature
+   configuration using same-SHA A/A under the same admitted conditions.
+3. **Execution queue:** defect dispositions before affected Metal rows; R02 then R03; R04a before
+   Gemma; R04/R05/R06/R10 may prepare on independent files. Establish each row's disposition before
+   booking; only timed-path/build changes receive a serialized pair. Then R07–R09, R11, R12 and R13
+   follow the table. Both R03/R04 live results precede D9 rebuilding and every R14–R18 landing. Do
+   not reuse an invalidated base.
+4. **Time reservation:** record observed arm/setup/cooldown duration, compile time, admission wait
+   and cleanup separately for the exact target/configuration. No estimate from historical laptop
+   timings is treated as a benchmark-host measurement. Reserve from a recent valid observed total;
+   if absent, first reserve a bounded pilot and report timeout as incomplete rather than shortening
+   the gate.
+5. **Uncertainty:** retain the runner's classification, source reachability and calibration
+   evidence. An uncalibrated/informational result needs a stated owner-reviewed performance
+   decision; it cannot assert equivalence. Allow one declared confirmation job after an ambiguous
+   pair, then keep the row pending instead of retrying until it looks green. No threshold adjustment
+   based on head's favorable or unfavorable result. Correctness and readback/allocation budgets
+   remain independent.
+
+The live paired runner already takes its own locks and implements ABBA plus boundary/in-phase
+checks. Invoke `scripts/bench-compare.sh`, not its internal shell body, and do not wrap it in a
+second copy of its locks. Use explicit base/head refs, verified target/features and
+`--fail-on-regression` where an enforced calibrated verdict is required; report-only is not
+enforcement. Preserve all run conditions and classifications in the receipt. For non-Criterion
+pairs, follow the narrower `bench-command.sh --durable` contract and disclose its missing full
+quiet-machine checks.
+
+## Draft-stage review and later execution gates
+
+R00 defines contracts; it does not claim their controls have run. The eventual implementation packet
+must name concrete executable tests for each row below before declaring the gate complete:
+
+| Proposed control pair                                                            | Required observation                                                                                                                                                                             |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Sampled candidate versus different policy-forced final ID                        | Existing grammar/budget negative rejects the final ID; a legal forced-close case scores and consumes that final ID with unchanged RNG/event ordering. Wrong-ID scoring or consumption must fail. |
+| Guarded owner relocated outside discovery roots through import/re-export         | Destination is resolved and read or certification refuses; dropping it during discovery fails completeness before the negative-symbol search.                                                    |
+| Real supported model/backend versus deliberately bypassed adapter                | Supported request emits the shared-route marker; bypassed route fails the route assertion, not merely a source-text search.                                                                      |
+| Valid E2B target versus one changed unsupported mode/role/PLE property           | Supported fixture admitted; invalid fixture rejected before weight loading. Retain otherwise-valid geometry to isolate the rule.                                                                 |
+| Canonical Qwen control versus narrower standalone profile                        | Canonical supported request works; wrong-profile wiring fails the compatibility fixture.                                                                                                         |
+| Ordinary GPU compact selection versus deliberate dense-readback substitution     | Same output contract; counter delta violates the zero-added-readback budget on substitution.                                                                                                     |
+| Warm real generation versus retained allocation/reallocation in the interface    | R01 extends the existing counting allocator; nonzero incremental calls/bytes fail, missing or unstable samples refuse certification.                                                             |
+| Complete discovered production population versus omitted file or early delimiter | Coverage fails on omission; retired declaration in the newly included file fails; test-only decoy remains excluded.                                                                              |
+| Old public `GenerateOutput` literal versus a changed public shape                | Old-path downstream-style literal continues to compile; no new field is authorized by this milestone.                                                                                            |
+| Valid shared-KV owner versus wrong donor                                         | Existing ADR-082 per-layer trace gate fails for the wrong owner; final token alone is insufficient.                                                                                              |
+| Complete rollback versus mutated cursor/cache restoration                        | Reuse control succeeds only after complete state restoration; corrupted restoration fails independently of final text.                                                                           |
+| Populated measurement versus missing device/model/route                          | Normal arm produces expected samples/counters; missing prerequisite refuses certification.                                                                                                       |
+
+The new-gate adversarial trigger is treated as fired because no implementation differential exists
+yet. These are the planned suite cases, **not executed results**. Formal sign-off must receive the
+execution-output artifact with its must-reject control and judge coverage of the admitted set;
+review prose or arithmetic does not substitute for it. This document does not assign numerical
+confidence or power to these contract fixtures.

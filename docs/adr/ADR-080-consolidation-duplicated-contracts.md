@@ -574,6 +574,10 @@ lowest-risk/highest-already-confirmed cluster first.
 
 ## References
 
+- [ADR-090](ADR-090-shared-decoder-generation.md) — proposed shared decoder generation driver;
+  inherits the checked decode-policy helpers here and separately decides the session boundary.
+  Backend-specific numerical kernels remain separate.
+
 - Internal duplication audit, run 2026-07-09 (audited at `13c8de8a3`; verified and re-verified at `0699e60cc`) — the four cluster evidence tables above
 - `crates/inference/src/attention/gqa.rs`, `crates/inference/src/attention/decode.rs`
 - `crates/inference/src/bin/lattice.rs`, `crates/inference/src/bin/lattice_serve.rs`
