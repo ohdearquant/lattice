@@ -8,6 +8,8 @@
 //! path's own call shape). The input is a formula-generated patch tensor
 //! (no image codec, no resize) that this test regenerates bit-exactly, so
 //! the gate isolates the encoder + projector algebra from preprocessing.
+//! Regenerate with `scripts/gen_paddleocr_vision_goldens.py`; the adjacent
+//! fixture manifest records its pinned reference inputs and runtime.
 //!
 //! **Fail-closed contract** (mirrors `paddleocr_vl_decoder_goldens_test.rs`):
 //! the ~1.9 GB checkpoint is not committed. With `LATTICE_POCR_MODEL_DIR`
@@ -47,22 +49,24 @@ mod gate {
     use serde::Deserialize;
     use std::path::PathBuf;
 
-    /// Both sides load bit-identical bf16 weights and compute in f32, so the
-    /// divergence is accumulation-order noise compounded across 27 blocks plus
-    /// the projector's 4608-wide reductions. Measured worst error on the
-    /// compared fields across the three fixture grids was 2.6e-4 (on the
-    /// 96-patch case's projector rows); the bounds below leave ~4x headroom.
-    /// Two structural mutations were run against this gate and each reddened
-    /// it on the first compared checkpoint (bilinear position-embedding
-    /// interpolation with the align-corners convention instead of the
-    /// half-pixel one; swapped row/column RoPE axes). A third, tanh-approximate instead of exact-erf GELU in the
-    /// projector, moves the compared rows by at most 6.8e-4 and is NOT
-    /// discriminated by these bounds: the fixture summarises projector rows by
-    /// their first eight values and per-row mean |x|, and the two GELU
-    /// variants differ by O(1e-3) only near |x| ~ 2 before a 4608-wide linear
-    /// averages it down.
+    /// Retain the original summary bounds. A CPU f32 calibration measured
+    /// 3.672e-5 worst HF disagreement over the 94 projector summary values.
+    /// The 2.6e-4 quoted here previously is the 96-patch case's worst over
+    /// the whole compared surface, and it is attained on an encoder
+    /// checkpoint rather than on the projector: it is unchanged under the
+    /// projector-only tanh-GELU substitution, which moves the other two
+    /// cases to 6.83e-4 and 4.99e-4. That substitution's worst summary
+    /// residual against HF is 6.828e-4 and passes these bounds.
     const ATOL: f32 = 1e-3;
     const RTOL: f32 = 1e-3;
+
+    /// The first row's maximum scans all 1024 channels without averaging.
+    /// Across the three calibration cases, the smallest GELU-swap signal
+    /// (4.325e-4) exceeds the largest full-first-row HF disagreement
+    /// (3.958e-5) by 10.9x. This common bound leaves at least 3.1x measured
+    /// noise headroom and 3.2x mutant-residual separation. These are single
+    /// CPU-host observations, not a bound on every accumulation order.
+    const PROJECTOR_FIRST_ROW_MAX_ABS_ATOL: f32 = 1.25e-4;
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -100,6 +104,7 @@ mod gate {
         last_row_first8: Vec<f32>,
         mean_abs: f32,
         row_mean_abs: Vec<f32>,
+        first_row_max_abs: f32,
     }
 
     fn close(a: f32, e: f32) -> bool {
@@ -122,6 +127,28 @@ mod gate {
 
     fn mean_abs(x: &[f32]) -> f32 {
         x.iter().map(|v| v.abs()).sum::<f32>() / x.len() as f32
+    }
+
+    fn assert_projector_first_row_max_abs(results: &[(&str, f32, f32)]) {
+        let mut failures = Vec::new();
+        for &(id, actual, expected) in results {
+            let error = (actual - expected).abs();
+            println!(
+                "case {id}: projector.first_row_max_abs lattice {actual} vs HF {expected}, \
+                 |diff| {error:.8e}"
+            );
+            if !actual.is_finite()
+                || !expected.is_finite()
+                || error > PROJECTOR_FIRST_ROW_MAX_ABS_ATOL
+            {
+                failures.push(id);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "projector.first_row_max_abs exceeded absolute bound \
+             {PROJECTOR_FIRST_ROW_MAX_ABS_ATOL} in cases {failures:?}"
+        );
     }
 
     /// `pixel[i, c, py, px] = ((i*7 + c*13 + py*3 + px*5) % 17) / 8 - 1`, the
@@ -190,10 +217,14 @@ mod gate {
             "pixel[i,c,py,px] = ((i*7 + c*13 + py*3 + px*5) % 17) / 8 - 1; i = raster patch index",
             "fixture pixel formula metadata does not match this test"
         );
-        assert!(
-            golden.cases.len() >= 3,
-            "goldens shrank to {} cases",
-            golden.cases.len()
+        assert_eq!(
+            golden
+                .cases
+                .iter()
+                .map(|case| (case.id.as_str(), case.grid_h, case.grid_w))
+                .collect::<Vec<_>>(),
+            [("g4x4", 4, 4), ("g6x10", 6, 10), ("g12x8", 12, 8)],
+            "fixture cases differ from the calibrated grids"
         );
 
         let cfg = PaddleOcrVisionConfig::from_config_json(&dir.join("config.json"))
@@ -201,6 +232,8 @@ mod gate {
         let mut source =
             SafetensorsFile::open(&dir.join("model.safetensors")).expect("open weights");
         let weights = PaddleOcrVisionWeights::load(&mut source, &cfg).expect("weights load");
+        assert_eq!(cfg.text_hidden_size, 1024, "projector channel count");
+        let mut projector_maxima = Vec::new();
 
         for case in &golden.cases {
             let (gh, gw) = (case.grid_h, case.grid_w);
@@ -290,11 +323,28 @@ mod gate {
                 "case {}: production output",
                 case.id
             );
+            assert!(
+                trace.projector[..t].iter().all(|value| value.is_finite()),
+                "case {}: nonfinite projector first row",
+                case.id
+            );
+            projector_maxima.push((
+                case.id.as_str(),
+                trace.projector[..t]
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(0f32, f32::max),
+                case.projector.first_row_max_abs,
+            ));
             println!(
                 "case {}: grid {gh}x{gw} ({n} patches) all checkpoints within tolerance, \
                  worst |diff| {worst:.2e}",
                 case.id
             );
         }
+        // Complete every original assertion before the tighter projector check.
+        println!("[POCR_VISION_LEGACY_GATE] executed=true cases=3");
+        assert_projector_first_row_max_abs(&projector_maxima);
+        println!("[POCR_PROJECTOR_GELU_GATE] executed=true cases=3");
     }
 }
