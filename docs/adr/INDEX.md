@@ -4,33 +4,33 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 
 ## lattice-inference (ADR-001 to ADR-011, ADR-040 to ADR-053)
 
-| ADR                                            | Title                                                                                                    |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| [001](ADR-001-pure-rust-transformer-engine.md) | Pure Rust Transformer Engine                                                                             |
-| [002](ADR-002-simd-dispatch.md)                | SIMD Dispatch Strategy                                                                                   |
-| [003](ADR-003-safetensors-loading.md)          | SafeTensors Weight Loading                                                                               |
-| [004](ADR-004-kv-cache.md)                     | KV Cache Design                                                                                          |
-| [005](ADR-005-tokenizer-architecture.md)       | Tokenizer Architecture                                                                                   |
-| [006](ADR-006-speculative-decoding.md)         | Speculative Decoding                                                                                     |
-| [007](ADR-007-rope-positional-encoding.md)     | Rotary Positional Encoding (RoPE)                                                                        |
-| [008](ADR-008-lora-injection.md)               | LoRA Injection via Trait Hook                                                                            |
-| [009](ADR-009-model-architectures.md)          | Model Architectures (BERT and Qwen3); proposed clarification [090](ADR-090-shared-decoder-generation.md) |
-| [010](ADR-010-attention-mechanisms.md)         | Attention Mechanisms                                                                                     |
-| [011](ADR-011-sampling-strategies.md)          | Sampling Strategies                                                                                      |
-| [040](ADR-040-gated-attention.md)              | Gated Attention (G1 SDPA-Output)                                                                         |
-| [041](ADR-041-differential-attention.md)       | Differential Attention                                                                                   |
-| [042](ADR-042-native-sparse-attention.md)      | Native Sparse Attention                                                                                  |
-| [043](ADR-043-lora-serving-verification.md)    | LoRA Serving Verification                                                                                |
-| [044](ADR-044-quarot-rotated-quantization.md)  | QuaRot Hadamard-Rotated Quantization                                                                     |
-| [045](ADR-045-quarot-lora-composition.md)      | QuaRot + LoRA Composition                                                                                |
-| [046](ADR-046-structured-output.md)            | Structured Output (JSON Schema Constrained Decoding)                                                     |
-| [047](ADR-047-paged-kv-cache.md)               | Paged KV Cache                                                                                           |
-| [048](ADR-048-continuous-batching.md)          | Continuous Batching with Disaggregated Prefill/Decode                                                    |
-| [049](ADR-049-vision-encoder.md)               | Vision Encoder                                                                                           |
-| [050](ADR-050-rejection-sampling.md)           | Rejection Sampling for Speculative Decoding                                                              |
-| [051](ADR-051-quarot-mtp-rotation.md)          | QuaRot-MTP Rotation Reconciliation                                                                       |
-| [052](ADR-052-gdn-speculative-state.md)        | GDN State Management for Speculative Rollback                                                            |
-| [053](ADR-053-moe-metal-dispatch.md)           | MoE Metal Dispatch with Expert Coalescing                                                                |
+| ADR                                            | Title                                                                                           |
+| ---------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| [001](ADR-001-pure-rust-transformer-engine.md) | Pure Rust Transformer Engine                                                                    |
+| [002](ADR-002-simd-dispatch.md)                | SIMD Dispatch Strategy                                                                          |
+| [003](ADR-003-safetensors-loading.md)          | SafeTensors Weight Loading                                                                      |
+| [004](ADR-004-kv-cache.md)                     | KV Cache Design                                                                                 |
+| [005](ADR-005-tokenizer-architecture.md)       | Tokenizer Architecture                                                                          |
+| [006](ADR-006-speculative-decoding.md)         | Speculative Decoding                                                                            |
+| [007](ADR-007-rope-positional-encoding.md)     | Rotary Positional Encoding (RoPE)                                                               |
+| [008](ADR-008-lora-injection.md)               | LoRA Injection via Trait Hook                                                                   |
+| [009](ADR-009-model-architectures.md)          | Model Architectures (BERT and Qwen3); clarification [090](ADR-090-shared-decoder-generation.md) |
+| [010](ADR-010-attention-mechanisms.md)         | Attention Mechanisms                                                                            |
+| [011](ADR-011-sampling-strategies.md)          | Sampling Strategies                                                                             |
+| [040](ADR-040-gated-attention.md)              | Gated Attention (G1 SDPA-Output)                                                                |
+| [041](ADR-041-differential-attention.md)       | Differential Attention                                                                          |
+| [042](ADR-042-native-sparse-attention.md)      | Native Sparse Attention                                                                         |
+| [043](ADR-043-lora-serving-verification.md)    | LoRA Serving Verification                                                                       |
+| [044](ADR-044-quarot-rotated-quantization.md)  | QuaRot Hadamard-Rotated Quantization                                                            |
+| [045](ADR-045-quarot-lora-composition.md)      | QuaRot + LoRA Composition                                                                       |
+| [046](ADR-046-structured-output.md)            | Structured Output (JSON Schema Constrained Decoding)                                            |
+| [047](ADR-047-paged-kv-cache.md)               | Paged KV Cache                                                                                  |
+| [048](ADR-048-continuous-batching.md)          | Continuous Batching with Disaggregated Prefill/Decode                                           |
+| [049](ADR-049-vision-encoder.md)               | Vision Encoder                                                                                  |
+| [050](ADR-050-rejection-sampling.md)           | Rejection Sampling for Speculative Decoding                                                     |
+| [051](ADR-051-quarot-mtp-rotation.md)          | QuaRot-MTP Rotation Reconciliation                                                              |
+| [052](ADR-052-gdn-speculative-state.md)        | GDN State Management for Speculative Rollback                                                   |
+| [053](ADR-053-moe-metal-dispatch.md)           | MoE Metal Dispatch with Expert Coalescing                                                       |
 
 ## lattice-embed (ADR-012 to ADR-019)
 
@@ -125,7 +125,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [087](ADR-087-bench-compare-gate-calibration-and-coverage.md) | Bench-compare Gate Calibration, Coverage, and Admissible Structural Proof                                    | Accepted | ADR-058, ADR-064                                                               |
 | [088](ADR-088-sealed-native-embedding-attestation.md)         | Sealed Native Embedding Preparation and Attestation                                                          | Proposed | ADR-003, ADR-005, ADR-014–017, ADR-087                                         |
 | [089](ADR-089-paddleocr-vl-cpu-reference-gated-by-goldens.md) | PaddleOCR-VL: CPU reference forward per slice, each gated by HF goldens, before any accelerated path         | Proposed |                                                                                |
-| [090](ADR-090-shared-decoder-generation.md)                   | Shared decoder generation with model-owned execution sessions                                                | Proposed | Clarifies 009; inherits 080/082; legacy batch-verifier disposition             |
+| [090](ADR-090-shared-decoder-generation.md)                   | Shared decoder generation with model-owned execution sessions                                                | Accepted | Clarifies 009; inherits 080/082; legacy batch-verifier disposition             |
 
 ## informational
 
