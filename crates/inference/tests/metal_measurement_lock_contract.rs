@@ -365,6 +365,7 @@ const IN_CRATE_COMMAND_BUFFER_TESTS: &[&str] = &[
     "src/forward/metal_qwen35/inner/tests/dispatch.rs::dispatch_matmul_q4_writes_all_rows",
 ];
 const CONSTRUCTION_SELECTORS: &[CallSelector] = &[
+    CallSelector::Path(&["MetalErnie45State", "new"]),
     CallSelector::Path(&["MetalQwen35State", "new"]),
     CallSelector::Path(&["MetalQwen35State", "from_q4_dir"]),
     // QwenModel::from_directory attempts MetalForwardPass::new internally
@@ -1217,6 +1218,7 @@ fn macro_tokens_name_protected_work(tokens: &proc_macro2::TokenStream) -> bool {
     }
     let rendered = tokens.to_string();
     [
+        "MetalErnie45State :: new",
         "MetalForwardPass :: new",
         "MetalQwen35State :: from_q4_dir",
         "MetalQwen35State :: new",
@@ -2865,9 +2867,14 @@ impl StructuredSource {
                 return Ok(true);
             }
         }
-        Ok(["MetalQwen35State", "MetalForwardPass", "QwenModel"]
-            .iter()
-            .any(|marker| self.has_code_identifier(marker)))
+        Ok([
+            "MetalErnie45State",
+            "MetalQwen35State",
+            "MetalForwardPass",
+            "QwenModel",
+        ]
+        .iter()
+        .any(|marker| self.has_code_identifier(marker)))
     }
 }
 

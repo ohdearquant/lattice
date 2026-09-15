@@ -11,6 +11,7 @@ pub mod gdn_chunk_ref;
 pub mod gpu;
 pub mod gpu_gemm;
 pub mod metal;
+pub mod metal_ernie45;
 pub mod metal_gemm;
 pub mod metal_qwen35;
 pub mod moe_expert_cache;

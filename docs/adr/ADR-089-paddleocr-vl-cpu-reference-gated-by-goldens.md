@@ -41,9 +41,41 @@ port, and a Metal path written against a wrong CPU reference would carry the err
 5. No accelerated path (Metal, quantized weights, KV cache, batched prefill) is written for this family until
    the CPU reference is merged; each later path is compared against the CPU reference on the same goldens, and
    the reference stays in the tree as the oracle.
-6. Bench-compare dispositions for these slices are structural while no declared bench target reaches the
-   model, with the population searched and the residual risk stated in the PR body; the first Metal slice adds
-   a bench target and moves the family onto measured dispositions.
+6. Bench-compare dispositions remain structural only while a search of every declared measurement target
+   proves none executes a changed path, with the population and residual risk stated in the PR body. The
+   first text-only Metal prefill implementation exposes an explicit backend without adding a measurement
+   target. This revises the earlier proposal to add a benchmark in the same change: correctness and its
+   controls are established first, while initialization cost, latency, throughput and scaling remain
+   unmeasured. Performance optimization or automatic backend selection requires a measured target and
+   recorded comparisons; parity is never evidence of speed.
+
+### Explicit Metal text prefill
+
+`forward::metal_ernie45::MetalErnie45State::new(&config, &weights, max_seq_len)` uploads an
+`Ernie45Weights` decoder into persistent f32 buffers. The implementation requires macOS and `metal-gpu`;
+the same API returns an availability error on unsupported builds. The separate `f16` feature is needed to
+load the shipped BF16 checkpoint, not to execute already-loaded f32 weights.
+
+`prefill(&mut self, ids, logits)` recomputes one complete text sequence. The caller supplies exactly
+`ids.len() * config.vocab_size` f32 output elements, laid out as contiguous token-major rows. Positions begin
+at zero on every call, attention is causal, and no KV cache survives between calls. Head width is 128;
+query and KV projection widths remain independent of the hidden-state width. The CPU configuration
+validator must accept the section layout before it is reduced to text-only 1-D stride-half RoPE.
+
+Construction validates the complete layer count, every weight shape and value, indexing capacity and
+actual device/pipeline limits. Prefill checks sequence capacity, token IDs and exact output size before
+encoding. All layers share one queue, pipeline collection, RoPE tables and scratch set. Embedding lookup,
+the complete layer loop, final RMSNorm and the untied language head execute on Metal. The caller's output
+changes only after command completion and a finite-value check. GPU failure returns an error.
+
+The full-model correctness test compares every logit with the retained CPU forward on all four committed
+decoder cases and a separate 17-token cross-tile case. It applies the committed HF logit assertions directly
+to Metal output and checks the CPU activation summaries. Its predeclared componentwise bound is
+`abs(metal - cpu) <= 0.002 + 0.002 * abs(cpu)`, with finite values and exact per-position greedy choices.
+Negating only the final decoder layer's down projection must make the unchanged comparator reject the
+output; restoring its original bits must recover parity. A separate head-width rejection test must fail
+when that guard is removed. Test-only dispatch counters verify the full embedding/layer/head path, and
+enforcement turns missing features, device or checkpoint into failures instead of successful skips.
 
 ## Consequences
 

@@ -152,7 +152,7 @@ impl Ernie45Config {
         Self::from_config_json_str(&text)
     }
 
-    fn validate(&self) -> Result<(), InferenceError> {
+    pub(crate) fn validate(&self) -> Result<(), InferenceError> {
         validate_dimension("hidden_size", self.hidden_size, MAX_HIDDEN_SIZE)?;
         validate_dimension(
             "intermediate_size",
