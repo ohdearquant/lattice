@@ -27,7 +27,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 
 # Caching
-lru = "0.16.3"
+lru = "0.18.2"
 sha2 = { workspace = true }
 parking_lot = { workspace = true }
 
