@@ -92,6 +92,11 @@ pub fn format_normalized_chat_template(messages: &[contract::NormalizedChatMessa
     )
 }
 
+/// Runtime LoRA adapter control shared by both HTTP servers: the
+/// `/v1/lora/load` request parser, the file-to-worker-command translation, the
+/// classification of a worker-side failure, and the success bodies.
+pub mod lora;
+
 /// Shared Metal GPU worker owner (issue #832, ADR-080 cluster C2/C3):
 /// the single dedicated thread that owns the `!Send` `MetalQwen35State` for
 /// the whole process lifetime, used by both the `lattice` unified server and

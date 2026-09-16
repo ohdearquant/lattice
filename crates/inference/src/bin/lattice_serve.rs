@@ -3203,8 +3203,161 @@ mod imp {
             .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/embeddings", post(embeddings))
+            .route("/v1/lora/load", post(lora_load))
+            .route("/v1/lora/unload", post(lora_unload))
             .route("/metrics", get(metrics_handler))
             .with_state(state)
+    }
+
+    /// `POST /v1/lora/load`: load a PEFT or MLX LoRA adapter onto the running model.
+    ///
+    /// Everything that is not axum plumbing lives in
+    /// [`lattice_inference::serve::lora`], shared with `lattice serve`'s route of the
+    /// same name: one request parser, one file-to-command translation, one failure
+    /// classification. The parse runs here, on the request's own task, so a malformed
+    /// file costs the worker nothing; only a parsed `(layers, descriptor)` pair is
+    /// ever submitted.
+    ///
+    /// Deployment boundary: the request names a filesystem path that this process
+    /// reads. Every route on this server is unauthenticated, so on a non-loopback
+    /// `--host` this route lets anyone who can reach the port make the server open a
+    /// file of their choosing. The startup warning covers it; an allow-root is the
+    /// obvious next control and is deliberately not invented here.
+    async fn lora_load(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Response {
+        let timer = Instant::now();
+        const ROUTE: &str = "/v1/lora/load";
+        // `err_response` collapses every status it was not taught into 400, so each
+        // non-400 answer below is built from its `ApiError` variant directly and
+        // reported to telemetry from the same value.
+        let fail = |err: lattice_inference::serve::ApiError| -> Response {
+            let response = err.into_response();
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                response.status().as_u16(),
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                None,
+            );
+            response
+        };
+        if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
+            return fail(err);
+        }
+        let Ok(bytes) = to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await else {
+            return fail(lattice_inference::serve::ApiError::BadRequest {
+                message: "invalid request body".to_string(),
+                code: "invalid_request",
+            });
+        };
+        let path = match lattice_inference::serve::lora::parse_lora_load_path(&bytes) {
+            Ok(path) => path,
+            Err(err) => return fail(err),
+        };
+
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        {
+            let prepared = match lattice_inference::serve::lora::prepare_adapter_load(&path) {
+                Ok(prepared) => prepared,
+                Err(err) => return fail(err),
+            };
+            let (rank, layer_count) = (prepared.rank, prepared.layers);
+            let receiver = match s.jobs.submit_adapter_command(prepared.command) {
+                Ok(receiver) => receiver,
+                Err(err) => return fail(err),
+            };
+            match receiver.await {
+                Ok(Ok(())) => {
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        ROUTE,
+                        200,
+                        None,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        false,
+                        None,
+                    );
+                    Json(lattice_inference::serve::lora::load_success_body(
+                        &path,
+                        rank,
+                        layer_count,
+                    ))
+                    .into_response()
+                }
+                Ok(Err(message)) => {
+                    let code = lattice_inference::serve::lora::adapter_failure_code(&message);
+                    fail(lattice_inference::serve::ApiError::BadRequest { message, code })
+                }
+                Err(_) => fail(lattice_inference::serve::lora::worker_unavailable(
+                    "the inference worker is not running; the adapter was not loaded",
+                )),
+            }
+        }
+        #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+        {
+            let _ = path;
+            fail(lattice_inference::serve::lora::worker_unavailable(
+                "adapter loading requires a macOS Metal build of this server",
+            ))
+        }
+    }
+
+    /// `POST /v1/lora/unload`: drop the currently-loaded adapter. A no-op when none
+    /// is loaded, which is the worker's own contract, so this is idempotent by
+    /// construction rather than by a state read the caller could race.
+    async fn lora_unload(State(s): State<AppState>) -> Response {
+        let timer = Instant::now();
+        const ROUTE: &str = "/v1/lora/unload";
+        let fail = |err: lattice_inference::serve::ApiError| -> Response {
+            let response = err.into_response();
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                ROUTE,
+                response.status().as_u16(),
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                None,
+            );
+            response
+        };
+        let receiver = match s
+            .jobs
+            .submit_adapter_command(lattice_inference::serve::metal_worker::AdapterCommand::Unload)
+        {
+            Ok(receiver) => receiver,
+            Err(err) => return fail(err),
+        };
+        match receiver.await {
+            Ok(Ok(())) => {
+                emit_serve_event(
+                    &s.metrics,
+                    "POST",
+                    ROUTE,
+                    200,
+                    None,
+                    None,
+                    timer.elapsed().as_secs_f64() * 1000.0,
+                    false,
+                    None,
+                );
+                Json(lattice_inference::serve::lora::unload_success_body()).into_response()
+            }
+            Ok(Err(message)) => {
+                let code = lattice_inference::serve::lora::adapter_failure_code(&message);
+                fail(lattice_inference::serve::ApiError::BadRequest { message, code })
+            }
+            Err(_) => fail(lattice_inference::serve::lora::worker_unavailable(
+                "the inference worker is not running; no adapter was unloaded",
+            )),
+        }
     }
 
     pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -3997,6 +4150,97 @@ mod imp {
         // success-path tests genuinely need a loaded model and are
         // `#[ignore]`d behind `LATTICE_SERVE_EMBEDDING_TEST_MODEL_DIR` (see
         // `test_embedding_state`'s doc comment).
+
+        // ── `/v1/lora/*` tests (runtime adapter load, Ocean 2026-09-16) ──
+        //
+        // Every arm below returns before the worker is ever reached, except
+        // the unload arm, which reaches a `test_app_state()` client with no
+        // worker thread behind it and so exercises the closed-receiver path.
+        // The success path needs a real Metal engine and a real adapter and
+        // is covered by the engine tests, not here.
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_load_wrong_content_type_415() {
+            let body = Body::from(r#"{"path":"/tmp/a.safetensors"}"#.to_string());
+            let response = lora_load(State(test_app_state()), HeaderMap::new(), body).await;
+            let (status, _code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_load_missing_path_400() {
+            let response = lora_load(
+                State(test_app_state()),
+                test_json_headers(),
+                Body::from(r#"{}"#.to_string()),
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_load_unknown_field_rejected_not_dropped() {
+            let response = lora_load(
+                State(test_app_state()),
+                test_json_headers(),
+                Body::from(r#"{"path":"/tmp/a.safetensors","scale":2.0}"#.to_string()),
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request");
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_load_empty_path_400() {
+            let response = lora_load(
+                State(test_app_state()),
+                test_json_headers(),
+                Body::from(r#"{"path":"   "}"#.to_string()),
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "invalid_request");
+        }
+
+        /// A path that does not exist must be refused as such, before the file is
+        /// opened and before the worker is touched: an adapter that was never read
+        /// and an adapter that failed to parse are different answers.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_load_nonexistent_file_400() {
+            let missing = std::env::temp_dir().join("lattice-no-such-adapter-1584.safetensors");
+            let _ = std::fs::remove_file(&missing);
+            let body = serde_json::json!({"path": missing.to_string_lossy()}).to_string();
+            let response = lora_load(
+                State(test_app_state()),
+                test_json_headers(),
+                Body::from(body),
+            )
+            .await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(code, "lora_adapter_not_found");
+        }
+
+        /// With no worker thread the reply channel closes, and a closed channel means
+        /// the command was never applied. Reporting that as success would be the
+        /// worst available answer, so it is a 503 naming the worker.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_unload_without_a_worker_is_503() {
+            let response = lora_unload(State(test_app_state())).await;
+            let (status, code) = error_code_of(response).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(code, "server_busy");
+        }
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]

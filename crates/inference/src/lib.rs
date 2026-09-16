@@ -66,6 +66,13 @@ pub mod error;
 pub mod grammar;
 /// Flat and paged key/value cache implementations. See [`model`] and [`forward`].
 pub mod kv_cache;
+/// PEFT/MLX LoRA safetensors loading: a path in, the `(layers, descriptor)` pair the
+/// Metal engine takes out. Every item in it is Metal-only, so the module itself is
+/// gated rather than left as an empty shell on other builds; it also reaches
+/// `lattice-fann` for the shared effective-scale helper, and that dependency exists
+/// only under `metal-gpu` (or `mixture`). See [`lora_hook`] and [`serve`].
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+pub mod lora_file;
 /// LoRA adapter hook called from inference forward paths. See [`model`] and [`forward`].
 pub mod lora_hook;
 /// Repository-internal guards shared by Metal tests and measurement targets.
