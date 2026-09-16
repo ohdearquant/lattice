@@ -41,3 +41,7 @@ class LintDocsTests(unittest.TestCase):
             text=True,
         )
         return len(result.stdout.splitlines())
+
+
+if __name__ == "__main__":
+    unittest.main()
