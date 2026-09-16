@@ -126,6 +126,7 @@ Global ADR index for the Lattice project. Numbered sequentially, grouped by crat
 | [088](ADR-088-sealed-native-embedding-attestation.md)         | Sealed Native Embedding Preparation and Attestation                                                          | Proposed | ADR-003, ADR-005, ADR-014–017, ADR-087                                         |
 | [089](ADR-089-paddleocr-vl-cpu-reference-gated-by-goldens.md) | PaddleOCR-VL: CPU reference forward per slice, each gated by HF goldens, before any accelerated path         | Proposed |                                                                                |
 | [090](ADR-090-shared-decoder-generation.md)                   | Shared decoder generation with model-owned execution sessions                                                | Accepted | Clarifies 009; inherits 080/082; legacy batch-verifier disposition             |
+| [092](ADR-092-model-owned-decoder-execution.md)               | Model-owned decoder execution and a neutral serving boundary                                                 | Proposed | ADR-009, ADR-080, ADR-082, ADR-086, ADR-090                                    |
 
 ## informational
 
