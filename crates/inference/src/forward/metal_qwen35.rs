@@ -2150,11 +2150,15 @@ mod inner {
         pub prefill_kv_batch: AtomicU64,
         pub prefill_attn_batched: AtomicU64,
         pub prefill_hidden_readback: AtomicU64,
+        pub prefill_full_vocab_logit_readback: AtomicU64,
+        pub prefill_compact_candidate_logit_readback: AtomicU64,
         pub decode_kv_copy: AtomicU64,
         pub decode_attn_direct: AtomicU64,
         pub decode_attn_split_partial: AtomicU64,
         pub decode_attn_split_reduce: AtomicU64,
         pub decode_hidden_readback: AtomicU64,
+        pub decode_full_vocab_logit_readback: AtomicU64,
+        pub decode_compact_candidate_logit_readback: AtomicU64,
     }
 
     impl PathProofCounters {
@@ -2162,11 +2166,19 @@ mod inner {
             self.prefill_kv_batch.store(0, Ordering::Relaxed);
             self.prefill_attn_batched.store(0, Ordering::Relaxed);
             self.prefill_hidden_readback.store(0, Ordering::Relaxed);
+            self.prefill_full_vocab_logit_readback
+                .store(0, Ordering::Relaxed);
+            self.prefill_compact_candidate_logit_readback
+                .store(0, Ordering::Relaxed);
             self.decode_kv_copy.store(0, Ordering::Relaxed);
             self.decode_attn_direct.store(0, Ordering::Relaxed);
             self.decode_attn_split_partial.store(0, Ordering::Relaxed);
             self.decode_attn_split_reduce.store(0, Ordering::Relaxed);
             self.decode_hidden_readback.store(0, Ordering::Relaxed);
+            self.decode_full_vocab_logit_readback
+                .store(0, Ordering::Relaxed);
+            self.decode_compact_candidate_logit_readback
+                .store(0, Ordering::Relaxed);
         }
     }
 
@@ -2188,6 +2200,21 @@ mod inner {
     pub struct HiddenReadbackPathProofSnapshot {
         pub decode: u64,
         pub prefill: u64,
+    }
+
+    /// Explicit vocabulary-logit-readback counts recorded by the Metal path-proof
+    /// probe, split by shape: a full-vocab readback (`vocab_size` f32 values) versus
+    /// a compact-candidate readback (the top-k shortlist only). These are separate
+    /// dispatch sites in [`MetalQwen35State`] from the hidden-state readback counted
+    /// by [`HiddenReadbackPathProofSnapshot`] — a request eligible for the compact
+    /// path that instead takes the full-vocab path changes this snapshot's shape
+    /// without changing that one's.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LogitReadbackPathProofSnapshot {
+        pub decode_full_vocab: u64,
+        pub decode_compact_candidate: u64,
+        pub prefill_full_vocab: u64,
+        pub prefill_compact_candidate: u64,
     }
 
     // ---------------------------------------------------------------------------
@@ -3665,9 +3692,9 @@ mod inner {
         /// Zeroes the Metal path-proof counters.
         ///
         /// Call before a one-shot `generate`/`generate_streaming` run so
-        /// [`Self::path_proof_snapshot`] and
-        /// [`Self::hidden_readback_path_proof_snapshot`] afterward reflect only
-        /// that run's dispatches and explicit hidden readbacks.
+        /// [`Self::path_proof_snapshot`], [`Self::hidden_readback_path_proof_snapshot`],
+        /// and [`Self::logit_readback_path_proof_snapshot`] afterward reflect only
+        /// that run's dispatches, explicit hidden readbacks, and logit readbacks.
         pub fn reset_path_proof_counters(&self) {
             self.path_proof.reset();
         }
@@ -3702,6 +3729,31 @@ mod inner {
                 prefill: self
                     .path_proof
                     .prefill_hidden_readback
+                    .load(Ordering::Relaxed),
+            }
+        }
+
+        /// Snapshots explicit vocabulary-logit-readback path-proof counters (full-vocab
+        /// vs compact-candidate, decode and prefill) without resetting them. See
+        /// [`LogitReadbackPathProofSnapshot`] for why this is a separate instrument from
+        /// [`Self::hidden_readback_path_proof_snapshot`].
+        pub fn logit_readback_path_proof_snapshot(&self) -> LogitReadbackPathProofSnapshot {
+            LogitReadbackPathProofSnapshot {
+                decode_full_vocab: self
+                    .path_proof
+                    .decode_full_vocab_logit_readback
+                    .load(Ordering::Relaxed),
+                decode_compact_candidate: self
+                    .path_proof
+                    .decode_compact_candidate_logit_readback
+                    .load(Ordering::Relaxed),
+                prefill_full_vocab: self
+                    .path_proof
+                    .prefill_full_vocab_logit_readback
+                    .load(Ordering::Relaxed),
+                prefill_compact_candidate: self
+                    .path_proof
+                    .prefill_compact_candidate_logit_readback
                     .load(Ordering::Relaxed),
             }
         }
@@ -4188,8 +4240,19 @@ mod inner {
             output
         }
 
-        /// Copy live GDN conv/S buffers into the given checkpoint slot (blocking GPU blit).
+        // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+        // dispatch creates command buffers on the same long-lived worker thread.
+        // Unmeasured individually; fixed on the structural argument, not on numbers.
         fn checkpoint_gdn_to_slot(
+            &mut self,
+            slot: usize,
+            _traffic_scope: GdnStateTrafficScope,
+        ) -> Result<(), crate::error::InferenceError> {
+            objc::rc::autoreleasepool(|| self.checkpoint_gdn_to_slot_dispatch(slot, _traffic_scope))
+        }
+
+        /// Copy live GDN conv/S buffers into the given checkpoint slot (blocking GPU blit).
+        fn checkpoint_gdn_to_slot_dispatch(
             &mut self,
             slot: usize,
             _traffic_scope: GdnStateTrafficScope,
@@ -4236,8 +4299,21 @@ mod inner {
             Ok(())
         }
 
-        /// Restore live GDN conv/S buffers from the given checkpoint slot (blocking GPU blit).
+        // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+        // dispatch creates command buffers on the same long-lived worker thread.
+        // Unmeasured individually; fixed on the structural argument, not on numbers.
         fn restore_gdn_slot_blocking(
+            &mut self,
+            slot: usize,
+            _traffic_scope: GdnStateTrafficScope,
+        ) -> Result<(), crate::error::InferenceError> {
+            objc::rc::autoreleasepool(|| {
+                self.restore_gdn_slot_blocking_dispatch(slot, _traffic_scope)
+            })
+        }
+
+        /// Restore live GDN conv/S buffers from the given checkpoint slot (blocking GPU blit).
+        fn restore_gdn_slot_blocking_dispatch(
             &mut self,
             slot: usize,
             _traffic_scope: GdnStateTrafficScope,
@@ -4406,6 +4482,17 @@ mod inner {
             })
         }
 
+        // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+        // dispatch creates command buffers on the same long-lived worker thread.
+        // Unmeasured individually; fixed on the structural argument, not on numbers.
+        fn verify_tokens_batch_gemm(
+            &mut self,
+            tokens: &[u32],
+            start_pos: usize,
+        ) -> Result<MetalVerifyOutput, crate::error::InferenceError> {
+            objc::rc::autoreleasepool(|| self.verify_tokens_batch_gemm_dispatch(tokens, start_pos))
+        }
+
         /// Batch-GEMM verifier (activate with `LATTICE_MTP_BATCH=1`).
         ///
         /// Processes K verify tokens layer-by-layer using batch GEMM for all weight projections,
@@ -4417,7 +4504,7 @@ mod inner {
         /// pending token to re-establish the correct intermediate GDN state.
         ///
         /// Expected V_2: ~1.35 at α=100%, ~1.60 at α=75%, ~2.30 at α=5%.
-        fn verify_tokens_batch_gemm(
+        fn verify_tokens_batch_gemm_dispatch(
             &mut self,
             tokens: &[u32],
             start_pos: usize,
@@ -5129,6 +5216,17 @@ mod inner {
             })
         }
 
+        // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+        // dispatch creates command buffers on the same long-lived worker thread.
+        // Unmeasured individually; fixed on the structural argument, not on numbers.
+        fn mtp_forward_one(
+            &mut self,
+            pending_token: u32,
+            position: usize,
+        ) -> MetalMtpForwardOutput {
+            objc::rc::autoreleasepool(|| self.mtp_forward_one_dispatch(pending_token, position))
+        }
+
         /// Draft one extra token using the MTP module.
         ///
         /// Runs the single MTP attention+MLP layer on top of the target model's
@@ -5136,7 +5234,7 @@ mod inner {
         /// `pending_token + 1`.  Returns the draft token id and logits.
         ///
         /// Panics if `self.session.mtp` is None.
-        fn mtp_forward_one(
+        fn mtp_forward_one_dispatch(
             &mut self,
             pending_token: u32,
             position: usize,
@@ -5646,6 +5744,15 @@ mod inner {
             }
         }
 
+        // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+        // dispatch creates command buffers on the same long-lived worker thread.
+        // Unmeasured individually; fixed on the structural argument, not on numbers.
+        fn mtp_prefill_append(&mut self, token_id: u32, hidden_in: &[f32], position: usize) {
+            objc::rc::autoreleasepool(|| {
+                self.mtp_prefill_append_dispatch(token_id, hidden_in, position)
+            })
+        }
+
         /// Appends one MTP cache entry (K/V only — no Q, attention, MLP, or logits)
         /// for `token_id` at absolute position `position`, using `hidden_in` as the
         /// target's pre-final hidden state input in place of
@@ -5654,7 +5761,12 @@ mod inner {
         /// everything after that point (attention, gating, MLP, logits) only matters
         /// for a position acting as a *query*, and a prefilled position is only ever
         /// a future *key*.
-        fn mtp_prefill_append(&mut self, token_id: u32, hidden_in: &[f32], position: usize) {
+        fn mtp_prefill_append_dispatch(
+            &mut self,
+            token_id: u32,
+            hidden_in: &[f32],
+            position: usize,
+        ) {
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
             let kv_dim = cfg.full_kv_dim();
@@ -5980,6 +6092,41 @@ mod inner {
             .logits
         }
 
+        // lattice#1584: `new_command_buffer` hands back a borrowed reference to an
+        // autoreleased, unretained object, so every command buffer and encoder this
+        // dispatch creates stays alive until some pool drains. The serving worker thread
+        // is long-lived by construction, so its outermost pool never drains during a
+        // session. Measured on this funnel at 3000 decode steps: 1.3-1.5 KB per step
+        // accumulates without this pool and nothing accumulates with it, at identical
+        // throughput.
+        #[allow(clippy::too_many_arguments)]
+        fn forward_step_inner_impl(
+            &mut self,
+            token_id: u32,
+            position: usize,
+            capture_hidden: bool,
+            skip_logits_readback: bool,
+            emit_head: bool,
+            _traffic_scope: GdnStateTrafficScope,
+            injected_embedding: Option<&[f32]>,
+            mrope_cos_sin: Option<(&[f32], &[f32])>,
+            signpost_scope: crate::forward::signpost::Scope,
+        ) -> MetalStepOutput {
+            objc::rc::autoreleasepool(|| {
+                self.forward_step_inner_impl_dispatch(
+                    token_id,
+                    position,
+                    capture_hidden,
+                    skip_logits_readback,
+                    emit_head,
+                    _traffic_scope,
+                    injected_embedding,
+                    mrope_cos_sin,
+                    signpost_scope,
+                )
+            })
+        }
+
         /// `mrope_cos_sin`, when supplied (Qwen3.5 vision M-RoPE, ADR-069 MP3),
         /// replaces the six GQA layers' 1-D `engine.rope_cos`/`rope_sin` table
         /// lookup (keyed by `position`) with this caller-supplied interleaved-axis
@@ -5996,7 +6143,7 @@ mod inner {
         /// active MTP session needs the pre-final hidden state this step, so a
         /// caller cannot accidentally starve MTP capture by passing `false`.
         #[allow(clippy::too_many_arguments)]
-        fn forward_step_inner_impl(
+        fn forward_step_inner_impl_dispatch(
             &mut self,
             token_id: u32,
             position: usize,
@@ -6382,6 +6529,11 @@ mod inner {
                 let logits = if !run_head || skip_logits_readback {
                     vec![]
                 } else if let Some(which) = topk_which_inner {
+                    if self.path_proof_enabled {
+                        self.path_proof
+                            .decode_compact_candidate_logit_readback
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let _signpost_host_read = crate::forward::signpost::interval_in(
                         signpost_scope,
                         crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6391,6 +6543,11 @@ mod inner {
                     self.session.compact_result = candidates;
                     vec![]
                 } else {
+                    if self.path_proof_enabled {
+                        self.path_proof
+                            .decode_full_vocab_logit_readback
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let _signpost_host_read = crate::forward::signpost::interval_in(
                         signpost_scope,
                         crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6559,6 +6716,11 @@ mod inner {
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
                 // SAFETY: GPU completed, buffers are StorageModeShared.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_compact_candidate_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let _signpost_host_read = crate::forward::signpost::interval_in(
                     signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6570,6 +6732,11 @@ mod inner {
             } else {
                 // Full path: read vocab_size f32 logits back to host.
                 // SAFETY: GPU completed, buffer is StorageModeShared.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_full_vocab_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let _signpost_host_read = crate::forward::signpost::interval_in(
                     signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -7110,6 +7277,13 @@ mod inner {
             }
         }
 
+        // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+        // dispatch creates command buffers on the same long-lived worker thread.
+        // Unmeasured individually; fixed on the structural argument, not on numbers.
+        fn forward_step_gdn_only(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+            objc::rc::autoreleasepool(|| self.forward_step_gdn_only_dispatch(token_id, position))
+        }
+
         /// Run a token through GDN layers only, skipping all GQA layers.
         ///
         /// GQA layers are bypassed: the residual stream passes through unmodified,
@@ -7118,7 +7292,7 @@ mod inner {
         /// GDN-only hidden state via final-norm + lm_head.
         ///
         /// Caller is responsible for checkpointing GDN state before calling.
-        fn forward_step_gdn_only(&mut self, token_id: u32, position: usize) -> Vec<f32> {
+        fn forward_step_gdn_only_dispatch(&mut self, token_id: u32, position: usize) -> Vec<f32> {
             let cfg = self.engine.config.clone();
             let hidden = cfg.hidden_size;
 
@@ -7958,6 +8132,28 @@ mod inner {
             );
         }
 
+        // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+        // dispatch creates command buffers on the same long-lived worker thread.
+        // Unmeasured individually; fixed on the structural argument, not on numbers.
+        fn forward_prefill_batched_chunk(
+            &mut self,
+            token_ids: &[u32],
+            start_pos: usize,
+            all_positions: bool,
+            emit_logits: bool,
+            capture_hidden: bool,
+        ) -> Vec<f32> {
+            objc::rc::autoreleasepool(|| {
+                self.forward_prefill_batched_chunk_dispatch(
+                    token_ids,
+                    start_pos,
+                    all_positions,
+                    emit_logits,
+                    capture_hidden,
+                )
+            })
+        }
+
         /// Batched single-command-buffer prefill for a contiguous token slice starting
         /// at absolute position `start_pos`.
         ///
@@ -7974,7 +8170,7 @@ mod inner {
         /// work (and its GPU readback) is skipped. Callers with an intermediate chunk of
         /// a chunked, last-token-only (`!all_positions`) prefill — whose tail output is
         /// always discarded — pass `false`; every other caller passes `true`.
-        fn forward_prefill_batched_chunk(
+        fn forward_prefill_batched_chunk_dispatch(
             &mut self,
             token_ids: &[u32],
             start_pos: usize,
@@ -8275,9 +8471,19 @@ mod inner {
 
             if let Some(pb) = ppl_buf {
                 // SAFETY: GPU completed, ppl_buf is StorageModeShared and sized n*vocab.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .prefill_full_vocab_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 unsafe { read_buffer(&pb, n * cfg.vocab_size) }
             } else if let Some(which) = topk_which {
                 // SAFETY: GPU completed, buffers are StorageModeShared.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .prefill_compact_candidate_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let k = self.session.compact_topk;
                 let candidates = unsafe { self.read_topk_candidates(which, k) };
                 self.session.compact_result = candidates;
@@ -8285,8 +8491,31 @@ mod inner {
             } else {
                 // SAFETY: The command buffer has completed and logits is a
                 // StorageModeShared buffer sized for vocab_size f32 values.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .prefill_full_vocab_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
             }
+        }
+
+        // lattice#1584: same autorelease contract as `forward_step_inner_impl`. This
+        // dispatch creates command buffers on the same long-lived worker thread.
+        // Unmeasured individually; fixed on the structural argument, not on numbers.
+        #[cfg(feature = "bench-internals")]
+        fn forward_prefill_chunk_gdn_isolated(
+            &mut self,
+            token_ids: &[u32],
+            start_pos: usize,
+            capture: &[bench_support::GdnCaptureRequest],
+        ) -> (
+            bench_support::GdnIsolatedChunkTiming,
+            Vec<bench_support::GdnLayerCapture>,
+        ) {
+            objc::rc::autoreleasepool(|| {
+                self.forward_prefill_chunk_gdn_isolated_dispatch(token_ids, start_pos, capture)
+            })
         }
 
         /// GDN-recurrence-isolating variant of [`Self::forward_prefill_batched_chunk`],
@@ -8345,7 +8574,7 @@ mod inner {
         /// path (unchanged behavior/dispatch either way; this never perturbs what
         /// gets dispatched, only what gets read back afterward).
         #[cfg(feature = "bench-internals")]
-        fn forward_prefill_chunk_gdn_isolated(
+        fn forward_prefill_chunk_gdn_isolated_dispatch(
             &mut self,
             token_ids: &[u32],
             start_pos: usize,
@@ -38251,7 +38480,7 @@ mod public_scheduling_entry_point_tests {
 
     /// Removes `//` comments and ordinary quoted strings while preserving source length;
     /// block comments, raw strings, and character literals are outside its limits.
-    fn strip_comments_and_strings(source: &str) -> String {
+    pub(super) fn strip_comments_and_strings(source: &str) -> String {
         let mut bytes = source.as_bytes().to_vec();
         let mut index = 0;
         while index < bytes.len() {
@@ -39457,8 +39686,8 @@ mod gdn_state_traffic_tests {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, HiddenReadbackPathProofSnapshot, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord, PathProofSnapshot,
-    arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
+    LogitReadbackPathProofSnapshot, LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord,
+    PathProofSnapshot, arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
     take_moe_routing_trace,
 };
 
@@ -41538,5 +41767,178 @@ mod self_spec_eos_tests {
             !stopped,
             "zero budget → stopped must be false (Length, not Eos)"
         );
+    }
+}
+
+/// lattice#1584: no production Metal dispatch may create a command buffer outside an
+/// autorelease pool.
+///
+/// `metal-rs`'s `new_command_buffer` returns a borrowed reference to an autoreleased,
+/// unretained object, so a command buffer created with no enclosing pool survives until
+/// the thread's outermost pool drains, which on the long-lived serving worker never
+/// happens during a session. The measured cost on the decode funnel was 1.3-1.5 KB per
+/// step.
+///
+/// The guard is written over the discovered population rather than over a list of known
+/// sites, because the defect this fixes was that nine sibling dispatch paths were never
+/// swept together: a tenth one added later is exactly the case a hand-written list would
+/// miss. Every function in the production region that creates a command buffer must be a
+/// `*_dispatch` body reached through a pooling wrapper of the same base name, or appear
+/// in `EXEMPT` with its reason.
+#[cfg(test)]
+mod metal_command_buffer_pool_tests {
+    use super::public_scheduling_entry_point_tests::strip_comments_and_strings;
+    use std::collections::BTreeSet;
+
+    /// A bench fixture, not a serving path: the process that runs it exits after the
+    /// measurement, and pooling inside it would change a timed region. It would stop
+    /// being exempt the moment anything long-lived called it.
+    const EXEMPT: [&str; 1] = ["run_once"];
+
+    fn body_end(source: &str, from: usize) -> usize {
+        let open = from
+            + source[from..]
+                .find('{')
+                .expect("function declaration has a body");
+        let mut depth = 0usize;
+        for (offset, byte) in source.as_bytes()[open..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return open + offset + 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated function body at byte {from}");
+    }
+
+    /// Overwrites every `#[cfg(..test..)] mod NAME { .. }` with spaces, preserving length
+    /// so byte offsets still address the same source positions. Test helpers drive Metal
+    /// from short-lived test binaries and are not the subject.
+    fn blank_test_modules(source: &str) -> String {
+        let mut out = source.as_bytes().to_vec();
+        let mut index = 0usize;
+        while let Some(found) = source[index..].find("#[cfg(") {
+            let start = index + found;
+            let Some(close) = source[start..].find(")]") else {
+                break;
+            };
+            let attribute = &source[start..start + close];
+            index = start + close + 2;
+            if !attribute.contains("test") {
+                continue;
+            }
+            let after = &source[index..];
+            let trimmed = after.trim_start();
+            let skipped = after.len() - trimmed.len();
+            let declaration = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+            if !declaration.starts_with("mod ") {
+                continue;
+            }
+            let end = body_end(source, index + skipped);
+            for byte in out[start..end].iter_mut() {
+                if *byte != b'\n' {
+                    *byte = b' ';
+                }
+            }
+            index = end;
+        }
+        String::from_utf8(out).expect("blanking preserves UTF-8 boundaries")
+    }
+
+    fn enclosing_functions(source: &str) -> Vec<(&str, usize, usize)> {
+        let mut functions = Vec::new();
+        let mut index = 0usize;
+        while let Some(found) = source[index..].find("fn ") {
+            let start = index + found;
+            let preceded_by_word = source[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+            if preceded_by_word {
+                index = start + 3;
+                continue;
+            }
+            let name_start = start + 3;
+            let Some(name_len) = source[name_start..].find(['(', '<']) else {
+                break;
+            };
+            let name = source[name_start..name_start + name_len].trim();
+            if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                index = name_start;
+                continue;
+            }
+            let end = body_end(source, name_start + name_len);
+            functions.push((name, start, end));
+            index = end;
+        }
+        functions
+    }
+
+    #[test]
+    fn every_production_command_buffer_creator_runs_inside_an_autorelease_pool() {
+        let source = include_str!("metal_qwen35.rs");
+        let region = source
+            .split_once("mod inner {")
+            .expect("real Metal implementation exists")
+            .1
+            .split_once("// Target-independent numerical support follows")
+            .expect("real Metal implementation has a stable end marker")
+            .0;
+        let scrubbed = blank_test_modules(&strip_comments_and_strings(region));
+        assert_eq!(
+            scrubbed.len(),
+            region.len(),
+            "scrubbing must preserve offsets"
+        );
+
+        let functions = enclosing_functions(&scrubbed);
+        let mut creators: BTreeSet<&str> = BTreeSet::new();
+        let mut sites = 0usize;
+        let mut cursor = 0usize;
+        while let Some(found) = scrubbed[cursor..].find("new_command_buffer") {
+            let at = cursor + found;
+            cursor = at + "new_command_buffer".len();
+            sites += 1;
+            let owner = functions
+                .iter()
+                .rev()
+                .find(|(_, start, end)| *start <= at && at < *end)
+                .unwrap_or_else(|| {
+                    panic!("command buffer creation at byte {at} sits in no function")
+                });
+            creators.insert(owner.0);
+        }
+        assert!(
+            sites > 0,
+            "found no command buffer creation at all: the scanner, not the source, changed"
+        );
+
+        for name in creators {
+            if EXEMPT.contains(&name) {
+                continue;
+            }
+            let base = name.strip_suffix("_dispatch").unwrap_or_else(|| {
+                panic!(
+                    "{name} creates a Metal command buffer with no autorelease pool \
+                     (lattice#1584). Rename it to {name}_dispatch and add a wrapper \
+                     `fn {name}(..) {{ objc::rc::autoreleasepool(|| self.{name}_dispatch(..)) }}`, \
+                     or add it to EXEMPT with the reason it cannot leak."
+                )
+            });
+            let wrapper_start = scrubbed
+                .find(&format!("fn {base}("))
+                .unwrap_or_else(|| panic!("{name} has no wrapper named {base}"));
+            let wrapper = &scrubbed[wrapper_start..body_end(&scrubbed, wrapper_start + 3)];
+            assert!(
+                wrapper.contains("objc::rc::autoreleasepool")
+                    && wrapper.contains(&format!("{name}(")),
+                "{base} must be the pooling wrapper that calls {name} (lattice#1584)"
+            );
+        }
     }
 }
