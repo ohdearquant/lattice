@@ -1777,8 +1777,18 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
         Mutation-sensitive: restore the ``[[ "$target" == lattice-embed:* ]] &&``
         guard on the calibration branch and the fabricated inference regression exits
         1 at full resolution.
+
+        The two resolutions end on different exit codes and the difference carries
+        the rule. At full resolution ``lattice-embed:simd`` still gates, so the run
+        holds an aggregate verdict and the demoted inference regression is simply
+        excluded from it. In quick mode the manifest demotes ``simd`` as well, so no
+        arm gated at all and the run has no verdict to render. Neither may exit 1:
+        an uncalibrated target must not vote either way.
         """
-        for flags, resolution in (([], "quick"), (["--full"], "full")):
+        for flags, resolution, expected_rc in (
+            ([], "quick", 3),
+            (["--full"], "full", 0),
+        ):
             with self.subTest(resolution=resolution):
                 with tempfile.TemporaryDirectory() as temporary:
                     order_file = Path(temporary) / "order.txt"
@@ -1794,12 +1804,23 @@ class BenchCompareMeasurementGuard(unittest.TestCase):
                         setup=_add_inference_bench_source,
                     )
                 self.assertEqual(
-                    result.returncode, 0,
-                    f"uncalibrated {resolution} inference target voted on a regression\n"
+                    result.returncode, expected_rc,
+                    f"uncalibrated {resolution} inference target did not land on "
+                    f"the expected disposition\n"
                     f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
                 )
                 self.assertIn("**ℹ️ 1 informational**", result.stdout)
                 self.assertNotIn("gate reported a confirmed regression", result.stderr)
+                if expected_rc == 3:
+                    self.assertIn(
+                        "no target in this run held gating authority",
+                        result.stderr,
+                    )
+                    self.assertNotIn(
+                        "gated benches within noise band", result.stdout
+                    )
+                else:
+                    self.assertNotIn("held gating authority", result.stderr)
 
     def test_feature_changed_default_inference_target_is_not_calibrated(self):
         """Calibration binds target AND features on the inference side too.
