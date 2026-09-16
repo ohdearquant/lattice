@@ -289,6 +289,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/bench_gdn_state.rs",
     "examples/bench_gpu.rs",
     "examples/bench_metal.rs",
+    "examples/bench_metal_forward_allocation.rs",
     "examples/bench_mps_gemm.rs",
     "examples/bench_persistent_state.rs",
     "examples/bench_profile.rs",
