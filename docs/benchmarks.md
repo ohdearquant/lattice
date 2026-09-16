@@ -17,13 +17,22 @@ Target classification and enforcement are separate:
 | `make bench-gate`                                                    | The current checkout against the `perf-baselines` branch, full resolution | Every measured result is gating; the quick informational manifest is ignored                                                   | Exits `1` for a missing baseline or regression, `2` when the gate cannot judge, and `0` only for a genuine pass |
 
 Informational classification does not skip measurement or remove results from the report. It
-excludes that quick-mode target from the regression verdict. `scripts/bench-compare.sh` is
+excludes that target from the regression verdict. Two policies demote: the quick manifest above,
+and the target/feature calibration allowlist in `scripts/lib/bench-compare-impl.sh`, which applies
+at both resolutions — so the middle row's "every measured target is gating" holds for the default
+target and feature pairs, not for a custom `BENCHES_*` target or a changed `CARGO_FEATURES_*` set.
+Demotion is target-wide, so a demoted target's gated set is empty and that arm has no verdict to
+render: it exits `3` with its rows printed beside the refusal, and never reports a pass. A run
+keeps its aggregate verdict from the arms that did gate; when no arm gated, the run says so and
+refuses, because a report whose every row was excluded is a coverage statement, not a safety one.
+`scripts/bench-compare.sh` is
 report-only in either resolution unless `--fail-on-regression` is supplied. Report-only changes
 exit handling, not evidence collection: both paths run `base₁ → head₁ → head₂ → base₂`.
 
 At multi-target aggregation, input error `2` outranks confirmed regression `1`, which outranks
-not-measurable `3`. Exit `3` covers valid ambient samples below the idle floor or an AB/BA order
-bound above the 7% fail margin; every enforcing consumer treats it as failure. The gate script
+not-measurable `3`. Exit `3` covers valid ambient samples below the idle floor, an AB/BA order
+bound above the 7% fail margin, and a gated set left empty by target policy; every enforcing
+consumer treats it as failure. The gate script
 allows first-run exit `0` only without `--require-measurements`; `make bench-gate` always
 passes it and never creates a baseline. `make bench-ci` saves one locally, and `bench-update.yml`
 updates `perf-baselines` on `main`. This closes the exact fail-open: expecting a green first run

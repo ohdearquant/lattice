@@ -70,6 +70,32 @@ class PerfBenchGateResolutionTests(unittest.TestCase):
                 self.assertNotIn("WARN", report)
                 self.assertNotIn("FAIL", report)
 
+    def test_wholly_demoted_target_refuses_instead_of_ticking(self) -> None:
+        """EMPTY is not CLEAN: a noise-band tick needs a population.
+
+        Mutation-sensitive: key the tick branch back on
+        ``decision_suppressed_reason`` alone and the checkmark comes back over
+        zero gated rows; drop the ``gate_empty`` arm of the informational row
+        selection and the demoted row disappears from the top-level report.
+        """
+        target = "lattice-embed:simd"
+        report = GATE.render_report(
+            [result(1.0)], "test-arch", target, target, resolution="full"
+        )
+
+        self.assertIn("NO GATED MEASUREMENT", report)
+        self.assertNotIn("gated benches within noise band", report)
+        beside_verdict = report.partition("<details><summary>All ")[0]
+        self.assertIn("layer_norm/896", beside_verdict)
+        self.assertIn("(informational)", beside_verdict)
+
+    def test_empty_gate_reason_claims_only_the_wholly_demoted_case(self) -> None:
+        """The refusal must not swallow the two cases other guards own."""
+        target = "lattice-embed:simd"
+        self.assertIsNone(GATE.empty_gate_reason([result(1.0)], target, None))
+        self.assertIsNone(GATE.empty_gate_reason([], target, target))
+        self.assertIsNotNone(GATE.empty_gate_reason([result(1.0)], target, target))
+
     def test_empty_results_refuse_with_and_without_optimization(self) -> None:
         program = f"""
 import importlib.util
