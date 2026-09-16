@@ -15320,6 +15320,24 @@ mod inner {
                     include_str!("metal_qwen35/mtp_weights.rs"),
                 ),
             ];
+            // The seven pairs above repeat their path in both positions by hand, since a
+            // local macro would be refused by the lexical scanner described above. Nothing
+            // therefore binds a key to the text supplied beside it: the right key carrying a
+            // neighbour's `include_str!` still satisfies the coverage walk, and the guard
+            // would from then on scan one file twice and that one never, staying green.
+            // Read each key off disk and require equality, which is the binding the macro
+            // used to provide. A missing file fails here too, since a key naming a path that
+            // no longer exists is the same defect arriving from the other side.
+            let forward_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/forward");
+            for (path, source) in included_sources {
+                let on_disk = std::fs::read_to_string(forward_dir.join(path))
+                    .unwrap_or_else(|error| panic!("guard source {path} is unreadable: {error}"));
+                assert_eq!(
+                    on_disk, source,
+                    "guard source {path} does not match the file at that path"
+                );
+            }
+
             let covered = production_module_coverage("metal_qwen35.rs", &included_sources)
                 .unwrap_or_else(|error| panic!("retirement guard population: {error}"));
             eprintln!(
