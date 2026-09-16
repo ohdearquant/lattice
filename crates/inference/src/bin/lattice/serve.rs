@@ -19,8 +19,6 @@ use lattice_inference::Tokenizer;
 use lattice_inference::forward::metal_qwen35::ChatMessage;
 #[cfg(test)]
 use lattice_inference::forward::metal_qwen35::format_chat_template;
-#[cfg(feature = "metal-gpu")]
-use lattice_inference::model::qwen35_config::GenerateConfig;
 use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
 use lattice_inference::serve::contract::{
     ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
@@ -103,123 +101,23 @@ impl MetalHandle {
         }
     }
 
-    /// Run one generation on the shared worker thread, forwarding each
-    /// token delta to `on_token`. Returns the full `GenerateOutput`
-    /// (including `stopped`/`stop_reason`) so callers can compute
-    /// `finish_reason` with the exact same `finish_reason_for` helper
-    /// the CPU path uses.
-    ///
-    /// Returns `Err` if the worker thread is unreachable
-    /// (`ApiError::Internal`, "inference worker unavailable" — the same
-    /// wording `lattice_serve.rs` uses for the identical condition on
-    /// this shared worker contract, #832; this binary's prior distinct
-    /// "not running" vs "dropped the request" phrasing collapses into
-    /// one message here, since `MetalWorkerClient::submit` no longer
-    /// exposes that distinction to callers), if the request cannot fit
-    /// the model's context window (`ApiError::BadRequest`, surfaced by
-    /// the shared worker's `check_prompt_fits_window` — new coverage
-    /// for this binary; the HTTP-layer `check_context_window` preflight
-    /// in `prepare_chat_request` already rejects the overwhelming
-    /// majority of these before this call is ever reached), or if the
-    /// underlying `generate_streaming` call itself fails closed (#611:
-    /// e.g. a grammar mask that blocks every candidate token) —
-    /// collapsed to `ApiError::Internal` here, matching the same
-    /// generic "inference failed" 500 the CPU path already returns for
-    /// any `generate()` error.
-    async fn generate_streaming(
-        &self,
-        messages: Vec<ChatMessage>,
-        gen_cfg: GenerateConfig,
-        on_token: impl FnMut(&str) -> bool + Send + 'static,
-    ) -> Result<GenerateOutput, ApiError> {
-        // `cancel = never-fires` convenience form of
-        // `generate_streaming_with_cancel`, for callers that do not wire
-        // up disconnect cancellation.
-        let (_never_cancels, cancel_rx) = tokio::sync::watch::channel(false);
-        self.generate_streaming_with_cancel(messages, gen_cfg, on_token, cancel_rx)
-            .await
-    }
-
-    /// Cancellation-aware sibling of [`Self::generate_streaming`]
-    /// (ADR-080 C2, #744): `cancel` starts `false` and flips to `true`
-    /// the moment the caller's paired
-    /// `lattice_inference::serve::CancelOnDrop` guard is dropped (client
-    /// disconnect). The shared worker (issue #832) checks it
-    /// independently of `on_token`'s return value — before prefill,
-    /// immediately after prefill, and at the top of every decode
-    /// iteration — via
-    /// `generate_streaming_with_prefix_cache_and_cancel`'s
-    /// `should_cancel` predicate, and once more at dequeue time before
-    /// paying for prefill on an already-abandoned job.
-    ///
-    /// `on_token`'s return value is still honored (this method stops
-    /// calling it the first time it returns `false`, e.g. a
-    /// disconnected `tx_delta`), but can no longer stop the worker
-    /// thread directly the way it did when `MetalJob` embedded the
-    /// callback inside the worker itself — the shared worker now lives
-    /// behind a `WorkerEvent` channel this method drains from a
-    /// separate async task, and `cancel` (checked independently by the
-    /// worker) is the only signal that can reach across that boundary.
-    /// In practice this is not a behavior change: `tx_delta` and the
-    /// `cancel_guard` pairing `cancel` are dropped by the exact same
-    /// axum stream-drop event at every call site, so `cancel` already
-    /// catches a disconnect at essentially the same moment `on_token`
-    /// would have.
-    async fn generate_streaming_with_cancel(
-        &self,
-        messages: Vec<ChatMessage>,
-        gen_cfg: GenerateConfig,
-        on_token: impl FnMut(&str) -> bool + Send + 'static,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<GenerateOutput, ApiError> {
-        // #932: the ONE way `MetalWorkerClient::submit` fails outwardly
-        // -- the shared worker's outstanding-job admission cap is full.
-        // Surfaces as an ordinary `ApiError::ServiceUnavailable` (503),
-        // exactly like any other `Err` this method already returns.
-        let mut rx = self.submit(messages, gen_cfg, cancel)?;
-        Self::drain(&mut rx, on_token).await
-    }
-
-    /// Admission-only half of [`Self::generate_streaming_with_cancel`]
-    /// (#939): runs `MetalWorkerClient::submit`'s synchronous admission
-    /// check (issue #932's `Semaphore::try_acquire_owned`) and returns
-    /// immediately, before any event is drained from the worker.
-    ///
-    /// Split out so `chat_completions`'s streaming arm can call this
-    /// directly -- and propagate `Err(ApiError::ServiceUnavailable)`
-    /// with `?` -- BEFORE building and returning the SSE response,
-    /// instead of discovering admission failure only after a detached
-    /// `tokio::spawn` task (which may not even have started running
-    /// yet) reaches this call. Draining is [`Self::drain`], called
-    /// separately once the response has been committed.
-    fn submit(
-        &self,
-        messages: Vec<ChatMessage>,
-        gen_cfg: GenerateConfig,
-        cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<
-        tokio::sync::mpsc::UnboundedReceiver<lattice_inference::serve::metal_worker::WorkerEvent>,
-        ApiError,
-    > {
-        self.client.submit(messages, gen_cfg, cancel)
-    }
-
-    /// Drains a receiver obtained from [`Self::submit`], forwarding
-    /// token deltas to `on_token` and normalizing
-    /// `WorkerEvent::Cancelled` -- exactly the loop
-    /// `generate_streaming_with_cancel` ran inline before admission was
-    /// split out of it (#939).
+    /// Drain an admitted job, forwarding deltas and preserving worker failures.
     async fn drain(
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<
             lattice_inference::serve::metal_worker::WorkerEvent,
         >,
+        mut first: Option<lattice_inference::serve::metal_worker::WorkerEvent>,
         mut on_token: impl FnMut(&str) -> bool + Send + 'static,
     ) -> Result<GenerateOutput, ApiError> {
         use lattice_inference::serve::metal_worker::WorkerEvent;
 
         let mut deliver_deltas = true;
         loop {
-            let Some(ev) = rx.recv().await else {
+            let event = match first.take() {
+                Some(event) => Some(event),
+                None => rx.recv().await,
+            };
+            let Some(ev) = event else {
                 return Err(ApiError::Internal {
                     message: "inference worker unavailable".to_string(),
                 });
@@ -1185,6 +1083,13 @@ async fn chat_completions_with_request(
     State(state): State<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Response, ApiError> {
+    lattice_inference::serve::lora::validate_scales(&req.lora)?;
+    if !req.lora.is_empty() {
+        #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+        adapter_client(&state)?.validate_lora(&req.lora)?;
+        #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+        return Err(adapter_unsupported_build());
+    }
     let PreparedChatRequest {
         messages: _normalized_messages,
         max_tokens,
@@ -1325,10 +1230,36 @@ async fn chat_completions_with_request(
                 // `ApiError::ServiceUnavailable` (503) before this
                 // handler ever returns `Sse::new(...)`. Only draining the
                 // already-admitted job happens in the detached task.
-                let mut rx = handle.submit(chat_messages, gen_cfg, cancel_rx)?;
+                let mut rx = handle.client.submit_with_lora(
+                    chat_messages,
+                    gen_cfg,
+                    cancel_rx,
+                    req.lora.clone(),
+                )?;
+                // An unload queued ahead of this job can invalidate the HTTP
+                // snapshot. Resolve the worker's rejection before committing SSE.
+                let first = if req.lora.is_empty() {
+                    None
+                } else {
+                    use lattice_inference::serve::metal_worker::WorkerEvent;
+                    match rx.recv().await {
+                        Some(WorkerEvent::Rejected(error)) => return Err(error),
+                        Some(
+                            WorkerEvent::Failed(message) | WorkerEvent::ConstraintBlocked(message),
+                        ) => {
+                            return Err(ApiError::Internal { message });
+                        }
+                        Some(event) => Some(event),
+                        None => {
+                            return Err(ApiError::Internal {
+                                message: "inference worker unavailable".into(),
+                            });
+                        }
+                    }
+                };
                 tokio::spawn(async move {
                     let tx_delta = tx.clone();
-                    let result = MetalHandle::drain(&mut rx, move |delta| {
+                    let result = MetalHandle::drain(&mut rx, first, move |delta| {
                         tx_delta
                             .unbounded_send(StreamMsg::Delta(delta.to_string()))
                             .is_ok()
@@ -1488,12 +1419,18 @@ async fn chat_completions_with_request(
                     })?
             }
             #[cfg(feature = "metal-gpu")]
-            ModelBackend::Metal { handle, .. } => handle
-                .generate_streaming(chat_messages, gen_cfg, |_delta| true)
-                .await
-                // Preserve admission 503s and request-dependent worker
-                // rejections (including image geometry/context 400s).
-                .map_err(map_metal_generation_error)?,
+            ModelBackend::Metal { handle, .. } => {
+                let (_guard, cancel) = lattice_inference::serve::cancel_pair();
+                let mut rx = handle.client.submit_with_lora(
+                    chat_messages,
+                    gen_cfg,
+                    cancel,
+                    req.lora.clone(),
+                )?;
+                MetalHandle::drain(&mut rx, None, |_delta| true)
+                    .await
+                    .map_err(map_metal_generation_error)?
+            }
             // ADR-080 C2 added
             // this variant for the streaming arm's cancellation probe
             // only, so non-streaming used to bypass the injected
@@ -1694,17 +1631,22 @@ fn adapter_unsupported_build() -> ApiError {
     )
 }
 
-/// `POST /v1/lora/load`: load a PEFT or MLX LoRA adapter onto the running model.
+/// List confirmed resident adapters and the currently applied mixture.
+pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiError> {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        Ok(Json(serde_json::json!(adapter_client(&state)?.adapter_index())).into_response())
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        let _ = state;
+        Err(adapter_unsupported_build())
+    }
+}
+
+/// Make a PEFT or MLX adapter resident without applying it to generation.
 ///
-/// Everything that is not axum plumbing lives in
-/// [`lattice_inference::serve::lora`], shared with the `lattice_serve` binary's route
-/// of the same name. The adapter file is read and parsed on this request's own task,
-/// off the worker thread, so a malformed file costs the worker nothing and the caller
-/// gets the parse error directly.
-///
-/// Deployment boundary: the request names a filesystem path that this process reads,
-/// and this server has no authentication, so on a non-loopback `--host` the route
-/// lets anyone who can reach the port make the server open a file of their choosing.
+/// This unauthenticated route reads a caller-selected path on the server host.
 pub async fn lora_load(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1720,17 +1662,17 @@ pub async fn lora_load(
                 code: "invalid_request_body",
             }
         })?;
-    let path = lattice_inference::serve::lora::parse_lora_load_path(&bytes)?;
+    let (path, name) = lattice_inference::serve::lora::parse_lora_load(&bytes)?;
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
         let client = adapter_client(&state)?;
-        let prepared = lattice_inference::serve::lora::prepare_adapter_load(&path)?;
+        let prepared = lattice_inference::serve::lora::prepare_adapter_load(&path, &name)?;
         let (rank, layers) = (prepared.rank, prepared.layers);
         let receiver = client.submit_adapter_command(prepared.command)?;
         match receiver.await {
-            Ok(Ok(())) => Ok(Json(lattice_inference::serve::lora::load_success_body(
-                &path, rank, layers,
+            Ok(Ok(id)) => Ok(Json(lattice_inference::serve::lora::load_success_body(
+                id, &name, &path, rank, layers,
             ))
             .into_response()),
             Ok(Err(message)) => {
@@ -1744,24 +1686,42 @@ pub async fn lora_load(
     }
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
-        let _ = (&state, path);
+        let _ = (&state, path, name);
         Err(adapter_unsupported_build())
     }
 }
 
-/// `POST /v1/lora/unload`: drop the currently-loaded adapter. A no-op when none is
-/// loaded, which is the worker's own contract, so this is idempotent by construction
-/// rather than by a state read the caller could race.
-pub async fn lora_unload(State(state): State<AppState>) -> Result<Response, ApiError> {
+/// Remove one resident identifier, refusing unknown ids.
+pub async fn lora_unload(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<Response, ApiError> {
+    // Backend refusal keeps its own diagnosis even for a bodyless CPU request.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    let client = adapter_client(&state)?;
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        let _ = (&state, headers, body);
+        Err(adapter_unsupported_build())
+    }
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
-        let client = adapter_client(&state)?;
+        lattice_inference::serve::require_json_content_type(&headers)?;
+        let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
+            .await
+            .map_err(|_| ApiError::BadRequest {
+                message: "invalid request body".into(),
+                code: "invalid_request",
+            })?;
+        let id = lattice_inference::serve::lora::parse_lora_unload(&bytes)?;
+
         let receiver = client.submit_adapter_command(
-            lattice_inference::serve::metal_worker::AdapterCommand::Unload,
+            lattice_inference::serve::metal_worker::AdapterCommand::Unload { id },
         )?;
         match receiver.await {
-            Ok(Ok(())) => {
-                Ok(Json(lattice_inference::serve::lora::unload_success_body()).into_response())
+            Ok(Ok(id)) => {
+                Ok(Json(lattice_inference::serve::lora::unload_success_body(id)).into_response())
             }
             Ok(Err(message)) => {
                 let code = lattice_inference::serve::lora::adapter_failure_code(&message);
@@ -1771,11 +1731,6 @@ pub async fn lora_unload(State(state): State<AppState>) -> Result<Response, ApiE
                 "the inference worker is not running; no adapter was unloaded",
             )),
         }
-    }
-    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-    {
-        let _ = &state;
-        Err(adapter_unsupported_build())
     }
 }
 
@@ -1790,6 +1745,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/lora", get(lora_list))
         .route("/v1/lora/load", post(lora_load))
         .route("/v1/lora/unload", post(lora_unload))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
@@ -2269,6 +2225,7 @@ mod tests {
             tool_choice: None,
             logprobs: None,
             top_logprobs: None,
+            lora: Vec::new(),
             n: None,
         };
         assert!(reject_unsupported(&req).is_ok());
@@ -2378,6 +2335,7 @@ mod tests {
             tool_choice: None,
             logprobs: None,
             top_logprobs: None,
+            lora: Vec::new(),
             n: Some(3),
         };
         let err = reject_unsupported(&req).unwrap_err();
@@ -2413,6 +2371,7 @@ mod tests {
             tool_choice: None,
             logprobs: None,
             top_logprobs: None,
+            lora: Vec::new(),
             n: None,
         };
         let err = reject_unsupported(&req).unwrap_err();
@@ -2428,6 +2387,99 @@ mod tests {
     // -----------------------------------------------------------------------
     // reject_unsupported — remaining fields
     // -----------------------------------------------------------------------
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn lora_list_on_cpu_refuses_by_name() {
+        let error = lora_list(State(tiny_state(64))).await.unwrap_err();
+        assert_eq!(error.code(), "lora_unsupported_backend");
+        assert!(error.message().contains("Metal"));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn lora_selection_on_cpu_refuses_by_name() {
+        for stream in [false, true] {
+            let request = serde_json::from_value(serde_json::json!({"messages":[{"role":"user","content":"hi"}],"lora":[{"id":7,"scale":1.0}],"stream":stream})).unwrap();
+            let error = chat_completions_with_request(State(tiny_state(64)), request)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), "lora_unsupported_backend");
+            assert!(error.message().contains("Metal"));
+        }
+    }
+
+    #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+    #[tokio::test]
+    async fn lora_selection_reaches_unified_worker_and_unknown_id_is_400() {
+        use lattice_inference::serve::lora::{AdapterMetadata, LoraSelection};
+        use lattice_inference::serve::metal_worker::{
+            WorkerEvent, WorkerMessage, test_client_and_jobs_with_adapters,
+        };
+        for (stream, reject) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (client, mut jobs) = test_client_and_jobs_with_adapters(vec![AdapterMetadata {
+                id: 7,
+                name: "test".into(),
+                path: "test.safetensors".into(),
+                rank: 1,
+                layers: 1,
+            }]);
+            let mut state = tiny_state(64);
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            state.model = ModelBackend::Metal {
+                handle: MetalHandle { client },
+                tokenizer: Arc::new(tokenizer),
+                max_context: 4096,
+            };
+            let bad = serde_json::from_value(serde_json::json!({"model":"test-model","messages":[{"role":"user","content":"hi"}],"lora":[{"id":99,"scale":1.0}],"stream":stream})).unwrap();
+            let error = chat_completions_with_request(State(state.clone()), bad)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest { .. }));
+            assert!(error.message().contains("99"));
+            let worker = tokio::spawn(async move {
+                let Some(WorkerMessage::Generate(job)) = jobs.recv().await else {
+                    panic!("missing generation")
+                };
+                assert_eq!(
+                    job.lora_selection(),
+                    &[LoraSelection { id: 7, scale: 0.25 }]
+                );
+                if reject {
+                    job.reply(WorkerEvent::Rejected(
+                        lattice_inference::serve::lora::unknown_adapter(7),
+                    ));
+                    return;
+                }
+                job.reply(WorkerEvent::Complete(GenerateOutput {
+                    text: "ok".into(),
+                    token_ids: vec![0],
+                    prompt_tokens: 1,
+                    generated_tokens: 1,
+                    stopped: true,
+                    stop_reason: None,
+                    token_logprobs: vec![],
+                }));
+            });
+            let request = serde_json::from_value(serde_json::json!({"model":"test-model","messages":[{"role":"user","content":"hi"}],"max_tokens":1,"lora":[{"id":7,"scale":0.25}],"stream":stream})).unwrap();
+            let result = chat_completions_with_request(State(state), request).await;
+            if reject {
+                let error = result.unwrap_err();
+                assert!(matches!(error, ApiError::BadRequest { .. }));
+                assert!(error.message().contains("7"));
+                worker.await.unwrap();
+                continue;
+            }
+            let response = result.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            worker.await.unwrap();
+        }
+    }
 
     fn bare_req() -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -2448,6 +2500,7 @@ mod tests {
             tool_choice: None,
             logprobs: None,
             top_logprobs: None,
+            lora: Vec::new(),
             n: None,
         }
     }

@@ -69,6 +69,9 @@ pub const MAX_CUMULATIVE_STOP_BYTES: usize = 2 * MAX_STOP_STRING_BYTES;
 /// OpenAI-compatible client behavior on both serving endpoints.
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
+    /// Ordered resident adapters to apply; omitted or empty selects the base model.
+    #[serde(default)]
+    pub lora: Vec<super::lora::LoraSelection>,
     /// Requested model identifier. `None` when the field is omitted; `Some("")`
     /// when the client sends an explicit empty string — these are validated
     /// differently, so the distinction must survive deserialization.
