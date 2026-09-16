@@ -1,6 +1,6 @@
 # ADR-090: Shared decoder generation with model-owned execution sessions
 
-**Status**: Proposed\
+**Status**: Accepted (2026-09-15)\
 **Date**: 2026-09-15\
 **Crate**: lattice-inference
 
@@ -549,6 +549,52 @@ Keep shader assembly bytes and compile options fixed. The production shader sour
 external; changing translation units, compiler concurrency or library routing is a separate measured
 build/behavior change, not source-file housekeeping.
 
+### D10. The serving surface stops naming concrete model types
+
+Added at sign-off, 2026-09-15. The rest of this ADR proves the shared route by EXECUTION: R13
+requires real token streams from both families through both serving surfaces. That is not the same
+claim as the serving surface being model-agnostic. A serve worker can route every request through
+the shared driver and still hold a concrete model type in its own struct, which is the shape at the
+source ref.
+
+Measured baseline at `7ba69b2f1c461b10b8c26eff458bc0afc1c3d07c`, stated so the acceptance has
+something to move: `crates/inference/src/serve/` is five files, three of which name a concrete model
+type, nineteen occurrences in total, sixteen of them `MetalQwen35State` in `serve/metal_worker.rs`,
+two `Qwen35Model` in `serve/embeddings.rs`, one `QwenModel` in `serve/mod.rs`. The serving binaries
+carry eleven, six and one. No second-family type occurs anywhere under `serve/`.
+
+**The acceptance is an execution arm, and R13 does not complete without it.** A model family reaches
+both serving surfaces through the worker factory with no edit to any file under
+`crates/inference/src/serve/` and no edit to the serving binaries. It is proven by a real additional
+family, or by a fixture family constructed the way a real one would be: loaded, admitted, and
+routed through the same factory path. A fake session does not prove it, for the same reason D9 gives
+for the live milestones.
+
+**A name search rides beside that arm as a cheap tripwire, and is never promoted to the acceptance.**
+
+```
+! git grep -nE '\b(MetalQwen35State|Qwen35Model|QwenModel|Gemma4Model|Ernie45[A-Za-z]*|PaddleOcr[A-Za-z]*)\b' \
+    -- 'crates/inference/src/serve/*.rs' 'crates/inference/src/bin/*.rs' 'crates/inference/src/bin/**/*.rs'
+```
+
+Its false negatives are written here rather than left to be rediscovered, because a tripwire that
+looks like a gate is how the weaker check replaces the stronger one:
+
+1. **A type alias.** `type Worker = MetalQwen35State;` in a neighbouring module satisfies the search
+   at the serve site while the coupling is unchanged. Every lexical check is defeated by renaming.
+2. **A family enum behind the factory.** Serve holds the boxed session; the factory matches on a
+   family enum and constructs the concrete type one module away. The search passes, and adding a
+   family still cannot be done without editing that match, which is the thing the acceptance is
+   for.
+3. **A cfg-selected type of the same name.** A platform-gated stub keeps the coupling portable and
+   invisible to a search run on one platform.
+
+A stronger enforcement exists and is deliberately not taken here: moving serving into a crate that
+cannot depend on the concrete model implementations would make the separation structural rather than
+lexical. That is a larger change than this ADR decides, it interacts with the crate-ownership rules
+recorded elsewhere, and it is not a prerequisite for the execution arm above. Recording it keeps the
+option visible for a later decision rather than leaving the grep looking like the ceiling.
+
 ## Alternatives considered
 
 | Alternative                                      | Rejection / retained use                                                                                                                             |
@@ -572,9 +618,10 @@ validate migration.
 
 Before dependent implementation, review the companion ADR deltas together, compile-check the three
 private interface sketches in the first implementation packet, and prove the new routing/admission
-controls with hot/cold pairs and a must-reject control. The draft proposes new gates, so absence of
-an implementation does not count as a passing adversarial suite. Formal specification sign-off and
-execution of those controls remain pending; a source review is not their substitute.
+controls with hot/cold pairs and a must-reject control. This ADR proposes new gates, so absence of
+an implementation does not count as a passing adversarial suite. Formal specification sign-off
+completed 2026-09-15; execution of those controls remains pending, and a source review is not
+their substitute.
 
 ## References
 
