@@ -157,16 +157,13 @@ fn run() {
     use std::path::PathBuf;
 
     fn model_dir() -> Option<PathBuf> {
-        let dir = if let Ok(v) = std::env::var("LATTICE_MODEL_DIR") {
-            PathBuf::from(v)
+        if let Ok(v) = std::env::var("LATTICE_MODEL_DIR") {
+            Some(PathBuf::from(v))
         } else {
             let home = std::env::var("HOME").ok()?;
-            PathBuf::from(format!("{home}/.lattice/models/qwen3.5-0.8b-q4"))
-        };
-        if dir.join("config.json").exists() {
-            Some(dir)
-        } else {
-            None
+            Some(PathBuf::from(format!(
+                "{home}/.lattice/models/qwen3.5-0.8b-q4"
+            )))
         }
     }
 
@@ -196,10 +193,13 @@ fn run() {
         return;
     };
 
-    let cfg = match Qwen35Config::from_config_json(&dir.join("config.json")) {
+    // `from_model_dir` fails closed on a missing or unreadable config.json, so it
+    // doubles as the checkpoint-presence probe. A separate `exists()` check is
+    // both redundant and the lexical shape examples_no_preset_fallback.rs guards.
+    let cfg = match Qwen35Config::from_model_dir(&dir) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("SKIP bench_metal_forward_allocation: config parse failed: {e}");
+            eprintln!("SKIP bench_metal_forward_allocation: model config unavailable: {e}");
             return;
         }
     };
