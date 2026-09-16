@@ -70,6 +70,13 @@ run "test-bin-lattice" \
 run "test-lib-serve" \
     cargo test --locked -p lattice-inference --features f16,metal-gpu,test-utils \
     --lib serve:: -- --test-threads=1
+# Default features on purpose: this is the guard the workspace suite runs in CI,
+# and none of the arms above reaches it. It records the file:line of every
+# construction-site exemption, so any commit that MOVES code in a scanned file
+# reddens it with a position mismatch rather than a locking violation. It costs
+# seconds, and it is the arm whose absence let that red reach CI once already.
+run "test-lock-contract" \
+    cargo test --locked -p lattice-inference --test metal_measurement_lock_contract
 
 echo "== END rc=$overall"
 exit "$overall"
