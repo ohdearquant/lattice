@@ -8679,7 +8679,7 @@ mod inner {
                 // draft-EOS would silently truncate generation early.
 
                 // --- Verify phase (LATTICE_MTP_BATCH=1 selects batch-GEMM verifier) ---
-                let use_batch = std::env::var_os("LATTICE_MTP_BATCH").is_some();
+                let use_batch = crate::env_switch_enabled("LATTICE_MTP_BATCH");
                 let t_verify = std::time::Instant::now();
                 let verify_result = if use_batch {
                     self.verify_tokens_batch_gemm(&[pending_token, draft.token_id], pos)
@@ -9388,7 +9388,7 @@ mod inner {
             // MTP greedy path: programmatic flag or env-gated, greedy (top_k<=1) only.
             let mtp_enabled = gen_cfg
                 .enable_mtp
-                .unwrap_or_else(|| std::env::var("LATTICE_MTP").is_ok());
+                .unwrap_or_else(|| crate::env_switch_enabled("LATTICE_MTP"));
             let use_mtp = super::mtp_route_active(
                 self.session.mtp.is_some(),
                 mtp_enabled,
@@ -12868,7 +12868,7 @@ mod inner {
             let is_quarot = quarot_seed_opt.is_some();
 
             // Load MTP weights (cache+activations go into session, not engine).
-            let mtp_requested = std::env::var_os("LATTICE_MTP").is_some();
+            let mtp_requested = crate::env_switch_enabled("LATTICE_MTP");
             let MtpQ4LoadResult {
                 weights: mtp_weights_opt,
                 first_missing_file: mtp_missing_file,
