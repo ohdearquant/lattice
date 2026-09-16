@@ -77,8 +77,11 @@ fi
 exit 0
 """
 
-# Test helpers invoking real Git must disable repository hooks.
-GIT = ("git", "-c", "core.hooksPath=/dev/null")
+# Test helpers invoking real Git must disable repository hooks, and must not let
+# git start background work inside a directory the test is about to delete: an
+# auto-gc writing into .git after rmtree has walked it is what made teardown
+# fail the suite in #1618.
+GIT = ("git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0")
 
 STUB_GOVERNOR = """#!/usr/bin/env python3
 import json
@@ -124,7 +127,12 @@ class _Sandbox:
     """A throwaway repo holding the shipping scripts, with locks redirected."""
 
     def __init__(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        # ignore_cleanup_errors: teardown must never be able to fail the suite.
+        # Any writer that touches this tree between rmtree's walk and its rmdir
+        # raises there, and the traceback names a test whose assertions all
+        # passed (#1618). gc.auto=0 on GIT above removes the known writer; this
+        # closes the class regardless of which writer comes next.
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 
     def __enter__(self):
         tmp = self._tmp.name
@@ -1179,6 +1187,37 @@ def load_tests(
     if tests.countTestCases() == 0:
         raise RuntimeError("no tests collected from tests.test_bench_locks")
     return tests
+
+
+class SandboxTeardown(unittest.TestCase):
+    def test_sandbox_temporary_directory_ignores_cleanup_errors(self):
+        """Mutation-sensitive: drop `ignore_cleanup_errors=True` from
+        `_Sandbox.__init__` and this fails.
+
+        What this pins is the construction, not the race, and the distinction
+        is worth stating. #1618 raised `OSError: [Errno 39] Directory not
+        empty: '.git'` inside `TemporaryDirectory.cleanup()`, after every
+        assertion in the test that reported it had passed. Two obvious ways to
+        reproduce that deterministically do not work: a permission-blocked
+        subdirectory is healed by `cleanup()` itself, which resets modes and
+        retries, and a mocked `cleanup` raising `OSError` would propagate with
+        the flag set too, so it would fail whether or not the fix is present.
+        The constructor flag is what a deterministic test can hold.
+        """
+        sandbox = _Sandbox()
+        try:
+            self.assertTrue(sandbox._tmp._ignore_cleanup_errors)
+        finally:
+            sandbox._tmp.cleanup()
+
+    def test_sandbox_git_disables_auto_gc(self):
+        """Mutation-sensitive: remove `gc.auto=0` from GIT and this fails.
+
+        Auto-gc is the writer that can touch `.git` after `rmtree` has walked
+        it. `ignore_cleanup_errors` stops that from failing the suite; this
+        stops it from happening.
+        """
+        self.assertIn("gc.auto=0", GIT)
 
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):
