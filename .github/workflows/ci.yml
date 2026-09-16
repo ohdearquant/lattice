@@ -1146,6 +1146,16 @@ jobs:
       # guarding nothing; same harness-plumbing scope as the steps above.
       - name: python3 tests/test_perf_bench_gate_resolution.py
         run: python3 tests/test_perf_bench_gate_resolution.py -v
+      # e2e-parity's frozen-reference and verdict guards. The suite existed and
+      # ran in no workflow; e2e-parity.yml names the file only inside the path
+      # filter that decides whether the parity JOB runs, which is why a grep for
+      # its name looks wired. Same harness-plumbing scope as the steps above: it
+      # drives the checker's pure functions against fabricated verdicts and runs
+      # no model. Invoked as a module rather than as a script on purpose -- under
+      # `-m unittest`, `__name__` is never `__main__`, so a stray mid-file
+      # `unittest.main()` cannot truncate the run the way one already did here.
+      - name: python3 -m unittest tests.test_e2e_parity_reference
+        run: python3 -m unittest tests.test_e2e_parity_reference -v
       # bench-compare.sh's measurement-integrity guard. Drives the shipping
       # script in a disposable repo against a stub cargo, so it exercises the
       # real parser-to-guard path; no benchmark runs and no real cargo is

@@ -1010,16 +1010,52 @@ def compare(prompt: str, hf: dict, lattice: dict, match_window: int) -> dict:
     }
 
 
+def gating_results(results: list[dict]) -> list[dict]:
+    """The prompts that can vote.
+
+    A prompt carrying an ``xfail_issue`` is excluded from the verdict in BOTH
+    directions: its divergence cannot fail the gate, and its agreement is not
+    evidence that the gate is holding anything. Counting such a prompt as
+    gating is how a waiver comes to read as coverage, which is the same
+    arithmetic whether it diverged or happened to match.
+    """
+    return [r for r in results if not r.get("xfail_issue")]
+
+
+def empty_gating_reason(results: list[dict]) -> str | None:
+    """Why no prompt could vote, or None when at least one can.
+
+    Empty is not clean. With every compared prompt waived there is no
+    population for "parity holds" to be a statement about, so this run owes a
+    refusal rather than a pass. The waiver list is meant to grow one tracked
+    divergence at a time, and nothing today notices when it has grown to cover
+    the whole table.
+    """
+    if not results:
+        return "no prompts were compared at all"
+    if gating_results(results):
+        return None
+    return (
+        f"all {len(results)} compared prompt(s) carry an expected-divergence "
+        "waiver, so no prompt could vote; a pass over an empty gating set says "
+        "nothing about parity"
+    )
+
+
 def render_report(results: list[dict]) -> str:
     lines = ["## E2E Parity Report", ""]
     fails = [r for r in results if not r["pass"] and not r.get("xfail_issue")]
     known = [r for r in results if not r["pass"] and r.get("xfail_issue")]
-    if fails:
+    gating = gating_results(results)
+    no_gating = empty_gating_reason(results)
+    if no_gating is not None:
+        lines.append(f"**NO GATING PROMPT**: {no_gating}")
+    elif fails:
         lines.append(f"**FAIL**: {len(fails)}/{len(results)} prompts diverged within their match windows")
     elif known:
         issues = ", ".join(sorted({r["xfail_issue"] for r in known}))
         lines.append(
-            f"**PASS**: {len(results) - len(known)}/{len(results)} gating prompts match; "
+            f"**PASS**: {len(gating)}/{len(results)} gating prompts match; "
             f"{len(known)} known divergence ({issues}) excluded from the verdict"
         )
     else:
@@ -1305,6 +1341,14 @@ def main() -> int:
         print(f"\nFAIL: {fails}/{len(results)} prompts failed parity gate", file=sys.stderr)
         return 1
 
+    no_gating = empty_gating_reason(results)
+    if no_gating is not None:
+        # Exit 2, not 1: exit 1 is reserved for lattice and the reference
+        # disagreeing, and nothing here disagreed. This is the harness being
+        # asked to certify a table that cannot certify anything.
+        print(f"\nNO GATING PROMPT: {no_gating}", file=sys.stderr)
+        return 2
+
     if xpass:
         print(
             "\nNOTE: expected-divergent prompt(s) PASSED — if this repeats, the "
@@ -1320,7 +1364,7 @@ def main() -> int:
         else ""
     )
     print(
-        f"\nPASS: all {len(results) - known} gating prompts passed{suffix}",
+        f"\nPASS: all {len(gating_results(results))} gating prompts passed{suffix}",
         file=sys.stderr,
     )
     return 0
