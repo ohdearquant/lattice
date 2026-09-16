@@ -78,9 +78,21 @@ mode to be enabled.
   mechanism `reload`'s no-partial-mutation contract makes cheap, and it is the difference between
   detecting collapse and merely being able to describe it afterwards.
 
-**4. Caller-supplied weights are unaffected.** A request that names adapters and scales explicitly
-gets exactly those, with the same normalization and floor applied for the same reasons. The learned
-weights are a default, not a policy the caller cannot escape.
+**4. Caller-supplied weights keep their magnitudes, and are floored without renormalisation.** The
+normalisation in Decision 1 is a property of the learned path, not of the mixture in general. Raw
+gate scores have no calibrated magnitude, so they have to become proportions before two requests can
+be compared at all; a caller's scales are the instruction. A request naming one adapter at 0.5 means
+half strength and gets half strength.
+
+The floor still applies, because the cost argument in Decision 2 does not care who chose the weight:
+an adapter below `epsilon` pays its full rank in the decode of every token and changes nothing. The
+survivors are **not** renormalised after a drop, since scaling them up to recover the dropped mass
+would move the caller's chosen strength by an amount that depends on what was dropped.
+
+So the two paths differ in exactly one respect, and it is worth saying rather than leaving to be
+inferred: learned weights are normalised because their magnitudes are arbitrary, caller weights are
+not because their magnitudes are the request. Both are floored. The learned weights are a default,
+not a policy the caller cannot escape.
 
 **5. Evidence gate, before any dependent code merges.** The learned mode ships disabled. It is
 enabled only after a closed-loop run over `N` feedback rounds on a small held-out task reports:
@@ -113,6 +125,10 @@ output. A run that fails the threshold leaves `1/k` in place and this ADR in `Pr
   `RouterError`'s variants are unchanged.
 - The blend boundary is unchanged. Callers still fold `alpha / rank` into the effective weight
   before calling `blend_lora_layer_data`, which continues to load at `scale = 1.0`.
+- Explicit per-request scales are not rescaled, so total adapter strength on that path stays the
+  caller's arithmetic by design, including when their scales do not sum to 1. The only change for an
+  explicit-scale caller is that an adapter whose weight falls below `epsilon` is absent from the
+  blend rather than present at a weight that does nothing, and the survivors are left alone.
 - ADR-079's COMPOSE row says selection policy is what ROUTE supplies next. This is that policy, and
   it lands as a new record rather than an edit to that row.
 
