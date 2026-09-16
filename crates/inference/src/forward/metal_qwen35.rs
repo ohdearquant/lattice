@@ -14969,7 +14969,7 @@ mod inner {
                         .filter(|candidate| included.contains_key(candidate.as_str()))
                         .collect();
                     match matches.as_slice() {
-                        [path] => pending.push(path.to_string()),
+                        [path] => pending.push((*path).clone()),
                         [] => {
                             return Err(format!(
                                 "missing included production module: {} or {} (declared in {path})",
