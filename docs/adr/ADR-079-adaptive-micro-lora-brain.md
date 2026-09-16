@@ -124,12 +124,14 @@ synthesizing record; it references the seven above rather than re-opening any of
   which names the GQA and GDN slot layers it actually materialised, rather than assuming from the
   range.
 
-- **G2 — In-process route→refit→route loop-closure.** `update_router` returns a fresh gate blob but
-  nothing in lattice reloads it into a live `AdapterRouter` between requests; the caller owns
-  persistence and reload. **Re-entry:** when a host runtime needs the refit gate to take effect
-  without an out-of-process reload step, add an in-process `AdapterRouter::reload(gate_bytes)` path
-  and a loop-closure integration test (route → collect feedback → refit → reload → route again). The
-  boundary is deliberate today; this only fires if in-process closure becomes a requirement.
+- **G2 — In-process route→refit→route loop-closure. CLOSED 2026-09-12 (`7c48c8968f`).**
+  `update_router` returns a fresh gate blob, and `AdapterRouter::reload` now installs one into a
+  live router between requests: it parses and validates both dimensions before any mutation, so a
+  mismatched refit fails once and serving continues on the previous gate. The loop-closure test
+  asserts that the second `route` returns a **different** selection attributable to the feedback,
+  rather than asserting that five steps ran without error. Persistence across process restarts stays
+  caller-owned; the out-of-process round trip does not. Contract and rationale: Amendment 1 below.
+  The mixture-weight policy the closed loop refits is ADR-091.
 
 - **G3 — EWC anchor-pullback as a live anti-forgetting mode.** `penalty_gradient`/`ewc_lambda` is
   inert by design in v1 (Fisher null-space damping is the shipped mechanism). **Re-entry:** when
