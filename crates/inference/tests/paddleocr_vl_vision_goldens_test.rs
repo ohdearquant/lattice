@@ -51,12 +51,11 @@ mod gate {
 
     /// Retain the original summary bounds. A CPU f32 calibration measured
     /// 3.672e-5 worst HF disagreement over the 94 projector summary values.
-    /// The 2.6e-4 quoted here previously is the 96-patch case's worst over
-    /// the whole compared surface, and it is attained on an encoder
-    /// checkpoint rather than on the projector: it is unchanged under the
-    /// projector-only tanh-GELU substitution, which moves the other two
-    /// cases to 6.83e-4 and 4.99e-4. That substitution's worst summary
-    /// residual against HF is 6.828e-4 and passes these bounds.
+    /// The 96-patch case prints 2.60e-4 over sampled encoder and projector
+    /// coordinates, excluding means. Its captured projector samples have
+    /// smaller errors, so an encoder sample supplies that maximum.
+    /// The projector-only tanh-GELU substitution's worst summary residual
+    /// against HF is 6.828e-4 and passes these bounds.
     const ATOL: f32 = 1e-3;
     const RTOL: f32 = 1e-3;
 
