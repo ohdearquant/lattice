@@ -1141,6 +1141,11 @@ jobs:
         run: python3 scripts/perf-bench-gate.py --selftest
       - name: python3 tests/test_perf_bench_gate_status.py
         run: python3 tests/test_perf_bench_gate_status.py -v
+      # The gate's classifier unit tests. This suite existed and ran in no
+      # workflow, so its assertions about which verdict a bound produces were
+      # guarding nothing; same harness-plumbing scope as the steps above.
+      - name: python3 tests/test_perf_bench_gate_resolution.py
+        run: python3 tests/test_perf_bench_gate_resolution.py -v
       # e2e-parity's frozen-reference and verdict guards. The suite existed and
       # ran in no workflow; e2e-parity.yml names the file only inside the path
       # filter that decides whether the parity JOB runs, which is why a grep for

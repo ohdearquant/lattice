@@ -51,7 +51,9 @@ Status mode is opt-in. It requires exactly one perf-ambient-sample/v1 record for
 each voting phase (before, between, after), ignores other phase labels, and
 writes an atomic perf-bench-gate-status/v1 document. Ambient refusal is checked
 before the final exit/status verdict, so exit 3 outranks pass or regression for
-every target in the run. Excessive order bias is the other exit-3 cause.
+every target in the run. Excessive order bias is a second exit-3 cause, and a
+gated set left empty by target policy is the third: with nothing able to vote
+there is no verdict to render, so the run refuses instead of ticking.
 
 With --phase-load-summaries, status also carries four ordered phase_load entries
 and phase_load_verdict (ok or LOUD). This records in-phase contamination without
@@ -66,8 +68,10 @@ and the target/feature calibration allowlist -- which covers both crates -- does
 it at either resolution for selected configurations that have not calibrated the
 gate. Every result in
 an informational root is still measured and reported, but excluded from the
-FAIL/WARN verdict and exit code. This classifier validates exact target identity;
-the caller owns the policy decision to withhold gating authority.
+FAIL/WARN verdict. Because the policy is target-wide, demoting the target empties
+the gated set: such a run exits 3 with its rows rendered beside the refusal, and
+never reports a pass. This classifier validates exact target identity; the caller
+owns the policy decision to withhold gating authority.
 
 Run provenance is schema-versioned. New bench-compare runs write
 lattice-bench-provenance-v2, where embed_features is required. The reader also
@@ -1451,6 +1455,29 @@ def render_run_provenance(
     return lines
 
 
+def empty_gate_reason(
+    results: list[BenchResult],
+    target: str | None,
+    informational_target: str | None,
+) -> str | None:
+    """Why nothing could vote, or None when at least one measurement can.
+
+    EMPTY is not CLEAN. With every row demoted by target policy the noise band
+    has no population left to be a statement about, so the run owes a refusal
+    rather than a tick: a reader cannot tell "nothing regressed" from "nothing
+    was allowed to say".
+    """
+    if not results:
+        return None
+    if any(not r.is_informational(target, informational_target) for r in results):
+        return None
+    return (
+        f"target policy classified all {len(results)} measurement(s) of "
+        f"`{target}` informational, so no benchmark could vote; a pass over an "
+        "empty gated set says nothing about this change"
+    )
+
+
 def render_report(results: list[BenchResult], arch: str, target: str | None = None,
                   informational_target: str | None = None,
                   provenance: RunProvenance | None = None,
@@ -1471,6 +1498,11 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
         r for r in results
         if r.is_informational(target, informational_target)
     ]
+    gate_empty = empty_gate_reason(results, target, informational_target)
+    # One predicate for every verdict-bearing branch below: a tick, a WARN/FAIL
+    # headline and the rule footer all assert a classification, and neither a
+    # suppressed decision nor an empty gated set has one to assert.
+    suppressed = decision_suppressed_reason is not None or gate_empty is not None
 
     fails = [r for r in gated if r.verdict(resolution) == "FAIL"]
     warns = [r for r in gated if r.verdict(resolution) == "WARN"]
@@ -1487,6 +1519,11 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
     info_wins = [r for r in info if r.verdict(resolution) == "WIN"]
 
     lines = [f"### `{arch}` — perf regression report\n"]
+    if gate_empty is not None:
+        lines.append(
+            "**⛔ NO GATED MEASUREMENT** — "
+            f"{gate_empty}. No source-performance verdict was rendered."
+        )
     if decision_suppressed_reason is not None:
         lines.append(
             "**⏸ NOT MEASURABLE** — "
@@ -1505,7 +1542,7 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
                 "of Criterion's two-sided 95% CI, i.e. about a 97.5% one-sided "
                 "level, not a calibrated one-sided 95% test)"
             )
-    if decision_suppressed_reason is None and warns:
+    if not suppressed and warns:
         qualifier = (
             "order-bias-widened ABBA lower bound"
             if order_balanced
@@ -1515,22 +1552,22 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             f"**⚠ {len(warns)} WARN** (regression {WARN_PCT}-{FAIL_PCT}% by "
             f"the same {qualifier})"
         )
-    if decision_suppressed_reason is None and unattributable:
+    if not suppressed and unattributable:
         lines.append(
             f"**◻ {len(unattributable)} UNATTRIBUTABLE** (quick-resolution "
             f"{WARN_PCT}-{FAIL_PCT}% warn band is narrower than the harness's "
             "measured arm-order bias)"
         )
-    if decision_suppressed_reason is None and wins:
+    if not suppressed and wins:
         lines.append(f"**🚀 {len(wins)} confirmed improvement**")
-    if decision_suppressed_reason is None and not (
+    if not suppressed and not (
         fails or warns or unattributable or wins
     ):
         lines.append(f"✅ All {len(gated)} gated benches within noise band (±{WARN_PCT}%)")
     lines.append("")
     lines.extend(render_run_provenance(provenance, results))
 
-    if decision_suppressed_reason is None and (
+    if not suppressed and (
         fails or warns or unattributable or wins
     ):
         bias_column = " | order bias ≤" if order_balanced else ""
@@ -1570,9 +1607,20 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
             f"**ℹ️ {len(info)} informational** (explicit target policy; "
             f"measured and reported, excluded from the verdict)"
         )
-        if decision_suppressed_reason is None and (
-            info_fails or info_warns or info_unattributable or info_wins
-        ):
+        if gate_empty is not None:
+            # Every row was demoted, so the informational table IS the report.
+            # Render all of them beside the refusal, PASS rows included: the
+            # reader's question here is what was measured at all, and the
+            # all-measurements <details> below carries no would-be verdict.
+            info_rows = sorted(info, key=lambda r: -r.ci_low_pct)
+        elif not suppressed:
+            info_rows = sorted(
+                info_fails + info_warns + info_unattributable + info_wins,
+                key=lambda r: -r.ci_low_pct,
+            )
+        else:
+            info_rows = []
+        if info_rows:
             bias_column = " | order bias ≤" if order_balanced else ""
             lines.append(
                 f"| Bench | Δ point | {interval_label}{bias_column} | new ns | "
@@ -1583,16 +1631,14 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
                 if order_balanced
                 else "|---|---:|---|---:|---:|---|---|---|"
             )
-            for r in sorted(
-                info_fails + info_warns + info_unattributable + info_wins,
-                key=lambda r: -r.ci_low_pct,
-            ):
+            for r in info_rows:
                 verdict = r.verdict(resolution)
                 icon = {
                     "FAIL": "❌",
                     "WARN": "⚠",
                     QUICK_UNATTRIBUTABLE: "◻",
                     "WIN": "🚀",
+                    "PASS": "✅",
                 }[verdict]
                 bias_cell = (
                     f"| {r.order_bias_bound_pct:+.2f}% "
@@ -1633,7 +1679,7 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
         if order_balanced
         else "CI-lower of change"
     )
-    if decision_suppressed_reason is None:
+    if not suppressed:
         if resolution == "quick":
             lines.append(
                 f"_Rule: {lower_bound_name} ≤{WARN_PCT}% passes silently; "
@@ -1646,6 +1692,11 @@ def render_report(results: list[BenchResult], arch: str, target: str | None = No
                 f"_Rule: {lower_bound_name} ≤{WARN_PCT}% passes silently; "
                 f"({WARN_PCT}%, {FAIL_PCT}%] warns; >{FAIL_PCT}% fails._"
             )
+    elif gate_empty is not None:
+        lines.append(
+            "_The measurements are shown for diagnosis only; no row held "
+            "gating authority, so none was classified._"
+        )
     else:
         lines.append(
             "_The measurements are shown for diagnosis only; WARN/FAIL "
@@ -2367,16 +2418,46 @@ def run_selftest() -> int:
             )
 
         # A target can be intentionally all-informational only when the exact
-        # target key accompanies both the root and the demotion. This remains a
-        # measured target and is valid in an enforcing multi-target run; another
-        # target supplies the gating comparisons. A mismatched key must refuse.
+        # target key accompanies both the root and the demotion; a mismatched key
+        # must refuse. Demotion is target-wide, so it empties the gated set: this
+        # invocation has no verdict to render and exits 3 with its rows beside the
+        # refusal. It remains valid inside an enforcing multi-target run —
+        # bench-compare decides the RUN from the arms that did gate, and refuses
+        # only when none did.
+        # Mutation-sensitive: drop the empty-gated-set refusal in main() and this
+        # exits 0 having printed a tick over nothing.
         info_root = Path(td) / "info" / "criterion"
         _fabricate_bench(info_root / "grp_info" / "bench_info", "compare-base")
-        if _run(info_root, "--require-measurements",
-                "--target", "lattice-embed:simd",
-                "--informational-target", "lattice-embed:simd").returncode != 0:
-            failures.append("require-measurements: an explicitly qualified "
-                            "informational target was rejected")
+        _fabricate_bench(
+            info_root / "grp_clean" / "bench_clean",
+            "compare-base",
+            point=0.001,
+            ci_low=-0.005,
+            ci_high=0.007,
+        )
+        all_informational = _run(
+            info_root, "--require-measurements",
+            "--target", "lattice-embed:simd",
+            "--informational-target", "lattice-embed:simd")
+        if all_informational.returncode != 3:
+            failures.append(
+                "empty-gated-set: an all-informational target exited "
+                f"{all_informational.returncode} instead of 3")
+        if "NO GATED MEASUREMENT" not in all_informational.stdout:
+            failures.append(
+                "empty-gated-set: the refusal was not labelled NO GATED "
+                "MEASUREMENT in the report")
+        if "gated benches within noise band" in all_informational.stdout:
+            failures.append(
+                "empty-gated-set: a green tick was printed over an empty "
+                "gated set")
+        beside_verdict = all_informational.stdout.partition(
+            "<details><summary>All ")[0]
+        for demoted_id in ("grp_info/bench_info", "grp_clean/bench_clean"):
+            if demoted_id not in beside_verdict:
+                failures.append(
+                    f"empty-gated-set: demoted row {demoted_id!r} was not "
+                    "rendered beside the verdict")
         if _run(info_root, "--require-measurements",
                 "--target", "lattice-inference:elementwise_cpu_bench",
                 "--informational-target", "lattice-embed:simd").returncode != 2:
@@ -3629,6 +3710,9 @@ def main() -> int:
         r for r in results
         if not r.is_informational(args.target, args.informational_target)
     ]
+    gate_empty = empty_gate_reason(
+        results, args.target, args.informational_target
+    )
 
     excessive_order_bias = [
         result
@@ -3683,6 +3767,19 @@ def main() -> int:
             "not_measurable",
             EXIT_NOT_MEASURABLE,
             order_bias_reason,
+            measurement_count=len(results),
+        )
+
+    if gate_empty is not None:
+        # Reached only with measurements in hand: the empty-results case already
+        # refused above. So this is policy, not a broken read, and the exit has
+        # to be non-zero for the same reason exit 3 exists at all — the run
+        # produced no verdict, and a zero here would be one.
+        print(f"NO GATED MEASUREMENT: {gate_empty}", file=sys.stderr)
+        return finish(
+            "not_measurable",
+            EXIT_NOT_MEASURABLE,
+            gate_empty,
             measurement_count=len(results),
         )
 

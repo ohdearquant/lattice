@@ -1123,9 +1123,11 @@ reconcile_criterion_groups() {
 echo ""
 echo "=== Target-qualified gate reports ==="
 GATE_RC=0
+GATING_TARGETS=0
+DEMOTED_TARGETS=0
 run_target_gate() {
   local target="$1" criterion_root="$2" order_control_root="$3" bench_source="$4"
-  local gate_rc=0 policy_rc=0 policy_invalid=0
+  local gate_rc=0 policy_rc=0 policy_invalid=0 informational=0
 
   reconcile_criterion_groups "$target" "$criterion_root" "$bench_source"
   local gate_args=(
@@ -1153,10 +1155,12 @@ run_target_gate() {
     # A selected configuration that has not calibrated this gate is still useful
     # measurement evidence, but cannot vote at either resolution.
     gate_args+=(--informational-target "$target")
+    informational=1
   elif [ -n "$QUICK_FLAGS" ]; then
     if "$REPO/scripts/lib/bench-informational-targets.sh" \
          --is-informational "$target"; then
       gate_args+=(--informational-target "$target")
+      informational=1
     else
       policy_rc=$?
       if [ "$policy_rc" -ne 1 ]; then
@@ -1194,14 +1198,33 @@ run_target_gate() {
     gate_rc=2
   fi
 
+  if [ "$informational" -eq 1 ]; then
+    DEMOTED_TARGETS=$((DEMOTED_TARGETS + 1))
+  fi
+
   case "$gate_rc" in
-    0) ;;
+    0)
+      if [ "$informational" -eq 0 ]; then
+        GATING_TARGETS=$((GATING_TARGETS + 1))
+      fi
+      ;;
     2) GATE_RC=2 ;;
     1)
+      if [ "$informational" -eq 0 ]; then
+        GATING_TARGETS=$((GATING_TARGETS + 1))
+      fi
       if [ "$GATE_RC" -ne 2 ]; then GATE_RC=1; fi
       ;;
     3)
-      if [ "$GATE_RC" -eq 0 ]; then GATE_RC=3; fi
+      # A target THIS run demoted has no verdict to render, and exit 3 is how the
+      # gate says so; failing a run that another target did gate would report a
+      # policy decision as a measurement failure. Absorbing it is safe only
+      # because of the two facts stated here, not as a general rule: the ambient
+      # assessment is one per-run sample set shared by every target, so an
+      # ambient exit 3 also lands on any gating arm, and order bias is computed
+      # from the gating rows a demoted target does not have. A run where NO arm
+      # gated is refused below instead.
+      if [ "$informational" -eq 0 ] && [ "$GATE_RC" -eq 0 ]; then GATE_RC=3; fi
       ;;
     *)
       echo "bench-compare: gate returned unexpected exit $gate_rc — treating it as an input error." >&2
@@ -1221,15 +1244,33 @@ run_target_gate \
   "$BASE_CONTROL_EMBED_CRITERION_ROOT" \
   "$(bench_source_for_target "$HEAD_DIR" "embed" "$BENCHES_EMBED")"
 
+# EMPTY is not CLEAN at the run level either. Every arm can be demoted at once
+# (a custom target, non-default features, or quick mode over a demoted target),
+# and each arm's own report is then honest while the run as a whole has measured
+# nothing that could vote. Say so where the aggregate verdict is decided.
+if [ "$GATING_TARGETS" -eq 0 ] && [ "$DEMOTED_TARGETS" -gt 0 ]; then
+  # The DEMOTED guard keeps this line off a run whose arms failed for some other
+  # reason: "0 demoted by target policy" beside a broken measurement names the
+  # wrong cause, and the arm that broke already said what happened.
+  echo "bench-compare: no target in this run held gating authority" \
+       "($DEMOTED_TARGETS demoted by target policy) — this run rendered no" \
+       "performance verdict, and its clean arms are coverage, not safety." >&2
+  if [ "$GATE_RC" -eq 0 ]; then GATE_RC=3; fi
+fi
+
 if [ "$FAIL_ON_REGRESSION" = "1" ] && [ "$GATE_RC" -ne 0 ]; then
   # Exit 1 is a confirmed regression; exit 2 is a broken measurement contract;
-  # exit 3 is a run whose ambient or order-bias evidence makes it unmeasurable.
+  # exit 3 is a run the gate could not render a verdict for at all: ambient or
+  # order-bias evidence, or a gated set that target policy left empty.
   # All must fail the caller: a green exit standing in for evidence that was
   # never produced is the exact defect this flag exists to remove.
   if [ "$GATE_RC" = "2" ]; then
     echo "bench-compare: gate could not judge this run — no usable measurements." >&2
   elif [ "$GATE_RC" = "3" ]; then
-    echo "bench-compare: measurement conditions made this run not measurable." >&2
+    # Do not name a cause here: three different conditions produce exit 3 and
+    # the gate already printed the one that fired.
+    echo "bench-compare: the gate rendered no verdict for this run — see its" \
+         "NOT MEASURABLE or NO GATED MEASUREMENT line above." >&2
   else
     echo "bench-compare: gate reported a confirmed regression (exit $GATE_RC)." >&2
   fi
