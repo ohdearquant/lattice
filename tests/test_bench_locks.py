@@ -1189,8 +1189,6 @@ def load_tests(
     return tests
 
 
-
-
 class SandboxTeardown(unittest.TestCase):
     def test_sandbox_temporary_directory_ignores_cleanup_errors(self):
         """Mutation-sensitive: drop `ignore_cleanup_errors=True` from
@@ -1211,6 +1209,7 @@ class SandboxTeardown(unittest.TestCase):
             self.assertTrue(sandbox._tmp._ignore_cleanup_errors)
         finally:
             sandbox._tmp.cleanup()
+
     def test_sandbox_git_disables_auto_gc(self):
         """Mutation-sensitive: remove `gc.auto=0` from GIT and this fails.
 
@@ -1219,6 +1218,7 @@ class SandboxTeardown(unittest.TestCase):
         stops it from happening.
         """
         self.assertIn("gc.auto=0", GIT)
+
 
 class _FailOnEmptyTestProgram(unittest.TestProgram):
     def runTests(self) -> None:
