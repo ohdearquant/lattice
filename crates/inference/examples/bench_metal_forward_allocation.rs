@@ -17,7 +17,7 @@
 //!
 //! # Run
 //! ```text
-//! cargo bench -p lattice-inference --features metal-gpu,f16 -- metal_forward_allocation_bench
+//! cargo run --release -p lattice-inference --features metal-gpu,f16 --example bench_metal_forward_allocation
 //! ```
 //!
 //! # CI note
@@ -143,7 +143,7 @@ fn snapshot() -> Counts {
 fn main() {
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
-        eprintln!("SKIP metal_forward_allocation_bench: requires macOS + metal-gpu feature");
+        eprintln!("SKIP bench_metal_forward_allocation: requires macOS + metal-gpu feature");
     }
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
@@ -186,20 +186,20 @@ fn run() {
 
     let Some(dir) = model_dir() else {
         eprintln!(
-            "SKIP metal_forward_allocation_bench: model checkpoint not found \
+            "SKIP bench_metal_forward_allocation: model checkpoint not found \
              (set LATTICE_MODEL_DIR)"
         );
         return;
     };
     let Some(tok_dir) = tokenizer_dir() else {
-        eprintln!("SKIP metal_forward_allocation_bench: tokenizer.json not found");
+        eprintln!("SKIP bench_metal_forward_allocation: tokenizer.json not found");
         return;
     };
 
     let cfg = match Qwen35Config::from_config_json(&dir.join("config.json")) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("SKIP metal_forward_allocation_bench: config parse failed: {e}");
+            eprintln!("SKIP bench_metal_forward_allocation: config parse failed: {e}");
             return;
         }
     };
@@ -214,7 +214,7 @@ fn run() {
     let mut state = match MetalQwen35State::from_q4_dir(&dir, &tok_path, &cfg, 4096) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("SKIP metal_forward_allocation_bench: Metal Q4 init failed: {e}");
+            eprintln!("SKIP bench_metal_forward_allocation: Metal Q4 init failed: {e}");
             return;
         }
     };
@@ -232,7 +232,7 @@ fn run() {
 
     let counts = snapshot();
     println!(
-        "metal_forward_allocation_bench: alloc_calls={} realloc_calls={} bytes_allocated={}",
+        "bench_metal_forward_allocation: alloc_calls={} realloc_calls={} bytes_allocated={}",
         counts.alloc_calls, counts.realloc_calls, counts.bytes_allocated
     );
 }
