@@ -4223,6 +4223,373 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // DecodePolicy::transition token-finalization tests
+    // -----------------------------------------------------------------------
+    //
+    // The zero-weight test fixture's greedy sampler always selects vocab
+    // index 0 (strict `v > best_val` tie-break), which makes it impossible to
+    // drive `Qwen35Model::generate` through more than one distinguishable
+    // decode position. The tests below construct `DecodePolicy` directly
+    // instead, mirroring the exact call shape every decode loop above uses
+    // (`transition`'s closures wired the same way `decode_loop` wires them),
+    // to isolate the finalization ordering itself from sampling.
+
+    /// A budget-forced `</think>` that clears the grammar-advance and EOS
+    /// checks must be emitted and have its own logprob recorded under the
+    /// forced id, not the sample it replaced.
+    ///
+    /// Mutation sensitivity: recording the logprob under `sampled_id` instead
+    /// of the post-override `next_id` makes `token_logprobs[1].token_id`
+    /// read back as the stale sample (3) instead of the forced close id (7).
+    #[test]
+    fn forced_close_with_logprobs_records_the_post_override_token() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(1),
+            enable_thinking: true,
+            logprobs: Some(0),
+            ..GenerateConfig::default()
+        };
+        let close_id = 7u32;
+        let stale_sample = 3u32;
+        let logits = [0.0f32; 10];
+
+        let mut token_logprobs = Vec::new();
+        let mut policy = DecodePolicy::init(
+            &gen_cfg,
+            Some(close_id),
+            &mut token_logprobs,
+            /* first_emitted_id */ 1,
+            &logits,
+            0.0,
+            /* first_generated_len */ 1,
+            false,
+        );
+
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let outcome = policy.transition(
+            &mut token_logprobs,
+            stale_sample,
+            &logits,
+            0.0,
+            /* generated_len_before */ 1,
+            |_next_id| true,
+            |_next_id| false,
+            |_next_id| {},
+            |_next_id| String::new(),
+            &mut text,
+            &mut offsets,
+            |_delta, _next_id| true,
+        );
+
+        match outcome {
+            StepOutcome::Emitted { token_id, .. } => assert_eq!(
+                token_id, close_id,
+                "an accepted forced close must emit the close id, not the sample it replaced"
+            ),
+            _ => panic!("a forced close that clears grammar-advance and EOS must be Emitted"),
+        }
+        assert_eq!(
+            token_logprobs.len(),
+            2,
+            "one entry from init's first token, one from this transition"
+        );
+        assert_eq!(
+            token_logprobs[1].token_id, close_id,
+            "the recorded logprob entry must describe the actually-emitted forced token, \
+             not the stale pre-override sample"
+        );
+    }
+
+    /// A budget-forced close must be checked for EOS against the token it
+    /// actually emits, never against the raw sample it replaced. Without this
+    /// ordering, a raw sample that happens to be an EOS/stop id could end the
+    /// generation one step early even though the override already replaced
+    /// it with a different, legal token.
+    ///
+    /// Mutation sensitivity: checking `is_eos(sampled_id)` instead of
+    /// `is_eos(next_id)` makes the closure below see the stale sample (3),
+    /// which it treats as EOS, and the outcome becomes `Eos` instead of
+    /// `Emitted`.
+    #[test]
+    fn transition_refuses_eos_on_the_stale_pre_override_sample() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(1),
+            enable_thinking: true,
+            ..GenerateConfig::default()
+        };
+        let close_id = 7u32;
+        let stale_sample = 3u32;
+
+        let mut token_logprobs = Vec::new();
+        let mut policy = DecodePolicy::init(
+            &gen_cfg,
+            Some(close_id),
+            &mut token_logprobs,
+            /* first_emitted_id */ 1,
+            &[],
+            0.0,
+            /* first_generated_len */ 1,
+            false,
+        );
+
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let outcome = policy.transition(
+            &mut token_logprobs,
+            stale_sample,
+            &[],
+            0.0,
+            /* generated_len_before */ 1,
+            |_next_id| true,
+            // Only the stale, pre-override sample would trigger EOS here.
+            |next_id| next_id == stale_sample,
+            |_next_id| {},
+            |_next_id| String::new(),
+            &mut text,
+            &mut offsets,
+            |_delta, _next_id| true,
+        );
+
+        match outcome {
+            StepOutcome::Emitted { token_id, .. } => assert_eq!(
+                token_id, close_id,
+                "the emitted token must be the forced close id, not the stale sample"
+            ),
+            StepOutcome::Eos => panic!(
+                "EOS must not fire on the stale pre-override sample ({stale_sample}); \
+                 the forced close id ({close_id}) is not itself EOS-eligible here"
+            ),
+            _ => panic!("unexpected outcome for an accepted forced close"),
+        }
+    }
+
+    /// Once the reasoning block has already closed, a later step whose raw
+    /// budget condition (`generated_so_far >= budget`) is still trivially
+    /// true must not force a second close — the close id is consumed at most
+    /// once per generation.
+    ///
+    /// Mutation sensitivity: dropping the already-closed guard from the
+    /// forced-close condition makes it force `close_id` again here; the
+    /// emitted token becomes 7 instead of the untouched sample, and this
+    /// test fails.
+    #[test]
+    fn transition_refuses_to_force_close_a_second_time_once_already_closed() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(1),
+            enable_thinking: true,
+            ..GenerateConfig::default()
+        };
+        let close_id = 7u32;
+        let sampled_id = 3u32;
+
+        let mut token_logprobs = Vec::new();
+        // The prefill-derived first token IS the close marker, so `init`
+        // seeds `thinking_closed = true` immediately.
+        let mut policy = DecodePolicy::init(
+            &gen_cfg,
+            Some(close_id),
+            &mut token_logprobs,
+            /* first_emitted_id */ close_id,
+            &[],
+            0.0,
+            /* first_generated_len */ 1,
+            false,
+        );
+
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        // generated_len_before is far past the budget (1), so the raw
+        // budget condition is still trivially satisfied on its own.
+        let outcome = policy.transition(
+            &mut token_logprobs,
+            sampled_id,
+            &[],
+            0.0,
+            /* generated_len_before */ 5,
+            |_next_id| true,
+            |_next_id| false,
+            |_next_id| {},
+            |_next_id| String::new(),
+            &mut text,
+            &mut offsets,
+            |_delta, _next_id| true,
+        );
+
+        match outcome {
+            StepOutcome::Emitted { token_id, .. } => assert_eq!(
+                token_id, sampled_id,
+                "an already-closed block must not force the close id again; \
+                 the untouched sample must pass through"
+            ),
+            _ => panic!("unexpected outcome for an untouched, already-closed step"),
+        }
+    }
+
+    /// The prefill-derived first token can itself be the close marker (a
+    /// prompt that pushes the model straight into it). `DecodePolicy::init`
+    /// must still record that token's own logprob when requested — the same
+    /// contract `init_records_the_prefill_tokens_logprob_before_any_transition_call`
+    /// pins for the ordinary case, isolated here for the close-marker-as-
+    /// first-token edge specifically.
+    #[test]
+    fn init_records_the_first_tokens_logprob_when_it_is_already_the_close_marker() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(1),
+            enable_thinking: true,
+            logprobs: Some(0),
+            ..GenerateConfig::default()
+        };
+        let close_id = 7u32;
+        let logits = [0.0f32; 10];
+
+        let mut token_logprobs = Vec::new();
+        let _policy = DecodePolicy::init(
+            &gen_cfg,
+            Some(close_id),
+            &mut token_logprobs,
+            /* first_emitted_id */ close_id,
+            &logits,
+            0.0,
+            /* first_generated_len */ 1,
+            false,
+        );
+
+        assert_eq!(
+            token_logprobs.len(),
+            1,
+            "init must record exactly one logprob entry for the first token"
+        );
+        assert_eq!(
+            token_logprobs[0].token_id, close_id,
+            "the recorded entry must describe the actual first token (the close marker)"
+        );
+    }
+
+    /// When the reasoning block is already closed as of the first token, the
+    /// answer-budget window opens immediately from that token's position.
+    /// `max_new_tokens: 1` then means exactly one more (answer) token closes
+    /// the window — `answer_budget_exhausted` must report `true` on that
+    /// step, so the decode loop breaks instead of attempting a next decode.
+    ///
+    /// Mutation sensitivity: seeding the reasoning-end position from anything
+    /// other than the first token's own generated length (e.g. leaving it
+    /// unset when the first token already closed the block) makes
+    /// `answer_budget_exhausted` stay `false` here, and the assertion fails.
+    #[test]
+    fn answer_budget_exhausts_on_the_terminal_token_with_no_next_decode_expected() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(1),
+            enable_thinking: true,
+            max_new_tokens: 1,
+            ..GenerateConfig::default()
+        };
+        let close_id = 7u32;
+        let sampled_id = 3u32;
+
+        let mut token_logprobs = Vec::new();
+        let mut policy = DecodePolicy::init(
+            &gen_cfg,
+            Some(close_id),
+            &mut token_logprobs,
+            /* first_emitted_id */ close_id,
+            &[],
+            0.0,
+            /* first_generated_len */ 1,
+            false,
+        );
+
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let outcome = policy.transition(
+            &mut token_logprobs,
+            sampled_id,
+            &[],
+            0.0,
+            /* generated_len_before */ 1,
+            |_next_id| true,
+            |_next_id| false,
+            |_next_id| {},
+            |_next_id| String::new(),
+            &mut text,
+            &mut offsets,
+            |_delta, _next_id| true,
+        );
+
+        match outcome {
+            StepOutcome::Emitted {
+                answer_budget_exhausted,
+                ..
+            } => assert!(
+                answer_budget_exhausted,
+                "one answer token after an already-closed block must exhaust a \
+                 max_new_tokens: 1 answer budget on this same step"
+            ),
+            _ => panic!("unexpected outcome for the terminal answer token"),
+        }
+    }
+
+    /// The ordinary case: a reasoning budget nowhere near exhaustion must
+    /// leave every step's outcome and logprob untouched by the override
+    /// machinery — the positive baseline the refusal tests above are
+    /// contrasted against.
+    #[test]
+    fn transition_leaves_an_unspent_reasoning_budget_inert() {
+        let gen_cfg = GenerateConfig {
+            reasoning_budget: Some(1_000),
+            enable_thinking: true,
+            logprobs: Some(0),
+            ..GenerateConfig::default()
+        };
+        let close_id = 7u32;
+        let sampled_id = 3u32;
+        let logits = [0.0f32; 10];
+
+        let mut token_logprobs = Vec::new();
+        let mut policy = DecodePolicy::init(
+            &gen_cfg,
+            Some(close_id),
+            &mut token_logprobs,
+            /* first_emitted_id */ 1,
+            &logits,
+            0.0,
+            /* first_generated_len */ 1,
+            false,
+        );
+
+        let mut text = String::new();
+        let mut offsets = Vec::new();
+        let outcome = policy.transition(
+            &mut token_logprobs,
+            sampled_id,
+            &logits,
+            0.0,
+            /* generated_len_before */ 1,
+            |_next_id| true,
+            |_next_id| false,
+            |_next_id| {},
+            |_next_id| String::new(),
+            &mut text,
+            &mut offsets,
+            |_delta, _next_id| true,
+        );
+
+        match outcome {
+            StepOutcome::Emitted { token_id, .. } => assert_eq!(
+                token_id, sampled_id,
+                "far from budget exhaustion, the sampled token must pass through unmodified"
+            ),
+            _ => panic!("unexpected outcome for an ordinary, budget-unspent step"),
+        }
+        assert_eq!(
+            token_logprobs.len(),
+            2,
+            "one entry from init's first token, one from this transition"
+        );
+        assert_eq!(token_logprobs[1].token_id, sampled_id);
+    }
+
+    // -----------------------------------------------------------------------
     // generate_streaming_with_cancel mutation-sensitive tests (ADR-080 C2, #744)
     // -----------------------------------------------------------------------
     //

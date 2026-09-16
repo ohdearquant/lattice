@@ -2150,11 +2150,15 @@ mod inner {
         pub prefill_kv_batch: AtomicU64,
         pub prefill_attn_batched: AtomicU64,
         pub prefill_hidden_readback: AtomicU64,
+        pub prefill_full_vocab_logit_readback: AtomicU64,
+        pub prefill_compact_candidate_logit_readback: AtomicU64,
         pub decode_kv_copy: AtomicU64,
         pub decode_attn_direct: AtomicU64,
         pub decode_attn_split_partial: AtomicU64,
         pub decode_attn_split_reduce: AtomicU64,
         pub decode_hidden_readback: AtomicU64,
+        pub decode_full_vocab_logit_readback: AtomicU64,
+        pub decode_compact_candidate_logit_readback: AtomicU64,
     }
 
     impl PathProofCounters {
@@ -2162,11 +2166,19 @@ mod inner {
             self.prefill_kv_batch.store(0, Ordering::Relaxed);
             self.prefill_attn_batched.store(0, Ordering::Relaxed);
             self.prefill_hidden_readback.store(0, Ordering::Relaxed);
+            self.prefill_full_vocab_logit_readback
+                .store(0, Ordering::Relaxed);
+            self.prefill_compact_candidate_logit_readback
+                .store(0, Ordering::Relaxed);
             self.decode_kv_copy.store(0, Ordering::Relaxed);
             self.decode_attn_direct.store(0, Ordering::Relaxed);
             self.decode_attn_split_partial.store(0, Ordering::Relaxed);
             self.decode_attn_split_reduce.store(0, Ordering::Relaxed);
             self.decode_hidden_readback.store(0, Ordering::Relaxed);
+            self.decode_full_vocab_logit_readback
+                .store(0, Ordering::Relaxed);
+            self.decode_compact_candidate_logit_readback
+                .store(0, Ordering::Relaxed);
         }
     }
 
@@ -2188,6 +2200,21 @@ mod inner {
     pub struct HiddenReadbackPathProofSnapshot {
         pub decode: u64,
         pub prefill: u64,
+    }
+
+    /// Explicit vocabulary-logit-readback counts recorded by the Metal path-proof
+    /// probe, split by shape: a full-vocab readback (`vocab_size` f32 values) versus
+    /// a compact-candidate readback (the top-k shortlist only). These are separate
+    /// dispatch sites in [`MetalQwen35State`] from the hidden-state readback counted
+    /// by [`HiddenReadbackPathProofSnapshot`] — a request eligible for the compact
+    /// path that instead takes the full-vocab path changes this snapshot's shape
+    /// without changing that one's.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LogitReadbackPathProofSnapshot {
+        pub decode_full_vocab: u64,
+        pub decode_compact_candidate: u64,
+        pub prefill_full_vocab: u64,
+        pub prefill_compact_candidate: u64,
     }
 
     // ---------------------------------------------------------------------------
@@ -3665,9 +3692,9 @@ mod inner {
         /// Zeroes the Metal path-proof counters.
         ///
         /// Call before a one-shot `generate`/`generate_streaming` run so
-        /// [`Self::path_proof_snapshot`] and
-        /// [`Self::hidden_readback_path_proof_snapshot`] afterward reflect only
-        /// that run's dispatches and explicit hidden readbacks.
+        /// [`Self::path_proof_snapshot`], [`Self::hidden_readback_path_proof_snapshot`],
+        /// and [`Self::logit_readback_path_proof_snapshot`] afterward reflect only
+        /// that run's dispatches, explicit hidden readbacks, and logit readbacks.
         pub fn reset_path_proof_counters(&self) {
             self.path_proof.reset();
         }
@@ -3702,6 +3729,31 @@ mod inner {
                 prefill: self
                     .path_proof
                     .prefill_hidden_readback
+                    .load(Ordering::Relaxed),
+            }
+        }
+
+        /// Snapshots explicit vocabulary-logit-readback path-proof counters (full-vocab
+        /// vs compact-candidate, decode and prefill) without resetting them. See
+        /// [`LogitReadbackPathProofSnapshot`] for why this is a separate instrument from
+        /// [`Self::hidden_readback_path_proof_snapshot`].
+        pub fn logit_readback_path_proof_snapshot(&self) -> LogitReadbackPathProofSnapshot {
+            LogitReadbackPathProofSnapshot {
+                decode_full_vocab: self
+                    .path_proof
+                    .decode_full_vocab_logit_readback
+                    .load(Ordering::Relaxed),
+                decode_compact_candidate: self
+                    .path_proof
+                    .decode_compact_candidate_logit_readback
+                    .load(Ordering::Relaxed),
+                prefill_full_vocab: self
+                    .path_proof
+                    .prefill_full_vocab_logit_readback
+                    .load(Ordering::Relaxed),
+                prefill_compact_candidate: self
+                    .path_proof
+                    .prefill_compact_candidate_logit_readback
                     .load(Ordering::Relaxed),
             }
         }
@@ -6382,6 +6434,11 @@ mod inner {
                 let logits = if !run_head || skip_logits_readback {
                     vec![]
                 } else if let Some(which) = topk_which_inner {
+                    if self.path_proof_enabled {
+                        self.path_proof
+                            .decode_compact_candidate_logit_readback
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let _signpost_host_read = crate::forward::signpost::interval_in(
                         signpost_scope,
                         crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6391,6 +6448,11 @@ mod inner {
                     self.session.compact_result = candidates;
                     vec![]
                 } else {
+                    if self.path_proof_enabled {
+                        self.path_proof
+                            .decode_full_vocab_logit_readback
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     let _signpost_host_read = crate::forward::signpost::interval_in(
                         signpost_scope,
                         crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6559,6 +6621,11 @@ mod inner {
             } else if let Some(which) = topk_which {
                 // Compact path: read k*(f32+u32)=k*8 bytes instead of vocab*4 bytes.
                 // SAFETY: GPU completed, buffers are StorageModeShared.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_compact_candidate_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let _signpost_host_read = crate::forward::signpost::interval_in(
                     signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -6570,6 +6637,11 @@ mod inner {
             } else {
                 // Full path: read vocab_size f32 logits back to host.
                 // SAFETY: GPU completed, buffer is StorageModeShared.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .decode_full_vocab_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let _signpost_host_read = crate::forward::signpost::interval_in(
                     signpost_scope,
                     crate::forward::signpost::Label::DecodeHostScalarRead,
@@ -8275,9 +8347,19 @@ mod inner {
 
             if let Some(pb) = ppl_buf {
                 // SAFETY: GPU completed, ppl_buf is StorageModeShared and sized n*vocab.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .prefill_full_vocab_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 unsafe { read_buffer(&pb, n * cfg.vocab_size) }
             } else if let Some(which) = topk_which {
                 // SAFETY: GPU completed, buffers are StorageModeShared.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .prefill_compact_candidate_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let k = self.session.compact_topk;
                 let candidates = unsafe { self.read_topk_candidates(which, k) };
                 self.session.compact_result = candidates;
@@ -8285,6 +8367,11 @@ mod inner {
             } else {
                 // SAFETY: The command buffer has completed and logits is a
                 // StorageModeShared buffer sized for vocab_size f32 values.
+                if self.path_proof_enabled {
+                    self.path_proof
+                        .prefill_full_vocab_logit_readback
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
             }
         }
@@ -39457,8 +39544,8 @@ mod gdn_state_traffic_tests {
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub use inner::{
     ChatCompletionOutput, HiddenReadbackPathProofSnapshot, LayerImportanceScore, LayerPruningPlan,
-    LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord, PathProofSnapshot,
-    arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
+    LogitReadbackPathProofSnapshot, LoraLayerData, MetalQwen35State, MoeRoutingTraceRecord,
+    PathProofSnapshot, arm_moe_routing_trace, blend_lora_layer_data, dump_moe_routing_trace_jsonl,
     take_moe_routing_trace,
 };
 
