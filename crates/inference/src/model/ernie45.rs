@@ -427,8 +427,10 @@ fn softmax_row_fail_closed(row: &mut [f32]) {
 /// Reference layout (`apply_multimodal_rotary_pos_emb`): `mrope_section`
 /// is repeated twice to cover the stride-half pairing (lane `j` pairs with
 /// `j + head_dim/2`, so both lanes of a pair must rotate by the same
-/// angle), and lane `i` of the half dimension gathers the cos/sin of
-/// position row `i % 3` over the tripled pattern `[t, h, w]`. With the
+/// angle), and the cos/sin table is split on that doubled section list into
+/// six chunks, chunk `i` taken from position row `i % 3` over the pattern
+/// `[t, h, w]`. That `i` indexes chunks, not lanes: one chunk is a whole
+/// section, so lane 1 reads `t` like lane 0 and not `h`. With the
 /// pinned section `[16, 24, 24]` doubled, lanes 0..15 read `t`, 16..39
 /// read `h`, 40..63 read `w`, and the pattern repeats for lanes 64..127 —
 /// identical angles at `j` and `j + 64`, so `gemma4_apply_rope`'s
@@ -443,8 +445,9 @@ fn mrope_cos_sin_table(cfg: &Ernie45Config, positions: &[[u32; 3]]) -> (Vec<f32>
     let half = head_dim / 2;
     // Lane -> position-row map: the half dimension's `mrope_section`
     // (`[16, 24, 24]` pinned) is repeated twice to cover the stride-half
-    // pairing, so lane `j` reads position row `j`'s section index —
-    // `t, h, w, t, h, w` over the 128 lanes — and always uses frequency
+    // pairing, so lane `j` reads the position row of the section it falls
+    // in — six section-sized blocks running `t, h, w, t, h, w` across the
+    // 128 lanes, not one row per lane — and always uses frequency
     // `j % half`. The repetition is what keeps paired lanes `j` and
     // `j + half` on the same row.
     let mut lane_row = vec![0usize; head_dim];
