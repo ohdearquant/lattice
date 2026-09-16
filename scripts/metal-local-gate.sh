@@ -16,6 +16,15 @@
 # box. Locally the lib arm is scoped to the module a serving change can reach
 # and to one thread, which is seconds rather than tens of gigabytes.
 #
+# THE BOUND IS ABOUT THE SUITE, NOT THE FLAG, and that correction is here because
+# the first version of this header got it wrong. `--lib` is one door to those
+# oracle tests; `cargo test --workspace` is another, and it was walked through on
+# this machine fifteen minutes after the `--lib` bound was written, reaching 31 GB
+# and closing admission fleet-wide a second time. `--workspace`, `--all-targets`
+# on a test command, and a bare `cargo test -p lattice-inference` all reach them.
+# On this kind of host, run a NAMED test or a scoped module, never a suite whose
+# membership you have not enumerated.
+#
 # Run this under whatever machine-wide build lock your environment uses; this
 # script takes none of its own.
 #
