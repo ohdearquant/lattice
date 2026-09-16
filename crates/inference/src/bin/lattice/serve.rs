@@ -1653,6 +1653,133 @@ pub async fn embeddings(
 }
 
 // -----------------------------------------------------------------------
+// Runtime LoRA adapter control (Ocean 2026-09-16)
+// -----------------------------------------------------------------------
+
+/// Why this server cannot take an adapter.
+///
+/// Adapter loading is a Metal-engine capability: the single-slot adapter API lives
+/// on `MetalQwen35State` and there is no CPU equivalent, so a CPU-backed server, or
+/// a build without Metal at all, refuses rather than pretending. The refusal is a
+/// 400 naming the condition, the same shape `/v1/embeddings` uses when the loaded
+/// checkpoint cannot serve it: the route exists, and its unavailability is a
+/// discoverable server state rather than a bare 404.
+fn lora_unsupported_backend(message: &'static str) -> ApiError {
+    ApiError::BadRequest {
+        message: message.to_string(),
+        code: "lora_unsupported_backend",
+    }
+}
+
+/// The Metal worker client behind a Metal-backed server, or the refusal above.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn adapter_client(
+    state: &AppState,
+) -> Result<&lattice_inference::serve::metal_worker::MetalWorkerClient, ApiError> {
+    match &state.model {
+        ModelBackend::Metal { handle, .. } => Ok(&handle.client),
+        _ => Err(lora_unsupported_backend(
+            "runtime LoRA adapters require the Metal backend; restart this server with a \
+             Metal Q4 checkpoint to enable this route",
+        )),
+    }
+}
+
+/// The refusal a build without Metal owes every adapter request.
+#[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+fn adapter_unsupported_build() -> ApiError {
+    lora_unsupported_backend(
+        "this server was built without Metal support; runtime LoRA adapters require a macOS \
+         Metal build",
+    )
+}
+
+/// `POST /v1/lora/load`: load a PEFT or MLX LoRA adapter onto the running model.
+///
+/// Everything that is not axum plumbing lives in
+/// [`lattice_inference::serve::lora`], shared with the `lattice_serve` binary's route
+/// of the same name. The adapter file is read and parsed on this request's own task,
+/// off the worker thread, so a malformed file costs the worker nothing and the caller
+/// gets the parse error directly.
+///
+/// Deployment boundary: the request names a filesystem path that this process reads,
+/// and this server has no authentication, so on a non-loopback `--host` the route
+/// lets anyone who can reach the port make the server open a file of their choosing.
+pub async fn lora_load(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Body,
+) -> Result<Response, ApiError> {
+    lattice_inference::serve::require_json_content_type(&headers)?;
+    let bytes = axum::body::to_bytes(body, REQUEST_BODY_LIMIT_BYTES)
+        .await
+        .map_err(|err| {
+            eprintln!("invalid request body: {err}");
+            ApiError::BadRequest {
+                message: "invalid JSON request body".to_string(),
+                code: "invalid_request_body",
+            }
+        })?;
+    let path = lattice_inference::serve::lora::parse_lora_load_path(&bytes)?;
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        let client = adapter_client(&state)?;
+        let prepared = lattice_inference::serve::lora::prepare_adapter_load(&path)?;
+        let (rank, layers) = (prepared.rank, prepared.layers);
+        let receiver = client.submit_adapter_command(prepared.command)?;
+        match receiver.await {
+            Ok(Ok(())) => Ok(Json(lattice_inference::serve::lora::load_success_body(
+                &path, rank, layers,
+            ))
+            .into_response()),
+            Ok(Err(message)) => {
+                let code = lattice_inference::serve::lora::adapter_failure_code(&message);
+                Err(ApiError::BadRequest { message, code })
+            }
+            Err(_) => Err(lattice_inference::serve::lora::worker_unavailable(
+                "the inference worker is not running; the adapter was not loaded",
+            )),
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        let _ = (&state, path);
+        Err(adapter_unsupported_build())
+    }
+}
+
+/// `POST /v1/lora/unload`: drop the currently-loaded adapter. A no-op when none is
+/// loaded, which is the worker's own contract, so this is idempotent by construction
+/// rather than by a state read the caller could race.
+pub async fn lora_unload(State(state): State<AppState>) -> Result<Response, ApiError> {
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    {
+        let client = adapter_client(&state)?;
+        let receiver = client.submit_adapter_command(
+            lattice_inference::serve::metal_worker::AdapterCommand::Unload,
+        )?;
+        match receiver.await {
+            Ok(Ok(())) => {
+                Ok(Json(lattice_inference::serve::lora::unload_success_body()).into_response())
+            }
+            Ok(Err(message)) => {
+                let code = lattice_inference::serve::lora::adapter_failure_code(&message);
+                Err(ApiError::BadRequest { message, code })
+            }
+            Err(_) => Err(lattice_inference::serve::lora::worker_unavailable(
+                "the inference worker is not running; no adapter was unloaded",
+            )),
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+    {
+        let _ = &state;
+        Err(adapter_unsupported_build())
+    }
+}
+
+// -----------------------------------------------------------------------
 // Router
 // -----------------------------------------------------------------------
 
@@ -1663,6 +1790,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/lora/load", post(lora_load))
+        .route("/v1/lora/unload", post(lora_unload))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
         .with_state(state)
 }
@@ -3401,6 +3530,115 @@ mod tests {
                 .await
                 .expect("response body must be readable");
             serde_json::from_slice(&bytes).expect("response body must be JSON")
+        }
+
+        // ── `/v1/lora/*` routes (runtime adapter load, Ocean 2026-09-16) ──
+        //
+        // These arms all return before a worker is ever reached, which is what a
+        // CPU-backed `tiny_state` can prove: that the routes exist, that the request
+        // contract is enforced, and that a server which cannot take an adapter says
+        // so instead of accepting one. The success path needs a live Metal engine and
+        // a real adapter file and is covered by the engine tests.
+
+        fn post_lora_load(body: &str) -> axum::http::Request<Body> {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/lora/load")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request fixture must build")
+        }
+
+        /// The route has to be registered on the router, not merely written: a
+        /// handler nobody routed to is a 404 that reads exactly like an unsupported
+        /// build. Both arms assert a non-404 status.
+        #[tokio::test]
+        async fn both_lora_routes_are_registered() {
+            let load = router(tiny_state(64))
+                .oneshot(post_lora_load(r#"{"path":"/tmp/a.safetensors"}"#))
+                .await
+                .expect("router must return a response");
+            assert_ne!(load.status(), StatusCode::NOT_FOUND);
+            let unload = router(tiny_state(64))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/lora/unload")
+                        .body(Body::empty())
+                        .expect("request fixture must build"),
+                )
+                .await
+                .expect("router must return a response");
+            assert_ne!(unload.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// A CPU-backed server cannot load an adapter: the single-slot adapter API
+        /// is a Metal-engine capability. Refusing with a named code is the whole
+        /// point -- accepting the request and doing nothing would report a loaded
+        /// adapter that is not loaded.
+        #[tokio::test]
+        async fn a_cpu_backend_refuses_an_adapter_by_name() {
+            let response = router(tiny_state(64))
+                .oneshot(post_lora_load(r#"{"path":"/tmp/a.safetensors"}"#))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "lora_unsupported_backend"
+            );
+        }
+
+        #[tokio::test]
+        async fn lora_unload_on_a_cpu_backend_refuses_by_name() {
+            let response = router(tiny_state(64))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/lora/unload")
+                        .body(Body::empty())
+                        .expect("request fixture must build"),
+                )
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "lora_unsupported_backend"
+            );
+        }
+
+        #[tokio::test]
+        async fn lora_load_without_json_content_type_is_415() {
+            let response = router(tiny_state(64))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/v1/lora/load")
+                        .body(Body::from(r#"{"path":"/tmp/a.safetensors"}"#))
+                        .expect("request fixture must build"),
+                )
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+
+        /// Request-contract failures are answered before the backend question, so
+        /// this arm distinguishes itself from `lora_unsupported_backend` on the same
+        /// CPU state: a malformed body is the caller's error whatever the backend is.
+        #[tokio::test]
+        async fn lora_load_rejects_an_unknown_field_before_asking_the_backend() {
+            let response = router(tiny_state(64))
+                .oneshot(post_lora_load(
+                    r#"{"path":"/tmp/a.safetensors","scale":2.0}"#,
+                ))
+                .await
+                .expect("router must return a response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                json_body(response).await["error"]["code"],
+                "invalid_request"
+            );
         }
 
         #[tokio::test]

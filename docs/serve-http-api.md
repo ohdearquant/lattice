@@ -518,6 +518,69 @@ backend already holds in memory, at roughly 2 bytes per checkpoint parameter, so
 memory to grow by roughly that much. If the loaded model directory has no vision config, this extra
 load is skipped entirely and only the chat backend stays resident.
 
+## `POST /v1/lora/load` and `POST /v1/lora/unload`
+
+Load a LoRA adapter onto the running model without restarting the server, and drop it again. Both
+routes exist on `lattice serve` and on the standalone `lattice_serve` binary, and both take the
+Metal backend only: the engine's adapter slot lives on the Metal state and there is no CPU
+equivalent, so a CPU-backed server answers 400 `lora_unsupported_backend` rather than accepting a
+request it cannot honor.
+
+```bash
+curl http://127.0.0.1:8080/v1/lora/load \
+  -H "Content-Type: application/json" \
+  -d '{"path": "/path/to/adapter.safetensors"}'
+```
+
+```json
+{
+  "object": "lora.adapter",
+  "status": "loaded",
+  "path": "/path/to/adapter.safetensors",
+  "rank": 8,
+  "layers": 24
+}
+```
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/lora/unload
+```
+
+```json
+{ "object": "lora.adapter", "status": "unloaded" }
+```
+
+The adapter file is a PEFT or MLX LoRA safetensors export. Rank comes from the adapter's own tensor
+shapes; scale comes from `alpha` in the file's `__metadata__` section, falling back to `alpha = rank`
+(scale 1.0) when the file carries no metadata. `layers` in the response counts the adapter layers
+that were loaded, not the model's layer count.
+
+Notes on the request and the state it changes:
+
+- `path` is the only accepted field, and it must be a non-empty string. Any other field is refused
+  with 400 `invalid_request` rather than ignored: a caller sending `scale` is asking for something
+  this route does not do, and silently dropping it would load the adapter at a scale nobody asked
+  for.
+- The engine holds one adapter at a time and has no swap command. Loading while one is already
+  loaded is 400 with code `lora_adapter_already_loaded`; unload first, then load. That code is the
+  discriminator to branch on, because the shared error envelope has no conflict status.
+- `unload` with no adapter loaded succeeds. It is idempotent by construction rather than by a state
+  read the caller could race.
+- The file is read and parsed on the request's own task, before the engine is touched, so a
+  malformed adapter never reaches the worker. A path that does not exist is 400
+  `lora_adapter_not_found`; a file that exists and fails to parse or validate is 400
+  `lora_load_failed` carrying the loader's own message.
+- If the engine worker is not running, both routes answer 503 (`server_busy`) rather than reporting
+  a success that never happened.
+- Requests in flight are not synchronized against the adapter change. The command is queued to the
+  same worker that runs generation, so it takes effect between jobs, and a generation already
+  under way finishes on the adapter it started with.
+
+Security note, and it is the same one the rest of this document carries: these routes are
+unauthenticated like every other route here, and this one names a filesystem path that the server
+process opens. On a non-loopback `--host` that lets anyone who can reach the port make the server
+read a file of their choosing. Run it on loopback, or behind your own authenticating proxy.
+
 ## Context window and token-budget limits
 
 `lattice serve` enforces a **hardcoded `max_tokens_cap` of 4096** — this is not a CLI flag; it's a
@@ -579,8 +642,9 @@ message content. There is no requirement to strip reasoning blocks between turns
 ## Summary
 
 - `lattice serve` (not the separate `lattice_serve` binary) is the OpenAI-compatible server this
-  document covers: `GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`, and
-  `POST /v1/embeddings` (see above; the last requires a vision-language checkpoint at startup).
+  document covers: `GET /`, `GET /health`, `GET /v1/models`, `POST /v1/chat/completions`,
+  `POST /v1/embeddings` (see above; that one requires a vision-language checkpoint at startup), and
+  `POST /v1/lora/load` / `POST /v1/lora/unload` (Metal backend only).
   The standalone `lattice_serve` binary also carries a `POST /v1/embeddings` route (issue #584),
   through a separately loaded `--embedding-model` `BertModel` -- see the "Both binaries also have
   a `POST /v1/embeddings` route" note above and [`docs/capability-matrix.md`](capability-matrix.md).
