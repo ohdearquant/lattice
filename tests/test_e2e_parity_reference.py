@@ -252,6 +252,26 @@ class FrozenReferenceLoaderRefusalTest(unittest.TestCase):
             "prompts": [],
         }
 
+    FIXTURE_INSTALLED_VERSION = "9.9.9+fixture"
+
+    def _patched_installed(self):
+        """Own the installed side of the comparison under test.
+
+        Both provenance tests below read the real environment, so they ran only
+        where torch and transformers happen to be installed and ERRORED
+        everywhere else, this repo's own no-engine job included. Their subject
+        is the recorded-vs-installed comparison inside the loader, not which
+        packages the host has, so the installed side belongs to the test.
+        """
+        return unittest.mock.patch.object(
+            PARITY,
+            "installed_reference_versions",
+            lambda: {
+                pkg: self.FIXTURE_INSTALLED_VERSION
+                for pkg in PARITY.REFERENCE_PACKAGES
+            },
+        )
+
     def test_wrong_package_version_refuses_on_provenance_alone(self):
         """Isolates the provenance check.
 
@@ -264,20 +284,24 @@ class FrozenReferenceLoaderRefusalTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "prov.json"
             p.write_text(json.dumps(self._schema_valid_fixture(bogus)))
-            with self.assertRaisesRegex(RuntimeError, "package version mismatch for"):
-                self._load_with(p)
+            with self._patched_installed():
+                with self.assertRaisesRegex(
+                    RuntimeError, "package version mismatch for"
+                ):
+                    self._load_with(p)
 
     def test_missing_package_entry_refuses_on_provenance_alone(self):
         """Same isolation, for an incomplete rather than wrong provenance set."""
-        installed = PARITY.installed_reference_versions()
         partial = {
-            pkg: installed[pkg] for pkg in PARITY.REFERENCE_PACKAGES[:-1]
+            pkg: self.FIXTURE_INSTALLED_VERSION
+            for pkg in PARITY.REFERENCE_PACKAGES[:-1]
         }
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "partial.json"
             p.write_text(json.dumps(self._schema_valid_fixture(partial)))
-            with self.assertRaisesRegex(RuntimeError, "must name exactly"):
-                self._load_with(p)
+            with self._patched_installed():
+                with self.assertRaisesRegex(RuntimeError, "must name exactly"):
+                    self._load_with(p)
 
     def test_frozen_loader_failure_never_falls_back_to_live_hf(self):
         with tempfile.TemporaryDirectory() as d:
