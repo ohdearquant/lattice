@@ -100,6 +100,7 @@ paths = [
     "crates/inference/examples/layer_sweep.rs",
     "crates/inference/examples/profile_metal.rs",
     "crates/inference/examples/profile_metal_decode.rs",
+    "crates/inference/examples/rss_autorelease_probe.rs",
 ]
 
 [[excluded_surface]]
