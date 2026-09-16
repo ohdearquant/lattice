@@ -402,5 +402,10 @@ name = "f16_convert_bench"
 harness = false
 required-features = ["bench-internals"]
 
+[[bench]]
+name = "metal_forward_allocation_bench"
+harness = false
+required-features = ["metal-gpu", "f16"]
+
 [lints]
 workspace = true
