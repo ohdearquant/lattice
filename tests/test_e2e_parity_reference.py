@@ -124,10 +124,6 @@ class CandidateSelectionEvidenceTest(unittest.TestCase):
         self.assertIn(runbook, workflow)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def gen(tokens, text="", tok_per_sec=1.0):
     return {
         "generated_ids": tokens,
@@ -304,6 +300,97 @@ class FrozenReferenceLoaderRefusalTest(unittest.TestCase):
             ):
                 self.assertEqual(PARITY.main(), 2)
                 run_hf.assert_not_called()
+
+
+def verdict_row(passed, xfail_issue=None):
+    row = {
+        "prompt": "p",
+        "pass": passed,
+        "match_window": 3,
+        "agree_rate": 1.0 if passed else 0.0,
+        "total_agree": 3 if passed else 0,
+        "total_compared": 3,
+        "first_mismatch": None if passed else 0,
+        "hf_tok_s": 1.0,
+        "lat_tok_s": 1.0,
+        "hf_text": "",
+        "lat_text": "",
+    }
+    if xfail_issue is not None:
+        row["xfail_issue"] = xfail_issue
+    return row
+
+
+class EmptyGatingSetTest(unittest.TestCase):
+    """A waiver is not coverage, and a table of waivers is not a pass.
+
+    The expected-divergence map is meant to grow one tracked issue at a time.
+    Nothing noticed when it covered the whole prompt table: every remaining
+    branch reported PASS and the process exited 0, so the gate announced parity
+    over a population of zero.
+    """
+
+    def test_all_waived_refuses_instead_of_passing(self):
+        rows = [verdict_row(False, "#535") for _ in range(4)]
+
+        report = PARITY.render_report(rows)
+
+        self.assertIn("NO GATING PROMPT", report)
+        self.assertNotIn("PASS", report)
+
+    def test_a_waived_prompt_that_passed_is_still_not_gating(self):
+        """Excluded in BOTH directions, which is where the old count leaked.
+
+        `len(results) - len(known)` counted only the waived prompts that
+        DIVERGED, so a waived prompt that happened to match was reported as a
+        gating prompt that passed.
+        """
+        rows = [verdict_row(True), verdict_row(True), verdict_row(True, "#535")]
+
+        self.assertEqual(len(PARITY.gating_results(rows)), 2)
+
+    def test_empty_gating_reason_claims_only_the_cases_it_owns(self):
+        self.assertIsNone(
+            PARITY.empty_gating_reason([verdict_row(True), verdict_row(False, "#535")])
+        )
+        self.assertIsNotNone(PARITY.empty_gating_reason([]))
+        self.assertIsNotNone(
+            PARITY.empty_gating_reason([verdict_row(False, "#535")])
+        )
+
+
+class SuiteIsWholeWhenRunAsAScriptTest(unittest.TestCase):
+    """This module used to execute 5 of its 18 tests and print OK.
+
+    A second `if __name__ == "__main__": unittest.main()` sat in the middle of
+    the file, so running it the way the workflow runs its siblings stopped
+    there: the classes defined below that line were never defined, and the
+    truncated run exited 0. Measured 5 as a script against 18 under
+    `python -m unittest` before removing it.
+
+    An AST scan of all 26 test modules found no second instance, with the
+    pre-fix copy of this file used as the positive control for the scan.
+
+    This guard cannot catch the defect in the mode that has it: a stray
+    mid-file guard truncates the run before this class is defined, so as a
+    script it would pass by not existing. That is why the workflow invokes
+    this module as `python3 -m unittest`, where `__name__` is never
+    `__main__` and no guard can truncate anything. The guard below is the
+    backstop for anyone running the file directly.
+    """
+
+    def test_exactly_one_main_guard_and_it_is_last(self):
+        import ast
+
+        tree = ast.parse(Path(__file__).read_text())
+        guards = [
+            index
+            for index, node in enumerate(tree.body)
+            if isinstance(node, ast.If) and "__main__" in ast.dump(node.test)
+        ]
+
+        self.assertEqual(len(guards), 1)
+        self.assertEqual(guards[0], len(tree.body) - 1)
 
 
 if __name__ == "__main__":
