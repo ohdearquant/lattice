@@ -14886,26 +14886,237 @@ mod inner {
             );
         }
 
+        fn production_module_coverage(
+            root: &str,
+            sources: &[(&str, &str)],
+        ) -> Result<std::collections::BTreeSet<String>, String> {
+            use std::collections::{BTreeMap, BTreeSet};
+            use std::path::PathBuf;
+            use syn::visit::Visit;
+
+            struct Modules {
+                directory: PathBuf,
+                external: Vec<[String; 2]>,
+                unsupported: Vec<String>,
+            }
+
+            impl<'ast> Visit<'ast> for Modules {
+                fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+                    if module.attrs.iter().any(|attr| {
+                        attr.path().is_ident("cfg")
+                            && attr
+                                .parse_args::<syn::Path>()
+                                .is_ok_and(|path| path.is_ident("test"))
+                    }) {
+                        return;
+                    }
+                    let directory = self.directory.join(module.ident.to_string());
+                    if module.attrs.iter().any(|attr| {
+                        attr.path().is_ident("path") || attr.path().is_ident("cfg_attr")
+                    }) {
+                        self.unsupported.push(directory.display().to_string());
+                        return;
+                    }
+                    if module.content.is_some() {
+                        let previous = std::mem::replace(&mut self.directory, directory);
+                        syn::visit::visit_item_mod(self, module);
+                        self.directory = previous;
+                    } else {
+                        self.external.push([
+                            directory.with_extension("rs").display().to_string(),
+                            directory.join("mod.rs").display().to_string(),
+                        ]);
+                    }
+                }
+            }
+
+            let included: BTreeMap<_, _> = sources.iter().copied().collect();
+            if included.len() != sources.len() {
+                return Err("duplicate included production module path".into());
+            }
+            let mut pending = vec![root.to_owned()];
+            let mut covered = BTreeSet::new();
+            while let Some(path) = pending.pop() {
+                if !covered.insert(path.clone()) {
+                    continue;
+                }
+                let source = included
+                    .get(path.as_str())
+                    .ok_or_else(|| format!("missing included production module: {path}"))?;
+                let syntax = syn::parse_file(source)
+                    .map_err(|error| format!("cannot parse production module {path}: {error}"))?;
+                let mut directory = PathBuf::from(&path);
+                if directory.file_name().is_some_and(|name| name == "mod.rs") {
+                    directory.pop();
+                } else {
+                    directory.set_extension("");
+                }
+                let mut modules = Modules {
+                    directory,
+                    external: Vec::new(),
+                    unsupported: Vec::new(),
+                };
+                modules.visit_file(&syntax);
+                if !modules.unsupported.is_empty() {
+                    return Err(format!(
+                        "production module path/cfg_attr requires explicit resolution: {:?}",
+                        modules.unsupported
+                    ));
+                }
+                for candidates in modules.external {
+                    let matches: Vec<_> = candidates
+                        .iter()
+                        .filter(|candidate| included.contains_key(candidate.as_str()))
+                        .collect();
+                    match matches.as_slice() {
+                        [path] => pending.push((*path).clone()),
+                        [] => {
+                            return Err(format!(
+                                "missing included production module: {} or {} (declared in {path})",
+                                candidates[0], candidates[1]
+                            ));
+                        }
+                        _ => {
+                            return Err(format!(
+                                "ambiguous included production module: {} and {}",
+                                candidates[0], candidates[1]
+                            ));
+                        }
+                    }
+                }
+            }
+            let unused: Vec<_> = included
+                .keys()
+                .filter(|path| !covered.contains(**path))
+                .collect();
+            if !unused.is_empty() {
+                return Err(format!(
+                    "included sources are not production modules: {unused:?}"
+                ));
+            }
+            Ok(covered)
+        }
+
         #[test]
         fn retired_closed_call_chains_stay_deleted() {
-            let src = include_str!("metal_qwen35.rs");
+            let fixture = [
+                (
+                    "root.rs",
+                    r#"
+                        // mod comment_decoy;
+                        const TEXT: &str = "mod string_decoy;";
+                        #[cfg(test)] mod tests { mod test_decoy; }
+                        #[cfg(test)] mod external_test_decoy;
+                        #[cfg(any(test, feature = "metal-gpu"))] mod weights;
+                        mod inner { pub(super) mod layers; }
+                    "#,
+                ),
+                ("root/weights.rs", ""),
+                ("root/inner/layers/mod.rs", "mod gqa;"),
+                ("root/inner/layers/gqa.rs", ""),
+            ];
+            assert_eq!(
+                production_module_coverage("root.rs", &fixture)
+                    .unwrap()
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                [
+                    "root.rs",
+                    "root/inner/layers/gqa.rs",
+                    "root/inner/layers/mod.rs",
+                    "root/weights.rs",
+                ]
+            );
+            let missing: Vec<_> = fixture
+                .iter()
+                .copied()
+                .filter(|(path, _)| *path != "root/weights.rs")
+                .collect();
+            let error = production_module_coverage("root.rs", &missing).unwrap_err();
+            assert!(error.contains("missing included production module: root/weights.rs"));
+            let mut extracted = fixture;
+            extracted[2].1 = "mod gqa; mod extracted;";
+            let error = production_module_coverage("root.rs", &extracted).unwrap_err();
+            assert!(error.contains("root/inner/layers/extracted.rs"));
+            let mut extra = fixture.to_vec();
+            extra.push(("root/tests/test_decoy.rs", ""));
+            let error = production_module_coverage("root.rs", &extra).unwrap_err();
+            assert!(error.contains("not production modules"));
+            assert!(error.contains("root/tests/test_decoy.rs"));
+            let mut ambiguous = fixture.to_vec();
+            ambiguous.push(("root/weights/mod.rs", ""));
+            let error = production_module_coverage("root.rs", &ambiguous).unwrap_err();
+            assert!(error.contains("ambiguous included production module: root/weights.rs"));
+            assert!(production_module_coverage("root.rs", &[]).is_err());
+            let error = production_module_coverage("root.rs", &[("root.rs", "mod")]).unwrap_err();
+            assert!(error.contains("cannot parse production module root.rs"));
+            let mut duplicate = fixture.to_vec();
+            duplicate.push(fixture[1]);
+            let error = production_module_coverage("root.rs", &duplicate).unwrap_err();
+            assert!(error.contains("duplicate included production module path"));
+            let error = production_module_coverage(
+                "root.rs",
+                &[("root.rs", "#[path = \"elsewhere.rs\"] mod child;")],
+            )
+            .unwrap_err();
+            assert!(error.contains("path/cfg_attr requires explicit resolution"));
+
+            // Written as explicit tuples, not a local macro: this file is scanned as
+            // text by tests/metal_measurement_lock_contract.rs, which refuses any macro
+            // it cannot classify in a test-bearing scope. `include_str!` it classifies.
+            let included_sources = [
+                ("metal_qwen35.rs", include_str!("metal_qwen35.rs")),
+                (
+                    "metal_qwen35/inner/dispatch.rs",
+                    include_str!("metal_qwen35/inner/dispatch.rs"),
+                ),
+                (
+                    "metal_qwen35/inner/gdn_state.rs",
+                    include_str!("metal_qwen35/inner/gdn_state.rs"),
+                ),
+                (
+                    "metal_qwen35/inner/layers/mod.rs",
+                    include_str!("metal_qwen35/inner/layers/mod.rs"),
+                ),
+                (
+                    "metal_qwen35/inner/layers/gdn.rs",
+                    include_str!("metal_qwen35/inner/layers/gdn.rs"),
+                ),
+                (
+                    "metal_qwen35/inner/layers/gqa.rs",
+                    include_str!("metal_qwen35/inner/layers/gqa.rs"),
+                ),
+                (
+                    "metal_qwen35/mtp_weights.rs",
+                    include_str!("metal_qwen35/mtp_weights.rs"),
+                ),
+            ];
+            let covered = production_module_coverage("metal_qwen35.rs", &included_sources)
+                .unwrap_or_else(|error| panic!("retirement guard population: {error}"));
+            eprintln!(
+                "retirement guard population: {} production sources",
+                covered.len()
+            );
+            let included_source = |path| {
+                included_sources
+                    .iter()
+                    .find_map(|(included, source)| (*included == path).then_some(*source))
+                    .unwrap_or_else(|| panic!("guard requires included source {path}"))
+            };
+            let src = included_source("metal_qwen35.rs");
             let production_end = src
                 .find("    mod tests {")
                 .expect("mod tests must exist in this file");
             let production_src = &src[..production_end];
-            let dispatch_src = include_str!("metal_qwen35/inner/dispatch.rs");
-            let gdn_state_src = include_str!("metal_qwen35/inner/gdn_state.rs");
-            let layers_src = include_str!("metal_qwen35/inner/layers/mod.rs");
-            let gdn_layer_src = include_str!("metal_qwen35/inner/layers/gdn.rs");
-            let gqa_layer_src = include_str!("metal_qwen35/inner/layers/gqa.rs");
-            let production_sources = [
-                production_src,
-                dispatch_src,
-                gdn_state_src,
-                layers_src,
-                gdn_layer_src,
-                gqa_layer_src,
-            ];
+            let layers_src = included_source("metal_qwen35/inner/layers/mod.rs");
+            let gqa_layer_src = included_source("metal_qwen35/inner/layers/gqa.rs");
+            let production_sources = included_sources.map(|(path, source)| {
+                if path == "metal_qwen35.rs" {
+                    production_src
+                } else {
+                    source
+                }
+            });
 
             for retired_declaration in [
                 concat!("fn full_attention_layer_step_by_", "idx("),
