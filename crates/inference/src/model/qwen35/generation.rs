@@ -2437,7 +2437,7 @@ pub(crate) fn resolve_reasoning_close_token(
 pub(crate) fn check_mtp_not_requested(gen_cfg: &GenerateConfig) -> Result<(), InferenceError> {
     let mtp_enabled = gen_cfg
         .enable_mtp
-        .unwrap_or_else(|| std::env::var("LATTICE_MTP").is_ok());
+        .unwrap_or_else(|| crate::env_switch_enabled("LATTICE_MTP"));
     if mtp_enabled {
         return Err(InferenceError::InvalidInput(
             "enable_mtp (or LATTICE_MTP) is not supported on the cross-turn \
