@@ -7,10 +7,9 @@ use super::stop_strings::{
 };
 use crate::attention::gdn::GatedDeltaNetState;
 use crate::error::InferenceError;
+use crate::generation::{GenerateConfig, GenerateOutput, TokenLogprob};
 use crate::grammar::pda::GrammarState;
-use crate::model::qwen35_config::{
-    GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob, decode_cap, force_close_think,
-};
+use crate::model::qwen35_config::{Qwen35Config, decode_cap, force_close_think};
 use crate::sampling::compute_step_logprobs;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
@@ -5322,7 +5321,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+        let gen_cfg = crate::generation::GenerateConfig {
             max_new_tokens,
             temperature: 0.0,
             repetition_penalty: 1.0,
@@ -5377,7 +5376,7 @@ mod tests {
         let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
             .expect("dense Qwen3.5 model should load successfully");
 
-        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+        let gen_cfg = crate::generation::GenerateConfig {
             max_new_tokens: 20,
             temperature: 0.0,
             repetition_penalty: 1.0,
@@ -5436,7 +5435,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+        let gen_cfg = crate::generation::GenerateConfig {
             max_new_tokens: 1,
             temperature: 0.0,
             repetition_penalty: 1.0,

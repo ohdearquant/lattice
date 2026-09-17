@@ -3,7 +3,7 @@
 //! Supports temperature scaling, top-k filtering, min-p filtering, top-p
 //! (nucleus) sampling, and repetition penalty.
 
-use crate::model::qwen35_config::{GenerateConfig, TopLogprob};
+use crate::generation::{GenerateConfig, TopLogprob};
 
 /// Greedy argmax over a dense `f32` logit slice, with **first-wins** tie-break
 /// (ADR-080 C3, #783).

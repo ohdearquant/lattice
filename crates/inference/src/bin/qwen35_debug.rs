@@ -37,7 +37,7 @@ fn main() {
     println!("Expected:  [760, 6511, 314, 9338, 369]");
 
     // Run generate with temperature 0 (greedy)
-    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    let mut gen_cfg = lattice_inference::GenerateConfig::default();
     gen_cfg.max_new_tokens = 16;
     gen_cfg.temperature = 0.0;
     gen_cfg.top_k = 1;

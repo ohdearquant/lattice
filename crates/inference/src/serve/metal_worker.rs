@@ -57,10 +57,9 @@ use crate::forward::metal_qwen35::{
     ChatMessage, LoraLayerData, MetalQwen35State, format_chat_template, push_chat_generation_open,
     push_chat_turn_close, push_chat_turn_open,
 };
+use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::kv_cache::CrossTurnSlotId;
-use crate::model::qwen35_config::{
-    GenerateConfig, GenerateOutput, Qwen35Config, VisionModelConfig,
-};
+use crate::model::qwen35_config::{Qwen35Config, VisionModelConfig};
 use crate::serve::ApiError;
 use crate::tokenizer::Tokenizer as _;
 use crate::tokenizer::bpe::BpeTokenizer;

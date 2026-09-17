@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tower::ServiceExt as _;
 
-use crate::model::qwen35_config::GenerateConfig;
+use crate::generation::GenerateConfig;
 
 /// Shared chat-completions wire DTO and normalization policies.
 pub mod contract;
@@ -1094,7 +1094,7 @@ pub struct ProductionAdapterObservation {
     pub prompt_tokens: usize,
     /// Whether the (canned) terminal outcome this capture's caller chose to
     /// report was an explicit stop condition (`true`) vs. exhausting the
-    /// token budget (`false`) -- mirrors [`GenerateOutput::stopped`](crate::model::qwen35_config::GenerateOutput::stopped) /
+    /// token budget (`false`) -- mirrors [`GenerateOutput::stopped`](crate::generation::GenerateOutput::stopped) /
     /// `Ev::Done`'s `stopped` field.
     pub stopped: bool,
 }

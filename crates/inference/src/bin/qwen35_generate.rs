@@ -82,7 +82,7 @@ fn main() {
     let load_ms = t0.elapsed().as_millis();
     println!("Model loaded in {load_ms}ms\n");
 
-    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    let mut gen_cfg = lattice_inference::GenerateConfig::default();
     gen_cfg.max_new_tokens = max_tokens;
     gen_cfg.seed = seed;
     if let Some(t) = temperature {
@@ -306,7 +306,7 @@ fn run_emit_phase_events(args: &[String]) -> i32 {
     // profile"): greedy, EOS disabled (forced fixed-length decode),
     // temperature 0 / top-k 1 / top-p 1 / repetition_penalty 1, thinking and
     // MTP off, no grammar, no string-level stops, no reasoning budget.
-    let mut base_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    let mut base_cfg = lattice_inference::GenerateConfig::default();
     base_cfg.max_new_tokens = max_tokens;
     base_cfg.seed = Some(seed);
     base_cfg.temperature = 0.0;

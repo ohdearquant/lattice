@@ -70,7 +70,7 @@ mod mtp_weights;
 fn mtp_route_active(
     mtp_present: bool,
     mtp_enabled: bool,
-    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+    gen_cfg: &crate::generation::GenerateConfig,
     use_compact: bool,
 ) -> bool {
     mtp_present
@@ -98,7 +98,7 @@ fn mtp_route_active(
 fn self_spec_route_active(
     gdn_checkpoints_present: bool,
     self_spec_env_set: bool,
-    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+    gen_cfg: &crate::generation::GenerateConfig,
     use_compact: bool,
     num_active_linear_attention_layers: usize,
 ) -> bool {
@@ -118,7 +118,7 @@ fn self_spec_route_active(
 #[cfg(test)]
 mod route_predicate_tests {
     use super::{mtp_route_active, self_spec_route_active};
-    use crate::model::qwen35_config::GenerateConfig;
+    use crate::generation::GenerateConfig;
 
     fn greedy_gen_cfg(stop_strings: Vec<String>) -> GenerateConfig {
         GenerateConfig {
@@ -524,12 +524,13 @@ mod inner {
     };
     use crate::attention::gdn::GatedDeltaNetState;
     use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
+    use crate::generation::{GenerateConfig, GenerateOutput, TokenLogprob};
     use crate::model::qwen35::stop_strings::StopStringMatcher;
     use crate::model::qwen35::{
         AttentionWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
         ModelWeights, prepare_generation,
     };
-    use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config, TokenLogprob};
+    use crate::model::qwen35_config::Qwen35Config;
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;
     use crate::tokenizer::common::Tokenizer;
@@ -4238,9 +4239,8 @@ mod inner {
             adapter_weights: &[(&[LoraLayerData], f32)],
             prompt: &str,
             tokenizer: &crate::tokenizer::BpeTokenizer,
-            gen_cfg: &crate::model::qwen35_config::GenerateConfig,
-        ) -> Result<crate::model::qwen35_config::GenerateOutput, crate::error::InferenceError>
-        {
+            gen_cfg: &crate::generation::GenerateConfig,
+        ) -> Result<crate::generation::GenerateOutput, crate::error::InferenceError> {
             if adapter_weights.is_empty() {
                 return Err(crate::error::InferenceError::InvalidInput(
                     "generate_with_lora_mixture: adapter_weights must not be empty".into(),
@@ -17742,7 +17742,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 );
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -18365,7 +18365,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let Some(_) = Device::system_default() else {
                 return;
             };
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (mut cfg, weights) = tiny_metal_qwen35_fixture();
@@ -24598,7 +24598,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_metal_qwen35_fixture();
@@ -29198,7 +29198,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -29231,7 +29231,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (mut cfg, weights) = tiny_metal_qwen35_fixture();
@@ -29270,7 +29270,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -29313,7 +29313,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -29355,7 +29355,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -29398,7 +29398,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = minimal_bpe_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -29462,7 +29462,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
 
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = minimal_bpe_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -29835,8 +29835,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         /// comfortably admits. If one of those guards fired first,
         /// `assert_moe_prefill_rejected` would see the wrong error variant and fail
         /// rather than pass on the wrong evidence.
-        fn moe_rejection_gen_cfg() -> crate::model::qwen35_config::GenerateConfig {
-            crate::model::qwen35_config::GenerateConfig {
+        fn moe_rejection_gen_cfg() -> crate::generation::GenerateConfig {
+            crate::generation::GenerateConfig {
                 max_new_tokens: 4,
                 temperature: 0.0,
                 top_k: 1,
@@ -29928,7 +29928,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
@@ -30004,7 +30004,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
@@ -30083,7 +30083,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = multibyte_vocab_tokenizer();
             let base_cfg = GenerateConfig {
@@ -30161,7 +30161,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
@@ -30253,7 +30253,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
@@ -30345,8 +30345,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
+            use crate::generation::GenerateConfig;
             use crate::kv_cache::PrefixReuseMode;
-            use crate::model::qwen35_config::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let base_cfg = GenerateConfig {
@@ -30436,7 +30436,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = minimal_bpe_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -30837,7 +30837,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
 
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -30906,7 +30906,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
 
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -30988,7 +30988,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
 
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -31073,7 +31073,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
 
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -31142,7 +31142,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -31189,7 +31189,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -31236,7 +31236,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -31293,7 +31293,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
             let _gpu_guard = gpu_test_lock();
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -31349,7 +31349,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
 
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -31414,7 +31414,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
 
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let gen_cfg = GenerateConfig {
@@ -31513,7 +31513,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 return;
             };
 
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
             use crate::speculative::MtpTargetVerifier;
 
             let tokenizer = minimal_bpe_tokenizer();
@@ -36266,8 +36266,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -36326,8 +36326,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -36396,8 +36396,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -36760,7 +36760,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -36832,7 +36832,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -36920,7 +36920,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let mut state = MetalQwen35State::new(&weights, &cfg, 32).expect("tiny hybrid fixture");
             let slot_id = crate::kv_cache::CrossTurnSlotId::DEFAULT;
 
-            let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+            let gen_cfg = crate::generation::GenerateConfig {
                 enable_mtp: Some(true),
                 ..cross_turn_test_gen_cfg(1, 2)
             };
@@ -36979,7 +36979,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
-            use crate::model::qwen35_config::GenerateConfig;
+            use crate::generation::GenerateConfig;
 
             let tokenizer = single_char_vocab_tokenizer();
             let (cfg, weights) = tiny_hybrid_fixture();
@@ -37545,7 +37545,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         fn single_char_grammar_cfg(
             gbnf: &str,
             max_new_tokens: usize,
-        ) -> crate::model::qwen35_config::GenerateConfig {
+        ) -> crate::generation::GenerateConfig {
             use crate::grammar::{GrammarEngine, GrammarSpec};
             use std::sync::Arc;
 
@@ -37554,7 +37554,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                 GrammarEngine::new(&spec, single_char_vocab_bytes())
                     .expect("grammar engine builds over single-char vocab"),
             );
-            crate::model::qwen35_config::GenerateConfig {
+            crate::generation::GenerateConfig {
                 max_new_tokens,
                 temperature: 0.0,
                 top_k: 1,
@@ -37585,8 +37585,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -37641,8 +37641,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -37704,8 +37704,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let _guard = gpu_test_lock();
 
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -37998,8 +37998,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -38052,8 +38052,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -38116,8 +38116,8 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             let _guard = gpu_test_lock();
 
             use crate::error::InferenceError;
+            use crate::generation::GenerateConfig;
             use crate::grammar::{GrammarEngine, GrammarSpec};
-            use crate::model::qwen35_config::GenerateConfig;
             use std::sync::Arc;
 
             let tokenizer = single_char_vocab_tokenizer();
@@ -39508,7 +39508,7 @@ mod topk_boundary_tie_tests {
 /// exercise the guard logic on any platform without GPU hardware.
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 pub(crate) fn multimodal_generate_preflight(
-    gen_cfg: &crate::model::qwen35_config::GenerateConfig,
+    gen_cfg: &crate::generation::GenerateConfig,
 ) -> Result<(), crate::error::InferenceError> {
     crate::model::qwen35::check_grammar_not_set(gen_cfg)?;
     crate::model::qwen35::check_logprobs_not_set(gen_cfg)?;
@@ -39519,8 +39519,8 @@ pub(crate) fn multimodal_generate_preflight(
 mod multimodal_preflight_tests {
     use super::multimodal_generate_preflight;
     use crate::error::InferenceError;
+    use crate::generation::GenerateConfig;
     use crate::grammar::{GrammarEngine, GrammarSpec};
-    use crate::model::qwen35_config::GenerateConfig;
     use std::sync::Arc;
 
     /// Grammar-constrained decoding is not wired into the multimodal path; the
@@ -40351,8 +40351,8 @@ impl MetalQwen35State {
         &mut self,
         _prompt: &str,
         _tokenizer: &crate::tokenizer::bpe::BpeTokenizer,
-        _cfg: &crate::model::qwen35_config::GenerateConfig,
-    ) -> Result<crate::model::qwen35_config::GenerateOutput, crate::error::InferenceError> {
+        _cfg: &crate::generation::GenerateConfig,
+    ) -> Result<crate::generation::GenerateOutput, crate::error::InferenceError> {
         Err(crate::error::InferenceError::Inference(
             "Metal GPU not available (requires macOS + metal-gpu feature)".into(),
         ))
@@ -40437,7 +40437,7 @@ impl MetalQwen35State {
 mod non_metal_stub_tests {
     use super::MetalQwen35State;
     use crate::error::InferenceError;
-    use crate::model::qwen35_config::GenerateConfig;
+    use crate::generation::GenerateConfig;
     use crate::tokenizer::bpe::BpeTokenizer;
     use std::collections::HashMap;
 

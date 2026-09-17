@@ -19,7 +19,6 @@ use lattice_inference::Tokenizer;
 use lattice_inference::forward::metal_qwen35::ChatMessage;
 #[cfg(test)]
 use lattice_inference::forward::metal_qwen35::format_chat_template;
-use lattice_inference::model::qwen35_config::{GenerateOutput, TokenLogprob};
 use lattice_inference::serve::contract::{
     ChatRequest as ChatCompletionRequest, GenerationDefaults, ServeProfile,
     ValidatedChatRequest as ContractValidatedChatRequest,
@@ -30,6 +29,7 @@ use lattice_inference::serve::contract::{
     ContentPart, Message, MessageContent, ResponseFormat, normalize_request,
 };
 use lattice_inference::serve::{format_normalized_chat_template, into_engine_chat_messages};
+use lattice_inference::{GenerateOutput, TokenLogprob};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -200,7 +200,7 @@ pub enum ModelBackend {
         generate: Arc<
             dyn Fn(
                     &str,
-                    &lattice_inference::model::qwen35_config::GenerateConfig,
+                    &lattice_inference::GenerateConfig,
                     &mut dyn FnMut(&str) -> bool,
                     &mut dyn FnMut() -> bool,
                 )
@@ -720,9 +720,7 @@ fn to_chat_messages(messages: &[Message]) -> Result<Vec<ChatMessage>, ApiError> 
 /// drift between them again -- `lattice_serve.rs`'s worker previously
 /// hardcoded `"stop"` unconditionally instead of carrying the engine's
 /// `stopped` flag through.
-pub(super) fn finish_reason_for(
-    output: &lattice_inference::model::qwen35_config::GenerateOutput,
-) -> &'static str {
+pub(super) fn finish_reason_for(output: &lattice_inference::GenerateOutput) -> &'static str {
     lattice_inference::serve::finish_reason(output.stopped)
 }
 
@@ -968,11 +966,11 @@ fn spawn_cpu_style_streaming_generation(
     tx: futures::channel::mpsc::UnboundedSender<StreamMsg>,
     cancel_rx: tokio::sync::watch::Receiver<bool>,
     prompt: String,
-    gen_cfg: lattice_inference::model::qwen35_config::GenerateConfig,
+    gen_cfg: lattice_inference::GenerateConfig,
     generate: Arc<
         dyn Fn(
                 &str,
-                &lattice_inference::model::qwen35_config::GenerateConfig,
+                &lattice_inference::GenerateConfig,
                 &mut dyn FnMut(&str) -> bool,
                 &mut dyn FnMut() -> bool,
             ) -> Result<GenerateOutput, lattice_inference::error::InferenceError>
@@ -1113,7 +1111,7 @@ async fn chat_completions_with_request(
         || state.model.max_context(),
     )?;
 
-    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    let mut gen_cfg = lattice_inference::GenerateConfig::default();
     gen_cfg.max_new_tokens = max_tokens;
     gen_cfg.temperature = temperature;
     gen_cfg.top_p = top_p;
@@ -1203,7 +1201,7 @@ async fn chat_completions_with_request(
                 let generate: Arc<
                     dyn Fn(
                             &str,
-                            &lattice_inference::model::qwen35_config::GenerateConfig,
+                            &lattice_inference::GenerateConfig,
                             &mut dyn FnMut(&str) -> bool,
                             &mut dyn FnMut() -> bool,
                         )
@@ -2160,7 +2158,7 @@ mod tests {
     // A stop-condition output has stopped=true → "stop".
     #[test]
     fn finish_reason_length_only_at_cap() {
-        use lattice_inference::model::qwen35_config::GenerateOutput;
+        use lattice_inference::GenerateOutput;
         let cap = GenerateOutput {
             text: String::new(),
             token_ids: vec![],
@@ -2193,7 +2191,7 @@ mod tests {
     // finish_reason_for reverts to the old `generated_tokens == max_tokens` formula.
     #[test]
     fn finish_reason_stop_string_at_cap_is_stop_not_length() {
-        use lattice_inference::model::qwen35_config::GenerateOutput;
+        use lattice_inference::GenerateOutput;
         let max_tokens: usize = 4;
         // stop-string hit at exactly the token budget:
         // stopped=true because a stop string matched; generated_tokens==max_tokens
@@ -2217,7 +2215,7 @@ mod tests {
     // Natural length cap (no stop condition) must still yield "length".
     #[test]
     fn finish_reason_natural_length_cap_is_length() {
-        use lattice_inference::model::qwen35_config::GenerateOutput;
+        use lattice_inference::GenerateOutput;
         let output = GenerateOutput {
             text: "hi".into(),
             token_ids: vec![1, 2, 3, 4],
@@ -3112,11 +3110,11 @@ mod tests {
                 token_id: 0,
                 logprob: -0.1,
                 top: vec![
-                    lattice_inference::model::qwen35_config::TopLogprob {
+                    lattice_inference::TopLogprob {
                         token_id: 0,
                         logprob: -0.1,
                     },
-                    lattice_inference::model::qwen35_config::TopLogprob {
+                    lattice_inference::TopLogprob {
                         token_id: 1,
                         logprob: -2.3,
                     },
@@ -4100,7 +4098,7 @@ mod tests {
             max_tokens_cap: usize,
             generate: impl Fn(
                 &str,
-                &lattice_inference::model::qwen35_config::GenerateConfig,
+                &lattice_inference::GenerateConfig,
                 &mut dyn FnMut(&str) -> bool,
                 &mut dyn FnMut() -> bool,
             )
@@ -4538,7 +4536,7 @@ mod tests {
             let generate: Arc<
                 dyn Fn(
                         &str,
-                        &lattice_inference::model::qwen35_config::GenerateConfig,
+                        &lattice_inference::GenerateConfig,
                         &mut dyn FnMut(&str) -> bool,
                         &mut dyn FnMut() -> bool,
                     )
@@ -4731,7 +4729,7 @@ mod tests {
             let generate: Arc<
                 dyn Fn(
                         &str,
-                        &lattice_inference::model::qwen35_config::GenerateConfig,
+                        &lattice_inference::GenerateConfig,
                         &mut dyn FnMut(&str) -> bool,
                         &mut dyn FnMut() -> bool,
                     )
@@ -4802,7 +4800,7 @@ mod tests {
         /// `..Default::default()` tail.
         #[allow(clippy::field_reassign_with_default)]
         fn expected_gen_cfg() -> GenerateConfigSnapshot {
-            let mut cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+            let mut cfg = lattice_inference::GenerateConfig::default();
             cfg.max_new_tokens = 9;
             cfg.temperature = 1.3;
             cfg.top_p = 0.55;

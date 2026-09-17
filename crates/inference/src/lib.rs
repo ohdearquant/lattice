@@ -62,6 +62,10 @@ pub(crate) mod bounded_read;
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].
 pub mod error;
+/// Neutral generation types shared by every decoder path: request configuration and
+/// result struct, independent of model family. See [`GenerateConfig`] and
+/// [`GenerateOutput`].
+pub mod generation;
 /// Grammar-constrained decoding and logit masking. See [`model`] and [`sampling`].
 pub mod grammar;
 /// Flat and paged key/value cache implementations. See [`model`] and [`forward`].
@@ -153,6 +157,19 @@ pub use crate::forward::cpu::BertCpuKernelPolicy;
 /// Frozen CPU capability facts for the dormant BERT pinned-policy contract.
 #[doc(hidden)]
 pub use crate::forward::cpu::BertCpuKernelProfile;
+/// Sampling and stop configuration for a generation request. Canonical path under ADR-092;
+/// `model::qwen35_config::GenerateConfig` remains as a deprecated alias. See [`generation`].
+pub use crate::generation::GenerateConfig;
+/// Result of a generation request: text, token ids, counts and stop reason. Canonical path
+/// under ADR-092. See [`generation`] and [`StopReason`].
+pub use crate::generation::GenerateOutput;
+/// Per-token log-probability data for one generated token. See [`GenerateConfig::logprobs`].
+pub use crate::generation::TokenLogprob;
+/// One alternative token and its log-probability at a single step. See [`TokenLogprob`].
+pub use crate::generation::TopLogprob;
+/// Grammar-constrained decoding engine, reachable from the root because
+/// [`GenerateConfig::grammar`] carries one. See [`grammar`].
+pub use crate::grammar::GrammarEngine;
 /// BERT encoder configuration. See [`BertModel`] and [`model`].
 pub use crate::model::BertConfig;
 /// BERT/BGE encoder model. See [`BertConfig`], [`Tokenizer`], and [`BertPooling`].

@@ -176,8 +176,9 @@ fn run_gpu_decode_bench(
     model_dir_str: &str,
     new_tokens: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::tokenizer::BpeTokenizer;
     use std::time::Instant;
 

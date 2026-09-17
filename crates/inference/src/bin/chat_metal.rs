@@ -128,7 +128,7 @@ fn emit_json_generation(
     prompt: &str,
     metal: &mut lattice_inference::forward::metal_qwen35::MetalQwen35State,
     tokenizer: &lattice_inference::tokenizer::bpe::BpeTokenizer,
-    gen_cfg: &lattice_inference::model::qwen35_config::GenerateConfig,
+    gen_cfg: &lattice_inference::GenerateConfig,
     model_format: &str,
     lora_tag: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -358,12 +358,11 @@ fn parse_serve_request_line(
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
     use lattice_inference::kv_cache::CrossTurnSlotId;
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{
-        GenerateConfig, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
-    };
+    use lattice_inference::model::qwen35_config::{QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config};
     use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use std::io::Write;

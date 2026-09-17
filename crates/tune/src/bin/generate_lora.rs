@@ -143,7 +143,7 @@ fn main() {
     }
 
     // Configure generation
-    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    let mut gen_cfg = lattice_inference::GenerateConfig::default();
     gen_cfg.max_new_tokens = max_tokens;
     gen_cfg.seed = seed;
     if let Some(t) = temperature {

@@ -44,13 +44,14 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::grammar::engine::{
         enable_mask_profiling, last_build_profile, probe_reachable_states, take_mask_profile,
     };
     use lattice_inference::grammar::pda::StackFrame;
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::tokenizer::BpeTokenizer;
     use std::collections::HashMap;
     use std::sync::Arc;

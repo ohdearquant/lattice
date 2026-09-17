@@ -99,9 +99,7 @@ mod imp {
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::grammar::{GrammarEngine, GrammarSpec};
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{
-        GenerateConfig, GenerateOutput, QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config,
-    };
+    use lattice_inference::model::qwen35_config::{QWEN_CHAT_IM_END_TOKEN_ID, Qwen35Config};
     use lattice_inference::model_format::{self, ModelFormat};
     use lattice_inference::serve::contract::{
         ChatRequest as ChatReq, GenerationDefaults, ServeProfile, ValidatedChatRequest,
@@ -124,6 +122,7 @@ mod imp {
     use lattice_inference::serve::metrics::ServeMetrics;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::{BertModel, BertPooling};
+    use lattice_inference::{GenerateConfig, GenerateOutput};
     use serde_json::{Value, json};
     use std::collections::{HashMap, VecDeque};
     use std::sync::{Arc, Condvar, Mutex};
@@ -7238,7 +7237,7 @@ mod imp {
             /// `grammar`, `reasoning_budget`, `logprobs`, `stop_strings`) to
             /// the exact same values `GenerateConfig::default()` carries.
             fn expected_gen_cfg() -> GenerateConfigSnapshot {
-                let mut cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+                let mut cfg = lattice_inference::GenerateConfig::default();
                 cfg.max_new_tokens = 9;
                 cfg.temperature = 1.3;
                 cfg.top_p = 0.55;
