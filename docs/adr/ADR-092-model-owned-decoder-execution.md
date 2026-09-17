@@ -103,6 +103,63 @@ Neither a direct-entry wrapper nor a feature-disabled error stub is deleted simp
 shared session exists. Preserve downstream `GenerateOutput` literals without adding fields or
 changing exhaustiveness.
 
+##### Amendment, 2026-09-17: the neutral types are canonical at the crate root
+
+Re-deriving the compatibility calls at `79d422805b` (the precondition above) found that "neutral
+config/output types" is not true of the paths those types are reached through, so this clause is
+made explicit rather than left to the implementation.
+
+`GenerateConfig` and `GenerateOutput` are defined in `crate::model::qwen35_config`, a Qwen-family
+module, and are not surfaced from the crate root. Measured across the workspace, 99 of 102 import
+sites name that family module; the other 3 use `crate::model::GenerateConfig`, which exists because
+`model/mod.rs` already re-exports that one type and not the other. So "keep the old imports"
+and ADR-090 D10's goal of a serving surface that stops naming concrete model types pull in opposite
+directions, including for the two serving binaries.
+
+**The decision.** The neutral generation types are re-exported from the crate root, and the
+crate-root path is canonical. "Keep old imports" means old paths keep compiling, not that old paths
+stay canonical. Nothing is removed. New and migrated code names the crate-root path; the
+Qwen-family path remains valid.
+
+**The compatibility surface, stated, because it is larger than the two types this clause began
+with.** A consumer that can name only `GenerateConfig` and `GenerateOutput` from the crate root
+still cannot name the field types of the output it just received. The transitive closure of the
+public field types is six, of which one is already at the root:
+
+| type             | defined in               | at the crate root today             |
+| ---------------- | ------------------------ | ----------------------------------- |
+| `GenerateConfig` | `model/qwen35_config.rs` | no (`model::GenerateConfig` exists) |
+| `GenerateOutput` | `model/qwen35_config.rs` | no                                  |
+| `TokenLogprob`   | `model/qwen35_config.rs` | no                                  |
+| `TopLogprob`     | `model/qwen35_config.rs` | no                                  |
+| `GrammarEngine`  | `grammar/engine.rs`      | no                                  |
+| `StopReason`     | `stop_reason.rs`         | yes                                 |
+
+`GenerateOutput` carries `Option<StopReason>` and `Vec<TokenLogprob>`; `TokenLogprob` carries
+`Vec<TopLogprob>`; `GenerateConfig` carries `Option<Arc<GrammarEngine>>`. All six are re-exported,
+not two, or the canonical path is canonical only for the outermost name.
+
+Note that `GrammarEngine` is already in a neutral module, so for it the question is reachability
+from the root and nothing else.
+
+**The mechanism is the move, not a crate-root `pub use` alone.** The Qwen-family path is the
+_definition_ site, so adding a crate-root re-export would make the root an alias of a family-module
+type rather than the other way round: rustdoc and `type_name` would keep reporting
+`model::qwen35_config`. That is precisely the coupling ADR-090 D10 measures, so a root `pub use`
+alone does not discharge this clause.
+
+Therefore: the four definitions currently in `model/qwen35_config.rs` (`GenerateConfig`,
+`GenerateOutput`, `TokenLogprob`, `TopLogprob`) move to a neutral module. The crate root re-exports
+all six types in the table. `model::qwen35_config` re-exports the four with `#[deprecated]` pointing
+at the crate-root path, so the old paths keep compiling and nothing is removed. The in-crate call
+sites move in the same change — 69 of them name `crate::model::qwen35_config::GenerateConfig` today
+— so the deprecation warning reaches external consumers only rather than the crate's own code.
+
+The reason this is specified rather than left to the implementation is that the two shapes **build
+identically and document differently**. A root `pub use` and a move both compile, both keep every
+old import working, and both look correct in review; they diverge only in what rustdoc and
+`type_name` report, which is the surface this clause is about.
+
 Prefix-cache reuse and speculative state repair remain typed extensions, with checked capability
 negotiation and model/adapter/tokenizer/cache identity. Existing serving uses the prefix-cache
 streaming route; ordinary generation alone is not full serving coverage. A stop inside an accepted
