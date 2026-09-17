@@ -68,6 +68,7 @@ pub const MAX_CUMULATIVE_STOP_BYTES: usize = 2 * MAX_STOP_STRING_BYTES;
 /// `logit_bias`, `user`) are ignored rather than rejected, matching standard
 /// OpenAI-compatible client behavior on both serving endpoints.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct ChatRequest {
     /// Requested model identifier. `None` when the field is omitted; `Some("")`
     /// when the client sends an explicit empty string — these are validated
@@ -141,6 +142,7 @@ pub struct ChatRequest {
 
 /// One input chat message.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct Message {
     /// OpenAI message role.
     pub role: String,
@@ -217,6 +219,7 @@ pub enum ContentPart {
 
 /// Image URL payload carried by an image content part.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ImageUrl {
     /// Image URL or data URL.
     pub url: String,
@@ -265,6 +268,7 @@ impl<'de> Deserialize<'de> for ContentPart {
 
 /// OpenAI response-format request.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct ResponseFormat {
     /// Requested response format name.
     pub r#type: String,
@@ -275,6 +279,7 @@ pub struct ResponseFormat {
 
 /// Strict JSON Schema response-format payload.
 #[derive(Debug, Deserialize)]
+#[non_exhaustive]
 pub struct JsonSchemaFormat {
     /// Client-visible schema name.
     #[serde(default)]

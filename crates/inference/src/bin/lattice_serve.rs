@@ -3674,6 +3674,20 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        fn input_message(role: String, content: MessageContent) -> InMsg {
+            let mut message: InMsg = serde_json::from_str(r#"{"role":"","content":""}"#).unwrap();
+            message.role = role;
+            message.content = content;
+            message
+        }
+
+        fn input_image_url(url: String, detail: Option<String>) -> ImageUrl {
+            let mut image: ImageUrl = serde_json::from_str(r#"{"url":""}"#).unwrap();
+            image.url = url;
+            image.detail = detail;
+            image
+        }
+
         use super::*;
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         use lattice_inference::serve::ApiError;
@@ -3769,10 +3783,7 @@ mod imp {
 
         #[test]
         fn message_content_plain_string_normalizes() {
-            let msg = InMsg {
-                role: "user".to_string(),
-                content: MessageContent::Text("hi".to_string()),
-            };
+            let msg = input_message("user".to_string(), MessageContent::Text("hi".to_string()));
             let chat_message = normalize_messages(std::slice::from_ref(&msg))
                 .expect("plain string content must parse");
             assert_eq!(
@@ -3784,9 +3795,9 @@ mod imp {
 
         #[test]
         fn message_content_parts_concatenate_in_order() {
-            let msg = InMsg {
-                role: "user".to_string(),
-                content: MessageContent::Parts(vec![
+            let msg = input_message(
+                "user".to_string(),
+                MessageContent::Parts(vec![
                     Part::Text {
                         text: "a".to_string(),
                     },
@@ -3794,22 +3805,19 @@ mod imp {
                         text: "b".to_string(),
                     },
                 ]),
-            };
+            );
             let chat_message = normalize_messages(std::slice::from_ref(&msg)).unwrap();
             assert_eq!(chat_message[0].content, "ab");
         }
 
         #[test]
         fn message_content_image_url_rejected() {
-            let msg = InMsg {
-                role: "user".to_string(),
-                content: MessageContent::Parts(vec![Part::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/cat.png".to_string(),
-                        detail: None,
-                    },
+            let msg = input_message(
+                "user".to_string(),
+                MessageContent::Parts(vec![Part::ImageUrl {
+                    image_url: input_image_url("https://example.com/cat.png".to_string(), None),
                 }]),
-            };
+            );
             let err = normalize_messages(std::slice::from_ref(&msg)).unwrap_err();
             assert_eq!(err.message(), IMAGE_REQUIRES_VISION_MESSAGE);
         }
@@ -3822,12 +3830,12 @@ mod imp {
             // ..."); production always went through the shared normalizer
             // (`normalize_request`), so this pins the wording clients
             // actually receive.
-            let msg = InMsg {
-                role: "user".to_string(),
-                content: MessageContent::Parts(vec![Part::Unsupported {
+            let msg = input_message(
+                "user".to_string(),
+                MessageContent::Parts(vec![Part::Unsupported {
                     kind: "file".to_string(),
                 }]),
-            };
+            );
             let err = normalize_messages(std::slice::from_ref(&msg)).unwrap_err();
             assert_eq!(
                 err.message(),
@@ -3908,31 +3916,13 @@ mod imp {
                 reasoning_budget: Some(50),
                 ..GenerationDefaults::standard(100)
             };
-            let req = ChatReq {
-                model: None,
-                messages: vec![InMsg {
-                    role: "user".to_string(),
-                    content: MessageContent::Text("hi".to_string()),
-                }],
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                max_tokens: None,
-                seed: None,
-                stream: None,
-                repetition_penalty: None,
-                reasoning_budget: Some(
-                    serde_json::value::RawValue::from_string("50".to_string()).unwrap(),
-                ),
-                max_completion_tokens: None,
-                tools: None,
-                tool_choice: None,
-                response_format: None,
-                n: None,
-                logprobs: None,
-                top_logprobs: None,
-                stop: None,
-            };
+            let mut req = serde_json::from_str::<ChatReq>("{}").unwrap();
+            req.messages = vec![input_message(
+                "user".to_string(),
+                MessageContent::Text("hi".to_string()),
+            )];
+            req.reasoning_budget =
+                Some(serde_json::value::RawValue::from_string("50".to_string()).unwrap());
             let normalized = normalize_for_cfg(&req, &defaults, 8);
             let cfg = build_cfg(&normalized);
             assert!(cfg.max_new_tokens <= 8);
@@ -6677,29 +6667,12 @@ mod imp {
         #[test]
         fn build_cfg_aliases_max_completion_tokens_when_max_tokens_absent() {
             let defaults = GenerationDefaults::standard(100);
-            let req = ChatReq {
-                model: None,
-                messages: vec![InMsg {
-                    role: "user".to_string(),
-                    content: MessageContent::Text("hi".to_string()),
-                }],
-                temperature: None,
-                top_p: None,
-                top_k: None,
-                max_tokens: None,
-                seed: None,
-                stream: None,
-                repetition_penalty: None,
-                reasoning_budget: None,
-                max_completion_tokens: Some(42),
-                tools: None,
-                tool_choice: None,
-                response_format: None,
-                n: None,
-                logprobs: None,
-                top_logprobs: None,
-                stop: None,
-            };
+            let mut req = serde_json::from_str::<ChatReq>("{}").unwrap();
+            req.messages = vec![input_message(
+                "user".to_string(),
+                MessageContent::Text("hi".to_string()),
+            )];
+            req.max_completion_tokens = Some(42);
             let normalized = normalize_for_cfg(&req, &defaults, 4096);
             let cfg = build_cfg(&normalized);
             assert_eq!(cfg.max_new_tokens, 42);
