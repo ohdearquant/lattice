@@ -24856,7 +24856,7 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // And QS must resolve to EXACTLY the base's seed, not merely "some"
             // rotation: rotating an identical copy directly with `base_seed` must
             // land on the same buffers `load_lora_adapter` produced.
-            let mut direct = vec![layer()];
+            let mut direct = [layer()];
             {
                 use crate::quant::quarot::lora::{LoraLayerMut, rotate_adapter_for_quarot};
                 use crate::quant::quarot::plan::RotationPlan;
