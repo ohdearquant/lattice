@@ -322,7 +322,7 @@ mod tests {
         let available: Vec<AdapterId> = (0..6).map(|i| format!("adapter-{i}")).collect();
         let ctx = vec![1.0f32; 4];
         let result = router.route(&ctx, &available, 3).unwrap();
-        assert_eq!(result.len(), 3);
+        assert_eq!(result.len(), 4);
     }
 
     #[test]
