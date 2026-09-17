@@ -2,9 +2,9 @@
 
 **Status**: Accepted (clusters C1–C4 implemented and merged; see implementation record below)
 **Kind**: Aspirational
-**Date**: 2026-07-09 (status updated 2026-07-11; amended 2026-07-28 and 2026-07-29)
+**Date**: 2026-07-09 (status updated 2026-07-11; amended 2026-07-28, 2026-07-29, and 2026-09-16)
 
-**Implementation record** (verified against merged PRs at `origin/main @ 32697ed0e`):
+**Implementation record** (original cluster implementations verified against merged PRs at `origin/main @ 32697ed0e`; later amendments recorded below):
 
 - C1 — shared fail-closed softmax row finalizer: PR #785 (merged 2026-07-10); the
   companion dead-kernel deletion and Metal `fused_attention` fail-closed finalize
@@ -25,6 +25,9 @@
 - C2 lifecycle amendment (#833) — the shared Metal worker owner performs one
   bounded join after the last job sender closes; see "Amendment: bounded shared
   Metal-worker shutdown" below.
+- C2 request-DTO amendment (0.11.0) — the five deserialized public input
+  structs become non-exhaustive; both binaries construct test fixtures by
+  deserialization. See "Amendment: non-exhaustive serving request DTOs" below.
 
 The cluster defect tickets (#739–#741, resolved by C1; #744–#746, resolved by C2) are
 closed against the merged PRs above. The non-cluster audit items from the same sweep
@@ -409,6 +412,54 @@ rather than allowed to keep router state alive indefinitely.
 
 **Resolves**: #833 — graceful queue-close and join on the normal path, with a documented,
 observable timeout-to-cancel and worker timeout-to-detach fallback.
+
+### Amendment (2026-09-16): non-exhaustive serving request DTOs (0.11.0)
+
+The shared serving module exposes its deserialized request types publicly so
+both binaries and Rust callers can normalize the same input. At 0.10.0, an
+additional optional wire field also breaks downstream Rust struct literals:
+Serde's default for an omitted field does not make an exhaustive Rust literal
+forward-compatible.
+
+Mark the five deserialize-only public request structs in `serve::contract`
+`#[non_exhaustive]`: `ChatRequest`, `Message`, `ImageUrl`, `ResponseFormat`, and
+`JsonSchemaFormat`. This is itself a breaking Rust API change, carried by the
+workspace's 0.10.0 to 0.11.0 boundary. Downstream callers construct these values
+through deserialization, may continue reading and assigning existing public
+fields, and include `..` when destructuring them. The two binaries' test
+fixtures use that same construction path. No new constructor API is introduced.
+
+Keep `GenerationDefaults` available for caller-provided configuration literals.
+Keep the normalization outputs `NormalizedChatMessage`, `NormalizedChatImage`,
+and `ValidatedChatRequest` unchanged. `ServeProfile` already has private fields
+and public constructors. The module's three public enums are already
+non-exhaustive. The boundary is request-input representation, not every public
+struct in the module.
+
+The annotation does not change wire field names, deserialization defaults, or
+validation. Future request fields still need their own wire-compatibility and
+admission review; non-exhaustiveness only removes exhaustive Rust construction
+as an obstacle to adding fields. The normal HTTP suites remain the behavior
+checks. The [ADR-064](ADR-064-ci-gate-taxonomy.md) semver gate compares against
+published releases; a pre-1.0 minor bump may permit the break while executing
+zero lints. Record the actual per-crate executed and skipped counts, rather
+than treating a green version-boundary result as proof of unchanged API.
+
+### Amendment (2026-09-17): request-input DTOs across modules (0.11.0)
+
+The 2026-09-16 amendment named five structs in `serve::contract`. Its boundary
+is request-input representation, which also includes types in other modules:
+`serve::lora::LoraSelection` is deserialized as `ChatRequest.lora` and therefore
+takes `#[non_exhaustive]` under the same policy. Its two external-crate
+construction sites were binary test fixtures, now migrated to deserialization.
+In-library construction sites are unaffected because `#[non_exhaustive]`
+restricts construction only outside the defining crate.
+
+The earlier list records the types known at that time; new request-input DTOs
+join it. Both amendments ship within the same 0.10.0 to 0.11.0 boundary, so this
+extension requires no second version boundary. `AdapterMetadata` and
+`AdapterIndex` remain exhaustive: they represent worker output, excluded from
+the input policy alongside the normalization outputs in the earlier amendment.
 
 ## What we are NOT doing
 

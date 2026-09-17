@@ -8,6 +8,7 @@ use std::collections::HashSet;
 /// One contribution to an ordered request mixture.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct LoraSelection {
     /// Resident adapter identifier.
     pub id: u32,

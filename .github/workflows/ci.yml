@@ -1079,6 +1079,20 @@ jobs:
         run: python3 tests/test_perf_postmerge_base.py -v
       - name: post-merge perf workflow contract tests
         run: python3 tests/test_perf_postmerge_workflow.py -v
+      # Both of these ran in no workflow until the orphaned-suite gate below found
+      # them. test_semver_checks_disclose.py needs the PyYAML installed above, which
+      # is why it lands in this job rather than beside the bench suites.
+      - name: documentation lint script tests
+        run: python3 tests/test_lint_docs.py -v
+      - name: semver disclosure workflow tests
+        run: python3 tests/test_semver_checks_disclose.py -v
+      # A test module that no workflow step runs is a suite nobody is reading, and
+      # two were found by hand on one day. The selftest arm runs first so a broken
+      # gate refuses instead of passing everything.
+      - name: orphaned suite gate
+        run: |
+          python3 scripts/orphaned_suite_gate.py --selftest
+          python3 scripts/orphaned_suite_gate.py
 
   # Deterministic fake-adapter unit tests + raw-observation schema validation
   # for the decode-benchmark harness core (issue #813 step 1) and every
@@ -1193,6 +1207,16 @@ jobs:
         run: python3 tests/test_bench_measurement_supervision.py -v
       - name: python3 tests/test_perf_governor.py
         run: python3 tests/test_perf_governor.py -v
+      # Four suites the orphaned-suite gate found running nowhere: 226 tests that
+      # had never executed in CI. All four are pure-Python and engine-free.
+      - name: python3 tests/test_bench_gate_math.py
+        run: python3 tests/test_bench_gate_math.py -v
+      - name: python3 tests/test_bench_run_record.py
+        run: python3 tests/test_bench_run_record.py -v
+      - name: python3 tests/test_bench_cpu_flagship_supervisor.py
+        run: python3 tests/test_bench_cpu_flagship_supervisor.py -v
+      - name: python3 tests/test_adr064_gpu_decode_gate.py
+        run: python3 tests/test_adr064_gpu_decode_gate.py -v
 
   # cargo-semver-checks against the latest published crates.io release for
   # every internal path-dependency crate, so a breaking public API change is
