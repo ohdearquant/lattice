@@ -1802,6 +1802,24 @@ pub fn router(state: AppState) -> Router {
 
 #[cfg(test)]
 mod tests {
+    fn input_message(role: String, content: MessageContent) -> Message {
+        let mut message: Message = serde_json::from_str(r#"{"role":"","content":""}"#).unwrap();
+        message.role = role;
+        message.content = content;
+        message
+    }
+
+    fn input_image_url(
+        url: String,
+        detail: Option<String>,
+    ) -> lattice_inference::serve::contract::ImageUrl {
+        let mut image: lattice_inference::serve::contract::ImageUrl =
+            serde_json::from_str(r#"{"url":""}"#).unwrap();
+        image.url = url;
+        image.detail = detail;
+        image
+    }
+
     use super::*;
     use axum::http::StatusCode;
     use lattice_inference::forward::metal_qwen35::ChatRole;
@@ -2152,14 +2170,14 @@ mod tests {
     #[test]
     fn chat_template_multi_message_chatml() {
         let messages = vec![
-            Message {
-                role: "system".to_string(),
-                content: MessageContent::Text("Be helpful.".to_string()),
-            },
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("Hello".to_string()),
-            },
+            input_message(
+                "system".to_string(),
+                MessageContent::Text("Be helpful.".to_string()),
+            ),
+            input_message(
+                "user".to_string(),
+                MessageContent::Text("Hello".to_string()),
+            ),
         ];
         let prompt = format_chat_template(&to_chat_messages(&messages).unwrap());
         assert!(prompt.contains("<|im_start|>system\nBe helpful.<|im_end|>"));
@@ -2251,26 +2269,9 @@ mod tests {
     fn reject_unsupported_stream_true_ok() {
         // stream=true is now handled by the streaming path and must NOT be
         // rejected by reject_unsupported.
-        let req = ChatCompletionRequest {
-            model: Some("m".to_string()),
-            messages: vec![],
-            max_tokens: None,
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            repetition_penalty: None,
-            reasoning_budget: None,
-            stream: Some(true),
-            stop: None,
-            seed: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            logprobs: None,
-            top_logprobs: None,
-            n: None,
-        };
+        let mut req = serde_json::from_str::<ChatCompletionRequest>("{}").unwrap();
+        req.model = Some("m".to_string());
+        req.stream = Some(true);
         assert!(reject_unsupported(&req).is_ok());
     }
 
@@ -2279,11 +2280,9 @@ mod tests {
         // #585: logprobs is implemented on the non-streaming path only;
         // combined with stream: true it must be rejected, not silently
         // ignored.
-        let req = ChatCompletionRequest {
-            stream: Some(true),
-            logprobs: Some(true),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.stream = Some(true);
+        req.logprobs = Some(true);
         let err = reject_unsupported(&req).unwrap_err();
         assert!(matches!(
             err,
@@ -2360,26 +2359,9 @@ mod tests {
 
     #[test]
     fn reject_unsupported_n_gt_1() {
-        let req = ChatCompletionRequest {
-            model: Some("m".to_string()),
-            messages: vec![],
-            max_tokens: None,
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            repetition_penalty: None,
-            reasoning_budget: None,
-            stream: None,
-            stop: None,
-            seed: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            logprobs: None,
-            top_logprobs: None,
-            n: Some(3),
-        };
+        let mut req = serde_json::from_str::<ChatCompletionRequest>("{}").unwrap();
+        req.model = Some("m".to_string());
+        req.n = Some(3);
         let err = reject_unsupported(&req).unwrap_err();
         assert!(matches!(
             err,
@@ -2392,29 +2374,14 @@ mod tests {
 
     #[test]
     fn reject_unsupported_response_format_json() {
-        let req = ChatCompletionRequest {
-            model: Some("m".to_string()),
-            messages: vec![],
-            max_tokens: None,
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            repetition_penalty: None,
-            reasoning_budget: None,
-            stream: None,
-            stop: None,
-            seed: None,
-            response_format: Some(ResponseFormat {
-                r#type: "json_object".to_string(),
-                json_schema: None,
-            }),
-            tools: None,
-            tool_choice: None,
-            logprobs: None,
-            top_logprobs: None,
-            n: None,
-        };
+        let mut req = serde_json::from_str::<ChatCompletionRequest>("{}").unwrap();
+        req.model = Some("m".to_string());
+        req.response_format = Some(
+            serde_json::from_value::<ResponseFormat>(
+                serde_json::json!({"type": "json_object".to_string()}),
+            )
+            .unwrap(),
+        );
         let err = reject_unsupported(&req).unwrap_err();
         assert!(matches!(
             err,
@@ -2430,34 +2397,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn bare_req() -> ChatCompletionRequest {
-        ChatCompletionRequest {
-            model: Some("m".to_string()),
-            messages: vec![],
-            max_tokens: None,
-            max_completion_tokens: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            repetition_penalty: None,
-            reasoning_budget: None,
-            stream: None,
-            stop: None,
-            seed: None,
-            response_format: None,
-            tools: None,
-            tool_choice: None,
-            logprobs: None,
-            top_logprobs: None,
-            n: None,
-        }
+        serde_json::from_str(r#"{"model":"m"}"#).unwrap()
     }
 
     #[test]
     fn reject_unsupported_tools_rejected() {
-        let req = ChatCompletionRequest {
-            tools: Some(serde_json::json!([])),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.tools = Some(serde_json::json!([]));
         let err = reject_unsupported(&req).unwrap_err();
         assert!(matches!(
             err,
@@ -2470,10 +2416,8 @@ mod tests {
 
     #[test]
     fn reject_unsupported_tool_choice_rejected() {
-        let req = ChatCompletionRequest {
-            tool_choice: Some(serde_json::json!("auto")),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.tool_choice = Some(serde_json::json!("auto"));
         let err = reject_unsupported(&req).unwrap_err();
         assert!(matches!(
             err,
@@ -2489,20 +2433,16 @@ mod tests {
         // #585: logprobs is now implemented on the non-streaming path, so a
         // standalone `logprobs: true` (no `stream: true`) must be accepted
         // here — validation of the value itself is `validate_logprobs`'s job.
-        let req = ChatCompletionRequest {
-            logprobs: Some(true),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.logprobs = Some(true);
         assert!(reject_unsupported(&req).is_ok());
     }
 
     #[test]
     fn reject_unsupported_stop_now_accepted() {
         // stop is no longer rejected by reject_unsupported; it is parsed separately.
-        let req = ChatCompletionRequest {
-            stop: Some(serde_json::json!("</s>")),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.stop = Some(serde_json::json!("</s>"));
         assert!(reject_unsupported(&req).is_ok());
     }
 
@@ -2601,40 +2541,34 @@ mod tests {
     #[test]
     fn reject_unsupported_stream_false_ok() {
         // stream=false must not trigger a rejection.
-        let req = ChatCompletionRequest {
-            stream: Some(false),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.stream = Some(false);
         assert!(reject_unsupported(&req).is_ok());
     }
 
     #[test]
     fn reject_unsupported_n_1_ok() {
-        let req = ChatCompletionRequest {
-            n: Some(1),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.n = Some(1);
         assert!(reject_unsupported(&req).is_ok());
     }
 
     #[test]
     fn reject_unsupported_response_format_text_ok() {
-        let req = ChatCompletionRequest {
-            response_format: Some(ResponseFormat {
-                r#type: "text".to_string(),
-                json_schema: None,
-            }),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.response_format = Some(
+            serde_json::from_value::<ResponseFormat>(
+                serde_json::json!({"type": "text".to_string()}),
+            )
+            .unwrap(),
+        );
         assert!(reject_unsupported(&req).is_ok());
     }
 
     #[test]
     fn reject_unsupported_logprobs_false_ok() {
-        let req = ChatCompletionRequest {
-            logprobs: Some(false),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.logprobs = Some(false);
         assert!(reject_unsupported(&req).is_ok());
     }
 
@@ -2688,10 +2622,10 @@ mod tests {
 
     #[test]
     fn chat_template_user_only() {
-        let msgs = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Text("hi".to_string()),
-        }];
+        let msgs = vec![input_message(
+            "user".to_string(),
+            MessageContent::Text("hi".to_string()),
+        )];
         let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap());
         assert_eq!(
             prompt,
@@ -2702,18 +2636,12 @@ mod tests {
     #[test]
     fn chat_template_multi_turn_assistant() {
         let msgs = vec![
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("q1".to_string()),
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: MessageContent::Text("a1".to_string()),
-            },
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("q2".to_string()),
-            },
+            input_message("user".to_string(), MessageContent::Text("q1".to_string())),
+            input_message(
+                "assistant".to_string(),
+                MessageContent::Text("a1".to_string()),
+            ),
+            input_message("user".to_string(), MessageContent::Text("q2".to_string())),
         ];
         let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap());
         assert!(prompt.contains("<|im_start|>user\nq1<|im_end|>"));
@@ -2724,9 +2652,9 @@ mod tests {
 
     #[test]
     fn chat_template_content_parts_text_ok() {
-        let msgs = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Parts(vec![
+        let msgs = vec![input_message(
+            "user".to_string(),
+            MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "hello".to_string(),
                 },
@@ -2734,7 +2662,7 @@ mod tests {
                     text: " world".to_string(),
                 },
             ]),
-        }];
+        )];
         let prompt = format_chat_template(&to_chat_messages(&msgs).unwrap());
         assert!(prompt.contains("<|im_start|>user\nhello world<|im_end|>"));
     }
@@ -2746,10 +2674,10 @@ mod tests {
 
     #[test]
     fn to_chat_messages_rejects_invalid_role() {
-        let messages = vec![Message {
-            role: "function".to_string(),
-            content: MessageContent::Text("data".to_string()),
-        }];
+        let messages = vec![input_message(
+            "function".to_string(),
+            MessageContent::Text("data".to_string()),
+        )];
         let err = to_chat_messages(&messages).unwrap_err();
         assert!(matches!(
             err,
@@ -2762,10 +2690,10 @@ mod tests {
 
     #[test]
     fn to_chat_messages_rejects_tool_role() {
-        let messages = vec![Message {
-            role: "tool".to_string(),
-            content: MessageContent::Text("result".to_string()),
-        }];
+        let messages = vec![input_message(
+            "tool".to_string(),
+            MessageContent::Text("result".to_string()),
+        )];
         let err = to_chat_messages(&messages).unwrap_err();
         assert!(matches!(
             err,
@@ -2778,10 +2706,10 @@ mod tests {
 
     #[test]
     fn to_chat_messages_rejects_developer_role() {
-        let messages = vec![Message {
-            role: "developer".to_string(),
-            content: MessageContent::Text("system prompt".to_string()),
-        }];
+        let messages = vec![input_message(
+            "developer".to_string(),
+            MessageContent::Text("system prompt".to_string()),
+        )];
         let err = to_chat_messages(&messages).unwrap_err();
         assert!(matches!(
             err,
@@ -2794,15 +2722,12 @@ mod tests {
 
     #[test]
     fn to_chat_messages_rejects_non_text_content_part() {
-        let messages = vec![Message {
-            role: "user".to_string(),
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
-                image_url: lattice_inference::serve::contract::ImageUrl {
-                    url: "https://example.com/image.png".to_string(),
-                    detail: None,
-                },
+        let messages = vec![input_message(
+            "user".to_string(),
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: input_image_url("https://example.com/image.png".to_string(), None),
             }]),
-        }];
+        )];
         let err = to_chat_messages(&messages).unwrap_err();
         assert!(matches!(
             err,
@@ -2816,18 +2741,15 @@ mod tests {
     #[test]
     fn to_chat_messages_accepts_valid_roles() {
         let messages = vec![
-            Message {
-                role: "system".to_string(),
-                content: MessageContent::Text("Be helpful.".to_string()),
-            },
-            Message {
-                role: "user".to_string(),
-                content: MessageContent::Text("q1".to_string()),
-            },
-            Message {
-                role: "assistant".to_string(),
-                content: MessageContent::Text("a1".to_string()),
-            },
+            input_message(
+                "system".to_string(),
+                MessageContent::Text("Be helpful.".to_string()),
+            ),
+            input_message("user".to_string(), MessageContent::Text("q1".to_string())),
+            input_message(
+                "assistant".to_string(),
+                MessageContent::Text("a1".to_string()),
+            ),
         ];
         let chat_messages = to_chat_messages(&messages).unwrap();
         assert_eq!(chat_messages.len(), 3);
@@ -2911,18 +2833,18 @@ mod tests {
 
     #[test]
     fn message_text_plain_string() {
-        let messages = [Message {
-            role: "user".to_string(),
-            content: MessageContent::Text("hello".to_string()),
-        }];
+        let messages = [input_message(
+            "user".to_string(),
+            MessageContent::Text("hello".to_string()),
+        )];
         assert_eq!(to_chat_messages(&messages).unwrap()[0].content, "hello");
     }
 
     #[test]
     fn message_text_parts_concatenates() {
-        let messages = [Message {
-            role: "user".to_string(),
-            content: MessageContent::Parts(vec![
+        let messages = [input_message(
+            "user".to_string(),
+            MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: "foo".to_string(),
                 },
@@ -2930,21 +2852,18 @@ mod tests {
                     text: "bar".to_string(),
                 },
             ]),
-        }];
+        )];
         assert_eq!(to_chat_messages(&messages).unwrap()[0].content, "foobar");
     }
 
     #[test]
     fn message_text_parts_rejects_image() {
-        let messages = [Message {
-            role: "user".to_string(),
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
-                image_url: lattice_inference::serve::contract::ImageUrl {
-                    url: "https://example.com/image.png".to_string(),
-                    detail: None,
-                },
+        let messages = [input_message(
+            "user".to_string(),
+            MessageContent::Parts(vec![ContentPart::ImageUrl {
+                image_url: input_image_url("https://example.com/image.png".to_string(), None),
             }]),
-        }];
+        )];
         let err = to_chat_messages(&messages).unwrap_err();
         match err {
             ApiError::BadRequest { message, code } => {
@@ -2957,12 +2876,12 @@ mod tests {
 
     #[test]
     fn message_text_parts_rejects_unknown_part_type() {
-        let messages = [Message {
-            role: "user".to_string(),
-            content: MessageContent::Parts(vec![ContentPart::Unsupported {
+        let messages = [input_message(
+            "user".to_string(),
+            MessageContent::Parts(vec![ContentPart::Unsupported {
                 kind: "file".to_string(),
             }]),
-        }];
+        )];
         let err = to_chat_messages(&messages).unwrap_err();
         match err {
             ApiError::BadRequest { message, code } => {
@@ -3186,19 +3105,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn user_msg(text: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: MessageContent::Text(text.to_string()),
-        }
+        input_message("user".to_string(), MessageContent::Text(text.to_string()))
     }
 
     #[test]
     fn cm_serve_model_mismatch_rejected() {
-        let req = ChatCompletionRequest {
-            model: Some("some-other-model".to_string()),
-            messages: vec![user_msg("hi")],
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.model = Some("some-other-model".to_string());
+        req.messages = vec![user_msg("hi")];
         let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
         assert!(matches!(
             err,
@@ -3211,21 +3125,17 @@ mod tests {
 
     #[test]
     fn cm_serve_model_match_passes_model_check() {
-        let req = ChatCompletionRequest {
-            model: Some("served-model".to_string()),
-            messages: vec![user_msg("hi")],
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.model = Some("served-model".to_string());
+        req.messages = vec![user_msg("hi")];
         assert!(validate_chat_request(&req, "served-model", 256, 4096).is_ok());
     }
 
     #[test]
     fn cm_serve_empty_messages_rejected() {
-        let req = ChatCompletionRequest {
-            model: Some("served-model".to_string()),
-            messages: vec![],
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.model = Some("served-model".to_string());
+        req.messages = vec![];
         let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
         assert!(matches!(
             err,
@@ -3238,17 +3148,15 @@ mod tests {
 
     #[test]
     fn cm_serve_last_message_not_user_rejected() {
-        let req = ChatCompletionRequest {
-            model: Some("served-model".to_string()),
-            messages: vec![
-                user_msg("hi"),
-                Message {
-                    role: "assistant".to_string(),
-                    content: MessageContent::Text("hello".to_string()),
-                },
-            ],
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.model = Some("served-model".to_string());
+        req.messages = vec![
+            user_msg("hi"),
+            input_message(
+                "assistant".to_string(),
+                MessageContent::Text("hello".to_string()),
+            ),
+        ];
         let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
         assert!(matches!(
             err,
@@ -3265,12 +3173,10 @@ mod tests {
         // first in the cascade: a request that both targets the wrong model
         // AND asks for `tools` must fail on the tools rejection, not the
         // model-mismatch check, so callers get the more specific error.
-        let req = ChatCompletionRequest {
-            model: Some("some-other-model".to_string()),
-            messages: vec![user_msg("hi")],
-            tools: Some(serde_json::json!([{"type": "function"}])),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.model = Some("some-other-model".to_string());
+        req.messages = vec![user_msg("hi")];
+        req.tools = Some(serde_json::json!([{"type": "function"}]));
         let err = validate_chat_request(&req, "served-model", 256, 4096).unwrap_err();
         assert!(matches!(
             err,
@@ -3286,12 +3192,10 @@ mod tests {
         // Full-cascade check that a well-formed request carrying `stop`
         // resolves through to `PreparedChatRequest.stop_strings` — the
         // capability matrix's "supported" claim for `stop` on this surface.
-        let req = ChatCompletionRequest {
-            model: Some("served-model".to_string()),
-            messages: vec![user_msg("hi")],
-            stop: Some(serde_json::json!(["\n\n"])),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.model = Some("served-model".to_string());
+        req.messages = vec![user_msg("hi")];
+        req.stop = Some(serde_json::json!(["\n\n"]));
         let prepared =
             prepare_chat_request(&req, "served-model", 256, 4096, false, |_| 1, || 4096).unwrap();
         assert_eq!(prepared.stop_strings, vec!["\n\n".to_string()]);
@@ -3314,12 +3218,10 @@ mod tests {
         // `check_context_window` / `parse_stop_strings` calls inside
         // `prepare_chat_request`, not just to whether each sub-function
         // works in isolation.
-        let req = ChatCompletionRequest {
-            model: Some("served-model".to_string()),
-            messages: vec![user_msg("hi")],
-            stop: Some(serde_json::json!([])), // malformed: empty array is rejected
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.model = Some("served-model".to_string());
+        req.messages = vec![user_msg("hi")];
+        req.stop = Some(serde_json::json!([]));
         let err = prepare_chat_request(&req, "served-model", 256, 4096, false, |_| 4096, || 4096)
             .unwrap_err();
         assert!(matches!(
@@ -3335,13 +3237,11 @@ mod tests {
     fn cm_serve_logprobs_resolved_end_to_end() {
         // Full-cascade check backing the matrix's "supported, non-streaming
         // only" `logprobs`/`top_logprobs` claim for `lattice serve`.
-        let req = ChatCompletionRequest {
-            model: Some("served-model".to_string()),
-            messages: vec![user_msg("hi")],
-            logprobs: Some(true),
-            top_logprobs: Some(3),
-            ..bare_req()
-        };
+        let mut req = bare_req();
+        req.model = Some("served-model".to_string());
+        req.messages = vec![user_msg("hi")];
+        req.logprobs = Some(true);
+        req.top_logprobs = Some(3);
         let validated = validate_chat_request(&req, "served-model", 256, 4096).unwrap();
         assert_eq!(validated.logprobs, Some(3));
     }
@@ -3841,13 +3741,11 @@ mod tests {
         /// if the disconnect-stops-generation behavior regresses.
         #[tokio::test]
         async fn chat_completions_streaming_disconnect_stops_generation() {
-            let req = ChatCompletionRequest {
-                model: Some("test-model".to_string()),
-                messages: vec![user_msg("hi")],
-                max_tokens: Some(NEAR_MAX_CONTEXT_TOKENS),
-                stream: Some(true),
-                ..bare_req()
-            };
+            let mut req = bare_req();
+            req.model = Some("test-model".to_string());
+            req.messages = vec![user_msg("hi")];
+            req.max_tokens = Some(NEAR_MAX_CONTEXT_TOKENS);
+            req.stream = Some(true);
 
             let response = chat_completions_with_request(State(tiny_state()), req)
                 .await
@@ -4129,13 +4027,11 @@ mod tests {
                         "blocked by grammar".to_string(),
                     ))
                 });
-            let req = ChatCompletionRequest {
-                model: Some("test-model".to_string()),
-                messages: vec![user_msg("hi")],
-                max_tokens: Some(64),
-                stream: Some(true),
-                ..bare_req()
-            };
+            let mut req = bare_req();
+            req.model = Some("test-model".to_string());
+            req.messages = vec![user_msg("hi")];
+            req.max_tokens = Some(64);
+            req.stream = Some(true);
 
             let response = chat_completions_with_request(State(state), req)
                 .await
@@ -4265,13 +4161,11 @@ mod tests {
                 },
             );
 
-            let req = ChatCompletionRequest {
-                model: Some("test-model".to_string()),
-                messages: vec![user_msg("hi")],
-                max_tokens: Some(NEAR_MAX_CONTEXT_TOKENS),
-                stream: Some(true),
-                ..bare_req()
-            };
+            let mut req = bare_req();
+            req.model = Some("test-model".to_string());
+            req.messages = vec![user_msg("hi")];
+            req.max_tokens = Some(NEAR_MAX_CONTEXT_TOKENS);
+            req.stream = Some(true);
             let response = chat_completions_with_request(State(state), req)
                 .await
                 .expect("streaming request must be accepted");
