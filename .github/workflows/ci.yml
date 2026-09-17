@@ -319,6 +319,43 @@ jobs:
       # opt-in API cannot rot silently.
       - name: tune — simulated-teacher (build + run tests)
         run: cargo test -p lattice-tune --features simulated-teacher --lib
+      # lattice-inference's OWN `mixture` feature is a different feature from the
+      # lattice-tune one two steps above, and nothing here used to enable it, so
+      # crates/inference/src/mixture.rs (the AdapterRouter gate) was compiled by
+      # no job in this file: its route_* tests never ran and clippy never saw it.
+      # The reason that was easy to miss is worth stating, because the next
+      # feature to go dark will hide the same way: the tune step's NAME contains
+      # the word `mixture`, so a reader checking whether the feature is exercised
+      # finds a step that builds and runs tests and stops there. Its comment is
+      # accurate about covering crates/tune/src/lora/router_update.rs; the name is
+      # what generalises. And tune's `mixture` forwards with
+      # `lattice-inference?/mixture`, where the `?` enables the dependency's
+      # feature only if the OPTIONAL lattice-inference dep is already on -- which
+      # that step does not turn on -- so the forward is inert and reads identical
+      # to a live one. Run the tests and lint the module here.
+      # The assertions below are the point of the step, not decoration: a cargo
+      # test filter that matches NOTHING exits 0, so a step that merely runs the
+      # command would report this module as covered in exactly the case where the
+      # filter has rotted. That is the same shape as the gap this step closes, so
+      # it is closed here rather than left for the next reader. The patterns are
+      # deliberately shape-based rather than an exact name list or an exact count:
+      # a step pinning either becomes a sibling of every test anyone adds.
+      - name: inference — mixture (adapter router, build + run tests)
+        run: |
+          log="${RUNNER_TEMP:-/tmp}/inference-mixture-tests.log"
+          if cargo test -p lattice-inference --features mixture --lib mixture:: \
+            >"$log" 2>&1
+          then
+            cat "$log"
+          else
+            status=$?
+            cat "$log"
+            exit "$status"
+          fi
+          grep -Eq '^test .*route_[a-z0-9_]+ \.\.\. ok$' "$log"
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference — mixture clippy
+        run: cargo clippy -p lattice-inference --all-targets --features mixture -- -D warnings
       - name: inference — f16 + train-backward
         run: cargo build -p lattice-inference --features f16,train-backward
       # wgpu-gpu is excluded from default builds and was silently broken under
