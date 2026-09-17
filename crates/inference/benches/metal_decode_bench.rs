@@ -216,8 +216,15 @@ fn bench_metal_decode_q4(c: &mut Criterion) {
 
         state.reset_state();
         let lora_layers = generate_random_lora(&cfg, 8);
+        // `None`, not a literal seed: the adapter is generated here, so it has no
+        // QuaRot rotation of its own to declare, and `load_lora_adapter` resolves
+        // `None` to the base model's own seed (rotating to match a rotated base,
+        // staying unrotated against an unrotated one). Naming any literal here
+        // refuses on every base except one rotated with exactly that value --
+        // including unrotated bases, via the (Some(seed), None) arm -- which
+        // aborted this whole target before the first group could run.
         state
-            .load_lora_adapter(lora_layers, 1.0, Some(42))
+            .load_lora_adapter(lora_layers, 1.0, None)
             .expect("load_lora_adapter (rank 8)");
         state.forward_prefill(&prompt_tokens);
         pos = prompt_tokens.len();
@@ -230,7 +237,7 @@ fn bench_metal_decode_q4(c: &mut Criterion) {
                     state.reset_state();
                     state.unload_lora_adapter();
                     state
-                        .load_lora_adapter(generate_random_lora(&cfg, 8), 1.0, Some(42))
+                        .load_lora_adapter(generate_random_lora(&cfg, 8), 1.0, None)
                         .expect("reload lora_rank8");
                     state.forward_prefill(&prompt_tokens);
                     pos = prompt_tokens.len();
