@@ -33342,11 +33342,17 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
         // lane injected into the Q (or K) input, once with that entire Q (or
         // K) sub-vector explicitly zeroed instead. Per ADR-080 C1 + the #850
         // contract (an invalid Q/K vector is assigned literal 0.0, matching
-        // ordinary zero-weight arithmetic), both runs take the SAME
-        // `!(sum_sq > 1e-12f) -> assign 0.0` branch server-side (a poisoned
-        // sum_sq is non-finite, an all-zero sum_sq is exactly 0.0 <= 1e-12f),
-        // so a correct kernel produces BIT-IDENTICAL output between the two
-        // runs. This is a Metal-vs-Metal (poisoned-vs-explicit-zero-reference)
+        // ordinary zero-weight arithmetic), a correct kernel produces
+        // BIT-IDENTICAL output between the two runs. Since #1583 the two runs
+        // reach that identical output by DIFFERENT routes, which is worth
+        // stating because the earlier "both take the same branch" reasoning is
+        // no longer what makes this test valid: the poisoned run has a
+        // non-finite sum_sq and takes the fail-closed `assign 0.0` arm, while
+        // the explicitly-zeroed run has sum_sq == 0.0, which is finite, so it
+        // takes the ORDINARY arm and computes `0.0 * rsqrt(0.0 + 1e-6)` — an
+        // exact zero for every lane, because the input vector is all zeros.
+        // The assertion is unchanged and still discriminating; only its
+        // justification moved. This is a Metal-vs-Metal (poisoned-vs-explicit-zero-reference)
         // differential, not a cross-language CPU-vs-Metal one; see the PR body
         // for why that scope was chosen. Mutation-sensitive: the pre-fix
         // `value * guarded_zero_reciprocal` code lets the poisoned lane itself
@@ -33453,7 +33459,16 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
 
                 let s_buf = f32_buf(device, s_init, "S_all");
                 let conv_buf = f32_buf(device, conv_out, "conv_out");
-                let z_buf = f32_buf(device, &vec![0.0f32; output_dim as usize], "z_proj");
+                // z_proj was all zeros here, which made `silu(z)` zero and therefore
+                // `output` identically zero for every input, whatever the kernel did.
+                // Any assertion on `output` was vacuous, and since the state update
+                // reads only k_tg/delta/g and never q_tg, the Q path had NO observable
+                // at all. The offset keeps every lane's gate comfortably away from 0.
+                let z_vals: Vec<f32> = lcg_vec(6, output_dim as usize)
+                    .iter()
+                    .map(|v| v + 0.5)
+                    .collect();
+                let z_buf = f32_buf(device, &z_vals, "z_proj");
                 let hidden_buf = f32_buf(device, hidden_in, "hidden_in");
                 let inb_buf = make_buffer_f16(device, in_proj_b, "in_proj_b");
                 let ina_buf = make_buffer_f16(device, in_proj_a, "in_proj_a");
@@ -33576,6 +33591,223 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
                         );
                     }
                 }
+            }
+
+            /// #1583, divergence 1: the Metal Q/K L2 normalisation must carry the same
+            /// epsilon the CPU reference uses, which is observable as a LOSS of scale
+            /// invariance.
+            ///
+            /// This is the discriminating property, and it needs no CPU reimplementation of
+            /// the recurrence -- which matters, because reimplementing it would make the
+            /// test agree with my own port rather than with the kernel. `q / sqrt(sum_sq)`
+            /// is homogeneous by construction: scaling the Q sub-vector by any positive `c`
+            /// leaves the normalised vector, and therefore the whole kernel output,
+            /// unchanged up to rounding. `q / sqrt(sum_sq + eps)` is NOT homogeneous,
+            /// because the epsilon has a fixed scale. So scaling only the Q slice and
+            /// requiring the output to MOVE is exactly an assertion that the epsilon is
+            /// there.
+            ///
+            /// Mutation sensitivity is structural rather than incidental: reverting the
+            /// eight sites to `rsqrt(sg_buf[0])` restores exact homogeneity, and the two
+            /// runs collapse to within f32 rounding of each other on every lane at once.
+            #[test]
+            fn gdn_qk_l2_norm_is_not_scale_invariant_1583() {
+                // Fail closed under LATTICE_METAL_TEST_ENFORCE=1, matching the other
+                // Metal tests CI names explicitly: without this the CI step added for
+                // this test would pass on a runner with no Metal device, which is the
+                // one condition that makes the step worth having.
+                let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                let Some(device) = Device::system_default() else {
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present (gdn_qk_l2_norm_is_not_scale_invariant_1583)"
+                    );
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_recurrence_fused");
+                let queue = device.new_command_queue();
+
+                let kd = 8u32;
+                let vd = 8u32;
+                let hd = 16u32;
+                let hidden_in = lcg_vec(1, hd as usize);
+                let in_proj_b = lcg_vec(2, hd as usize);
+                let in_proj_a = lcg_vec(3, hd as usize);
+                let s_init = lcg_vec(4, (kd * vd) as usize);
+
+                // Chosen so the two runs sit on OPPOSITE sides of the epsilon's influence:
+                // the unscaled sum_sq is far above 1e-6, the scaled one far below it. That
+                // makes the predicted gap order-1 instead of marginal, so the assertion
+                // does not depend on a finely-tuned threshold.
+                const C: f32 = 1e-4;
+
+                for label in ["Q", "K"] {
+                    let base = lcg_vec(5, (3 * kd) as usize); // [Q(kd) | K(kd) | V(kd)]
+                    let (lo, hi) = if label == "Q" {
+                        (0usize, kd as usize)
+                    } else {
+                        (kd as usize, 2 * kd as usize)
+                    };
+
+                    // The fixture's own preconditions, asserted rather than assumed: a
+                    // fixture that drifted to either side of the epsilon would make this
+                    // test pass or fail for a reason that has nothing to do with the code.
+                    let sum_sq: f32 = base[lo..hi].iter().map(|v| v * v).sum();
+                    assert!(
+                        sum_sq > 1e-3,
+                        "{label}: fixture sum_sq {sum_sq} is not comfortably above the 1e-6 epsilon"
+                    );
+                    assert!(
+                        sum_sq * C * C < 1e-7,
+                        "{label}: scaled sum_sq {} is not comfortably below the 1e-6 epsilon",
+                        sum_sq * C * C
+                    );
+
+                    let mut scaled = base.clone();
+                    for v in scaled[lo..hi].iter_mut() {
+                        *v *= C;
+                    }
+
+                    let (out_base, _) = run_gdn_recurrence_fused(
+                        &device, &queue, &pipe, kd, vd, hd, &base, &s_init, &hidden_in, &in_proj_b,
+                        &in_proj_a,
+                    );
+                    let (out_scaled, _) = run_gdn_recurrence_fused(
+                        &device, &queue, &pipe, kd, vd, hd, &scaled, &s_init, &hidden_in,
+                        &in_proj_b, &in_proj_a,
+                    );
+                    assert_no_nonfinite(label, "output(base)", &out_base);
+                    assert_no_nonfinite(label, "output(scaled)", &out_scaled);
+
+                    let max_abs = out_base.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+                    let max_delta = out_base
+                        .iter()
+                        .zip(out_scaled.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        max_abs > 1e-6,
+                        "{label}: baseline output is ~zero (max_abs {max_abs}); this fixture \
+                         cannot express a difference and the comparison below would be vacuous"
+                    );
+                    let rel = max_delta / max_abs;
+
+                    // Rounding noise between the two arms is order 1e-6 relative; the
+                    // epsilon's effect here is order 1. 1e-2 separates them with several
+                    // orders of margin on both sides.
+                    assert!(
+                        rel > 1e-2,
+                        "{label}: scaling the {label} sub-vector by {C} moved the output by only \
+                         {rel} relative (max_delta {max_delta}, max_abs {max_abs}). The Q/K \
+                         normalisation is still scale-invariant, which means the #1583 epsilon \
+                         is absent from rsqrt(sg_buf[0])."
+                    );
+                }
+            }
+
+            /// #1583, divergence 2: a tiny but FINITE Q/K vector must no longer be treated
+            /// as if it were the zero vector.
+            ///
+            /// The Metal guard used to read `isfinite(sum_sq) && sum_sq > 1e-12f`, zeroing
+            /// the whole vector below that threshold, while the CPU reference
+            /// (`l2_normalize_rows`, gdn_chunk_ref.rs:38-56) fails closed on NON-FINITE
+            /// input only and otherwise divides by `sqrt(sum_sq + 1e-6)`. So for
+            /// `0 < sum_sq <= 1e-12` the two backends did categorically different things:
+            /// Metal returned an exact zero vector, the CPU returned the input scaled by
+            /// about 1e3. Adding the epsilon collapses both rules to the CPU's, because
+            /// `sum_sq + 1e-6` is never near zero, so the threshold arm became unreachable
+            /// and was removed.
+            ///
+            /// The assertion is a ratio rather than a threshold, which is what lets it be
+            /// mutation-sensitive to the GUARD specifically and not merely to the epsilon:
+            /// a run just below the old cliff must be CLOSER to its neighbour just above
+            /// the cliff than it is to a run with Q identically zero. Restoring the
+            /// `> 1e-12f` arm makes the below-cliff run bit-identical to the zero-Q run
+            /// (distance 0) and wildly far from its neighbour, inverting the inequality.
+            #[test]
+            fn gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583() {
+                // Fail closed under LATTICE_METAL_TEST_ENFORCE=1, matching the other
+                // Metal tests CI names explicitly: without this the CI step added for
+                // this test would pass on a runner with no Metal device, which is the
+                // one condition that makes the step worth having.
+                let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
+                let Some(device) = Device::system_default() else {
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present (gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583)"
+                    );
+                    return;
+                };
+                let _gpu = gpu_test_lock();
+                let lib = compile_msl(&device);
+                let pipe = pipeline_for(&device, &lib, "gdn_recurrence_fused");
+                let queue = device.new_command_queue();
+
+                let kd = 8u32;
+                let vd = 8u32;
+                let hd = 16u32;
+                let hidden_in = lcg_vec(1, hd as usize);
+                let in_proj_b = lcg_vec(2, hd as usize);
+                let in_proj_a = lcg_vec(3, hd as usize);
+                let s_init = lcg_vec(4, (kd * vd) as usize);
+
+                let base = lcg_vec(5, (3 * kd) as usize);
+                let sum_sq: f32 = base[..kd as usize].iter().map(|v| v * v).sum();
+                assert!(
+                    sum_sq > 1e-3,
+                    "fixture sum_sq {sum_sq} too small to rescale from"
+                );
+
+                // Two Q vectors straddling the REMOVED 1e-12 threshold, plus the zero
+                // vector the old guard mapped the lower one onto.
+                let scale_to = |target: f32| {
+                    let c = (target / sum_sq).sqrt();
+                    let mut v = base.clone();
+                    for x in v[..kd as usize].iter_mut() {
+                        *x *= c;
+                    }
+                    v
+                };
+                let below = scale_to(9e-13);
+                let above = scale_to(1.1e-12);
+                let mut zeroed = base.clone();
+                for x in zeroed[..kd as usize].iter_mut() {
+                    *x = 0.0;
+                }
+
+                let run = |conv: &[f32]| {
+                    run_gdn_recurrence_fused(
+                        &device, &queue, &pipe, kd, vd, hd, conv, &s_init, &hidden_in, &in_proj_b,
+                        &in_proj_a,
+                    )
+                    .0
+                };
+                let out_below = run(&below);
+                let out_above = run(&above);
+                let out_zero = run(&zeroed);
+                assert_no_nonfinite("Q", "output(below)", &out_below);
+                assert_no_nonfinite("Q", "output(above)", &out_above);
+                assert_no_nonfinite("Q", "output(zero)", &out_zero);
+
+                let dist = |a: &[f32], b: &[f32]| {
+                    a.iter()
+                        .zip(b.iter())
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0f32, f32::max)
+                };
+                let d_neighbour = dist(&out_below, &out_above);
+                let d_zero = dist(&out_below, &out_zero);
+
+                assert!(
+                    d_zero > d_neighbour,
+                    "a Q vector with sum_sq 9e-13 is closer to an identically-zero Q \
+                     (distance {d_zero}) than to a Q with sum_sq 1.1e-12 (distance \
+                     {d_neighbour}). That is the signature of the removed `sum_sq > 1e-12f` \
+                     guard: the normalisation still has a cliff there and still zeroes \
+                     tiny-but-finite vectors the CPU reference normalises."
+                );
             }
 
             // --------------------------------------------------------------
