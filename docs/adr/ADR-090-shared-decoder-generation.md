@@ -604,7 +604,12 @@ looks like a gate is how the weaker check replaces the stronger one:
    family still cannot be done without editing that match, which is the thing the acceptance is
    for.
 3. **A cfg-selected type of the same name.** A platform-gated stub keeps the coupling portable and
-   invisible to a search run on one platform.
+   invisible to a search run on one platform. Measured at `79d422805bbde537e19bd17f2e89dd3fbf4780f6`,
+   this one is not hypothetical: it is the shape two owners already have. `MetalQwen35State` is a
+   real struct inside a `#[cfg(all(target_os = "macos", feature = "metal-gpu"))]` module and a unit
+   struct under `#[cfg(not(...))]` with the same public generation surface, and
+   `MetalErnie45State` is declared the same two ways. A run on Linux and a run on macOS are reading
+   different type sets, so the platform the tripwire runs on is part of its result.
 
 #### Amendment, 2026-09-17: the published command matched nothing, and the check is negated
 
