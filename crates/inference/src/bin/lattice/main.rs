@@ -92,6 +92,14 @@ enum Command {
                 .range(1..=(tokio::sync::Semaphore::MAX_PERMITS as u64))
         )]
         max_pending: usize,
+        /// Maximum resident adapter identities; reaching the cap rejects new loads.
+        #[arg(long, default_value_t = lattice_inference::serve::lora::DEFAULT_MAX_RESIDENT_ADAPTERS,
+            value_parser = lattice_inference::serve::lora::parse_resident_limit)]
+        max_resident_adapters: usize,
+        /// Resident A/B tensor payload budget in bytes, not a process-memory budget.
+        #[arg(long, default_value_t = lattice_inference::serve::lora::DEFAULT_MAX_RESIDENT_ADAPTER_BYTES,
+            value_parser = lattice_inference::serve::lora::parse_resident_limit)]
+        max_resident_adapter_bytes: usize,
         /// Eagerly load vision weights at startup instead of on the first
         /// image request (issue #1336). Off by default: lazy loading keeps
         /// text-only startup time and resident memory unchanged from a
@@ -177,6 +185,8 @@ async fn main() {
             model_id,
             tokenizer_dir,
             max_pending,
+            max_resident_adapters,
+            max_resident_adapter_bytes,
             preload_vision,
         } => {
             use std::path::Path;
@@ -218,6 +228,10 @@ async fn main() {
                             model_path.to_path_buf(),
                             tokenizer_dir_path,
                             max_pending,
+                            lattice_inference::serve::lora::ResidencyLimits {
+                                max_adapters: max_resident_adapters,
+                                max_bytes: max_resident_adapter_bytes,
+                            },
                             preload_vision,
                         ) {
                             Ok((backend, _max_context)) => backend,
@@ -230,7 +244,11 @@ async fn main() {
                     #[cfg(not(feature = "metal-gpu"))]
                     {
                         let _ = &tokenizer_dir;
-                        let _ = max_pending;
+                        let _ = (
+                            max_pending,
+                            max_resident_adapters,
+                            max_resident_adapter_bytes,
+                        );
                         let _ = preload_vision;
                         eprintln!("Error: {}", backend::metal_gpu_required_message(model_path));
                         std::process::exit(1);
@@ -367,6 +385,76 @@ mod max_pending_cli_tests {
             Command::Serve { max_pending, .. } => Ok(max_pending),
             _ => panic!("expected Command::Serve, got a different Command variant"),
         }
+    }
+
+    fn parse_resident_limits(args: &[&str]) -> Result<(usize, usize), clap::Error> {
+        let mut full = vec!["lattice", "serve", "--model", "fixture"];
+        full.extend_from_slice(args);
+        match Cli::try_parse_from(full)?.command {
+            Command::Serve {
+                max_resident_adapters,
+                max_resident_adapter_bytes,
+                ..
+            } => Ok((max_resident_adapters, max_resident_adapter_bytes)),
+            _ => panic!("expected serve"),
+        }
+    }
+
+    #[test]
+    fn resident_limits_defaults_and_overrides() {
+        assert_eq!(parse_resident_limits(&[]).unwrap(), (32, 536_870_912));
+        assert_eq!(
+            parse_resident_limits(&[
+                "--max-resident-adapters",
+                "2",
+                "--max-resident-adapter-bytes",
+                "128"
+            ])
+            .unwrap(),
+            (2, 128)
+        );
+        assert_eq!(
+            parse_resident_limits(&[
+                "--max-resident-adapters",
+                "1",
+                "--max-resident-adapter-bytes",
+                "1"
+            ])
+            .unwrap(),
+            (1, 1)
+        );
+    }
+
+    fn assert_resident_flag_rejects_invalid(flag: &str) {
+        parse_resident_limits(&[flag, "8"]).unwrap();
+        for value in ["not-a-number", "0", "-1", "18446744073709551616"] {
+            assert!(
+                parse_resident_limits(&[flag, value]).is_err(),
+                "{flag} accepted {value}"
+            );
+        }
+        assert!(parse_resident_limits(&[flag]).is_err());
+    }
+
+    #[test]
+    fn resident_count_malformed_is_rejected() {
+        assert_resident_flag_rejects_invalid("--max-resident-adapters");
+    }
+
+    #[test]
+    fn resident_bytes_malformed_is_rejected() {
+        assert_resident_flag_rejects_invalid("--max-resident-adapter-bytes");
+    }
+
+    #[test]
+    fn resident_limits_valid_flags_are_accepted() {
+        parse_max_pending(&[
+            "--max-resident-adapters",
+            "2",
+            "--max-resident-adapter-bytes",
+            "128",
+        ])
+        .unwrap();
     }
 
     #[test]

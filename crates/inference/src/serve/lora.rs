@@ -5,6 +5,91 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 
+/// Default maximum number of resident adapters per server.
+pub const DEFAULT_MAX_RESIDENT_ADAPTERS: usize = 32;
+/// Default tensor-payload budget per server: 512 MiB, excluding other memory.
+pub const DEFAULT_MAX_RESIDENT_ADAPTER_BYTES: usize = 512 * 1024 * 1024;
+
+/// Admission limits for explicitly loaded adapters. Reaching either rejects a load;
+/// existing residents are never evicted. This is not a process-memory budget.
+#[derive(Debug, Clone, Copy)]
+pub struct ResidencyLimits {
+    /// Maximum number of distinct client-supplied `(name, path)` identities.
+    pub max_adapters: usize,
+    /// Maximum sum of A/B tensor payload bytes, excluding strings and struct overhead.
+    pub max_bytes: usize,
+}
+
+impl Default for ResidencyLimits {
+    fn default() -> Self {
+        Self {
+            max_adapters: DEFAULT_MAX_RESIDENT_ADAPTERS,
+            max_bytes: DEFAULT_MAX_RESIDENT_ADAPTER_BYTES,
+        }
+    }
+}
+
+/// Parse a positive resident limit without silently replacing malformed input.
+pub fn parse_resident_limit(raw: &str) -> Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|_| "expected a positive integer".to_string())?;
+    if value == 0 {
+        return Err("expected a positive integer".into());
+    }
+    Ok(value)
+}
+
+/// Failure of a worker-local adapter load or unload command.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AdapterControlError {
+    /// Invalid descriptor, tensor payload, or unavailable control implementation.
+    #[error("{0}")]
+    InvalidAdapter(String),
+    /// The identifier is no longer resident.
+    #[error("unknown LoRA adapter id {0}")]
+    NotFound(u32),
+    /// Admitting a new identity would exceed the count limit.
+    #[error("resident LoRA adapter count limit reached ({limit})")]
+    CountLimit { limit: usize },
+    /// Admitting the tensor payload would exceed the byte limit.
+    #[error("resident LoRA adapter tensor payload byte limit exceeded ({limit})")]
+    ByteLimit { limit: usize },
+    /// All identifiers have been used during this worker's lifetime.
+    #[error("LoRA adapter id space exhausted")]
+    IdExhausted,
+}
+
+impl From<String> for AdapterControlError {
+    fn from(message: String) -> Self {
+        Self::InvalidAdapter(message)
+    }
+}
+
+impl From<&str> for AdapterControlError {
+    fn from(message: &str) -> Self {
+        Self::InvalidAdapter(message.to_string())
+    }
+}
+
+impl From<AdapterControlError> for ApiError {
+    fn from(error: AdapterControlError) -> Self {
+        Self::BadRequest {
+            code: adapter_failure_code(&error),
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Confirmed result, including the resident metadata on an idempotent load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdapterControlResult {
+    /// Newly admitted or already resident adapter.
+    Loaded(AdapterMetadata),
+    /// Explicitly removed identifier.
+    Unloaded(u32),
+}
+
 /// One contribution to an ordered request mixture.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -17,7 +102,7 @@ pub struct LoraSelection {
 }
 
 /// Metadata for one resident adapter; contains no weights.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdapterMetadata {
     /// Identifier, never reused during this worker's lifetime.
     pub id: u32,
@@ -131,11 +216,15 @@ pub fn parse_lora_load_path(bytes: &[u8]) -> Result<String, ApiError> {
 }
 
 /// Classify a residency command failure without hiding its diagnosis.
-pub fn adapter_failure_code(message: &str) -> &'static str {
-    if message.starts_with("unknown LoRA adapter id ") {
-        "lora_adapter_not_found"
-    } else {
-        "lora_load_failed"
+pub fn adapter_failure_code(error: &AdapterControlError) -> &'static str {
+    match error {
+        AdapterControlError::NotFound(_) => "lora_adapter_not_found",
+        AdapterControlError::CountLimit { .. } | AdapterControlError::ByteLimit { .. } => {
+            "lora_residency_limit_exceeded"
+        }
+        AdapterControlError::InvalidAdapter(_) | AdapterControlError::IdExhausted => {
+            "lora_load_failed"
+        }
     }
 }
 
@@ -165,8 +254,8 @@ pub fn unload_success_body(id: u32) -> Value {
     serde_json::json!({"object": "lora.adapter", "status": "unloaded", "id": id})
 }
 
-/// A parsed adapter, ready to hand to the worker, plus the two numbers the
-/// success body reports.
+/// A parsed adapter and its source metadata, ready to hand to the worker.
+/// The confirmed worker reply supplies response metadata when identity is reused.
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 pub struct PreparedAdapter {
     pub command: super::metal_worker::AdapterCommand,
@@ -347,11 +436,13 @@ mod tests {
     #[test]
     fn a_worker_failure_separates_unknown_id_from_a_bad_adapter() {
         assert_eq!(
-            adapter_failure_code("unknown LoRA adapter id 7"),
+            adapter_failure_code(&AdapterControlError::NotFound(7)),
             "lora_adapter_not_found"
         );
         assert_eq!(
-            adapter_failure_code("load_lora_adapter: layers must not be empty"),
+            adapter_failure_code(&AdapterControlError::InvalidAdapter(
+                "unknown LoRA adapter id 7".into()
+            )),
             "lora_load_failed"
         );
     }

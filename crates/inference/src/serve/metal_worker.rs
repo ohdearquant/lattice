@@ -49,7 +49,9 @@
 //! on `metal_qwen35.rs`'s own exhaustive Device-gated tests for the
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
-use super::lora::{AdapterIndex, LoraSelection};
+use super::lora::{
+    AdapterControlError, AdapterControlResult, AdapterIndex, LoraSelection, ResidencyLimits,
+};
 use super::lora_registry::ResidencyRegistry;
 use crate::forward::metal_qwen35::{
     ChatMessage, LoraLayerData, MetalQwen35State, format_chat_template, push_chat_generation_open,
@@ -205,6 +207,10 @@ impl From<crate::error::InferenceError> for WorkerFailure {
 pub enum StartupError {
     Load(String),
     ThreadExited,
+    /// Both resident limits must be positive before the worker can start.
+    InvalidResidencyLimits {
+        limits: ResidencyLimits,
+    },
     /// `max_pending` was `0` (admits nothing -- every request would fail
     /// admission before any generation work could ever run) or greater
     /// than `Semaphore::MAX_PERMITS` (`Semaphore::new` panics outright on
@@ -222,6 +228,11 @@ impl std::fmt::Display for StartupError {
             StartupError::ThreadExited => {
                 write!(f, "worker thread exited before loading finished")
             }
+            StartupError::InvalidResidencyLimits { limits } => write!(
+                f,
+                "resident adapter limits must be positive (count {}, bytes {})",
+                limits.max_adapters, limits.max_bytes
+            ),
             StartupError::InvalidMaxPending { max_pending } => write!(
                 f,
                 "--max-pending must be between 1 and {} (got {max_pending})",
@@ -303,7 +314,7 @@ impl std::fmt::Debug for AdapterCommand {
 /// because neither type can be constructed with the other's permit.
 pub struct ControlRequest {
     command: AdapterCommand,
-    reply: oneshot::Sender<Result<u32, String>>,
+    reply: oneshot::Sender<Result<AdapterControlResult, AdapterControlError>>,
     /// Held from [`MetalWorkerClient::submit_adapter_command`] until the
     /// worker has finished applying this command and dropped it. Its only job
     /// is to exist and be dropped, like `WorkerJob::_admission_permit`.
@@ -607,13 +618,14 @@ impl MetalWorkerClient {
     /// unresolved load/unload commands have no order a caller can reason
     /// about, since neither has reported its result yet.
     ///
-    /// Success returns the loaded or unloaded id. The worker publishes metadata
-    /// before replying, even if the caller disconnected. A closed receiver leaves
+    /// Success returns confirmed resident metadata or the unloaded id. Metadata
+    /// is published before replying, even if the caller disconnected. A closed receiver leaves
     /// the outcome unknown; inspect the index before retrying.
     pub fn submit_adapter_command(
         &self,
         command: AdapterCommand,
-    ) -> Result<oneshot::Receiver<Result<u32, String>>, ApiError> {
+    ) -> Result<oneshot::Receiver<Result<AdapterControlResult, AdapterControlError>>, ApiError>
+    {
         let permit =
             self.control
                 .clone()
@@ -782,8 +794,10 @@ fn run_worker_loop(
 /// message. Written as a named function rather than a closure at each call
 /// site so every such worker returns the same string.
 #[cfg(any(test, feature = "test-utils"))]
-fn control_unsupported(_command: AdapterCommand) -> Result<u32, String> {
-    Err("this inference worker does not support adapter commands".to_string())
+fn control_unsupported(
+    _command: AdapterCommand,
+) -> Result<AdapterControlResult, AdapterControlError> {
+    Err("this inference worker does not support adapter commands".into())
 }
 
 /// [`run_worker_loop`] with an injected adapter-control handler.
@@ -796,8 +810,7 @@ fn control_unsupported(_command: AdapterCommand) -> Result<u32, String> {
 ///
 /// `control` runs on the worker thread with exclusive access to whatever state
 /// that thread owns, at a point where no generation is in flight. It returns
-/// the underlying loader's error string unchanged: across a channel that
-/// string is the entire diagnosis the caller gets.
+/// a typed failure so HTTP callers can distinguish capacity from invalid input.
 #[cfg(any(test, feature = "test-utils"))]
 fn run_worker_loop_with_control(
     msg_rx: mpsc::UnboundedReceiver<WorkerMessage>,
@@ -807,7 +820,7 @@ fn run_worker_loop_with_control(
         &mut dyn FnMut(&str, u32) -> bool,
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
-    control: impl FnMut(AdapterCommand) -> Result<u32, String>,
+    control: impl FnMut(AdapterCommand) -> Result<AdapterControlResult, AdapterControlError>,
 ) {
     run_worker_loop_with_lora(
         msg_rx,
@@ -825,7 +838,7 @@ fn run_worker_loop_with_lora(
         &mut dyn FnMut(&str, u32) -> bool,
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
-    mut control: impl FnMut(AdapterCommand) -> Result<u32, String>,
+    mut control: impl FnMut(AdapterCommand) -> Result<AdapterControlResult, AdapterControlError>,
 ) {
     while let Some(message) = msg_rx.blocking_recv() {
         let job = match message {
@@ -1355,14 +1368,21 @@ impl MetalWorker {
     /// outstanding-job admission cap -- see [`MetalWorkerClient::submit`].
     /// Both binaries pass their own `--max-pending`-derived value (default
     /// [`DEFAULT_MAX_PENDING_JOBS`]); this function applies no default of
-    /// its own.
+    /// its own. `residency_limits` bounds explicit adapter loads independently
+    /// of request admission; both its fields must be positive.
     pub fn spawn(
         loader: impl FnOnce() -> Result<(MetalQwen35State, BpeTokenizer, WorkerMetadata), String>
         + Send
         + 'static,
         max_pending: usize,
+        residency_limits: ResidencyLimits,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
-        Self::spawn_with_vision(loader, VisionRuntime::unsupported(), max_pending)
+        Self::spawn_with_vision(
+            loader,
+            VisionRuntime::unsupported(),
+            max_pending,
+            residency_limits,
+        )
     }
 
     /// Vision-capable sibling of [`Self::spawn`].
@@ -1376,7 +1396,13 @@ impl MetalWorker {
         + 'static,
         mut vision_runtime: VisionRuntime,
         max_pending: usize,
+        residency_limits: ResidencyLimits,
     ) -> Result<(MetalWorkerOwner, MetalWorkerClient, WorkerMetadata), StartupError> {
+        if residency_limits.max_adapters == 0 || residency_limits.max_bytes == 0 {
+            return Err(StartupError::InvalidResidencyLimits {
+                limits: residency_limits,
+            });
+        }
         let vision_supported = vision_runtime.shared_capability();
         // #939: validate BEFORE `Semaphore::new`, which panics outright for
         // `max_pending > Semaphore::MAX_PERMITS` and would otherwise let
@@ -1406,7 +1432,10 @@ impl MetalWorker {
                 // construction rather than by convention.
                 let state_rc = Rc::new(RefCell::new(state));
                 let state_for_control = Rc::clone(&state_rc);
-                let registry = Rc::new(RefCell::new(ResidencyRegistry::new(worker_index)));
+                let registry = Rc::new(RefCell::new(ResidencyRegistry::new(
+                    worker_index,
+                    residency_limits,
+                )));
                 let control_registry = Rc::clone(&registry);
                 run_worker_loop_with_lora(
                     job_rx,
@@ -1546,13 +1575,14 @@ impl MetalWorker {
                                 layers,
                                 descriptor,
                             } => {
-                                control_registry
-                                    .borrow_mut()
-                                    .load(name, path, layers, *descriptor)
+                                let mut registry = control_registry.borrow_mut();
+                                let id = registry.load(name, path, layers, *descriptor)?;
+                                registry.metadata(id).map(AdapterControlResult::Loaded)
                             }
-                            AdapterCommand::Unload { id } => {
-                                control_registry.borrow_mut().unload(id, state)
-                            }
+                            AdapterCommand::Unload { id } => control_registry
+                                .borrow_mut()
+                                .unload(id, state)
+                                .map(AdapterControlResult::Unloaded),
                         }
                     },
                 );
@@ -2805,7 +2835,7 @@ mod tests {
                 move |command| {
                     assert!(matches!(command, AdapterCommand::Unload { id: 0 }));
                     epoch_for_control.fetch_add(1, Ordering::SeqCst);
-                    Ok(0)
+                    Ok(AdapterControlResult::Unloaded(0))
                 },
             );
         });
@@ -2843,7 +2873,11 @@ mod tests {
             // dropped -- otherwise "the generation was unaffected" would be
             // true for the uninteresting reason.
             let outcome = reply_rx.blocking_recv().expect("control reply channel");
-            assert_eq!(outcome, Ok(0), "the injected command must have run");
+            assert_eq!(
+                outcome,
+                Ok(AdapterControlResult::Unloaded(0)),
+                "the injected command must have run"
+            );
         }
 
         drop(msg_tx);
@@ -2901,7 +2935,11 @@ mod tests {
                     Arc::new(AtomicUsize::new(0)),
                     Arc::new(AtomicUsize::new(0)),
                 ),
-                |_command| Err(LOADER_MESSAGE.to_string()),
+                |_command| {
+                    Err(AdapterControlError::InvalidAdapter(
+                        LOADER_MESSAGE.to_string(),
+                    ))
+                },
             );
         });
 
@@ -2918,7 +2956,12 @@ mod tests {
             .unwrap();
 
         let outcome = reply_rx.blocking_recv().expect("control reply channel");
-        assert_eq!(outcome, Err(LOADER_MESSAGE.to_string()));
+        assert_eq!(
+            outcome,
+            Err(AdapterControlError::InvalidAdapter(
+                LOADER_MESSAGE.to_string()
+            ))
+        );
 
         drop(msg_tx);
         handle.join().unwrap();
@@ -3507,12 +3550,37 @@ mod tests {
         let result = MetalWorker::spawn(
             || Err("simulated load failure".to_string()),
             DEFAULT_MAX_PENDING_JOBS,
+            ResidencyLimits::default(),
         );
         match result {
             Err(StartupError::Load(message)) => {
                 assert_eq!(message, "simulated load failure");
             }
             other => panic!("expected StartupError::Load, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_resident_limits_are_rejected_before_loading() {
+        for limits in [
+            ResidencyLimits {
+                max_adapters: 0,
+                max_bytes: 8,
+            },
+            ResidencyLimits {
+                max_adapters: 1,
+                max_bytes: 0,
+            },
+        ] {
+            let result = MetalWorker::spawn(
+                || panic!("invalid limits must be rejected before loading"),
+                DEFAULT_MAX_PENDING_JOBS,
+                limits,
+            );
+            assert!(matches!(
+                result,
+                Err(StartupError::InvalidResidencyLimits { .. })
+            ));
         }
     }
 
@@ -3547,6 +3615,7 @@ mod tests {
                 panic!("loader must not run: max_pending=0 must be rejected first")
             },
             0,
+            ResidencyLimits::default(),
         );
         match result {
             Err(StartupError::InvalidMaxPending { max_pending: 0 }) => {}
@@ -3562,6 +3631,7 @@ mod tests {
                 panic!("loader must not run: max_pending above MAX_PERMITS must be rejected first")
             },
             too_big,
+            ResidencyLimits::default(),
         );
         match result {
             Err(StartupError::InvalidMaxPending { max_pending }) => {
