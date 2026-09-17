@@ -1590,6 +1590,14 @@ mod inner {
         /// Used by mtp_forward_one to apply R^T to embed and pre-final-hidden before
         /// the O-space MTP forward, and R to mtp_h_out before the logits GEMV.
         pub(crate) quarot_rotation: Option<crate::quant::quarot::hadamard::RandomizedHadamard>,
+        /// The base model's own QuaRot rotation seed, independent of whether MTP
+        /// weights are present (unlike `quarot_rotation`, which is only built when
+        /// `mtp_weights` is `Some`). Set once at construction from the same
+        /// `quarot_seed_opt` `from_q4_dir` computes for `quarot_rotation`; `None` for
+        /// every non-QuaRot construction path. `load_lora_adapter` resolves an
+        /// adapter's own (optional) seed against this value instead of silently
+        /// skipping rotation when the adapter carries no seed of its own.
+        pub(crate) base_quarot_seed: Option<u64>,
         /// Whether any active layer's FFN is `MetalFfnWeights::Moe`. Computed once at
         /// construction — layer FFN kinds never change after load (LoRA attaches to
         /// attention projections, MTP weights are separate) — so the batched-prefill
@@ -3266,6 +3274,7 @@ mod inner {
                 quant_format,
                 mtp_weights: None,
                 quarot_rotation: None,
+                base_quarot_seed: None,
                 has_moe_layer,
             })
         }
@@ -3850,8 +3859,14 @@ mod inner {
 
         /// Load a LoRA adapter onto the Metal GPU for inference.
         ///
-        /// Applies rotation corrections for QuaRot-converted bases when `quarot_seed`
-        /// is provided, then uploads all A/B matrices to Metal shared-memory buffers.
+        /// Resolves the QuaRot rotation seed to use before uploading anything: when
+        /// `quarot_seed` is `None`, the base model's own rotation seed is used (so an
+        /// adapter loaded onto a QuaRot-rotated base is rotated by default, rather than
+        /// silently skipped); when `quarot_seed` is `Some`, it must agree with the
+        /// base's seed if the base has one, and the base must actually be rotated if
+        /// it does not. See `# Errors` below. Once resolved, rotation corrections are
+        /// applied for a `Some` seed, then all A/B matrices are uploaded to Metal
+        /// shared-memory buffers.
         ///
         /// Each `LoraLayerData` must name a valid Qwen3.5 projection module for its
         /// layer type, and its `(d_in, d_out)` must match the model's actual projection
@@ -3882,8 +3897,12 @@ mod inner {
         /// - A/B vector lengths are inconsistent with rank × dimensions
         /// - `layer_idx` is out of range
         /// - Duplicate `(layer_idx, module)` entries exist
-        /// - Any module is not in the rotation plan (when `quarot_seed` is set)
+        /// - Any module is not in the rotation plan (when a seed resolves, from
+        ///   `quarot_seed` or the base model)
         /// - Rank or dimensions overflow `u32`
+        /// - `quarot_seed` is `Some` and disagrees with the base model's own QuaRot
+        ///   rotation seed
+        /// - `quarot_seed` is `Some` but the base model is not QuaRot-rotated
         pub fn load_lora_adapter(
             &mut self,
             mut layers: Vec<LoraLayerData>,
@@ -3912,7 +3931,28 @@ mod inner {
 
             let hidden_dim = self.engine.config.hidden_size;
 
-            if let Some(seed) = quarot_seed {
+            // Resolve the seed to rotate with, rather than trusting `quarot_seed`
+            // alone: an adapter that names no seed of its own is rotated with the
+            // base's own seed when the base is QuaRot-rotated, instead of silently
+            // loading unrotated onto a rotated base (see this function's doc comment).
+            let resolved_seed = match (quarot_seed, self.engine.base_quarot_seed) {
+                (None, base_seed) => base_seed,
+                (Some(adapter_seed), None) => {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: adapter specifies QuaRot seed {adapter_seed}, but \
+                         the base model has no QuaRot rotation seed (base is not rotated)"
+                    )));
+                }
+                (Some(adapter_seed), Some(base_seed)) if adapter_seed != base_seed => {
+                    return Err(InferenceError::Inference(format!(
+                        "load_lora_adapter: adapter QuaRot seed {adapter_seed} does not match \
+                         base model QuaRot rotation seed {base_seed}"
+                    )));
+                }
+                (Some(adapter_seed), Some(_)) => Some(adapter_seed),
+            };
+
+            if let Some(seed) = resolved_seed {
                 let plan = RotationPlan::qwen35_residual_stream_linear_layers();
                 let lora_muts: Vec<LoraLayerMut<'_>> = layers
                     .iter_mut()
@@ -13190,6 +13230,7 @@ mod inner {
                     quant_format,
                     mtp_weights: mtp_weights_opt,
                     quarot_rotation,
+                    base_quarot_seed: quarot_seed_opt,
                     has_moe_layer,
                 },
                 session: InferenceSession {
@@ -24675,6 +24716,11 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let (cfg, weights) = tiny_metal_qwen35_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            // Give the fixture a base QuaRot seed matching the adapter's `Some(42)`
+            // below, so this test exercises the quarot rotation path itself rather
+            // than tripping the (adapter-seed, no-base-seed) refusal added for the
+            // fail-closed seed resolution in `load_lora_adapter`.
+            state.engine.base_quarot_seed = Some(42);
             let hidden = cfg.hidden_size;
             let rank = 4usize;
             let mut layer = make_valid_layer(hidden, rank);
@@ -24682,7 +24728,19 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             // quarot_seed = Some triggers rotate_adapter_for_quarot path, but
             // validation after that catches the mismatch.
             let result = state.load_lora_adapter(vec![layer], 1.0, Some(42));
-            assert!(result.is_err(), "quarot path: short A must return Err");
+            // Assert on the specific length-mismatch message, not merely `is_err()`:
+            // a missing base seed ALSO returns an `Err` (the seed-resolution refusal
+            // added ahead of this validation), so a bare `is_err()` check cannot tell
+            // "reached the length check" apart from "refused before reaching it" and
+            // would stay green even if the `state.engine.base_quarot_seed = Some(42)`
+            // line above were dropped.
+            let message = result
+                .expect_err("quarot path: short A must return Err")
+                .to_string();
+            assert!(
+                message.contains("A length"),
+                "must fail on the A-length check specifically: {message}"
+            );
         }
 
         #[test]
@@ -24693,12 +24751,179 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             };
             let (cfg, weights) = tiny_metal_qwen35_fixture();
             let mut state = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            // See the matching comment in `load_lora_adapter_rejects_quarot_with_short_a`.
+            state.engine.base_quarot_seed = Some(42);
             let hidden = cfg.hidden_size;
             let rank = 4usize;
             let mut layer = make_valid_layer(hidden, rank);
             layer.b.pop();
             let result = state.load_lora_adapter(vec![layer], 1.0, Some(42));
-            assert!(result.is_err(), "quarot path: short B must return Err");
+            // Unlike short_a: `o_proj` is an output-side module, so B (not A) is the
+            // side `rotate_adapter_for_quarot` actually rewrites. Its own internal
+            // shape check (`absorb_output_rotation`) rejects the short buffer while
+            // applying the rotation, before the generic post-rotation length loop
+            // ever runs -- so the message is NOT "B length ...", it is
+            // absorb_output_rotation's own "weight length ... != rows*cols ...".
+            // Measured: this test failed with exactly that message before this
+            // assertion was corrected to match it.
+            let message = result
+                .expect_err("quarot path: short B must return Err")
+                .to_string();
+            assert!(
+                message.contains("absorb_output_rotation"),
+                "must fail inside the output-side rotation's own shape check: {message}"
+            );
+        }
+
+        // ── QuaRot seed resolution tests (fail-closed default) ──────────────
+        // These cover the seed-resolution rule added to `load_lora_adapter`:
+        // an adapter that names no seed of its own is rotated with the base's
+        // own seed rather than left unrotated, and a seed mismatch refuses.
+
+        #[test]
+        fn load_lora_adapter_none_seed_resolves_to_base_seed_not_no_rotation() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+            let base_seed = 42u64;
+
+            // Non-zero, distinguishable A/B data -- `make_valid_layer`'s all-zero
+            // buffers would rotate to themselves and could not show a difference.
+            let layer = || LoraLayerData {
+                layer_idx: 0,
+                module: "o_proj".into(),
+                a: (0..rank * hidden)
+                    .map(|i| (i as f32) * 0.001 + 0.1)
+                    .collect(),
+                b: (0..hidden * rank)
+                    .map(|i| (i as f32) * 0.002 + 0.2)
+                    .collect(),
+                rank,
+                d_in: hidden,
+                d_out: hidden,
+            };
+
+            // QS arm: base is QuaRot-rotated (base_quarot_seed = Some); the adapter
+            // passes no seed of its own (`None`) and must be rotated with the base's
+            // seed rather than skipped.
+            let mut state_qs = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            state_qs.engine.base_quarot_seed = Some(base_seed);
+            state_qs
+                .load_lora_adapter(vec![layer()], 1.0, None)
+                .expect("None adapter seed against a rotated base must succeed");
+
+            // QN arm: base is not rotated (base_quarot_seed = None, the default from
+            // `MetalQwen35State::new`); nothing should be rotated.
+            let mut state_qn = MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            state_qn
+                .load_lora_adapter(vec![layer()], 1.0, None)
+                .expect("None adapter seed against an unrotated base must succeed");
+
+            let read_ab = |state: &MetalQwen35State| -> (Vec<f32>, Vec<f32>) {
+                let adapter = state.lora.as_ref().expect("adapter loaded");
+                let proj = adapter
+                    .get_projection(0, "o_proj")
+                    .expect("o_proj projection present");
+                unsafe {
+                    (
+                        read_buffer(&proj.a_buf, rank * hidden),
+                        read_buffer(&proj.b_buf, hidden * rank),
+                    )
+                }
+            };
+            let (a_qs, b_qs) = read_ab(&state_qs);
+            let (a_qn, b_qn) = read_ab(&state_qn);
+
+            // QN must be byte-identical to the raw input: no rotation happened.
+            let raw = layer();
+            assert_eq!(a_qn, raw.a, "QN: A must be unrotated");
+            assert_eq!(b_qn, raw.b, "QN: B must be unrotated");
+
+            // QS must differ from QN: a `None` adapter seed against a rotated base
+            // must NOT resolve the same way as against an unrotated one. If rule 2's
+            // `(None, base)` arm regresses back to a skip, this fails because QS
+            // becomes byte-identical to QN.
+            assert_ne!(
+                (a_qs.clone(), b_qs.clone()),
+                (a_qn, b_qn),
+                "QS (None resolved to the base seed) must differ from QN (no rotation)"
+            );
+
+            // And QS must resolve to EXACTLY the base's seed, not merely "some"
+            // rotation: rotating an identical copy directly with `base_seed` must
+            // land on the same buffers `load_lora_adapter` produced.
+            let mut direct = [layer()];
+            {
+                use crate::quant::quarot::lora::{LoraLayerMut, rotate_adapter_for_quarot};
+                use crate::quant::quarot::plan::RotationPlan;
+
+                let plan = RotationPlan::qwen35_residual_stream_linear_layers();
+                let lora_muts: Vec<LoraLayerMut<'_>> = direct
+                    .iter_mut()
+                    .map(|l| LoraLayerMut {
+                        layer_idx: l.layer_idx,
+                        module: &l.module,
+                        a: &mut l.a,
+                        b: &mut l.b,
+                        rank: l.rank,
+                        d_in: l.d_in,
+                        d_out: l.d_out,
+                    })
+                    .collect();
+                rotate_adapter_for_quarot(lora_muts, base_seed, hidden, &plan)
+                    .expect("direct rotation with the base seed succeeds");
+            }
+            assert_eq!(
+                a_qs, direct[0].a,
+                "QS A must match direct rotation with the base seed"
+            );
+            assert_eq!(
+                b_qs, direct[0].b,
+                "QS B must match direct rotation with the base seed"
+            );
+        }
+
+        #[test]
+        fn load_lora_adapter_refuses_seed_mismatch_and_seed_without_rotated_base() {
+            let _gpu_guard = gpu_test_lock();
+            let Some(_dev) = metal::Device::system_default() else {
+                return;
+            };
+            let (cfg, weights) = tiny_metal_qwen35_fixture();
+            let hidden = cfg.hidden_size;
+            let rank = 4usize;
+
+            // (Some(adapter_seed), Some(base_seed)) with adapter_seed != base_seed:
+            // refuse, naming both values.
+            let mut state_mismatch =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            state_mismatch.engine.base_quarot_seed = Some(7);
+            let err = state_mismatch
+                .load_lora_adapter(vec![make_valid_layer(hidden, rank)], 1.0, Some(9))
+                .expect_err("mismatched adapter/base QuaRot seeds must refuse");
+            let message = err.to_string();
+            assert!(
+                message.contains('9') && message.contains('7'),
+                "error must name both the adapter seed and the base seed: {message}"
+            );
+
+            // (Some(adapter_seed), None): refuse -- rotating an adapter for a base
+            // that is not QuaRot-rotated. `base_quarot_seed` defaults to `None` from
+            // `MetalQwen35State::new`, so no explicit assignment is needed here.
+            let mut state_unrotated =
+                MetalQwen35State::new(&weights, &cfg, 4).expect("tiny fixture");
+            let err = state_unrotated
+                .load_lora_adapter(vec![make_valid_layer(hidden, rank)], 1.0, Some(9))
+                .expect_err("a seeded adapter against an unrotated base must refuse");
+            let message = err.to_string();
+            assert!(
+                message.contains('9') && message.to_lowercase().contains("base is not rotated"),
+                "error must name the adapter seed and state the base is not rotated: {message}"
+            );
         }
 
         // ── shape / semantic validation tests ────────────────────────────────
