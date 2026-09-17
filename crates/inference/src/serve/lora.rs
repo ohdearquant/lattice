@@ -3,6 +3,7 @@
 use super::ApiError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 
 /// One contribution to an ordered request mixture.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
@@ -42,6 +43,7 @@ impl AdapterIndex {
     /// Validate without waiting for generation; the worker rechecks at execution.
     pub fn validate(&self, selection: &[LoraSelection]) -> Result<(), ApiError> {
         validate_scales(selection)?;
+        validate_unique_ids(selection)?;
         for entry in selection {
             if !self.adapters.iter().any(|adapter| adapter.id == entry.id) {
                 return Err(unknown_adapter(entry.id));
@@ -49,6 +51,19 @@ impl AdapterIndex {
         }
         Ok(())
     }
+}
+
+pub(super) fn validate_unique_ids(selection: &[LoraSelection]) -> Result<(), ApiError> {
+    let mut seen = HashSet::new();
+    for entry in selection {
+        if !seen.insert(entry.id) {
+            return Err(ApiError::BadRequest {
+                message: format!("duplicate LoRA adapter id {}", entry.id),
+                code: "lora_duplicate_adapter_id",
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Reject scales that cannot participate in a finite blend.
@@ -196,6 +211,39 @@ pub fn prepare_adapter_load(path: &str, name: &str) -> Result<PreparedAdapter, A
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_ids_are_rejected_before_admission() {
+        let index = AdapterIndex {
+            adapters: [7, 11]
+                .into_iter()
+                .map(|id| AdapterMetadata {
+                    id,
+                    name: format!("adapter-{id}"),
+                    path: format!("{id}.safetensors"),
+                    rank: 1,
+                    layers: 1,
+                })
+                .collect(),
+            applied: Vec::new(),
+        };
+        let unique = [
+            LoraSelection { id: 7, scale: 0.0 },
+            LoraSelection {
+                id: 11,
+                scale: -0.5,
+            },
+        ];
+        assert!(index.validate(&unique).is_ok());
+        assert!(index.validate(&[]).is_ok());
+        for scale in [0.0, 1.0, -0.25] {
+            let selection = [unique[0], unique[1], LoraSelection { id: 7, scale }];
+            let error = index.validate(&selection).unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest { .. }));
+            assert_eq!(error.code(), "lora_duplicate_adapter_id");
+            assert_eq!(error.message(), "duplicate LoRA adapter id 7");
+        }
+    }
 
     #[test]
     fn selections_reject_nonfinite_scales_and_unknown_ids() {

@@ -320,6 +320,37 @@ class PerfBenchGateStatusTests(unittest.TestCase):
             self.assertEqual(payload["measurement_count"], 1)
             self.assertEqual(payload["ambient"]["assessment"], "valid")
 
+    def test_wholly_demoted_target_refuses_with_not_measurable_status(self) -> None:
+        """A quiet machine and clean rows still render no verdict.
+
+        The ambient assessment is `valid` and the single measurement is inside
+        the noise band, so nothing here is a measurement failure: the refusal is
+        the target policy, and the status document has to say that rather than
+        record a pass nobody measured.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            criterion = _criterion_root(root, "demoted", 0.0)
+            samples = root / "ambient.jsonl"
+            _samples(samples, {phase: 95.0 for phase in PHASES})
+            status = root / "status.json"
+            target = "lattice-embed:simd"
+
+            result = _run(
+                criterion, samples, status, target,
+                ["--informational-target", target],
+            )
+
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn("NO GATED MEASUREMENT", result.stderr)
+            self.assertNotIn("gated benches within noise band", result.stdout)
+            payload = json.loads(status.read_text())
+            self.assertEqual(payload["verdict"], "not_measurable")
+            self.assertEqual(payload["exit_code"], 3)
+            self.assertIn("no benchmark could vote", payload["reason"])
+            self.assertEqual(payload["measurement_count"], 1)
+            self.assertEqual(payload["ambient"]["assessment"], "valid")
+
     def test_completeness_error_outranks_not_measurable_for_informational_target(
         self,
     ) -> None:

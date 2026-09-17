@@ -569,6 +569,9 @@ Omitting `lora`, or sending an empty array, selects the base model even when
 adapters are resident. Each scale multiplies that adapter's alpha/rank scale;
 scales are not normalized and may be negative or zero. Nonfinite scales and
 unknown identifiers return 400; a missing-id message names the identifier.
+Each identifier may appear only once. A repeated identifier returns 400
+`lora_duplicate_adapter_id` with a message naming that identifier, even when
+the repeated entries use different scales.
 The worker validates again after dequeue, so an intervening unload cannot
 silently redirect a request to different weights. A blend incompatible with the
 model or exceeding the engine's blend limits returns `lora_apply_failed`.
@@ -576,8 +579,8 @@ model or exceeding the engine's blend limits returns `lora_apply_failed`.
 The worker caches one applied mixture. Identical ordered id/scale vectors reuse
 the blend and GPU upload; a different vector replaces it. Order is significant
 because changing the concatenated rank order can change floating-point
-reductions. Repeated ids contribute repeatedly. Base selection clears an applied
-mixture. The existing engine load/unload invalidates retained prefix state when
+reductions. Base selection clears an applied mixture. The existing engine
+load/unload invalidates retained prefix state when
 the applied identity changes. An upload failure leaves base active and the failed
 selection is retried on the next request, never mistaken for a cache hit.
 

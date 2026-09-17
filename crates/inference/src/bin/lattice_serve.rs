@@ -6103,6 +6103,48 @@ mod imp {
 
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
+        async fn lora_duplicate_id_is_400_before_admission() {
+            use lattice_inference::serve::lora::AdapterMetadata;
+            use lattice_inference::serve::metal_worker::test_client_and_jobs_with_adapters;
+            for stream in [false, true] {
+                let (client, mut jobs) =
+                    test_client_and_jobs_with_adapters(vec![AdapterMetadata {
+                        id: 7,
+                        name: "test".into(),
+                        path: "test.safetensors".into(),
+                        rank: 1,
+                        layers: 1,
+                    }]);
+                let mut state = test_app_state();
+                state.jobs = client;
+                let body = Body::from(
+                    serde_json::json!({
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "lora": [{"id": 7, "scale": 1.0}, {"id": 7, "scale": -0.25}],
+                        "stream": stream,
+                    })
+                    .to_string(),
+                );
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    chat_completions(State(state.clone()), test_json_headers(), body),
+                )
+                .await
+                .expect("duplicate selection must return before a worker reply");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["error"]["code"], "lora_duplicate_adapter_id");
+                assert_eq!(error["error"]["message"], "duplicate LoRA adapter id 7");
+                assert!(matches!(
+                    jobs.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+            }
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
         async fn lora_list_reads_confirmed_index() {
             let Json(value) = lora_list(State(test_app_state())).await;
             assert_eq!(value, serde_json::json!({"adapters":[],"applied":[]}));

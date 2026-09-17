@@ -2411,6 +2411,53 @@ mod tests {
 
     #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
     #[tokio::test]
+    async fn lora_duplicate_id_is_400_before_unified_admission() {
+        use lattice_inference::serve::lora::AdapterMetadata;
+        use lattice_inference::serve::metal_worker::test_client_and_jobs_with_adapters;
+        for stream in [false, true] {
+            let (client, mut jobs) = test_client_and_jobs_with_adapters(vec![AdapterMetadata {
+                id: 7,
+                name: "test".into(),
+                path: "test.safetensors".into(),
+                rank: 1,
+                layers: 1,
+            }]);
+            let mut state = tiny_state(64);
+            let tokenizer = lattice_inference::model::qwen35::test_support::tiny_zero_model()
+                .tokenizer()
+                .clone();
+            state.model = ModelBackend::Metal {
+                handle: MetalHandle { client },
+                tokenizer: Arc::new(tokenizer),
+                max_context: 4096,
+            };
+            let request = serde_json::from_value(serde_json::json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+                "lora": [{"id": 7, "scale": 1.0}, {"id": 7, "scale": -0.25}],
+                "stream": stream,
+            }))
+            .unwrap();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                chat_completions_with_request(State(state.clone()), request),
+            )
+            .await
+            .expect("duplicate selection must return before a worker reply")
+            .unwrap_err();
+            assert!(matches!(error, ApiError::BadRequest { .. }));
+            assert_eq!(error.code(), "lora_duplicate_adapter_id");
+            assert_eq!(error.message(), "duplicate LoRA adapter id 7");
+            assert!(matches!(
+                jobs.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+    #[tokio::test]
     async fn lora_selection_reaches_unified_worker_and_unknown_id_is_400() {
         use lattice_inference::serve::lora::{AdapterMetadata, LoraSelection};
         use lattice_inference::serve::metal_worker::{

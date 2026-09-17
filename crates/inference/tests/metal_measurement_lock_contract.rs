@@ -304,6 +304,7 @@ const TARGETS_WITH_RECOGNIZED_METAL_MARKERS: &[&str] = &[
     "examples/layer_sweep.rs",
     "examples/profile_metal.rs",
     "examples/profile_metal_decode.rs",
+    "examples/rss_autorelease_probe.rs",
     "src/bin/backfill_qwen3.rs",
     "src/bin/bench_decode_ab.rs",
     "src/bin/bench_decode_slopefit.rs",

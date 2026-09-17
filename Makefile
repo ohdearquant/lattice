@@ -1,4 +1,4 @@
-.PHONY: setup check clippy test test-timing fmt fmt-check build clean ci publish publish-dry package-size-check publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
+.PHONY: setup check clippy test test-timing fmt fmt-check build clean ci metal-gate publish publish-dry package-size-check publish-npm publish-npm-dry lint-docs bench-ci bench-gate bench-compare bench-agentic bench-agentic-quick wasm-parity e2e-parity bench-decode-slopefit
 
 setup:
 	rustup component add rustfmt clippy
@@ -35,6 +35,13 @@ clean:
 
 lint-docs:
 	./scripts/lint-docs.sh
+
+# The macOS Metal arms of CI, run locally. `make ci` is the default-feature
+# pipeline and never compiles the Metal paths at all, so this is the gate a
+# Metal-touching change needs before a PR. Its lib arm is deliberately scoped --
+# see the script header for the measurement behind that.
+metal-gate:
+	./scripts/metal-local-gate.sh
 
 ci:
 	./scripts/ci.sh

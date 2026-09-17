@@ -1,7 +1,10 @@
 //! Worker-local adapter weights and the currently materialized mixture.
 
 use super::ApiError;
-use super::lora::{AdapterIndex, AdapterMetadata, LoraSelection, unknown_adapter, validate_scales};
+use super::lora::{
+    AdapterIndex, AdapterMetadata, LoraSelection, unknown_adapter, validate_scales,
+    validate_unique_ids,
+};
 use crate::forward::metal_qwen35::{LoraLayerData, MetalQwen35State, blend_lora_layer_data};
 use lattice_fann::lora::LoraDescriptor;
 use std::collections::HashMap;
@@ -122,6 +125,7 @@ impl ResidencyRegistry {
         slot: &mut impl AdapterSlot,
     ) -> Result<(), ApiError> {
         validate_scales(selection)?;
+        validate_unique_ids(selection)?;
         // Resolve again after dequeue: an unload may have passed client validation.
         let inputs = selection
             .iter()
@@ -295,6 +299,32 @@ mod tests {
         registry.next_id = Some(u32::MAX);
         assert_eq!(load(&mut registry, "last"), u32::MAX);
         assert!(registry.next_id.is_none());
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected_before_blending_or_replacing_slot() {
+        let mut registry = registry();
+        let mut slot = Slot::default();
+        let a = load(&mut registry, "a");
+        let b = load(&mut registry, "b");
+        let original = [LoraSelection { id: a, scale: 1.0 }];
+        registry.apply(&original, &mut slot).unwrap();
+        let duplicate = [
+            LoraSelection { id: a, scale: 0.5 },
+            LoraSelection { id: b, scale: 0.25 },
+            LoraSelection {
+                id: a,
+                scale: -0.25,
+            },
+        ];
+        let error = registry.apply(&duplicate, &mut slot).unwrap_err();
+        assert!(matches!(error, ApiError::BadRequest { .. }));
+        assert_eq!(error.code(), "lora_duplicate_adapter_id");
+        assert_eq!(error.message(), format!("duplicate LoRA adapter id {a}"));
+        assert_eq!((registry.blends, slot.uploads, slot.unloads), (1, 1, 0));
+        assert_eq!(slot.output(), 22.0);
+        assert_eq!(registry.applied, original);
+        assert_eq!(registry.index.read().unwrap().applied, original);
     }
 
     #[test]

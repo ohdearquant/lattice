@@ -68,6 +68,25 @@ const SHADERS: &[ShaderCase] = &[
 ];
 
 #[test]
+fn every_shader_case_source_is_the_file_it_names() {
+    // `file` and the path inside `source`'s `include_str!` are written out twice by
+    // hand, so nothing binds them: a case carrying a neighbour's source would validate
+    // one shader twice, never validate the other, and name the wrong file in any
+    // failure it did report. Read each named file off disk and require equality.
+    let wgsl_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/forward/wgsl");
+    assert!(!SHADERS.is_empty(), "shader case inventory is empty");
+    for case in SHADERS {
+        let on_disk = std::fs::read_to_string(wgsl_dir.join(case.file))
+            .unwrap_or_else(|error| panic!("shader {} is unreadable: {error}", case.file));
+        assert_eq!(
+            on_disk, case.source,
+            "shader case {} does not carry the contents of the file it names",
+            case.file
+        );
+    }
+}
+
+#[test]
 fn wgsl_artifacts_parse_validate_and_export_expected_entry_points() {
     for case in SHADERS {
         let module = wgsl::parse_str(case.source)
