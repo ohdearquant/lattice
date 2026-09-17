@@ -9,9 +9,21 @@
 //! on the CPU (see `crates/tune/src/lora/blend.rs`) and loaded into the Metal
 //! path through the existing single-slot adapter API.
 //!
-//! Mixture weights in this implementation are constant `1/k` (top-k uniform).
-//! The gate network output is used only to rank adapters; the weights themselves
-//! are fixed at selection time and are not learned.
+//! # Mixture weights
+//!
+//! [`AdapterRouter::route`] assigns each selected adapter a weight under a
+//! configured [`WeightPolicy`]. The default and only fully-supported policy
+//! is `Uniform` (`1/k` for every selected adapter), matching the router's
+//! original behaviour. [`WeightPolicy::Softmax`] draws weights from the
+//! gate's own scores instead: a learnable-softmax router can collapse to
+//! effectively one adapter under sparse, noisy reward, so a temperature and
+//! an `epsilon` floor bound the result (ADR-091; see
+//! [`AdapterRouter::set_weight_policy`] and [`AdapterRouter::set_epsilon`]).
+//! The collapse guards that reasoning calls for — a floor on the temperature
+//! itself, a load-balance/entropy penalty applied during refit, and
+//! rejection of a refit that collapses — are a separate mechanism and are
+//! not implemented in this module; `Softmax` should not be preferred in
+//! production ahead of them.
 
 use lattice_fann::{FannError, Network};
 
@@ -93,22 +105,79 @@ pub enum RouterError {
         /// The repeated adapter ID
         id: String,
     },
+
+    /// The softmax temperature `tau` was not usable: it must be finite and
+    /// strictly positive. A temperature free to reach zero collapses the
+    /// distribution to an argmax with extra steps; a negative or non-finite
+    /// temperature has no defined softmax at all.
+    #[error("softmax temperature tau must be finite and > 0.0, got {tau}")]
+    InvalidTau {
+        /// The offending temperature.
+        tau: f32,
+    },
 }
 
-/// Routes a context vector to a top-k subset of available adapters with
-/// constant equal mixture weights.
+/// Named mixture weight policy for [`AdapterRouter::route`] (ADR-091).
 ///
-/// The gate network produces one score per available adapter.  The `k` adapters
-/// with the highest scores are selected; each receives weight `1/k`.
+/// `Uniform` is the default and reproduces the router's original behaviour.
+/// Reaching uniform weights is a matter of naming this variant, never a
+/// matter of choosing a large `tau` — see [`AdapterRouter::set_weight_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum WeightPolicy {
+    /// Every selected adapter receives `1.0 / k`.
+    #[default]
+    Uniform,
+    /// Softmax over the selected adapters' own gate scores at temperature
+    /// `tau`, normalised to sum to 1 across the selected set. `tau` must be
+    /// finite and strictly positive.
+    Softmax {
+        /// Softmax temperature. Lower sharpens the distribution toward the
+        /// top score; higher flattens it toward uniform.
+        tau: f32,
+    },
+}
+
+/// Outcome of applying the `epsilon` floor to a weight vector.
+///
+/// Distinguishes an adapter that was never selected at all from one that was
+/// selected (or explicitly supplied) and then removed for falling below
+/// `epsilon`: the former appears in neither field, the latter appears only
+/// in `dropped`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FloorOutcome {
+    /// Surviving adapters and their final weight.
+    pub weights: Vec<(AdapterId, f32)>,
+    /// Adapters that were present before the floor and removed for falling
+    /// below `epsilon`.
+    pub dropped: Vec<AdapterId>,
+}
+
+/// Routes a context vector to a top-k subset of available adapters and
+/// assigns each a mixture weight under the router's [`WeightPolicy`].
+///
+/// The gate network produces one score per available adapter.  The `k`
+/// adapters with the highest scores are selected; the selected scores are
+/// then turned into weights by [`route`](Self::route)'s configured policy
+/// and `epsilon` floor (see [`set_weight_policy`](Self::set_weight_policy)
+/// and [`set_epsilon`](Self::set_epsilon)).
 ///
 /// # Mixture weight semantics
 ///
-/// Weights are constant and uniform (`1/k`).  A learnable-softmax router can
-/// collapse to effectively one adapter under sparse, noisy reward, so the
-/// weights are fixed and only the selector is learned.  Gate scores are random
-/// at initialisation; only the rank ordering matters.
+/// The default policy is [`WeightPolicy::Uniform`]: constant `1/k`,
+/// unaffected by the gate scores' magnitude — only the rank ordering
+/// matters, which is why gate scores being random at initialisation is
+/// harmless. [`WeightPolicy::Softmax`] draws weights from those same scores
+/// instead; a learnable-softmax router can collapse to effectively one
+/// adapter under sparse, noisy reward, so a temperature floor, a
+/// load-balance/entropy penalty applied during refit, and refit rejection
+/// are required before this policy is safe to prefer in production
+/// (ADR-091). This module implements the weight mechanism and the `epsilon`
+/// floor only; those collapse guards live elsewhere and are not yet built.
 pub struct AdapterRouter {
     gate: Network,
+    weight_policy: WeightPolicy,
+    epsilon: f32,
+    last_dropped: Vec<AdapterId>,
 }
 
 impl AdapterRouter {
@@ -119,7 +188,12 @@ impl AdapterRouter {
     /// support a dynamic adapter pool should size the output to the maximum
     /// expected pool size.
     pub fn new(gate: Network) -> Self {
-        Self { gate }
+        Self {
+            gate,
+            weight_policy: WeightPolicy::default(),
+            epsilon: 0.0,
+            last_dropped: Vec::new(),
+        }
     }
 
     /// Replace the gate from a complete [`Network::to_bytes`] blob.
@@ -145,8 +219,40 @@ impl AdapterRouter {
         Ok(())
     }
 
-    /// Select the top-`k` adapters for the given context and assign each
-    /// a constant mixture weight of `1/k`.
+    /// Set the mixture weight policy used by subsequent
+    /// [`route`](Self::route) calls.
+    ///
+    /// The default, from [`AdapterRouter::new`], is [`WeightPolicy::Uniform`].
+    pub fn set_weight_policy(&mut self, policy: WeightPolicy) {
+        self.weight_policy = policy;
+    }
+
+    /// Set the `epsilon` floor used by subsequent [`route`](Self::route)
+    /// calls.
+    ///
+    /// After weights are assigned, any selected adapter whose weight falls
+    /// below `epsilon` is removed and the survivors are renormalised to sum
+    /// to 1 again. The default, from [`AdapterRouter::new`], is `0.0`, which
+    /// never drops anything, since every weight `route` can produce is
+    /// `>= 0.0`. `epsilon` should be non-negative; a negative or NaN value
+    /// disables the floor, since no weight then compares less than it.
+    pub fn set_epsilon(&mut self, epsilon: f32) {
+        self.epsilon = epsilon;
+    }
+
+    /// Adapters dropped by the most recent [`route`](Self::route) call for
+    /// falling below the `epsilon` floor.
+    ///
+    /// An adapter that never reached the top-`k` selection never appears
+    /// here; only one that was selected and then removed does. Empty after
+    /// a call that dropped nothing, and reset (not accumulated) on every
+    /// call.
+    pub fn last_dropped(&self) -> &[AdapterId] {
+        &self.last_dropped
+    }
+
+    /// Select the top-`k` adapters for the given context and assign each a
+    /// mixture weight under the configured [`WeightPolicy`].
     ///
     /// # Arguments
     ///
@@ -158,8 +264,17 @@ impl AdapterRouter {
     ///
     /// # Returns
     ///
-    /// A `Vec` of `(AdapterId, weight)` pairs, length `k`, sorted by
-    /// descending gate score.  Each weight is `1.0 / k as f32`.
+    /// A `Vec` of `(AdapterId, weight)` pairs, sorted by descending gate
+    /// score, whose weights sum to 1 over the selected set — **length is at
+    /// most `k`**, not always `k`: any selected adapter whose weight falls
+    /// below the configured `epsilon` floor is removed rather than kept at a
+    /// weight near zero, and the survivors are renormalised. Call
+    /// [`last_dropped`](Self::last_dropped) after this returns to see which
+    /// adapters, if any, were dropped that way.
+    ///
+    /// With the default policy ([`WeightPolicy::Uniform`]) and the default
+    /// `epsilon` (`0.0`), this reproduces the router's original contract
+    /// exactly: length `k`, every weight `1.0 / k as f32`.
     ///
     /// # Errors
     ///
@@ -168,6 +283,8 @@ impl AdapterRouter {
     /// - `k > available.len()`
     /// - the context vector length does not match the gate input size
     /// - the gate forward pass fails
+    /// - the policy is [`WeightPolicy::Softmax`] and `tau` is zero,
+    ///   negative, or non-finite
     pub fn route(
         &mut self,
         context_vector: &[f32],
@@ -225,13 +342,43 @@ impl AdapterRouter {
         // cannot confuse a position() lookup.
         indexed[..k].sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let weight = 1.0 / k as f32;
-        let selected: Vec<(AdapterId, f32)> = indexed[..k]
-            .iter()
-            .map(|(idx, _)| (available[*idx].clone(), weight))
-            .collect();
+        let raw_weights: Vec<(AdapterId, f32)> = match self.weight_policy {
+            WeightPolicy::Uniform => {
+                let weight = 1.0 / k as f32;
+                indexed[..k]
+                    .iter()
+                    .map(|(idx, _)| (available[*idx].clone(), weight))
+                    .collect()
+            }
+            WeightPolicy::Softmax { tau } => {
+                if !tau.is_finite() || tau <= 0.0 {
+                    return Err(RouterError::InvalidTau { tau });
+                }
+                // Subtract the max selected score before exponentiating: the
+                // max always maps to exp(0) = 1.0, so the sum of exponentials
+                // is always >= 1.0 and this can never divide by zero — and it
+                // keeps a wide selected score spread from overflowing f32,
+                // which a raw `score / tau` exponent would not.
+                let max_score = indexed[..k]
+                    .iter()
+                    .map(|(_, score)| *score)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let exp_scores: Vec<f32> = indexed[..k]
+                    .iter()
+                    .map(|(_, score)| ((*score - max_score) / tau).exp())
+                    .collect();
+                let sum: f32 = exp_scores.iter().sum();
+                indexed[..k]
+                    .iter()
+                    .zip(exp_scores.iter())
+                    .map(|((idx, _), exp_score)| (available[*idx].clone(), exp_score / sum))
+                    .collect()
+            }
+        };
 
-        Ok(selected)
+        let FloorOutcome { weights, dropped } = floor_and_renormalize(raw_weights, self.epsilon);
+        self.last_dropped = dropped;
+        Ok(weights)
     }
 
     /// Return the number of inputs the gate network expects.
@@ -243,6 +390,64 @@ impl AdapterRouter {
     pub fn output_size(&self) -> usize {
         self.gate.num_outputs()
     }
+}
+
+/// Remove any weight strictly below `epsilon`, in original order, without
+/// renormalising the survivors.
+fn apply_floor(weights: Vec<(AdapterId, f32)>, epsilon: f32) -> FloorOutcome {
+    let mut survivors = Vec::with_capacity(weights.len());
+    let mut dropped = Vec::new();
+    for (id, weight) in weights {
+        if weight < epsilon {
+            dropped.push(id);
+        } else {
+            survivors.push((id, weight));
+        }
+    }
+    FloorOutcome {
+        weights: survivors,
+        dropped,
+    }
+}
+
+/// Apply the `epsilon` floor and renormalise the survivors back to summing
+/// to 1.
+///
+/// This is the gate-computed ("learned") path's rule: [`AdapterRouter::route`]
+/// always renormalises after a drop, whether its policy is
+/// [`WeightPolicy::Uniform`] or [`WeightPolicy::Softmax`] — both are gate
+/// output, as opposed to weights a caller supplies directly (see
+/// [`apply_caller_weights`]). If the drop removes every survivor, the result
+/// is an empty weight vector rather than a division by zero.
+fn floor_and_renormalize(weights: Vec<(AdapterId, f32)>, epsilon: f32) -> FloorOutcome {
+    let FloorOutcome {
+        mut weights,
+        dropped,
+    } = apply_floor(weights, epsilon);
+    if !dropped.is_empty() {
+        let sum: f32 = weights.iter().map(|(_, weight)| *weight).sum();
+        if sum > 0.0 {
+            for (_, weight) in weights.iter_mut() {
+                *weight /= sum;
+            }
+        }
+    }
+    FloorOutcome { weights, dropped }
+}
+
+/// Apply the `epsilon` floor to weights a caller supplied directly, without
+/// renormalising the survivors (ADR-091).
+///
+/// A caller's weight is the caller's own request magnitude — naming one
+/// adapter at `0.5` means half strength, and must still mean half strength
+/// when a sibling adapter is dropped for falling below `epsilon`. This is
+/// the one respect in which the caller-supplied path differs from
+/// [`AdapterRouter::route`]'s gate-computed path, which renormalises: raw
+/// gate scores have no calibrated magnitude of their own, so they only
+/// become comparable proportions by being renormalised, while a caller's
+/// scale already is one.
+pub fn apply_caller_weights(weights: Vec<(AdapterId, f32)>, epsilon: f32) -> FloorOutcome {
+    apply_floor(weights, epsilon)
 }
 
 #[cfg(test)]
@@ -262,6 +467,16 @@ mod tests {
     fn fixed_gate(inputs: usize, outputs: usize, preferred: usize) -> Network {
         let mut layer = lattice_fann::Layer::zeros(inputs, outputs, Activation::Linear).unwrap();
         layer.biases_mut()[preferred] = 1.0;
+        Network::new(vec![layer]).unwrap()
+    }
+
+    /// A gate whose forward pass returns exactly `scores`, for any input of
+    /// the right length: the weight matrix is all zero and the activation is
+    /// linear, so the output is the bias vector alone.
+    fn scored_gate(inputs: usize, scores: &[f32]) -> Network {
+        let mut layer =
+            lattice_fann::Layer::zeros(inputs, scores.len(), Activation::Linear).unwrap();
+        layer.biases_mut().copy_from_slice(scores);
         Network::new(vec![layer]).unwrap()
     }
 
@@ -398,6 +613,167 @@ mod tests {
         assert!(
             matches!(result, Err(RouterError::DuplicateAdapterId { .. })),
             "duplicate adapter id should return DuplicateAdapterId error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn softmax_weights_sum_to_one_nonuniform() {
+        let mut router = AdapterRouter::new(scored_gate(1, &[3.0, 1.0, 0.0]));
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let result = router.route(&[0.0], &available, 3).unwrap();
+        let sum: f32 = result.iter().map(|(_, w)| w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "softmax weights must sum to 1, got {sum}"
+        );
+        let uniform = 1.0 / 3.0;
+        assert!(
+            result.iter().any(|(_, w)| (w - uniform).abs() > 1e-3),
+            "softmax at tau=1.0 over distinct scores must not degenerate to uniform"
+        );
+    }
+
+    #[test]
+    fn uniform_default_ignores_score_magnitude() {
+        // No set_weight_policy call: the default must be Uniform, not merely
+        // a large tau. Scores are wildly different, which a softmax could
+        // only make exactly uniform in the tau -> infinity limit.
+        let mut router = AdapterRouter::new(scored_gate(1, &[1000.0, 0.0, -1000.0]));
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let result = router.route(&[0.0], &available, 3).unwrap();
+        let expected = 1.0 / 3.0;
+        for (_, w) in &result {
+            assert!(
+                (w - expected).abs() < 1e-6,
+                "default policy must be exactly uniform regardless of score spread, got {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_drops_adapter_below_epsilon_and_shrinks_length() {
+        let mut router = AdapterRouter::new(scored_gate(1, &[10.0, 0.0]));
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        router.set_epsilon(1e-3);
+        let available: Vec<AdapterId> = vec!["strong".into(), "weak".into()];
+        let result = router.route(&[0.0], &available, 2).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "the below-epsilon adapter must be dropped, not damped, and length must shrink below k"
+        );
+        assert!(
+            !result.iter().any(|(id, _)| id == "weak"),
+            "a dropped adapter must be absent from the result, not present at a small weight"
+        );
+        assert_eq!(router.last_dropped(), &["weak".to_string()]);
+    }
+
+    #[test]
+    fn floor_and_renormalize_drops_and_renormalizes_survivors() {
+        let weights = vec![
+            ("a".to_string(), 0.6),
+            ("b".to_string(), 0.39),
+            ("c".to_string(), 0.01),
+        ];
+        let outcome = floor_and_renormalize(weights, 0.05);
+        assert_eq!(outcome.dropped, vec!["c".to_string()]);
+        assert_eq!(outcome.weights.len(), 2);
+        let sum: f32 = outcome.weights.iter().map(|(_, w)| w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "survivors must renormalise to sum 1, got {sum}"
+        );
+        let a_weight = outcome.weights.iter().find(|(id, _)| id == "a").unwrap().1;
+        assert!(
+            (a_weight - 0.6).abs() > 1e-6,
+            "a surviving weight must be rescaled by the drop, not left as-is, got {a_weight}"
+        );
+    }
+
+    #[test]
+    fn caller_weights_not_renormalized_after_drop() {
+        // The isolating arm for the two rules: a caller asking for 0.5 must
+        // still get exactly 0.5 when a sibling is dropped, unlike the
+        // gate-computed path, which renormalises.
+        let weights = vec![("kept".to_string(), 0.5), ("dropped".to_string(), 0.01)];
+        let outcome = apply_caller_weights(weights, 0.05);
+        assert_eq!(outcome.dropped, vec!["dropped".to_string()]);
+        assert_eq!(outcome.weights, vec![("kept".to_string(), 0.5)]);
+    }
+
+    #[test]
+    fn softmax_equal_scores_gives_uniform_weights() {
+        let mut router = AdapterRouter::new(scored_gate(1, &[2.0, 2.0, 2.0]));
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 0.7 });
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let result = router.route(&[0.0], &available, 3).unwrap();
+        let expected = 1.0 / 3.0;
+        for (_, w) in &result {
+            assert!(
+                w.is_finite(),
+                "equal scores must not produce a NaN/inf weight"
+            );
+            assert!(
+                (w - expected).abs() < 1e-6,
+                "equal scores must softmax to uniform, got {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_large_scores_do_not_overflow() {
+        // Without subtracting the max score first, exp(1000.0) overflows f32
+        // to infinity and inf/inf yields NaN. This is the case the
+        // max-subtraction exists for.
+        let mut router = AdapterRouter::new(scored_gate(1, &[1000.0, 999.0]));
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
+        let result = router.route(&[0.0], &available, 2).unwrap();
+        for (_, w) in &result {
+            assert!(
+                w.is_finite(),
+                "large selected scores must not overflow to NaN/inf"
+            );
+        }
+        let sum: f32 = result.iter().map(|(_, w)| w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "weights must still sum to 1, got {sum}"
+        );
+    }
+
+    #[test]
+    fn softmax_rejects_degenerate_tau() {
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
+        for tau in [0.0f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut router = AdapterRouter::new(scored_gate(1, &[1.0, 0.0]));
+            router.set_weight_policy(WeightPolicy::Softmax { tau });
+            let result = router.route(&[0.0], &available, 2);
+            assert!(
+                matches!(result, Err(RouterError::InvalidTau { .. })),
+                "tau={tau} must be rejected as InvalidTau, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_last_dropped_distinguishes_floored_from_unselected() {
+        // Three candidates; k=2 selects the top two by score ("strong" and
+        // "weak"); "unselected" never reaches the top-k at all. "weak" is
+        // then floored. last_dropped must report "weak" and nothing else.
+        let mut router = AdapterRouter::new(scored_gate(1, &[10.0, 0.0, -100.0]));
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 1.0 });
+        router.set_epsilon(1e-3);
+        let available: Vec<AdapterId> = vec!["strong".into(), "weak".into(), "unselected".into()];
+        let result = router.route(&[0.0], &available, 2).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "strong");
+        assert_eq!(router.last_dropped(), &["weak".to_string()]);
+        assert!(
+            !router.last_dropped().contains(&"unselected".to_string()),
+            "an adapter that never reached the top-k must not appear in last_dropped"
         );
     }
 }
