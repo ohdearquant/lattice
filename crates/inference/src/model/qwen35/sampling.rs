@@ -1,7 +1,7 @@
 //! Qwen3.5 token sampling, repetition penalty, greedy fallback, top-n-sigma
 //! filtering, softmax probability build, min-p/top-p filtering, distribution
 //! draw, and RNG helper.
-use crate::model::qwen35_config::GenerateConfig;
+use crate::generation::GenerateConfig;
 
 /// Sample a token from logits using temperature, top-k, min-p, top-p, and repetition penalty.
 ///
@@ -629,7 +629,7 @@ mod tests {
     /// RNG step per token draw, so the draw streams are permanently aligned.
     #[test]
     fn cross_path_parity_sampler_vs_sample_token() {
-        use crate::model::qwen35_config::GenerateConfig;
+        use crate::generation::GenerateConfig;
         use crate::sampling::{Sampler, SamplingConfig};
 
         // 64-entry logit vector; hash-derived values in [-10, 10] with no exact
@@ -909,7 +909,7 @@ mod tests {
     /// either Path-B tie-break comparator to descending token-id fails this assertion.
     #[test]
     fn cross_path_parity_with_logit_ties() {
-        use crate::model::qwen35_config::GenerateConfig;
+        use crate::generation::GenerateConfig;
         use crate::sampling::{Sampler, SamplingConfig};
 
         // 8 tokens. Two ties, both at HIGH-probability positions:

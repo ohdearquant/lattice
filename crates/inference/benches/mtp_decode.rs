@@ -71,8 +71,9 @@ fn bench_baseline(c: &mut Criterion) {
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
+        use lattice_inference::GenerateConfig;
         use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
-        use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+        use lattice_inference::model::qwen35_config::Qwen35Config;
         use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
         let Some(dir) = q4_model_dir() else {
@@ -165,8 +166,9 @@ fn bench_mtp(c: &mut Criterion) {
 
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
+        use lattice_inference::GenerateConfig;
         use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
-        use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+        use lattice_inference::model::qwen35_config::Qwen35Config;
         use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
         let Some(dir) = q4_model_dir() else {

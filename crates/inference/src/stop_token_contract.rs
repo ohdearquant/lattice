@@ -20,7 +20,7 @@
 //! semantics most callers expect (the stop marker is a control signal, not
 //! content), and it
 //! composes correctly with string-level `stop_strings` truncation, which by
-//! construction already drops the matched suffix. [`crate::model::qwen35_config::GenerateOutput`]
+//! construction already drops the matched suffix. [`crate::generation::GenerateOutput`]
 //! records this explicitly. The MTP and self-spec loops were the two sites
 //! that needed a production change; see `crates/inference/src/forward/metal_qwen35.rs`.
 //!
@@ -83,9 +83,10 @@ mod tests {
     use crate::forward::cpu_q8::generate_q8;
     use crate::forward::neon::pack_weights_q8;
     use crate::forward::neon_forward::{Q8NeonModel, generate_q8_neon};
+    use crate::generation::{GenerateConfig, GenerateOutput};
     use crate::lora_hook::NoopLoraHook;
     use crate::model::qwen35::{ModelWeights, Qwen35Model};
-    use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
+    use crate::model::qwen35_config::Qwen35Config;
     use crate::rope::RopeTable;
     use crate::stop_reason::StopReason;
     use crate::tokenizer::bpe::BpeTokenizer;

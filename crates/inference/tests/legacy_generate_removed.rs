@@ -109,9 +109,23 @@ fn workspace_has_no_deleted_api_references() {
 
 #[test]
 fn canonical_generation_contract_remains() {
-    let config = lattice_inference::model::GenerateConfig::default();
+    let config = lattice_inference::GenerateConfig::default();
     assert_eq!(config.max_new_tokens, 256);
-    let _ = std::mem::size_of::<lattice_inference::model::qwen35_config::GenerateOutput>();
+    let _ = std::mem::size_of::<lattice_inference::GenerateOutput>();
+    let _ = std::mem::size_of::<lattice_inference::TokenLogprob>();
+    let _ = std::mem::size_of::<lattice_inference::TopLogprob>();
+
+    // ADR-092 keeps the pre-move paths resolving. Asserting that is the point of this
+    // test, so the deprecation is allowed here deliberately rather than silenced by
+    // rewriting these to the canonical path with the rest of the tree.
+    #[allow(deprecated)]
+    {
+        let legacy_family = lattice_inference::model::qwen35_config::GenerateConfig::default();
+        assert_eq!(legacy_family.max_new_tokens, config.max_new_tokens);
+        let legacy_model = lattice_inference::model::GenerateConfig::default();
+        assert_eq!(legacy_model.max_new_tokens, config.max_new_tokens);
+        let _ = std::mem::size_of::<lattice_inference::model::qwen35_config::GenerateOutput>();
+    }
     let _ = std::mem::size_of::<lattice_inference::QwenModel>();
 
     let _ = lattice_inference::model::Qwen35Model::generate;
@@ -121,7 +135,7 @@ fn canonical_generation_contract_remains() {
     let _streaming_entry_point =
         |model: &lattice_inference::model::Qwen35Model,
          prompt: &str,
-         gen_cfg: &lattice_inference::model::GenerateConfig| {
+         gen_cfg: &lattice_inference::GenerateConfig| {
             model.generate_streaming(prompt, gen_cfg, |_token: &str| {})
         };
 }

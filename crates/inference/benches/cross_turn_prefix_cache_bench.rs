@@ -18,11 +18,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+use lattice_inference::GenerateConfig;
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::forward::metal_qwen35::{ChatMessage, MetalQwen35State};
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::kv_cache::CrossTurnSlotId;
-#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-use lattice_inference::model::qwen35_config::GenerateConfig;
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 use lattice_inference::tokenizer::bpe::BpeTokenizer;
 

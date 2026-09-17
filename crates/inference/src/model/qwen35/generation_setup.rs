@@ -7,9 +7,9 @@ use super::generation::{
     check_prompt_not_empty, check_reasoning_budget_not_set, check_stop_strings_not_set,
 };
 use crate::error::InferenceError;
+use crate::generation::{GenerateConfig, GenerateOutput};
 #[cfg(any(test, all(target_os = "macos", feature = "metal-gpu")))]
 use crate::model::qwen35_config::decode_cap;
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput};
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;

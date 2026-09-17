@@ -175,8 +175,8 @@ fn bench_llm() -> Vec<Metric> {
         return vec![];
     }
 
+    use lattice_inference::GenerateConfig;
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::GenerateConfig;
 
     // Load model
     let t_load = Instant::now();
@@ -271,8 +271,9 @@ fn bench_llm_f16() -> Vec<Metric> {
         return vec![];
     }
 
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::cpu_f16::generate_f16;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::rope::RopeTable;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use lattice_inference::weights::SafetensorsFile;
@@ -357,9 +358,10 @@ fn bench_llm_q8() -> Vec<Metric> {
         return vec![];
     }
 
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::cpu_q8::{generate_q8, quantize_from_model};
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::rope::RopeTable;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
@@ -438,9 +440,10 @@ fn bench_llm_q8_neon() -> Vec<Metric> {
         return vec![];
     }
 
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::neon_forward::{generate_q8_neon, quantize_model};
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::rope::RopeTable;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
@@ -518,9 +521,9 @@ fn bench_llm_metal() -> Vec<Metric> {
         return vec![];
     }
 
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::GenerateConfig;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
     let model = Qwen35Model::from_safetensors(dir).expect("failed to load Qwen3.5-2B");

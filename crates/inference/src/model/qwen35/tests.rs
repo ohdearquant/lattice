@@ -37,7 +37,7 @@ fn test_partial_rope_only_rotates_first_quarter() {
 #[test]
 fn test_sample_greedy() {
     let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-    let cfg = crate::model::qwen35_config::GenerateConfig {
+    let cfg = crate::generation::GenerateConfig {
         temperature: 0.0,
         ..Default::default()
     };
@@ -50,7 +50,7 @@ fn test_sample_greedy() {
 fn test_sample_repetition_penalty() {
     // Token 3 has highest logit but gets penalized
     let logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
-    let cfg = crate::model::qwen35_config::GenerateConfig {
+    let cfg = crate::generation::GenerateConfig {
         temperature: 0.0,
         repetition_penalty: 100.0,
         ..Default::default()
@@ -70,7 +70,7 @@ fn test_repetition_penalty_applied_once_per_repeated_id() {
     // matching HF and the Metal `CandidateSet` path — not once per occurrence
     // (which compounds to penalty^N and over-suppresses as the sequence grows).
     let logits = vec![0.0, 10.0, 3.0];
-    let cfg = crate::model::qwen35_config::GenerateConfig {
+    let cfg = crate::generation::GenerateConfig {
         temperature: 0.0,
         repetition_penalty: 2.0,
         ..Default::default()
@@ -93,7 +93,7 @@ fn test_sample_nonfinite_temperature_is_greedy() {
     // forces the categorical path that would otherwise mis-sample.
     let logits = vec![0.0, 100.0, 99.0];
     for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-        let cfg = crate::model::qwen35_config::GenerateConfig {
+        let cfg = crate::generation::GenerateConfig {
             temperature: bad,
             top_k: 2,
             top_p: 1.0,
@@ -220,7 +220,7 @@ fn test_qwen36_27b_required_tensor_names_language_model_prefix() {
 #[test]
 fn test_should_stop_token_includes_im_end() {
     let cfg = crate::model::qwen35_config::Qwen35Config::qwen36_35b_a3b();
-    let gen_cfg = crate::model::qwen35_config::GenerateConfig::default();
+    let gen_cfg = crate::generation::GenerateConfig::default();
     assert!(should_stop_token(&cfg, &gen_cfg, cfg.eos_token_id));
     assert!(should_stop_token(&cfg, &gen_cfg, QWEN_CHAT_IM_END_TOKEN_ID));
     assert!(!should_stop_token(&cfg, &gen_cfg, 123));
@@ -370,7 +370,7 @@ fn test_qwen36_greedy_one_token_smoke() {
         .expect("set LATTICE_QWEN36_MODEL_DIR to a Qwen3.6 checkpoint directory");
     let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
         .expect("Qwen3.6 MoE model should load successfully");
-    let cfg = crate::model::qwen35_config::GenerateConfig {
+    let cfg = crate::generation::GenerateConfig {
         max_new_tokens: 1,
         temperature: 0.0,
         ..Default::default()
@@ -859,7 +859,7 @@ mod lora_serving {
         // forward pass, so a synthetic model is sufficient to exercise it.
         let cfg = test_config();
         let model = build_model(cfg.clone(), 0xBEEF_F00D);
-        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+        let gen_cfg = crate::generation::GenerateConfig {
             max_new_tokens: 0,
             ..Default::default()
         };
@@ -884,7 +884,7 @@ mod lora_serving {
         let cfg = test_config();
         let model = build_model(cfg, 0xBEEF_CAFE);
         let max_context = model.max_context();
-        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+        let gen_cfg = crate::generation::GenerateConfig {
             max_new_tokens: max_context + 16,
             ..Default::default()
         };
@@ -906,7 +906,7 @@ mod lora_serving {
         let cfg = test_config();
         let model = build_model(cfg, 0xBEEF_CAFD);
         let max_context = model.max_context();
-        let gen_cfg = crate::model::qwen35_config::GenerateConfig {
+        let gen_cfg = crate::generation::GenerateConfig {
             max_new_tokens: max_context + 16,
             ..Default::default()
         };

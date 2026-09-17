@@ -17,9 +17,10 @@ fn main() {
     let dir = std::path::Path::new(&model_dir);
     let tokenizer_path = std::path::Path::new(&tokenizer_dir).join("tokenizer.json");
 
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
     use lattice_inference::model::qwen35::Qwen35Model;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::model_format::{ModelFormat, detect_format};
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 

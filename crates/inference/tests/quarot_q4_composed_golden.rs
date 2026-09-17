@@ -160,8 +160,9 @@ fn shellexpand_home(path: &str) -> String {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run_composed_gate(model_dir: &Path, q4_dir: &Path, golden: &Golden) {
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::metal_qwen35::MetalQwen35State;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
 
     let _gpu_guard = lattice_inference::measurement::gpu_test_lock();

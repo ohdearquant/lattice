@@ -63,11 +63,8 @@ impl MetalChatBackend {
     fn generate(
         &mut self,
         prompt: &str,
-        gen_cfg: &lattice_inference::model::qwen35_config::GenerateConfig,
-    ) -> Result<
-        lattice_inference::model::qwen35_config::GenerateOutput,
-        lattice_inference::error::InferenceError,
-    > {
+        gen_cfg: &lattice_inference::GenerateConfig,
+    ) -> Result<lattice_inference::GenerateOutput, lattice_inference::error::InferenceError> {
         self.state.generate(prompt, &self.tokenizer, gen_cfg)
     }
 }
@@ -146,7 +143,7 @@ pub(crate) fn run_chat(
     };
     eprintln!("Model loaded. Type 'exit' or 'quit' to stop.\n");
 
-    let mut gen_cfg = lattice_inference::model::qwen35_config::GenerateConfig::default();
+    let mut gen_cfg = lattice_inference::GenerateConfig::default();
     gen_cfg.max_new_tokens = max_tokens;
     gen_cfg.temperature = temperature;
 

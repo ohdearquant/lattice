@@ -14,12 +14,13 @@ use crate::attention::gdn_fused::{
     simd_l2_normalize, simd_matvec_transpose,
 };
 use crate::forward::cpu::{elementwise_mul, matmul_bt, silu_inplace};
+use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::Qwen35Model;
 use crate::model::qwen35::{
     ForwardScratch, GenerationEntryContract, GenerationPlan, GenerationPreparation, KvCache,
     decode_tokens, prepare_generation, qwen35_rms_norm, resize, sample_token, should_stop_token,
 };
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
+use crate::model::qwen35_config::Qwen35Config;
 use crate::rope::RopeTable;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;

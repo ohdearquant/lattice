@@ -150,10 +150,16 @@ alone does not discharge this clause.
 
 Therefore: the four definitions currently in `model/qwen35_config.rs` (`GenerateConfig`,
 `GenerateOutput`, `TokenLogprob`, `TopLogprob`) move to a neutral module. The crate root re-exports
-all six types in the table. `model::qwen35_config` re-exports the four with `#[deprecated]` pointing
-at the crate-root path, so the old paths keep compiling and nothing is removed. The in-crate call
-sites move in the same change — 69 of them name `crate::model::qwen35_config::GenerateConfig` today
-— so the deprecation warning reaches external consumers only rather than the crate's own code.
+all six types in the table. `model::qwen35_config` keeps the four reachable through **deprecated
+type aliases** pointing at the crate-root path, so the old paths keep compiling and nothing is
+removed. The alias form is load-bearing rather than incidental: `#[deprecated]` on a `pub use`, and
+on the module containing one, are both accepted by the compiler and emit nothing, so the obvious
+spelling of this clause would land a deprecation that warns no one (measured on the pinned 1.94.1,
+with the attribute on the struct itself as a control that does fire). Every in-repo call site moves
+in the same change, across both path spellings and brace-group imports, so the warning reaches
+external consumers only rather than the crate's own targets — and that population is materially
+larger than a single-spelling count suggests; lattice#1656 carries the measured figure and the
+search grammar it covers.
 
 The reason this is specified rather than left to the implementation is that the two shapes **build
 identically and document differently**. A root `pub use` and a move both compile, both keep every

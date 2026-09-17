@@ -331,8 +331,9 @@ mod resolver_strictness_tests {
 
 #[cfg(feature = "f16")]
 fn run_s5b_gate(model_dir: &Path) {
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::cpu_f16::generate_multimodal_f16;
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::vision::multimodal::Qwen35VisionRequest;
     use lattice_inference::vision::qwen35_vit::GridThw;
     use lattice_inference::weights::SafetensorsFile;

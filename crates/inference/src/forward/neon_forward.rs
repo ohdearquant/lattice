@@ -21,13 +21,14 @@ use crate::attention::gdn_fused::GatedDeltaNetFusedScratch;
 use crate::error::InferenceError;
 use crate::forward::cpu::{elementwise_mul, silu_inplace};
 use crate::forward::neon::{matmul_q8_neon_into, pack_weights_q8};
+use crate::generation::{GenerateConfig, GenerateOutput};
 use crate::model::qwen35::{
     AttentionWeights, CommonLayerWeights, FeedForwardWeights, ForwardScratch,
     FullAttentionLayerWeights, GenerationEntryContract, GenerationPlan, GenerationPreparation,
     KvCache, ModelWeights, decode_tokens, prepare_generation, qwen35_rms_norm, resize,
     sample_token, should_stop_token,
 };
-use crate::model::qwen35_config::{GenerateConfig, GenerateOutput, Qwen35Config};
+use crate::model::qwen35_config::Qwen35Config;
 use crate::rope::RopeTable;
 use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;

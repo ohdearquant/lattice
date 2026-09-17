@@ -25,10 +25,11 @@ fn main() {
 
 #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
 fn run() {
+    use lattice_inference::GenerateConfig;
     use lattice_inference::forward::metal_qwen35::{
         ChatMessage, MetalQwen35State, format_chat_template,
     };
-    use lattice_inference::model::qwen35_config::{GenerateConfig, Qwen35Config};
+    use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::tokenizer::bpe::BpeTokenizer;
     use std::time::Instant;
 
