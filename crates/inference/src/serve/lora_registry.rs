@@ -2,8 +2,8 @@
 
 use super::ApiError;
 use super::lora::{
-    AdapterIndex, AdapterMetadata, LoraSelection, unknown_adapter, validate_scales,
-    validate_unique_ids,
+    AdapterControlError, AdapterIndex, AdapterMetadata, LoraSelection, ResidencyLimits,
+    unknown_adapter, validate_scales, validate_unique_ids,
 };
 use crate::forward::metal_qwen35::{LoraLayerData, MetalQwen35State, blend_lora_layer_data};
 use lattice_fann::lora::LoraDescriptor;
@@ -30,10 +30,14 @@ struct ResidentAdapter {
     metadata: AdapterMetadata,
     layers: Vec<LoraLayerData>,
     descriptor: LoraDescriptor,
+    payload_bytes: usize,
 }
 
 pub(super) struct ResidencyRegistry {
     residents: HashMap<u32, ResidentAdapter>,
+    identities: HashMap<(String, String), u32>,
+    resident_bytes: usize,
+    limits: ResidencyLimits,
     next_id: Option<u32>,
     // Order determines concatenated rank order and hence floating-point reduction.
     applied: Vec<LoraSelection>,
@@ -43,9 +47,12 @@ pub(super) struct ResidencyRegistry {
 }
 
 impl ResidencyRegistry {
-    pub(super) fn new(index: Arc<RwLock<AdapterIndex>>) -> Self {
+    pub(super) fn new(index: Arc<RwLock<AdapterIndex>>, limits: ResidencyLimits) -> Self {
         Self {
             residents: HashMap::new(),
+            identities: HashMap::new(),
+            resident_bytes: 0,
+            limits,
             next_id: Some(0),
             applied: Vec::new(),
             index,
@@ -60,7 +67,12 @@ impl ResidencyRegistry {
         path: String,
         layers: Vec<LoraLayerData>,
         descriptor: LoraDescriptor,
-    ) -> Result<u32, String> {
+    ) -> Result<u32, AdapterControlError> {
+        // Identity is lexical: aliases and changed file contents are not detected.
+        let identity = (name.clone(), path.clone());
+        if let Some(&id) = self.identities.get(&identity) {
+            return Ok(id);
+        }
         descriptor.validate()?;
         lattice_fann::lora::validate_target_modules(
             &descriptor.target_modules,
@@ -84,7 +96,31 @@ impl ResidencyRegistry {
                 "resident LoRA layers disagree with descriptor rank or target modules".into(),
             );
         }
-        let id = self.next_id.ok_or("LoRA adapter id space exhausted")?;
+        if self.residents.len() >= self.limits.max_adapters {
+            return Err(AdapterControlError::CountLimit {
+                limit: self.limits.max_adapters,
+            });
+        }
+        let byte_limit = || AdapterControlError::ByteLimit {
+            limit: self.limits.max_bytes,
+        };
+        let payload_bytes = layers
+            .iter()
+            .try_fold(0usize, |sum, layer| {
+                let bytes = layer
+                    .a
+                    .len()
+                    .checked_add(layer.b.len())?
+                    .checked_mul(size_of::<f32>())?;
+                sum.checked_add(bytes)
+            })
+            .ok_or_else(byte_limit)?;
+        let total_bytes = self
+            .resident_bytes
+            .checked_add(payload_bytes)
+            .filter(|&total| total <= self.limits.max_bytes)
+            .ok_or_else(byte_limit)?;
+        let id = self.next_id.ok_or(AdapterControlError::IdExhausted)?;
         // A removed identifier must never redirect a queued request to new weights.
         self.next_id = id.checked_add(1);
         let metadata = AdapterMetadata {
@@ -100,23 +136,40 @@ impl ResidencyRegistry {
                 metadata,
                 layers,
                 descriptor,
+                payload_bytes,
             },
         );
+        self.identities.insert(identity, id);
+        self.resident_bytes = total_bytes;
         self.publish();
         Ok(id)
     }
 
-    pub(super) fn unload(&mut self, id: u32, slot: &mut impl AdapterSlot) -> Result<u32, String> {
-        if !self.residents.contains_key(&id) {
-            return Err(format!("unknown LoRA adapter id {id}"));
-        }
+    pub(super) fn unload(
+        &mut self,
+        id: u32,
+        slot: &mut impl AdapterSlot,
+    ) -> Result<u32, AdapterControlError> {
+        let adapter = self
+            .residents
+            .remove(&id)
+            .ok_or(AdapterControlError::NotFound(id))?;
         if self.applied.iter().any(|entry| entry.id == id) {
             slot.unload();
             self.applied.clear();
         }
-        self.residents.remove(&id);
+        self.resident_bytes -= adapter.payload_bytes;
+        self.identities
+            .remove(&(adapter.metadata.name, adapter.metadata.path));
         self.publish();
         Ok(id)
+    }
+
+    pub(super) fn metadata(&self, id: u32) -> Result<AdapterMetadata, AdapterControlError> {
+        self.residents
+            .get(&id)
+            .map(|adapter| adapter.metadata.clone())
+            .ok_or(AdapterControlError::NotFound(id))
     }
 
     pub(super) fn apply(
@@ -237,7 +290,10 @@ mod tests {
         }
     }
     fn registry() -> ResidencyRegistry {
-        ResidencyRegistry::new(Arc::new(RwLock::new(AdapterIndex::default())))
+        ResidencyRegistry::new(
+            Arc::new(RwLock::new(AdapterIndex::default())),
+            ResidencyLimits::default(),
+        )
     }
     fn load(registry: &mut ResidencyRegistry, name: &str) -> u32 {
         registry
@@ -261,6 +317,221 @@ mod tests {
                 },
             )
             .unwrap()
+    }
+
+    fn limited(max_adapters: usize, max_bytes: usize) -> ResidencyRegistry {
+        ResidencyRegistry::new(
+            Arc::new(RwLock::new(AdapterIndex::default())),
+            ResidencyLimits {
+                max_adapters,
+                max_bytes,
+            },
+        )
+    }
+
+    fn try_load(
+        registry: &mut ResidencyRegistry,
+        name: &str,
+        path: &str,
+    ) -> Result<u32, AdapterControlError> {
+        registry.load(
+            name.into(),
+            path.into(),
+            vec![LoraLayerData {
+                layer_idx: 0,
+                module: "q_proj".into(),
+                a: vec![2.0],
+                b: vec![3.0],
+                rank: 1,
+                d_in: 1,
+                d_out: 1,
+            }],
+            LoraDescriptor {
+                rank: 1,
+                alpha: 2.0,
+                target_modules: vec!["q_proj".into()],
+                dtype: "f32".into(),
+            },
+        )
+    }
+
+    fn assert_rejected_without_state_change(
+        registry: &mut ResidencyRegistry,
+    ) -> AdapterControlError {
+        let id = try_load(registry, "a", "a.safetensors").unwrap();
+        let selection = [LoraSelection { id, scale: 1.0 }];
+        let mut slot = Slot::default();
+        registry.apply(&selection, &mut slot).unwrap();
+        let before = serde_json::to_value(registry.index.read().unwrap().clone()).unwrap();
+        let next_id = registry.next_id;
+        let bytes = registry.resident_bytes;
+        let output = slot.output();
+        let error = try_load(registry, "b", "b.safetensors").unwrap_err();
+        assert_eq!(
+            serde_json::to_value(registry.index.read().unwrap().clone()).unwrap(),
+            before
+        );
+        assert_eq!(registry.next_id, next_id);
+        assert_eq!(registry.resident_bytes, bytes);
+        assert_eq!(registry.residents.len(), 1);
+        assert_eq!(registry.identities.len(), 1);
+        registry.apply(&selection, &mut slot).unwrap();
+        assert_eq!(slot.output(), output);
+        assert_eq!(slot.uploads, 1);
+        assert_eq!(slot.unloads, 0);
+        error
+    }
+
+    #[test]
+    fn count_limit_preserves_residents_and_applied_selection() {
+        let mut registry = limited(1, 1024);
+        let error = assert_rejected_without_state_change(&mut registry);
+        assert!(matches!(
+            error,
+            AdapterControlError::CountLimit { limit: 1 }
+        ));
+    }
+
+    #[test]
+    fn byte_limit_preserves_residents_and_applied_selection() {
+        let mut registry = limited(10, 8);
+        let error = assert_rejected_without_state_change(&mut registry);
+        assert!(matches!(error, AdapterControlError::ByteLimit { limit: 8 }));
+    }
+
+    #[test]
+    fn dedup_at_capacity_does_not_spend_another_budget_slot() {
+        let mut registry = limited(1, 8);
+        let id = try_load(&mut registry, "a", "a.safetensors").unwrap();
+        for _ in 0..10 {
+            assert_eq!(try_load(&mut registry, "a", "a.safetensors").unwrap(), id);
+        }
+        assert_eq!(registry.residents.len(), 1);
+        assert_eq!(registry.resident_bytes, 8);
+        assert_eq!(registry.next_id, Some(1));
+        let mut slot = Slot::default();
+        registry.unload(id, &mut slot).unwrap();
+        assert!(registry.residents.is_empty());
+        assert!(registry.identities.is_empty());
+        assert_eq!(registry.resident_bytes, 0);
+        assert!(registry.unload(id, &mut slot).is_err());
+        assert_eq!(
+            try_load(&mut registry, "a", "a.safetensors").unwrap(),
+            id + 1
+        );
+    }
+
+    #[test]
+    fn reused_identity_preserves_original_weights_and_metadata() {
+        let mut registry = limited(1, 8);
+        let id = try_load(&mut registry, "a", "a.safetensors").unwrap();
+        let metadata = registry.metadata(id).unwrap();
+        let reused = registry
+            .load(
+                "a".into(),
+                "a.safetensors".into(),
+                vec![LoraLayerData {
+                    layer_idx: 0,
+                    module: "q_proj".into(),
+                    a: vec![100.0; 2],
+                    b: vec![100.0; 2],
+                    rank: 2,
+                    d_in: 1,
+                    d_out: 1,
+                }],
+                LoraDescriptor {
+                    rank: 2,
+                    alpha: 2.0,
+                    target_modules: vec!["q_proj".into()],
+                    dtype: "f32".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(reused, id);
+        assert_eq!(registry.metadata(reused).unwrap(), metadata);
+        assert_eq!(registry.resident_bytes, 8);
+        let mut slot = Slot::default();
+        registry
+            .apply(&[LoraSelection { id, scale: 1.0 }], &mut slot)
+            .unwrap();
+        assert_eq!(slot.output(), 22.0);
+    }
+
+    #[test]
+    fn oversized_first_payload_leaves_empty_registry() {
+        let mut registry = limited(10, 7);
+        assert!(matches!(
+            try_load(&mut registry, "a", "a.safetensors"),
+            Err(AdapterControlError::ByteLimit { limit: 7 })
+        ));
+        assert!(registry.residents.is_empty());
+        assert!(registry.identities.is_empty());
+        assert_eq!(registry.resident_bytes, 0);
+        assert_eq!(registry.next_id, Some(0));
+        assert!(registry.index.read().unwrap().adapters.is_empty());
+    }
+
+    #[test]
+    fn identity_uses_both_exact_name_and_path() {
+        let mut registry = limited(3, 24);
+        let a = try_load(&mut registry, "a", "file.safetensors").unwrap();
+        let b = try_load(&mut registry, "b", "file.safetensors").unwrap();
+        let c = try_load(&mut registry, "a", "./file.safetensors").unwrap();
+        assert_eq!((a, b, c), (0, 1, 2));
+        assert_eq!(registry.resident_bytes, 24);
+    }
+
+    #[test]
+    fn lowered_byte_limit_rejects_without_underflow() {
+        let mut registry = limited(10, 16);
+        try_load(&mut registry, "a", "a.safetensors").unwrap();
+        registry.limits.max_bytes = 1;
+        assert!(matches!(
+            try_load(&mut registry, "b", "b.safetensors"),
+            Err(AdapterControlError::ByteLimit { limit: 1 })
+        ));
+        assert_eq!(registry.resident_bytes, 8);
+        assert_eq!(registry.residents.len(), 1);
+    }
+
+    #[test]
+    fn total_byte_overflow_is_rejected() {
+        let mut registry = limited(10, usize::MAX);
+        registry.resident_bytes = usize::MAX - 4;
+        assert!(matches!(
+            try_load(&mut registry, "a", "a.safetensors"),
+            Err(AdapterControlError::ByteLimit { .. })
+        ));
+        assert!(registry.residents.is_empty());
+        assert_eq!(registry.next_id, Some(0));
+    }
+
+    #[tokio::test]
+    async fn capacity_failure_emits_distinct_http_code() {
+        use axum::response::IntoResponse;
+        for mut registry in [limited(1, 1024), limited(10, 8)] {
+            try_load(&mut registry, "a", "a.safetensors").unwrap();
+            let error = try_load(&mut registry, "b", "b.safetensors").unwrap_err();
+            let response = ApiError::from(error).into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], "lora_residency_limit_exceeded");
+            assert_ne!(body["error"]["code"], "lora_load_failed");
+        }
+    }
+
+    #[test]
+    fn repeated_identity_reuses_one_resident() {
+        let mut registry = registry();
+        let first = load(&mut registry, "same");
+        for _ in 0..8 {
+            assert_eq!(load(&mut registry, "same"), first);
+        }
+        assert_eq!(registry.residents.len(), 1);
+        assert_eq!(registry.next_id, Some(1));
     }
 
     #[test]
@@ -440,6 +711,12 @@ mod tests {
         registry.unload(b, &mut slot).unwrap();
         assert_eq!(slot.output(), 10.0);
         assert!(registry.apply(&next, &mut slot).is_err());
-        assert!(registry.unload(90, &mut slot).unwrap_err().contains("90"));
+        assert!(
+            registry
+                .unload(90, &mut slot)
+                .unwrap_err()
+                .to_string()
+                .contains("90")
+        );
     }
 }

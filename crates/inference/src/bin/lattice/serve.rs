@@ -266,6 +266,7 @@ impl ModelBackend {
         model_dir: std::path::PathBuf,
         tokenizer_dir: Option<std::path::PathBuf>,
         max_pending: usize,
+        residency_limits: lattice_inference::serve::lora::ResidencyLimits,
         preload_vision: bool,
     ) -> Result<(Self, usize), String> {
         use lattice_inference::serve::metal_worker::{
@@ -337,6 +338,7 @@ impl ModelBackend {
             },
             vision_runtime,
             max_pending,
+            residency_limits,
         )
         .map_err(|e| match e {
             StartupError::Load(msg) => msg,
@@ -1646,6 +1648,8 @@ pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiErr
 
 /// Make a PEFT or MLX adapter resident without applying it to generation.
 ///
+/// Repeated exact `(name, path)` identities reuse the resident id. One unload
+/// removes it for every caller; aliases and changed file contents are not detected.
 /// This unauthenticated route reads a caller-selected path on the server host.
 pub async fn lora_load(
     State(state): State<AppState>,
@@ -1668,17 +1672,22 @@ pub async fn lora_load(
     {
         let client = adapter_client(&state)?;
         let prepared = lattice_inference::serve::lora::prepare_adapter_load(&path, &name)?;
-        let (rank, layers) = (prepared.rank, prepared.layers);
         let receiver = client.submit_adapter_command(prepared.command)?;
         match receiver.await {
-            Ok(Ok(id)) => Ok(Json(lattice_inference::serve::lora::load_success_body(
-                id, &name, &path, rank, layers,
-            ))
-            .into_response()),
-            Ok(Err(message)) => {
-                let code = lattice_inference::serve::lora::adapter_failure_code(&message);
-                Err(ApiError::BadRequest { message, code })
+            Ok(Ok(lattice_inference::serve::lora::AdapterControlResult::Loaded(adapter))) => {
+                Ok(Json(lattice_inference::serve::lora::load_success_body(
+                    adapter.id,
+                    &adapter.name,
+                    &adapter.path,
+                    adapter.rank,
+                    adapter.layers,
+                ))
+                .into_response())
             }
+            Ok(Err(error)) => Err(error.into()),
+            Ok(Ok(_)) => Err(lattice_inference::serve::lora::worker_unavailable(
+                "unexpected adapter command reply",
+            )),
             Err(_) => Err(lattice_inference::serve::lora::worker_unavailable(
                 "the inference worker is not running; the adapter was not loaded",
             )),
@@ -1720,13 +1729,13 @@ pub async fn lora_unload(
             lattice_inference::serve::metal_worker::AdapterCommand::Unload { id },
         )?;
         match receiver.await {
-            Ok(Ok(id)) => {
+            Ok(Ok(lattice_inference::serve::lora::AdapterControlResult::Unloaded(id))) => {
                 Ok(Json(lattice_inference::serve::lora::unload_success_body(id)).into_response())
             }
-            Ok(Err(message)) => {
-                let code = lattice_inference::serve::lora::adapter_failure_code(&message);
-                Err(ApiError::BadRequest { message, code })
-            }
+            Ok(Err(error)) => Err(error.into()),
+            Ok(Ok(_)) => Err(lattice_inference::serve::lora::worker_unavailable(
+                "unexpected adapter command reply",
+            )),
             Err(_) => Err(lattice_inference::serve::lora::worker_unavailable(
                 "the inference worker is not running; no adapter was unloaded",
             )),

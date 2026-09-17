@@ -529,6 +529,36 @@ Loading makes an adapter resident without changing generation. Supply a nonempty
 refused. The file is a PEFT or MLX LoRA safetensors export. Its alpha/rank scale
 defaults to 1.0 when alpha metadata is absent.
 
+Both binaries accept `--max-resident-adapters` (default **32**) and
+`--max-resident-adapter-bytes` (default **536870912**, or 512 MiB). Each must be a
+positive integer. These are per-server limits on the Metal resident registry.
+A load that would exceed either limit returns HTTP 400
+`lora_residency_limit_exceeded`, with the exhausted limit in the message.
+Rejection preserves every resident identifier and the applied selection; no
+adapter is evicted. Unload an adapter explicitly to reclaim its capacity.
+
+The byte limit counts only tensor payload: the sum of
+`(a.len() + b.len()) * size_of::<f32>()` over resident layers. It excludes module
+name strings and struct overhead. This is **not a process-memory budget or an
+OOM defence**. It does not bound model buffers, KV cache, recurrent state,
+prefix state, transient scratch, other CPU allocations, or OS reserve. In
+particular, parsing a load and materializing an applied mixture need additional
+memory. The defaults are configurable engineering choices, not measured safe
+thresholds for a particular machine or memory-pressure failure curve. If an
+active sequence costs `S = r + o + k*T` bytes (per-sequence state `r`, overhead
+`o`, and `k` bytes per token at mean context length `T`), reserving `R` bytes for
+adapters consumes approximately `R / S` sequences of memory capacity; actual
+concurrency also depends on the rest of the serving configuration.
+
+Load is idempotent by the exact client-supplied `(name, path)` pair: repeated
+loads return the existing identifier and consume no additional resident count
+or payload budget, including when the registry is full. There is no independent
+reference count: **one unload removes that identifier for all callers**.
+Identity equality does not recognize alternate spellings of the same file path
+or detect changed file contents at an unchanged path. To replace weights under
+an existing identity, unload it first. The load route still reads and validates
+the supplied file before submitting the command, even for a repeated identity.
+
 Zero rank and nonfinite alpha are rejected during loading with HTTP 400. Finite
 alpha equal to zero is valid: the adapter remains resident and selectable, with
 a zero contribution rather than being silently removed from the mixture.

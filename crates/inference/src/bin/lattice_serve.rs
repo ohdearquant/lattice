@@ -3174,6 +3174,26 @@ mod imp {
         }
     }
 
+    fn parse_residency_limits(
+        args: &[String],
+    ) -> Result<lattice_inference::serve::lora::ResidencyLimits, String> {
+        use lattice_inference::serve::lora::{ResidencyLimits, parse_resident_limit};
+        let parse = |flag: &str, default: usize| {
+            let Some(index) = args.iter().position(|arg| arg == flag) else {
+                return Ok(default);
+            };
+            let raw = args
+                .get(index + 1)
+                .ok_or_else(|| format!("{flag}: expected a positive integer"))?;
+            parse_resident_limit(raw).map_err(|err| format!("{flag}: {err}"))
+        };
+        let defaults = ResidencyLimits::default();
+        Ok(ResidencyLimits {
+            max_adapters: parse("--max-resident-adapters", defaults.max_adapters)?,
+            max_bytes: parse("--max-resident-adapter-bytes", defaults.max_bytes)?,
+        })
+    }
+
     fn default_model_cache() -> std::path::PathBuf {
         std::env::var("LATTICE_MODEL_CACHE")
             .map(std::path::PathBuf::from)
@@ -3247,6 +3267,9 @@ mod imp {
         Json(serde_json::json!(s.jobs.adapter_index()))
     }
 
+    /// Repeated exact `(name, path)` identities share one resident id and lifetime:
+    /// one unload removes it for all callers. Path aliases and changed contents
+    /// are not detected. Capacity exhaustion rejects the load without eviction.
     async fn lora_load(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Response {
         let timer = Instant::now();
         const ROUTE: &str = "/v1/lora/load";
@@ -3289,13 +3312,12 @@ mod imp {
                 Ok(prepared) => prepared,
                 Err(err) => return fail(err),
             };
-            let (rank, layer_count) = (prepared.rank, prepared.layers);
             let receiver = match s.jobs.submit_adapter_command(prepared.command) {
                 Ok(receiver) => receiver,
                 Err(err) => return fail(err),
             };
             match receiver.await {
-                Ok(Ok(id)) => {
+                Ok(Ok(lattice_inference::serve::lora::AdapterControlResult::Loaded(adapter))) => {
                     emit_serve_event(
                         &s.metrics,
                         "POST",
@@ -3308,18 +3330,18 @@ mod imp {
                         None,
                     );
                     Json(lattice_inference::serve::lora::load_success_body(
-                        id,
-                        &name,
-                        &path,
-                        rank,
-                        layer_count,
+                        adapter.id,
+                        &adapter.name,
+                        &adapter.path,
+                        adapter.rank,
+                        adapter.layers,
                     ))
                     .into_response()
                 }
-                Ok(Err(message)) => {
-                    let code = lattice_inference::serve::lora::adapter_failure_code(&message);
-                    fail(lattice_inference::serve::ApiError::BadRequest { message, code })
-                }
+                Ok(Err(error)) => fail(error.into()),
+                Ok(Ok(_)) => fail(lattice_inference::serve::lora::worker_unavailable(
+                    "unexpected adapter command reply",
+                )),
                 Err(_) => fail(lattice_inference::serve::lora::worker_unavailable(
                     "the inference worker is not running; the adapter was not loaded",
                 )),
@@ -3373,7 +3395,7 @@ mod imp {
             Err(err) => return fail(err),
         };
         match receiver.await {
-            Ok(Ok(id)) => {
+            Ok(Ok(lattice_inference::serve::lora::AdapterControlResult::Unloaded(id))) => {
                 emit_serve_event(
                     &s.metrics,
                     "POST",
@@ -3387,10 +3409,10 @@ mod imp {
                 );
                 Json(lattice_inference::serve::lora::unload_success_body(id)).into_response()
             }
-            Ok(Err(message)) => {
-                let code = lattice_inference::serve::lora::adapter_failure_code(&message);
-                fail(lattice_inference::serve::ApiError::BadRequest { message, code })
-            }
+            Ok(Err(error)) => fail(error.into()),
+            Ok(Ok(_)) => fail(lattice_inference::serve::lora::worker_unavailable(
+                "unexpected adapter command reply",
+            )),
             Err(_) => fail(lattice_inference::serve::lora::worker_unavailable(
                 "the inference worker is not running; no adapter was unloaded",
             )),
@@ -3462,6 +3484,7 @@ mod imp {
         // conservative default is correct even though this binary only ever
         // runs one generation at a time.
         let max_pending: usize = parse_max_pending(&args)?;
+        let residency_limits = parse_residency_limits(&args)?;
 
         // issue #1336: eagerly load vision weights at startup instead of on
         // the first image request. Off by default -- lazy loading keeps
@@ -3526,6 +3549,7 @@ mod imp {
             },
             vision_runtime,
             max_pending,
+            residency_limits,
         ) {
             Ok(triple) => triple,
             Err(StartupError::Load(e)) => return Err(e.into()),
@@ -4003,6 +4027,49 @@ mod imp {
         // `usize`s that parse fine and are instead caught once, downstream,
         // by `MetalWorker::spawn`'s own `StartupError::InvalidMaxPending`
         // (covered by that module's own boundary tests).
+
+        #[test]
+        fn resident_limits_defaults_and_overrides() {
+            let defaults = parse_residency_limits(&[]).unwrap();
+            assert_eq!(
+                (defaults.max_adapters, defaults.max_bytes),
+                (32, 536_870_912)
+            );
+            let args = [
+                "--max-resident-adapters",
+                "2",
+                "--max-resident-adapter-bytes",
+                "128",
+            ]
+            .map(String::from);
+            let limits = parse_residency_limits(&args).unwrap();
+            assert_eq!((limits.max_adapters, limits.max_bytes), (2, 128));
+        }
+
+        fn assert_resident_flag_rejects_invalid(flag: &str) {
+            let args = [flag, "8"].map(String::from);
+            parse_residency_limits(&args).unwrap();
+            for value in ["not-a-number", "0", "-1", "18446744073709551616"] {
+                let args = [flag, value].map(String::from);
+                let err = parse_residency_limits(&args).unwrap_err();
+                assert!(err.contains(flag), "{err}");
+            }
+            assert!(
+                parse_residency_limits(&[flag.to_string()])
+                    .unwrap_err()
+                    .contains(flag)
+            );
+        }
+
+        #[test]
+        fn resident_count_malformed_is_rejected() {
+            assert_resident_flag_rejects_invalid("--max-resident-adapters");
+        }
+
+        #[test]
+        fn resident_bytes_malformed_is_rejected() {
+            assert_resident_flag_rejects_invalid("--max-resident-adapter-bytes");
+        }
 
         #[test]
         fn max_pending_omitted_defaults_to_32() {
