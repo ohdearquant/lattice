@@ -972,6 +972,13 @@ kernel void conv1d_depthwise_silu(
 }
 
 // ===== GDN: Fused per-head recurrence =====
+// GDN Q/K L2-normalisation epsilon (#1583). Matches the CPU reference, which computes
+// `1 / sqrt(sum_sq + 1e-6)` (`l2_normalize_rows`, gdn_chunk_ref.rs:38-56, called with 1e-6 at
+// gdn_chunk_ref.rs:643). Deliberately NOT `p.eps`: that field is the model config's
+// `rms_norm_eps` and is used by the RMS sites below; the two agreeing would be a property of one
+// config rather than a contract between the backends.
+constant float GDN_QK_NORM_EPS = 1e-6f;
+
 // One threadgroup per head, 128 threads (4 simdgroups).
 // S stored transposed: S^T[value_dim, key_dim] for contiguous row access.
 struct GdnRecurParams {
@@ -1049,7 +1056,7 @@ kernel void gdn_recurrence_fused(
     // ADR-080 C1 fail-closed (#850): NaN * 0.0f == NaN under IEEE-754, so a NaN lane in
     // q_val survives a plain `q_val *= qs` even when qs is correctly 0.0f from the
     // sg_buf[0] guard. Assign the literal 0.0f directly to the whole vector on an
-    // invalid (non-finite or near-zero) norm instead of multiplying a poisoned lane
+    // invalid (non-finite) norm instead of multiplying a poisoned lane
     // through a zeroed reciprocal.
     float q_val = (tid < kd) ? conv_out[k_head * kd + tid] : 0.0f;
     float q_sq = simd_sum(q_val * q_val);
@@ -1057,8 +1064,8 @@ kernel void gdn_recurrence_fused(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    bool q_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
-    float qs = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    bool q_valid = isfinite(sg_buf[0]);
+    float qs = q_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
     q_val = q_valid ? (q_val * qs) : 0.0f;
     if (tid < kd) q_tg[tid] = q_val;
     // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
@@ -1073,8 +1080,8 @@ kernel void gdn_recurrence_fused(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    bool k_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
-    float ks = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    bool k_valid = isfinite(sg_buf[0]);
+    float ks = k_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
     k_val = k_valid ? (k_val * ks) : 0.0f;
     if (tid < kd) k_tg[tid] = k_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1211,8 +1218,8 @@ kernel void gdn_recurrence_fused_q36(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    bool q_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
-    float qs = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    bool q_valid = isfinite(sg_buf[0]);
+    float qs = q_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
     q_tg[tid] = q_valid ? (q_val * qs) : 0.0f;
     // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
     // before the K-normalize reduction below overwrites sg_buf[sgitg].
@@ -1225,8 +1232,8 @@ kernel void gdn_recurrence_fused_q36(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    bool k_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
-    float ks_inv = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    bool k_valid = isfinite(sg_buf[0]);
+    float ks_inv = k_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
     k_tg[tid] = k_valid ? (k_val * ks_inv) : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1347,7 +1354,7 @@ kernel void gdn_precompute_keys(
 
     // Q/K stay per KEY head (repeat_interleave: k_head = h / ratio)
     // ADR-080 C1 fail-closed (#850): assign 0.0f to the whole vector directly on an
-    // invalid (non-finite or near-zero) norm, never `value * guarded_zero_reciprocal`
+    // invalid (non-finite) norm, never `value * guarded_zero_reciprocal`
     // (NaN * 0.0f == NaN under IEEE-754).
     float q_val = conv_out[k_head * kd + tid];
     float q_sq  = simd_sum(q_val * q_val);
@@ -1355,8 +1362,8 @@ kernel void gdn_precompute_keys(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { q_sq = 0; for (uint s = 0; s < 4; s++) q_sq += sg_buf[s]; sg_buf[0] = q_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    bool q_valid      = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
-    float qs          = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    bool q_valid      = isfinite(sg_buf[0]);
+    float qs          = q_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
     float q_norm_val  = q_valid ? (q_val * qs) : 0.0f;
     // WAR guard: all simdgroups must finish reading sg_buf[0] (the Q norm) above
     // before the K-normalize reduction below overwrites sg_buf[sgitg].
@@ -1368,8 +1375,8 @@ kernel void gdn_precompute_keys(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) { k_sq = 0; for (uint s = 0; s < 4; s++) k_sq += sg_buf[s]; sg_buf[0] = k_sq; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    bool k_valid      = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
-    float ks_inv      = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
+    bool k_valid      = isfinite(sg_buf[0]);
+    float ks_inv      = k_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
     float k_norm_val  = k_valid ? (k_val * ks_inv) : 0.0f;
     // WAR guard: all simdgroups must finish reading sg_buf[0] (the K norm) above
     // before the k_dot_q reduction below overwrites sg_buf[sgitg].
@@ -2779,7 +2786,7 @@ kernel void gdn_chunk_materialize_c32(
 
         // L2 normalize Q (reduce over 128 dims, 4 simdgroups × 32 lanes)
         // ADR-080 C1 fail-closed (#850): assign 0.0f to the whole vector directly on an
-        // invalid (non-finite or near-zero) norm, never `value * guarded_zero_reciprocal`
+        // invalid (non-finite) norm, never `value * guarded_zero_reciprocal`
         // (NaN * 0.0f == NaN under IEEE-754).
         float qsq = simd_sum(q_silu * q_silu);
         if (simd_lane == 0) sg_buf[sgitg] = qsq;
@@ -2790,8 +2797,8 @@ kernel void gdn_chunk_materialize_c32(
             sg_buf[0] = s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        bool q_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
-        float qs_inv = q_valid ? rsqrt(sg_buf[0]) : 0.0f;
+        bool q_valid = isfinite(sg_buf[0]);
+        float qs_inv = q_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
         // WAR guard: all simdgroups must finish reading sg_buf[0] above before the
         // K-normalize reduction below overwrites sg_buf[sgitg]. Without this barrier a
         // lagging simdgroup reads the K-sum in place of the Q-sum (cross-simdgroup race).
@@ -2807,8 +2814,8 @@ kernel void gdn_chunk_materialize_c32(
             sg_buf[0] = s;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        bool k_valid = isfinite(sg_buf[0]) && sg_buf[0] > 1e-12f;
-        float ks_inv = k_valid ? rsqrt(sg_buf[0]) : 0.0f;
+        bool k_valid = isfinite(sg_buf[0]);
+        float ks_inv = k_valid ? rsqrt(sg_buf[0] + GDN_QK_NORM_EPS) : 0.0f;
         // WAR guard: same hazard as above — every simdgroup must read the K-sum from
         // sg_buf[0] before the beta reduction below overwrites sg_buf[sgitg].
         threadgroup_barrier(mem_flags::mem_threadgroup);
