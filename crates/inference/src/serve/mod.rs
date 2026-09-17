@@ -97,6 +97,8 @@ pub fn format_normalized_chat_template(messages: &[contract::NormalizedChatMessa
 /// classification of a worker-side failure, and the success bodies.
 pub mod lora;
 
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+mod lora_registry;
 /// Shared Metal GPU worker owner (issue #832, ADR-080 cluster C2/C3):
 /// the single dedicated thread that owns the `!Send` `MetalQwen35State` for
 /// the whole process lifetime, used by both the `lattice` unified server and

@@ -445,6 +445,22 @@ published releases; a pre-1.0 minor bump may permit the break while executing
 zero lints. Record the actual per-crate executed and skipped counts, rather
 than treating a green version-boundary result as proof of unchanged API.
 
+### Amendment (2026-09-17): request-input DTOs across modules (0.11.0)
+
+The 2026-09-16 amendment named five structs in `serve::contract`. Its boundary
+is request-input representation, which also includes types in other modules:
+`serve::lora::LoraSelection` is deserialized as `ChatRequest.lora` and therefore
+takes `#[non_exhaustive]` under the same policy. Its two external-crate
+construction sites were binary test fixtures, now migrated to deserialization.
+In-library construction sites are unaffected because `#[non_exhaustive]`
+restricts construction only outside the defining crate.
+
+The earlier list records the types known at that time; new request-input DTOs
+join it. Both amendments ship within the same 0.10.0 to 0.11.0 boundary, so this
+extension requires no second version boundary. `AdapterMetadata` and
+`AdapterIndex` remain exhaustive: they represent worker output, excluded from
+the input policy alongside the normalization outputs in the earlier amendment.
+
 ## What we are NOT doing
 
 - **No new crate.** Every extracted helper lands inside `lattice-inference`, the crate that already

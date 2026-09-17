@@ -2027,6 +2027,20 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
+        if let Err(err) = s.jobs.validate_lora(&req.lora) {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                "/v1/chat/completions",
+                400,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
         let validated = match normalize_request(
             &req,
             s.defaults,
@@ -2119,21 +2133,26 @@ mod imp {
         // first-event peek (`rx.recv()` returning `None`) and report
         // identically to this binary's prior up-front `jobs.send(..).is_err()`
         // check.
-        let mut rx = match s.jobs.submit(messages, cfg, cancel_rx) {
+        let mut rx = match s
+            .jobs
+            .submit_with_lora(messages, cfg, cancel_rx, req.lora.clone())
+        {
             Ok(rx) => rx,
             Err(api_err) => {
+                let code = api_err.code();
+                let response = api_err.into_response();
                 emit_serve_event(
                     &s.metrics,
                     "POST",
                     "/v1/chat/completions",
-                    503,
+                    response.status().as_u16(),
                     None,
                     None,
                     timer.elapsed().as_secs_f64() * 1000.0,
                     false,
-                    Some(api_err.code()),
+                    Some(code),
                 );
-                return api_err.into_response();
+                return response;
             }
         };
         // Dropped when nobody cares about the response anymore: at the end of
@@ -3203,6 +3222,7 @@ mod imp {
             .route("/v1/models", get(list_models))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/embeddings", post(embeddings))
+            .route("/v1/lora", get(lora_list))
             .route("/v1/lora/load", post(lora_load))
             .route("/v1/lora/unload", post(lora_unload))
             .route("/metrics", get(metrics_handler))
@@ -3223,6 +3243,10 @@ mod imp {
     /// `--host` this route lets anyone who can reach the port make the server open a
     /// file of their choosing. The startup warning covers it; an allow-root is the
     /// obvious next control and is deliberately not invented here.
+    async fn lora_list(State(s): State<AppState>) -> Json<Value> {
+        Json(serde_json::json!(s.jobs.adapter_index()))
+    }
+
     async fn lora_load(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Response {
         let timer = Instant::now();
         const ROUTE: &str = "/v1/lora/load";
@@ -3253,14 +3277,15 @@ mod imp {
                 code: "invalid_request",
             });
         };
-        let path = match lattice_inference::serve::lora::parse_lora_load_path(&bytes) {
+        let (path, name) = match lattice_inference::serve::lora::parse_lora_load(&bytes) {
             Ok(path) => path,
             Err(err) => return fail(err),
         };
 
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
         {
-            let prepared = match lattice_inference::serve::lora::prepare_adapter_load(&path) {
+            let prepared = match lattice_inference::serve::lora::prepare_adapter_load(&path, &name)
+            {
                 Ok(prepared) => prepared,
                 Err(err) => return fail(err),
             };
@@ -3270,7 +3295,7 @@ mod imp {
                 Err(err) => return fail(err),
             };
             match receiver.await {
-                Ok(Ok(())) => {
+                Ok(Ok(id)) => {
                     emit_serve_event(
                         &s.metrics,
                         "POST",
@@ -3283,6 +3308,8 @@ mod imp {
                         None,
                     );
                     Json(lattice_inference::serve::lora::load_success_body(
+                        id,
+                        &name,
                         &path,
                         rank,
                         layer_count,
@@ -3300,17 +3327,15 @@ mod imp {
         }
         #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
         {
-            let _ = path;
+            let _ = (path, name);
             fail(lattice_inference::serve::lora::worker_unavailable(
                 "adapter loading requires a macOS Metal build of this server",
             ))
         }
     }
 
-    /// `POST /v1/lora/unload`: drop the currently-loaded adapter. A no-op when none
-    /// is loaded, which is the worker's own contract, so this is idempotent by
-    /// construction rather than by a state read the caller could race.
-    async fn lora_unload(State(s): State<AppState>) -> Response {
+    /// Remove one resident identifier, refusing unknown ids.
+    async fn lora_unload(State(s): State<AppState>, headers: HeaderMap, body: Body) -> Response {
         let timer = Instant::now();
         const ROUTE: &str = "/v1/lora/unload";
         let fail = |err: lattice_inference::serve::ApiError| -> Response {
@@ -3328,15 +3353,27 @@ mod imp {
             );
             response
         };
-        let receiver = match s
-            .jobs
-            .submit_adapter_command(lattice_inference::serve::metal_worker::AdapterCommand::Unload)
-        {
+        if let Err(err) = lattice_inference::serve::require_json_content_type(&headers) {
+            return fail(err);
+        }
+        let Ok(bytes) = to_bytes(body, REQUEST_BODY_LIMIT_BYTES).await else {
+            return fail(lattice_inference::serve::ApiError::BadRequest {
+                message: "invalid request body".into(),
+                code: "invalid_request",
+            });
+        };
+        let id = match lattice_inference::serve::lora::parse_lora_unload(&bytes) {
+            Ok(id) => id,
+            Err(err) => return fail(err),
+        };
+        let receiver = match s.jobs.submit_adapter_command(
+            lattice_inference::serve::metal_worker::AdapterCommand::Unload { id },
+        ) {
             Ok(receiver) => receiver,
             Err(err) => return fail(err),
         };
         match receiver.await {
-            Ok(Ok(())) => {
+            Ok(Ok(id)) => {
                 emit_serve_event(
                     &s.metrics,
                     "POST",
@@ -3348,7 +3385,7 @@ mod imp {
                     false,
                     None,
                 );
-                Json(lattice_inference::serve::lora::unload_success_body()).into_response()
+                Json(lattice_inference::serve::lora::unload_success_body(id)).into_response()
             }
             Ok(Err(message)) => {
                 let code = lattice_inference::serve::lora::adapter_failure_code(&message);
@@ -4226,7 +4263,12 @@ mod imp {
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         #[tokio::test]
         async fn lora_unload_without_a_worker_is_503() {
-            let response = lora_unload(State(test_app_state())).await;
+            let response = lora_unload(
+                State(test_app_state()),
+                test_json_headers(),
+                Body::from(r#"{"id":0}"#),
+            )
+            .await;
             let (status, code) = error_code_of(response).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(code, "server_busy");
@@ -6035,6 +6077,126 @@ mod imp {
         /// matching only `WorkerMessage::Generate` replies to nothing if a
         /// control command arrives instead, which fails the test loudly rather
         /// than passing over a message it ignored.
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_unknown_id_is_400_before_streaming() {
+            for stream in [false, true] {
+                let body = Body::from(serde_json::json!({"messages":[{"role":"user","content":"hi"}],"lora":[{"id":99,"scale":1.0}],"stream":stream}).to_string());
+                let response =
+                    chat_completions(State(test_app_state()), test_json_headers(), body).await;
+                let (status, message) = error_message_of(response).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert!(message.contains("99"));
+            }
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_duplicate_id_is_400_before_admission() {
+            use lattice_inference::serve::lora::AdapterMetadata;
+            use lattice_inference::serve::metal_worker::test_client_and_jobs_with_adapters;
+            for stream in [false, true] {
+                let (client, mut jobs) =
+                    test_client_and_jobs_with_adapters(vec![AdapterMetadata {
+                        id: 7,
+                        name: "test".into(),
+                        path: "test.safetensors".into(),
+                        rank: 1,
+                        layers: 1,
+                    }]);
+                let mut state = test_app_state();
+                state.jobs = client;
+                let body = Body::from(
+                    serde_json::json!({
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "lora": [{"id": 7, "scale": 1.0}, {"id": 7, "scale": -0.25}],
+                        "stream": stream,
+                    })
+                    .to_string(),
+                );
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    chat_completions(State(state.clone()), test_json_headers(), body),
+                )
+                .await
+                .expect("duplicate selection must return before a worker reply");
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(error["error"]["code"], "lora_duplicate_adapter_id");
+                assert_eq!(error["error"]["message"], "duplicate LoRA adapter id 7");
+                assert!(matches!(
+                    jobs.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ));
+            }
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_list_reads_confirmed_index() {
+            let Json(value) = lora_list(State(test_app_state())).await;
+            assert_eq!(value, serde_json::json!({"adapters":[],"applied":[]}));
+        }
+
+        #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
+        #[tokio::test]
+        async fn lora_selection_reaches_worker() {
+            use lattice_inference::serve::lora::{AdapterMetadata, LoraSelection};
+            use lattice_inference::serve::metal_worker::test_client_and_jobs_with_adapters;
+            for (stream, reject) in [(false, false), (true, false), (false, true), (true, true)] {
+                let (client, mut jobs) =
+                    test_client_and_jobs_with_adapters(vec![AdapterMetadata {
+                        id: 7,
+                        name: "test".into(),
+                        path: "test.safetensors".into(),
+                        rank: 1,
+                        layers: 1,
+                    }]);
+                let mut state = test_app_state();
+                state.jobs = client;
+                let worker = tokio::spawn(async move {
+                    let Some(WorkerMessage::Generate(job)) = jobs.recv().await else {
+                        panic!("missing generation")
+                    };
+                    assert_eq!(
+                        job.lora_selection(),
+                        &[
+                            serde_json::from_str::<LoraSelection>(r#"{"id":7,"scale":0.25}"#)
+                                .unwrap()
+                        ]
+                    );
+                    if reject {
+                        job.reply(WorkerEvent::Rejected(
+                            lattice_inference::serve::lora::unknown_adapter(7),
+                        ));
+                        return;
+                    }
+                    job.reply(WorkerEvent::Complete(GenerateOutput {
+                        text: "ok".into(),
+                        token_ids: vec![0],
+                        prompt_tokens: 1,
+                        generated_tokens: 1,
+                        stopped: true,
+                        stop_reason: None,
+                        token_logprobs: vec![],
+                    }));
+                });
+                let body = Body::from(serde_json::json!({"messages":[{"role":"user","content":"hi"}],"lora":[{"id":7,"scale":0.25}],"stream":stream}).to_string());
+                let response = chat_completions(State(state), test_json_headers(), body).await;
+                if reject {
+                    let (status, message) = error_message_of(response).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST);
+                    assert!(message.contains("7"));
+                    worker.await.unwrap();
+                    continue;
+                }
+                assert_eq!(response.status(), StatusCode::OK);
+                let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                worker.await.unwrap();
+            }
+        }
+
         #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]
         fn test_app_state_with_jobs() -> (AppState, mpsc::UnboundedReceiver<WorkerMessage>) {
             let (jobs, jobs_rx) = test_client_and_jobs();

@@ -49,6 +49,8 @@
 //! on `metal_qwen35.rs`'s own exhaustive Device-gated tests for the
 //! underlying `generate_streaming_with_prefix_cache_and_cancel` call).
 
+use super::lora::{AdapterIndex, LoraSelection};
+use super::lora_registry::ResidencyRegistry;
 use crate::forward::metal_qwen35::{
     ChatMessage, LoraLayerData, MetalQwen35State, format_chat_template, push_chat_generation_open,
     push_chat_turn_close, push_chat_turn_open,
@@ -74,7 +76,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch};
 
@@ -241,6 +243,7 @@ impl std::error::Error for StartupError {}
 pub struct WorkerJob {
     messages: Vec<ChatMessage>,
     cfg: GenerateConfig,
+    lora: Vec<LoraSelection>,
     tx: mpsc::UnboundedSender<WorkerEvent>,
     cancel: watch::Receiver<bool>,
     /// Admission slot for this job (issue #932), held from
@@ -256,27 +259,17 @@ pub struct WorkerJob {
     _admission_permit: OwnedSemaphorePermit,
 }
 
-/// One adapter state change for the model the worker thread owns.
-///
-/// There is deliberately no `Swap` variant. `MetalQwen35State::load_lora_adapter`
-/// rejects a load while an adapter is present, so a swap can only be
-/// unload-then-load, and a load that fails after the unload leaves the model
-/// serving no adapter at all. Making that atomic would mean building the new
-/// GPU buffers before dropping the old ones, which this type does not do. An
-/// API that offers a rollback it cannot perform is worse than one that makes
-/// the caller sequence the two steps and decide what to do in between.
+/// One resident-adapter mutation, applied between whole generation jobs.
 pub enum AdapterCommand {
-    /// Load `layers` under `descriptor`, which also supplies the blend scale.
-    /// Fails, leaving any currently-loaded adapter untouched, if one is
-    /// already loaded.
+    /// Make weights resident without applying them to generation.
     Load {
+        name: String,
+        path: String,
         layers: Vec<LoraLayerData>,
         descriptor: Box<lattice_fann::lora::LoraDescriptor>,
-        quarot_seed: Option<u64>,
     },
-    /// Drop the currently-loaded adapter and its GPU buffers. A no-op when
-    /// none is loaded.
-    Unload,
+    /// Remove a resident id, clearing the applied slot if it uses this id.
+    Unload { id: u32 },
 }
 
 impl std::fmt::Debug for AdapterCommand {
@@ -287,14 +280,16 @@ impl std::fmt::Debug for AdapterCommand {
             Self::Load {
                 layers,
                 descriptor,
-                quarot_seed,
+                name,
+                path,
             } => f
                 .debug_struct("Load")
                 .field("layers", &layers.len())
                 .field("rank", &descriptor.rank)
-                .field("quarot_seed", quarot_seed)
+                .field("name", name)
+                .field("path", path)
                 .finish(),
-            Self::Unload => f.write_str("Unload"),
+            Self::Unload { id } => f.debug_struct("Unload").field("id", id).finish(),
         }
     }
 }
@@ -308,7 +303,7 @@ impl std::fmt::Debug for AdapterCommand {
 /// because neither type can be constructed with the other's permit.
 pub struct ControlRequest {
     command: AdapterCommand,
-    reply: oneshot::Sender<Result<(), String>>,
+    reply: oneshot::Sender<Result<u32, String>>,
     /// Held from [`MetalWorkerClient::submit_adapter_command`] until the
     /// worker has finished applying this command and dropped it. Its only job
     /// is to exist and be dropped, like `WorkerJob::_admission_permit`.
@@ -481,6 +476,7 @@ pub struct MetalWorkerClient {
     /// load/unload commands in flight have no meaningful order to a caller
     /// that has not yet seen the first one's result.
     control: Arc<Semaphore>,
+    adapters: Arc<RwLock<AdapterIndex>>,
     vision_supported: Arc<AtomicBool>,
     /// Keeps the worker join owner alive for exactly as long as the queue
     /// can accept jobs. Test-only clients without a worker carry an owner
@@ -499,6 +495,7 @@ impl MetalWorkerClient {
             jobs: Some(jobs),
             admission,
             control: Arc::new(Semaphore::new(1)),
+            adapters: Arc::new(RwLock::new(AdapterIndex::default())),
             vision_supported,
             _owner: owner,
         }
@@ -542,6 +539,34 @@ impl MetalWorkerClient {
         gen_cfg: GenerateConfig,
         cancel: watch::Receiver<bool>,
     ) -> Result<mpsc::UnboundedReceiver<WorkerEvent>, ApiError> {
+        self.submit_with_lora(messages, gen_cfg, cancel, Vec::new())
+    }
+
+    /// Read confirmed metadata without waiting for the worker queue.
+    pub fn adapter_index(&self) -> AdapterIndex {
+        self.adapters
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Validate the current resident index before committing an HTTP response.
+    pub fn validate_lora(&self, selection: &[LoraSelection]) -> Result<(), ApiError> {
+        self.adapters
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .validate(selection)
+    }
+
+    /// Submit a request with an ordered adapter mixture; empty means base model.
+    pub fn submit_with_lora(
+        &self,
+        messages: Vec<ChatMessage>,
+        gen_cfg: GenerateConfig,
+        cancel: watch::Receiver<bool>,
+        lora: Vec<LoraSelection>,
+    ) -> Result<mpsc::UnboundedReceiver<WorkerEvent>, ApiError> {
+        self.validate_lora(&lora)?;
         let permit = self.admission.clone().try_acquire_owned().map_err(|_| {
             ApiError::ServiceUnavailable {
                 message: "too many outstanding requests; the inference worker's pending-job \
@@ -553,6 +578,7 @@ impl MetalWorkerClient {
         let job = WorkerJob {
             messages,
             cfg: gen_cfg,
+            lora,
             tx,
             cancel,
             _admission_permit: permit,
@@ -581,18 +607,13 @@ impl MetalWorkerClient {
     /// unresolved load/unload commands have no order a caller can reason
     /// about, since neither has reported its result yet.
     ///
-    /// The returned receiver resolves to the loader's own error string on
-    /// failure, unchanged. A failing `Load` leaves whatever was loaded before
-    /// it still loaded and still serving -- every check in
-    /// `MetalQwen35State::load_lora_adapter_with_descriptor` and
-    /// `load_lora_adapter` runs before any mutation of the state.
-    ///
-    /// A closed receiver (the worker thread is gone) is the same signal it is
-    /// for [`Self::submit`]: the command was never applied.
+    /// Success returns the loaded or unloaded id. The worker publishes metadata
+    /// before replying, even if the caller disconnected. A closed receiver leaves
+    /// the outcome unknown; inspect the index before retrying.
     pub fn submit_adapter_command(
         &self,
         command: AdapterCommand,
-    ) -> Result<oneshot::Receiver<Result<(), String>>, ApiError> {
+    ) -> Result<oneshot::Receiver<Result<u32, String>>, ApiError> {
         let permit =
             self.control
                 .clone()
@@ -761,7 +782,7 @@ fn run_worker_loop(
 /// message. Written as a named function rather than a closure at each call
 /// site so every such worker returns the same string.
 #[cfg(any(test, feature = "test-utils"))]
-fn control_unsupported(_command: AdapterCommand) -> Result<(), String> {
+fn control_unsupported(_command: AdapterCommand) -> Result<u32, String> {
     Err("this inference worker does not support adapter commands".to_string())
 }
 
@@ -777,15 +798,34 @@ fn control_unsupported(_command: AdapterCommand) -> Result<(), String> {
 /// that thread owns, at a point where no generation is in flight. It returns
 /// the underlying loader's error string unchanged: across a channel that
 /// string is the entire diagnosis the caller gets.
+#[cfg(any(test, feature = "test-utils"))]
 fn run_worker_loop_with_control(
-    mut msg_rx: mpsc::UnboundedReceiver<WorkerMessage>,
+    msg_rx: mpsc::UnboundedReceiver<WorkerMessage>,
     mut generate: impl FnMut(
         &[ChatMessage],
         &GenerateConfig,
         &mut dyn FnMut(&str, u32) -> bool,
         &mut dyn FnMut() -> bool,
     ) -> Result<GenerateOutput, WorkerFailure>,
-    mut control: impl FnMut(AdapterCommand) -> Result<(), String>,
+    control: impl FnMut(AdapterCommand) -> Result<u32, String>,
+) {
+    run_worker_loop_with_lora(
+        msg_rx,
+        move |messages, cfg, _lora, on_token, cancel| generate(messages, cfg, on_token, cancel),
+        control,
+    );
+}
+
+fn run_worker_loop_with_lora(
+    mut msg_rx: mpsc::UnboundedReceiver<WorkerMessage>,
+    mut generate: impl FnMut(
+        &[ChatMessage],
+        &GenerateConfig,
+        &[LoraSelection],
+        &mut dyn FnMut(&str, u32) -> bool,
+        &mut dyn FnMut() -> bool,
+    ) -> Result<GenerateOutput, WorkerFailure>,
+    mut control: impl FnMut(AdapterCommand) -> Result<u32, String>,
 ) {
     while let Some(message) = msg_rx.blocking_recv() {
         let job = match message {
@@ -837,7 +877,13 @@ fn run_worker_loop_with_control(
         let mut should_cancel =
             move || *cancel_for_predicate.borrow() || tx_for_predicate.is_closed();
 
-        match generate(&job.messages, &job.cfg, &mut on_token, &mut should_cancel) {
+        match generate(
+            &job.messages,
+            &job.cfg,
+            &job.lora,
+            &mut on_token,
+            &mut should_cancel,
+        ) {
             Ok(output) => {
                 let _ = job.tx.send(WorkerEvent::Complete(output));
             }
@@ -1342,6 +1388,8 @@ impl MetalWorker {
         let admission = Arc::new(Semaphore::new(max_pending));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<WorkerMetadata, String>>();
 
+        let adapters = Arc::new(RwLock::new(AdapterIndex::default()));
+        let worker_index = Arc::clone(&adapters);
         let join_handle = std::thread::spawn(move || match loader() {
             Ok((state, tokenizer, meta)) => {
                 let _ = ready_tx.send(Ok(meta.clone()));
@@ -1358,9 +1406,11 @@ impl MetalWorker {
                 // construction rather than by convention.
                 let state_rc = Rc::new(RefCell::new(state));
                 let state_for_control = Rc::clone(&state_rc);
-                run_worker_loop_with_control(
+                let registry = Rc::new(RefCell::new(ResidencyRegistry::new(worker_index)));
+                let control_registry = Rc::clone(&registry);
+                run_worker_loop_with_lora(
                     job_rx,
-                    move |messages, cfg, on_token, should_cancel| {
+                    move |messages, cfg, lora, on_token, should_cancel| {
                         let mut guard = state_rc.borrow_mut();
                         let state = &mut *guard;
                         if let JobRoute::Vision {
@@ -1403,6 +1453,10 @@ impl MetalWorker {
                              metal_gemm_dispatches={metal_dispatches} \
                              metal_gemm_calls={gemm_calls}"
                             );
+                            registry
+                                .borrow_mut()
+                                .apply(lora, state)
+                                .map_err(WorkerFailure::Rejected)?;
                             let output = state
                                 .generate_multimodal_vision_with_cancel(
                                     &request,
@@ -1455,6 +1509,13 @@ impl MetalWorker {
                         // A shared inference endpoint serving mutually distrusting
                         // clients must key the slot per tenant via
                         // `CrossTurnSlotId::new`, not inherit `DEFAULT`.
+                        if should_cancel() {
+                            return Ok(cancelled_output());
+                        }
+                        registry
+                            .borrow_mut()
+                            .apply(lora, state)
+                            .map_err(WorkerFailure::Rejected)?;
                         let cached = state.generate_streaming_with_prefix_cache_and_cancel(
                             CrossTurnSlotId::DEFAULT,
                             &prompt,
@@ -1480,19 +1541,17 @@ impl MetalWorker {
                         let state = &mut *guard;
                         match command {
                             AdapterCommand::Load {
+                                name,
+                                path,
                                 layers,
                                 descriptor,
-                                quarot_seed,
-                            } => state
-                                .load_lora_adapter_with_descriptor(layers, &descriptor, quarot_seed)
-                                // The loader's own message, unchanged. Across
-                                // a channel it is the only thing the caller
-                                // receives, so collapsing it to a bool or
-                                // rewording it destroys the diagnosis.
-                                .map_err(|e| e.to_string()),
-                            AdapterCommand::Unload => {
-                                state.unload_lora_adapter();
-                                Ok(())
+                            } => {
+                                control_registry
+                                    .borrow_mut()
+                                    .load(name, path, layers, *descriptor)
+                            }
+                            AdapterCommand::Unload { id } => {
+                                control_registry.borrow_mut().unload(id, state)
                             }
                         }
                     },
@@ -1506,12 +1565,13 @@ impl MetalWorker {
         let owner = MetalWorkerOwner::from_handle(join_handle);
         match ready_rx.recv() {
             Ok(Ok(meta)) => {
-                let client = MetalWorkerClient::with_owner(
+                let mut client = MetalWorkerClient::with_owner(
                     job_tx,
                     admission,
                     vision_supported,
                     owner.clone(),
                 );
+                client.adapters = adapters;
                 Ok((owner, client, meta))
             }
             Ok(Err(e)) => Err(StartupError::Load(e)),
@@ -1537,6 +1597,11 @@ impl MetalWorker {
 
 #[cfg(any(test, feature = "test-utils"))]
 impl WorkerJob {
+    /// Selection received by this queued job, for HTTP-to-worker contract tests.
+    pub fn lora_selection(&self) -> &[LoraSelection] {
+        &self.lora
+    }
+
     /// Reply to this job with one event, exactly as the production worker
     /// loop would via its own `job.tx.send(..)`. Returns `false` once the
     /// submitting caller's event receiver is gone. Test-only: production
@@ -1563,6 +1628,22 @@ pub fn test_client_and_jobs() -> (MetalWorkerClient, mpsc::UnboundedReceiver<Wor
     // Tests that specifically exercise the cap use
     // `test_client_and_jobs_with_cap` instead.
     test_client_and_jobs_with_cap(TEST_EFFECTIVELY_UNBOUNDED_CAP)
+}
+
+/// An unattached client with a known metadata snapshot for request routing tests.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn test_client_and_jobs_with_adapters(
+    adapters: Vec<super::lora::AdapterMetadata>,
+) -> (MetalWorkerClient, mpsc::UnboundedReceiver<WorkerMessage>) {
+    let (client, jobs) = test_client_and_jobs();
+    *client
+        .adapters
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = AdapterIndex {
+        adapters,
+        applied: Vec::new(),
+    };
+    (client, jobs)
 }
 
 /// Same as [`test_client_and_jobs`], with an explicit admission cap (issue
@@ -2633,6 +2714,7 @@ mod tests {
         let job = WorkerJob {
             messages: vec![ChatMessage::user("hi")],
             cfg: GenerateConfig::default(),
+            lora: Vec::new(),
             tx,
             cancel: cancel_rx,
             _admission_permit: permit,
@@ -2721,9 +2803,9 @@ mod tests {
                 msg_rx,
                 epoch_reporting_generate(epoch_for_generate, 6, started_tx, release),
                 move |command| {
-                    assert!(matches!(command, AdapterCommand::Unload));
+                    assert!(matches!(command, AdapterCommand::Unload { id: 0 }));
                     epoch_for_control.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(0)
                 },
             );
         });
@@ -2736,7 +2818,7 @@ mod tests {
                 .expect("fresh semaphore");
             msg_tx
                 .send(WorkerMessage::Control(ControlRequest {
-                    command: AdapterCommand::Unload,
+                    command: AdapterCommand::Unload { id: 0 },
                     reply,
                     _control_permit: permit,
                 }))
@@ -2761,7 +2843,7 @@ mod tests {
             // dropped -- otherwise "the generation was unaffected" would be
             // true for the uninteresting reason.
             let outcome = reply_rx.blocking_recv().expect("control reply channel");
-            assert_eq!(outcome, Ok(()), "the injected command must have run");
+            assert_eq!(outcome, Ok(0), "the injected command must have run");
         }
 
         drop(msg_tx);
@@ -2829,7 +2911,7 @@ mod tests {
             .expect("fresh semaphore");
         msg_tx
             .send(WorkerMessage::Control(ControlRequest {
-                command: AdapterCommand::Unload,
+                command: AdapterCommand::Unload { id: 0 },
                 reply,
                 _control_permit: permit,
             }))
@@ -2853,10 +2935,10 @@ mod tests {
         let (client, _msg_rx) = test_client_and_jobs();
 
         let first = client
-            .submit_adapter_command(AdapterCommand::Unload)
+            .submit_adapter_command(AdapterCommand::Unload { id: 0 })
             .expect("the first command should be admitted");
 
-        let second = client.submit_adapter_command(AdapterCommand::Unload);
+        let second = client.submit_adapter_command(AdapterCommand::Unload { id: 0 });
         match second {
             Err(ApiError::ServiceUnavailable { ref message }) => {
                 assert!(
@@ -2981,6 +3063,7 @@ mod tests {
         let job = WorkerJob {
             messages: vec![ChatMessage::user("hi")],
             cfg: GenerateConfig::default(),
+            lora: Vec::new(),
             tx,
             cancel: cancel_rx,
             _admission_permit: permit,
