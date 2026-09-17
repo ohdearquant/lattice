@@ -572,10 +572,27 @@ for the live milestones.
 
 **A name search rides beside that arm as a cheap tripwire, and is never promoted to the acceptance.**
 
+```zsh
+pat='MetalQwen35State|Qwen35Model|QwenModel|Gemma4Model|Ernie45[A-Za-z]*|PaddleOcr[A-Za-z]*'
+serve=('crates/inference/src/serve/*.rs' 'crates/inference/src/bin/*.rs' 'crates/inference/src/bin/**/*.rs')
+
+files=$(git grep -l '' -- $serve | wc -l | tr -d ' ')
+ctl=$(git grep -w -E "$pat" -- 'crates/inference/src/forward/*.rs' | wc -l | tr -d ' ')
+hits=$(git grep -nw -E "$pat" -- $serve | wc -l | tr -d ' ')
+
+if   (( files == 0 )); then print -r -- "FAIL population empty: the search had nothing to read"
+elif (( ctl   == 0 )); then print -r -- "FAIL control dead: the pattern matched nothing where it must match"
+elif (( hits  > 0  )); then print -r -- "FAIL $hits concrete-type occurrences on the serving surface"
+else                        print -r -- "PASS ($files files searched, control $ctl)"
+fi
 ```
-! git grep -nE '\b(MetalQwen35State|Qwen35Model|QwenModel|Gemma4Model|Ernie45[A-Za-z]*|PaddleOcr[A-Za-z]*)\b' \
-    -- 'crates/inference/src/serve/*.rs' 'crates/inference/src/bin/*.rs' 'crates/inference/src/bin/**/*.rs'
-```
+
+Three arms, one pass, and the order is the point: the population must be non-empty and the control
+must match before an absence on the serving surface is allowed to mean anything. Run at
+`79d422805bbde537e19bd17f2e89dd3fbf4780f6` it prints
+`FAIL 134 concrete-type occurrences on the serving surface`, which is the expected reading today:
+the execution arm above has not landed, so the tripwire should be red. A green reading before that
+work exists would itself be the defect.
 
 Its false negatives are written here rather than left to be rediscovered, because a tripwire that
 looks like a gate is how the weaker check replaces the stronger one:
@@ -588,6 +605,46 @@ looks like a gate is how the weaker check replaces the stronger one:
    for.
 3. **A cfg-selected type of the same name.** A platform-gated stub keeps the coupling portable and
    invisible to a search run on one platform.
+
+#### Amendment, 2026-09-17: the published command matched nothing, and the check is negated
+
+The command first published with D10 used `\b` for its word boundaries. `git grep -E` is POSIX ERE
+and has no `\b`, so the pattern matched nothing, silently. Measured at
+`79d422805bbde537e19bd17f2e89dd3fbf4780f6` in one pass: the published form returns **0**, the same
+alternation under `-w` returns **134**, and the POSIX bracket form `[[:<:]]…[[:>:]]` also returns
+**134**. The two working forms agree; the published one is the outlier.
+
+The direction is what makes this more than a typo. The check is negated, so a search that can never
+match is a search that always passes, and as published it would have certified the serving surface
+clean forever. That is why the replacement above asserts its own population and runs a must-match
+control in the same invocation rather than beside it: an absence produced by a broken instrument and
+an absence produced by a clean tree print the same thing. The tripwire was not wired into any
+workflow, script or test, so nothing was falsely green in the interim; the hazard was prospective.
+Tracked as [#1649](https://github.com/ohdearquant/lattice/issues/1649).
+
+**The baseline re-derived at the same commit, beside the pin figures, so the spread is visible.**
+Scope is `crates/inference/src/serve/*.rs`, the same scope the pin paragraph uses:
+
+|                              | at `7ba69b2f1c` | at `79d422805b` |
+| ---------------------------- | --------------- | --------------- |
+| files in scope               | 5               | 7               |
+| occurrences                  | 19              | 19              |
+| files naming a concrete type | 3               | 4               |
+
+The total held while the coupling spread, which is the reading an aggregate hides: two files were
+added to the scope, a fourth file began naming a concrete type, and `MetalQwen35State` moved into
+`serve/lora_registry.rs`, a file that did not exist at the pin. Per file and type at
+`79d422805b`: `MetalQwen35State` 13 in `serve/metal_worker.rs`, 2 in `serve/lora_registry.rs`, 1 in
+`serve/mod.rs`; `Qwen35Model` 1 in `serve/metal_worker.rs` and 1 in `serve/embeddings.rs`;
+`QwenModel` 1 in `serve/embeddings.rs`.
+
+One correction to the pin paragraph above while re-deriving it. Its per-type totals are right (16
+`MetalQwen35State`, 2 `Qwen35Model`, 1 `QwenModel`, 19 in all) but three of the file attributions
+are not: at the pin the 16 `MetalQwen35State` are 15 in `serve/metal_worker.rs` plus 1 in
+`serve/mod.rs`, the 2 `Qwen35Model` are 1 in `serve/metal_worker.rs` plus 1 in
+`serve/embeddings.rs`, and the single `QwenModel` is in `serve/embeddings.rs`, not in
+`serve/mod.rs`. The counts a later reader would diff against are the per-file ones, so they are
+restated here rather than left to be rediscovered.
 
 A stronger enforcement exists and is deliberately not taken here: moving serving into a crate that
 cannot depend on the concrete model implementations would make the separation structural rather than
