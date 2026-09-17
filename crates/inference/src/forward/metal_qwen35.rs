@@ -33612,9 +33612,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             /// runs collapse to within f32 rounding of each other on every lane at once.
             #[test]
             fn gdn_qk_l2_norm_is_not_scale_invariant_1583() {
+                // Fail closed under LATTICE_METAL_TEST_ENFORCE=1, matching the other
+                // Metal tests CI names explicitly: without this the CI step added for
+                // this test would pass on a runner with no Metal device, which is the
+                // one condition that makes the step worth having.
+                let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
                 let Some(device) = Device::system_default() else {
-                    eprintln!(
-                        "skipping gdn_qk_l2_norm_is_not_scale_invariant_1583: no Metal device"
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present (gdn_qk_l2_norm_is_not_scale_invariant_1583)"
                     );
                     return;
                 };
@@ -33722,9 +33728,15 @@ kernel void per_head_rms_norm_batch_pre_854_oracle(
             /// (distance 0) and wildly far from its neighbour, inverting the inequality.
             #[test]
             fn gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583() {
+                // Fail closed under LATTICE_METAL_TEST_ENFORCE=1, matching the other
+                // Metal tests CI names explicitly: without this the CI step added for
+                // this test would pass on a runner with no Metal device, which is the
+                // one condition that makes the step worth having.
+                let enforce = std::env::var_os("LATTICE_METAL_TEST_ENFORCE").is_some();
                 let Some(device) = Device::system_default() else {
-                    eprintln!(
-                        "skipping gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583: no Metal device"
+                    assert!(
+                        !enforce,
+                        "LATTICE_METAL_TEST_ENFORCE=1 but no Metal device present (gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583)"
                     );
                     return;
                 };
