@@ -142,16 +142,23 @@ not two, or the canonical path is canonical only for the outermost name.
 Note that `GrammarEngine` is already in a neutral module, so for it the question is reachability
 from the root and nothing else.
 
-**One structural consequence, recorded because the obvious reading of this clause does not deliver
-it.** The Qwen-family path is the _definition_ site, not an alias, so adding a crate-root
-`pub use` makes the root a re-export of a family-module type rather than making the family path an
-alias: rustdoc and `type_name` continue to report `model::qwen35_config`, and a `#[deprecated]` on
-that path would warn the 69 in-crate users of it, not just external ones. Making the family path a
-genuine deprecated alias requires moving the four definitions into a neutral module and
-re-exporting from `model::qwen35_config`. That is the larger change and it is the one that matches
-the intent; the implementation PR may take it, and if it does, it updates the in-crate call sites in
-the same change so the deprecation reaches external consumers only. Whichever it takes, it says
-which, because the two produce the same successful build and different public documentation.
+**The mechanism is the move, not a crate-root `pub use` alone.** The Qwen-family path is the
+_definition_ site, so adding a crate-root re-export would make the root an alias of a family-module
+type rather than the other way round: rustdoc and `type_name` would keep reporting
+`model::qwen35_config`. That is precisely the coupling ADR-090 D10 measures, so a root `pub use`
+alone does not discharge this clause.
+
+Therefore: the four definitions currently in `model/qwen35_config.rs` (`GenerateConfig`,
+`GenerateOutput`, `TokenLogprob`, `TopLogprob`) move to a neutral module. The crate root re-exports
+all six types in the table. `model::qwen35_config` re-exports the four with `#[deprecated]` pointing
+at the crate-root path, so the old paths keep compiling and nothing is removed. The in-crate call
+sites move in the same change — 69 of them name `crate::model::qwen35_config::GenerateConfig` today
+— so the deprecation warning reaches external consumers only rather than the crate's own code.
+
+The reason this is specified rather than left to the implementation is that the two shapes **build
+identically and document differently**. A root `pub use` and a move both compile, both keep every
+old import working, and both look correct in review; they diverge only in what rustdoc and
+`type_name` report, which is the surface this clause is about.
 
 Prefix-cache reuse and speculative state repair remain typed extensions, with checked capability
 negotiation and model/adapter/tokenizer/cache identity. Existing serving uses the prefix-cache
