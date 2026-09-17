@@ -676,6 +676,47 @@ jobs:
             exit "$test_status"
           fi
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      # #1583 / PR #1652: the Metal GDN Q/K L2 normalisation had no epsilon while the
+      # CPU reference computes 1/sqrt(sum_sq + 1e-6). These two tests are the regression
+      # guard, and neither runs under any other step here: `--lib forward::metal::` does
+      # not match `forward::metal_qwen35::` (the next character is `_`, not `:`), and every
+      # other Metal step names a single unrelated test with `--exact`. The env var turns a
+      # runner with no Metal device from a green early return into a failure, which is the
+      # only condition under which these steps could otherwise lie.
+      - name: inference — Metal GDN Q/K epsilon, scale sensitivity (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-gdn-qk-eps-scale.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::gdn_850_failclosed::gdn_qk_l2_norm_is_not_scale_invariant_1583' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
+      - name: inference — Metal GDN Q/K epsilon, no cliff at the old guard (macOS only)
+        if: runner.os == 'macOS'
+        env:
+          LATTICE_METAL_TEST_ENFORCE: '1'
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP:-/tmp}/metal-gdn-qk-eps-cliff.log"
+          if cargo test -p lattice-inference --features f16,metal-gpu --lib \
+            'forward::metal_qwen35::inner::tests::gdn_850_failclosed::gdn_qk_l2_norm_has_no_cliff_at_the_old_guard_1583' \
+            -- --exact --nocapture >"$log" 2>&1; then
+            cat "$log"
+          else
+            test_status=$?
+            cat "$log"
+            exit "$test_status"
+          fi
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;' "$log"
       - name: inference — Metal MTP cursor preflight (macOS only)
         if: runner.os == 'macOS'
         env:
