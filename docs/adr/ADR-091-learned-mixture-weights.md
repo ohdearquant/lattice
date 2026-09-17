@@ -1,6 +1,6 @@
 # ADR-091: Learned mixture weights over a resident LoRA pool
 
-**Status**: Proposed
+**Status**: Accepted (2026-09-17)
 **Date**: 2026-09-16
 **Crate**: lattice-inference / lattice-fann / lattice-tune
 
@@ -78,6 +78,14 @@ mode to be enabled.
   mechanism `reload`'s no-partial-mutation contract makes cheap, and it is the difference between
   detecting collapse and merely being able to describe it afterwards.
 
+The entropy floor cannot tell collapse from a correctly sharp distribution: a router that has
+genuinely learned to prefer one adapter produces the same low-entropy weight vector as one that has
+collapsed under sparse reward. The floor is a guard on refits, not a guard on truth: it decides
+which gate gets reloaded, not whether the resulting policy is good. The arbiter of that question is
+Decision 5's held-out metric. The falsifier is named explicitly: a rejected refit whose held-out
+metric was improving is the falsifier for the floor value, and that observation, not intuition
+about the number, is what moves it.
+
 **4. Caller-supplied weights keep their magnitudes, and are floored without renormalisation.** The
 normalisation in Decision 1 is a property of the learned path, not of the mixture in general. Raw
 gate scores have no calibrated magnitude, so they have to become proportions before two requests can
@@ -94,16 +102,33 @@ inferred: learned weights are normalised because their magnitudes are arbitrary,
 not because their magnitudes are the request. Both are floored. The learned weights are a default,
 not a policy the caller cannot escape.
 
-**5. Evidence gate, before any dependent code merges.** The learned mode ships disabled. It is
-enabled only after a closed-loop run over `N` feedback rounds on a small held-out task reports:
+Both paths report the dropped adapters and the applied weight vector, in the response or in
+diagnostics. That is what makes a request naming an adapter that was **absent from the blend**
+distinguishable from one naming an adapter that was **present at a small weight**. Those are
+different facts about the caller's own request, and only a record of what was dropped and what
+survived lets the caller tell them apart.
+
+**5. Acceptance fixes the contract; the evidence gate flips the default.** Accepting this ADR fixes
+the contract: weights drawn from the gate's own scores at temperature `tau` (Decision 1), the floor
+that drops rather than damps (Decision 2), the three collapse guards (Decision 3), and refit
+rejection. The mechanism code merges under that accepted contract, with the learned mode **off by
+default** and `1/k` named as the default weight policy.
+
+The evidence gate governs the **flip of that default**, not the status of this ADR. Enabling the
+learned mode requires a closed-loop run over `N` feedback rounds on a small held-out task, with the
+kill threshold and the decision rule registered before the run starts, not chosen from its output,
+and the measurement host fixed and named in the run record so the pre/post comparison is not itself
+a source of noise. The run reports:
 
 - the held-out task metric before and after the rounds, as one table;
 - the same metric on the base tasks, as a regression check, since a router that improves the target
   task by forgetting everything else has not improved anything;
 - the rollback arm: unloading the adapters returns the base-model numbers.
 
-The kill threshold and the decision rule are registered before that run starts, not chosen from its
-output. A run that fails the threshold leaves `1/k` in place and this ADR in `Proposed`.
+A run that fails the threshold leaves the **default at `1/k`**; it does not leave this ADR at
+`Proposed`. The mechanism code that the run exercises is already merged under this Accepted ADR, so
+the closed-loop run needs no code that this ADR forbids merging. Only the flip to
+learned-by-default waits on it.
 
 ## Alternatives considered
 

@@ -1,6 +1,6 @@
 # ADR-092: Model-owned decoder execution and a neutral serving boundary
 
-**Status**: Proposed\
+**Status**: Accepted (2026-09-17)\
 **Date**: 2026-09-16\
 **Crate**: lattice-inference
 
@@ -128,6 +128,17 @@ restore a retired API under a neutral spelling.
 
 #### Completion requires both dependency and execution evidence
 
+These two kinds of evidence are not equally forgeable, and completion is ordered accordingly. The
+real-consumer execution controls land **first**, as the gate for the migration PRs: actual token
+output plus a private marker emitted inside the common controller, proved on Qwen CPU, Qwen Metal
+and Gemma E2B CPU; a deliberate bypass of the controller must fail; the prefix-cache route repeated
+under the same proof; the batch-verifier route explicitly excluded. The source-level
+`pipeline_boundary_contract` resolver described below, with the controls listed for it, lands as its
+**own** step. Its absence does not block a migration PR that already carries the execution controls
+above; once it does land, those controls are required in that same PR. Before that resolver is
+built, what ADR-087's and ADR-090's existing guards already measure of this boundary must be stated,
+and stated before it is built rather than after.
+
 Add a dedicated `pipeline_boundary_contract` integration target. Proposed commands, **not run
 and not yet implemented**, are:
 
@@ -224,8 +235,8 @@ separate from routing changes. This record reports no measured cost or passing n
 - A neutral façade can hide old control flow; only shared-driver bypass controls distinguish that
   from genuine migration.
 - The source pin predates subsequent changes. Before implementation, recheck the selected owners,
-  feature gates and compatibility calls at the new base. Implementation remains subject to
-  acceptance of this Proposed decision.
+  feature gates and compatibility calls at the new base. Implementation proceeds under this
+  accepted decision, and that recheck is a precondition of the first implementation PR.
 
 ## References
 
