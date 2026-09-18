@@ -162,6 +162,34 @@ bounds the shared driver: a route through this type needs a fallback-arm counter
 build loses the other eleven entry points, and `generate_streaming_with_cancel`, the method closest to
 the shared contract, has no fallback counterpart at the pinned ref.
 
+### The allocation instruments are measurement-time, not gates
+
+CI's only invocation of the inference bench targets is a compile. The macOS leg runs
+`cargo bench -p lattice-inference --features bench-internals,metal-gpu,f16 --no-run`
+(`.github/workflows/ci.yml`), so the bench binary is built and never executed.
+
+Every allocation instrument in `crates/inference/benches/inference_perf.rs` is therefore inert in
+CI: the zero gate in `allocation_count_report`, the three-sample determinism check in both
+reporters, and the zeroed-allocation entry-point check. None of them can fail a pull request,
+because none of them runs during one.
+
+Two consequences bind the rows that rely on D7.
+
+A row may not cite a green pull request as evidence that an allocation gate held. The evidence is
+the bench run's own output, quoted, together with the command that produced it. A clean CI result
+on a change to these instruments establishes that they compile.
+
+A guard protecting these instruments has to sit on the bench's own execution path. The target is
+declared `harness = false`, so libtest does not run `#[test]` functions in it, and the CI
+invocation does not run the binary at all; a test written for that file would be unreachable from
+both directions, each sufficient on its own. The zeroed-allocation check is a runtime call from the
+reporter bodies for this reason, so that it fires at the moment the numbers are produced, which is
+the only moment they exist.
+
+This is a statement about coverage, not a defect. Allocation counts are produced deliberately, by a
+person running the bench to support a row, and that is when the checks are wanted. It is recorded
+here so that a later reader does not mistake the presence of these gates for their enforcement.
+
 ## Serialized host plan and bounded uncertainty
 
 All performance work runs on one maintainer-designated benchmark host, never the development laptop.
