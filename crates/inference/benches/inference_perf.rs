@@ -772,20 +772,57 @@ fn bench_q8_neon_forward(c: &mut Criterion) {
 // alloc_calls, realloc_calls, or bytes_allocated differ across runs.
 // ---------------------------------------------------------------------------
 
+// Builds the stderr heading for one allocation report. The suite is the caller's
+// Criterion group, so a report can never be filed under another bench's name; an
+// empty `label` collapses to `<suite>/<phase>` for benches whose only axis is the
+// phase.
+fn allocation_report_heading(suite: &str, label: &str, phase: &str) -> String {
+    if label.is_empty() {
+        format!("{suite}/{phase}")
+    } else {
+        format!("{suite}/{label}/{phase}")
+    }
+}
+
+// Asserts that a zeroing allocation is visible to `CountingAlloc`. `GlobalAlloc`'s
+// `alloc_zeroed` is not overridden above, so zeroed allocations are only counted
+// while its default implementation routes through `alloc`. Overriding it later to
+// recover the platform calloc path would stop counting a whole category, and every
+// total would drop -- which reads as an improvement. This runs on the bench's own
+// path rather than as a `#[test]`, because this target is declared `harness = false`
+// and libtest never runs here.
+fn assert_zeroed_allocation_is_counted() {
+    let before = AllocationSnapshot::capture();
+    let zeroed: Vec<u8> = vec![0; 4096];
+    black_box(&zeroed);
+    let delta = AllocationSnapshot::delta_since(&before);
+    assert!(
+        delta.alloc_calls > 0,
+        "zeroed allocation was not observed by CountingAlloc: a 4 KiB vec![0; _] moved \
+         alloc_calls by {} and bytes_allocated by {}; allocation totals in this bench \
+         are undercounting every calloc-shaped allocation",
+        delta.alloc_calls,
+        delta.bytes_allocated,
+    );
+}
+
 // Print allocation counts without asserting zero — use for "before" snapshots.
 #[allow(dead_code)]
 fn allocation_count_print(
+    suite: &str,
     label: &str,
     phase: &str,
     tokens: usize,
     run_fn: &mut impl FnMut() -> AllocationDelta,
 ) {
+    assert_zeroed_allocation_is_counted();
+    let heading = allocation_report_heading(suite, label, phase);
     let samples: Vec<AllocationDelta> = (0..3).map(|_| run_fn()).collect();
     let s0 = samples[0];
     for (i, &s) in samples.iter().enumerate().skip(1) {
         if s != s0 {
             panic!(
-                "allocation count is non-deterministic at run {i} for {label}/{phase}: \
+                "allocation count is non-deterministic at run {i} for {heading}: \
                  run0=({},{},{}) run{i}=({},{},{})",
                 s0.alloc_calls,
                 s0.realloc_calls,
@@ -798,7 +835,7 @@ fn allocation_count_print(
     }
     let n = tokens as f64;
     eprintln!(
-        "\nq8_neon_forward_allocations/{label}/{phase}\n\
+        "\n{heading}\n\
          tokens={tokens}\n\
          alloc_calls_total={}\n\
          realloc_calls_total={}\n\
@@ -817,18 +854,21 @@ fn allocation_count_print(
 
 #[allow(dead_code)]
 fn allocation_count_report(
+    suite: &str,
     label: &str,
     phase: &str,
     tokens: usize,
     run_fn: &mut impl FnMut() -> AllocationDelta,
 ) {
+    assert_zeroed_allocation_is_counted();
+    let heading = allocation_report_heading(suite, label, phase);
     let samples: Vec<AllocationDelta> = (0..3).map(|_| run_fn()).collect();
 
     let s0 = samples[0];
     for (i, &s) in samples.iter().enumerate().skip(1) {
         if s != s0 {
             panic!(
-                "allocation count is non-deterministic at run {i} for {label}/{phase}: \
+                "allocation count is non-deterministic at run {i} for {heading}: \
                  run0=({},{},{}) run{i}=({},{},{})",
                 s0.alloc_calls,
                 s0.realloc_calls,
@@ -842,7 +882,7 @@ fn allocation_count_report(
 
     if s0.alloc_calls != 0 || s0.realloc_calls != 0 || s0.bytes_allocated != 0 {
         panic!(
-            "allocation gate failed for {label}/{phase}: \
+            "allocation gate failed for {heading}: \
              alloc_calls_total={} realloc_calls_total={} bytes_allocated_total={}",
             s0.alloc_calls, s0.realloc_calls, s0.bytes_allocated,
         );
@@ -850,7 +890,7 @@ fn allocation_count_report(
 
     let n = tokens as f64;
     eprintln!(
-        "\nq8_neon_forward_allocations/{label}/{phase}\n\
+        "\n{heading}\n\
          tokens={tokens}\n\
          alloc_calls_total={}\n\
          realloc_calls_total={}\n\
@@ -881,14 +921,20 @@ fn bench_q8_neon_forward_allocations(c: &mut Criterion) {
             let measured_tokens = 16usize;
             let warm_len = 128usize;
 
-            allocation_count_report("synthetic_2layer", "after", measured_tokens, &mut || {
-                let mut state = fixture.state_with_capacity(warm_len, measured_tokens);
-                let start = AllocationSnapshot::capture();
-                for t in 0..measured_tokens {
-                    let _ = black_box(fixture.step(&mut state, t as u32 + 42));
-                }
-                AllocationSnapshot::delta_since(&start)
-            });
+            allocation_count_report(
+                "q8_neon_forward_allocations",
+                "synthetic_2layer",
+                "after",
+                measured_tokens,
+                &mut || {
+                    let mut state = fixture.state_with_capacity(warm_len, measured_tokens);
+                    let start = AllocationSnapshot::capture();
+                    for t in 0..measured_tokens {
+                        let _ = black_box(fixture.step(&mut state, t as u32 + 42));
+                    }
+                    AllocationSnapshot::delta_since(&start)
+                },
+            );
 
             // Criterion latency measurement (structural — keeps group alive).
             group.bench_function("synthetic_2layer_allocation_gate", |b| {
@@ -914,6 +960,7 @@ fn bench_q8_neon_forward_allocations(c: &mut Criterion) {
             let warm_len = 128usize;
 
             allocation_count_report(
+                "q8_neon_forward_allocations",
                 "qwen35_24layer_shape",
                 "after",
                 measured_tokens,
@@ -1681,6 +1728,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
             const MEASURED: usize = 1;
             allocation_count_print(
                 "generate_forward_with_cache",
+                "",
                 "allocating_current",
                 MEASURED,
                 &mut || {
@@ -1735,6 +1783,7 @@ fn bench_forward_with_cache(c: &mut Criterion) {
             let mut scratch = ForwardBenchScratch::new(FWD_WARM_KV + 1);
             allocation_count_report(
                 "generate_forward_with_cache",
+                "",
                 "scratch_dispatch",
                 MEASURED,
                 &mut || {
