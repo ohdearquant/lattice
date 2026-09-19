@@ -2168,6 +2168,21 @@ mod inner {
         pub decode_hidden_readback: AtomicU64,
         pub decode_full_vocab_logit_readback: AtomicU64,
         pub decode_compact_candidate_logit_readback: AtomicU64,
+        /// Device-to-host bytes moved by the logit readbacks counted above.
+        ///
+        /// These are not redundant with the counts, for two independent reasons. A
+        /// compact-eligible request that takes the full-vocab path moves
+        /// `vocab_size * 4` bytes instead of `k * 8`, a ratio near 1187 at a 151936
+        /// vocabulary and `k = 64`, while both spellings increment some counter by
+        /// exactly 1. And `prefill_full_vocab_logit_readback` is incremented by two
+        /// sites that move different amounts: the perplexity path reads
+        /// `n * vocab_size` values, the ordinary path reads `vocab_size`. The event
+        /// count reports 1 for both and destroys the factor of `n`, with no
+        /// substitution and no adversary involved.
+        pub prefill_full_vocab_logit_readback_bytes: AtomicU64,
+        pub prefill_compact_candidate_logit_readback_bytes: AtomicU64,
+        pub decode_full_vocab_logit_readback_bytes: AtomicU64,
+        pub decode_compact_candidate_logit_readback_bytes: AtomicU64,
     }
 
     impl PathProofCounters {
@@ -2187,6 +2202,14 @@ mod inner {
             self.decode_full_vocab_logit_readback
                 .store(0, Ordering::Relaxed);
             self.decode_compact_candidate_logit_readback
+                .store(0, Ordering::Relaxed);
+            self.prefill_full_vocab_logit_readback_bytes
+                .store(0, Ordering::Relaxed);
+            self.prefill_compact_candidate_logit_readback_bytes
+                .store(0, Ordering::Relaxed);
+            self.decode_full_vocab_logit_readback_bytes
+                .store(0, Ordering::Relaxed);
+            self.decode_compact_candidate_logit_readback_bytes
                 .store(0, Ordering::Relaxed);
         }
     }
@@ -2224,6 +2247,18 @@ mod inner {
         pub decode_compact_candidate: u64,
         pub prefill_full_vocab: u64,
         pub prefill_compact_candidate: u64,
+        /// Device-to-host bytes for each of the four readback shapes above.
+        ///
+        /// ADR-090 D7 asks for transfers *and* bytes around the selected request (the
+        /// bare label `D7` is reused elsewhere in this file for an unrelated item, so
+        /// the ADR is named here rather than assumed); the counts
+        /// above are the transfers. A shape check can be satisfied by a substitution
+        /// that moves three orders of magnitude more data under a different field
+        /// name, which is what these make assertable.
+        pub decode_full_vocab_bytes: u64,
+        pub decode_compact_candidate_bytes: u64,
+        pub prefill_full_vocab_bytes: u64,
+        pub prefill_compact_candidate_bytes: u64,
     }
 
     // ---------------------------------------------------------------------------
@@ -2504,6 +2539,20 @@ mod inner {
         let mut out = vec![0.0f32; len];
         std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len);
         out
+    }
+
+    /// Device-side layout of one top-k candidate: `struct TopKCandidate { float logit;
+    /// uint token_id; }` in the shader.
+    ///
+    /// Module-scoped rather than local to [`MetalQwen35State::read_topk_candidates`] so the
+    /// readback sites can size their transfers with `size_of::<GpuCandidate>()`. The shader
+    /// owns this layout, so a literal byte count at those sites would rot silently the first
+    /// time the shader struct changed and nothing would fail.
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub(crate) struct GpuCandidate {
+        logit: f32,
+        token_id: u32,
     }
 
     /// Read f32 slice from a Metal shared-mode buffer starting at a given element offset.
@@ -3764,6 +3813,22 @@ mod inner {
                 prefill_compact_candidate: self
                     .path_proof
                     .prefill_compact_candidate_logit_readback
+                    .load(Ordering::Relaxed),
+                decode_full_vocab_bytes: self
+                    .path_proof
+                    .decode_full_vocab_logit_readback_bytes
+                    .load(Ordering::Relaxed),
+                decode_compact_candidate_bytes: self
+                    .path_proof
+                    .decode_compact_candidate_logit_readback_bytes
+                    .load(Ordering::Relaxed),
+                prefill_full_vocab_bytes: self
+                    .path_proof
+                    .prefill_full_vocab_logit_readback_bytes
+                    .load(Ordering::Relaxed),
+                prefill_compact_candidate_bytes: self
+                    .path_proof
+                    .prefill_compact_candidate_logit_readback_bytes
                     .load(Ordering::Relaxed),
             }
         }
@@ -6573,6 +6638,13 @@ mod inner {
                         self.path_proof
                             .decode_compact_candidate_logit_readback
                             .fetch_add(1, Ordering::Relaxed);
+                        self.path_proof
+                            .decode_compact_candidate_logit_readback_bytes
+                            .fetch_add(
+                                (self.session.compact_topk * std::mem::size_of::<GpuCandidate>())
+                                    as u64,
+                                Ordering::Relaxed,
+                            );
                     }
                     let _signpost_host_read = crate::forward::signpost::interval_in(
                         signpost_scope,
@@ -6587,6 +6659,12 @@ mod inner {
                         self.path_proof
                             .decode_full_vocab_logit_readback
                             .fetch_add(1, Ordering::Relaxed);
+                        self.path_proof
+                            .decode_full_vocab_logit_readback_bytes
+                            .fetch_add(
+                                (cfg.vocab_size * std::mem::size_of::<f32>()) as u64,
+                                Ordering::Relaxed,
+                            );
                     }
                     let _signpost_host_read = crate::forward::signpost::interval_in(
                         signpost_scope,
@@ -6760,6 +6838,13 @@ mod inner {
                     self.path_proof
                         .decode_compact_candidate_logit_readback
                         .fetch_add(1, Ordering::Relaxed);
+                    self.path_proof
+                        .decode_compact_candidate_logit_readback_bytes
+                        .fetch_add(
+                            (self.session.compact_topk * std::mem::size_of::<GpuCandidate>())
+                                as u64,
+                            Ordering::Relaxed,
+                        );
                 }
                 let _signpost_host_read = crate::forward::signpost::interval_in(
                     signpost_scope,
@@ -6776,6 +6861,12 @@ mod inner {
                     self.path_proof
                         .decode_full_vocab_logit_readback
                         .fetch_add(1, Ordering::Relaxed);
+                    self.path_proof
+                        .decode_full_vocab_logit_readback_bytes
+                        .fetch_add(
+                            (cfg.vocab_size * std::mem::size_of::<f32>()) as u64,
+                            Ordering::Relaxed,
+                        );
                 }
                 let _signpost_host_read = crate::forward::signpost::interval_in(
                     signpost_scope,
@@ -8515,6 +8606,14 @@ mod inner {
                     self.path_proof
                         .prefill_full_vocab_logit_readback
                         .fetch_add(1, Ordering::Relaxed);
+                    // `n *` is the whole reason the byte counter exists: this site and
+                    // the ordinary one below share a counter and move different amounts.
+                    self.path_proof
+                        .prefill_full_vocab_logit_readback_bytes
+                        .fetch_add(
+                            (n * cfg.vocab_size * std::mem::size_of::<f32>()) as u64,
+                            Ordering::Relaxed,
+                        );
                 }
                 unsafe { read_buffer(&pb, n * cfg.vocab_size) }
             } else if let Some(which) = topk_which {
@@ -8523,6 +8622,13 @@ mod inner {
                     self.path_proof
                         .prefill_compact_candidate_logit_readback
                         .fetch_add(1, Ordering::Relaxed);
+                    self.path_proof
+                        .prefill_compact_candidate_logit_readback_bytes
+                        .fetch_add(
+                            (self.session.compact_topk * std::mem::size_of::<GpuCandidate>())
+                                as u64,
+                            Ordering::Relaxed,
+                        );
                 }
                 let k = self.session.compact_topk;
                 let candidates = unsafe { self.read_topk_candidates(which, k) };
@@ -8535,6 +8641,12 @@ mod inner {
                     self.path_proof
                         .prefill_full_vocab_logit_readback
                         .fetch_add(1, Ordering::Relaxed);
+                    self.path_proof
+                        .prefill_full_vocab_logit_readback_bytes
+                        .fetch_add(
+                            (cfg.vocab_size * std::mem::size_of::<f32>()) as u64,
+                            Ordering::Relaxed,
+                        );
                 }
                 unsafe { read_buffer(&self.session.activations.logits, cfg.vocab_size) }
             }
@@ -10938,13 +11050,6 @@ mod inner {
             which: u8,
             k: usize,
         ) -> Vec<crate::sampling::Candidate> {
-            // GPU layout: struct TopKCandidate { float logit; uint token_id; }
-            #[repr(C)]
-            #[derive(Copy, Clone)]
-            struct GpuCandidate {
-                logit: f32,
-                token_id: u32,
-            }
             let buf = if which == 0 {
                 &self.session.activations.topk_scratch_a
             } else {
@@ -15079,6 +15184,7 @@ mod inner {
     #[cfg(test)]
     mod tests {
         mod dispatch;
+        mod path_proof_bytes;
 
         use super::super::{
             LM_HEAD_TOPK_TIE_EPSILON, LM_HEAD_TOPK_TIE_EPSILON_Q4, TopkSetAgreement,
