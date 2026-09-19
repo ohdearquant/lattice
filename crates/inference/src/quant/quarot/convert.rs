@@ -216,8 +216,17 @@ impl Default for PromotionRecord {
 /// ADR-051 §"quantize_quarot Binary Change": the rotation seed is the runtime's
 /// authoritative source for reconstructing the QuaRot Hadamard sign vector. It
 /// lives next to the tensor index so a loader can recover it without parsing
-/// `config.json`. `quantize_index.json` from older builds (no `quarot_seed`)
-/// remains compatible — the field is `Option<u64>`.
+/// `config.json`.
+///
+/// The field is `Option<u64>` for wire-format reasons, not because a seedless
+/// object-form manifest is a supported state. The only writer of this shape is
+/// [`convert_quarot_qwen35`], which rotates unconditionally and has stamped
+/// `Some(seed)` here since the struct was introduced, so "an older build wrote
+/// an object-form manifest without a seed" describes a population that has
+/// never existed. [`read_quarot_seed_from_index`] refuses that combination
+/// when the legacy `config.json` channel is also silent. ADR-051's
+/// absent-seed-means-unrotated clause is about the pre-existing bare-array
+/// artifacts it promised to keep loadable, and those still load unchanged.
 ///
 /// `online` is the schema-of-record home for [`OnlineArtifactDescriptor`] —
 /// the ONE place a converter/loader reads or writes online-rotation
@@ -279,7 +288,11 @@ struct QuantizeIndex {
 /// caller falls back to the legacy `config.json` field
 /// (`quarot_rotation_seed`) for those. A **present** file that fails to
 /// read, exceeds the size cap, is not valid JSON, or (for the object form)
-/// does not match the strict schema is `Err`. A file that exists and
+/// does not match the strict schema is `Err`. An object-form file that parses
+/// but carries no `quarot_seed` is also `Err`, unless `cfg` supplies the
+/// legacy seed: the object shape identifies the converter as its writer, and
+/// that converter always rotates, so a seed absent from both channels is a
+/// rotated artifact with no recoverable recipe rather than an unrotated one. A file that exists and
 /// doesn't parse is evidence of truncation/corruption/tampering, not a
 /// legitimate "no rotation" artifact, and silently falling back to the
 /// legacy seed (or no rotation at all) would apply the wrong rotation to a
@@ -363,6 +376,35 @@ pub(crate) fn read_quarot_seed_from_index(
         return Err(format!(
             "{}: this runtime does not yet execute V1 online rotation \
              recipes; artifact requires R3/R4 runtime support",
+            path.display()
+        ));
+    }
+    if index.quarot_seed.is_none() && cfg.quarot_rotation_seed.is_none() {
+        // Object form means `convert_quarot_qwen35` wrote this manifest, and
+        // that converter rotates unconditionally and stamps the seed into both
+        // channels it owns (`quarot_seed` here, `quarot_rotation_seed` in the
+        // emitted `config.json`). So an object-form manifest whose seed is
+        // absent from BOTH channels describes rotated weights whose rotation
+        // is no longer recoverable — the same "corrupted or in-progress write"
+        // reading the entry-completeness check above already applies, extended
+        // to the field that decides whether counter-rotation runs at all.
+        //
+        // The bare-array shape is untouched: it returns above, because for
+        // `bin/quantize_q4.rs` output an absent seed is the only representable
+        // state and genuinely means unrotated. The legacy `config.json`
+        // channel is untouched too — a seed there yields `is_quarot = true`
+        // with counter-rotation correctly applied, which is the fallback path
+        // this refusal must never reach.
+        //
+        // Checked before the `online` descriptor validation below for the
+        // reject-before-validate reason stated above: a manifest refused
+        // regardless of the outcome must not first drive that O(layers^2 +
+        // tensor_names^2) scan over attacker-controlled content.
+        return Err(format!(
+            "{}: object-form quantize_index.json (quantize_quarot shape) \
+             carries no quarot_seed and config.json declares no \
+             quarot_rotation_seed; refusing to load rotated weights with no \
+             recoverable rotation seed",
             path.display()
         ));
     }
@@ -2999,13 +3041,57 @@ mod tests {
     }
 
     #[test]
-    fn read_quarot_seed_from_index_without_key_is_none() {
+    fn read_quarot_seed_from_index_object_form_without_seed_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("quantize_index.json"), r#"{"tensors":[]}"#).unwrap();
+        let cfg = Qwen35Config::qwen35_0_8b();
         assert_eq!(
-            read_quarot_seed_from_index(tmp.path(), &Qwen35Config::qwen35_0_8b()),
+            cfg.quarot_rotation_seed, None,
+            "control: this fixture's config must declare no legacy seed, or the \
+             refusal under test is not the one being exercised"
+        );
+        let err = read_quarot_seed_from_index(tmp.path(), &cfg).expect_err(
+            "object-form manifest with no seed in either channel must be refused, not \
+             read as an unrotated artifact",
+        );
+        assert!(
+            err.contains("no recoverable rotation seed"),
+            "refusal must name the missing seed, got: {err}"
+        );
+    }
+
+    /// The legacy `config.json` channel keeps an object-form manifest with no
+    /// `quarot_seed` loadable. `.or(cfg.quarot_rotation_seed)` in the caller
+    /// supplies the seed, so counter-rotation still runs and the refusal above
+    /// must not reach this case — refusing it would break exactly the fallback
+    /// the legacy field exists to serve.
+    #[test]
+    fn read_quarot_seed_from_index_object_form_without_seed_defers_to_legacy_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), r#"{"tensors":[]}"#).unwrap();
+        let mut cfg = Qwen35Config::qwen35_0_8b();
+        cfg.quarot_rotation_seed = Some(12_648_430);
+        assert_eq!(
+            read_quarot_seed_from_index(tmp.path(), &cfg),
             Ok(None),
-            "index without quarot_seed key must yield Ok(None)"
+            "with a legacy config seed present the manifest read must succeed and \
+             return None, leaving the caller's `.or` to supply the seed"
+        );
+    }
+
+    /// A bare array is the `quantize_q4` shape, where an absent seed is the
+    /// only representable state and genuinely means unrotated. The object-form
+    /// refusal must not widen to it even when the config is silent too.
+    #[test]
+    fn read_quarot_seed_from_index_bare_array_without_any_seed_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("quantize_index.json"), r#"[]"#).unwrap();
+        let cfg = Qwen35Config::qwen35_0_8b();
+        assert_eq!(cfg.quarot_rotation_seed, None, "control: no legacy seed");
+        assert_eq!(
+            read_quarot_seed_from_index(tmp.path(), &cfg),
+            Ok(None),
+            "bare-array manifest with no seed anywhere must stay loadable"
         );
     }
 

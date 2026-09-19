@@ -6,6 +6,29 @@
 
 ---
 
+## Amendment 1 (2026-09-19): "absent seed means unrotated" is scoped to the bare-array shape
+
+The section below on the `quantize_quarot` binary change says the runtime loader treats an absent
+`quarot_seed` key as `None`, so existing unrotated artifacts stay loadable without conversion. That
+promise was written about the artifacts that predated this ADR, and those are all bare top-level
+JSON arrays written by `bin/quantize_q4.rs`, a tool with no seed concept. For that shape an absent
+seed is the only representable state and genuinely means unrotated, and it keeps loading unchanged.
+
+The object shape is different, and the original wording did not separate the two. `{"quarot_seed":
+..., "tensors": [...]}` can only come from `convert_quarot_qwen35`, which rotates unconditionally
+and has written `Some(seed)` since the struct was introduced. An object-form manifest with no seed
+therefore does not describe an unrotated model; it describes rotated weights whose rotation recipe
+is missing. Reading it as `None` loaded those weights with no counter-rotation, which is the failure
+this ADR's counter-rotation exists to prevent.
+
+`read_quarot_seed_from_index` now refuses that combination, and only that combination: object form,
+no `quarot_seed`, and no `quarot_rotation_seed` in `config.json`. The legacy `config.json` channel
+still works, so an object-form manifest whose seed lives only in the config still loads and still
+counter-rotates. No artifact in the current inventory is in the refused state, and no converter
+build ever produced one, so the amendment closes a path rather than invalidating existing files.
+
+---
+
 ## Context
 
 ADR-044 ships QuaRot Q4 quantization for Qwen3.5. It applies a global random Hadamard rotation R
