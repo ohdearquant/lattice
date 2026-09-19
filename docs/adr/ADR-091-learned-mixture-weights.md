@@ -86,7 +86,7 @@ Decision 5's held-out metric. The falsifier is named explicitly: a rejected refi
 metric was improving is the falsifier for the floor value, and that observation, not intuition
 about the number, is what moves it.
 
-#### Amendment, 2026-09-19 (Status: **Proposed**, pending sign-off): the named guard was not the one running
+#### Amendment, 2026-09-19 (Status: **Accepted**, 2026-09-19): the named guard was not the one running
 
 The second bullet above cites `crates/fann/src/training/rloo.rs:401 load_balance_aux_loss` and
 `:418 router_z_loss` as two of the three mandatory collapse guards. Two things were wrong with that,
