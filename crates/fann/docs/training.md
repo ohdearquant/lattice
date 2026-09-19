@@ -383,17 +383,41 @@ silently convert "push this down" feedback into "pull this up" feedback.
 
 **Auxiliary losses**, always added regardless of reward sign:
 
-- _Load-balance loss_ `(1/K) Σ_i (p_i − 1/K)²` penalizes routing collapse
-  (one action absorbing all probability mass) — pulls the distribution toward
-  uniform.
+- _Load-balance loss_ `K · Σ_i f_i · P_i`, the Switch / ST-MoE form, where `f` is
+  an exponential moving average of which expert recent decisions selected and `P`
+  is this context's gate distribution. It penalizes routing collapse measured over
+  traffic, and the property that matters is what it does **not** penalize: at
+  balanced `f` its gradient is identically zero however sharp the gate is, so a
+  correctly confident routing decision is never taxed.
 - _Router z-loss_ `(log Σ exp(logits))²` penalizes logit magnitude explosion,
   which otherwise makes the softmax increasingly saturated/overconfident over
   training.
 
-The public `load_balance_aux_loss` and `router_z_loss` functions expose these
-scalar definitions for inspection or external logging. The load-balance helper
-returns zero for an empty probability slice. The z-loss helper defines
-log-sum-exp of an empty logits slice as zero, and therefore also returns zero.
+The frequency EMA is trainer-private and starts uniform, so the load-balance term
+contributes nothing at all until observed routing drifts off balance. That silence
+on a fresh trainer is the intended semantics rather than a gap: there is no traffic
+yet to be imbalanced, and the alternative — pressure derived from no observations —
+is what the superseded per-context form did.
+
+`load_balance_aux_loss_batch` states that objective and `load_balance_aux_gradient`
+is what `step` and `rloo_step` actually apply; `router_z_loss` and
+`router_z_gradient` are the same pair for the z term. The trainer **calls** these
+functions rather than re-deriving their gradients inline, which is a deliberate
+correction: the earlier code inlined both gradients in two places while the public
+scalars sat uncalled, so correcting an objective at the documented function would
+have changed no behaviour at all. `aux_gradient_matches_finite_difference_of_the_batch_loss`
+keeps each stated loss and its applied gradient from drifting apart.
+
+`load_balance_aux_loss` remains as the **deprecated** per-context form
+`(1/K) Σ_i (p_i − 1/K)²`. It pulls a single context toward uniform, which penalizes
+a gate that is confidently and correctly routing one request; load balance is a
+property of the traffic, not of any one decision. It is deprecated rather than
+removed because removing a `pub` item is a major-version break.
+
+The load-balance helpers return zero for an empty probability slice. The z-loss
+helper defines log-sum-exp of an empty logits slice as zero, and therefore also
+returns zero. Both batch helpers reject a frequency vector whose width does not
+match the probability vector, rather than defaulting it to uniform.
 For nonempty logits, the internal softmax and log-sum-exp routines subtract the
 maximum logit before exponentiating to avoid overflow.
 

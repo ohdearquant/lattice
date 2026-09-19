@@ -86,6 +86,62 @@ Decision 5's held-out metric. The falsifier is named explicitly: a rejected refi
 metric was improving is the falsifier for the floor value, and that observation, not intuition
 about the number, is what moves it.
 
+#### Amendment, 2026-09-19 (Status: **Accepted**, 2026-09-19): the named guard was not the one running
+
+The second bullet above cites `crates/fann/src/training/rloo.rs:401 load_balance_aux_loss` and
+`:418 router_z_loss` as two of the three mandatory collapse guards. Two things were wrong with that,
+and they are independent.
+
+**The citation pointed at code nothing calls.** Measured at `2d5f7f9e60`: both functions have zero
+callers anywhere outside their own `#[cfg(test)]` block. The objective reached production only as a
+hand-inlined gradient, in two places (`step` and `rloo_step`, the second carrying the comment
+"identical to step"). So there were three copies of one objective, and the one this ADR named was
+the only one that did nothing. The consequence is the part worth recording: a maintainer who
+followed this citation and corrected the loss at `:401` would have shipped a no-op and had every
+reason to believe otherwise, while a maintainer who deleted those functions as unreferenced would
+have left the guard fully in force.
+
+**The objective taxed the behaviour it was meant to permit.** The inlined form is the gradient of
+`(1/K) Σ_i (p_i − 1/K)²`, a pull toward uniform on a _single_ context. Load balance is a property of
+traffic, not of any one decision, and the Switch / ST-MoE form `K · Σ_i f_i · P_i` is a batch
+statistic for that reason. The per-context form instead penalizes a gate that is confidently and
+correctly routing one request, which is the behaviour the policy gradient exists to learn. This ADR
+already makes exactly this distinction about its neighbouring guard: "the entropy floor cannot tell
+collapse from a correctly sharp distribution." The load-balance term had the same blindness, and
+unlike the entropy floor, which only rejects a refit, it was in the gradient on every step.
+
+**Amended decision.** The second bullet now reads: the load-balance and z-loss terms applied to the
+weight distribution are `load_balance_aux_loss_batch` / `load_balance_aux_gradient` and
+`router_z_loss` / `router_z_gradient`, and `step` and `rloo_step` **call** them rather than
+re-deriving their gradients inline. `f` is an exponential moving average of which expert recent
+decisions selected, held trainer-private, initialised uniform, with a fixed rate of `0.01` per
+decision. It is trainer-private and not a config field because `RlooConfig` is `pub` with `pub`
+fields and therefore externally constructible, which makes any added field a major-version break;
+the rate only rescales a gradient whose coefficient is already exposed as `aux_loss_coeff`.
+
+Two consequences stated rather than left to be discovered:
+
+- **The guard is silent until observed routing drifts.** At uniform `f` the gradient is identically
+  zero however sharp the gate is, so a fresh trainer applies no load-balance pressure at all. That
+  is the intended semantics: there is no traffic yet to be imbalanced, and pressure derived from no
+  observations is precisely what the superseded form applied.
+- **The per-context function is deprecated, not deleted**, because removing a `pub` item is a
+  major-version break. The deprecation note carries the warning that fixing the objective there
+  changes no behaviour.
+
+The one-copy property is now asserted rather than asked for.
+`rloo::tests::step_applies_the_named_load_balance_guard` sets reward to zero and `z_loss_coeff` to
+zero, leaving the load-balance guard as the only thing that can move a weight, and reddens if `step`
+stops routing through the named function or stops folding decisions into the EMA.
+`aux_gradient_matches_finite_difference_of_the_batch_loss` ties each stated loss to the gradient
+actually applied, which is what keeps the scalar definition load-bearing instead of decorative: a
+scalar nobody consumes is the defect this amendment corrects.
+
+Falsifier for the amended form, named the way Decision 3 names its others: a closed-loop run in
+which routing collapses onto one adapter while `f` reports balance. That would mean the EMA rate is
+too slow to see the collapse it is meant to bound, and it is that observation, not intuition about
+`0.01`, that moves the number.
+
 **4. Caller-supplied weights keep their magnitudes, and are floored without renormalisation.** The
 normalisation in Decision 1 is a property of the learned path, not of the mixture in general. Raw
 gate scores have no calibrated magnitude, so they have to become proportions before two requests can
