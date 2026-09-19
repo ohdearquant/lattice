@@ -319,6 +319,24 @@ jobs:
       # opt-in API cannot rot silently.
       - name: tune — simulated-teacher (build + run tests)
         run: cargo test -p lattice-tune --features simulated-teacher --lib
+      # lattice-fann's OWN test module behind `online-router` was run by NOTHING.
+      # The step two above enables the feature (tune's `mixture` maps to
+      # `lattice-fann/online-router`), which is exactly why this was invisible: a
+      # reader checking whether `online-router` is exercised finds a step whose
+      # comment names that feature, builds, and runs tests, and stops there. But a
+      # feature enabled ON A DEPENDENCY compiles that dependency's library, never
+      # its `#[cfg(test)]` block — those live in lattice-fann's own test binary,
+      # which only `cargo test -p lattice-fann` builds. And the required `ci` job
+      # does run lattice-fann's lib tests — `scripts/ci.sh:33` is
+      # `cargo test --workspace` — but at DEFAULT features, so the gated module
+      # contributes zero of them and `clippy --workspace` (ci.sh:22) never lints it
+      # either. `make ci` (Makefile:21) has the same shape and the same hole. So the
+      # RLOO trainer's tests — reward polarity, load balance, z-loss — were compiled
+      # by no job and run by none, while every surface that would report it was
+      # green. A green `--workspace` run is a statement about the default feature
+      # set, never about the code.
+      - name: fann — online-router (build + run tests)
+        run: cargo test -p lattice-fann --features online-router --lib
       # lattice-inference's OWN `mixture` feature is a different feature from the
       # lattice-tune one two steps above, and nothing here used to enable it, so
       # crates/inference/src/mixture.rs (the AdapterRouter gate) was compiled by

@@ -13,6 +13,15 @@ use crate::network::Network;
 use rand::Rng;
 use rand::SeedableRng;
 
+/// Rate at which one routing decision is folded into the frequency EMA.
+///
+/// Trainer-private on purpose: `RlooConfig` is `pub` with `pub` fields and so is
+/// externally constructible, which makes any added field a major-version break
+/// (`constructible_struct_adds_field`). The load-balance coefficient that scales
+/// this term is already exposed as `RlooConfig::aux_loss_coeff`, and the EMA rate
+/// only rescales the same gradient, so nothing is lost by fixing it here.
+const ROUTE_FREQ_DECAY: f32 = 0.01;
+
 /// Hyperparameters for one policy-gradient refit step.
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -43,6 +52,11 @@ pub struct RlooTrainer {
     config: RlooConfig,
     /// RNG used for Gumbel-max sampling in the Phase-2 multi-sample path.
     rng: rand::rngs::SmallRng,
+    /// EMA of the routing frequency `f_i`: the share of recent decisions that
+    /// selected expert `i`. Empty until the first step sizes it from the gate's
+    /// output width, then initialised uniform so that a trainer with no history
+    /// applies no load-balance pressure at all.
+    route_freqs: Vec<f32>,
 }
 
 impl RlooTrainer {
@@ -51,6 +65,7 @@ impl RlooTrainer {
         Self {
             config,
             rng: rand::rngs::SmallRng::from_entropy(),
+            route_freqs: Vec::new(),
         }
     }
 
@@ -61,6 +76,7 @@ impl RlooTrainer {
         Self {
             config,
             rng: rand::rngs::SmallRng::seed_from_u64(seed),
+            route_freqs: Vec::new(),
         }
     }
 
@@ -108,12 +124,15 @@ impl RlooTrainer {
         let logits: Vec<f32> = gate.forward(context)?.to_vec();
 
         let probs = softmax(&logits);
-        let lse = log_sum_exp(&logits);
 
         let k = num_outputs;
-        let sum_p_sq: f32 = probs.iter().map(|&p| p * p).sum();
-        // Scalar used in the load-balance gradient (computed once).
-        let c = sum_p_sq - 1.0 / k as f32;
+        // Both guard terms are applied by calling the functions that define them,
+        // never by re-deriving their gradients here: a second copy is a place for
+        // the two to disagree silently, and it is what let the documented guard
+        // sit uncalled while the trainer optimised something else.
+        let route_freqs = self.route_freqs_or_uniform(k);
+        let aux_grad = load_balance_aux_gradient(&route_freqs, &probs)?;
+        let z_grad = router_z_gradient(&logits, &probs);
 
         // Linear output makes this the pre-activation error; preserve reward polarity — see docs/training.md.
         let output_deltas: Vec<f32> = probs
@@ -122,14 +141,19 @@ impl RlooTrainer {
             .map(|(j, &pj)| {
                 let onehot_j = if j == action_idx { 1.0_f32 } else { 0.0_f32 };
                 let policy = reward * (pj - onehot_j);
-                let aux =
-                    self.config.aux_loss_coeff * (2.0 / k as f32) * pj * (pj - 1.0 / k as f32 - c);
-                let zloss = self.config.z_loss_coeff * 2.0 * lse * pj;
+                let aux = self.config.aux_loss_coeff * aux_grad[j];
+                let zloss = self.config.z_loss_coeff * z_grad[j];
                 policy + aux + zloss
             })
             .collect();
 
         self.backprop_and_apply(gate, context, &output_deltas, num_layers)?;
+
+        // Fold the decision actually taken into the frequency EMA, after the
+        // update, so the gradient above saw the traffic that preceded it.
+        let mut mass = vec![0.0_f32; k];
+        mass[action_idx] = 1.0;
+        self.observe_routing(&mass);
 
         // Scalar policy loss for caller logging.
         let loss = -reward * probs[action_idx].max(1e-9).ln();
@@ -199,7 +223,6 @@ impl RlooTrainer {
 
         let logits: Vec<f32> = gate.forward(context)?.to_vec();
         let probs = softmax(&logits);
-        let lse = log_sum_exp(&logits);
 
         // Draw `m_samples` Gumbel-top-`k` subsets — see docs/training.md.
         let mut rewards: Vec<f32> = Vec::with_capacity(m_samples);
@@ -239,8 +262,6 @@ impl RlooTrainer {
         // Build output-layer gradient with leave-one-out baseline.
         let reward_sum: f32 = rewards.iter().sum();
         let ko = num_outputs;
-        let sum_p_sq: f32 = probs.iter().map(|&p| p * p).sum();
-        let c = sum_p_sq - 1.0 / ko as f32;
 
         let mut output_deltas = vec![0.0_f32; ko];
 
@@ -264,17 +285,58 @@ impl RlooTrainer {
             }
         }
 
-        // Aux and z-loss terms (identical to step).
-        for (j, &pj) in probs.iter().enumerate() {
-            let aux =
-                self.config.aux_loss_coeff * (2.0 / ko as f32) * pj * (pj - 1.0 / ko as f32 - c);
-            let zloss = self.config.z_loss_coeff * 2.0 * lse * pj;
-            output_deltas[j] += aux + zloss;
+        // Aux and z-loss terms, through the same named guards step() calls.
+        let route_freqs = self.route_freqs_or_uniform(ko);
+        let aux_grad = load_balance_aux_gradient(&route_freqs, &probs)?;
+        let z_grad = router_z_gradient(&logits, &probs);
+        for j in 0..ko {
+            output_deltas[j] +=
+                self.config.aux_loss_coeff * aux_grad[j] + self.config.z_loss_coeff * z_grad[j];
         }
 
         self.backprop_and_apply(gate, context, &output_deltas, num_layers)?;
 
+        // Attribute this decision across the sampled subsets: each of the
+        // `m_samples` subsets contributes `1/k` to each expert it selected, so
+        // the mass sums to one exactly as the single-sample one-hot does.
+        let mut mass = vec![0.0_f32; ko];
+        let per_pick = 1.0 / (m_samples as f32 * k as f32);
+        for subset in &subsets {
+            for &i in subset {
+                mass[i] += per_pick;
+            }
+        }
+        self.observe_routing(&mass);
+
         Ok(reward_sum / m_samples as f32)
+    }
+
+    /// The routing-frequency EMA, sized to `k` and initialised uniform on first use.
+    ///
+    /// Uniform initialisation is what makes the guard silent on a fresh trainer:
+    /// at `f_i = 1/k` for every `i` the load-balance gradient is identically zero
+    /// regardless of how sharp the gate is, so the term contributes nothing until
+    /// observed routing actually drifts away from balance. That is the intended
+    /// semantics, not an accident of initialisation.
+    fn route_freqs_or_uniform(&mut self, k: usize) -> Vec<f32> {
+        if self.route_freqs.len() != k {
+            self.route_freqs = vec![1.0 / k as f32; k];
+        }
+        self.route_freqs.clone()
+    }
+
+    /// Fold one routing decision into the frequency EMA.
+    ///
+    /// `mass` is the share of this decision attributed to each expert and sums to
+    /// one: a one-hot vector for the single-sample path, and the empirical
+    /// selection frequency across the sampled subsets for the multi-sample path.
+    fn observe_routing(&mut self, mass: &[f32]) {
+        if self.route_freqs.len() != mass.len() {
+            return;
+        }
+        for (f, &m) in self.route_freqs.iter_mut().zip(mass.iter()) {
+            *f = (1.0 - ROUTE_FREQ_DECAY) * *f + ROUTE_FREQ_DECAY * m;
+        }
     }
 
     /// Backpropagate the output-layer delta through hidden layers and apply
@@ -394,10 +456,20 @@ impl RlooTrainer {
     }
 }
 
-/// Load-balance auxiliary loss: `(1/K) Σ_i (p_i − 1/K)²`.
+/// Per-context load-balance loss: `(1/K) Σ_i (p_i − 1/K)²`. **Superseded.**
 ///
-/// Penalises routing collapse where one adapter receives most probability mass.
-/// `probs` should be the softmax of the gate logits.
+/// This is a pull toward uniform on a *single* context, so it penalises a gate
+/// that is confidently and correctly routing one request. Load balance is a
+/// property of the traffic, not of any one decision: see
+/// [`load_balance_aux_loss_batch`], which is what the trainer optimises.
+///
+/// Kept, deprecated rather than deleted, because removing a `pub` item is a
+/// major-version break. The deprecation is the machine-readable form of the
+/// warning: correcting the objective *here* changes no behaviour, because the
+/// trainer does not call this function.
+#[deprecated(
+    note = "per-context pull to uniform taxes correct sharpness; use load_balance_aux_loss_batch"
+)]
 pub fn load_balance_aux_loss(probs: &[f32]) -> f32 {
     if probs.is_empty() {
         return 0.0;
@@ -409,6 +481,71 @@ pub fn load_balance_aux_loss(probs: &[f32]) -> f32 {
         .map(|&p| (p - uniform) * (p - uniform))
         .sum::<f32>()
         / k
+}
+
+/// Load-balance loss over observed traffic: `K * Σ_i f_i * P_i`.
+///
+/// `route_freqs` is `f`, the share of recent decisions that selected each expert;
+/// `probs` is this context's gate distribution, standing in for `P`. This is the
+/// Switch / ST-MoE form, and the property that matters is what it does *not*
+/// penalise: at balanced `f` its gradient is identically zero however sharp
+/// `probs` is, so it bounds collapse without taxing correct confidence.
+///
+/// This function states the objective; [`load_balance_aux_gradient`] is what the
+/// trainer applies. `rloo::tests::aux_gradient_matches_finite_difference_of_the_batch_loss`
+/// is what keeps the two from drifting apart.
+pub fn load_balance_aux_loss_batch(route_freqs: &[f32], probs: &[f32]) -> FannResult<f32> {
+    if route_freqs.len() != probs.len() {
+        return Err(FannError::InputSizeMismatch {
+            expected: probs.len(),
+            actual: route_freqs.len(),
+        });
+    }
+    if probs.is_empty() {
+        return Ok(0.0);
+    }
+    let k = probs.len() as f32;
+    Ok(k * route_freqs
+        .iter()
+        .zip(probs.iter())
+        .map(|(&f, &p)| f * p)
+        .sum::<f32>())
+}
+
+/// Gradient of [`load_balance_aux_loss_batch`] with respect to the gate logits.
+///
+/// `K * p_j * (f_j − Σ_i f_i p_i)`, which is positive for an over-used expert and
+/// negative for an under-used one, so gradient descent moves mass off the former.
+/// Scale it by `RlooConfig::aux_loss_coeff` at the call site.
+pub fn load_balance_aux_gradient(route_freqs: &[f32], probs: &[f32]) -> FannResult<Vec<f32>> {
+    if route_freqs.len() != probs.len() {
+        return Err(FannError::InputSizeMismatch {
+            expected: probs.len(),
+            actual: route_freqs.len(),
+        });
+    }
+    if probs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let k = probs.len() as f32;
+    let f_dot_p: f32 = route_freqs
+        .iter()
+        .zip(probs.iter())
+        .map(|(&f, &p)| f * p)
+        .sum();
+    Ok(probs
+        .iter()
+        .zip(route_freqs.iter())
+        .map(|(&p, &f)| k * p * (f - f_dot_p))
+        .collect())
+}
+
+/// Gradient of [`router_z_loss`] with respect to the gate logits: `2 * lse * p_j`.
+///
+/// Scale it by `RlooConfig::z_loss_coeff` at the call site.
+pub fn router_z_gradient(logits: &[f32], probs: &[f32]) -> Vec<f32> {
+    let lse = log_sum_exp(logits);
+    probs.iter().map(|&p| 2.0 * lse * p).collect()
 }
 
 /// Router z-loss: `(log Σ_i exp(s_i))²`.
@@ -511,6 +648,7 @@ mod tests {
     ///
     /// Mutation that fails: returning 0.0 unconditionally.
     #[test]
+    #[allow(deprecated)]
     fn load_balance_aux_loss_nonzero_on_skewed() {
         let skewed_logits = [10.0_f32, -10.0, -10.0, -10.0];
         let probs = softmax(&skewed_logits);
@@ -625,6 +763,152 @@ mod tests {
         assert!(
             matches!(result, Err(FannError::ShapeTooLarge { .. })),
             "expected ShapeTooLarge error for m_samples*k > MAX, got {result:?}"
+        );
+    }
+
+    /// The property the per-context form lacked: at balanced traffic the guard is
+    /// silent no matter how confident the gate is.
+    ///
+    /// The second half is the control. It asserts that the superseded per-context
+    /// form is NOT silent on the same input, so this test discriminates between
+    /// the two objectives rather than passing for both.
+    #[test]
+    #[allow(deprecated)]
+    fn balanced_route_freqs_give_zero_aux_gradient_even_for_a_sharp_gate() {
+        let k = 4usize;
+        let freqs = vec![1.0 / k as f32; k];
+        let probs = softmax(&[10.0, 0.0, 0.0, 0.0]);
+        assert!(
+            probs[0] > 0.99,
+            "fixture must be a sharp gate, got {probs:?}"
+        );
+
+        let grad = load_balance_aux_gradient(&freqs, &probs).unwrap();
+        for (j, &g) in grad.iter().enumerate() {
+            assert!(
+                g.abs() < 1e-6,
+                "balanced traffic must produce no load-balance pressure at j={j}, got {g}"
+            );
+        }
+
+        let per_context = load_balance_aux_loss(&probs);
+        assert!(
+            per_context > 1e-3,
+            "control: the superseded per-context form must be NONZERO here, else this \
+             test would pass for both objectives and prove nothing (got {per_context})"
+        );
+    }
+
+    /// Collapsed traffic must push probability mass off the over-used expert.
+    ///
+    /// Deltas are dL/dz and the trainer descends, so a POSITIVE gradient lowers
+    /// that logit. The zero-sum assertion is the shift-invariance any softmax
+    /// gradient must satisfy; it fails for most ways of getting the formula wrong.
+    #[test]
+    fn collapsed_route_freqs_push_mass_off_the_overused_expert() {
+        let freqs = [0.9_f32, 0.05, 0.05];
+        let probs = [1.0 / 3.0_f32; 3];
+
+        let grad = load_balance_aux_gradient(&freqs, &probs).unwrap();
+        assert!(
+            grad[0] > 0.0,
+            "over-used expert must get a positive gradient (descent lowers its logit), got {}",
+            grad[0]
+        );
+        assert!(
+            grad[1] < 0.0 && grad[2] < 0.0,
+            "under-used experts must be pushed up, got {:?}",
+            &grad[1..]
+        );
+        let sum: f32 = grad.iter().sum();
+        assert!(
+            sum.abs() < 1e-5,
+            "a softmax gradient must be zero-sum, got {sum}"
+        );
+    }
+
+    /// Ties the applied gradient to the stated loss, so the two cannot drift.
+    ///
+    /// Named in `load_balance_aux_loss_batch`'s doc comment: that function exists to
+    /// state the objective, and this is what makes it load-bearing rather than
+    /// decorative. A scalar nobody consumes is exactly the defect this change fixes.
+    #[test]
+    fn aux_gradient_matches_finite_difference_of_the_batch_loss() {
+        let freqs = [0.5_f32, 0.2, 0.2, 0.1];
+        let logits = [0.3_f32, -0.1, 0.7, 0.2];
+        let probs = softmax(&logits);
+        let analytic = load_balance_aux_gradient(&freqs, &probs).unwrap();
+
+        let h = 1e-3_f32;
+        for j in 0..logits.len() {
+            let mut up = logits;
+            let mut dn = logits;
+            up[j] += h;
+            dn[j] -= h;
+            let l_up = load_balance_aux_loss_batch(&freqs, &softmax(&up)).unwrap();
+            let l_dn = load_balance_aux_loss_batch(&freqs, &softmax(&dn)).unwrap();
+            let numeric = (l_up - l_dn) / (2.0 * h);
+            assert!(
+                (analytic[j] - numeric).abs() < 1e-2,
+                "analytic gradient must match the loss it claims to differentiate at j={j}: \
+                 analytic={}, numeric={numeric}",
+                analytic[j]
+            );
+        }
+    }
+
+    /// The one-copy assertion: this reddens if `step` stops routing through the
+    /// named guard, or stops folding the decision into the frequency EMA.
+    ///
+    /// Reward 0 kills the policy term and `z_loss_coeff` 0 kills the z term, so the
+    /// load-balance guard is the ONLY thing left that can move a weight.
+    #[test]
+    fn step_applies_the_named_load_balance_guard() {
+        let config = RlooConfig {
+            learning_rate: 0.5,
+            aux_loss_coeff: 1.0,
+            z_loss_coeff: 0.0,
+        };
+        let mut gate = test_gate();
+        let mut trainer = RlooTrainer::with_seed(config, 1);
+
+        // A fresh trainer is at uniform f, so the guard is silent and nothing at
+        // all may move. This arm also pins the documented initialisation.
+        let before = gate.forward(&CTX).unwrap().to_vec();
+        trainer.step(&mut gate, &CTX, 0, 0.0).unwrap();
+        let after_first = gate.forward(&CTX).unwrap().to_vec();
+        assert_eq!(
+            before, after_first,
+            "at uniform f with no policy and no z term, the guard must contribute nothing"
+        );
+
+        // Send every decision to expert 0 so observed traffic drifts off balance.
+        for _ in 0..200 {
+            trainer.step(&mut gate, &CTX, 0, 0.0).unwrap();
+        }
+        let after_drift = gate.forward(&CTX).unwrap().to_vec();
+
+        assert_ne!(
+            after_first, after_drift,
+            "once traffic has collapsed onto one expert the guard must act; if this \
+             passes, step() is no longer applying the named function"
+        );
+        assert!(
+            after_drift[0] < after_first[0],
+            "the over-used expert's logit must fall: before={}, after={}",
+            after_first[0],
+            after_drift[0]
+        );
+    }
+
+    /// A frequency vector of the wrong width is a caller error, not a shape to
+    /// silently paper over with a uniform default.
+    #[test]
+    fn aux_gradient_rejects_a_frequency_vector_of_the_wrong_width() {
+        let err = load_balance_aux_gradient(&[0.5, 0.5], &[0.3, 0.3, 0.4]).unwrap_err();
+        assert!(
+            matches!(err, FannError::InputSizeMismatch { .. }),
+            "expected InputSizeMismatch, got {err:?}"
         );
     }
 }
