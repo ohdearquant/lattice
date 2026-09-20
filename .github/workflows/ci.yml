@@ -432,6 +432,29 @@ jobs:
       # it is named here rather than hidden in a runtime skip branch.
       - name: inference — R03 golden gate controls (no checkpoint required)
         run: "cargo test -p lattice-inference --test cpu_pre_migration_greedy_golden -- controls::"
+      # The row D allocation arm is `test = false` in the manifest, for two reasons
+      # stated there: it installs its own `#[global_allocator]`, and its
+      # measurement test needs a 1.6 GiB checkpoint no runner has. `test = false`
+      # keeps it out of the default set; `--all-targets` still COMPILES it and
+      # never RUNS it. So without this step its two checkpoint-free controls --
+      # the ones proving the counter sees zeroed allocations at all, and that a
+      # vocabulary-width buffer registers as large -- would be compiled forever and
+      # executed nowhere, which is precisely the shape they exist to catch.
+      #
+      # The count assertion is not decoration. `cargo test` prints `0 passed` and
+      # exits 0 for a renamed module, a deleted test, a misspelled filter, or a
+      # target excluded by a cfg this command did not enable. Every one of those
+      # renders here as a green step, so the step reads the number it got.
+      - name: inference — R03 row D allocation-arm controls (no checkpoint required)
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p lattice-inference --test decoder_allocation_arm -- controls:: 2>&1)
+          printf '%s\n' "$out"
+          passed=$(printf '%s\n' "$out" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | head -1)
+          if [ -z "$passed" ] || [ "$passed" -lt 2 ]; then
+            echo "expected at least 2 passing allocation-arm controls, parsed '${passed:-<none>}'" >&2
+            exit 1
+          fi
       # `cargo test --workspace`'s default target set is lib, bins, tests,
       # benches, and doctests — it does NOT include `[[example]]` targets
       # (that needs an explicit `--example`/`--examples`/`--all-targets`).
