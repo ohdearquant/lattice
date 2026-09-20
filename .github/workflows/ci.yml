@@ -211,6 +211,13 @@ jobs:
       - run: ./scripts/ci.sh
         env:
           LATTICE_REQUIRE_DENO: '1'
+      # `scripts/ci.sh` already runs `cargo test --workspace`, so this target
+      # executes there in the default configuration too -- but that never runs
+      # the Metal feature configuration the ADR names (see the macOS-only step
+      # below), and an implicit sweep is not a named invoker for a guard an ADR
+      # calls out by name. This step is the call site.
+      - name: inference — ADR-092 pipeline boundary contract
+        run: cargo test --locked -p lattice-inference --test pipeline_boundary_contract -- --nocapture
       # Bench compilation, folded in from the former standalone `bench-compile`
       # job. It only ever ran on macOS (metal-gpu), so it maps onto this matrix
       # leg exactly. Folding it here costs one fewer macOS runner slot per PR
@@ -381,6 +388,12 @@ jobs:
       # both runners (wgpu compiles host-side without a GPU) so it cannot rot again.
       - name: inference — wgpu-gpu
         run: cargo build -p lattice-inference --features wgpu-gpu
+      # macOS-only: `metal-gpu,f16` is the Metal configuration the ADR names, and
+      # this job's OS matrix is not always macOS (see `featureoslist` above), so
+      # a plain, unguarded invocation would fail to build on an ubuntu leg.
+      - name: inference — ADR-092 pipeline boundary contract (metal-gpu)
+        if: matrix.os == 'macos-latest'
+        run: cargo test --locked -p lattice-inference --features metal-gpu,f16 --test pipeline_boundary_contract -- --nocapture
       - name: fann — no default features
         run: cargo build -p lattice-fann --no-default-features
       # Run this target alone. `-p lattice-embed` resolves lattice-embed's own
