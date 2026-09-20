@@ -1,6 +1,7 @@
 {
   "artifact_kind": "lattice-cpu-pre-migration-greedy-token-golden",
   "captured_at_ref": "d5e757524e4f8bce21d416b8f8fe0a80aa00b8df",
+  "captured_at_ref_budgeted_cases": "199e2c0bb85d44e2136d0241f4aec56b95b0e48d",
   "cases": [
     {
       "expected_generated_ids": [
@@ -47,6 +48,66 @@
       "name": "long_prose",
       "prompt": "A compiler translates a program written in a high-level language into a form a machine can execute. It reads the source text, groups the characters into tokens, builds a tree that reflects the grammar of the language, checks that the names and types in that tree are consistent, and then emits instructions for a particular target. Each of those stages can fail, and a good compiler reports the failure in terms of the source the programmer wrote rather than the internal representation it happened to be using at the time. The last stage, code generation, is where",
       "prompt_tokens": 108
+    },
+    {
+      "expected_generated_ids": [
+        11751,
+        13,
+        198,
+        760,
+        248069,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13
+      ],
+      "name": "short_factual_reasoning_budget_4",
+      "paired_with": "short_factual",
+      "prompt": "The capital of France is",
+      "prompt_tokens": 5,
+      "reasoning_budget": 4
+    },
+    {
+      "expected_generated_ids": [
+        279,
+        18826,
+        18082,
+        279,
+        248069,
+        271,
+        760,
+        1483,
+        6228,
+        11,
+        1970,
+        9191,
+        11,
+        369,
+        1332,
+        279,
+        18826,
+        18082,
+        279,
+        1534,
+        5484
+      ],
+      "name": "long_prose_reasoning_budget_4",
+      "paired_with": "long_prose",
+      "prompt": "A compiler translates a program written in a high-level language into a form a machine can execute. It reads the source text, groups the characters into tokens, builds a tree that reflects the grammar of the language, checks that the names and types in that tree are consistent, and then emits instructions for a particular target. Each of those stages can fail, and a good compiler reports the failure in terms of the source the programmer wrote rather than the internal representation it happened to be using at the time. The last stage, code generation, is where",
+      "prompt_tokens": 108,
+      "reasoning_budget": 4
     }
   ],
   "entry_point": "Qwen35Model::generate (crates/inference/src/model/qwen35/generation.rs)",
@@ -71,5 +132,5 @@
   "producer_features": [
     "f16"
   ],
-  "schema_version": 1
+  "schema_version": 2
 }

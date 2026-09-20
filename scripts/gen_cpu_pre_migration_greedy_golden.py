@@ -51,7 +51,14 @@ TOKEN_IDS_RE = re.compile(r"^Token IDs: \[(.*)\]$", re.MULTILINE)
 PROMPT_TOKENS_RE = re.compile(r"^Prompt tokens:\s+(\d+)$", re.MULTILINE)
 
 
-def run_case(binary: Path, model_dir: Path, prompt: str) -> tuple[list[int], int]:
+def run_case(
+    binary: Path, model_dir: Path, prompt: str, reasoning_budget: int | None = None
+) -> tuple[list[int], int]:
+    # A budgeted case is a different code path, not a different prompt: the
+    # override that replaces the sampled id with `</think>` is unreachable while
+    # the budget is unset, so a golden captured without this flag freezes the
+    # decode loop with that branch permanently dark.
+    budget_args = [] if reasoning_budget is None else ["--reasoning-budget", str(reasoning_budget)]
     proc = subprocess.run(
         [
             str(binary),
@@ -60,6 +67,7 @@ def run_case(binary: Path, model_dir: Path, prompt: str) -> tuple[list[int], int
             "--max-tokens", str(PINNED["max_new_tokens"]),
             "--temperature", PINNED["temperature"],
             "--repetition-penalty", PINNED["repetition_penalty"],
+            *budget_args,
         ],
         capture_output=True,
         text=True,
@@ -107,7 +115,9 @@ def main() -> int:
 
     changed = []
     for case in doc["cases"]:
-        ids, prompt_tokens = run_case(args.binary, args.model_dir, case["prompt"])
+        ids, prompt_tokens = run_case(
+            args.binary, args.model_dir, case["prompt"], case.get("reasoning_budget")
+        )
         if ids != case["expected_generated_ids"] or prompt_tokens != case["prompt_tokens"]:
             changed.append(case["name"])
             print(f"{case['name']}: CHANGED")
