@@ -12,6 +12,18 @@
 //! feature. Exact ID equality, not a float tolerance: greedy decode is
 //! deterministic, and the capture was verified reproducible across repeat runs.
 //!
+//! **Each prompt is frozen twice, and the second capture is the one that took
+//! work to justify.** The original pair pinned `reasoning_budget: null`, and
+//! `effective_reasoning_budget` returns `None` whenever the budget is unset, so
+//! `DecodePolicy::apply_override` never executed in either case: a migration
+//! that got the candidate-to-final override wrong would have reproduced those
+//! ids exactly. The `_reasoning_budget_4` cases close that hole by replaying the
+//! same prompts with a budget, which forces `</think>` at the budget index and
+//! puts the separate reasoning/answer accounting on the measured path. A
+//! control asserts each budgeted case agrees with its unbudgeted pair up to the
+//! budget and disagrees at it, because a budgeted case that matched its pair
+//! would look like coverage while proving nothing.
+//!
 //! **Not interchangeable with the QuaRot Q4 golden.** `quarot_q4_composed_golden`
 //! freezes tokens generated *from a rotated Q4 artifact* through
 //! `MetalQwen35State::from_q4_dir`, so quantization error and the rotation are
@@ -71,6 +83,15 @@ struct GoldenCase {
     prompt: String,
     prompt_tokens: usize,
     expected_generated_ids: Vec<u32>,
+    /// Per-case override of `generation.reasoning_budget`. Absent means the
+    /// shared unbudgeted config, which is what the two original cases use.
+    #[serde(default)]
+    reasoning_budget: Option<usize>,
+    /// The unbudgeted case this one was captured against, so the divergence
+    /// control can compare two real captures instead of a capture against a
+    /// hand-written expectation.
+    #[serde(default)]
+    paired_with: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +99,13 @@ struct GoldenGeneration {
     temperature: f32,
     repetition_penalty: f32,
     seed: Option<u64>,
+    /// Load-bearing for the budgeted cases: `force_close_think` requires it, so
+    /// the gate sets it explicitly rather than inheriting whatever
+    /// `GenerateConfig::default()` happens to carry.
+    enable_thinking: bool,
+    top_k: usize,
+    top_p: f32,
+    stop_token_ids: Vec<u32>,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +205,8 @@ fn cpu_pre_migration_greedy_golden() {
         cfg.temperature = golden.generation.temperature;
         cfg.repetition_penalty = golden.generation.repetition_penalty;
         cfg.seed = golden.generation.seed;
+        cfg.enable_thinking = golden.generation.enable_thinking;
+        cfg.reasoning_budget = case.reasoning_budget;
 
         let output = model
             .generate(&case.prompt, &cfg)
@@ -220,19 +250,43 @@ mod controls {
         }
     }
 
+    /// `</think>`. Duplicated as a literal on purpose: the production constant
+    /// lives in a `pub` module, but writing the number here means a rename or a
+    /// re-point of that constant cannot silently carry this control with it.
+    /// The capture that produced the budgeted cases emitted exactly this id.
+    const THINK_CLOSE_TOKEN_ID: u32 = 248_069;
+
     #[test]
-    fn fixture_parses_and_declares_both_cases() {
+    fn fixture_parses_and_declares_all_four_cases() {
         let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
         let names: Vec<&str> = golden.cases.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["short_factual", "long_prose"]);
+        assert_eq!(
+            names,
+            vec![
+                "short_factual",
+                "long_prose",
+                "short_factual_reasoning_budget_4",
+                "long_prose_reasoning_budget_4",
+            ]
+        );
         for case in &golden.cases {
+            // `decode_cap`'s documented contract: a reasoning budget gives the
+            // reasoning tokens their OWN budget on top of the answer budget,
+            // plus one for the forced `</think>` delimiter. An unbudgeted case
+            // is capped at `max_new_tokens` alone. Both captures ran to their
+            // cap, so equality is the right assertion, and it fails loudly if
+            // that accounting ever changes.
+            let expected_len = match case.reasoning_budget {
+                Some(budget) if budget > 0 => budget + golden.max_new_tokens + 1,
+                _ => golden.max_new_tokens,
+            };
             assert_eq!(
                 case.expected_generated_ids.len(),
-                golden.max_new_tokens,
-                "case {} froze {} ids but max_new_tokens is {}",
+                expected_len,
+                "case {} froze {} ids but its cap is {}",
                 case.name,
                 case.expected_generated_ids.len(),
-                golden.max_new_tokens
+                expected_len
             );
         }
         // The config the gate replays must be the greedy one, not GenerateConfig's
@@ -242,6 +296,79 @@ mod controls {
         assert_eq!(golden.generation.temperature, 0.0);
         assert_eq!(golden.generation.repetition_penalty, 1.0);
         assert_eq!(golden.generation.seed, None);
+        // Without this the budgeted cases would be capturing the disabled path:
+        // `effective_reasoning_budget` returns None whenever thinking is off, so
+        // a fixture recording a budget alongside `enable_thinking: false` would
+        // freeze ordinary unbudgeted ids under a budgeted name.
+        assert!(golden.generation.enable_thinking);
+    }
+
+    #[test]
+    fn fields_the_gate_does_not_set_match_the_config_default() {
+        // `top_k`, `top_p` and `stop_token_ids` are recorded in the fixture but
+        // never written onto the replayed config, which is only safe while they
+        // equal what `GenerateConfig::default()` already carries. Co-located
+        // values that nothing reads are how a fixture comes to describe a run
+        // that never happened; this is the read that keeps them honest.
+        let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
+        let default = lattice_inference::GenerateConfig::default();
+        assert_eq!(golden.generation.top_k, default.top_k);
+        assert_eq!(golden.generation.top_p, default.top_p);
+        assert_eq!(golden.generation.stop_token_ids, default.stop_token_ids);
+    }
+
+    #[test]
+    fn every_budgeted_case_diverges_from_its_pair_at_the_budget() {
+        // The point of the budgeted cases. `apply_override` replaces the sampled
+        // id with `</think>` once `generated_so_far` reaches the budget, so a
+        // budgeted capture must agree with its unbudgeted pair on every earlier
+        // token and disagree at exactly that index. A budgeted case whose ids
+        // matched its pair would prove nothing at all, which is the failure this
+        // control exists to make impossible to miss.
+        let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
+        let mut checked = 0usize;
+        for case in &golden.cases {
+            let (Some(budget), Some(pair_name)) =
+                (case.reasoning_budget, case.paired_with.as_ref())
+            else {
+                continue;
+            };
+            let pair = golden
+                .cases
+                .iter()
+                .find(|c| &c.name == pair_name)
+                .unwrap_or_else(|| panic!("case {} names a pair that is absent", case.name));
+            assert_eq!(
+                pair.prompt, case.prompt,
+                "case {} and its pair must share a prompt or the comparison is between two runs",
+                case.name
+            );
+            assert!(pair.reasoning_budget.is_none(), "a pair must be unbudgeted");
+            assert!(budget < pair.expected_generated_ids.len());
+            assert_eq!(
+                case.expected_generated_ids[..budget],
+                pair.expected_generated_ids[..budget],
+                "case {} diverges from its pair BEFORE the budget",
+                case.name
+            );
+            assert_eq!(
+                case.expected_generated_ids[budget], THINK_CLOSE_TOKEN_ID,
+                "case {} does not carry the forced close token at its budget",
+                case.name
+            );
+            assert_ne!(
+                case.expected_generated_ids[budget], pair.expected_generated_ids[budget],
+                "case {} agrees with its unbudgeted pair at the budget index, so the \
+                 override path was never exercised",
+                case.name
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 2,
+            "expected two budgeted cases to check; a fixture edit that drops them \
+             would otherwise leave this control vacuously green"
+        );
     }
 
     #[test]
