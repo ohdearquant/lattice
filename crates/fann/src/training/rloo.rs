@@ -1205,6 +1205,19 @@ mod tests {
         // action_idx=2, reward=1.0, RlooConfig::default()) by running the
         // pre-refactor `step` at base commit 0d4507889a, before `step_impl`
         // existed, then asserted tight against drift.
+        //
+        // This fixture CANNOT see the load-balance term at all, and that is a
+        // property of the fixture rather than of the code it pins: a fresh
+        // trainer's `route_freqs` are uniform, and `load_balance_aux_gradient`
+        // is identically zero at uniform freqs (`K * p_j * (f_j - f-bar)` with
+        // every `f_j` equal), whatever `probs` is. Mutating the aux term's
+        // scale leaves this assertion green. It pins the policy and z-loss
+        // arms; the arm that pins the load-balance one is
+        // `step_output_is_pinned_on_a_fixture_that_can_see_the_aux_term`
+        // below, which drifts the frequencies first. Kept because the
+        // fresh-trainer path is also worth pinning, and labelled because an
+        // unlabelled pin that cannot express the defect it names is worse
+        // than no pin.
         let expected: [f32; 4] = [0.09232578, 0.0055880453, -0.08243938, -0.02555845];
         for (i, (&got, &want)) in after.iter().zip(expected.iter()).enumerate() {
             assert!(
@@ -1212,6 +1225,40 @@ mod tests {
                 "step()'s output must be pinned at i={i}: got={got}, want={want}"
             );
         }
+    }
+
+    /// `step`'s output is BIT-identical across the `step_impl` refactor on a
+    /// fixture where the load-balance term is non-zero, which is the arm the
+    /// fresh-trainer pin above cannot provide.
+    ///
+    /// The refactor routes `step` through `aux_scale = 1.0`. That is exact for
+    /// every finite `f32`, so the claim is bit-identity rather than tolerance,
+    /// and the assertion compares raw bit patterns: a tolerance here would
+    /// accept precisely the drift the claim denies.
+    ///
+    /// The expected bits were captured by running this same fixture against
+    /// the PRE-refactor `step` at base commit `0d4507889a` and read back as
+    /// `to_bits()`, not transcribed from a decimal rendering. The fixture's
+    /// sensitivity was then established in the same pass by mutating the
+    /// `None` branch's scale from `1.0` to `2.0`, which moved every one of the
+    /// four words.
+    #[test]
+    fn step_output_is_pinned_on_a_fixture_that_can_see_the_aux_term() {
+        let (mut gate, mut trainer) = drifted_off_uniform(&test_gate(), RlooConfig::default());
+        trainer.step(&mut gate, &CTX, 2, 1.0).unwrap();
+        let bits: Vec<u32> = gate
+            .forward(&CTX)
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+
+        assert_eq!(
+            bits,
+            vec![1035781587, 1001842595, 3181957232, 3167838379],
+            "step() must be bit-identical to its pre-refactor form on a \
+             fixture with non-uniform route frequencies"
+        );
     }
 
     /// `w_full` of the wrong width is a caller error, not a shape to silently
