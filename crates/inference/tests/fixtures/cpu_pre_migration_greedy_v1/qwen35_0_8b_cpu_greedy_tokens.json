@@ -1,0 +1,75 @@
+{
+  "artifact_kind": "lattice-cpu-pre-migration-greedy-token-golden",
+  "captured_at_ref": "d5e757524e4f8bce21d416b8f8fe0a80aa00b8df",
+  "cases": [
+    {
+      "expected_generated_ids": [
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369,
+        11751,
+        13,
+        198,
+        760,
+        6511,
+        314,
+        9338,
+        369
+      ],
+      "name": "short_factual",
+      "prompt": "The capital of France is",
+      "prompt_tokens": 5
+    },
+    {
+      "expected_generated_ids": [
+        279,
+        18826,
+        18082,
+        279,
+        5484,
+        1970,
+        13,
+        271,
+        760,
+        18826,
+        369,
+        264,
+        5224,
+        421,
+        45351,
+        264
+      ],
+      "name": "long_prose",
+      "prompt": "A compiler translates a program written in a high-level language into a form a machine can execute. It reads the source text, groups the characters into tokens, builds a tree that reflects the grammar of the language, checks that the names and types in that tree are consistent, and then emits instructions for a particular target. Each of those stages can fail, and a good compiler reports the failure in terms of the source the programmer wrote rather than the internal representation it happened to be using at the time. The last stage, code generation, is where",
+      "prompt_tokens": 108
+    }
+  ],
+  "entry_point": "Qwen35Model::generate (crates/inference/src/model/qwen35/generation.rs)",
+  "generation": {
+    "enable_thinking": true,
+    "reasoning_budget": null,
+    "repetition_penalty": 1.0,
+    "seed": null,
+    "stop_token_ids": [
+      248046
+    ],
+    "temperature": 0.0,
+    "top_k": 50,
+    "top_p": 0.9
+  },
+  "loader": "Qwen35Model::from_safetensors",
+  "max_new_tokens": 16,
+  "model_dtype": "bf16 safetensors, loaded under the f16 feature",
+  "model_id": "Qwen/Qwen3.5-0.8B",
+  "prefill_path": "prefill_tokens_batched_for_generate (dense config; the serial fallback is MoE-only and the test-only force_serial_prefill toggle is not reachable from this binary)",
+  "producer": "target/release/qwen35_generate",
+  "producer_features": [
+    "f16"
+  ],
+  "schema_version": 1
+}

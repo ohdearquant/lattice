@@ -411,6 +411,27 @@ jobs:
       # divergence — locally-green, CI-green, and still rotting — cannot recur.
       - name: inference — default-feature clippy, isolated (no workspace unification)
         run: cargo clippy -p lattice-inference --all-targets -- -D warnings
+      # The R03 golden gate (`crates/inference/tests/cpu_pre_migration_greedy_golden.rs`)
+      # is declared `test = false`, which keeps it out of `cargo test --workspace` —
+      # it enforces by default and replays a 1.6 GiB checkpoint no runner has. That
+      # exclusion ALSO removes it from `--all-targets` above: measured, the step
+      # before this one compiles `tests/quarot_q4_composed_golden.rs` and does not
+      # compile this file. So the target is linted by name, on both of its
+      # compilation arms — the file's `f16` and non-`f16` bodies are different code,
+      # and linting one says nothing about the other.
+      - name: inference — R03 golden gate lint (excluded from --all-targets by test = false)
+        run: |
+          cargo clippy -p lattice-inference --test cpu_pre_migration_greedy_golden -- -D warnings
+          cargo clippy -p lattice-inference --test cpu_pre_migration_greedy_golden --features f16 -- -D warnings
+      # ...and its checkpoint-free controls DO run here. They are the part a runner
+      # can verify: that the gate refuses an unset, relative or missing checkpoint
+      # and refuses every bypass variable, plus the must-pass arms showing the
+      # accepting paths still accept. Without this step the controls would live in
+      # a target nothing ever runs, which is the failure mode the gate itself is
+      # written against. The filter is what keeps the checkpoint-replaying test out;
+      # it is named here rather than hidden in a runtime skip branch.
+      - name: inference — R03 golden gate controls (no checkpoint required)
+        run: "cargo test -p lattice-inference --test cpu_pre_migration_greedy_golden -- controls::"
       # `cargo test --workspace`'s default target set is lib, bins, tests,
       # benches, and doctests — it does NOT include `[[example]]` targets
       # (that needs an explicit `--example`/`--examples`/`--all-targets`).
