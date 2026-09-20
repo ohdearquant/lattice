@@ -348,6 +348,260 @@ mod tests {
         );
     }
 
+    /// A dotted `(major, minor, patch)`.
+    type Version = (u64, u64, u64);
+
+    /// One `since` declaration: the 1-based line it was read from, and either
+    /// its parsed version or the reason it could not be read.
+    type SinceDeclaration = (usize, Result<Version, String>);
+
+    /// Every `(major, minor, patch)` a `#[deprecated(since = ...)]` declares in
+    /// this crate's sources, with the file and 1-based line it was read from.
+    ///
+    /// The scan is lexical and deliberately shaped so that it cannot see its
+    /// own fixtures. It looks for the bare token followed by `=` and then an
+    /// UNESCAPED double quote; every fixture in this module spells that quote
+    /// `\"` inside a Rust string literal, so the bytes on disk are a backslash
+    /// where the scanner requires a quote. That is the same property the
+    /// silent-return scan above relies on, and it is stated here because it is
+    /// load-bearing rather than incidental: without it this very file would
+    /// report its own must-fail fixtures as crate defects and the guard could
+    /// never be green.
+    ///
+    /// A declaration whose value does not parse as dotted integers is returned
+    /// as `Err` rather than dropped. Skipping it would make an unreadable
+    /// declaration indistinguishable from a compliant one, which is the
+    /// fail-open direction: the caller turns it into a failure.
+    fn deprecated_since_declarations(source: &str) -> Vec<SinceDeclaration> {
+        let mut found = Vec::new();
+        for (i, line) in source.lines().enumerate() {
+            let mut rest = line;
+            while let Some(at) = rest.find("since") {
+                let after = &rest[at + "since".len()..];
+                rest = after;
+                // The token must stand alone: `licensed_since = "x"` is not a
+                // deprecation attribute, and neither is `sincerely`.
+                let before_ok = line[..line.len() - after.len() - "since".len()]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+                if !before_ok {
+                    continue;
+                }
+                let after = after.trim_start();
+                let Some(after) = after.strip_prefix('=') else {
+                    continue;
+                };
+                let after = after.trim_start();
+                let Some(after) = after.strip_prefix('"') else {
+                    continue;
+                };
+                let Some(end) = after.find('"') else {
+                    continue;
+                };
+                found.push((i + 1, parse_dotted_version(&after[..end])));
+            }
+        }
+        found
+    }
+
+    /// `"0.11"` and `"0.11.0"` both mean the same release; anything else is an
+    /// error carrying the offending text, never a silent zero.
+    fn parse_dotted_version(raw: &str) -> Result<Version, String> {
+        let mut parts = raw.split('.');
+        let mut next = || -> Result<u64, String> {
+            match parts.next() {
+                None => Ok(0),
+                Some(p) => p
+                    .parse::<u64>()
+                    .map_err(|_| format!("{raw:?} is not a dotted integer version")),
+            }
+        };
+        let (major, minor, patch) = (next()?, next()?, next()?);
+        if parts.next().is_some() {
+            return Err(format!("{raw:?} has more than three components"));
+        }
+        Ok((major, minor, patch))
+    }
+
+    /// The scanner must SEE each spelling that appears in real attributes, and
+    /// must NOT see the near-misses that share the word.
+    ///
+    /// Built as escaped one-line strings on purpose: see the note on
+    /// [`deprecated_since_declarations`]. If a future edit spells one of these
+    /// fixtures as a raw string or a multi-line literal, the quote stops being
+    /// escaped on disk, this file starts reporting itself, and the failure will
+    /// name the fixture rather than a real defect.
+    #[test]
+    fn deprecated_since_scanner_sees_each_spelling_and_no_near_miss() {
+        let seen = |src: &str| -> Vec<Result<Version, String>> {
+            deprecated_since_declarations(src)
+                .into_iter()
+                .map(|(_, v)| v)
+                .collect()
+        };
+
+        assert_eq!(
+            seen("#[deprecated(since = \"0.11.0\", note = \"x\")]"),
+            vec![Ok((0, 11, 0))],
+            "the rustfmt-normalised spelling must be seen"
+        );
+        assert_eq!(
+            seen("    since=\"1.2.3\","),
+            vec![Ok((1, 2, 3))],
+            "the unspaced spelling must be seen; rustfmt normalises it today, \
+             which is a formatting habit and not a guarantee"
+        );
+        assert_eq!(
+            seen("    since   =   \"2.0\","),
+            vec![Ok((2, 0, 0))],
+            "a two-component version means patch 0"
+        );
+        assert_eq!(
+            seen("let licensed_since = \"9.9.9\";"),
+            Vec::new(),
+            "a longer identifier ENDING in the token is not a deprecation \
+             attribute; without the boundary check this scan invents defects"
+        );
+        assert_eq!(
+            seen("/// deprecated since 0.11.0"),
+            Vec::new(),
+            "prose with no `= \"` is not a declaration"
+        );
+        assert!(
+            matches!(seen("since = \"not-a-version\"").as_slice(), [Err(_)]),
+            "an unparseable value is an ERROR, not a skip: dropping it would \
+             make it indistinguishable from a compliant declaration"
+        );
+    }
+
+    /// The comparison must reject a future version at every component, and
+    /// accept the current one.
+    ///
+    /// The equal case is the arm with teeth. `since` naming the version that
+    /// will first CONTAIN the deprecation is the correct declaration, so a
+    /// guard written with `>=` would condemn every correct site and be
+    /// reverted rather than fixed.
+    #[test]
+    fn a_since_above_the_crate_version_is_the_only_rejected_case() {
+        let current: Version = (0, 11, 0);
+        assert!(
+            exceeds(current, (0, 11, 1)),
+            "a future patch must be caught"
+        );
+        assert!(
+            exceeds(current, (0, 12, 0)),
+            "a future minor must be caught"
+        );
+        assert!(exceeds(current, (1, 0, 0)), "a future major must be caught");
+        assert!(
+            !exceeds(current, current),
+            "the version that first contains the deprecation is the CORRECT \
+             declaration and must pass"
+        );
+        assert!(!exceeds(current, (0, 10, 9)), "an older version must pass");
+    }
+
+    fn exceeds(current: Version, declared: Version) -> bool {
+        declared > current
+    }
+
+    /// No `#[deprecated(since = ...)]` in this crate may name a version the
+    /// crate has not reached.
+    ///
+    /// This exists because five declarations drifted to `0.11.1` against an
+    /// unreleased `0.11.0` and nothing noticed; they were corrected by reading
+    /// the registry by hand. A hand check that has to be remembered is not a
+    /// guard.
+    ///
+    /// SCOPE, stated because the invariant is wider than the check: this reads
+    /// `lattice-inference`'s own roots and compares against
+    /// `CARGO_PKG_VERSION`, which every crate here inherits from
+    /// `[workspace.package]`. `crates/embed` carries a `since` declaration that
+    /// this scan does not reach, and reaching it would mean walking out of the
+    /// crate, which is exactly the fail-open [`rust_sources_under`] refuses.
+    /// So the uncovered population is one site in one sibling crate, named
+    /// rather than implied.
+    #[test]
+    fn no_deprecated_since_exceeds_the_crate_version() {
+        let current = parse_dotted_version(env!("CARGO_PKG_VERSION"))
+            .expect("the crate's own version must parse");
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let mut offenders = Vec::new();
+        let mut declarations = 0usize;
+        let mut scanned = Vec::new();
+        let mut symlinks = Vec::new();
+
+        for dir in ["src", "tests", "benches", "examples"] {
+            let root = manifest_dir.join(dir);
+            assert!(
+                is_real_dir(&root),
+                "{root:?} is not a real directory; an absence over a tree that \
+                 was not found is not a clearance, and a symlinked root would \
+                 be followed out of the crate"
+            );
+            let walk = rust_sources_under(&root);
+            symlinks.extend(walk.skipped_symlinks);
+            let before = scanned.len();
+            for path in walk.sources {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
+                for (line, declared) in deprecated_since_declarations(&source) {
+                    declarations += 1;
+                    match declared {
+                        Err(why) => offenders.push(format!("{}:{line}: {why}", path.display())),
+                        Ok(v) if exceeds(current, v) => offenders.push(format!(
+                            "{}:{line}: since = {v:?} is ahead of the crate version {current:?}",
+                            path.display()
+                        )),
+                        Ok(_) => {}
+                    }
+                }
+                scanned.push(path);
+            }
+            assert!(
+                scanned.len() > before,
+                "{root:?} contributed no .rs files; an absence over an empty \
+                 root is not a clearance"
+            );
+        }
+
+        assert!(
+            symlinks.is_empty(),
+            "the scan declined to follow {} symlink(s), so the trees behind \
+             them were not read and the clearance below does not cover them: \
+             {symlinks:?}",
+            symlinks.len()
+        );
+        assert!(
+            scanned.iter().any(|p| p.ends_with("test_support.rs")),
+            "the scan did not reach this very file, so it did not read the \
+             tree it claims to have cleared; scanned {} file(s)",
+            scanned.len()
+        );
+        // The must-MATCH control, in the same pass that produces the absence.
+        // A scanner whose pattern has rotted finds nothing and reports a clean
+        // crate; this crate really does carry deprecation declarations, so a
+        // zero here is an instrument failure and not a clearance.
+        assert!(
+            declarations > 0,
+            "the scan read {} file(s) and found NO `since` declaration at all; \
+             this crate carries several, so this is a dead scanner reporting a \
+             clean result",
+            scanned.len()
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "deprecation `since` declarations this crate cannot support or \
+             cannot read, against crate version {current:?}: {offenders:?}. A \
+             `since` names the first release CONTAINING the deprecation, so it \
+             is at or below the current version, never ahead of it; a value \
+             that does not parse is reported here rather than skipped."
+        );
+    }
+
     /// `is_real_dir` must reject a symlink that points at a directory, and the
     /// naive form must accept it.
     ///
