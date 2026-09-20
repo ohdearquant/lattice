@@ -272,73 +272,91 @@ mod tests {
         assert!(silent_return_after_env_var(fixture).is_empty());
     }
 
+    /// One crate source file: its path, and its text read once.
+    struct CrateSource {
+        path: PathBuf,
+        text: String,
+    }
+
+    /// Every `.rs` file under this crate's own roots, read once for the whole
+    /// test binary, with the structural conditions that make an ABSENCE over
+    /// them meaningful already asserted.
+    ///
+    /// Two scans depend on this population (the silent-return checkpoint scan
+    /// and the deprecation-`since` contract), and before this helper existed
+    /// each carried its own copy of the root list, the real-directory check,
+    /// the per-root population assert and the skipped-symlink assert. That is
+    /// the sibling-invocation-path shape this crate's own guidance warns
+    /// about: a traversal fix would have to land twice or the two would drift.
+    /// It is also two full reads of the same ~12 MB.
+    ///
+    /// The asserts live HERE rather than in the callers on purpose. A caller
+    /// that forgot one would report an absence over a tree it had not
+    /// established it read, and nothing would say so.
+    fn validated_crate_sources() -> &'static [CrateSource] {
+        static SOURCES: std::sync::OnceLock<Vec<CrateSource>> = std::sync::OnceLock::new();
+        SOURCES.get_or_init(|| {
+            let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let mut sources: Vec<CrateSource> = Vec::new();
+            let mut symlinks = Vec::new();
+            // `benches` and `examples` are here because a checkpoint-reading
+            // site does not care which Cargo target it compiles into, and
+            // these two were outside the scan while carrying 56 `.rs` files
+            // between them.
+            for dir in ["src", "tests", "benches", "examples"] {
+                let root = manifest_dir.join(dir);
+                assert!(
+                    is_real_dir(&root),
+                    "{root:?} is not a real directory; a scan cannot report an \
+                     absence over a tree it did not find, and a symlinked root \
+                     would be followed out of the crate"
+                );
+                let walk = rust_sources_under(&root);
+                symlinks.extend(walk.skipped_symlinks);
+                let before = sources.len();
+                for path in walk.sources {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
+                    sources.push(CrateSource { path, text });
+                }
+                // Per root, not just in total. A single large root keeps the
+                // crate-wide count plausible while another contributes
+                // nothing, and a root that silently reads empty is exactly the
+                // failure a widened scan is supposed to make visible.
+                assert!(
+                    sources.len() > before,
+                    "{root:?} contributed no .rs files; an absence over an \
+                     empty root is not a clearance"
+                );
+            }
+            assert!(
+                symlinks.is_empty(),
+                "the walk declined to follow {} symlink(s) under the scanned \
+                 roots, so the trees behind them were not read and no absence \
+                 over this population covers them: {symlinks:?}",
+                symlinks.len()
+            );
+            // A count alone is weak -- a truncated walk still returns a
+            // plausible number -- so the control names a file that must be in
+            // the set: this one.
+            assert!(
+                sources.iter().any(|s| s.path.ends_with("test_support.rs")),
+                "the walk did not reach this very file, so it did not read the \
+                 tree it claims to cover; read {} file(s)",
+                sources.len()
+            );
+            sources
+        })
+    }
+
     #[test]
     fn no_silent_return_checkpoint_sites_remain_in_crate_source() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut all_hits = Vec::new();
-        let mut scanned = Vec::new();
-        let mut symlinks = Vec::new();
-        // `benches` and `examples` are here because a checkpoint-reading site
-        // does not care which Cargo target it compiles into, and these two
-        // were outside the scan while carrying 56 `.rs` files between them.
-        // None of the 56 carries the shape today, so this is prophylactic
-        // rather than a fix -- which is the honest reason to land it, since
-        // the population it protects is the one nobody is watching.
-        let roots = ["src", "tests", "benches", "examples"];
-        for dir in roots {
-            let root = manifest_dir.join(dir);
-            assert!(
-                is_real_dir(&root),
-                "{root:?} is not a real directory; this scan cannot report an \
-                 absence over a tree it did not find, and a symlinked root \
-                 would be followed out of the crate"
-            );
-            let walk = rust_sources_under(&root);
-            symlinks.extend(walk.skipped_symlinks);
-            let before = scanned.len();
-            for path in walk.sources {
-                let source = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
-                for line in silent_return_after_env_var(&source) {
-                    all_hits.push(format!("{}:{line}", path.display()));
-                }
-                scanned.push(path);
+        for source in validated_crate_sources() {
+            for line in silent_return_after_env_var(&source.text) {
+                all_hits.push(format!("{}:{line}", source.path.display()));
             }
-            // Per root, not just in total. A single large root keeps the
-            // crate-wide count plausible while another contributes nothing,
-            // and a root that silently reads empty is exactly the widening
-            // failure this change is supposed to make visible.
-            assert!(
-                scanned.len() > before,
-                "{root:?} contributed no .rs files; an absence over an empty \
-                 root is not a clearance"
-            );
         }
-
-        assert!(
-            symlinks.is_empty(),
-            "the scan declined to follow {} symlink(s) under the scanned \
-             roots, so the trees behind them were not read and the absence \
-             below does not cover them: {symlinks:?}",
-            symlinks.len()
-        );
-
-        // The population assert, without which an empty result is
-        // indistinguishable from a walk that read nothing. A count alone is
-        // weak -- a truncated walk still returns a plausible number -- so the
-        // control names a file that must be in the set: this one.
-        assert!(
-            scanned.len() > 1,
-            "the scan read {} file(s); an empty or near-empty walk makes the \
-             absence below meaningless",
-            scanned.len()
-        );
-        assert!(
-            scanned.iter().any(|p| p.ends_with("test_support.rs")),
-            "the scan did not reach this very file, so it did not read the \
-             tree it claims to have cleared; scanned {} file(s)",
-            scanned.len()
-        );
 
         assert!(
             all_hits.is_empty(),
@@ -351,58 +369,106 @@ mod tests {
     /// A dotted `(major, minor, patch)`.
     type Version = (u64, u64, u64);
 
-    /// One `since` declaration: the 1-based line it was read from, and either
-    /// its parsed version or the reason it could not be read.
+    /// One `#[deprecated(since = ...)]` declaration: the 1-based line it was
+    /// read from, and either its parsed version or the reason it could not be
+    /// used.
     type SinceDeclaration = (usize, Result<Version, String>);
 
-    /// Every `(major, minor, patch)` a `#[deprecated(since = ...)]` declares in
-    /// this crate's sources, with the file and 1-based line it was read from.
+    /// Every `since` a `#[deprecated(...)]` attribute declares in `source`.
     ///
-    /// The scan is lexical and deliberately shaped so that it cannot see its
-    /// own fixtures. It looks for the bare token followed by `=` and then an
-    /// UNESCAPED double quote; every fixture in this module spells that quote
-    /// `\"` inside a Rust string literal, so the bytes on disk are a backslash
-    /// where the scanner requires a quote. That is the same property the
-    /// silent-return scan above relies on, and it is stated here because it is
-    /// load-bearing rather than incidental: without it this very file would
-    /// report its own must-fail fixtures as crate defects and the guard could
-    /// never be green.
+    /// This parses the file with `syn` rather than matching text, and the
+    /// first version of it did match text. That version was wrong in a way
+    /// worth recording, because the lexical form looked sufficient: it
+    /// required a plain `"` after `since =`, so `since = r"0.12.0"`,
+    /// `since = r#"0.12.0"#` and a declaration split across lines all read as
+    /// ABSENT. All three compile -- verified with `rustc --edition 2024` on a
+    /// fixture carrying each -- so the cheapest way to silence that guard was
+    /// to write a raw string, which is the fail-open direction for a guard
+    /// whose entire job is to notice a new declaration.
     ///
-    /// A declaration whose value does not parse as dotted integers is returned
-    /// as `Err` rather than dropped. Skipping it would make an unreadable
-    /// declaration indistinguishable from a compliant one, which is the
-    /// fail-open direction: the caller turns it into a failure.
+    /// Parsing removes the class rather than the three instances. It also
+    /// retires a property the lexical version depended on: it could not be
+    /// allowed to see its own fixtures, so every fixture had to spell its
+    /// quote `\"` inside a string literal. A string literal in a function body
+    /// is not an attribute, so the fixtures below can be written as ordinary
+    /// Rust.
+    ///
+    /// Two things are reported rather than skipped, because skipping either
+    /// makes it indistinguishable from a compliant declaration: a value that
+    /// is not a dotted integer version, and a `cfg_attr` that carries a
+    /// `deprecated` payload this reader does not expand.
     fn deprecated_since_declarations(source: &str) -> Vec<SinceDeclaration> {
-        let mut found = Vec::new();
-        for (i, line) in source.lines().enumerate() {
-            let mut rest = line;
-            while let Some(at) = rest.find("since") {
-                let after = &rest[at + "since".len()..];
-                rest = after;
-                // The token must stand alone: `licensed_since = "x"` is not a
-                // deprecation attribute, and neither is `sincerely`.
-                let before_ok = line[..line.len() - after.len() - "since".len()]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|c| !c.is_alphanumeric() && c != '_');
-                if !before_ok {
-                    continue;
+        use syn::spanned::Spanned;
+        use syn::visit::Visit;
+
+        struct Collect {
+            found: Vec<SinceDeclaration>,
+        }
+
+        impl<'ast> Visit<'ast> for Collect {
+            fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+                let line = attr.span().start().line;
+                if attr.path().is_ident("cfg_attr")
+                    && matches!(&attr.meta, syn::Meta::List(list)
+                        if list.tokens.to_string().contains("deprecated"))
+                {
+                    self.found.push((
+                        line,
+                        Err("a cfg_attr carrying a `deprecated` payload is not \
+                             expanded by this reader"
+                            .to_string()),
+                    ));
+                    return;
                 }
-                let after = after.trim_start();
-                let Some(after) = after.strip_prefix('=') else {
-                    continue;
-                };
-                let after = after.trim_start();
-                let Some(after) = after.strip_prefix('"') else {
-                    continue;
-                };
-                let Some(end) = after.find('"') else {
-                    continue;
-                };
-                found.push((i + 1, parse_dotted_version(&after[..end])));
+                if !attr.path().is_ident("deprecated") {
+                    return;
+                }
+                // `#[deprecated]` and `#[deprecated = "why"]` declare no
+                // `since` and are not this guard's subject; only the list form
+                // can carry one.
+                if !matches!(attr.meta, syn::Meta::List(_)) {
+                    return;
+                }
+                let mut hit: Option<SinceDeclaration> = None;
+                let parsed = attr.parse_nested_meta(|meta| {
+                    if meta.path.is_ident("since") {
+                        let lit: syn::LitStr = meta.value()?.parse()?;
+                        hit = Some((lit.span().start().line, parse_dotted_version(&lit.value())));
+                    } else {
+                        // Consume this key's value, whatever it is, so an
+                        // unrelated key does not abort the walk over `since`.
+                        let _ = meta
+                            .value()
+                            .and_then(syn::parse::ParseBuffer::parse::<syn::Expr>);
+                    }
+                    Ok(())
+                });
+                match (parsed, hit) {
+                    (Ok(()), Some(found)) => self.found.push(found),
+                    (Ok(()), None) => {}
+                    (Err(e), _) => self.found.push((
+                        line,
+                        Err(format!("a `deprecated` attribute did not parse: {e}")),
+                    )),
+                }
             }
         }
-        found
+
+        let file = match syn::parse_file(source) {
+            Ok(file) => file,
+            // Loud, not skipped. A file this reader cannot parse is a file
+            // whose declarations it cannot see, and reporting it as clean
+            // would be the same absence a compliant file produces.
+            Err(e) => {
+                return vec![(
+                    e.span().start().line,
+                    Err(format!("source did not parse: {e}")),
+                )];
+            }
+        };
+        let mut collect = Collect { found: Vec::new() };
+        collect.visit_file(&file);
+        collect.found
     }
 
     /// `"0.11"` and `"0.11.0"` both mean the same release; anything else is an
@@ -424,16 +490,13 @@ mod tests {
         Ok((major, minor, patch))
     }
 
-    /// The scanner must SEE each spelling that appears in real attributes, and
-    /// must NOT see the near-misses that share the word.
+    /// The reader must see every spelling `rustc` accepts, and no near-miss.
     ///
-    /// Built as escaped one-line strings on purpose: see the note on
-    /// [`deprecated_since_declarations`]. If a future edit spells one of these
-    /// fixtures as a raw string or a multi-line literal, the quote stops being
-    /// escaped on disk, this file starts reporting itself, and the failure will
-    /// name the fixture rather than a real defect.
+    /// The three must-MATCH arms after the plain one are the ones that matter:
+    /// each was a silent MISS for the lexical predecessor, and each compiles.
+    /// They are the reason this reader parses instead of matching text.
     #[test]
-    fn deprecated_since_scanner_sees_each_spelling_and_no_near_miss() {
+    fn deprecated_since_reader_sees_every_accepted_spelling_and_no_near_miss() {
         let seen = |src: &str| -> Vec<Result<Version, String>> {
             deprecated_since_declarations(src)
                 .into_iter()
@@ -442,36 +505,76 @@ mod tests {
         };
 
         assert_eq!(
-            seen("#[deprecated(since = \"0.11.0\", note = \"x\")]"),
+            seen("#[deprecated(since = \"0.11.0\", note = \"x\")]\npub fn a() {}"),
             vec![Ok((0, 11, 0))],
-            "the rustfmt-normalised spelling must be seen"
+            "the ordinary spelling must be seen"
         );
         assert_eq!(
-            seen("    since=\"1.2.3\","),
-            vec![Ok((1, 2, 3))],
-            "the unspaced spelling must be seen; rustfmt normalises it today, \
-             which is a formatting habit and not a guarantee"
+            seen("#[deprecated(since = r\"0.12.0\")]\npub fn a() {}"),
+            vec![Ok((0, 12, 0))],
+            "a raw string must be seen: the lexical predecessor missed this \
+             and it compiles, so it was the cheapest way to silence the guard"
         );
         assert_eq!(
-            seen("    since   =   \"2.0\","),
-            vec![Ok((2, 0, 0))],
-            "a two-component version means patch 0"
+            seen("#[deprecated(since = r#\"0.13.0\"#)]\npub fn a() {}"),
+            vec![Ok((0, 13, 0))],
+            "a hashed raw string must be seen for the same reason"
         );
         assert_eq!(
-            seen("let licensed_since = \"9.9.9\";"),
+            seen("#[deprecated(\n    since\n        = \"0.14.0\"\n)]\npub fn a() {}"),
+            vec![Ok((0, 14, 0))],
+            "a declaration split across lines must be seen: a line-oriented \
+             predicate cannot see this one at all"
+        );
+        assert_eq!(
+            seen("#[deprecated(since = \"0.11.0\")]\npub type A = u8;"),
+            vec![Ok((0, 11, 0))],
+            "the attribute is not tied to one item kind"
+        );
+
+        assert_eq!(
+            seen("pub fn a() { let licensed_since = \"9.9.9\"; }"),
             Vec::new(),
-            "a longer identifier ENDING in the token is not a deprecation \
-             attribute; without the boundary check this scan invents defects"
+            "a longer identifier ending in the token is not an attribute"
         );
         assert_eq!(
-            seen("/// deprecated since 0.11.0"),
+            seen("/// deprecated since 0.11.0\npub fn a() {}"),
             Vec::new(),
-            "prose with no `= \"` is not a declaration"
+            "prose is not a declaration"
         );
+        assert_eq!(
+            seen("pub fn a() { let s = \"#[deprecated(since = \\\"9.9.9\\\")]\"; }"),
+            Vec::new(),
+            "a string containing an attribute is a string. The lexical \
+             predecessor needed every fixture escaped so it could not read \
+             itself; parsing removes that requirement, and this arm pins it"
+        );
+        assert_eq!(
+            seen("#[deprecated]\npub fn a() {}\n#[deprecated = \"why\"]\npub fn b() {}"),
+            Vec::new(),
+            "the bare and name-value forms declare no `since`"
+        );
+
         assert!(
-            matches!(seen("since = \"not-a-version\"").as_slice(), [Err(_)]),
+            matches!(
+                seen("#[deprecated(since = \"nope\")]\npub fn a() {}").as_slice(),
+                [Err(_)]
+            ),
             "an unparseable value is an ERROR, not a skip: dropping it would \
              make it indistinguishable from a compliant declaration"
+        );
+        assert!(
+            matches!(
+                seen("#[cfg_attr(feature = \"x\", deprecated(since = \"9.9.9\"))]\npub fn a() {}")
+                    .as_slice(),
+                [Err(_)]
+            ),
+            "a cfg_attr carrying a deprecation is reported unresolved rather \
+             than silently unread"
+        );
+        assert!(
+            matches!(seen("this is not rust").as_slice(), [Err(_)]),
+            "a file that does not parse is reported, never treated as clean"
         );
     }
 
@@ -526,70 +629,34 @@ mod tests {
     fn no_deprecated_since_exceeds_the_crate_version() {
         let current = parse_dotted_version(env!("CARGO_PKG_VERSION"))
             .expect("the crate's own version must parse");
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 
         let mut offenders = Vec::new();
         let mut declarations = 0usize;
-        let mut scanned = Vec::new();
-        let mut symlinks = Vec::new();
-
-        for dir in ["src", "tests", "benches", "examples"] {
-            let root = manifest_dir.join(dir);
-            assert!(
-                is_real_dir(&root),
-                "{root:?} is not a real directory; an absence over a tree that \
-                 was not found is not a clearance, and a symlinked root would \
-                 be followed out of the crate"
-            );
-            let walk = rust_sources_under(&root);
-            symlinks.extend(walk.skipped_symlinks);
-            let before = scanned.len();
-            for path in walk.sources {
-                let source = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
-                for (line, declared) in deprecated_since_declarations(&source) {
-                    declarations += 1;
-                    match declared {
-                        Err(why) => offenders.push(format!("{}:{line}: {why}", path.display())),
-                        Ok(v) if exceeds(current, v) => offenders.push(format!(
-                            "{}:{line}: since = {v:?} is ahead of the crate version {current:?}",
-                            path.display()
-                        )),
-                        Ok(_) => {}
-                    }
+        let sources = validated_crate_sources();
+        for source in sources {
+            for (line, declared) in deprecated_since_declarations(&source.text) {
+                declarations += 1;
+                match declared {
+                    Err(why) => offenders.push(format!("{}:{line}: {why}", source.path.display())),
+                    Ok(v) if exceeds(current, v) => offenders.push(format!(
+                        "{}:{line}: since = {v:?} is ahead of the crate version {current:?}",
+                        source.path.display()
+                    )),
+                    Ok(_) => {}
                 }
-                scanned.push(path);
             }
-            assert!(
-                scanned.len() > before,
-                "{root:?} contributed no .rs files; an absence over an empty \
-                 root is not a clearance"
-            );
         }
 
-        assert!(
-            symlinks.is_empty(),
-            "the scan declined to follow {} symlink(s), so the trees behind \
-             them were not read and the clearance below does not cover them: \
-             {symlinks:?}",
-            symlinks.len()
-        );
-        assert!(
-            scanned.iter().any(|p| p.ends_with("test_support.rs")),
-            "the scan did not reach this very file, so it did not read the \
-             tree it claims to have cleared; scanned {} file(s)",
-            scanned.len()
-        );
         // The must-MATCH control, in the same pass that produces the absence.
-        // A scanner whose pattern has rotted finds nothing and reports a clean
-        // crate; this crate really does carry deprecation declarations, so a
-        // zero here is an instrument failure and not a clearance.
+        // A reader that has stopped seeing attributes finds nothing and
+        // reports a clean crate; this crate really does carry deprecation
+        // declarations, so a zero here is an instrument failure.
         assert!(
             declarations > 0,
             "the scan read {} file(s) and found NO `since` declaration at all; \
-             this crate carries several, so this is a dead scanner reporting a \
+             this crate carries several, so this is a dead reader reporting a \
              clean result",
-            scanned.len()
+            sources.len()
         );
 
         assert!(
