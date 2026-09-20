@@ -142,6 +142,110 @@ which routing collapses onto one adapter while `f` reports balance. That would m
 too slow to see the collapse it is meant to bound, and it is that observation, not intuition about
 `0.01`, that moves the number.
 
+#### Amendment, 2026-09-20 (Status: **Accepted**, 2026-09-20): "the weight distribution" scopes to the load-balance term only
+
+The second bullet of Decision 3, as amended on 2026-09-19, asks for "the load-balance and z-loss
+terms ... applied to the weight distribution, not only to the selection logits". Read as written it
+puts both terms on the same vector, and that reading is wrong for one of them. The sentence is
+amended to scope the phrase to the load-balance term, and the misreading is named here rather than
+quietly avoided, because the plain reading of the superseded sentence is the one a maintainer
+arrives at.
+
+**The z-loss stays on the raw logits.** It is the _square_ of `log-sum-exp` over the pre-softmax
+scores, `(log Σ_i exp(s_i))²`, with gradient `2 · lse · p_j`. Both are derived for values that are
+unbounded above: the term's whole purpose is to tax a gate that grows its logits without bound,
+which is a thing only an unnormalised vector can do. A mixture weight vector is normalised by
+construction, so the whole chain collapses over it. For `k` adapters whose weights sum to one,
+`lse` ranges from `log(k · e^(1/k))` at uniform to `log(e + k − 1)` at one-hot, so the objective
+runs `2.678` to `3.040` at `k = 4` and spans `0.091` on a value near `17.5` at `k = 64`.
+
+The gradient degenerates further, and the gradient is what a guard has to work through. With `lse`
+confined to that sliver, `2 · lse · p_j` is a near-constant multiple of `p_j`: at `k = 64` the
+multiplier varies by under `0.3%` across the entire space from uniform to one-hot. A term that
+pushes every weight down in proportion to itself, by the same factor whatever the shape, carries no
+information about the shape it is supposed to bound. Applying it there would not be a stricter
+guard, it would be a guard that reports success by arithmetic. `router_z_gradient(&logits, &probs)`
+therefore keeps its current arguments.
+
+**The load-balance term runs on the weight distribution, and specifically on `softmax(selected
+logits / tau)` BEFORE Decision 2's drop and renormalisation.** The ordering is the substance of
+this amendment, not a detail of it. An adapter dropped by the `epsilon` floor has no gradient path
+through the drop, so a balance term computed on the post-floor vector cannot move a weight that has
+already gone to zero. That is precisely the case the guard exists for: a router collapsing onto one
+adapter drives the others under `epsilon`, and at that moment a post-floor term goes silent on the
+exact event it was added to catch. Computed before the floor, the collapsing adapters are still
+present in the distribution and still carry gradient.
+
+`tau` enters this chain as the `1 / tau` scale on the logits, which is bounded below by guard (a).
+Without that floor the scale is unbounded and the balance term's gradient can be made arbitrarily
+small by sharpening, which is the argmax-with-extra-steps failure guard (a) exists to prevent. The
+three mechanisms are load-bearing on each other, as Decision 3 says: this is one of the places that
+is true rather than rhetorical.
+
+**Batch form, per the 2026-09-19 amendment, which this one builds on rather than restates.** The
+term is `load_balance_aux_gradient(route_freqs, ...)` with `route_freqs` the trainer-private
+exponential moving average of which adapter recent decisions selected — not the deprecated
+per-context pull toward uniform, which taxes a gate for confidently and correctly routing a single
+request.
+
+"Only the second argument changes" is the tidy way to state the rest, and it is false, so the three
+things it hides are specified here instead. `load_balance_aux_gradient` refuses unequal lengths with
+`InputSizeMismatch`, its returned gradient indexes the gate's output layer, and it differentiates
+through a plain softmax. A weight vector over the selected top-`k` satisfies none of the three.
+
+- **Projection.** The weight vector is embedded into the gate's full output space before the call:
+  `w_full[selected[i]] = w[i]`, zero elsewhere. Lengths then match by construction, the returned
+  gradient indexes `output_deltas` directly with no scatter step, and the unselected entries take
+  exactly zero from this term, which is the semantics wanted — an adapter that carried no weight in
+  this decision is not something a weight-balance term has anything to say about. The zeros are safe
+  in the formula: `K · p_j · (f_j − Σ_i f_i p_i)` has no division, and `Σ_i f_i p_i` becomes the
+  `f`-mean over the selected set alone, which is the comparison the term wants. `K` becomes the pool
+  size rather than the selected count; that is a constant rescale, and `aux_loss_coeff` already
+  absorbs it.
+- **Temperature.** The helper returns `∂L/∂z` for `p = softmax(z)`. The weights are `softmax(z / tau)`,
+  so the caller multiplies the returned vector by `1 / tau` to reach the gradient with respect to the
+  logits the trainer updates. Omitting that factor does not fail; it rescales the guard by `tau`, and
+  at the small `tau` that is the collapse regime the guard exists for it rescales it _up_, which is
+  the direction that hides the omission.
+- **Entry point.** `step` and `rloo_step` carry neither the selected indices nor `tau` today, and
+  their signatures cannot gain parameters without a major-version break — the same constraint the
+  2026-09-19 amendment records for `RlooConfig`. The learned-weight path therefore routes through a
+  new trainer entry point beside them, taking `w_full` and `tau` alongside the existing arguments,
+  while `step` and `rloo_step` keep today's behaviour with the term on the selection distribution.
+  That is also what binds the guard to the learned path specifically: the learned mode is not
+  permitted to use the entry points that cannot express it.
+- **The EMA follows the same vector.** `observe_routing` takes the per-decision mass over the full
+  output space, so the learned path folds `w_full` rather than a one-hot, and `f` then tracks
+  weighted traffic rather than selection counts — which is the thing a weight-collapse guard has to
+  compare against. Its length check is a silent early return, so the projection above is also what
+  keeps the fold from quietly becoming a no-op.
+
+**Guard (b) is a gradient term, not a monitor.** Decision 3 states that the three mechanisms _bound_
+collapse, and a quantity that is only computed and reported bounds nothing. It belongs in the
+objective the trainer already applies, beside the terms `step` and `rloo_step` fold into
+`output_deltas` today.
+
+**Amended decision.** The second bullet now reads: the load-balance term is applied to the weight
+distribution, `softmax(selected logits / tau)` taken before Decision 2's `epsilon` drop and
+renormalisation, projected into the gate's full output space as `w_full` and scaled by `1 / tau`,
+through `load_balance_aux_gradient(route_freqs, w_full)` with `route_freqs` as defined by the
+2026-09-19 amendment and folded over that same `w_full`; the z-loss term is applied to the raw
+pre-softmax logits, where it is the square of `log-sum-exp`, and `router_z_gradient(&logits,
+&probs)` is unchanged. Both remain gradient terms inside the trainer's step, never separately
+reported quantities.
+
+Consequence stated rather than left to be discovered: the two terms now take their arguments from
+different stages of the same forward pass, the selection logits and the post-temperature weight
+vector, so a future change that reorders selection and weighting silently changes what this guard
+measures. A test should tie each argument to its stage, not merely to a vector of the right length — the
+projection makes every vector in this chain the same length, so length is exactly the property that
+can no longer catch a mistake, and the `1 / tau` factor is invisible to it by construction.
+
+Falsifier, named the way Decision 3 names its others: a closed-loop run in which routing collapses
+onto one adapter while the load-balance gradient stays near zero throughout. That would mean the
+pre-floor placement is not reaching the collapsing adapters after all, and it is that observation,
+not the argument above, that moves the placement.
+
 **4. Caller-supplied weights keep their magnitudes, and are floored without renormalisation.** The
 normalisation in Decision 1 is a property of the learned path, not of the mixture in general. Raw
 gate scores have no calibrated magnitude, so they have to become proportions before two requests can
