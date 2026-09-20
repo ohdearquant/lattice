@@ -24,7 +24,7 @@ pub use self::gemma4_model::Gemma4Model;
 pub use self::qwen::{LayerTimings, ProfileTimings, QwenConfig, QwenModel};
 pub use self::qwen35::{HiddenPooling, Qwen35Model};
 #[deprecated(
-    since = "0.11.1",
+    since = "0.11.0",
     note = "moved under ADR-092; use `lattice_inference::GenerateConfig`"
 )]
 pub type GenerateConfig = crate::generation::GenerateConfig;
