@@ -38,12 +38,12 @@ pub(crate) static FORCE_SERIAL_PREFILL: std::sync::atomic::AtomicBool =
 pub(crate) static SERIAL_PREFILL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
-fn force_serial_prefill() -> bool {
+pub(crate) fn force_serial_prefill() -> bool {
     FORCE_SERIAL_PREFILL.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(not(test))]
-fn force_serial_prefill() -> bool {
+pub(crate) fn force_serial_prefill() -> bool {
     false
 }
 
@@ -1292,7 +1292,7 @@ fn grammar_output(
     }
 }
 
-fn initial_rng_state(seed: Option<u64>) -> u64 {
+pub(crate) fn initial_rng_state(seed: Option<u64>) -> u64 {
     match seed {
         Some(s) => {
             if s == 0 {
@@ -1319,7 +1319,7 @@ fn finish_detokenizer(
     (!confirmed_stop_string_match).then(|| detok.finish())
 }
 
-fn prefill_tokens(
+pub(crate) fn prefill_tokens(
     model: &Qwen35Model,
     prompt_ids: &[u32],
     gdn_states: &mut [GatedDeltaNetState],

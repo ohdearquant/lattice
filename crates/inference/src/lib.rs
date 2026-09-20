@@ -58,7 +58,13 @@ pub mod weights;
 /// and [`model`].
 pub mod batch;
 pub(crate) mod bounded_read;
-#[allow(dead_code)] // removed by the row that adds the first DecoderSession implementation
+// Dead-code analysis asks who CALLS a thing, not who implements it. This row adds
+// the first `DecoderSession` implementation and nothing outside `#[cfg(test)]`
+// reaches it, so the whole module still reads as dead under the plain lib build.
+// The attribute comes off with the row that routes `generate()` through the
+// session, which is the first PRODUCTION caller. An earlier version of this
+// comment named the implementing row and was wrong about its own trigger.
+#[allow(dead_code)]
 pub(crate) mod decoder;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;

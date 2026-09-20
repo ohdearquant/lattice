@@ -15,6 +15,10 @@ use crate::generation::{GenerateConfig, TopLogprob};
 use crate::grammar::GrammarEngine;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// First concrete [`DecoderSession`] implementation (ADR-090 row B): the CPU dense
+/// Qwen3.5 entry point wrapped over this module's typed vocabulary.
+pub(crate) mod qwen_cpu;
+
 // ---------------------------------------------------------------------------
 // PredictionId / PredictionLedger
 // ---------------------------------------------------------------------------
