@@ -8,6 +8,10 @@
 # API and cannot tell whether a referenced issue is open, closed, or
 # transferred -- it only proves the marker carries *a* numeric reference.
 #
+# Prerequisite: ripgrep (`rg`) on PATH. A missing `rg` is a lint FAILURE
+# (exit 2), never a skip, so an environment without it refuses rather than
+# reporting a clean tree it never scanned.
+#
 # Known approximation (line-based, not a language parser): the lint matches
 # comment-OPENING syntax textually, not an actual tokenizer/AST. It does not
 # know about Rust/shell/Python string literals, so a marker-shaped substring
