@@ -431,7 +431,7 @@ jobs:
       # written against. The filter is what keeps the checkpoint-replaying test out;
       # it is named here rather than hidden in a runtime skip branch.
       - name: inference — R03 golden gate controls (no checkpoint required)
-        run: cargo test -p lattice-inference --test cpu_pre_migration_greedy_golden -- controls::
+        run: "cargo test -p lattice-inference --test cpu_pre_migration_greedy_golden -- controls::"
       # `cargo test --workspace`'s default target set is lib, bins, tests,
       # benches, and doctests — it does NOT include `[[example]]` targets
       # (that needs an explicit `--example`/`--examples`/`--all-targets`).
