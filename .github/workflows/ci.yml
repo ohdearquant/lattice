@@ -201,6 +201,25 @@ jobs:
       - uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
         with:
           deno-version: v2.x
+      # `scripts/ci.sh` runs `scripts/lint-docs.sh`, which runs the source-marker
+      # provenance lint, and that lint scans with ripgrep. No runner image in this
+      # matrix ships it: measured, `rg: not found` on ubuntu-latest, ubuntu-24.04-arm
+      # and macos-latest alike. The trailing `rg --version` is the assertion -- a
+      # silent install failure would otherwise surface later as a lint error that
+      # reads like a lint defect rather than a missing tool.
+      - name: Install ripgrep (source-marker lint dependency)
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            rg --version
+            exit 0
+          fi
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y ripgrep
+          else
+            brew install ripgrep
+          fi
+          rg --version
       - name: Clean lattice crates (force rebuild, keep dep cache)
         run: |
           cargo clean -p lattice-inference 2>/dev/null || true

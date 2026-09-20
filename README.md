@@ -600,8 +600,10 @@ Tracking issues with first-milestone slices: see the
 
 ## Development checks
 
-`make lint-docs` checks tracked Markdown with Deno and runs the capability-fixture
-and path checks. Without Deno, the default command still runs the other checks
+`make lint-docs` checks tracked Markdown with Deno and runs the capability-fixture,
+path and source-marker checks. The source-marker check requires ripgrep (`rg`) and
+fails rather than skipping when it is absent, so it never reports a tree it did not
+scan. Without Deno, the default command still runs the other checks
 and names the skipped Markdown checks in its final line. `--format` and
 `--markdown-only` always require Deno.
 
