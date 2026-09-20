@@ -2339,25 +2339,25 @@ pub(crate) fn checked_double(value: usize, what: &str) -> Result<usize, Inferenc
 /// accepted by the compiler and emits nothing, so it would read as a live deprecation and
 /// warn no one. A deprecated type alias does fire.
 #[deprecated(
-    since = "0.11.1",
+    since = "0.11.0",
     note = "moved under ADR-092; use `lattice_inference::GenerateConfig`"
 )]
 pub type GenerateConfig = crate::generation::GenerateConfig;
 
 #[deprecated(
-    since = "0.11.1",
+    since = "0.11.0",
     note = "moved under ADR-092; use `lattice_inference::GenerateOutput`"
 )]
 pub type GenerateOutput = crate::generation::GenerateOutput;
 
 #[deprecated(
-    since = "0.11.1",
+    since = "0.11.0",
     note = "moved under ADR-092; use `lattice_inference::TokenLogprob`"
 )]
 pub type TokenLogprob = crate::generation::TokenLogprob;
 
 #[deprecated(
-    since = "0.11.1",
+    since = "0.11.0",
     note = "moved under ADR-092; use `lattice_inference::TopLogprob`"
 )]
 pub type TopLogprob = crate::generation::TopLogprob;

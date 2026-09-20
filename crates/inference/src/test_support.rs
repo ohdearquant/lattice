@@ -159,6 +159,20 @@ mod tests {
         hits
     }
 
+    /// What one walk of a root found: the `.rs` files, and every symlink it
+    /// declined to follow.
+    ///
+    /// The second field exists because skipping a symlink and reporting a
+    /// clean tree are the same observable. A symlinked source directory would
+    /// be unscanned and the guard would still say "no silent sites remain",
+    /// which is the fail-open direction. The caller asserts this is empty, so
+    /// a symlink appearing under a scanned root stops the guard and hands the
+    /// decision to a human instead of quietly shrinking the population.
+    struct Walk {
+        sources: Vec<PathBuf>,
+        skipped_symlinks: Vec<PathBuf>,
+    }
+
     /// Walks `root` for `.rs` files, panicking on any read error.
     ///
     /// Errors are loud on purpose. The obvious shape here skips an
@@ -166,17 +180,34 @@ mod tests {
     /// fail open: one unreadable directory renders its entire subtree
     /// invisible, the scan finds nothing, and "no silent sites remain" is
     /// then a statement about a tree that was never read.
-    fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
+    ///
+    /// Symlinks are classified from the directory entry's own file type,
+    /// never from `Path::is_dir`, which follows the link and answers about
+    /// the target. Following is not a stylistic choice here: measured, a link
+    /// at `src/x` pointing at `examples` made this scan report a hit at
+    /// `src/x/probe.rs` for a file in `examples`, a root the scan had not
+    /// named. A link pointing at an ancestor is worse, because the queue
+    /// carries no visited set and the walk does not terminate.
+    fn rust_sources_under(root: &Path) -> Walk {
         let mut pending = vec![root.to_path_buf()];
         let mut sources = Vec::new();
+        let mut skipped_symlinks = Vec::new();
         while let Some(dir) = pending.pop() {
             let entries = std::fs::read_dir(&dir)
                 .unwrap_or_else(|e| panic!("cannot read {dir:?} while scanning for sources: {e}"));
             for entry in entries {
                 let entry =
                     entry.unwrap_or_else(|e| panic!("cannot read an entry under {dir:?}: {e}"));
+                let file_type = entry.file_type().unwrap_or_else(|e| {
+                    panic!(
+                        "cannot stat {:?} while scanning for sources: {e}",
+                        entry.path()
+                    )
+                });
                 let path = entry.path();
-                if path.is_dir() {
+                if file_type.is_symlink() {
+                    skipped_symlinks.push(path);
+                } else if file_type.is_dir() {
                     pending.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "rs") {
                     sources.push(path);
@@ -184,7 +215,11 @@ mod tests {
             }
         }
         sources.sort();
-        sources
+        skipped_symlinks.sort();
+        Walk {
+            sources,
+            skipped_symlinks,
+        }
     }
 
     /// Deliberately-broken control: proves the scanner can FAIL by feeding it
@@ -228,14 +263,25 @@ mod tests {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut all_hits = Vec::new();
         let mut scanned = Vec::new();
-        for dir in ["src", "tests"] {
+        let mut symlinks = Vec::new();
+        // `benches` and `examples` are here because a checkpoint-reading site
+        // does not care which Cargo target it compiles into, and these two
+        // were outside the scan while carrying 56 `.rs` files between them.
+        // None of the 56 carries the shape today, so this is prophylactic
+        // rather than a fix -- which is the honest reason to land it, since
+        // the population it protects is the one nobody is watching.
+        let roots = ["src", "tests", "benches", "examples"];
+        for dir in roots {
             let root = manifest_dir.join(dir);
             assert!(
                 root.is_dir(),
                 "{root:?} is not a directory; this scan cannot report an \
                  absence over a tree it did not find"
             );
-            for path in rust_sources_under(&root) {
+            let walk = rust_sources_under(&root);
+            symlinks.extend(walk.skipped_symlinks);
+            let before = scanned.len();
+            for path in walk.sources {
                 let source = std::fs::read_to_string(&path)
                     .unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
                 for line in silent_return_after_env_var(&source) {
@@ -243,7 +289,24 @@ mod tests {
                 }
                 scanned.push(path);
             }
+            // Per root, not just in total. A single large root keeps the
+            // crate-wide count plausible while another contributes nothing,
+            // and a root that silently reads empty is exactly the widening
+            // failure this change is supposed to make visible.
+            assert!(
+                scanned.len() > before,
+                "{root:?} contributed no .rs files; an absence over an empty \
+                 root is not a clearance"
+            );
         }
+
+        assert!(
+            symlinks.is_empty(),
+            "the scan declined to follow {} symlink(s) under the scanned \
+             roots, so the trees behind them were not read and the absence \
+             below does not cover them: {symlinks:?}",
+            symlinks.len()
+        );
 
         // The population assert, without which an empty result is
         // indistinguishable from a walk that read nothing. A count alone is
