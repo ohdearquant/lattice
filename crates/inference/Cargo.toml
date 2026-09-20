@@ -193,8 +193,10 @@ test = false
 #     -- --nocapture --test-threads=1
 # Its two checkpoint-free controls -- that the counter is live including the
 # zeroed path, and that a vocabulary-width buffer registers in the histogram --
-# are named explicitly in CI, because `--all-targets` COMPILES a `test = false`
-# target without ever RUNNING it.
+# live in a `controls` module that CI runs by name (`-- controls::`), because
+# `--all-targets` COMPILES a `test = false` target without ever RUNNING it. The
+# module boundary, rather than a `--skip` of the measurement, is what keeps a
+# checkpoint-needing test added later from being dragged into that CI step.
 [[test]]
 name = "decoder_allocation_arm"
 test = false

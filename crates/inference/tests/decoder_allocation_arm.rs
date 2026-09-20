@@ -143,68 +143,76 @@ fn snapshot() -> Record {
     }
 }
 
-/// The instrument's own liveness, with the control in the same body.
+/// Checkpoint-free controls, in their own module so CI can name them.
 ///
-/// An ordinary allocation must be counted first. Without that, a zero from the
-/// zeroed-path checks below would be indistinguishable from a dead counter, and
-/// a dead counter is the failure this whole target would report as "no
-/// allocations", which reads like good news.
-#[test]
-fn counter_sees_zeroed_allocations() {
-    reset();
-    let ordinary: Vec<u8> = Vec::with_capacity(4096);
-    let after_ordinary = snapshot();
-    std::hint::black_box(&ordinary);
-    assert!(
-        after_ordinary.calls > 0,
-        "control failed: an ordinary Vec::with_capacity was not counted, so this \
-         target can say nothing about anything"
-    );
+/// The module boundary is the point: a `--skip <measurement>` filter would run
+/// any test added later that DOES need a checkpoint, and fail in CI. Naming the
+/// module runs exactly what is in it.
+mod controls {
+    /// The instrument's own liveness, with the control in the same body.
+    ///
+    /// An ordinary allocation must be counted first. Without that, a zero from the
+    /// zeroed-path checks below would be indistinguishable from a dead counter, and
+    /// a dead counter is the failure this whole target would report as "no
+    /// allocations", which reads like good news.
+    #[test]
+    fn counter_sees_zeroed_allocations() {
+        super::reset();
+        let ordinary: Vec<u8> = Vec::with_capacity(4096);
+        let after_ordinary = super::snapshot();
+        std::hint::black_box(&ordinary);
+        assert!(
+            after_ordinary.calls > 0,
+            "control failed: an ordinary Vec::with_capacity was not counted, so this \
+             target can say nothing about anything"
+        );
 
-    reset();
-    let zeroed: Vec<f32> = vec![0.0f32; 4096];
-    let after_zeroed = snapshot();
-    std::hint::black_box(&zeroed);
-    assert!(
-        after_zeroed.calls > 0,
-        "vec![0.0f32; 4096] allocated without being counted: the default \
-         alloc_zeroed no longer reaches CountingAlloc::alloc, so every \
-         vocabulary-sized zeroed buffer is invisible to this arm"
-    );
-}
+        super::reset();
+        let zeroed: Vec<f32> = vec![0.0f32; 4096];
+        let after_zeroed = super::snapshot();
+        std::hint::black_box(&zeroed);
+        assert!(
+            after_zeroed.calls > 0,
+            "vec![0.0f32; 4096] allocated without being counted: the default \
+             alloc_zeroed no longer reaches CountingAlloc::alloc, so every \
+             vocabulary-sized zeroed buffer is invisible to this arm"
+        );
+    }
 
-/// The detector must be able to express the thing it is looking for.
-///
-/// A histogram that has never registered a large allocation proves nothing about
-/// a run in which none appears. This deliberately materializes a buffer of the
-/// width D1 forbids across the interface and shows the check catching it.
-#[test]
-fn vocabulary_sized_allocation_is_detected() {
-    const VOCAB_ISH: usize = 151_936;
+    /// The detector must be able to express the thing it is looking for.
+    ///
+    /// A histogram that has never registered a large allocation proves nothing about
+    /// a run in which none appears. This deliberately materializes a buffer of the
+    /// width D1 forbids across the interface and shows the check catching it.
+    #[test]
+    fn vocabulary_sized_allocation_is_detected() {
+        const VOCAB_ISH: usize = 151_936;
+        let threshold = super::LARGE_ALLOC_BYTES;
 
-    reset();
-    let before = snapshot();
-    assert_eq!(
-        before.large_calls, 0,
-        "a reset record already carries a large allocation"
-    );
+        super::reset();
+        let before = super::snapshot();
+        assert_eq!(
+            before.large_calls, 0,
+            "a reset record already carries a large allocation"
+        );
 
-    let logits_width: Vec<f32> = vec![0.0f32; VOCAB_ISH];
-    let after = snapshot();
-    std::hint::black_box(&logits_width);
+        let logits_width: Vec<f32> = vec![0.0f32; VOCAB_ISH];
+        let after = super::snapshot();
+        std::hint::black_box(&logits_width);
 
-    assert!(
-        after.large_calls > before.large_calls,
-        "a {VOCAB_ISH}-entry f32 buffer ({} bytes) did not register as a large \
-         allocation against a {LARGE_ALLOC_BYTES}-byte threshold",
-        VOCAB_ISH * 4
-    );
-    assert!(
-        after.max_bytes >= VOCAB_ISH * 4,
-        "max_bytes {} is below the buffer just allocated ({} bytes)",
-        after.max_bytes,
-        VOCAB_ISH * 4
-    );
+        assert!(
+            after.large_calls > before.large_calls,
+            "a {VOCAB_ISH}-entry f32 buffer ({} bytes) did not register as a large \
+             allocation against a {threshold}-byte threshold",
+            VOCAB_ISH * 4
+        );
+        assert!(
+            after.max_bytes >= VOCAB_ISH * 4,
+            "max_bytes {} is below the buffer just allocated ({} bytes)",
+            after.max_bytes,
+            VOCAB_ISH * 4
+        );
+    }
 }
 
 /// The measurement. Prints one machine-readable record per case and asserts only
