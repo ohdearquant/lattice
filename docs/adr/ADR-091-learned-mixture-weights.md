@@ -268,6 +268,54 @@ distinguishable from one naming an adapter that was **present at a small weight*
 different facts about the caller's own request, and only a record of what was dropped and what
 survived lets the caller tell them apart.
 
+#### Amendment, 2026-09-20 (Status: **Accepted**, 2026-09-20): the caller-path floor compares magnitude
+
+Decision 4 says caller-supplied weights are floored at `epsilon`, and gives the reason by quoting
+Decision 2: an adapter below the floor "pays its full rank in the decode of every token and changes
+nothing". That reason is a statement about **magnitude**. The decision as written admits a comparison
+of the **signed** value, and the implementation took that reading
+(`crates/inference/src/mixture.rs`, `apply_caller_weights` delegating to `apply_floor`). The
+misreading is named here rather than quietly avoided, because it is the plain reading of the
+superseded sentence.
+
+On the gate-computed path the two comparisons are equivalent and always will be: both weight
+policies produce non-negative weights, `WeightPolicy::Uniform` as `1/k` and `WeightPolicy::Softmax`
+as a softmax. So the rules agree on precisely the population Decision 1 is about, and every fixture
+drawn from it passes under either.
+
+They disagree on the caller path, and the serving contract is the disagreeing case. `docs/serve-http-api.md`
+states that adapter scales "are not normalized and may be negative or zero"; the request validator
+rejects only non-finite values. A caller naming an adapter at `-0.5` is asking for a full-strength
+contribution in the other direction. Under the signed comparison that adapter is dropped at **every**
+non-negative `epsilon`, the `0.0` default included, while a `+0.0005` adapter — the one the cost
+argument is actually about — survives at any smaller floor. The rule is inverted with respect to its
+own stated reason on the one path it was written for.
+
+**Amended decision.** On the caller-supplied path the floor compares `|w|` against `epsilon`: an
+adapter is dropped when its magnitude is below the floor, whatever its sign. The gate-computed path
+keeps the signed form, where it is equivalent, so the change is confined to one function.
+
+Consequences stated rather than left to be discovered:
+
+- **`epsilon = 0.0` is a true no-op on the caller path.** `|w| < 0.0` is never satisfied, so nothing
+  is dropped. That is the right default for a number this record deliberately leaves open, and it is
+  not what the signed rule does.
+- **At that default a zero-scale adapter still survives**, since `0.0 < 0.0` is false — and that is
+  the very case Decision 2's cost argument names, an adapter paying its full rank for exactly zero
+  output change. The cost argument therefore only bites once an operator sets a positive `epsilon`.
+  This record leaves that number open on purpose; what it fixes is that the floor, when set, selects
+  on the quantity the argument is about.
+- **Sign and magnitude of a survivor are preserved.** The floor decides presence only, never
+  strength and never direction, on a path whose magnitudes are the request.
+- `NaN` survives under both the old and the new rule, since every ordered comparison against it is
+  false. The serving boundary rejects non-finite scales before this point, but the function is public
+  and states this rather than inheriting it silently.
+
+Falsifier, named the way Decision 3 names its others: a caller who wants a negative-scale adapter
+dropped by the floor for being **negative** rather than for being **small**. That is a direction
+policy, a different decision from this one, and it is that request rather than the argument above
+that reopens this.
+
 **5. Acceptance fixes the contract; the evidence gate flips the default.** Accepting this ADR fixes
 the contract: weights drawn from the gate's own scores at temperature `tau` (Decision 1), the floor
 that drops rather than damps (Decision 2), the three collapse guards (Decision 3), and refit

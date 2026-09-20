@@ -644,6 +644,11 @@ pub fn weight_entropy(weights: &[f32]) -> f32 {
 
 /// Remove any weight strictly below `epsilon`, in original order, without
 /// renormalising the survivors.
+///
+/// This is the gate-computed path's signed comparison. Both weight policies
+/// produce non-negative weights, so comparing `w` and comparing `|w|` select
+/// the same survivors here. The caller-supplied path, whose weights may be
+/// negative, compares magnitude instead — see [`apply_caller_weights`].
 fn apply_floor(weights: Vec<(AdapterId, f32)>, epsilon: f32) -> FloorOutcome {
     let mut survivors = Vec::with_capacity(weights.len());
     let mut dropped = Vec::new();
@@ -696,8 +701,37 @@ fn floor_and_renormalize(weights: Vec<(AdapterId, f32)>, epsilon: f32) -> FloorO
 /// gate scores have no calibrated magnitude of their own, so they only
 /// become comparable proportions by being renormalised, while a caller's
 /// scale already is one.
+///
+/// The floor compares `|w|`, not `w`. Decision 2's reason for dropping rather
+/// than damping is a cost argument — an adapter below the floor pays its full
+/// rank in the decode of every token and changes nothing — and that is a
+/// statement about magnitude. On the gate-computed path the distinction is
+/// invisible, since both weight policies produce non-negative weights and the
+/// two comparisons agree. On this path they do not: the serving contract
+/// accepts negative scales, and a caller naming an adapter at `-0.5` is asking
+/// for a full-strength contribution in the other direction. Comparing the
+/// signed value would drop it at every non-negative `epsilon` while keeping a
+/// `+0.0005` adapter, which is the one the cost argument is actually about.
+///
+/// A surviving weight keeps its sign and its magnitude: the floor decides
+/// presence only. `NaN` survives, here as under the signed comparison, because
+/// every ordered comparison against it is false; the serving boundary rejects
+/// non-finite scales before reaching this function, but the function is public
+/// and says so rather than inheriting it silently.
 pub fn apply_caller_weights(weights: Vec<(AdapterId, f32)>, epsilon: f32) -> FloorOutcome {
-    apply_floor(weights, epsilon)
+    let mut survivors = Vec::with_capacity(weights.len());
+    let mut dropped = Vec::new();
+    for (id, weight) in weights {
+        if weight.abs() < epsilon {
+            dropped.push(id);
+        } else {
+            survivors.push((id, weight));
+        }
+    }
+    FloorOutcome {
+        weights: survivors,
+        dropped,
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +985,119 @@ mod tests {
         let outcome = apply_caller_weights(weights, 0.05);
         assert_eq!(outcome.dropped, vec!["dropped".to_string()]);
         assert_eq!(outcome.weights, vec![("kept".to_string(), 0.5)]);
+    }
+
+    /// ADR-091 Decision 4's floor compares `|w|`. This is the arm that
+    /// separates that rule from the signed one, and it is load-bearing:
+    /// reverting `apply_caller_weights` to `apply_floor` reddens it.
+    ///
+    /// On this one input the rules give different survivor sets. The signed
+    /// rule drops both entries, since `-0.5 < 0.001` and `0.0005 < 0.001`.
+    /// The magnitude rule keeps the full-strength negative adapter and drops
+    /// only the one the cost argument is about. A fixture built from
+    /// non-negative weights cannot express this, which is why both arms are
+    /// asserted here on the same input.
+    #[test]
+    fn caller_floor_compares_magnitude_not_the_signed_weight() {
+        let weights = vec![("negative".to_string(), -0.5), ("tiny".to_string(), 0.0005)];
+        let outcome = apply_caller_weights(weights.clone(), 0.001);
+
+        assert_eq!(
+            outcome.weights,
+            vec![("negative".to_string(), -0.5)],
+            "a full-strength negative scale is above the floor in magnitude and must survive"
+        );
+        assert_eq!(
+            outcome.dropped,
+            vec!["tiny".to_string()],
+            "only the adapter that pays its rank and changes nothing may be dropped"
+        );
+
+        // The same input under the gate-computed path's signed rule, so the
+        // divergence is exhibited rather than asserted. This is what the
+        // caller path must NOT do.
+        let signed = apply_floor(weights, 0.001);
+        assert_eq!(
+            signed.dropped,
+            vec!["negative".to_string(), "tiny".to_string()],
+            "the signed rule drops the negative adapter too -- that is the defect this arm pins"
+        );
+    }
+
+    /// At the default `epsilon` the caller path drops nothing, negative scales
+    /// included, so wiring the floor into serving cannot change behaviour
+    /// until an operator sets a positive floor.
+    ///
+    /// The consequence stated rather than left to be discovered: a
+    /// `scale: 0.0` adapter — the very case Decision 2's cost argument names,
+    /// since it pays its full rank for exactly zero output change — ALSO
+    /// survives here, because `0.0 < 0.0` is false. The cost argument only
+    /// bites once `epsilon` is positive, and ADR-091 leaves that number open
+    /// on purpose.
+    #[test]
+    fn caller_floor_at_zero_epsilon_drops_nothing_including_zero_and_negative() {
+        let weights = vec![
+            ("negative".to_string(), -0.5),
+            ("zero".to_string(), 0.0),
+            ("tiny".to_string(), 1e-9),
+            ("normal".to_string(), 1.0),
+        ];
+        let outcome = apply_caller_weights(weights.clone(), 0.0);
+
+        assert!(
+            outcome.dropped.is_empty(),
+            "epsilon = 0.0 must be a no-op on the caller path, got dropped {:?}",
+            outcome.dropped
+        );
+        assert_eq!(
+            outcome.weights, weights,
+            "every entry must survive unchanged, in original order"
+        );
+    }
+
+    /// The floor decides presence only. A survivor's sign and magnitude are
+    /// the caller's request and are returned untouched, including when a
+    /// sibling is dropped -- the non-renormalisation property of Decision 4,
+    /// exercised here on a negative weight where a stray `abs()` in the
+    /// returned value would be invisible to the positive-only fixtures.
+    #[test]
+    fn caller_floor_preserves_a_surviving_negative_weight_exactly() {
+        let weights = vec![("kept".to_string(), -0.75), ("dropped".to_string(), -0.002)];
+        let outcome = apply_caller_weights(weights, 0.01);
+
+        assert_eq!(outcome.dropped, vec!["dropped".to_string()]);
+        assert_eq!(
+            outcome.weights,
+            vec![("kept".to_string(), -0.75)],
+            "sign and magnitude of a survivor are the caller's request, not a normalised value"
+        );
+    }
+
+    /// The confinement claim, tested rather than asserted: the gate-computed
+    /// path keeps the signed comparison and is unchanged by this fix. Its
+    /// weights are a softmax and therefore non-negative, which is exactly why
+    /// the two comparisons agree there -- so this arm would stay green under
+    /// either rule, and its job is to catch a fix that widened its blast
+    /// radius into `route`.
+    #[test]
+    fn learned_path_floor_is_unchanged_by_the_caller_path_rule() {
+        let mut router = AdapterRouter::new(scored_gate(1, &[4.0, 2.0, 2.0]));
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 0.5 });
+        router.set_epsilon(1e-3);
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into(), "c".into()];
+        let result = router.route(&[0.0], &available, 3).unwrap();
+
+        for (id, w) in &result {
+            assert!(
+                *w >= 0.0,
+                "gate-computed weights are non-negative by construction; {id} was {w}"
+            );
+        }
+        let sum: f32 = result.iter().map(|(_, w)| *w).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "the learned path still renormalises to 1 over the selected set, got {sum}"
+        );
     }
 
     #[test]
