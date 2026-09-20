@@ -13,6 +13,7 @@
 use crate::error::InferenceError;
 use crate::generation::{GenerateConfig, TopLogprob};
 use crate::grammar::GrammarEngine;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // PredictionId / PredictionLedger
@@ -22,35 +23,58 @@ use crate::grammar::GrammarEngine;
 /// finalization and, if accepted, consumption by the next decode step.
 ///
 /// `Copy` and comparable, but mintable only by [`PredictionLedger::open`] -- there is no
-/// `From<u64>`, no public constructor, and the field is private to this module (visible to
-/// this module's own `tests` submodule, never to the rest of the crate). A caller holding a
-/// `PredictionId` therefore has proof it went through the ledger that owns its validity,
-/// not a bare integer it could have fabricated.
+/// `From<u64>`, no public constructor, and both fields are private to this module (visible
+/// to this module's own `tests` submodule, never to the rest of the crate). A caller
+/// holding a `PredictionId` therefore has proof it went through the ledger that owns its
+/// validity, not a bare integer it could have fabricated.
 ///
-/// One field, not two. An earlier shape carried an `epoch` alongside the sequence number,
-/// bumped by every prefill/reset. It was dead: `seq` is monotonic and never reused, so no
-/// two ids from one ledger are ever equal regardless of epoch, and nothing read the field.
-/// The uniqueness-across-resets property it appeared to provide is actually provided by
-/// `seq` alone, and is pinned by a test below rather than implied by a field.
+/// **`ledger` is not the `epoch` field this type used to carry.** That one was bumped on
+/// every reset and read by nothing: `seq` is monotonic within a ledger and never reused, so
+/// it already made ids unique across resets, which is pinned by a test below. `ledger`
+/// answers a different question the sequence cannot: WHICH ledger minted this. Without it
+/// two freshly constructed ledgers both mint `seq = 0`, and since `is_live`/`consume`
+/// compare ids by value, session A's live prediction would be accepted and consumed by
+/// session B -- the exact cross-session confusion this type exists to make impossible. The
+/// id is assigned once per ledger from a process-wide counter, not once per token, so the
+/// decode path pays no atomic per step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PredictionId {
+    ledger: u64,
     seq: u64,
 }
 
+/// Source of ledger identities. Relaxed ordering is sufficient: the only property required
+/// is that no two `fetch_add` results are equal, which `fetch_add` guarantees on its own
+/// without any happens-before relationship between ledgers.
+static NEXT_LEDGER_ID: AtomicU64 = AtomicU64::new(0);
+
 /// The mechanism that makes "a stale prediction id is rejected" a state fact rather than a
-/// comment. Owns a monotonic sequence counter (never reused, even across epochs), an epoch
-/// bumped by every prefill/reset, and at most one live prediction.
+/// comment. Owns its own identity, a sequence counter that is monotonic within that
+/// identity and never reused, and at most one live prediction.
 ///
 /// D2: "There is one current prediction per evaluated prefix." Selection consumes no
 /// token; eligibility survives candidate selection and final-token metadata reads, and
 /// ends at consumption, cancellation, failure, finish, or another prefill/reset.
-#[derive(Debug, Default)]
+///
+/// No `Default`: constructing a ledger takes an identity from a process-wide counter, and a
+/// `Default` impl would hide that side effect behind a call that reads as inert.
+#[derive(Debug)]
 pub(crate) struct PredictionLedger {
+    id: u64,
     next_seq: u64,
     live: Option<PredictionId>,
 }
 
 impl PredictionLedger {
+    /// A ledger with a fresh identity no other ledger in this process shares.
+    pub(crate) fn new() -> Self {
+        Self {
+            id: NEXT_LEDGER_ID.fetch_add(1, Ordering::Relaxed),
+            next_seq: 0,
+            live: None,
+        }
+    }
+
     /// Mint a new prediction id and make it the ledger's one live prediction.
     ///
     /// **Decision (documented and tested below): supersede, not refuse.** `open` cannot
@@ -64,7 +88,10 @@ impl PredictionLedger {
     /// that bug surface as an ordinary stale-id rejection on whichever id the driver kept,
     /// instead of two simultaneously "live" ids racing to be consumed.
     pub(crate) fn open(&mut self) -> PredictionId {
-        let id = PredictionId { seq: self.next_seq };
+        let id = PredictionId {
+            ledger: self.id,
+            seq: self.next_seq,
+        };
         self.next_seq += 1;
         self.live = Some(id);
         id
@@ -143,10 +170,13 @@ impl From<PredictionError> for InferenceError {
 /// the only way to obtain a `PredictionId` to put in one is [`PredictionLedger::open`], so
 /// construction is gated by the ledger even without a dedicated constructor function.
 ///
-/// Deliberately not `Clone`, not `Copy`: an accepted token is meant to move into `decode`
-/// once. Its embedded `PredictionId` is `Copy` on its own, so a driver that needs to check
-/// or re-consume the prediction after moving the token can still do so from the id alone --
-/// which is exactly the shape the "cannot be consumed twice" rule below tests.
+/// Not `Clone`, not `Copy` -- but that is a hint, not the enforcement, and the difference
+/// matters. D1's `decode(&mut self, accepted: &AcceptedToken, ..)` takes a SHARED borrow, so
+/// the type cannot stop a caller from passing the same token twice; and the embedded
+/// `PredictionId` is `Copy`, so the identity can be lifted out and reused on its own.
+/// Consume-at-most-once is therefore a property of [`PredictionLedger::consume`], which
+/// clears the live slot so the second attempt finds nothing and is rejected exactly like any
+/// other stale id. The non-`Clone` shape only removes the most casual way to get it wrong.
 #[derive(Debug)]
 pub(crate) struct AcceptedToken {
     pub(crate) final_id: u32,
@@ -365,7 +395,7 @@ mod tests {
 
     #[test]
     fn consume_rejects_a_stale_id_but_accepts_a_live_one() {
-        let mut ledger = PredictionLedger::default();
+        let mut ledger = PredictionLedger::new();
         let first = ledger.open();
         ledger.reset(); // invalidates `first`; it is now genuinely stale
         let second = ledger.open();
@@ -386,7 +416,7 @@ mod tests {
 
     #[test]
     fn accepted_token_cannot_be_consumed_twice() {
-        let mut ledger = PredictionLedger::default();
+        let mut ledger = PredictionLedger::new();
         let id = ledger.open();
         let token = AcceptedToken {
             final_id: 7,
@@ -411,7 +441,7 @@ mod tests {
 
     #[test]
     fn cancelled_prediction_is_not_eligible_control_checks_before_cancel() {
-        let mut ledger = PredictionLedger::default();
+        let mut ledger = PredictionLedger::new();
         let id = ledger.open();
 
         // Control: before cancellation, the id passes the eligibility check a
@@ -430,7 +460,7 @@ mod tests {
 
     #[test]
     fn reset_invalidates_the_live_prediction() {
-        let mut ledger = PredictionLedger::default();
+        let mut ledger = PredictionLedger::new();
         let id = ledger.open();
         assert!(ledger.is_live(id)); // control: live immediately after open
 
@@ -446,7 +476,7 @@ mod tests {
 
     #[test]
     fn opening_while_one_is_live_supersedes_the_previous_prediction() {
-        let mut ledger = PredictionLedger::default();
+        let mut ledger = PredictionLedger::new();
         let first = ledger.open();
         assert!(ledger.is_live(first)); // control: live immediately after open
 
@@ -464,12 +494,43 @@ mod tests {
     }
 
     #[test]
+    fn one_ledgers_prediction_is_not_live_or_consumable_in_another() {
+        // Two sessions, each with its own ledger, both at sequence zero. Before this type
+        // carried a ledger identity, both minted an identical id, and since `is_live` and
+        // `consume` compare ids by value, session A's live prediction was accepted and
+        // consumed by session B -- the cross-session confusion the whole type exists to
+        // prevent, reported as a clean success.
+        let mut a = PredictionLedger::new();
+        let mut b = PredictionLedger::new();
+        let from_a = a.open();
+        let from_b = b.open();
+
+        assert_ne!(
+            from_a, from_b,
+            "two fresh ledgers must not mint equal ids at the same sequence"
+        );
+        // Control: each id IS live in the ledger that minted it, so the rejections below
+        // are about issuer identity and not about a ledger that simply has nothing live.
+        assert!(a.is_live(from_a));
+        assert!(b.is_live(from_b));
+
+        assert!(!b.is_live(from_a), "a foreign id must not be eligible");
+        assert_eq!(
+            b.consume(from_a),
+            Err(PredictionError::Stale),
+            "a foreign id must not consume this ledger's live prediction"
+        );
+        // And the victim's own prediction survived the foreign attempt.
+        assert!(b.is_live(from_b));
+    }
+
+    #[test]
     fn ids_are_never_reused_across_resets() {
         // The property an `epoch` field appeared to provide. It is `seq` monotonicity that
         // actually provides it, so it is pinned here instead of implied by a field nothing
         // reads. A ledger that reset its counter would hand out an id equal to a retired
         // one, and `is_live` would then answer `true` for a genuinely stale prediction.
-        let mut ledger = PredictionLedger::default();
+        let mut ledger = PredictionLedger::new();
         let mut seen = Vec::new();
         for _ in 0..4 {
             seen.push(ledger.open());
@@ -585,7 +646,7 @@ mod tests {
                 logprobs: true,
                 ..ExecutionCapabilities::default()
             },
-            ledger: PredictionLedger::default(),
+            ledger: PredictionLedger::new(),
         };
 
         // The coercion below is the object-safety proof: it only type-checks if every
