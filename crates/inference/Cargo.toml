@@ -178,6 +178,27 @@ required-features = ["download", "f16", "metal-gpu", "serve"]
 name = "cpu_pre_migration_greedy_golden"
 test = false
 
+# ADR-090 R03 row D, the allocation half of the pair evidence. Excluded for two
+# independent reasons, either sufficient. It declares a `#[global_allocator]`,
+# which applies to the whole binary it is linked into, so it must be its own
+# target and must not be pulled into a shared one. And its measurement body
+# enforces by default against the same 1.6 GiB bf16 checkpoint the gate above
+# replays, which is not on a CI runner.
+#
+# It is an A/B instrument: a global allocator is per BINARY, so the comparison is
+# this target run at the base ref and again at the head ref with the two printed
+# records diffed. Nothing in it asserts a cross-ref delta, because nothing in it
+# can see one.
+#   cargo test -p lattice-inference --test decoder_allocation_arm --features f16 \
+#     -- --nocapture --test-threads=1
+# Its two checkpoint-free controls -- that the counter is live including the
+# zeroed path, and that a vocabulary-width buffer registers in the histogram --
+# are named explicitly in CI, because `--all-targets` COMPILES a `test = false`
+# target without ever RUNNING it.
+[[test]]
+name = "decoder_allocation_arm"
+test = false
+
 [[bin]]
 name = "bench_decode_ab"
 path = "src/bin/bench_decode_ab.rs"
