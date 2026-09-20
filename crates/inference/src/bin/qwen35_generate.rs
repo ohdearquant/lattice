@@ -98,11 +98,26 @@ fn main() {
     if let Some(rp) = parse_arg(&args, "--repetition-penalty").and_then(|s| s.parse().ok()) {
         gen_cfg.repetition_penalty = rp;
     }
+    // A reasoning budget replaces the sampled token with `</think>` once that many
+    // tokens have been generated, so a capture taken with and without this flag
+    // exercises two different code paths through the same decode loop. Without a
+    // way to set it here, the only reachable value is the `None` default, and the
+    // override path is unreachable from this binary entirely.
+    if let Some(rb) = parse_arg(&args, "--reasoning-budget").and_then(|s| s.parse().ok()) {
+        gen_cfg.reasoning_budget = Some(rb);
+    }
 
     println!("Prompt: {prompt}");
     println!(
-        "Config: temp={}, top_k={}, top_p={}, rep_penalty={}, seed={:?}",
-        gen_cfg.temperature, gen_cfg.top_k, gen_cfg.top_p, gen_cfg.repetition_penalty, gen_cfg.seed
+        "Config: temp={}, top_k={}, top_p={}, rep_penalty={}, seed={:?}, \
+         enable_thinking={}, reasoning_budget={:?}",
+        gen_cfg.temperature,
+        gen_cfg.top_k,
+        gen_cfg.top_p,
+        gen_cfg.repetition_penalty,
+        gen_cfg.seed,
+        gen_cfg.enable_thinking,
+        gen_cfg.reasoning_budget
     );
     println!("Generating up to {max_tokens} tokens...\n");
 
