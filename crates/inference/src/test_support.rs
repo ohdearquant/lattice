@@ -132,18 +132,26 @@ mod tests {
     // (`stop_token_contract`, `metal_measurement_lock_contract`) already rely
     // on.
 
-    /// 1-based line numbers of `env::var(` calls that are followed, with no
-    /// other line between, by a bare `return;` -- the shape this module
-    /// exists to remove. Mirrors the `grep -rn -A1 'env::var(' | grep
-    /// 'return;'` population search from issue #1664 exactly, so a hit here
-    /// is a hit that search would find too.
+    /// 1-based line numbers of `env::var(` calls whose immediately following
+    /// line returns without saying anything -- the shape this module exists
+    /// to remove.
+    ///
+    /// The predicate is `trim().starts_with("return;")`, not equality. An
+    /// earlier version compared for equality and its doc claimed to mirror
+    /// the `grep -rn -A1 'env::var(' | grep 'return;'` population search
+    /// "exactly". It did not: grep matches `return;` as a substring, so
+    /// `        return; // provisioning` is a hit for the search that defined
+    /// this population and was a miss for the scanner. A guard narrower than
+    /// the search that motivated it is a guard that passes on the next
+    /// instance, so the predicate is widened here rather than the claim
+    /// softened, and the trailing-comment shape has its own fixture below.
     fn silent_return_after_env_var(source: &str) -> Vec<usize> {
         let lines: Vec<&str> = source.lines().collect();
         let mut hits = Vec::new();
         for (i, line) in lines.iter().enumerate() {
             if line.contains("env::var(")
                 && let Some(next) = lines.get(i + 1)
-                && next.trim() == "return;"
+                && next.trim().starts_with("return;")
             {
                 hits.push(i + 1);
             }
@@ -151,15 +159,22 @@ mod tests {
         hits
     }
 
+    /// Walks `root` for `.rs` files, panicking on any read error.
+    ///
+    /// Errors are loud on purpose. The obvious shape here skips an
+    /// unreadable directory with `continue`, and that makes the whole guard
+    /// fail open: one unreadable directory renders its entire subtree
+    /// invisible, the scan finds nothing, and "no silent sites remain" is
+    /// then a statement about a tree that was never read.
     fn rust_sources_under(root: &Path) -> Vec<PathBuf> {
         let mut pending = vec![root.to_path_buf()];
         let mut sources = Vec::new();
         while let Some(dir) = pending.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
+            let entries = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("cannot read {dir:?} while scanning for sources: {e}"));
             for entry in entries {
-                let Ok(entry) = entry else { continue };
+                let entry =
+                    entry.unwrap_or_else(|e| panic!("cannot read an entry under {dir:?}: {e}"));
                 let path = entry.path();
                 if path.is_dir() {
                     pending.push(path);
@@ -184,6 +199,21 @@ mod tests {
         assert_eq!(silent_return_after_env_var(fixture), vec![2]);
     }
 
+    /// The shape that escaped the earlier equality predicate. A bare return
+    /// carrying a trailing comment is still a silent pass -- the comment is
+    /// in the source, not in the test output -- and the population search
+    /// that defined this issue matches it.
+    #[test]
+    fn silent_return_after_env_var_detects_a_trailing_comment() {
+        // On ONE physical source line, deliberately. A fixture describing this
+        // shape must not LAY OUT as this shape: split across two lines with a
+        // trailing `\`, the literal itself becomes an `env::var(` line followed
+        // by a `return;` line, and the crate-wide scan below finds its own
+        // fixture. It did, the first time this arm was written.
+        let fixture = "fn x() {\n    let Ok(v) = std::env::var(\"X\") else {\n        return; // no checkpoint\n    };\n}\n";
+        assert_eq!(silent_return_after_env_var(fixture), vec![2]);
+    }
+
     /// The printed-skip shape (42 sites, explicitly out of scope for #1664)
     /// is a different, milder predicate and must not trip this scanner.
     #[test]
@@ -197,19 +227,41 @@ mod tests {
     fn no_silent_return_checkpoint_sites_remain_in_crate_source() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut all_hits = Vec::new();
+        let mut scanned = Vec::new();
         for dir in ["src", "tests"] {
             let root = manifest_dir.join(dir);
-            if !root.is_dir() {
-                continue;
-            }
+            assert!(
+                root.is_dir(),
+                "{root:?} is not a directory; this scan cannot report an \
+                 absence over a tree it did not find"
+            );
             for path in rust_sources_under(&root) {
                 let source = std::fs::read_to_string(&path)
                     .unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
                 for line in silent_return_after_env_var(&source) {
                     all_hits.push(format!("{}:{line}", path.display()));
                 }
+                scanned.push(path);
             }
         }
+
+        // The population assert, without which an empty result is
+        // indistinguishable from a walk that read nothing. A count alone is
+        // weak -- a truncated walk still returns a plausible number -- so the
+        // control names a file that must be in the set: this one.
+        assert!(
+            scanned.len() > 1,
+            "the scan read {} file(s); an empty or near-empty walk makes the \
+             absence below meaningless",
+            scanned.len()
+        );
+        assert!(
+            scanned.iter().any(|p| p.ends_with("test_support.rs")),
+            "the scan did not reach this very file, so it did not read the \
+             tree it claims to have cleared; scanned {} file(s)",
+            scanned.len()
+        );
+
         assert!(
             all_hits.is_empty(),
             "found env::var(...) immediately followed by a bare `return;` (a \
