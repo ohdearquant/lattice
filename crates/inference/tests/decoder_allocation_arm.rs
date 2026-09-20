@@ -7,6 +7,34 @@
 //! nothing here can see one. What it asserts is that the instrument is alive; the
 //! comparison is the caller's.
 //!
+//! **The base arm is an OVERLAY, and the sentence above hides that.** This file
+//! does not exist at any ref it will be compared against -- it was written for the
+//! comparison -- so "run it at the base ref" is not a checkout, and a reader who
+//! takes it literally finds no such target and cannot reproduce the numbers. The
+//! two lines appended to the manifest are the same `[[test]]` block this branch
+//! adds, and they are appended rather than patched so the recipe does not depend
+//! on the base manifest's shape. Pick a `WT` outside the repository.
+//!
+//! Run these FROM the checkout that contains this file -- the head side. That is
+//! not a detail: `cp` below reads the file out of the current checkout, so running
+//! the recipe from a checkout that predates this target fails at the copy with
+//! "No such file or directory". Measured, by running it from `main`.
+//!
+//! ```text
+//! BASE=<the base ref>
+//! WT=../decoder-alloc-ab-base
+//! git worktree add --detach "$WT" "$BASE"
+//! cp crates/inference/tests/decoder_allocation_arm.rs "$WT/crates/inference/tests/"
+//! printf '\n[[test]]\nname = "decoder_allocation_arm"\ntest = false\n' >> "$WT/crates/inference/Cargo.toml"
+//! (cd "$WT" && cargo test -p lattice-inference --test decoder_allocation_arm \
+//!    --features f16 -- --nocapture --test-threads=1)
+//! ```
+//!
+//! Run the same command in the ordinary checkout for the head arm, and diff the
+//! two printed record blocks. Remove the overlay worktree afterwards; it carries
+//! an untracked file and a modified manifest by construction, so it will never
+//! read clean and must not be mistaken for a working branch.
+//!
 //! **Why its own target.** A global allocator applies to the whole binary it is
 //! linked into. Putting one in an existing test file would silently instrument
 //! every test beside it and change their allocation behaviour.
