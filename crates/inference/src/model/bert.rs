@@ -1313,9 +1313,7 @@ mod tests {
     #[test]
     #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn test_encode_output_shape_and_l2_norm() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
 
         let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
         let embedding = model.encode("hello world").unwrap();
@@ -1333,9 +1331,8 @@ mod tests {
     #[test]
     #[ignore = "requires LATTICE_INFERENCE_BYTES_MODEL_DIR"]
     fn test_from_bytes_matches_from_directory() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_BYTES_MODEL_DIR") else {
-            return;
-        };
+        let model_dir =
+            crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_BYTES_MODEL_DIR");
         let dir = Path::new(&model_dir);
 
         let weights_bytes = fs::read(dir.join("model.safetensors")).unwrap();
@@ -1396,9 +1393,7 @@ mod tests {
     #[test]
     #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn test_encode_batch_matches_per_item_encode_mixed_lengths() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
 
         // Mixed lengths (short to long) force real padding across the batch.
@@ -1446,9 +1441,7 @@ mod tests {
     #[test]
     #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn test_encode_batch_boundary_max_and_min_length() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
 
         // One sequence at exactly the model's max position length, one at length 1
@@ -1531,9 +1524,7 @@ mod tests {
     #[test]
     #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn encode_batch_packed_matches_padded() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
 
         let short = "hi";
@@ -1754,9 +1745,7 @@ mod tests {
     #[test]
     #[ignore = "requires LATTICE_INFERENCE_MODEL_DIR"]
     fn test_ffn_intermediate_lora_delta_lands_before_gelu() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let mut model = BertModel::from_directory(Path::new(&model_dir)).unwrap();
 
         // Truncate to a single transformer layer so the adapter's effect does

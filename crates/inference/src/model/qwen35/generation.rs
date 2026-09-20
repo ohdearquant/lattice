@@ -4758,9 +4758,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_INFERENCE_MODEL_DIR"]
     fn generate_batched_prefill_matches_serial_for_seeded_dense_prompt() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
             .expect("dense Qwen3.5 model should load successfully");
 
@@ -4775,9 +4773,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_INFERENCE_MODEL_DIR"]
     fn generate_streaming_batched_prefill_matches_nonstreaming_text() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
             .expect("dense Qwen3.5 model should load successfully");
 
@@ -4809,9 +4805,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_INFERENCE_MODEL_DIR"]
     fn generate_batched_prefill_matches_serial_across_prompt_lengths() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
             .expect("dense Qwen3.5 model should load successfully");
 
@@ -4830,9 +4824,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_INFERENCE_MODEL_DIR; run --release"]
     fn public_prefill_ttft_ab_sweep() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let model = Qwen35Model::from_safetensors(std::path::Path::new(&model_dir))
             .expect("dense Qwen3.5 model should load successfully");
 

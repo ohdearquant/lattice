@@ -2460,9 +2460,7 @@ mod tests {
     #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn test_qwen_long_text_bench() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let _gpu_lock = gpu_test_lock();
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
         // Warmup
@@ -2484,9 +2482,7 @@ mod tests {
     #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn test_qwen_multilingual() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
         let _gpu_lock = gpu_test_lock();
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
 
@@ -2530,9 +2526,7 @@ mod tests {
     #[ignore = "Requires model files: set LATTICE_INFERENCE_MODEL_DIR"]
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     fn test_qwen_encode_real_model() {
-        let Ok(model_dir) = std::env::var("LATTICE_INFERENCE_MODEL_DIR") else {
-            return;
-        };
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_INFERENCE_MODEL_DIR");
 
         let _gpu_lock = gpu_test_lock();
         let model = QwenModel::from_directory(std::path::Path::new(&model_dir)).unwrap();
