@@ -22,13 +22,18 @@ use crate::grammar::GrammarEngine;
 /// finalization and, if accepted, consumption by the next decode step.
 ///
 /// `Copy` and comparable, but mintable only by [`PredictionLedger::open`] -- there is no
-/// `From<u64>`, no public constructor, and both fields are private to this module (visible
-/// to this module's own `tests` submodule, never to the rest of the crate). A caller
-/// holding a `PredictionId` therefore has proof it went through the ledger that owns its
-/// validity, not a bare integer it could have fabricated.
+/// `From<u64>`, no public constructor, and the field is private to this module (visible to
+/// this module's own `tests` submodule, never to the rest of the crate). A caller holding a
+/// `PredictionId` therefore has proof it went through the ledger that owns its validity,
+/// not a bare integer it could have fabricated.
+///
+/// One field, not two. An earlier shape carried an `epoch` alongside the sequence number,
+/// bumped by every prefill/reset. It was dead: `seq` is monotonic and never reused, so no
+/// two ids from one ledger are ever equal regardless of epoch, and nothing read the field.
+/// The uniqueness-across-resets property it appeared to provide is actually provided by
+/// `seq` alone, and is pinned by a test below rather than implied by a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PredictionId {
-    epoch: u64,
     seq: u64,
 }
 
@@ -42,7 +47,6 @@ pub(crate) struct PredictionId {
 #[derive(Debug, Default)]
 pub(crate) struct PredictionLedger {
     next_seq: u64,
-    epoch: u64,
     live: Option<PredictionId>,
 }
 
@@ -60,10 +64,7 @@ impl PredictionLedger {
     /// that bug surface as an ordinary stale-id rejection on whichever id the driver kept,
     /// instead of two simultaneously "live" ids racing to be consumed.
     pub(crate) fn open(&mut self) -> PredictionId {
-        let id = PredictionId {
-            epoch: self.epoch,
-            seq: self.next_seq,
-        };
+        let id = PredictionId { seq: self.next_seq };
         self.next_seq += 1;
         self.live = Some(id);
         id
@@ -76,14 +77,21 @@ impl PredictionLedger {
         self.live == Some(id)
     }
 
-    /// Another prefill/reset happened: bump the epoch and drop the live prediction, if any.
+    /// Another prefill/reset happened: the live prediction, if any, is no longer eligible.
+    ///
+    /// **Behaviourally identical to [`Self::invalidate`] today, and that is stated rather
+    /// than hidden.** The two exist as separate entry points because the call sites are
+    /// different -- a prefill is not a cancellation -- and because a reader at either call
+    /// site should not have to decide which generic verb to reach for. Nothing currently
+    /// distinguishes an id invalidated by a reset from one invalidated by a cancellation.
+    /// If a later row needs that distinction, it has to be added and tested deliberately;
+    /// it must not be assumed present because the methods have different names.
     pub(crate) fn reset(&mut self) {
-        self.epoch += 1;
         self.live = None;
     }
 
-    /// Cancellation, failure, or finish: drop the live prediction without bumping the
-    /// epoch (unlike [`Self::reset`], no new prefill has occurred).
+    /// Cancellation, failure, or finish: the live prediction, if any, is no longer
+    /// eligible. See [`Self::reset`] on why these are two methods with one behaviour.
     pub(crate) fn invalidate(&mut self) {
         self.live = None;
     }
@@ -284,9 +292,20 @@ pub(crate) enum FinishDisposition {
 ///
 /// Today cancellation is a generic closure parameter (`should_cancel: C where C: FnMut()
 /// -> bool`) at `model::qwen35::generation`'s `generate_streaming_with_cancel` and its
-/// siblings; this row does not change that call site. The blanket impl below lets the
-/// existing `|| bool_expr` closure shape used there adapt to this trait without a wrapper
-/// type, once a later row actually wires a driver through it.
+/// siblings; this row does not change that call site.
+///
+/// **The blanket impl below is narrower than that call site's bound, and the gap is real.**
+/// `is_cancelled` takes `&self`, which is forced by D1's `cancel: &dyn Cancellation`
+/// shape, so the impl can only cover `Fn() -> bool`. An `FnMut` closure that mutates
+/// captured state is not `Fn` and does not adapt. Worse for the serving path specifically:
+/// `crates/inference/src/bin/lattice/serve.rs` threads cancellation as an erased
+/// `&mut dyn FnMut() -> bool`, and `&mut dyn FnMut()` implements neither `Fn` nor this
+/// trait. Today's concrete closure there (`move || *cancel_rx.borrow()`) only reads its
+/// capture and so is `Fn`, but the type it travels under is not, which is what a future
+/// row will actually have to convert. So the covered case is: a non-mutating closure,
+/// passed unerased. Everything else needs either a wrapper with interior mutability or a
+/// change to the erased type along the serving chain. That choice belongs to the row that
+/// wires a driver through it, and it is a choice, not a formality.
 pub(crate) trait Cancellation {
     fn is_cancelled(&self) -> bool;
 }
@@ -442,6 +461,43 @@ mod tests {
             ledger.is_live(second),
             "the newly opened id must be the ledger's one live prediction"
         );
+    }
+
+    #[test]
+    fn ids_are_never_reused_across_resets() {
+        // The property an `epoch` field appeared to provide. It is `seq` monotonicity that
+        // actually provides it, so it is pinned here instead of implied by a field nothing
+        // reads. A ledger that reset its counter would hand out an id equal to a retired
+        // one, and `is_live` would then answer `true` for a genuinely stale prediction.
+        let mut ledger = PredictionLedger::default();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(ledger.open());
+            ledger.reset();
+        }
+        let first = seen[0];
+        assert!(
+            seen.iter().skip(1).all(|id| *id != first),
+            "a reset must not let the ledger re-mint a retired id: {seen:?}"
+        );
+        assert!(
+            !ledger.is_live(first),
+            "and the retired id must not be live after three further opens"
+        );
+    }
+
+    #[test]
+    fn the_blanket_impl_covers_a_capturing_non_mutating_closure() {
+        // The covered case, stated as a test rather than only in the doc comment: a
+        // closure that captures state and reads it is `Fn`, so it is a `Cancellation`.
+        // A closure that MUTATES its capture is `FnMut` and is not accepted here; that
+        // arm cannot be written as a passing test, which is why the limitation lives in
+        // the doc comment above and in the row that has to convert the serving path.
+        let flag = std::cell::Cell::new(false);
+        let cancel = || flag.get();
+        assert!(!(&cancel as &dyn Cancellation).is_cancelled());
+        flag.set(true);
+        assert!((&cancel as &dyn Cancellation).is_cancelled());
     }
 
     // -----------------------------------------------------------------
