@@ -130,6 +130,15 @@ pub mod stop_reason;
 #[cfg(test)]
 mod stop_token_contract;
 
+/// Test-support helper for the thirteen checkpoint-gated unit tests in
+/// [`model::bert`], [`model::qwen`], and `model::qwen35::generation` (a
+/// private submodule, so not linked) (issue #1664): resolves and panics
+/// naming an unset, relative, or missing
+/// model-directory env var, so an explicitly requested `--ignored` run
+/// without a checkpoint fails loudly instead of returning silently.
+#[cfg(test)]
+mod test_support;
+
 /// Backward-pass support for training and LoRA workflows, built on [`lora_hook`] and
 /// [`model`]. Requires the `train-backward` feature.
 #[cfg(feature = "train-backward")]
