@@ -165,6 +165,19 @@ required-features = ["f16", "metal-gpu", "serve"]
 name = "vision_serve_e2e_test"
 required-features = ["download", "f16", "metal-gpu", "serve"]
 
+# ADR-090 R03. Excluded from `cargo test`'s default target set on purpose: this
+# gate enforces by default (a missing checkpoint or a missing `f16` feature is a
+# panic, never a skip line), and the 1.6 GiB bf16 checkpoint it replays is not on
+# a CI runner. Exclusion by a manifest declaration is greppable; a runtime skip
+# branch renders as a pass, which is the failure this gate was written to avoid.
+# Select it explicitly:
+#   cargo test -p lattice-inference --test cpu_pre_migration_greedy_golden --features f16
+# The checkpoint-free controls in its `controls` module DO run in CI; see the
+# "R03 golden gate controls" step in .github/workflows/ci.yml.
+[[test]]
+name = "cpu_pre_migration_greedy_golden"
+test = false
+
 [[bin]]
 name = "bench_decode_ab"
 path = "src/bin/bench_decode_ab.rs"
