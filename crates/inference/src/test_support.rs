@@ -173,6 +173,20 @@ mod tests {
         skipped_symlinks: Vec<PathBuf>,
     }
 
+    /// Whether `path` is a directory in its own right, rather than a symlink
+    /// that happens to point at one.
+    ///
+    /// This exists because [`rust_sources_under`] classifies every ENTRY from
+    /// the directory entry's own file type and says so in its doc comment, and
+    /// then its one caller validated each ROOT with `Path::is_dir`, which
+    /// follows. The rule was stated in one place and broken in the other, so a
+    /// symlinked `benches` would pass the root check, be walked, and contribute
+    /// `.rs` files from outside the crate -- the same fail-open the entry-level
+    /// classification exists to close, escaped one level up.
+    fn is_real_dir(path: &Path) -> bool {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+    }
+
     /// Walks `root` for `.rs` files, panicking on any read error.
     ///
     /// Errors are loud on purpose. The obvious shape here skips an
@@ -274,9 +288,10 @@ mod tests {
         for dir in roots {
             let root = manifest_dir.join(dir);
             assert!(
-                root.is_dir(),
-                "{root:?} is not a directory; this scan cannot report an \
-                 absence over a tree it did not find"
+                is_real_dir(&root),
+                "{root:?} is not a real directory; this scan cannot report an \
+                 absence over a tree it did not find, and a symlinked root \
+                 would be followed out of the crate"
             );
             let walk = rust_sources_under(&root);
             symlinks.extend(walk.skipped_symlinks);
@@ -330,6 +345,40 @@ mod tests {
             "found env::var(...) immediately followed by a bare `return;` (a \
              silent-pass checkpoint site) at: {all_hits:?}. Route it through \
              require_checkpoint_dir instead."
+        );
+    }
+
+    /// `is_real_dir` must reject a symlink that points at a directory, and the
+    /// naive form must accept it.
+    ///
+    /// The second assertion is the one that gives this test teeth. Without it,
+    /// swapping `is_real_dir` back for `Path::is_dir` leaves the test green on
+    /// the real-directory case alone, and a guard test that cannot express the
+    /// defect it guards is decoration. Asserting that `link.is_dir()` is TRUE
+    /// pins the difference between the two forms rather than the behaviour of
+    /// the one we happen to call.
+    #[test]
+    fn is_real_dir_rejects_a_symlink_to_a_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).expect("create real dir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert!(is_real_dir(&real), "a real directory must be accepted");
+        assert!(
+            !is_real_dir(&link),
+            "a symlink pointing at a directory must be rejected: following it \
+             is what lets a scanned root reach outside the crate"
+        );
+        assert!(
+            link.is_dir(),
+            "control: Path::is_dir must ACCEPT this symlink, otherwise this \
+             fixture cannot tell the two forms apart and proves nothing"
+        );
+        assert!(
+            !is_real_dir(&tmp.path().join("absent")),
+            "a path that does not exist is not a real directory"
         );
     }
 }
