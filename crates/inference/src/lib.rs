@@ -58,6 +58,8 @@ pub mod weights;
 /// and [`model`].
 pub mod batch;
 pub(crate) mod bounded_read;
+#[allow(dead_code)] // removed by the row that adds the first DecoderSession implementation
+pub(crate) mod decoder;
 /// Model-file cache and conditional download helpers. See [`model`] and [`weights`].
 pub mod download;
 /// Crate error taxonomy; see [`InferenceError`].
