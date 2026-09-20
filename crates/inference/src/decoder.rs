@@ -2,11 +2,12 @@
 //!
 //! This module lands the type surface D1's illustrative `DecoderSession` trait sketches,
 //! plus the ledger mechanism that makes "a stale prediction id is rejected" a state fact
-//! the type system enforces rather than a comment a future caller has to remember. Nothing
-//! here is wired to a driver or a concrete session yet: there is no autoregressive loop, no
-//! `QwenCpuSession`/`GemmaCpuSession`/`QwenMetalSession`, and no caller anywhere else in the
-//! crate. That lands in a later row; see the ADR for the full lifecycle this vocabulary will
-//! eventually serve.
+//! the type system enforces rather than a comment a future caller has to remember.
+//!
+//! ADR-090 row C (`driver`) adds the one autoregressive loop over `&mut dyn DecoderSession`,
+//! and `model::qwen35::generation`'s `generate()`/`generate_with_trace()` are its first
+//! production callers -- see `driver`'s own module doc comment for the row's scope
+//! (notably: grammar and `logprobs` are not routed through it yet).
 //!
 //! Everything in this module is `pub(crate)`.
 
@@ -18,6 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// First concrete [`DecoderSession`] implementation (ADR-090 row B): the CPU dense
 /// Qwen3.5 entry point wrapped over this module's typed vocabulary.
 pub(crate) mod qwen_cpu;
+
+/// The autoregressive driver (ADR-090 row C): one loop over `&mut dyn DecoderSession`
+/// that drives [`DecodePolicy`](crate::generation::DecodePolicy) unchanged.
+pub(crate) mod driver;
 
 // ---------------------------------------------------------------------------
 // PredictionId / PredictionLedger
@@ -104,6 +109,11 @@ impl PredictionLedger {
     /// Whether `id` is the ledger's current live prediction. This is the eligibility check
     /// a concrete session's `select`/`metadata` operations must consult: a cancelled,
     /// consumed, superseded, or reset-invalidated id is never live again.
+    // Row C's driver never routes logprobs (see `decoder::driver`'s module doc comment),
+    // so its `metadata()` call -- the only production caller of this check -- never
+    // fires. Reserved for the logprobs-routing row; exercised today by this module's own
+    // ledger-invariant tests and by `QwenCpuSession::metadata`.
+    #[allow(dead_code)]
     pub(crate) fn is_live(&self, id: PredictionId) -> bool {
         self.live == Some(id)
     }
@@ -117,6 +127,10 @@ impl PredictionLedger {
     /// distinguishes an id invalidated by a reset from one invalidated by a cancellation.
     /// If a later row needs that distinction, it has to be added and tested deliberately;
     /// it must not be assumed present because the methods have different names.
+    // Reserved for a later row (see the doc comment above): neither `QwenCpuSession`
+    // nor the row C driver re-prefills a session, so nothing calls this outside this
+    // module's own tests yet.
+    #[allow(dead_code)]
     pub(crate) fn reset(&mut self) {
         self.live = None;
     }
@@ -210,6 +224,14 @@ pub(crate) struct SelectionCandidate {
 pub(crate) struct SelectionRequest<'a> {
     pub(crate) config: &'a GenerateConfig,
     pub(crate) history: &'a [u32],
+    // The row C driver never sets this to anything but `None`, and row B's
+    // `QwenCpuSession::select` never reads it (see that function's doc comment): grammar
+    // masking needs a mutable grammar state reachable from inside `select`, which a shared
+    // `&SelectionRequest` cannot carry (see the driver module's doc comment for the full
+    // reasoning). The field stays on the struct because the request shape is meant to hold
+    // it once a future row wires grammar through a session; until then it is constructed
+    // but never consulted.
+    #[allow(dead_code)]
     pub(crate) grammar: Option<&'a GrammarEngine>,
 }
 
@@ -221,6 +243,9 @@ pub(crate) struct SelectionRequest<'a> {
 /// [`GenerateConfig::logprobs`] exactly: `None` disables metadata capture entirely; `Some(n)`
 /// requests the final token's log-probability plus its `n` highest-probability
 /// alternatives (`n == 0` is valid: report only the final token's log-probability).
+// Row C's driver never calls `DecoderSession::metadata` (see `decoder::driver`'s module
+// doc comment on why logprobs stay out of scope); reserved for the logprobs-routing row.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataRequest {
     pub(crate) top_logprobs: Option<usize>,
@@ -237,6 +262,8 @@ pub(crate) struct MetadataRequest {
 /// log-probability under the prediction's pre-advance scoring view, never the candidate's.
 /// Reuses [`crate::generation::TopLogprob`] rather than defining a second alternative-token
 /// type.
+// Same scope note as `MetadataRequest` above: the output type of a call row C never makes.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct TokenMetadata {
     pub(crate) prediction: PredictionId,
@@ -378,6 +405,10 @@ pub(crate) trait DecoderSession {
         request: &SelectionRequest<'_>,
     ) -> Result<SelectionCandidate, InferenceError>;
 
+    // No caller in this crate reaches this yet: row C's driver stays out of logprobs
+    // routing (see `decoder::driver`'s module doc comment). Part of the trait's object-
+    // safety proof (this module's tests) regardless of whether a driver calls it.
+    #[allow(dead_code)]
     fn metadata(
         &mut self,
         prediction: PredictionId,
