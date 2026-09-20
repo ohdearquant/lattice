@@ -44,6 +44,29 @@ impl Default for RlooConfig {
     }
 }
 
+/// Per-call override for the load-balance term, carrying the learned mixture's
+/// projected weight vector and inverse temperature (ADR-091 Decision 3, amended
+/// 2026-09-20).
+///
+/// Private: it exists only so [`RlooTrainer::step`] and
+/// [`RlooTrainer::step_with_learned_weights`] can share one implementation
+/// without the two ever computing the load-balance term differently by
+/// accident — a second copy of this wiring is exactly the failure the
+/// 2026-09-19 amendment records (a documented guard sitting uncalled while the
+/// trainer optimised something else).
+struct WeightedAux<'a> {
+    /// `softmax(selected logits / tau)` embedded into the gate's full output
+    /// space (`w_full[selected[i]] = w[i]`, zero elsewhere), taken **before**
+    /// Decision 2's `epsilon` floor drop and renormalisation. Length must equal
+    /// `gate.num_outputs()`.
+    w_full: &'a [f32],
+    /// `1 / tau`. The load-balance gradient this module computes is `dL/dz`
+    /// for `p = softmax(z)`; the mixture weights are `softmax(z / tau)`, so
+    /// this factor rescales the returned gradient to the logits the trainer
+    /// actually updates.
+    inv_tau: f32,
+}
+
 /// A policy-gradient trainer for selector gates with linear logits.
 ///
 /// It applies softmax in the loss and leaves EWC composition to the caller.
@@ -85,12 +108,96 @@ impl RlooTrainer {
     /// The reward sign controls policy direction and its magnitude controls update strength.
     /// Returns the scalar policy loss for logging.
     /// See [`docs/training.md`](../../docs/training.md#phase-1-single-sample-reinforce-step-the-active-path) for reward semantics and the loss formula.
+    ///
+    /// The load-balance term here runs on this gate's own full-width selection
+    /// distribution. For the learned mixture-weight path, where ADR-091
+    /// Decision 3 (amended 2026-09-20) requires that term to run on the
+    /// caller's projected weight vector at `1 / tau` instead, see
+    /// [`Self::step_with_learned_weights`].
     pub fn step(
         &mut self,
         gate: &mut Network,
         context: &[f32],
         action_idx: usize,
         reward: f32,
+    ) -> FannResult<f32> {
+        self.step_impl(gate, context, action_idx, reward, None)
+    }
+
+    /// Applies one REINFORCE update whose load-balance term runs on the learned
+    /// mixture's projected weight vector instead of this gate's own selection
+    /// distribution (ADR-091 Decision 3, amended 2026-09-20).
+    ///
+    /// `w_full` is `softmax(selected logits / tau)` embedded into this gate's
+    /// full output space — `w_full[selected[i]] = w[i]`, zero elsewhere — taken
+    /// **before** the `epsilon` floor's drop and renormalisation: an adapter
+    /// the floor is about to drop must still be present and carry gradient
+    /// when this runs, which is exactly the event a post-floor vector would
+    /// already have zeroed out. `tau` is the temperature that produced it; the
+    /// load-balance gradient this module computes is `dL/dz` for
+    /// `p = softmax(z)`, and the weights are `softmax(z / tau)`, so this call
+    /// scales the returned gradient by `1 / tau` to reach the gradient with
+    /// respect to the logits it updates. The floor on `tau` is guard (a)'s job
+    /// in the router; this call enforces only the arithmetic precondition that
+    /// it be finite and strictly positive, and does not reimplement that floor.
+    ///
+    /// The policy-gradient and z-loss terms, and the `action_idx`/`reward`
+    /// arguments that drive them, are unchanged from [`Self::step`]: only the
+    /// load-balance term's input and the frequency EMA's fold differ.
+    ///
+    /// Returns `FannError::InputSizeMismatch` if `w_full.len() !=
+    /// gate.num_outputs()`, and `FannError::TrainingError` if `tau` is not
+    /// finite and strictly positive.
+    pub fn step_with_learned_weights(
+        &mut self,
+        gate: &mut Network,
+        context: &[f32],
+        action_idx: usize,
+        reward: f32,
+        w_full: &[f32],
+        tau: f32,
+    ) -> FannResult<f32> {
+        let num_outputs = gate.num_outputs();
+        if w_full.len() != num_outputs {
+            return Err(FannError::InputSizeMismatch {
+                expected: num_outputs,
+                actual: w_full.len(),
+            });
+        }
+        if !tau.is_finite() || tau <= 0.0 {
+            return Err(FannError::TrainingError(format!(
+                "step_with_learned_weights: tau must be finite and strictly positive, got {tau}"
+            )));
+        }
+
+        self.step_impl(
+            gate,
+            context,
+            action_idx,
+            reward,
+            Some(WeightedAux {
+                w_full,
+                inv_tau: 1.0 / tau,
+            }),
+        )
+    }
+
+    /// Shared body for [`Self::step`] and [`Self::step_with_learned_weights`].
+    ///
+    /// One implementation behind two public entries, so the load-balance
+    /// term's two call shapes cannot drift apart the way the per-context and
+    /// batch objectives once did (ADR-091's 2026-09-19 amendment). `weighted`
+    /// is `None` for the base selection-distribution path and `Some` for the
+    /// learned mixture-weight path; it changes exactly the load-balance term's
+    /// second argument and scale, and the vector folded into the frequency
+    /// EMA — the policy-gradient and z-loss terms never see it.
+    fn step_impl(
+        &mut self,
+        gate: &mut Network,
+        context: &[f32],
+        action_idx: usize,
+        reward: f32,
+        weighted: Option<WeightedAux<'_>>,
     ) -> FannResult<f32> {
         let num_inputs = gate.num_inputs();
         let num_outputs = gate.num_outputs();
@@ -131,7 +238,18 @@ impl RlooTrainer {
         // the two to disagree silently, and it is what let the documented guard
         // sit uncalled while the trainer optimised something else.
         let route_freqs = self.route_freqs_or_uniform(k);
-        let aux_grad = load_balance_aux_gradient(&route_freqs, &probs)?;
+
+        // The load-balance term runs on this gate's own selection distribution
+        // by default, or on the learned mixture's projected weight vector at
+        // `1 / tau` when `weighted` is supplied (ADR-091 Decision 3, amended
+        // 2026-09-20). `aux_scale = 1.0` in the default case is exact for
+        // every finite `f32` (`x * 1.0 == x` bit-for-bit), so this branch
+        // changes no bit of `step`'s existing output.
+        let (aux_source, aux_scale): (&[f32], f32) = match &weighted {
+            Some(w) => (w.w_full, w.inv_tau),
+            None => (probs.as_slice(), 1.0),
+        };
+        let aux_grad = load_balance_aux_gradient(&route_freqs, aux_source)?;
         let z_grad = router_z_gradient(&logits, &probs);
 
         // Linear output makes this the pre-activation error; preserve reward polarity — see docs/training.md.
@@ -141,7 +259,7 @@ impl RlooTrainer {
             .map(|(j, &pj)| {
                 let onehot_j = if j == action_idx { 1.0_f32 } else { 0.0_f32 };
                 let policy = reward * (pj - onehot_j);
-                let aux = self.config.aux_loss_coeff * aux_grad[j];
+                let aux = self.config.aux_loss_coeff * aux_scale * aux_grad[j];
                 let zloss = self.config.z_loss_coeff * z_grad[j];
                 policy + aux + zloss
             })
@@ -150,9 +268,18 @@ impl RlooTrainer {
         self.backprop_and_apply(gate, context, &output_deltas, num_layers)?;
 
         // Fold the decision actually taken into the frequency EMA, after the
-        // update, so the gradient above saw the traffic that preceded it.
-        let mut mass = vec![0.0_f32; k];
-        mass[action_idx] = 1.0;
+        // update, so the gradient above saw the traffic that preceded it. The
+        // learned path folds the same projected vector the aux term above
+        // just used, so `f` tracks weighted traffic rather than selection
+        // counts — the comparison a weight-collapse guard needs.
+        let mass: Vec<f32> = match &weighted {
+            Some(w) => w.w_full.to_vec(),
+            None => {
+                let mut m = vec![0.0_f32; k];
+                m[action_idx] = 1.0;
+                m
+            }
+        };
         self.observe_routing(&mass);
 
         // Scalar policy loss for caller logging.
@@ -910,5 +1037,215 @@ mod tests {
             matches!(err, FannError::InputSizeMismatch { .. }),
             "expected InputSizeMismatch, got {err:?}"
         );
+    }
+
+    // ---- ADR-091 Decision 3 (amended 2026-09-20): the learned-weight path ---
+
+    /// Repeats [`test_gate`]'s drift preamble against two independent clones
+    /// of the same base gate/trainer, so a caller can vary exactly one
+    /// argument to `step_with_learned_weights` and attribute any difference in
+    /// the result to that argument alone.
+    fn drifted_off_uniform(gate_base: &Network, config: RlooConfig) -> (Network, RlooTrainer) {
+        let mut gate = gate_base.clone();
+        let mut trainer = RlooTrainer::with_seed(config, 1);
+        for _ in 0..50 {
+            trainer.step(&mut gate, &CTX, 0, 0.0).unwrap();
+        }
+        (gate, trainer)
+    }
+
+    /// Control 1 — the projection changes the number: the caller's projected
+    /// mixture-weight vector and a plausible full-width selection distribution
+    /// must give different load-balance gradients, or a test that swaps one
+    /// for the other could never tell them apart.
+    ///
+    /// Mutation this guards: `step_with_learned_weights` silently ignoring
+    /// `w_full` and falling back to its own internally computed `probs` for
+    /// the load-balance term.
+    #[test]
+    fn step_with_learned_weights_moves_the_gate_by_w_full_not_by_probs() {
+        // Non-uniform on purpose: at uniform route_freqs, `load_balance_aux_gradient`
+        // is identically zero for ANY probability vector (see
+        // `balanced_route_freqs_give_zero_aux_gradient_even_for_a_sharp_gate`),
+        // which would make this fixture uninformative.
+        let route_freqs = [0.1_f32, 0.3, 0.3, 0.3];
+        let logits = [1.0_f32, 0.0, 3.0, 0.0];
+        let probs = softmax(&logits);
+
+        let tau = 0.5_f32;
+        let w = softmax(&[logits[0] / tau, logits[2] / tau]);
+        let w_full = [w[0], 0.0, w[1], 0.0];
+
+        let grad_probs = load_balance_aux_gradient(&route_freqs, &probs).unwrap();
+        let grad_w_full = load_balance_aux_gradient(&route_freqs, &w_full).unwrap();
+        assert!(
+            (grad_probs[0] - grad_w_full[0]).abs() > 1e-2,
+            "fixture must make the two vectors diverge: grad(probs)[0]={}, grad(w_full)[0]={}",
+            grad_probs[0],
+            grad_w_full[0]
+        );
+
+        let config = RlooConfig {
+            learning_rate: 0.5,
+            aux_loss_coeff: 1.0,
+            z_loss_coeff: 0.0,
+        };
+        let gate_base = test_gate();
+
+        let (mut gate_a, mut trainer_a) = drifted_off_uniform(&gate_base, config.clone());
+        trainer_a
+            .step_with_learned_weights(&mut gate_a, &CTX, 0, 0.0, &w_full, tau)
+            .unwrap();
+        let after_w_full = gate_a.forward(&CTX).unwrap().to_vec();
+
+        let (mut gate_b, mut trainer_b) = drifted_off_uniform(&gate_base, config);
+        trainer_b
+            .step_with_learned_weights(&mut gate_b, &CTX, 0, 0.0, &probs, tau)
+            .unwrap();
+        let after_probs = gate_b.forward(&CTX).unwrap().to_vec();
+
+        assert_ne!(
+            after_w_full, after_probs,
+            "step_with_learned_weights must move the gate by w_full, not by a \
+             different vector of the same shape: w_full={w_full:?}, probs={probs:?}"
+        );
+    }
+
+    /// Control 2 — the `1 / tau` factor: with `w_full` and everything else
+    /// held fixed, two calls that differ only in `tau` (chosen well away from
+    /// 1.0) must move the gate by different amounts.
+    ///
+    /// Mutation this guards: dropping the `1 / tau` scale on the load-balance
+    /// gradient. Predicted before running: with the factor dropped, `tau` has
+    /// no effect on the applied gradient at all, so the two calls below would
+    /// produce identical states and this test would redden.
+    #[test]
+    fn step_with_learned_weights_scales_the_aux_gradient_by_inverse_tau() {
+        let config = RlooConfig {
+            learning_rate: 0.5,
+            aux_loss_coeff: 1.0,
+            z_loss_coeff: 0.0,
+        };
+        let gate_base = test_gate();
+        let w_full = [0.7_f32, 0.0, 0.3, 0.0];
+
+        let (mut gate_a, mut trainer_a) = drifted_off_uniform(&gate_base, config.clone());
+        trainer_a
+            .step_with_learned_weights(&mut gate_a, &CTX, 0, 0.0, &w_full, 1.0)
+            .unwrap();
+        let after_tau_1 = gate_a.forward(&CTX).unwrap().to_vec();
+
+        let (mut gate_b, mut trainer_b) = drifted_off_uniform(&gate_base, config);
+        trainer_b
+            .step_with_learned_weights(&mut gate_b, &CTX, 0, 0.0, &w_full, 0.1)
+            .unwrap();
+        let after_tau_p1 = gate_b.forward(&CTX).unwrap().to_vec();
+
+        let max_diff = after_tau_1
+            .iter()
+            .zip(after_tau_p1.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_diff > 1e-3,
+            "tau=1.0 and tau=0.1 must move the gate by measurably different \
+             amounts; got after_tau_1.0={after_tau_1:?}, after_tau_0.1={after_tau_p1:?}"
+        );
+    }
+
+    /// Control 3 — the EMA fold is reached: `observe_routing`'s silent
+    /// length-mismatch early return must not be swallowing the weighted path.
+    /// `route_freqs` (private; visible here because `tests` is a descendant
+    /// module of the one that defines it) must move toward `w_full`'s shape —
+    /// split across indices 0 and 2 — not toward a one-hot on `action_idx`
+    /// (which is 0 here, so a one-hot fold would push index 2 DOWN, not up).
+    #[test]
+    fn step_with_learned_weights_folds_w_full_into_route_freqs() {
+        let mut gate = test_gate();
+        let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+        let w_full = [0.5_f32, 0.0, 0.5, 0.0];
+
+        for _ in 0..50 {
+            trainer
+                .step_with_learned_weights(&mut gate, &CTX, 0, 0.0, &w_full, 1.0)
+                .unwrap();
+        }
+
+        let f = &trainer.route_freqs;
+        assert!(
+            (f[0] - 0.25).abs() > 1e-3,
+            "f must have moved off uniform (1/4) at index 0, got {}",
+            f[0]
+        );
+        assert!(
+            f[2] > 0.25 + 1e-3,
+            "f must have moved toward the weighted vector at index 2, which \
+             carries half the mass despite action_idx=0 — a one-hot(action_idx) \
+             fold would have pushed this DOWN instead: got {}",
+            f[2]
+        );
+        assert!(
+            f[1] < 0.25 && f[3] < 0.25,
+            "indices absent from w_full must have moved down, got f={f:?}"
+        );
+    }
+
+    /// Control 4 — `step`'s existing behaviour is pinned across this change:
+    /// one full `step` call from a fresh, seeded gate must produce the exact
+    /// output it produced before `step` was rewritten to delegate to
+    /// `step_impl`. The refactor moves code; it must not move a float.
+    #[test]
+    fn step_output_is_pinned_across_the_step_impl_refactor() {
+        let mut gate = test_gate();
+        let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+        trainer.step(&mut gate, &CTX, 2, 1.0).unwrap();
+        let after = gate.forward(&CTX).unwrap().to_vec();
+
+        // Captured from this exact fixture (test_gate() seed 1, CTX,
+        // action_idx=2, reward=1.0, RlooConfig::default()) by running the
+        // pre-refactor `step` at base commit 0d4507889a, before `step_impl`
+        // existed, then asserted tight against drift.
+        let expected: [f32; 4] = [0.09232578, 0.0055880453, -0.08243938, -0.02555845];
+        for (i, (&got, &want)) in after.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "step()'s output must be pinned at i={i}: got={got}, want={want}"
+            );
+        }
+    }
+
+    /// `w_full` of the wrong width is a caller error, not a shape to silently
+    /// paper over.
+    #[test]
+    fn step_with_learned_weights_rejects_wrong_length_w_full() {
+        let mut gate = test_gate();
+        let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+        let wrong_w_full = [0.5_f32, 0.5]; // gate has 4 outputs
+        let err = trainer
+            .step_with_learned_weights(&mut gate, &CTX, 0, 0.0, &wrong_w_full, 1.0)
+            .unwrap_err();
+        assert!(
+            matches!(err, FannError::InputSizeMismatch { .. }),
+            "expected InputSizeMismatch, got {err:?}"
+        );
+    }
+
+    /// `tau` must be finite and strictly positive; this is the arithmetic
+    /// precondition only — the collapse floor on `tau` is guard (a)'s job in
+    /// the router, not reimplemented here.
+    #[test]
+    fn step_with_learned_weights_rejects_non_finite_or_nonpositive_tau() {
+        let w_full = [0.25_f32; 4];
+        for bad_tau in [0.0_f32, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut gate = test_gate();
+            let mut trainer = RlooTrainer::with_seed(RlooConfig::default(), 1);
+            let err = trainer
+                .step_with_learned_weights(&mut gate, &CTX, 0, 0.0, &w_full, bad_tau)
+                .unwrap_err();
+            assert!(
+                matches!(err, FannError::TrainingError(_)),
+                "tau={bad_tau} must be rejected as TrainingError, got {err:?}"
+            );
+        }
     }
 }
