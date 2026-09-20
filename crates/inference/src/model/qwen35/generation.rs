@@ -4,6 +4,8 @@ use super::model::Qwen35Model;
 use super::sampling::sample_token;
 use super::stop_strings::earliest_stop_match;
 use crate::attention::gdn::GatedDeltaNetState;
+use crate::decoder::driver;
+use crate::decoder::qwen_cpu::QwenCpuSession;
 use crate::error::InferenceError;
 use crate::generation::{
     DecodePolicy, GenerateConfig, GenerateOutput, StepOutcome, StopCheckOutcome, TokenLogprob,
@@ -49,7 +51,48 @@ pub(crate) fn force_serial_prefill() -> bool {
 
 impl Qwen35Model {
     /// **Unstable**: autoregressive text generation with temperature/top-k/top-p sampling.
+    ///
+    /// Delegates to [`Self::generate_with_trace`] and discards the driver trace (ADR-090
+    /// row C, decomposition "Open question 3, ANSWERED"): this entry's signature and
+    /// observable behaviour are unchanged, and the trace exists for the migration's own
+    /// tests to see, not for callers of the public API.
     pub fn generate(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+    ) -> Result<GenerateOutput, InferenceError> {
+        self.generate_with_trace(prompt, gen_cfg)
+            .map(|(output, _trace)| output)
+    }
+
+    /// ADR-090 row C dispatch point. Routes through [`Self::generate_via_driver`] (the new
+    /// `decoder::driver::run` over a [`crate::decoder::qwen_cpu::QwenCpuSession`]) whenever
+    /// neither grammar nor logprobs is requested, and falls back to
+    /// [`Self::generate_inline`] (the pre-migration implementation, unchanged) otherwise --
+    /// see `decoder::driver`'s module doc comment for why those two flags are the boundary:
+    /// the driver's `&mut dyn DecoderSession` has no way to reach the mutable grammar state
+    /// `select` samples against, nor the raw logits a logprobs capture needs.
+    ///
+    /// Crate-private and not `#[cfg(test)]`-gated (decomposition "Open question 3,
+    /// ANSWERED"): a marker that only exists under `cfg(test)` would make the shipped path
+    /// and the tested path differ in the one respect the test is about.
+    pub(crate) fn generate_with_trace(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
+        if gen_cfg.grammar.is_some() || gen_cfg.logprobs.is_some() {
+            return self
+                .generate_inline(prompt, gen_cfg)
+                .map(|output| (output, driver::DriverTrace::default()));
+        }
+        self.generate_via_driver(prompt, gen_cfg)
+    }
+
+    /// Pre-migration implementation (ADR-090 row C keeps this verbatim as the grammar/logprobs
+    /// fallback): unchanged body, unchanged behaviour, pinned by the e2e-parity CI gate and by
+    /// the `cpu_pre_migration_greedy_golden` integration test.
+    fn generate_inline(
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
@@ -394,6 +437,150 @@ impl Qwen35Model {
                 stop_reason: Some(loop_stop_reason),
                 token_logprobs,
             })
+        }
+    }
+
+    /// ADR-090 row C: `generate()`'s grammar/logprobs-free path, constructing a
+    /// [`QwenCpuSession`] and running [`driver::run`] over it instead of the two
+    /// hand-written loops [`Self::generate_inline`] still owns for the fallback case.
+    /// Every preflight step through `think_close_id` resolution is unchanged from
+    /// [`Self::generate_inline`] -- only the decode mechanics after prefill are
+    /// re-routed. `gen_cfg.seed` and `gen_cfg.temperature` go straight into
+    /// [`QwenCpuSession::new`], which owns the RNG draw and the per-request
+    /// `gdn_states`/`kv_cache`/`scratch` allocation from here on (see that
+    /// constructor's own doc comment for why it captures exactly those two fields).
+    fn generate_via_driver(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError> {
+        debug_assert!(gen_cfg.grammar.is_none() && gen_cfg.logprobs.is_none());
+        let cfg = &self.config;
+
+        let input = self.tokenizer.tokenize(prompt);
+        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+        let prompt_len = prompt_ids.len();
+
+        check_prompt_not_empty(prompt_len)?;
+
+        if gen_cfg.max_new_tokens == 0 {
+            return Ok((
+                GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
+                },
+                driver::DriverTrace::default(),
+            ));
+        }
+
+        let max_context = self.max_context();
+        check_context_budget(
+            prompt_len,
+            gen_cfg.effective_reasoning_budget(),
+            gen_cfg.max_new_tokens,
+            max_context,
+        )?;
+
+        let think_close_id = resolve_reasoning_close_token(
+            &self.tokenizer,
+            gen_cfg.reasoning_budget,
+            gen_cfg.enable_thinking,
+            cfg.vocab_size,
+        )?;
+
+        let mut session =
+            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+
+        if gen_cfg.stop_strings.is_empty() {
+            let mut throwaway_text = String::new();
+            let mut throwaway_offsets: Vec<usize> = Vec::new();
+            let result = driver::run(
+                &mut session,
+                gen_cfg,
+                think_close_id,
+                &prompt_ids,
+                cfg.eos_token_id,
+                false,
+                |_next_id| String::new(),
+                &mut throwaway_text,
+                &mut throwaway_offsets,
+                |_delta, _next_id| true,
+            )?;
+
+            let text = decode_tokens(&self.tokenizer, &result.generated_ids);
+
+            Ok((
+                GenerateOutput {
+                    text,
+                    token_ids: result.generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: result.generated_ids.len(),
+                    stopped: result.stopped,
+                    stop_reason: Some(result.stop_reason),
+                    token_logprobs: result.token_logprobs,
+                },
+                result.trace,
+            ))
+        } else {
+            let mut detok = IncrementalDetokenizer::new();
+            let mut full = String::new();
+            let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
+
+            let result = driver::run(
+                &mut session,
+                gen_cfg,
+                think_close_id,
+                &prompt_ids,
+                cfg.eos_token_id,
+                false,
+                |next_id| detok.push(&self.tokenizer, next_id),
+                &mut full,
+                &mut token_logprob_end_offsets,
+                |_delta, _next_id| true,
+            )?;
+
+            let mut token_logprobs = result.token_logprobs;
+            let mut stopped = result.stopped;
+            let mut stop_reason = result.stop_reason;
+
+            // Mirrors `decode_loop_with_stops`'s own post-loop tail-flush exactly
+            // (same detokenizer-finish/rescan/truncate sequence, same "already
+            // stopped wins" precedence).
+            if let Some(tail) = finish_detokenizer(&mut detok, result.confirmed_stop_string_match)
+                && !tail.is_empty()
+            {
+                full.push_str(&tail);
+                if let Some(hit) = earliest_stop_match(&full, &gen_cfg.stop_strings) {
+                    full.truncate(hit);
+                    truncate_token_logprobs_to_retained_text(
+                        &mut token_logprobs,
+                        &token_logprob_end_offsets,
+                        hit,
+                    );
+                    if !stopped {
+                        stopped = true;
+                        stop_reason = StopReason::Eos;
+                    }
+                }
+            }
+
+            Ok((
+                GenerateOutput {
+                    text: full,
+                    token_ids: result.generated_ids.clone(),
+                    prompt_tokens: prompt_len,
+                    generated_tokens: result.generated_ids.len(),
+                    stopped,
+                    stop_reason: Some(stop_reason),
+                    token_logprobs,
+                },
+                result.trace,
+            ))
         }
     }
 
@@ -1953,6 +2140,89 @@ pub(crate) fn check_context_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // ADR-090 row C: driver trace vs the pre-migration golden
+    // -----------------------------------------------------------------------
+
+    /// Mirrors `tests/cpu_pre_migration_greedy_golden.rs` exactly (same fixture, same
+    /// checkpoint, same replayed config), but through the crate-private
+    /// `generate_with_trace` that external integration test cannot see -- and asserts
+    /// the one thing that test cannot: acceptance #2 requires `trace.consumed ==
+    /// ids.len()` in the same test that asserts the ids, and `DriverTrace` does not
+    /// exist outside this crate. This does not modify, replace, or duplicate that
+    /// gate's own enforcement; it stays untouched and still runs on its own. This is
+    /// an additional, narrower check the golden's own crate boundary cannot perform.
+    #[test]
+    #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_CPU_GREEDY_MODEL_DIR"]
+    fn driver_trace_matches_ids_len_on_the_pre_migration_golden() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            prompt: String,
+            expected_generated_ids: Vec<u32>,
+            #[serde(default)]
+            reasoning_budget: Option<usize>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GoldenGeneration {
+            temperature: f32,
+            repetition_penalty: f32,
+            seed: Option<u64>,
+            enable_thinking: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            max_new_tokens: usize,
+            generation: GoldenGeneration,
+            cases: Vec<Case>,
+        }
+
+        const FIXTURE: &str = include_str!(
+            "../../../tests/fixtures/cpu_pre_migration_greedy_v1/qwen35_0_8b_cpu_greedy_tokens.json"
+        );
+        let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
+
+        let model_dir =
+            crate::test_support::require_checkpoint_dir("LATTICE_CPU_GREEDY_MODEL_DIR");
+        let model = Qwen35Model::from_safetensors(&model_dir)
+            .unwrap_or_else(|e| panic!("loading {model_dir:?} failed: {e}"));
+
+        for case in &golden.cases {
+            let cfg = GenerateConfig {
+                max_new_tokens: golden.max_new_tokens,
+                temperature: golden.generation.temperature,
+                repetition_penalty: golden.generation.repetition_penalty,
+                seed: golden.generation.seed,
+                enable_thinking: golden.generation.enable_thinking,
+                reasoning_budget: case.reasoning_budget,
+                ..Default::default()
+            };
+
+            let (output, trace) = model
+                .generate_with_trace(&case.prompt, &cfg)
+                .unwrap_or_else(|e| panic!("case {}: generation failed: {e}", case.name));
+
+            assert_eq!(
+                output.token_ids, case.expected_generated_ids,
+                "case {}: driver-routed ids diverged from the pre-migration golden",
+                case.name
+            );
+            assert_eq!(
+                trace.consumed,
+                output.token_ids.len(),
+                "case {}: trace.consumed must equal the emitted token count (acceptance #2)",
+                case.name
+            );
+            assert_eq!(
+                trace.opened,
+                output.token_ids.len(),
+                "case {}: trace.opened must equal the emitted token count too -- one \
+                 select() per emitted token on a natural (non-EOS-at-step-0) finish",
+                case.name
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Grammar wiring — mutation-sensitive unit tests (#397)

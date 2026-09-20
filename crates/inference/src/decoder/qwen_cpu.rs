@@ -88,6 +88,12 @@ pub(crate) struct QwenCpuSession<'model> {
     prompt_ids: Vec<u32>,
     prompt_len: usize,
     rng_state: u64,
+    // Read only by `metadata()`, which the row C driver never calls (logprobs stay out of
+    // scope; see `decoder::driver`'s module doc comment). Reserved for the logprobs-routing
+    // row rather than removed, so that row does not have to re-derive where the temperature
+    // for `compute_step_logprobs` comes from (see the module doc comment's "`metadata`
+    // temperature" section).
+    #[allow(dead_code)]
     temperature: f32,
     ledger: PredictionLedger,
 }
