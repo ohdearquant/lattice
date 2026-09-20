@@ -373,6 +373,7 @@ pub(crate) fn unclassifiable_macro(mac: &syn::Macro) -> Option<String> {
         name.as_str(),
         "cfg"
             | "column"
+            | "compile_error"
             | "concat"
             | "env"
             | "file"
@@ -384,6 +385,12 @@ pub(crate) fn unclassifiable_macro(mac: &syn::Macro) -> Option<String> {
             | "oslogstring"
             | "stringify"
     ) {
+        // `compile_error!` expands to a diagnostic emitted at compile time:
+        // it constructs nothing, calls nothing, and its one argument is a
+        // string literal for the message -- there is no runtime dependency
+        // it could carry, and no completeness gap in treating it as fully
+        // classifiable (lattice PR-B addendum, 2026-09-20, lifting this
+        // file's out-of-scope rule for this one classification arm).
         return None;
     }
     if matches!(
