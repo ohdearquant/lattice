@@ -1033,10 +1033,16 @@ mod tests {
     fn softmax_rejects_tau_below_floor() {
         let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
         let mut router = AdapterRouter::new(scored_gate(1, &[1.0, 0.0]));
-        assert!(
-            DEFAULT_TAU_FLOOR > 1e-9,
-            "test assumes 1e-9 is below the default floor"
-        );
+        // A `const` block, so a future edit that lowers DEFAULT_TAU_FLOOR under
+        // 1e-9 fails to COMPILE rather than silently turning this test into an
+        // assertion about a tau at or above the floor. A runtime assert! here
+        // is also what clippy::assertions_on_constants rejects.
+        const {
+            assert!(
+                DEFAULT_TAU_FLOOR > 1e-9,
+                "test assumes 1e-9 is below the default floor"
+            )
+        };
         router.set_weight_policy(WeightPolicy::Softmax { tau: 1e-9 });
         let result = router.route(&[0.0], &available, 2);
         assert!(
