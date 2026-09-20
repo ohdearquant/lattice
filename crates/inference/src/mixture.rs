@@ -19,11 +19,23 @@
 //! effectively one adapter under sparse, noisy reward, so a temperature and
 //! an `epsilon` floor bound the result (ADR-091; see
 //! [`AdapterRouter::set_weight_policy`] and [`AdapterRouter::set_epsilon`]).
-//! The collapse guards that reasoning calls for — a floor on the temperature
-//! itself, a load-balance/entropy penalty applied during refit, and
-//! rejection of a refit that collapses — are a separate mechanism and are
-//! not implemented in this module; `Softmax` should not be preferred in
-//! production ahead of them.
+//!
+//! ADR-091 Decision 3 names three collapse guards, all required before
+//! `Softmax` should be preferred in production. Two are implemented here: a
+//! floor below which [`AdapterRouter::route`] refuses `tau` rather than
+//! letting it fall toward an argmax (see [`AdapterRouter::set_tau_floor`]
+//! and [`RouterError::TauBelowFloor`]), and an entropy floor on a refit
+//! round's produced weight vectors that rejects the refit — leaving the live
+//! gate unchanged — after enough consecutive collapsed rounds (see
+//! [`AdapterRouter::submit_refit`]). The third, load-balance and z-loss
+//! terms applied to the weight distribution, is not implemented: the ADR
+//! text is ambiguous between at least two architecturally different readings
+//! (a monitoring signal evaluated on `route`'s selected/floored output vs.
+//! restructuring the refit gradient itself to train against that output
+//! rather than the gate's full logit vector), and no other document in this
+//! repository resolves it. See `submit_refit`'s doc for the reasoning; an
+//! answer invented here would be a spec change wearing an implementation's
+//! clothes. `Softmax` should not be preferred in production ahead of it.
 
 use lattice_fann::{FannError, Network};
 
@@ -115,6 +127,22 @@ pub enum RouterError {
         /// The offending temperature.
         tau: f32,
     },
+
+    /// `tau` was finite and strictly positive (so it passed the basic
+    /// validity check) but fell below the configured collapse-guard floor
+    /// (ADR-091 Decision 3, [`AdapterRouter::set_tau_floor`]).
+    #[error("softmax temperature tau={tau} is below the configured floor {floor}")]
+    TauBelowFloor {
+        /// The offending (too-low but otherwise valid) temperature.
+        tau: f32,
+        /// The configured floor it fell below.
+        floor: f32,
+    },
+
+    /// [`AdapterRouter::submit_refit`] was called with no weight vectors for
+    /// the round: there is nothing to measure entropy over.
+    #[error("refit round has no weight vectors to measure entropy over")]
+    EmptyRefitRound,
 }
 
 /// Named mixture weight policy for [`AdapterRouter::route`] (ADR-091).
@@ -152,6 +180,48 @@ pub struct FloorOutcome {
     pub dropped: Vec<AdapterId>,
 }
 
+/// Default floor on the softmax temperature `tau` (ADR-091 Decision 3,
+/// [`AdapterRouter::set_tau_floor`]).
+///
+/// Below this, `exp((score - max_score) / tau)` underflows toward zero in
+/// `f32` for any score gap of a couple of units, so the softmax is already
+/// an argmax in floating point, not merely "practically" one. `1e-2` is a
+/// round, conservative number rather than one derived from a specific score
+/// scale — gate scores have no calibrated magnitude (see the module doc) —
+/// chosen far enough above numerical underflow that it catches near-collapse
+/// well before floating point would. It is a policy default, not a proof:
+/// the Decision 5 evidence run is what should move it.
+pub const DEFAULT_TAU_FLOOR: f32 = 1e-2;
+
+/// Default entropy floor, in nats, below which a refit round's mean
+/// weight-entropy counts as collapsed (ADR-091 Decision 3,
+/// [`AdapterRouter::submit_refit`]).
+///
+/// At `k = 2` (the smallest, most common selection width) this is roughly a
+/// 97.7 / 2.3 split — sharp enough to already read as collapse rather than a
+/// confident, healthy preference. Entropy's scale depends on `k`, and this
+/// guard compares every round against one static floor regardless of `k`;
+/// a deployment mixing very different `k` across rounds should treat this as
+/// a known limitation, not a tuned-away one. As the ADR states: this floor
+/// cannot tell collapse from a correctly sharp distribution — a router that
+/// has genuinely learned to prefer one adapter produces the same low-entropy
+/// weight vector as one that has collapsed under sparse reward. It is a
+/// guard on refits, not a guard on truth: it decides which gate gets
+/// reloaded, not whether the resulting policy is good. A rejected refit
+/// whose held-out metric (Decision 5) was improving is the stated falsifier
+/// for the floor value — that observation, not intuition about the number,
+/// is what should move it.
+pub const DEFAULT_ENTROPY_FLOOR: f32 = 0.1;
+
+/// Default number of consecutive collapsed rounds tolerated before
+/// [`AdapterRouter::submit_refit`] rejects a refit (ADR-091 Decision 3).
+///
+/// `3` tolerates a single noisy round — one round at or above the floor
+/// resets the count — while still catching a sustained collapse within a
+/// small, bounded number of refit cycles. Policy, not derivation; see
+/// [`DEFAULT_ENTROPY_FLOOR`].
+pub const DEFAULT_MAX_CONSECUTIVE_COLLAPSED: usize = 3;
+
 /// Routes a context vector to a top-k subset of available adapters and
 /// assigns each a mixture weight under the router's [`WeightPolicy`].
 ///
@@ -169,15 +239,22 @@ pub struct FloorOutcome {
 /// harmless. [`WeightPolicy::Softmax`] draws weights from those same scores
 /// instead; a learnable-softmax router can collapse to effectively one
 /// adapter under sparse, noisy reward, so a temperature floor, a
-/// load-balance/entropy penalty applied during refit, and refit rejection
-/// are required before this policy is safe to prefer in production
-/// (ADR-091). This module implements the weight mechanism and the `epsilon`
-/// floor only; those collapse guards live elsewhere and are not yet built.
+/// load-balance/z-loss penalty applied during refit, and refit rejection are
+/// required before this policy is safe to prefer in production (ADR-091
+/// Decision 3). This module implements the temperature floor
+/// ([`set_tau_floor`](Self::set_tau_floor)) and refit rejection on an
+/// entropy floor ([`submit_refit`](Self::submit_refit)); the load-balance/
+/// z-loss guard is not implemented pending a spec clarification — see the
+/// module doc and `submit_refit`'s doc for what is ambiguous.
 pub struct AdapterRouter {
     gate: Network,
     weight_policy: WeightPolicy,
     epsilon: f32,
     last_dropped: Vec<AdapterId>,
+    tau_floor: f32,
+    entropy_floor: f32,
+    max_consecutive_collapsed: usize,
+    consecutive_collapsed_rounds: usize,
 }
 
 impl AdapterRouter {
@@ -193,6 +270,10 @@ impl AdapterRouter {
             weight_policy: WeightPolicy::default(),
             epsilon: 0.0,
             last_dropped: Vec::new(),
+            tau_floor: DEFAULT_TAU_FLOOR,
+            entropy_floor: DEFAULT_ENTROPY_FLOOR,
+            max_consecutive_collapsed: DEFAULT_MAX_CONSECUTIVE_COLLAPSED,
+            consecutive_collapsed_rounds: 0,
         }
     }
 
@@ -251,6 +332,46 @@ impl AdapterRouter {
         &self.last_dropped
     }
 
+    /// Set the floor below which [`route`](Self::route) refuses `tau` for
+    /// [`WeightPolicy::Softmax`], returning [`RouterError::TauBelowFloor`]
+    /// (ADR-091 Decision 3).
+    ///
+    /// Refusing rather than clamping keeps a misconfigured temperature
+    /// visible to the caller instead of quietly changing what they asked
+    /// for — the same reasoning behind dropping an under-`epsilon` weight
+    /// instead of damping it: a silent substitution is not an approximation
+    /// of the caller's request, it is a different request answered as if it
+    /// were the one asked. The default, from [`AdapterRouter::new`], is
+    /// [`DEFAULT_TAU_FLOOR`].
+    pub fn set_tau_floor(&mut self, floor: f32) {
+        self.tau_floor = floor;
+    }
+
+    /// Set the entropy floor (nats) used by [`submit_refit`](Self::submit_refit)
+    /// to decide whether a refit round counts as collapsed (ADR-091
+    /// Decision 3). The default, from [`AdapterRouter::new`], is
+    /// [`DEFAULT_ENTROPY_FLOOR`].
+    pub fn set_entropy_floor(&mut self, floor: f32) {
+        self.entropy_floor = floor;
+    }
+
+    /// Set the number of consecutive collapsed rounds
+    /// [`submit_refit`](Self::submit_refit) tolerates before rejecting a
+    /// refit (ADR-091 Decision 3). The default, from [`AdapterRouter::new`],
+    /// is [`DEFAULT_MAX_CONSECUTIVE_COLLAPSED`].
+    pub fn set_max_consecutive_collapsed(&mut self, max_consecutive_collapsed: usize) {
+        self.max_consecutive_collapsed = max_consecutive_collapsed;
+    }
+
+    /// The current consecutive-collapsed-round count tracked by
+    /// [`submit_refit`](Self::submit_refit).
+    ///
+    /// Reset to `0` by any round whose mean weight-entropy is at or above
+    /// the configured floor.
+    pub fn consecutive_collapsed_rounds(&self) -> usize {
+        self.consecutive_collapsed_rounds
+    }
+
     /// Select the top-`k` adapters for the given context and assign each a
     /// mixture weight under the configured [`WeightPolicy`].
     ///
@@ -285,6 +406,9 @@ impl AdapterRouter {
     /// - the gate forward pass fails
     /// - the policy is [`WeightPolicy::Softmax`] and `tau` is zero,
     ///   negative, or non-finite
+    /// - the policy is [`WeightPolicy::Softmax`] and `tau` is otherwise valid
+    ///   but below the configured floor (see
+    ///   [`set_tau_floor`](Self::set_tau_floor))
     pub fn route(
         &mut self,
         context_vector: &[f32],
@@ -354,6 +478,17 @@ impl AdapterRouter {
                 if !tau.is_finite() || tau <= 0.0 {
                     return Err(RouterError::InvalidTau { tau });
                 }
+                // ADR-091 Decision 3: a valid-but-too-small tau is an argmax
+                // with extra steps. Checked after the basic finite/positive
+                // validity check above, never before it — a NaN or negative
+                // tau must fail InvalidTau, not silently skip this floor
+                // (NaN compares false against everything, including `<`).
+                if tau < self.tau_floor {
+                    return Err(RouterError::TauBelowFloor {
+                        tau,
+                        floor: self.tau_floor,
+                    });
+                }
                 // Subtract the max selected score before exponentiating: the
                 // max always maps to exp(0) = 1.0, so the sum of exponentials
                 // is always >= 1.0 and this can never divide by zero — and it
@@ -390,6 +525,121 @@ impl AdapterRouter {
     pub fn output_size(&self) -> usize {
         self.gate.num_outputs()
     }
+
+    /// Submit a refit's candidate gate for loading, gated by the entropy
+    /// collapse guard (ADR-091 Decision 3).
+    ///
+    /// `round_weights` is the weight vector [`route`](Self::route) produced
+    /// for every request in the refit round being evaluated — there is no
+    /// driver anywhere in this repository that collects these across rounds
+    /// yet (see the module doc); whatever eventually does is expected to
+    /// call this instead of [`reload`](Self::reload) directly. That is a
+    /// deliberate, and only, structural property of this method: routing the
+    /// reload through the same call that performs the entropy check means a
+    /// future driver's cheapest path to loading a refit is also the guarded
+    /// one, rather than the guard being a second call a driver can build
+    /// without and still compile. It does not, and cannot, stop a caller
+    /// from calling `reload` directly instead — `reload` has to stay
+    /// available on its own for non-refit gate swaps, such as initial
+    /// provisioning, that have no round to measure entropy over.
+    ///
+    /// The round's mean [`weight_entropy`] is compared against the
+    /// configured entropy floor (see
+    /// [`set_entropy_floor`](Self::set_entropy_floor)): a round at or above
+    /// the floor resets the consecutive-collapsed count to zero, and a round
+    /// below it increments the count. While the count stays below the
+    /// configured maximum (see
+    /// [`set_max_consecutive_collapsed`](Self::set_max_consecutive_collapsed)),
+    /// the refit is accepted and loaded — including individual collapsed
+    /// rounds short of that count, since Decision 3 rejects on `M`
+    /// *consecutive* collapsed rounds, not on any one of them. Once the
+    /// count reaches the configured maximum, the refit is rejected:
+    /// `reload` is never called, the live gate is unchanged, and it keeps
+    /// serving its previous selection. `reload`'s own no-partial-mutation
+    /// contract is what makes this rejection free — there is nothing to
+    /// undo, because nothing was mutated.
+    ///
+    /// The floor cannot tell collapse from a correctly sharp distribution: a
+    /// router that has genuinely learned to prefer one adapter produces the
+    /// same low-entropy weight vector as one that has collapsed under
+    /// sparse reward. This is a guard on refits, not a guard on truth — it
+    /// decides which gate gets reloaded, not whether the resulting policy is
+    /// good. A rejected refit whose held-out metric (Decision 5) was
+    /// improving is the ADR's own stated falsifier for the floor value; that
+    /// observation, not intuition about the number, is what should move it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::EmptyRefitRound`] if `round_weights` is empty
+    /// — there is no request in the round to measure entropy over, and the
+    /// consecutive-collapsed count is left unchanged. Otherwise, on
+    /// acceptance, returns whatever [`reload`](Self::reload) itself returns.
+    pub fn submit_refit(
+        &mut self,
+        gate_bytes: &[u8],
+        round_weights: &[Vec<f32>],
+    ) -> Result<RefitOutcome, RouterError> {
+        if round_weights.is_empty() {
+            return Err(RouterError::EmptyRefitRound);
+        }
+        let mean_entropy = round_weights
+            .iter()
+            .map(|weights| weight_entropy(weights))
+            .sum::<f32>()
+            / round_weights.len() as f32;
+        if mean_entropy < self.entropy_floor {
+            self.consecutive_collapsed_rounds += 1;
+        } else {
+            self.consecutive_collapsed_rounds = 0;
+        }
+        if self.consecutive_collapsed_rounds >= self.max_consecutive_collapsed {
+            return Ok(RefitOutcome::Rejected {
+                mean_entropy,
+                consecutive_collapsed_rounds: self.consecutive_collapsed_rounds,
+            });
+        }
+        self.reload(gate_bytes)?;
+        Ok(RefitOutcome::Accepted { mean_entropy })
+    }
+}
+
+/// Outcome of [`AdapterRouter::submit_refit`]: whether the candidate gate
+/// was loaded or rejected by the entropy collapse guard (ADR-091 Decision 3).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RefitOutcome {
+    /// The round's mean weight-entropy was at or above the floor, or below
+    /// it for fewer than the configured consecutive-round limit. The
+    /// candidate gate was loaded via [`AdapterRouter::reload`].
+    Accepted {
+        /// Mean weight-entropy (nats) measured over the accepted round.
+        mean_entropy: f32,
+    },
+    /// The round's mean weight-entropy was below the floor for the
+    /// configured number of consecutive rounds. `reload` was not called:
+    /// the live gate is unchanged and continues to serve its previous
+    /// selection.
+    Rejected {
+        /// Mean weight-entropy (nats) measured over the rejected round.
+        mean_entropy: f32,
+        /// The consecutive-collapsed-round count that triggered rejection.
+        consecutive_collapsed_rounds: usize,
+    },
+}
+
+/// Shannon entropy, in nats, of a weight vector: `-Σ wᵢ · ln(wᵢ)`.
+///
+/// Terms where `wᵢ <= 0.0` (including `NaN`, which compares false against
+/// `0.0`) contribute `0.0` — the standard `0 · ln(0) := 0` convention,
+/// extended defensively to non-positive input rather than propagating a
+/// `NaN` or panicking. Does not require `weights` to sum to 1; a caller
+/// comparing the result against a floor tuned for normalised weights should
+/// pass a normalised vector, such as one [`AdapterRouter::route`] returned.
+pub fn weight_entropy(weights: &[f32]) -> f32 {
+    weights
+        .iter()
+        .filter(|&&w| w > 0.0)
+        .map(|&w| -w * w.ln())
+        .sum()
 }
 
 /// Remove any weight strictly below `epsilon`, in original order, without
@@ -774,6 +1024,264 @@ mod tests {
         assert!(
             !router.last_dropped().contains(&"unselected".to_string()),
             "an adapter that never reached the top-k must not appear in last_dropped"
+        );
+    }
+
+    // ─── ADR-091 Decision 3, guard (a): tau floor ──────────────────────────
+
+    #[test]
+    fn softmax_rejects_tau_below_floor() {
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
+        let mut router = AdapterRouter::new(scored_gate(1, &[1.0, 0.0]));
+        // A `const` block, so a future edit that lowers DEFAULT_TAU_FLOOR under
+        // 1e-9 fails to COMPILE rather than silently turning this test into an
+        // assertion about a tau at or above the floor. A runtime assert! here
+        // is also what clippy::assertions_on_constants rejects.
+        const {
+            assert!(
+                DEFAULT_TAU_FLOOR > 1e-9,
+                "test assumes 1e-9 is below the default floor"
+            )
+        };
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 1e-9 });
+        let result = router.route(&[0.0], &available, 2);
+        assert!(
+            matches!(
+                result,
+                Err(RouterError::TauBelowFloor { tau, floor })
+                    if tau == 1e-9 && floor == DEFAULT_TAU_FLOOR
+            ),
+            "tau=1e-9 (finite, positive, below the default floor) must be \
+             rejected as TauBelowFloor, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn softmax_accepts_tau_immediately_above_floor() {
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
+        let mut router = AdapterRouter::new(scored_gate(1, &[1.0, 0.0]));
+        let above_floor = DEFAULT_TAU_FLOOR * 1.01;
+        router.set_weight_policy(WeightPolicy::Softmax { tau: above_floor });
+        let result = router.route(&[0.0], &available, 2);
+        assert!(
+            result.is_ok(),
+            "tau just above the floor must be accepted, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn softmax_accepts_tau_exactly_at_floor() {
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
+        let mut router = AdapterRouter::new(scored_gate(1, &[1.0, 0.0]));
+        router.set_weight_policy(WeightPolicy::Softmax {
+            tau: DEFAULT_TAU_FLOOR,
+        });
+        let result = router.route(&[0.0], &available, 2);
+        assert!(
+            result.is_ok(),
+            "tau exactly at the floor must be accepted (floor is inclusive), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn set_tau_floor_is_respected() {
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
+        let mut router = AdapterRouter::new(scored_gate(1, &[1.0, 0.0]));
+        router.set_tau_floor(0.5);
+        router.set_weight_policy(WeightPolicy::Softmax { tau: 0.3 });
+        let result = router.route(&[0.0], &available, 2);
+        assert!(
+            matches!(
+                result,
+                Err(RouterError::TauBelowFloor { tau, floor })
+                    if tau == 0.3 && floor == 0.5
+            ),
+            "a raised floor must reject a tau the default floor would accept, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tau_floor_check_runs_after_basic_validity_check() {
+        // A degenerate tau (here NaN) must still resolve to InvalidTau, never
+        // to TauBelowFloor: `NaN < floor` is false, so an ordering bug that
+        // ran the floor check first would let NaN fall through this branch
+        // entirely and reach the softmax computation.
+        let available: Vec<AdapterId> = vec!["a".into(), "b".into()];
+        let mut router = AdapterRouter::new(scored_gate(1, &[1.0, 0.0]));
+        router.set_weight_policy(WeightPolicy::Softmax { tau: f32::NAN });
+        let result = router.route(&[0.0], &available, 2);
+        assert!(
+            matches!(result, Err(RouterError::InvalidTau { .. })),
+            "NaN tau must be rejected as InvalidTau, not TauBelowFloor or Ok, got {result:?}"
+        );
+    }
+
+    // ─── ADR-091 Decision 3, guard (c): entropy floor + refit rejection ────
+
+    #[test]
+    fn weight_entropy_flat_is_ln_k() {
+        let k = 4;
+        let flat = vec![1.0 / k as f32; k];
+        let entropy = weight_entropy(&flat);
+        let expected = (k as f32).ln();
+        assert!(
+            (entropy - expected).abs() < 1e-5,
+            "flat k={k} entropy must be ln(k)={expected}, got {entropy}"
+        );
+    }
+
+    #[test]
+    fn weight_entropy_skewed_is_lower_than_flat() {
+        let flat = vec![0.25, 0.25, 0.25, 0.25];
+        let skewed = vec![0.97, 0.01, 0.01, 0.01];
+        let flat_entropy = weight_entropy(&flat);
+        let skewed_entropy = weight_entropy(&skewed);
+        assert!(
+            skewed_entropy < flat_entropy,
+            "a skewed distribution must have lower entropy than the flat one: \
+             skewed={skewed_entropy}, flat={flat_entropy}"
+        );
+    }
+
+    #[test]
+    fn weight_entropy_one_hot_is_zero() {
+        let one_hot = vec![1.0, 0.0, 0.0];
+        assert_eq!(weight_entropy(&one_hot), 0.0);
+    }
+
+    #[test]
+    fn submit_refit_empty_round_is_rejected_as_error() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let result = router.submit_refit(&fixed_gate(2, 2, 1).to_bytes(), &[]);
+        assert!(matches!(result, Err(RouterError::EmptyRefitRound)));
+    }
+
+    /// `M-1` consecutive collapsed rounds must not reject: each round is
+    /// individually below the floor, but Decision 3 rejects on `M`
+    /// *consecutive* collapsed rounds, not on any single one.
+    #[test]
+    fn submit_refit_m_minus_one_collapsed_rounds_does_not_reject() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let collapsed_round = vec![vec![1.0, 0.0]]; // one-hot: entropy 0.0, collapsed
+        for _ in 0..DEFAULT_MAX_CONSECUTIVE_COLLAPSED - 1 {
+            let outcome = router
+                .submit_refit(&fixed_gate(2, 2, 1).to_bytes(), &collapsed_round)
+                .unwrap();
+            assert!(
+                matches!(outcome, RefitOutcome::Accepted { .. }),
+                "fewer than M consecutive collapsed rounds must still be accepted, got {outcome:?}"
+            );
+        }
+        assert_eq!(
+            router.consecutive_collapsed_rounds(),
+            DEFAULT_MAX_CONSECUTIVE_COLLAPSED - 1
+        );
+    }
+
+    /// The `M`-th consecutive collapsed round rejects, and the live gate
+    /// still produces its previous selection afterwards — the same
+    /// preserve-on-failure assertion style as `reload_malformed_bytes_preserves_selection`.
+    #[test]
+    fn submit_refit_mth_consecutive_collapsed_round_rejects_and_preserves_selection() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let pool = vec!["first".into(), "second".into()];
+        let context = [1.0, 0.5];
+        let collapsed_round = vec![vec![1.0, 0.0]];
+        for _ in 0..DEFAULT_MAX_CONSECUTIVE_COLLAPSED - 1 {
+            router
+                .submit_refit(&fixed_gate(2, 2, 1).to_bytes(), &collapsed_round)
+                .unwrap();
+        }
+        let before = router.route(&context, &pool, 1).unwrap();
+        let outcome = router
+            .submit_refit(&fixed_gate(2, 2, 1).to_bytes(), &collapsed_round)
+            .unwrap();
+        assert!(
+            matches!(
+                outcome,
+                RefitOutcome::Rejected {
+                    consecutive_collapsed_rounds,
+                    ..
+                } if consecutive_collapsed_rounds == DEFAULT_MAX_CONSECUTIVE_COLLAPSED
+            ),
+            "the Mth consecutive collapsed round must reject, got {outcome:?}"
+        );
+        let after = router.route(&context, &pool, 1).unwrap();
+        assert_eq!(
+            before, after,
+            "a rejected refit must never call reload; live gate must be unchanged"
+        );
+    }
+
+    /// One good round in the middle of a collapsed streak resets the count:
+    /// collapsed, collapsed, good, collapsed, collapsed must not reject
+    /// (default M=3), because the streak never reaches 3 consecutive.
+    #[test]
+    fn submit_refit_good_round_in_middle_resets_count() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let collapsed_round = vec![vec![1.0, 0.0]];
+        let good_round = vec![vec![0.5, 0.5]]; // flat over k=2: entropy ln(2) > default floor
+        let sequence = [
+            &collapsed_round,
+            &collapsed_round,
+            &good_round,
+            &collapsed_round,
+            &collapsed_round,
+        ];
+        for round in sequence {
+            let outcome = router
+                .submit_refit(&fixed_gate(2, 2, 1).to_bytes(), round)
+                .unwrap();
+            assert!(
+                matches!(outcome, RefitOutcome::Accepted { .. }),
+                "a good round mid-streak must prevent the M-consecutive threshold \
+                 from ever being reached, got {outcome:?}"
+            );
+        }
+        assert_eq!(router.consecutive_collapsed_rounds(), 2);
+    }
+
+    #[test]
+    fn submit_refit_accepted_round_reports_mean_entropy_and_reloads() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        let pool = vec!["first".into(), "second".into()];
+        let context = [1.0, 0.5];
+        let before = router.route(&context, &pool, 1).unwrap();
+        let good_round = vec![vec![0.5, 0.5], vec![0.5, 0.5]];
+        let outcome = router
+            .submit_refit(&fixed_gate(2, 2, 1).to_bytes(), &good_round)
+            .unwrap();
+        let expected_entropy = 2.0f32.ln();
+        assert!(
+            matches!(
+                outcome,
+                RefitOutcome::Accepted { mean_entropy }
+                    if (mean_entropy - expected_entropy).abs() < 1e-5
+            ),
+            "expected Accepted with mean_entropy={expected_entropy}, got {outcome:?}"
+        );
+        let after = router.route(&context, &pool, 1).unwrap();
+        assert_ne!(
+            before, after,
+            "an accepted refit must actually reload the gate"
+        );
+    }
+
+    #[test]
+    fn set_entropy_floor_and_set_max_consecutive_collapsed_are_respected() {
+        let mut router = AdapterRouter::new(fixed_gate(2, 2, 0));
+        // Raise the entropy floor above ln(2) so even the flat k=2
+        // distribution counts as collapsed, and lower M to 1 so a single
+        // collapsed round rejects immediately.
+        router.set_entropy_floor(10.0);
+        router.set_max_consecutive_collapsed(1);
+        let flat_round = vec![vec![0.5, 0.5]];
+        let outcome = router
+            .submit_refit(&fixed_gate(2, 2, 1).to_bytes(), &flat_round)
+            .unwrap();
+        assert!(
+            matches!(outcome, RefitOutcome::Rejected { .. }),
+            "a raised floor and M=1 must reject on the first round, got {outcome:?}"
         );
     }
 }
