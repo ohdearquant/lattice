@@ -2148,9 +2148,9 @@ mod tests {
     /// Mirrors `tests/cpu_pre_migration_greedy_golden.rs` exactly (same fixture, same
     /// checkpoint, same replayed config), but through the crate-private
     /// `generate_with_trace` that external integration test cannot see -- and asserts
-    /// the one thing that test cannot: acceptance #2 requires `trace.consumed ==
-    /// ids.len()` in the same test that asserts the ids, and `DriverTrace` does not
-    /// exist outside this crate. This does not modify, replace, or duplicate that
+    /// the one thing that test cannot: that those ids came through the driver, in the
+    /// same test that asserts them, and `DriverTrace` does not exist outside this
+    /// crate. This does not modify, replace, or duplicate that
     /// gate's own enforcement; it stays untouched and still runs on its own. This is
     /// an additional, narrower check the golden's own crate boundary cannot perform.
     #[test]
@@ -2183,8 +2183,7 @@ mod tests {
         );
         let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
 
-        let model_dir =
-            crate::test_support::require_checkpoint_dir("LATTICE_CPU_GREEDY_MODEL_DIR");
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_CPU_GREEDY_MODEL_DIR");
         let model = Qwen35Model::from_safetensors(&model_dir)
             .unwrap_or_else(|e| panic!("loading {model_dir:?} failed: {e}"));
 
@@ -2209,16 +2208,51 @@ mod tests {
                 case.name
             );
             assert_eq!(
-                trace.consumed,
+                trace.opened,
                 output.token_ids.len(),
-                "case {}: trace.consumed must equal the emitted token count (acceptance #2)",
+                "case {}: one select() per emitted token on a natural \
+                 (non-EOS-at-step-0) finish",
+                case.name
+            );
+            // The row's acceptance originally asked for `consumed == ids.len()`.
+            // It is the wrong equality and the driver's doc comment says why:
+            // squaring it would mean issuing one extra forward pass per request
+            // whose logits nothing reads. `consumed == opened - 1` is the
+            // invariant the loop actually maintains, and it detects a bypassed
+            // step exactly as well, because a bypass shortens `opened` too.
+            assert_eq!(
+                trace.consumed + 1,
+                trace.opened,
+                "case {}: exactly one prediction stays open at finish",
+                case.name
+            );
+
+            // The SAME case replayed with `logprobs` set, which is the routing
+            // predicate's other arm. This is not redundancy: before this row the
+            // golden pinned `decode_loop`, and after it the golden pins the driver,
+            // so `generate_inline` and the two loop helpers it still owns would ship
+            // with no token-level coverage at all -- reachable only through grammar
+            // or logprobs, neither of which the golden sets. Capturing log
+            // probabilities does not change which token greedy decode picks, so the
+            // ids must be the same ids, and a divergence here means the fallback
+            // drifted from the route that replaced it.
+            let inline_cfg = GenerateConfig {
+                logprobs: Some(0),
+                ..cfg.clone()
+            };
+            let (inline_output, inline_trace) = model
+                .generate_with_trace(&case.prompt, &inline_cfg)
+                .unwrap_or_else(|e| panic!("case {}: inline generation failed: {e}", case.name));
+            assert_eq!(
+                inline_output.token_ids, case.expected_generated_ids,
+                "case {}: the grammar/logprobs fallback diverged from the same golden",
                 case.name
             );
             assert_eq!(
-                trace.opened,
-                output.token_ids.len(),
-                "case {}: trace.opened must equal the emitted token count too -- one \
-                 select() per emitted token on a natural (non-EOS-at-step-0) finish",
+                inline_trace,
+                driver::DriverTrace::default(),
+                "case {}: a logprobs request must NOT reach the driver -- a non-default \
+                 trace here means the routing predicate sent it to the wrong loop",
                 case.name
             );
         }

@@ -175,13 +175,12 @@ pub(crate) fn run(
         streaming,
     );
 
-    // `pending`/`needs_final_decode` track the one prediction that has been
-    // opened (via `select`) but not yet consumed (via `decode`) -- see the
-    // struct doc on `DriverTrace` and the long comment at the bottom of this
-    // function for why an extra `decode()` call is sometimes needed to keep
-    // `consumed` in lockstep with the emitted-token count.
+    // `pending` is the one prediction that has been opened (via `select`) but
+    // not yet consumed (via `decode`). The loop below consumes the PREVIOUS
+    // iteration's candidate before opening the current one, so exactly one
+    // prediction is always left open when the loop ends -- see the comment
+    // above the `finish` call for why that one is dropped rather than decoded.
     let mut pending = candidate0.prediction;
-    let mut needs_final_decode = true;
 
     let first_delta = decode_delta(candidate0.candidate_id);
     match policy.check_initial_stop(
@@ -230,7 +229,6 @@ pub(crate) fn run(
         };
         session.decode(&accepted, &cancel_never)?;
         trace.consumed += 1;
-        needs_final_decode = false;
 
         let request = SelectionRequest {
             config: gen_cfg,
@@ -276,8 +274,6 @@ pub(crate) fn run(
                 stopped = true;
                 confirmed_stop_string_match = true;
                 stop_reason = StopReason::Eos;
-                pending = candidate.prediction;
-                needs_final_decode = true;
                 break;
             }
             StepOutcome::Interrupted => {
@@ -286,8 +282,6 @@ pub(crate) fn run(
                 // `true`), handled for exhaustiveness/defense-in-depth --
                 // mirrors the same note on `decode_loop_with_stops`.
                 stop_reason = StopReason::Interrupt;
-                pending = candidate.prediction;
-                needs_final_decode = true;
                 break;
             }
             StepOutcome::Emitted {
@@ -295,7 +289,6 @@ pub(crate) fn run(
                 ..
             } => {
                 pending = candidate.prediction;
-                needs_final_decode = true;
                 if answer_budget_exhausted {
                     break;
                 }
@@ -303,30 +296,27 @@ pub(crate) fn run(
         }
     }
 
-    // The prediction ledger's own bookkeeping is one `select` ahead of
-    // `decode` by construction: every loop iteration above consumes the
-    // PREVIOUS iteration's candidate before opening the current one, so the
-    // very last token that was ever pushed to `generated_ids` -- whichever
-    // outcome ended the loop, EXCEPT a rejected `GrammarStop`/`Eos` candidate
-    // that was never pushed at all -- has an open prediction with no
-    // following iteration to consume it. Without this call, `trace.consumed`
-    // would be exactly one short of `generated_ids.len()` for every
-    // termination that ends on a *pushed* token (natural cap exhaustion, an
-    // answer-budget break, a confirmed stop-string match, or an interrupt).
-    // The resulting forward pass's logits are never read -- generation is
-    // ending regardless -- so this is a real, and named, extra compute cost
-    // relative to the pre-migration loops, not a correctness-affecting one.
-    if needs_final_decode {
-        let accepted = AcceptedToken {
-            final_id: *all_ids
-                .last()
-                .expect("all_ids holds the prompt plus at least the step-0 token"),
-            prediction: pending,
-        };
-        session.decode(&accepted, &cancel_never)?;
-        trace.consumed += 1;
-    }
-
+    // The last opened prediction is dropped, not decoded, and that is the whole
+    // reason this driver costs the same number of forward passes as the loops it
+    // replaces. Every iteration above consumes the PREVIOUS candidate before
+    // opening the current one, so when the loop ends, the final emitted token
+    // still has an open prediction and no following iteration to consume it.
+    // `decode()` on a session is a real forward pass; issuing one here to square
+    // `consumed` with `generated_ids.len()` would add one full transformer step
+    // to every request, whose logits nothing would ever read -- a measurable cost
+    // paid to make a counter look tidy, and one that would land inside the very
+    // measurement the next row exists to take. `finish` invalidates the open
+    // prediction instead (`PredictionLedger::invalidate`), which is exactly what
+    // the ledger's "ends at ... finish" contract already says happens.
+    //
+    // So the driver's standing invariant is `consumed == opened - 1`, and on a
+    // natural finish `opened == generated_ids.len()`. A step routed around the
+    // driver leaves BOTH short, which is what makes the trace a bypass detector.
+    debug_assert_eq!(
+        trace.consumed + 1,
+        trace.opened,
+        "exactly one prediction is open when the loop ends"
+    );
     session.finish(FinishDisposition::Reusable)?;
 
     Ok(DriverResult {
