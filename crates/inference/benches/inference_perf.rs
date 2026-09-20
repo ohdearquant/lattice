@@ -413,7 +413,7 @@ fn bench_kv_cache_paged(c: &mut Criterion) {
 //   cache_miss: fresh text each call   — full BPE merge path for each word
 //
 // Real tokenizer: set LATTICE_INFERENCE_MODEL_DIR or place tokenizer.json at
-//   ~/.lattice/models/qwen3.5-0.5b/tokenizer.json (or Qwen3.5-0.5B/).
+//   ~/.lattice/models/qwen3.5-0.8b/tokenizer.json (or Qwen3.5-0.8B/).
 // Falls back to a synthetic GPT-2-style BPE if no real tokenizer found.
 // ---------------------------------------------------------------------------
 
@@ -425,10 +425,10 @@ fn qwen_tokenizer_path() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok();
     let from_home_lower = home
         .as_deref()
-        .map(|h| std::path::Path::new(h).join(".lattice/models/qwen3.5-0.5b/tokenizer.json"));
+        .map(|h| std::path::Path::new(h).join(".lattice/models/qwen3.5-0.8b/tokenizer.json"));
     let from_home_upper = home
         .as_deref()
-        .map(|h| std::path::Path::new(h).join(".lattice/models/Qwen3.5-0.5B/tokenizer.json"));
+        .map(|h| std::path::Path::new(h).join(".lattice/models/Qwen3.5-0.8B/tokenizer.json"));
 
     [from_env, from_home_lower, from_home_upper]
         .into_iter()
@@ -643,7 +643,7 @@ fn bench_tokenizer_bpe(c: &mut Criterion) {
             eprintln!(
                 "[inference_perf] no real tokenizer found; using synthetic BPE.\n\
                  Set LATTICE_INFERENCE_MODEL_DIR or place tokenizer.json at\n\
-                 ~/.lattice/models/qwen3.5-0.5b/tokenizer.json for real-model baselines."
+                 ~/.lattice/models/qwen3.5-0.8b/tokenizer.json for real-model baselines."
             );
             (build_synthetic_bpe(), "synthetic")
         }
