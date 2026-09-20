@@ -201,3 +201,86 @@ fn apply_rank_above_stack_capacity_falls_back_to_heap_allocation() {
          longer exercises it"
     );
 }
+
+/// Pins the one thing this file's counter silently depends on: that a ZEROED
+/// allocation reaches `CountingAlloc::alloc` and is counted.
+///
+/// `CountingAlloc` overrides `alloc`, `dealloc` and `realloc`, and does not
+/// override `alloc_zeroed`. It is counted today only because `GlobalAlloc`'s
+/// default `alloc_zeroed` calls `self.alloc` and then zeroes the block. That
+/// is a property of the standard library's default method, not of anything
+/// written here, and the whole dependency is invisible at this file's call
+/// sites — nothing in the assertions above mentions zeroing.
+///
+/// The regression it guards is quiet in the dangerous direction. Adding an
+/// `alloc_zeroed` override that forwards to `System.alloc_zeroed` without
+/// touching the counter would not fail to compile and would not fail any
+/// no-alloc assertion in this file, because those assert that a count did
+/// NOT rise. An allocation that stops being counted makes them pass harder.
+///
+/// This matters beyond this file: a zeroed vector is the ordinary shape of a
+/// large scratch buffer (`vec![0.0f32; n]` compiles to the zeroed path for
+/// any element whose zero is all-zero bits), so any later measurement reusing
+/// this allocator to prove a large buffer was NOT materialized is resting on
+/// the same default.
+#[test]
+fn zeroed_allocations_are_counted() {
+    // Control first, and it runs in the same test rather than being described
+    // in a comment: if an ordinary allocation is not counted, the counter is
+    // dead and the zeroed reading below would be meaningless rather than
+    // reassuring.
+    let before = alloc_calls();
+    let ordinary: Vec<u8> = Vec::with_capacity(4096);
+    let ordinary_delta = alloc_calls() - before;
+    std::hint::black_box(&ordinary);
+    assert!(
+        ordinary_delta > 0,
+        "control failed: an ordinary Vec::with_capacity was not counted, so \
+         this test can say nothing about zeroed allocations"
+    );
+
+    // `vec![0u8; n]` and `vec![0.0f32; n]` both lower to the zeroed path.
+    let before = alloc_calls();
+    let zeroed_bytes: Vec<u8> = vec![0u8; 4096];
+    let zeroed_bytes_delta = alloc_calls() - before;
+    std::hint::black_box(&zeroed_bytes);
+
+    let before = alloc_calls();
+    let zeroed_floats: Vec<f32> = vec![0.0f32; 4096];
+    let zeroed_floats_delta = alloc_calls() - before;
+    std::hint::black_box(&zeroed_floats);
+
+    assert!(
+        zeroed_bytes_delta > 0,
+        "vec![0u8; 4096] allocated without being counted: CountingAlloc no \
+         longer sees the zeroed path"
+    );
+    assert!(
+        zeroed_floats_delta > 0,
+        "vec![0.0f32; 4096] allocated without being counted: CountingAlloc no \
+         longer sees the zeroed path"
+    );
+
+    // Calling `alloc_zeroed` directly removes any doubt about what `vec!`
+    // lowers to on this toolchain, which is the actual invariant at risk.
+    let layout = Layout::from_size_align(4096, 8).expect("valid layout");
+    let before = alloc_calls();
+    // SAFETY: `layout` has a non-zero size and a valid power-of-two align, so
+    // it satisfies `alloc_zeroed`'s contract. The returned pointer is freed
+    // below through the same allocator under the identical layout.
+    let ptr = unsafe { GLOBAL.alloc_zeroed(layout) };
+    let direct_delta = alloc_calls() - before;
+    assert!(
+        !ptr.is_null(),
+        "alloc_zeroed returned null for a 4096-byte layout"
+    );
+    // SAFETY: `ptr` came from `GLOBAL.alloc_zeroed` under this same `layout`
+    // on the line above and has not been freed or reallocated since.
+    unsafe { GLOBAL.dealloc(ptr, layout) };
+
+    assert!(
+        direct_delta > 0,
+        "GlobalAlloc::alloc_zeroed did not reach CountingAlloc::alloc, so \
+         zeroed allocations are invisible to every counter in this file"
+    );
+}
