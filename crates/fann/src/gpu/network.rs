@@ -251,9 +251,11 @@ impl GpuNetwork {
             Activation::Tanh => ShaderType::Tanh,
             Activation::Linear => return Ok(()), // No-op
             Activation::Softmax => {
-                // Softmax is only applied to the final output layer on CPU.
-                // Non-final softmax layers produce incorrect GPU results.
-                // FIXME(FANN-M5): wire per-layer CPU softmax fallback.
+                // Reachable only for the final layer, whose softmax is applied on CPU
+                // during readback in `read_buffer`. A non-final Softmax layer cannot
+                // reach here: `Network::new` rejects one, and it is the single
+                // constructor for both the builder and the deserialization paths, so
+                // `GpuNetwork::new` can only ever be handed a validated network.
                 return Ok(());
             }
         };

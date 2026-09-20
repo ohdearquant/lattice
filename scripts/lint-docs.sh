@@ -160,6 +160,10 @@ echo "=== Absolute Developer Path Check (#1102) ==="
 "$script_dir/lint-absolute-paths.sh" --selftest
 "$script_dir/lint-absolute-paths.sh"
 
+echo "=== Source Marker Provenance (#818) ==="
+"$script_dir/lint-source-markers.sh" --selftest
+"$script_dir/lint-source-markers.sh"
+
 if [ "$markdown_skipped" -eq 1 ]; then
     echo "=== Doc Lint Passed (Markdown checks SKIPPED: deno not found) ==="
 else
