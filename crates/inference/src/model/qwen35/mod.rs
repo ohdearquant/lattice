@@ -110,6 +110,16 @@ pub use crate::tokenizer::detokenize::bytes_to_unicode;
 // Needed by all generate paths (cpu_q8, cpu_f16, neon_forward)
 // and by tests. `pub(crate)` keeps it out of the public API surface.
 pub(crate) use generation::should_stop_token;
+// Re-exported for `crate::decoder::qwen_cpu::QwenCpuSession` (ADR-090 row B), which
+// reuses `generate()`'s exact three-branch prefill choreography and RNG-seed
+// transform rather than re-deriving either — see that module's `prefill` and
+// session-construction code for the call sites.
+pub(crate) use generation::{force_serial_prefill, initial_rng_state, prefill_tokens};
+// Same row: `QwenCpuSession`'s own escape-hatch test toggles this process-global flag,
+// mirroring `generation.rs`'s own delegation-parity tests, and must serialize on the same
+// lock those tests use.
+#[cfg(test)]
+pub(crate) use generation::{FORCE_SERIAL_PREFILL, SERIAL_PREFILL_TEST_LOCK};
 // Public raw generation-lifecycle observer event, consumed by
 // `--emit-phase-events` in `qwen35_generate.rs` via
 // `Qwen35Model::generate_streaming_with_observer`.
