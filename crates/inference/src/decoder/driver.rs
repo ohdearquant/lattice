@@ -35,7 +35,7 @@
 //! test (grammar's own regression test only covers the pre-loop masking site
 //! this row does not touch; no test anywhere sets `logprobs` through the
 //! two loop helpers this row replaces).
-use super::{AcceptedToken, DecoderSession, FinishDisposition, SelectionRequest};
+use super::{AcceptedToken, Cancellation, DecoderSession, FinishDisposition, SelectionRequest};
 use crate::error::InferenceError;
 use crate::generation::{
     DecodePolicy, GenerateConfig, StepOutcome, StopCheckOutcome, TokenLogprob,
@@ -106,10 +106,13 @@ pub(crate) fn run(
     prompt_ids: &[u32],
     eos_token_id: u32,
     streaming: bool,
+    cancel: &dyn Cancellation,
     mut decode_delta: impl FnMut(u32) -> String,
     text: &mut String,
     token_logprob_end_offsets: &mut Vec<usize>,
     mut emit_confirmed: impl FnMut(&str, u32) -> bool,
+    mut on_prefill_end: impl FnMut(),
+    finish_tail: impl FnOnce() -> String,
 ) -> Result<DriverResult, InferenceError> {
     debug_assert!(
         gen_cfg.grammar.is_none() && gen_cfg.logprobs.is_none(),
@@ -128,8 +131,42 @@ pub(crate) fn run(
         "session does not declare reasoning_budget support but gen_cfg.reasoning_budget is set"
     );
 
+    // Cancellation checkpoint 1/3 (mirrors the pre-migration streaming entry's own
+    // first checkpoint): before the prefill pass starts, so a client that already
+    // disconnected never pays for it. `session.prefill`/`session.decode` below are
+    // still called with an always-false `Cancellation` of their own -- this driver
+    // owns the three streaming-contract checkpoints itself, at the exact points the
+    // pre-migration loop checked them, rather than delegating to the session's
+    // per-call check (which fires at a different point: immediately before its own
+    // forward pass, not before/after the surrounding driver-level bookkeeping).
+    if cancel.is_cancelled() {
+        return Ok(DriverResult {
+            generated_ids: Vec::new(),
+            token_logprobs: Vec::new(),
+            stopped: false,
+            stop_reason: StopReason::Interrupt,
+            confirmed_stop_string_match: false,
+            trace: DriverTrace::default(),
+        });
+    }
     let cancel_never = || false;
     session.prefill(&cancel_never)?;
+    on_prefill_end();
+
+    // Checkpoint 2/3: immediately after the prefill pass returns -- fired after
+    // `on_prefill_end` (mirroring the pre-migration entry firing `PrefillEnd` before
+    // this check, so a caller observing raw events still sees prefill end even on
+    // this early-return path) and before paying for the first `select`.
+    if cancel.is_cancelled() {
+        return Ok(DriverResult {
+            generated_ids: Vec::new(),
+            token_logprobs: Vec::new(),
+            stopped: false,
+            stop_reason: StopReason::Interrupt,
+            confirmed_stop_string_match: false,
+            trace: DriverTrace::default(),
+        });
+    }
 
     let mut trace = DriverTrace::default();
     let mut all_ids: Vec<u32> = prompt_ids.to_vec();
@@ -221,6 +258,13 @@ pub(crate) fn run(
     let mut confirmed_stop_string_match = false;
 
     for _ in 1..cap {
+        // Checkpoint 3/3: top of every decode iteration, before this step's
+        // forward pass -- mirrors the pre-migration streaming entry's per-iteration
+        // checkpoint exactly (checked before `forward_step`, every iteration).
+        if cancel.is_cancelled() {
+            stop_reason = StopReason::Interrupt;
+            break;
+        }
         let accepted = AcceptedToken {
             final_id: *all_ids
                 .last()
@@ -277,10 +321,12 @@ pub(crate) fn run(
                 break;
             }
             StepOutcome::Interrupted => {
-                // Unreachable on this path (`generate()`'s two non-streaming
-                // callers always pass an `emit_confirmed` that returns
-                // `true`), handled for exhaustiveness/defense-in-depth --
-                // mirrors the same note on `decode_loop_with_stops`.
+                // Unreachable for `generate()`'s two non-streaming callers (their
+                // `emit_confirmed` always returns `true`); reachable for the
+                // streaming caller, whose `emit_confirmed` forwards `on_token`'s
+                // return value -- a caller that can no longer consume the stream
+                // (e.g. a dropped SSE receiver) stops generation here, same as the
+                // pre-migration streaming loop.
                 stop_reason = StopReason::Interrupt;
                 break;
             }
@@ -317,6 +363,36 @@ pub(crate) fn run(
         trace.opened,
         "exactly one prediction is open when the loop ends"
     );
+
+    // Final flush of the natural end, run through the SAME `StopMode` matcher the
+    // loop above used -- mirrors the pre-migration streaming loop's own
+    // `policy.finish_stop` tail flush exactly, including on an EMPTY tail. Two
+    // different buffers are released here and only one of them is `tail`:
+    // `finish_tail` returns what the caller's incremental detokenizer held back for
+    // UTF-8-boundary reasons, while `StopStringMatcher::push` separately holds back
+    // `max_stop - 1` bytes on EVERY call so a stop string spanning a delta boundary
+    // is never streamed early. `finish_stop` is what releases that second buffer, so
+    // it must run even when `tail` is empty -- the ordinary case, since most
+    // generations end on a clean UTF-8 boundary. Skipped when the loop already ended
+    // via a confirmed stop-string match (nothing left to reconcile) or via a
+    // caller/cancel interruption (the caller has stopped consuming; mirrors that
+    // loop's `stopped_by_caller` gate, which it also sets on cancel).
+    // Non-streaming callers pass a `finish_tail` returning an empty string AND run
+    // in `StopMode::FullScan`, where `finish_stop` does nothing -- they do their own
+    // post-return tail handling.
+    if stop_reason != StopReason::Interrupt && !confirmed_stop_string_match {
+        let tail = finish_tail();
+        // The id here is never read: every `emit_confirmed` this driver's callers
+        // supply ignores it for the tail case (it is not tied to one sampled token),
+        // same as the pre-migration `finish_stop` call site, whose `on_token` sink
+        // takes no id at all.
+        let tail_stopped = policy.finish_stop(text, &tail, |s| emit_confirmed(s, 0));
+        if tail_stopped && !stopped {
+            stopped = true;
+            stop_reason = StopReason::Eos;
+        }
+    }
+
     session.finish(FinishDisposition::Reusable)?;
 
     Ok(DriverResult {

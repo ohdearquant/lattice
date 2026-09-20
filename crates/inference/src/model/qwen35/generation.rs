@@ -4,6 +4,7 @@ use super::model::Qwen35Model;
 use super::sampling::sample_token;
 use super::stop_strings::earliest_stop_match;
 use crate::attention::gdn::GatedDeltaNetState;
+use crate::decoder::Cancellation;
 use crate::decoder::driver;
 use crate::decoder::qwen_cpu::QwenCpuSession;
 use crate::error::InferenceError;
@@ -17,6 +18,23 @@ use crate::stop_reason::StopReason;
 use crate::tokenizer::bpe::BpeTokenizer;
 use crate::tokenizer::common::Tokenizer;
 use crate::tokenizer::detokenize::{IncrementalDetokenizer, decode_tokens};
+
+/// Adapts the streaming API's `should_cancel: impl FnMut() -> bool` (which may
+/// capture a `Receiver`-style handle and mutate on each poll) to
+/// `decoder::Cancellation`, whose blanket impl covers only non-mutating `Fn`
+/// closures (see that trait's own doc comment, which names this exact
+/// conversion as a future row's job). `RefCell` gives `is_cancelled(&self)` a
+/// runtime-checked path to the one mutable call it needs; `decoder::driver::run`
+/// calls it strictly sequentially from a single thread, so the borrow never
+/// conflicts.
+struct FnMutCancellation<'a, F: FnMut() -> bool>(&'a std::cell::RefCell<F>);
+
+impl<F: FnMut() -> bool> Cancellation for FnMutCancellation<'_, F> {
+    fn is_cancelled(&self) -> bool {
+        let mut should_cancel = self.0.borrow_mut();
+        (*should_cancel)()
+    }
+}
 
 /// Test-only toggle forcing the pre-delegation serial prefill path
 /// (`prefill_tokens`) instead of `prefill_tokens_batched_for_generate`.
@@ -496,6 +514,11 @@ impl Qwen35Model {
         let mut session =
             QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
 
+        // Non-streaming callers never cancel and never need raw-event/tail-flush
+        // hooks; only the streaming dispatch target (`generate_streaming_via_driver`)
+        // supplies real ones.
+        let never_cancel = || false;
+
         if gen_cfg.stop_strings.is_empty() {
             let mut throwaway_text = String::new();
             let mut throwaway_offsets: Vec<usize> = Vec::new();
@@ -506,10 +529,13 @@ impl Qwen35Model {
                 &prompt_ids,
                 cfg.eos_token_id,
                 false,
+                &never_cancel,
                 |_next_id| String::new(),
                 &mut throwaway_text,
                 &mut throwaway_offsets,
                 |_delta, _next_id| true,
+                || {},
+                String::new,
             )?;
 
             let text = decode_tokens(&self.tokenizer, &result.generated_ids);
@@ -538,10 +564,13 @@ impl Qwen35Model {
                 &prompt_ids,
                 cfg.eos_token_id,
                 false,
+                &never_cancel,
                 |next_id| detok.push(&self.tokenizer, next_id),
                 &mut full,
                 &mut token_logprob_end_offsets,
                 |_delta, _next_id| true,
+                || {},
+                String::new,
             )?;
 
             let mut token_logprobs = result.token_logprobs;
@@ -671,7 +700,205 @@ impl Qwen35Model {
     /// the exact same `push` control-flow point that increments
     /// `generated_ids`, never from a step that grammar-stops or EOS-stops
     /// before the token is pushed.
+    ///
+    /// Delegates to [`Self::generate_streaming_with_trace`] and discards the driver
+    /// trace, mirroring [`Self::generate`]'s relationship to
+    /// [`Self::generate_with_trace`] (ADR-092 arm 1): this entry's signature and
+    /// observable behaviour are unchanged.
     pub fn generate_streaming_with_observer<F, C, O>(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+        on_raw_event: O,
+    ) -> Result<GenerateOutput, InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+        O: FnMut(RawGenEvent),
+    {
+        self.generate_streaming_with_trace(prompt, gen_cfg, on_token, should_cancel, on_raw_event)
+            .map(|(output, _trace)| output)
+    }
+
+    /// ADR-092 arm 1 dispatch point, streaming sibling of [`Self::generate_with_trace`]:
+    /// routes through [`Self::generate_streaming_via_driver`] (`decoder::driver::run` over
+    /// a [`QwenCpuSession`], same as the non-streaming driver route) whenever neither
+    /// grammar nor logprobs is requested, and falls back to
+    /// [`Self::generate_streaming_inline`] (the pre-migration implementation, unchanged)
+    /// otherwise -- same routing predicate as `generate_with_trace`, for the same reason:
+    /// the driver's `&mut dyn DecoderSession` has no way to reach the mutable grammar
+    /// state `select` samples against, nor the raw logits a logprobs capture needs.
+    ///
+    /// Crate-private and not `#[cfg(test)]`-gated, matching `generate_with_trace`: a
+    /// marker that only exists under `cfg(test)` would make the shipped path and the
+    /// tested path differ in the one respect the test is about.
+    pub(crate) fn generate_streaming_with_trace<F, C, O>(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        on_token: F,
+        should_cancel: C,
+        on_raw_event: O,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+        O: FnMut(RawGenEvent),
+    {
+        if gen_cfg.grammar.is_some() || gen_cfg.logprobs.is_some() {
+            return self
+                .generate_streaming_inline(prompt, gen_cfg, on_token, should_cancel, on_raw_event)
+                .map(|output| (output, driver::DriverTrace::default()));
+        }
+        self.generate_streaming_via_driver(prompt, gen_cfg, on_token, should_cancel, on_raw_event)
+    }
+
+    /// Driver-routed dispatch target for the shape `decoder::driver::run` accepts (no
+    /// grammar, no logprobs) -- streaming sibling of [`Self::generate_via_driver`], which
+    /// it mirrors closely: same tokenize/preflight/context-budget/reasoning-close
+    /// sequence, same [`QwenCpuSession`], same `driver::run` call. Two differences, both
+    /// load-bearing for the streaming contract [`Self::generate_streaming_inline`]
+    /// documents:
+    ///
+    /// 1. **Cancellation.** `should_cancel` here is `FnMut` (it may capture a
+    ///    `Receiver`-style handle), while `decoder::Cancellation`'s blanket impl covers
+    ///    only non-mutating `Fn` closures. [`FnMutCancellation`] bridges the two via a
+    ///    `RefCell`, per that trait's own doc comment.
+    /// 2. **Raw-token eventing.** `decoder::driver::run` calls `decode_delta` exactly
+    ///    once per token that becomes part of `generated_ids`, immediately after the
+    ///    push, in generation order -- the same guarantee [`RawGenEvent::RawToken`]'s own
+    ///    doc comment relies on. A local counter incremented inside `decode_delta`
+    ///    therefore reproduces `index == generated_ids.len()` at push time exactly,
+    ///    without a dedicated driver parameter for it.
+    ///
+    /// Always builds a real incremental detokenizer and real output buffers (unlike
+    /// `generate_via_driver`'s fast/stop-strings split, which throws the delta away when
+    /// nothing needs to observe it): a streaming caller needs `on_token` fired
+    /// incrementally regardless of whether `stop_strings` is set, and `driver::run`'s own
+    /// `policy` (built from `gen_cfg.stop_strings`) already decides internally whether
+    /// that incremental work does anything.
+    fn generate_streaming_via_driver<F, C, O>(
+        &self,
+        prompt: &str,
+        gen_cfg: &GenerateConfig,
+        mut on_token: F,
+        should_cancel: C,
+        on_raw_event: O,
+    ) -> Result<(GenerateOutput, driver::DriverTrace), InferenceError>
+    where
+        F: FnMut(&str) -> bool,
+        C: FnMut() -> bool,
+        O: FnMut(RawGenEvent),
+    {
+        debug_assert!(gen_cfg.grammar.is_none() && gen_cfg.logprobs.is_none());
+        let cfg = &self.config;
+
+        let input = self.tokenizer.tokenize(prompt);
+        let prompt_ids: Vec<u32> = input.input_ids[..input.real_length].to_vec();
+        let prompt_len = prompt_ids.len();
+
+        check_prompt_not_empty(prompt_len)?;
+
+        if gen_cfg.max_new_tokens == 0 {
+            return Ok((
+                GenerateOutput {
+                    text: String::new(),
+                    token_ids: vec![],
+                    prompt_tokens: prompt_len,
+                    generated_tokens: 0,
+                    stopped: false,
+                    stop_reason: Some(StopReason::Length),
+                    token_logprobs: vec![],
+                },
+                driver::DriverTrace::default(),
+            ));
+        }
+
+        let max_context = self.max_context();
+        check_context_budget(
+            prompt_len,
+            gen_cfg.effective_reasoning_budget(),
+            gen_cfg.max_new_tokens,
+            max_context,
+        )?;
+
+        let think_close_id = resolve_reasoning_close_token(
+            &self.tokenizer,
+            gen_cfg.reasoning_budget,
+            gen_cfg.enable_thinking,
+            cfg.vocab_size,
+        )?;
+
+        let mut session =
+            QwenCpuSession::new(self, prompt_ids.clone(), gen_cfg.temperature, gen_cfg.seed);
+
+        let should_cancel_cell = std::cell::RefCell::new(should_cancel);
+        let cancel = FnMutCancellation(&should_cancel_cell);
+
+        // Shared via `RefCell` rather than plain captures: `decode_delta` (called once
+        // per pushed token) and `on_prefill_end` (called once, before any token) are two
+        // separate closures passed into the same `driver::run` call, and both need
+        // `on_raw_event`; `decode_delta` and `finish_tail` both need `detok`. Neither
+        // pair is ever live concurrently (`driver::run` calls them strictly
+        // sequentially, single-threaded), so the runtime borrow check never conflicts.
+        let on_raw_event_cell = std::cell::RefCell::new(on_raw_event);
+        let detok_cell = std::cell::RefCell::new(IncrementalDetokenizer::new());
+        let mut raw_token_index = 0usize;
+        let mut text = String::new();
+        let mut token_logprob_end_offsets: Vec<usize> = Vec::new();
+
+        let result = driver::run(
+            &mut session,
+            gen_cfg,
+            think_close_id,
+            &prompt_ids,
+            cfg.eos_token_id,
+            true,
+            &cancel,
+            |next_id| {
+                raw_token_index += 1;
+                (*on_raw_event_cell.borrow_mut())(RawGenEvent::RawToken {
+                    index: raw_token_index,
+                });
+                detok_cell.borrow_mut().push(&self.tokenizer, next_id)
+            },
+            &mut text,
+            &mut token_logprob_end_offsets,
+            |delta, _next_id| on_token(delta),
+            || {
+                (*on_raw_event_cell.borrow_mut())(RawGenEvent::PrefillEnd);
+                // Test-only seam (mirrors `generate_streaming_inline`'s own call to the
+                // same function, at the equivalent point: immediately before the first
+                // `sample_token` -- here, immediately before the first `session.select`,
+                // which is where that sampling happens for the driver route). No-op
+                // outside `cfg(test)`.
+                #[cfg(test)]
+                test_record_first_sample_entry();
+            },
+            || detok_cell.borrow_mut().finish(),
+        )?;
+
+        Ok((
+            GenerateOutput {
+                text,
+                token_ids: result.generated_ids.clone(),
+                prompt_tokens: prompt_len,
+                generated_tokens: result.generated_ids.len(),
+                stopped: result.stopped,
+                stop_reason: Some(result.stop_reason),
+                token_logprobs: result.token_logprobs,
+            },
+            result.trace,
+        ))
+    }
+
+    /// Pre-migration implementation (ADR-092 arm 1 keeps this verbatim as the
+    /// grammar/logprobs fallback): unchanged body, unchanged behaviour, pinned by the
+    /// e2e-parity CI gate. Was `generate_streaming_with_observer` before this row; see
+    /// that function (now a thin dispatcher) for the public entry point.
+    fn generate_streaming_inline<F, C, O>(
         &self,
         prompt: &str,
         gen_cfg: &GenerateConfig,
@@ -2255,6 +2482,155 @@ mod tests {
                  trace here means the routing predicate sent it to the wrong loop",
                 case.name
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-092 arm 1: the CPU streaming entry, driver trace vs the same
+    // pre-migration golden. Mirrors the non-streaming test directly above --
+    // same fixture, same checkpoint, same replayed config -- but through
+    // `generate_streaming_with_trace`, which the non-streaming test's own
+    // `generate_with_trace` cannot exercise (it never reaches
+    // `generate_streaming_via_driver`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "requires local Qwen3.5 checkpoint: set LATTICE_CPU_GREEDY_MODEL_DIR"]
+    fn streaming_driver_trace_matches_ids_len_on_the_pre_migration_golden() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            prompt: String,
+            expected_generated_ids: Vec<u32>,
+            #[serde(default)]
+            reasoning_budget: Option<usize>,
+        }
+        #[derive(serde::Deserialize)]
+        struct GoldenGeneration {
+            temperature: f32,
+            repetition_penalty: f32,
+            seed: Option<u64>,
+            enable_thinking: bool,
+        }
+        #[derive(serde::Deserialize)]
+        struct Golden {
+            max_new_tokens: usize,
+            generation: GoldenGeneration,
+            cases: Vec<Case>,
+        }
+
+        const FIXTURE: &str = include_str!(
+            "../../../tests/fixtures/cpu_pre_migration_greedy_v1/qwen35_0_8b_cpu_greedy_tokens.json"
+        );
+        let golden: Golden = serde_json::from_str(FIXTURE).expect("golden fixture parses");
+
+        let model_dir = crate::test_support::require_checkpoint_dir("LATTICE_CPU_GREEDY_MODEL_DIR");
+        let model = Qwen35Model::from_safetensors(&model_dir)
+            .unwrap_or_else(|e| panic!("loading {model_dir:?} failed: {e}"));
+
+        for case in &golden.cases {
+            let cfg = GenerateConfig {
+                max_new_tokens: golden.max_new_tokens,
+                temperature: golden.generation.temperature,
+                repetition_penalty: golden.generation.repetition_penalty,
+                seed: golden.generation.seed,
+                enable_thinking: golden.generation.enable_thinking,
+                reasoning_budget: case.reasoning_budget,
+                ..Default::default()
+            };
+
+            // Acceptance 1: real consumer, real tokens -- pinned by the SAME
+            // pre-migration golden the non-streaming route is pinned by.
+            let mut streamed_text = String::new();
+            let (output, trace) = model
+                .generate_streaming_with_trace(
+                    &case.prompt,
+                    &cfg,
+                    |delta| {
+                        streamed_text.push_str(delta);
+                        true
+                    },
+                    || false,
+                    |_evt| {},
+                )
+                .unwrap_or_else(|e| panic!("case {}: streaming generation failed: {e}", case.name));
+
+            assert_eq!(
+                output.token_ids, case.expected_generated_ids,
+                "case {}: streaming driver-routed ids diverged from the pre-migration golden",
+                case.name
+            );
+            assert_eq!(
+                output.text, streamed_text,
+                "case {}: the returned text must equal the concatenation of every \
+                 on_token delta",
+                case.name
+            );
+
+            // Acceptance 2: the marker, for the named request shape (no grammar, no
+            // logprobs) -- same pair the non-streaming test above uses, and the same
+            // pair `driver::run`'s own doc comment names as the invariant a bypassed
+            // step cannot satisfy.
+            assert_eq!(
+                trace.opened,
+                output.token_ids.len(),
+                "case {}: one select() per emitted token on a natural \
+                 (non-EOS-at-step-0) finish",
+                case.name
+            );
+            assert_eq!(
+                trace.consumed + 1,
+                trace.opened,
+                "case {}: exactly one prediction stays open at finish",
+                case.name
+            );
+
+            // Acceptance 3: the paired negative arm. The SAME request replayed with
+            // `logprobs` set must produce the same token ids and a default trace --
+            // without this pair, a default trace on its own cannot distinguish "the
+            // fallback correctly ran" from "the driver never ran at all".
+            let inline_cfg = GenerateConfig {
+                logprobs: Some(0),
+                ..cfg.clone()
+            };
+            let (inline_output, inline_trace) = model
+                .generate_streaming_with_trace(
+                    &case.prompt,
+                    &inline_cfg,
+                    |_delta| true,
+                    || false,
+                    |_evt| {},
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "case {}: streaming inline generation failed: {e}",
+                        case.name
+                    )
+                });
+            assert_eq!(
+                inline_output.token_ids, case.expected_generated_ids,
+                "case {}: the streaming grammar/logprobs fallback diverged from the same \
+                 golden",
+                case.name
+            );
+            assert_eq!(
+                inline_trace,
+                driver::DriverTrace::default(),
+                "case {}: a logprobs streaming request must NOT reach the driver -- a \
+                 non-default trace here means the routing predicate sent it to the wrong \
+                 loop",
+                case.name
+            );
+
+            // The bypass control for the marker is deliberately NOT an assert here.
+            // Mutating a local copy of `trace` and asserting the mutated copy breaks
+            // `consumed + 1 == opened` is arithmetic, true of any two numbers in that
+            // relation, and would hold with the driver deleted. The control that
+            // carries information is a source mutation -- skipping one
+            // `session.decode()`/`session.select()` pair inside `decoder::driver::run`
+            // -- run by hand against this test, which must redden the two marker
+            // assertions above while the golden id assertion stays green. It is run
+            // and recorded at review time, not committed.
         }
     }
 
@@ -4820,6 +5196,48 @@ mod tests {
         assert_eq!(nonstreaming.text, "�");
         assert_eq!(nonstreaming.text, streaming.text);
         assert_eq!(streaming.text, streamed_text);
+    }
+
+    /// ADR-092 arm 1 regression: the streaming driver route's natural-end tail
+    /// flush must run even when the incremental detokenizer holds nothing back.
+    ///
+    /// `StopStringMatcher::push` holds back `max_stop - 1` bytes on every call so a
+    /// stop string spanning a delta boundary is never streamed prematurely, and
+    /// `finish` is what releases them. Those bytes are held by the MATCHER, not by
+    /// the detokenizer, so gating the natural-end flush on a non-empty
+    /// `detok.finish()` drops them from both `text` and the caller's stream on every
+    /// generation that ends on a clean UTF-8 boundary with `stop_strings` set --
+    /// which is the ordinary case, not an edge case.
+    ///
+    /// Mutation sensitivity: wrapping `policy.finish_stop` in `decoder::driver::run`
+    /// in an `if !tail.is_empty()` guard truncates `streaming.text` by up to
+    /// `max_stop - 1` trailing bytes, failing both assertions below.
+    #[test]
+    fn streaming_flushes_held_back_stop_prefix_bytes_when_the_detokenizer_tail_is_empty() {
+        let model = build_tiny_zero_model();
+        let gen_cfg = GenerateConfig {
+            max_new_tokens: 3,
+            temperature: 0.0,
+            stop_strings: vec!["never".to_string()],
+            ..Default::default()
+        };
+
+        let nonstreaming = model
+            .generate("a", &gen_cfg)
+            .expect("non-streaming generate must succeed");
+        let mut streamed_text = String::new();
+        let streaming = model
+            .generate_streaming("a", &gen_cfg, |delta| streamed_text.push_str(delta))
+            .expect("streaming generate must succeed");
+
+        assert_eq!(
+            streaming.text, nonstreaming.text,
+            "a stop string that never matches must not truncate the streamed output"
+        );
+        assert_eq!(
+            streaming.text, streamed_text,
+            "the returned text must equal the concatenation of every delta"
+        );
     }
 
     /// Stop-string truncation must drop `token_logprobs` entries whose decoded
