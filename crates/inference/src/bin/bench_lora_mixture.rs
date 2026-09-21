@@ -6,7 +6,10 @@
 //!
 //! If `LATTICE_MODEL_DIR` points to a valid Qwen3.5-0.8b Q4 model, the bench
 //! additionally loads the blended adapter onto GPU and measures decode tok/s,
-//! giving a full end-to-end comparison.
+//! giving a full end-to-end comparison. It also times the per-selection-change
+//! swap cost — blend, GPU adapter unload, GPU adapter load — as three separate
+//! phases: a coefficient-only fast path that skips the blend still pays the
+//! unload+load cost, and a combined number cannot tell the two apart.
 //!
 //! # Output
 //!
@@ -21,10 +24,19 @@
 //!
 //! When a model is available:
 //! ```text
+//! SWAP_BENCH r=1 k=1 layers=<n> blend_us=<f> unload_us=<f> load_us=<f> iters=<n>
+//! SWAP_BENCH r=1 k=4 layers=<n> blend_us=<f> unload_us=<f> load_us=<f> iters=<n>
+//! ...
 //! DECODE_BENCH r=1 k=1 tok_s=<f>
 //! DECODE_BENCH r=1 k=4 tok_s=<f>
 //! ...
 //! ```
+//!
+//! `layers` means the same thing in both lines -- the number of blended
+//! `LoraLayerData` entries -- but the two `blend_us` figures are NOT comparable
+//! at equal `r` and `k`: the CPU section builds `q_proj` and `v_proj` per layer
+//! while the GPU section builds `q_proj` only, so it blends half as many entries
+//! by construction. Read `layers` before comparing any two blend figures.
 //!
 //! # Env vars
 //!
@@ -79,6 +91,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
+    if iters == 0 {
+        // Every per-iteration figure below divides by `iters`. At zero that is a
+        // NaN printed in a field a reader parses as microseconds, so refuse here
+        // rather than emit an unreadable measurement.
+        return Err("BENCH_ITERS must be at least 1".into());
+    }
     let new_tokens: usize = std::env::var("BENCH_NEW_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -160,7 +178,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // GPU decode bench: only if a model directory is available.
     if let Ok(model_dir_str) = std::env::var("LATTICE_MODEL_DIR") {
-        run_gpu_decode_bench(&model_dir_str, new_tokens)?;
+        run_gpu_decode_bench(&model_dir_str, new_tokens, warmup, iters)?;
     } else {
         eprintln!(
             "[bench_lora_mixture] LATTICE_MODEL_DIR not set; skipping GPU decode bench. \
@@ -175,9 +193,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 fn run_gpu_decode_bench(
     model_dir_str: &str,
     new_tokens: usize,
+    warmup: usize,
+    iters: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use lattice_inference::GenerateConfig;
-    use lattice_inference::forward::metal_qwen35::{LoraLayerData, MetalQwen35State};
+    use lattice_inference::forward::metal_qwen35::{
+        LoraLayerData, MetalQwen35State, blend_lora_layer_data,
+    };
     use lattice_inference::model::qwen35_config::Qwen35Config;
     use lattice_inference::tokenizer::BpeTokenizer;
     use std::time::Instant;
@@ -242,6 +264,59 @@ fn run_gpu_decode_bench(
             let mut gen_cfg = GenerateConfig::default();
             gen_cfg.max_new_tokens = new_tokens;
             gen_cfg.enable_thinking = false;
+
+            // Swap-cost bench: blend, GPU unload, GPU load, timed as three
+            // separate phases in the same order `ResidencyRegistry::apply`
+            // uses on a selection change. A combined number (as
+            // `generate_with_lora_mixture` below produces internally) can't
+            // tell a coefficient-only fast path's savings (skip the blend,
+            // still pay the upload) from the full cost.
+            let mut swap_blend_us_total = 0.0f64;
+            let mut swap_unload_us_total = 0.0f64;
+            let mut swap_load_us_total = 0.0f64;
+            let mut swap_layers = 0usize;
+
+            // Warmup
+            for _ in 0..warmup {
+                let blended =
+                    blend_lora_layer_data(&refs).expect("blend must not fail on synthetic data");
+                metal.unload_lora_adapter();
+                metal
+                    .load_lora_adapter(blended, 1.0, None)
+                    .expect("load must not fail on synthetic data");
+            }
+
+            // Measured iterations
+            for _ in 0..iters {
+                let blend_start = Instant::now();
+                let blended =
+                    blend_lora_layer_data(&refs).expect("blend must not fail on synthetic data");
+                swap_blend_us_total += blend_start.elapsed().as_micros() as f64;
+                swap_layers = blended.len();
+                std::hint::black_box(swap_layers);
+
+                let unload_start = Instant::now();
+                metal.unload_lora_adapter();
+                swap_unload_us_total += unload_start.elapsed().as_micros() as f64;
+
+                let load_start = Instant::now();
+                metal
+                    .load_lora_adapter(blended, 1.0, None)
+                    .expect("load must not fail on synthetic data");
+                swap_load_us_total += load_start.elapsed().as_micros() as f64;
+            }
+            // Leave the slot unloaded: `generate_with_lora_mixture` below
+            // unloads unconditionally before its own load, but this bench
+            // owns the state it just changed rather than relying on that.
+            metal.unload_lora_adapter();
+
+            let swap_blend_us = swap_blend_us_total / iters as f64;
+            let swap_unload_us = swap_unload_us_total / iters as f64;
+            let swap_load_us = swap_load_us_total / iters as f64;
+            println!(
+                "SWAP_BENCH r={rank} k={k} layers={swap_layers} blend_us={swap_blend_us:.1} \
+                 unload_us={swap_unload_us:.1} load_us={swap_load_us:.1} iters={iters}"
+            );
 
             // Warmup
             let _ = metal.generate_with_lora_mixture(&refs, prompt, &tokenizer, &gen_cfg);

@@ -417,18 +417,24 @@ official perplexity number for this checkpoint.)
 
 ### What it does
 
-Two benchmarks in one binary. First, a CPU-only synthetic benchmark of the latency to blend `k`
-LoRA adapters of rank `r` into one combined rank-`k*r` adapter (`k ∈ {1,4,8}`, `r ∈ {1,2}`),
-printed as `BLEND_BENCH` lines: this always runs, no model needed. Second, if
-`LATTICE_MODEL_DIR` is set, an end-to-end GPU decode benchmark that actually loads a Q4 model,
-applies each synthetic blended adapter, and measures decode tok/s, printed as `DECODE_BENCH`
-lines.
+Three benchmarks in one binary. First, a CPU-only synthetic benchmark of the latency to blend
+`k` LoRA adapters of rank `r` into one combined rank-`k*r` adapter (`k ∈ {1,4,8}`, `r ∈ {1,2}`),
+printed as `BLEND_BENCH` lines: this always runs, no model needed. The other two need
+`LATTICE_MODEL_DIR` set to a Q4 model directory. `SWAP_BENCH` times what a serving path pays
+when the adapter selection changes, as three separate phases in the order the registry performs
+them: blend, GPU unload, GPU upload. `DECODE_BENCH` then measures end-to-end decode tok/s with
+that blended adapter resident.
+
+`SWAP_BENCH` reports the three phases separately rather than as one figure because they are
+avoidable independently: a path that changes only the mixture weights could skip the blend and
+would still pay the unload and upload, and a combined number cannot express that difference.
 
 ### When you'd use it
 
 Estimating the CPU overhead of the LoRA mixture path (PR #443's weighted CPU pre-blend) versus
-the single-adapter path, and optionally getting a real decode-tok/s comparison across mixture
-sizes on real hardware.
+the single-adapter path; getting a real decode-tok/s comparison across mixture sizes on real
+hardware; and sizing the per-selection-change rebuild cost against the cost of a decoded token,
+which is the number that decides whether a fast path for weight-only changes is worth building.
 
 ### Prerequisites
 
@@ -439,16 +445,20 @@ sizes on real hardware.
   `tokenizer.json` alongside the `.q4`/`.f16` weight files (the tokenizer path is hardcoded to
   `<LATTICE_MODEL_DIR>/tokenizer.json`; there is no `--tokenizer-dir` override on this binary,
   unlike `chat_metal`). A bare `quantize_q4` output directory does not have either file by
-  default (see the `quantize_q4` section above), so copy them in first.
+  default (see the `quantize_q4` section above), so copy them in first. Copy, or hard-link:
+  the checkpoint loader opens weight files with `O_NOFOLLOW` and refuses any path whose final
+  component is a symlink, so assembling a model directory out of symlinks fails at the first
+  weight with `final path component is a symlink`. The guard covers the final component only, so
+  a symlinked parent directory is still followed.
 
 ### Environment variables
 
-| Variable            | Default | Notes                                                |
-| ------------------- | ------- | ---------------------------------------------------- |
-| `LATTICE_MODEL_DIR` | unset   | Q4 model dir; enables the `DECODE_BENCH` half if set |
-| `BENCH_WARMUP`      | 5       | warmup iterations for the blend bench                |
-| `BENCH_ITERS`       | 20      | measured iterations for the blend bench              |
-| `BENCH_NEW_TOKENS`  | 32      | tokens generated per `DECODE_BENCH` measurement      |
+| Variable            | Default | Notes                                                                                                                |
+| ------------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
+| `LATTICE_MODEL_DIR` | unset   | Q4 model dir; enables the `DECODE_BENCH` half if set                                                                 |
+| `BENCH_WARMUP`      | 5       | warmup iterations for the blend and swap benches                                                                     |
+| `BENCH_ITERS`       | 20      | measured iterations for the blend and swap benches; `0` is refused, because every per-iteration figure divides by it |
+| `BENCH_NEW_TOKENS`  | 32      | tokens generated per `DECODE_BENCH` measurement                                                                      |
 
 ### Verified command sequence
 
@@ -459,50 +469,68 @@ BENCH_ITERS=3 BENCH_WARMUP=1 ./target/release/bench_lora_mixture
 ```
 
 ```
-BLEND_BENCH r=1 k=1 layers=56 blend_us=344.0
-BLEND_BENCH r=1 k=4 layers=56 blend_us=1266.3
-BLEND_BENCH r=1 k=8 layers=56 blend_us=2992.3
-BLEND_BENCH r=2 k=1 layers=56 blend_us=501.0
-BLEND_BENCH r=2 k=4 layers=56 blend_us=10080.7
-BLEND_BENCH r=2 k=8 layers=56 blend_us=28584.3
+BLEND_BENCH r=1 k=1 layers=12 blend_us=30.3
+BLEND_BENCH r=1 k=4 layers=12 blend_us=112.7
+BLEND_BENCH r=1 k=8 layers=12 blend_us=263.7
+BLEND_BENCH r=2 k=1 layers=12 blend_us=49.7
+BLEND_BENCH r=2 k=4 layers=12 blend_us=222.7
+BLEND_BENCH r=2 k=8 layers=12 blend_us=529.3
 [bench_lora_mixture] LATTICE_MODEL_DIR not set; skipping GPU decode bench. Set it to a valid Qwen3.5-0.8b Q4 dir to enable decode tok/s measurements.
 ```
 
-(`layers=56` = the source's hardcoded `NUM_LAYERS=28` × 2 modules (`q_proj`+`v_proj`) for this
-half of the bench; see the failure-mode note below on why 28 is stale for `qwen3.5-0.8b`, which
-actually has 24 hidden layers.)
+(`layers=12` counts blended `LoraLayerData` entries: the 6 full-attention layers this config
+actually has, times the 2 modules this half of the bench builds, `q_proj` and `v_proj`. An
+earlier revision of this document recorded `layers=56` from a hardcoded 28-layer count that the
+source no longer contains; the layer indices are derived from `config.json`'s `layer_types` now.
+`SWAP_BENCH` uses the same field with the same meaning but builds `q_proj` only, so it reports
+`layers=6` and its `blend_us` is not comparable to the figure above at equal `r` and `k`.)
 
 With `LATTICE_MODEL_DIR` pointed at a Q4 dir that has `tokenizer.json` alongside it:
 
 ```bash
-BENCH_ITERS=3 BENCH_WARMUP=1 BENCH_NEW_TOKENS=8 \
 LATTICE_MODEL_DIR="$Q4_DIR" \
   ./target/release/bench_lora_mixture
 ```
 
 ```
-BLEND_BENCH r=1 k=1 layers=56 blend_us=347.3
+BLEND_BENCH r=1 k=1 layers=12 blend_us=31.1
 ...
 [bench_lora_mixture] loading model from <q4-dir>
-[load-timer] Total: 3.155s
-bench_lora_mixture failed: Inference error: module 'q_proj' is a full-attention projection but layer 21 is GDN
+[load-timer] Total: 1.051s
+SWAP_BENCH r=1 k=1 layers=6 blend_us=14.1 unload_us=12.6 load_us=29.8 iters=20
+DECODE_BENCH r=1 k=1 tok_s=135.9 generated=32
+SWAP_BENCH r=1 k=4 layers=6 blend_us=55.4 unload_us=18.5 load_us=64.8 iters=20
+DECODE_BENCH r=1 k=4 tok_s=136.3 generated=32
+SWAP_BENCH r=1 k=8 layers=6 blend_us=131.8 unload_us=20.8 load_us=106.5 iters=20
+DECODE_BENCH r=1 k=8 tok_s=135.3 generated=32
+SWAP_BENCH r=2 k=1 layers=6 blend_us=25.6 unload_us=13.0 load_us=36.2 iters=20
+DECODE_BENCH r=2 k=1 tok_s=135.5 generated=32
+SWAP_BENCH r=2 k=4 layers=6 blend_us=109.7 unload_us=20.1 load_us=101.7 iters=20
+DECODE_BENCH r=2 k=4 tok_s=135.4 generated=32
+SWAP_BENCH r=2 k=8 layers=6 blend_us=261.9 unload_us=23.8 load_us=161.4 iters=20
+DECODE_BENCH r=2 k=8 tok_s=135.1 generated=32
 ```
 
-### Common failure modes, including one confirmed bug not fixed here
+Recorded on an Apple M4 (16 GB, AC power) at `710bae8984`, release build with
+`--features metal-gpu,f16`, holding the exclusive bench window for the whole run; the machine
+read 87.3% idle before the run and 89.8% after. Summing the three `SWAP_BENCH` phases gives the
+whole cost of one selection change: 56.5 µs at `r=1 k=1` up to 447.1 µs at `r=2 k=8`, against
+7.38 ms per decoded token at 135.5 tok/s. So at these adapter shapes a full selection change
+costs under 6% of one token. That is a statement about these shapes and nothing wider: this half
+of the bench builds `q_proj` on 6 layers, and a full adapter covering every layer and every
+projection has many times the entries.
 
-- **`GDN layer` crash on the `DECODE_BENCH` half: confirmed bug, filed as
-  [ohdearquant/lattice#637](https://github.com/ohdearquant/lattice/issues/637).** Qwen3.5-0.8b
-  is a hybrid architecture: `config.json`'s `layer_types` shows only every 4th layer
-  (`full_attention_interval=4`) is `full_attention` (layers 3, 7, 11, 15, 19, 23 of 24 layers
-  total, not the 28 the source comment assumes); the rest are `linear_attention` (GDN) and have
-  no `q_proj`. `run_gpu_decode_bench` unconditionally builds a synthetic `q_proj` LoRA delta for
-  every layer index `0..num_hidden_layers`, so it deterministically crashes the first time it
-  reaches a GDN layer index (layer 21 in the run above); this reproduces every time against any
-  Qwen3.5-family Q4 checkpoint, not just this one. **Do not attempt to fix this in a docs PR**;
-  see the linked issue for the real fix (derive full-attention layer indices from
-  `cfg.layer_types` instead of hardcoding `q_proj` on every layer). The `BLEND_BENCH` half is
-  unaffected (it's pure CPU synthetic data, no real model), but its `layers=56` figure is also
-  not representative of qwen3.5-0.8b's real 24-layer count.
+### Common failure modes
+
+- **`GDN layer` crash on the `DECODE_BENCH` half: fixed, no longer reproduces.** Qwen3.5-0.8b is
+  a hybrid architecture: `config.json`'s `layer_types` marks only every 4th layer
+  (`full_attention_interval=4`) as `full_attention` (layers 3, 7, 11, 15, 19, 23 of 24), and the
+  rest are `linear_attention` (GDN) with no `q_proj`. The bench used to build a synthetic
+  `q_proj` delta on every layer index and crash on the first GDN one, which is what an earlier
+  revision of this document recorded. Both halves now derive their layer indices from
+  `cfg.layer_types`, so the `q_proj` deltas land only on full-attention layers.
+  [ohdearquant/lattice#637](https://github.com/ohdearquant/lattice/issues/637) closed with that
+  fix; the run recorded above completes the whole sweep.
 - Missing `tokenizer.json` next to `LATTICE_MODEL_DIR` prints
   `[bench_lora_mixture] tokenizer.json not found; skipping GPU bench` and returns `Ok(())`. The
   blend-only numbers still print, just no `DECODE_BENCH` lines: this is a soft skip, not a crash.
