@@ -445,7 +445,7 @@ fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
     }
     Err(ApiError::BadRequest {
         message: format!(
-            "router artifact records prompt source {source:?}, which this build does not know how              to reproduce; the gate would be routed on text it was not trained on"
+            "router artifact records prompt source {source:?}, which this build does not know how to reproduce; the gate would be routed on text it was not trained on"
         ),
         code: "router_artifact_unknown_prompt_source",
     })
@@ -462,7 +462,7 @@ fn trained_pooling(pooling: &str) -> Result<crate::forward::cpu_f16::PoolingStra
         "last_token" => Ok(crate::forward::cpu_f16::PoolingStrategy::LastToken),
         other => Err(ApiError::BadRequest {
             message: format!(
-                "router artifact records pooling {other:?}, which this build does not know how to                  reproduce; the gate would be served a representation it was not trained on"
+                "router artifact records pooling {other:?}, which this build does not know how to reproduce; the gate would be served a representation it was not trained on"
             ),
             code: "router_artifact_unknown_pooling",
         }),
@@ -546,7 +546,7 @@ pub fn check_representation(
     if trained_on != embedder_identity.as_str() {
         return Err(ApiError::BadRequest {
             message: format!(
-                "router gate was trained on embedding model {trained_on:?} but this server embeds                  with {:?}; the gate would route on a representation it never saw",
+                "router gate was trained on embedding model {trained_on:?} but this server embeds with {:?}; the gate would route on a representation it never saw",
                 embedder_identity.as_str()
             ),
             code: "router_representation_model_mismatch",
@@ -564,7 +564,7 @@ pub fn check_representation(
     if trained_loader != crate::serve::embeddings::EMBEDDING_LOADER_FORMAT {
         return Err(ApiError::BadRequest {
             message: format!(
-                "router gate was trained through the {trained_loader:?} embedding loader but this                  server embeds through {:?}",
+                "router gate was trained through the {trained_loader:?} embedding loader but this server embeds through {:?}",
                 crate::serve::embeddings::EMBEDDING_LOADER_FORMAT
             ),
             code: "router_representation_loader_mismatch",
@@ -576,7 +576,7 @@ pub fn check_representation(
     if recorded != measured {
         return Err(ApiError::BadRequest {
             message: format!(
-                "router gate takes a {recorded}-dimension context vector but this server's                  embedding model produces {measured} dimensions"
+                "router gate takes a {recorded}-dimension context vector but this server's embedding model produces {measured} dimensions"
             ),
             code: "router_representation_width_mismatch",
         });

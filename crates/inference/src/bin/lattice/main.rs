@@ -360,7 +360,7 @@ async fn main() {
                     Err(err) => {
                         if embedding_model_dir.is_some() {
                             eprintln!(
-                                "Error: --embedding-model {embedding_source} cannot serve as an                              embedding model: {err}"
+                                "Error: --embedding-model {embedding_source} cannot serve as an embedding model: {err}"
                             );
                             std::process::exit(1);
                         }
@@ -431,7 +431,7 @@ async fn main() {
                         // by co-location rather than by agreement.
                         let Some(embedder_dir) = embedding_model_dir.as_deref() else {
                             eprintln!(
-                                "Error: --router-state requires --embedding-model <dir>. Routing                                  needs a context vector, and the served checkpoint cannot                                  supply one: applying adapters needs the Metal backend, which                                  needs a Q4 directory, and the embeddings loader reads an f16                                  decoder and refuses a Q4 directory. Point --embedding-model at                                  an f16 Qwen3.5 checkpoint."
+                                "Error: --router-state requires --embedding-model <dir>. Routing needs a context vector, and the served checkpoint cannot supply one: applying adapters needs the Metal backend, which needs a Q4 directory, and the embeddings loader reads an f16 decoder and refuses a Q4 directory. Point --embedding-model at an f16 Qwen3.5 checkpoint."
                             );
                             std::process::exit(1);
                         };
@@ -440,7 +440,7 @@ async fn main() {
                         // load exits above. It says so instead of unwrapping.
                         let Some(embedder) = embedding_model.as_ref() else {
                             eprintln!(
-                                "Error: --embedding-model was given but no embedding model is                                  loaded; this is a bug in the startup ordering."
+                                "Error: --embedding-model was given but no embedding model is loaded; this is a bug in the startup ordering."
                             );
                             std::process::exit(1);
                         };
@@ -471,7 +471,7 @@ async fn main() {
                         ) {
                             Ok(served) => {
                                 eprintln!(
-                                    "Router gate loaded: version {version} over {names}                                      adapter(s){}",
+                                    "Router gate loaded: version {version} over {names} adapter(s){}",
                                     if pinned { " (pinned)" } else { "" }
                                 );
                                 Some(Arc::new(served))
