@@ -329,6 +329,46 @@ impl ServingRouter {
     }
 }
 
+/// Which text of a request becomes the gate's context vector.
+///
+/// An enum with one variant rather than a bare string comparison, because the
+/// point is that the serving path and the artifact name the same rule from one
+/// definition. A second variant is the moment this earns itself; today its job
+/// is to make the rule a value that can be compared at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptSource {
+    /// The last user message, alone. Not the rendered conversation: that makes
+    /// the vector drift with history length, so two requests asking the same
+    /// question route differently depending on how long the chat has been
+    /// going.
+    LastUserMessage,
+}
+
+impl PromptSource {
+    /// The rule this build's serving path actually follows.
+    pub const SERVED: Self = Self::LastUserMessage;
+
+    /// How the artifact spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LastUserMessage => "last_user_message",
+        }
+    }
+}
+
+/// Resolve the prompt-selection rule the gate was trained under.
+fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
+    if source == PromptSource::LastUserMessage.as_str() {
+        return Ok(PromptSource::LastUserMessage);
+    }
+    Err(ApiError::BadRequest {
+        message: format!(
+            "router artifact records prompt source {source:?}, which this build does not know how              to reproduce; the gate would be routed on text it was not trained on"
+        ),
+        code: "router_artifact_unknown_prompt_source",
+    })
+}
+
 /// Resolve the pooling the gate was trained under.
 ///
 /// Parsed once, at startup, rather than per request: an unrecognised value is
@@ -389,6 +429,22 @@ pub fn check_representation(
                 "router gate takes a {recorded}-dimension context vector but this server's                  embedding model produces {measured} dimensions"
             ),
             code: "router_representation_width_mismatch",
+        });
+    }
+
+    // Checked even though only one rule exists, and the check cannot fail
+    // against an artifact this build wrote. It can fail against one written by
+    // a build that had a second rule, which is the case that has no symptom:
+    // same model, same pooling, same width, different text.
+    let source = trained_prompt_source(&artifact.representation.prompt_source)?;
+    if source != PromptSource::SERVED {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "router gate was trained on the {} of a request but this server routes on the {}",
+                source.as_str(),
+                PromptSource::SERVED.as_str()
+            ),
+            code: "router_representation_prompt_source_mismatch",
         });
     }
 
@@ -506,6 +562,7 @@ mod tests {
         crate::router_state::TrainedRepresentation {
             embedding_model: "gme-qwen35".into(),
             pooling: "mean_visual".into(),
+            prompt_source: crate::serve::routing::PromptSource::SERVED.as_str().into(),
             input_width,
         }
     }
@@ -568,6 +625,22 @@ mod tests {
             .expect_err("an unknown pooling must refuse");
         assert!(
             err.message().contains("cls"),
+            "the unrecognised value must be quoted: {}",
+            err.message()
+        );
+    }
+
+    /// The third member of the representation, and the one a width check can
+    /// never stand in for: the same model and the same pooling over different
+    /// text produce a correctly-shaped vector of the wrong content.
+    #[test]
+    fn an_unrecognised_prompt_source_refuses_rather_than_defaulting() {
+        let mut art = artifact(&["technical"]);
+        art.representation.prompt_source = "rendered_conversation".into();
+        let err = check_representation(&art, "gme-qwen35", 4)
+            .expect_err("an unknown prompt source must refuse");
+        assert!(
+            err.message().contains("rendered_conversation"),
             "the unrecognised value must be quoted: {}",
             err.message()
         );

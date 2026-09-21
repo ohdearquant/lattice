@@ -2549,6 +2549,7 @@ mod tests {
                 representation: lattice_inference::router_state::TrainedRepresentation {
                     embedding_model: "gme-qwen35".into(),
                     pooling: "mean_visual".into(),
+                    prompt_source: "last_user_message".into(),
                     input_width: 4,
                 },
                 gate_bytes: vec![1, 2, 3],

@@ -44,7 +44,7 @@ use crate::bounded_read::{BoundedReadError, read_bytes_bounded};
 /// On-disk format revision for the manifest. Bumped only for a change that an
 /// older reader would misread; a reader refuses a revision it does not know
 /// rather than parsing a prefix of it.
-pub const ROUTER_ARTIFACT_FORMAT: u32 = 2;
+pub const ROUTER_ARTIFACT_FORMAT: u32 = 3;
 
 /// Size cap for the manifest read. The manifest is a small JSON object whose
 /// only unbounded field is the adapter-name list.
@@ -224,6 +224,23 @@ pub struct TrainedRepresentation {
     /// Pooling strategy, spelled as `/v1/embeddings` spells it: `mean_visual`
     /// or `last_token`.
     pub pooling: String,
+    /// Which text of the request was embedded, spelled as the serving path
+    /// spells it: `last_user_message`.
+    ///
+    /// The third member of the representation, and the one that looks least
+    /// like part of it. `embedding_model` and `pooling` say how a text becomes
+    /// a vector; they say nothing about WHICH text. A gate trained on the last
+    /// user message and served the whole rendered conversation agrees on the
+    /// model, agrees on the pooling, and produces a vector of exactly the
+    /// right width from different content -- the pooling problem one level
+    /// out, with the same absence of any symptom.
+    ///
+    /// Recorded rather than fixed by convention for the reason the other two
+    /// are: a convention has no instrument. The serving path has exactly one
+    /// rule today, so this field cannot disagree with it yet, which is
+    /// precisely when it is cheap to add and impossible to add later without
+    /// invalidating every artifact already written.
+    pub prompt_source: String,
     /// The gate's input width as RECORDED at write time.
     ///
     /// Already implied by the gate payload, and stored anyway so a startup
@@ -270,6 +287,7 @@ impl RouterArtifact {
         for field in [
             self.representation.embedding_model.as_str(),
             self.representation.pooling.as_str(),
+            self.representation.prompt_source.as_str(),
         ] {
             hasher.update((field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
@@ -591,6 +609,7 @@ mod tests {
         TrainedRepresentation {
             embedding_model: "gme-qwen35".into(),
             pooling: "mean_visual".into(),
+            prompt_source: "last_user_message".into(),
             input_width: 8,
         }
     }
@@ -1000,20 +1019,49 @@ mod tests {
         // artifact could be edited without producing a new version, so a
         // pinned version would mean two different things at two different
         // times. Each field is varied alone, because a hash that covered only
-        // one of them would still pass a test that changed all three.
+        // one of them would still pass a test that changed all of them at once.
+        //
+        // The fields are ENUMERATED from the serialized struct rather than
+        // listed here. The first version of this test listed three closures,
+        // one per field, and when `prompt_source` was added the list stayed at
+        // three: the new field rode outside the hash and this test passed. A
+        // hand-written list of what a struct contains is a claim nobody
+        // re-derives when they add to the struct, so it decays in exactly the
+        // direction that reads as coverage.
         let base = artifact();
-        for mutate in [
-            (|r: &mut TrainedRepresentation| r.pooling = "last_token".into())
-                as fn(&mut TrainedRepresentation),
-            |r: &mut TrainedRepresentation| r.embedding_model = "other-model".into(),
-            |r: &mut TrainedRepresentation| r.input_width += 1,
-        ] {
+        let value =
+            serde_json::to_value(&base.representation).expect("the representation serializes");
+        let fields = value
+            .as_object()
+            .expect("a struct serializes to a JSON object");
+        assert!(
+            !fields.is_empty(),
+            "no fields were enumerated, so the loop below asserts nothing"
+        );
+
+        for (name, original) in fields {
+            let changed = match original {
+                serde_json::Value::String(text) => serde_json::Value::String(format!("{text}-x")),
+                serde_json::Value::Number(number) => {
+                    let n = number
+                        .as_u64()
+                        .expect("a numeric field is an unsigned count");
+                    serde_json::json!(n + 1)
+                }
+                other => panic!("field {name} has type {other:?}, which this arm cannot vary"),
+            };
+            let mut mutated = fields.clone();
+            mutated.insert(name.clone(), changed);
+            let representation: TrainedRepresentation =
+                serde_json::from_value(serde_json::Value::Object(mutated))
+                    .expect("the varied representation deserializes");
+
             let mut other = base.clone();
-            mutate(&mut other.representation);
+            other.representation = representation;
             assert_ne!(
                 base.content_hash(),
                 other.content_hash(),
-                "a representation field changed without changing the hash"
+                "representation field {name} changed without changing the hash"
             );
         }
 
