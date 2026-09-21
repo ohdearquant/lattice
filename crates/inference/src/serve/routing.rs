@@ -44,6 +44,9 @@ use crate::serve::lora::{AdapterIndex, LoraSelection};
 // `test` is added rather than an `allow(dead_code)` because it states which
 // builds actually use these, instead of suppressing the question.
 /// Render a name list for a refusal message.
+///
+/// Still gated: the routability data is cfg-free, but only the refusal TEXT
+/// built from it needs rendering, and that lives with the gate.
 #[cfg(any(feature = "mixture", test))]
 fn render(names: &[String]) -> String {
     if names.is_empty() {
@@ -72,19 +75,68 @@ fn mismatch(artifact: &[String], resident: &[String], detail: String) -> ApiErro
 }
 
 /// Names in `a` that are absent from `b`, in `a`'s order.
-#[cfg(any(feature = "mixture", test))]
 fn missing(a: &[String], b: &[String]) -> Vec<String> {
     a.iter().filter(|n| !b.contains(n)).cloned().collect()
 }
 
 /// First name occurring more than once, if any.
-#[cfg(any(feature = "mixture", test))]
 fn first_duplicate(names: &[String]) -> Option<String> {
     names
         .iter()
         .enumerate()
         .find(|(i, n)| names[..*i].contains(n))
         .map(|(_, n)| n.clone())
+}
+
+/// Why the resident set can or cannot be routed, as data.
+///
+/// Data rather than a bool and a message, because TWO readers need this and
+/// they must not diverge. `route` refuses on it, and `GET /v1/lora` reports it
+/// so an operator sees the refusals coming instead of discovering them one 400
+/// at a time. A surface that recomputed "routable" its own way would
+/// eventually answer yes while routing answered no, and that disagreement has
+/// no symptom until a request arrives.
+///
+/// It carries all three conditions and not just the missing names, for the
+/// same reason: routing refuses on any of them, so a report built from one
+/// would claim routable over a set that refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Routability {
+    /// Trained names that are not resident.
+    pub missing: Vec<String>,
+    /// Resident names the gate was not trained on.
+    pub unexpected: Vec<String>,
+    /// A name the gate's trained list holds twice, whose columns therefore
+    /// cannot be told apart.
+    pub duplicate_trained: Option<String>,
+    /// A name resident twice, which stops the name identifying one adapter.
+    ///
+    /// Kept separate from `duplicate_trained` because the two have different
+    /// remedies -- one is a bad artifact, the other is a residency an operator
+    /// can fix -- and a single field would make the report name neither.
+    pub duplicate_resident: Option<String>,
+}
+
+impl Routability {
+    /// True when a request could be routed against this residency right now.
+    pub fn routable(&self) -> bool {
+        self.missing.is_empty()
+            && self.unexpected.is_empty()
+            && self.duplicate_trained.is_none()
+            && self.duplicate_resident.is_none()
+    }
+}
+
+/// Compare the artifact's trained set against residency, in both directions.
+pub fn routability(artifact: &RouterArtifact, resident: &AdapterIndex) -> Routability {
+    let trained = &artifact.adapter_names;
+    let live: Vec<String> = resident.adapters.iter().map(|a| a.name.clone()).collect();
+    Routability {
+        missing: missing(trained, &live),
+        unexpected: missing(&live, trained),
+        duplicate_trained: first_duplicate(trained),
+        duplicate_resident: first_duplicate(&live),
+    }
 }
 
 /// Check the artifact's trained set against residency in BOTH directions and
@@ -102,12 +154,17 @@ fn trained_order(
     let trained = &artifact.adapter_names;
     let live: Vec<String> = resident.adapters.iter().map(|a| a.name.clone()).collect();
 
+    // DERIVED from the same value the surface reports, never re-checked here.
+    // Two copies of this comparison would drift, and the drift would show up
+    // as `GET /v1/lora` promising a route that the next request refuses.
+    let state = routability(artifact, resident);
+
     // A duplicate name on either side makes the name-to-id resolution
     // ambiguous, and picking either candidate is exactly the silent
     // wrong-adapter selection this module exists to prevent. Not one of the
     // directions the ADR enumerates, because it is not a set difference: two
     // sides can agree as SETS and still be unresolvable.
-    if let Some(dup) = first_duplicate(trained) {
+    if let Some(dup) = state.duplicate_trained {
         return Err(mismatch(
             trained,
             &live,
@@ -116,7 +173,7 @@ fn trained_order(
             ),
         ));
     }
-    if let Some(dup) = first_duplicate(&live) {
+    if let Some(dup) = state.duplicate_resident {
         return Err(mismatch(
             trained,
             &live,
@@ -125,26 +182,23 @@ fn trained_order(
             ),
         ));
     }
-
-    let absent = missing(trained, &live);
-    if !absent.is_empty() {
+    if !state.missing.is_empty() {
         return Err(mismatch(
             trained,
             &live,
             format!(
                 "[{}] the gate was trained on are not resident",
-                render(&absent)
+                render(&state.missing)
             ),
         ));
     }
-    let unknown = missing(&live, trained);
-    if !unknown.is_empty() {
+    if !state.unexpected.is_empty() {
         return Err(mismatch(
             trained,
             &live,
             format!(
                 "[{}] are resident but not in the gate's trained set",
-                render(&unknown)
+                render(&state.unexpected)
             ),
         ));
     }
@@ -735,6 +789,61 @@ mod tests {
             !msg.contains("some-other-model"),
             "the artifact must not be blamed for a build problem: {msg}"
         );
+    }
+
+    /// The surface and the refusal must answer the same question. These pin
+    /// the predicate BOTH of them read, so a report claiming routable over a
+    /// set that routing declines is a failing test rather than a 400 nobody
+    /// predicted.
+    #[test]
+    fn a_matching_set_is_routable() {
+        let state = routability(
+            &artifact(&["technical", "legal"]),
+            &resident(&[(1, "legal"), (0, "technical")]),
+        );
+        assert!(
+            state.routable(),
+            "order is resolved by name, so it is not a reason to refuse"
+        );
+        assert_eq!(state, Routability::default());
+    }
+
+    #[test]
+    fn routability_names_what_is_missing_and_what_is_unexpected() {
+        let state = routability(
+            &artifact(&["technical", "legal"]),
+            &resident(&[(0, "technical"), (2, "medical")]),
+        );
+        assert!(!state.routable());
+        assert_eq!(state.missing, vec!["legal".to_string()]);
+        assert_eq!(state.unexpected, vec!["medical".to_string()]);
+    }
+
+    /// Reported separately from the set differences, because routing refuses
+    /// on it while the two sides agree AS SETS -- so a surface built from the
+    /// differences alone would print routable over a set that declines.
+    #[test]
+    fn a_duplicate_on_either_side_is_not_routable_even_though_the_sets_agree() {
+        let dup_resident = routability(
+            &artifact(&["technical"]),
+            &resident(&[(0, "technical"), (1, "technical")]),
+        );
+        assert!(dup_resident.missing.is_empty() && dup_resident.unexpected.is_empty());
+        assert!(
+            !dup_resident.routable(),
+            "the sets agree and it still refuses"
+        );
+        assert_eq!(
+            dup_resident.duplicate_resident.as_deref(),
+            Some("technical")
+        );
+
+        let dup_trained = routability(
+            &artifact(&["technical", "technical"]),
+            &resident(&[(0, "technical")]),
+        );
+        assert!(!dup_trained.routable());
+        assert_eq!(dup_trained.duplicate_trained.as_deref(), Some("technical"));
     }
 
     /// The first arm ADR-094 decision 2 names. It fails against any

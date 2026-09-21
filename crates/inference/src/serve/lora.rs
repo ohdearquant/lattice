@@ -128,12 +128,31 @@ pub fn lora_list_body(
     // scenario a pin exists for.
     let router = match router {
         None => serde_json::json!({"enabled": false}),
-        Some(report) => serde_json::json!({
-            "enabled": true,
-            "version": report.artifact.version_label(),
-            "pinned": report.pinned,
-            "adapter_names": report.artifact.adapter_names,
-        }),
+        Some(report) => {
+            // "enabled" and "can route right now" are different claims, and
+            // the second one moves: adapters load and unload while the server
+            // runs, so a gate that was routable a minute ago is not. Routing
+            // refuses a set it cannot match, so without this an operator meets
+            // that refusal one 400 at a time with nothing on the surface that
+            // predicted it.
+            //
+            // Computed by the SAME predicate routing refuses on, not by a
+            // comparison written here. A second copy would drift, and the
+            // drift reads as this endpoint promising a route the next request
+            // declines.
+            let state = crate::serve::routing::routability(report.artifact, index);
+            serde_json::json!({
+                "enabled": true,
+                "version": report.artifact.version_label(),
+                "pinned": report.pinned,
+                "adapter_names": report.artifact.adapter_names,
+                "routable": state.routable(),
+                "missing": state.missing,
+                "unexpected": state.unexpected,
+                "duplicate_trained": state.duplicate_trained,
+                "duplicate_resident": state.duplicate_resident,
+            })
+        }
     };
     let mut body = serde_json::to_value(index).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(map) = body.as_object_mut() {

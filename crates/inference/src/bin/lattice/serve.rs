@@ -1106,7 +1106,7 @@ pub async fn chat_completions(
 #[allow(clippy::field_reassign_with_default)]
 async fn chat_completions_with_request(
     State(state): State<AppState>,
-    #[allow(unused_mut)] mut req: ChatCompletionRequest,
+    req: ChatCompletionRequest,
 ) -> Result<Response, ApiError> {
     // Resolved ONCE here, upstream of every branch below, so the two submit
     // sites in this handler and the two `registry.apply` sites in the worker all
@@ -1160,13 +1160,38 @@ async fn chat_completions_with_request(
     // this request generates. Placed after normalization so the gate reads the same text the model
     // will, rather than a second rendering of the request that could drift from it.
     //
-    // An explicit `lora` wins. A caller who named adapters asked for those, and a learned guess
-    // must not overrule a stated intent -- that would make the request field advisory without
-    // saying so anywhere.
+    // Rebinds the RESOLVED value rather than writing back to `req.lora`. Every consumer below
+    // reads `requested`, which was resolved above, so a write to the raw field here would be
+    // discarded in silence -- the request would route, report that it routed, and serve the base
+    // model.
+    //
+    // `is_routable` is the whole condition. An explicit list is a stated intent and an explicit
+    // `[]` is a caller pinning the base model; routing over either would overrule the caller while
+    // looking like a default.
+    //
+    // The routed selection takes the same two checks the caller's field took above, because it is
+    // a different producer of the same value and those checks ran before it existed. An empty
+    // result means the gate declined (no user turn to read), which is the base model -- the
+    // original resolution already says that, so it stands rather than being restated as an
+    // `Explicit` list that names nothing.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    if let Some(served) = state.router_state.clone().filter(|_| req.lora.is_empty()) {
-        req.lora = route_selection(&state, &served, &chat_messages).await?;
-    }
+    let requested = match state
+        .router_state
+        .clone()
+        .filter(|_| requested.is_routable())
+    {
+        None => requested,
+        Some(served) => {
+            let routed = route_selection(&state, &served, &chat_messages).await?;
+            if routed.is_empty() {
+                requested
+            } else {
+                lattice_inference::serve::lora::validate_scales(&routed)?;
+                adapter_client(&state)?.validate_lora(&routed)?;
+                lattice_inference::serve::lora::RequestedAdapters::Explicit(routed)
+            }
+        }
+    };
     // CPU-only builds never render `_normalized_messages` (the CPU
     // closures below capture only `cpu_model`/`prompt`/`gen_cfg`) -- drop
     // it here instead of letting it ride, unused, across the
@@ -2644,6 +2669,15 @@ mod tests {
                 .is_some_and(|v| v.starts_with("7:")),
             "version label carries the counter, got {}",
             body["router"]["version"]
+        );
+
+        assert_eq!(
+            body["router"]["routable"], false,
+            "the fixture residency is empty, so the trained set is not resident"
+        );
+        assert_eq!(
+            body["router"]["missing"][0], "technical",
+            "an operator must be able to see the 400s coming, and by name"
         );
 
         let unpinned = ResolvedRouter {
