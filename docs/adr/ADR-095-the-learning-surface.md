@@ -238,6 +238,81 @@ is kept beside it, so a rollback is a rename rather than a refit. Pinning is `--
 boundary and is deliberately not added here: startup pinning is what an operator needs during an
 incident, and it is the arm that works when the process is the thing misbehaving.
 
+### Amended 2026-09-21, re-reading decisions 5 and 6 as a threat model rather than a posture
+
+Decisions 5 and 6 above describe where the routes listen and where the state lives. Neither says
+what an attacker gets, and a review of the accepted set found four places where the answer is worse
+than the text implies. They are recorded as amendments rather than rewrites because the decisions
+hold; what was missing is the boundary each one assumes.
+
+**Loopback is an assumption about the host, and it needs saying out loud.** Decision 5 leaves
+`POST /v1/lora/feedback` unauthenticated on a loopback bind, and ADR-096 lets those events drive a
+refit and a live gate activation. So on a shared or multi-tenant host, any local process can shape
+the served policy with no credential at all. That is acceptable only under a single-user trust
+boundary, which this project does assume elsewhere, and the cost of leaving it implicit is that the
+assumption is invisible at exactly the deployment where it stops being true. So it is stated: the
+loopback posture asserts that every local process is as trusted as the operator. Two cheap
+narrowings follow from stating it, and both are in scope for the feedback PR rather than deferred.
+Feedback carries the completion id it is about, and the server rejects an id it never issued, so a
+process cannot vote on requests it did not make. And the route takes a fixed per-interval cap,
+refusing over it, because an unbounded write path into learned state is a denial of service against
+the policy itself even from a trusted caller with a bug.
+
+**A bearer token over plain HTTP is a credential broadcast once per request.** Decision 5 permits
+non-loopback mutation when `--admin-token` is set, and the serving binary speaks plain HTTP. An
+on-path observer therefore captures the token from the first admin request and can load, unload,
+pin or poison from then on. The token does not make the route safe on an open port; it makes it
+auditable on a network that was already trusted. So the non-loopback mutating surface requires an
+explicitly declared TLS-terminating proxy — a flag that says the operator has put one in front —
+and refuses otherwise even when a token is set. Refusing is the right direction because the failure
+it prevents is silent: a captured token produces no error anywhere, and the first symptom is a
+policy that learned something nobody sent.
+
+**The router-state directory needs the file protections the model path already has.** Decision 6
+names an operator-selected path, head records, renames and persistence, and says nothing about what
+happens when a local principal can write that directory. Replacing the artifact, or redirecting the
+head record through a symlink, activates an untrusted gate on the next start with no signal. The
+mechanism is not new work: `quant/q4_manifest.rs` already reads manifests with
+`fs::symlink_metadata`, refuses to follow a symlink at the named path, and fails closed on a
+dangling target or a permission error rather than reporting absence. Router state takes the same
+treatment — no-follow open, refusal when the state directory is writable by a principal other than
+the server's own user, and a durable atomic commit for the head record so a crash cannot leave a
+half-written pointer that reads as valid. Fail closed on each, naming the path.
+
+**A pin with no `--router-state` has no artifact to pin.** Decision 6 says reads do not require the
+flag and that a pinned server serves the pinned gate, and those two sentences together describe an
+unreachable configuration: `--router-pin <version>` names a version within a state directory, and
+without the directory there is nothing to resolve the version against. The resolution is that a pin
+is a read of router state, not an alternative to it. `--router-pin` requires `--router-state` and
+refuses at startup naming the flag, in the same shape as every other refusal here. What does not
+require the flag is serving with no gate at all, which is the case decision 6 meant: a server
+without `--router-state` reports `"enabled": false` and routes nothing. Read-only differs from
+absent, and conflating them is what produced a pin with no locator.
+
+**Implicit preference variants are rejected at the wire, not translated.** This decision says the
+feedback wire shape follows `PreferenceSignal`, whose current definition
+(`crates/tune/src/lora/router_update.rs:34`, moving to `lattice-fann` under ADR-094 decision 3)
+carries `ImplicitPositive` and `ImplicitNegative` alongside the explicit pair, at half reward
+magnitude. ADR-096 admits only explicit feedback about a completed request. Following the enum
+shape therefore accepts two variants the admission policy does not want, and nothing said which
+of reject, ignore or translate applies — three behaviours that are indistinguishable to the sender
+and produce three different training sets. They are rejected with a 400 naming the variant. The
+sender learns its signal was not taken, which the ignore branch does not provide and which matters
+precisely because implicit signals would otherwise be dropped silently for the whole life of a
+deployment. Sharing a type with a trainer is not the same as sharing its admission policy, and the
+wire shape is the place to say so.
+
+### Ordering note: what this ADR describes and when it lands
+
+Two rows in decision 4's table, and the `GET /v1/lora` body row, describe the tree after this
+routing chain lands, not the tree this ADR merges into. At this ADR's own head, `lora_unload` in
+`bin/lattice/serve.rs` still resolves the adapter backend before the content-type check, the body
+cap and the parse, and `lora_list` still serializes the residency snapshot directly. Both changes
+are made by the router-artifact PR later in this chain. The table is the contract the chain is
+built to satisfy, and a reader checking it against this merge base will find the old order; that
+is expected rather than a contradiction, and saying so here is cheaper than leaving the next
+reader to discover it by grep.
+
 ### Two carriers this touches, found while writing it
 
 `bin/lattice_serve.rs` documents `POST /v1/lora/load` — including the whole deployment-boundary
@@ -269,8 +344,12 @@ the same change. A security notice that overstates exposure trains its reader to
 
 - `docs/serve-http-api.md` changes in the same PR as the endpoint, because this is a public product
   surface and its shape is the contract.
-- Decision 4's route-parity test is cheap and its absence is the only reason decision 4 needs
-  stating; it also retroactively covers the three existing `/v1/lora*` routes.
+- Decision 4's enforcement is the shared route-table constructor, not a test. This bullet used to
+  call it a route-parity test, which is the design decision 4 rejects two paragraphs into itself,
+  on the ground that axum's `Router` does not expose its table for enumeration. A superseded
+  design left standing in the consequences list is a reader's shortest path to the wrong answer,
+  since a consequences bullet is read as settled. The constructor retroactively covers the three
+  existing `/v1/lora*` routes.
 - Decision 1's cadence configuration and buffer counters are reported by `GET`, which means
   ADR-094's gate-free façade has to answer them in a build without the `mixture` feature too —
   as a disabled router with no version rather than as absent fields.

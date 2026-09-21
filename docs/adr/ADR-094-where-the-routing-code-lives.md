@@ -177,6 +177,22 @@ today, which is exactly when it is cheap to record and impossible to add later w
 every artifact already written. That is the third time that sentence has been the reason, which is
 the tell that it is one rule and not three coincidences.
 
+"One value today" is a statement about which builds can route, not about which loaders exist, and
+the difference is worth writing down before it is load-bearing. A second loader is already in the
+tree behind the SAME flag name: `lattice_serve --embedding-model` loads `BertModel` through
+`BertModel::from_directory` and reduces with `BertPooling`, while `lattice serve` holds a
+`serve::embeddings::EmbeddingModel` and reduces with `PoolingStrategy`. Same spelling, two loaders,
+two pooling vocabularies, and vectors of the same width from the same text. The representation key
+above is written against the second of those, and it is sound today for one reason only: the first
+binary has no `--router-state`, so it cannot route and cannot serve a gate at all. That is the
+whole of the protection, and it is a property of a missing flag rather than of the key.
+
+So the condition attaches here rather than being rediscovered: the day `lattice_serve` gains
+`--router-state`, it records its OWN `loader_format` and its own pooling vocabulary, and it does
+not inherit the constant this decision writes. Inheriting it is the failure with no symptom, since
+both sides would then agree on a string that describes only one of them, and every check above
+would pass on a vector the gate was never trained on.
+
 Recording it moves the artifact format from 3 to 4, and the field is inside the content hash: a
 representation member outside the hash is a member two artifacts can disagree on while claiming to
 be the same artifact.

@@ -122,6 +122,43 @@ an index in its place. One idempotent judgement per completed request; conflicti
 An event that arrives after its policy epoch ends is counted stale and is not reused as an on-policy
 sample for a different gate.
 
+**Amended 2026-09-21: the policy, written out.** "Exploration noise at a fixed scale" and "an
+attributable action probability" name a design without giving one, and the producer PR cannot be
+written from them. Four things were missing, and the fourth is the one that makes the other three
+easy.
+
+The noise is Gaussian on the gate's raw logits, independent per adapter, at a scale recorded in the
+policy identity: for a gate emitting logits `z` over `k` adapters, the served logits are
+`z' = z + e` with `e ~ N(0, s^2 I)`. `s` is a property of the policy epoch, not of a request, so a
+refit round has one value and events from a different value are the stale events decision 3 already
+excludes.
+
+The density that is scored is the density of `z'`, not of the weights. This is the step worth being
+explicit about, because the obvious alternative does not exist: the applied mixture is
+`w = floor(softmax(z'))`, and ADR-091's floor clamps a set of coordinates and renormalises the rest,
+so the distribution of `w` puts positive mass on a lower-dimensional face and has no density with
+respect to Lebesgue measure at all. Any estimator written against `p(w)` is therefore ill-defined
+in exactly the region the floor is there to produce. Scoring `z'` avoids it outright:
+`z' | z ~ N(z, s^2 I)` is a proper density everywhere, and it is the quantity the server already
+records as the sampled logits.
+
+The estimator follows from that choice, and the policy floor drops out of it. With
+`log pi(z' | z) = -||z' - z||^2 / (2 s^2) + const`, the score is
+`grad log pi = (z' - z) / s^2 * dz/dtheta`, which needs no derivative of `floor` or of `softmax`,
+because both are downstream of the sampled action and affect only the reward earned. So there is
+nothing to differentiate through the floor, which is what made the original wording read as a gap:
+it was describing a gradient path that the design does not use.
+
+The objective is expected reward under that policy, estimated on the round's eligible events with a
+leave-one-out baseline over the round rather than a learned value function: for events
+`i = 1..n` with rewards `r_i`, the update is the mean of `(r_i - mean of r_j for j != i) * grad
+log pi(z_i' | z_i)`. The baseline is what the existing RLOO trainer already provides, it needs no
+second network, and it is unbiased under the on-policy restriction decision 3 imposes. Reward is
+the explicit signal's magnitude and nothing else; the implicit variants are refused at the wire
+under ADR-095's amendment, so no half-magnitude term enters this objective. Retention
+regularisation stays out of it, as below, and the population the estimate describes is still the
+one that gave explicit feedback.
+
 Retention regularisation is not in the initial objective. The existing wrapper validates its
 regularisation strength and does not apply it; retention is measured at admission instead.
 
@@ -228,6 +265,28 @@ with no migration and no writer to produce what it would then require.
 The bootstrap of decision 2 does not pass through the learned-candidate quality rule: it is checked
 for structure and provenance and reported untrained. That exemption is written here so that it cannot
 be widened by an implementation that finds an ordinary refit inconvenient.
+
+## What exists at this ADR's merge base, and what this chain builds
+
+This ADR cites `router_state::write_artifact`, `ServingRouter::new` and a format-4 artifact. None of
+them exists at the commit this document merges into. The only `write_artifact` under `crates` at
+that base writes prune plans, and `AdapterRouter::reload` takes raw network bytes with no artifact
+around them. A reader checking the compatibility and rollback decisions against the tree will find
+nothing to check them against.
+
+That is the intended order rather than a defect in the decisions, and it is written here because a
+document that describes a contract in the present tense reads as a description of working code no
+matter how the surrounding PRs are sequenced. The routing chain lands the ADRs first, so this ADR
+is the specification the later PRs are built to satisfy: the router-state module, the artifact
+format and its version lineage, and the serving façade arrive in the router-artifact and producer
+PRs of this same chain. Until they do, every API name in this document is a name this chain is
+obliged to create, not one a reader can open.
+
+The practical consequence is for whoever reviews the producer PR. The compatibility and rollback
+decisions here are testable only against that PR's own tree, so the reviewer of this ADR is asked
+to judge whether the contract is right, and the reviewer of the producer PR is asked whether the
+code meets it. Splitting the question that way is deliberate; collapsing it is what produces a
+contract nobody checked because everyone assumed the other reader had.
 
 ## Alternatives considered
 

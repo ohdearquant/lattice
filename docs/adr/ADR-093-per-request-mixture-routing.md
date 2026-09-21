@@ -21,7 +21,16 @@ unconditionally, whether the adapter set changed or only the weights over an unc
 
 Measured on an Apple M4, release build with `metal-gpu,f16`, exclusive bench window held for the
 whole run, against `qwen3.5-0.8b-q4`. Decode runs at 135.5 tok/s, so one token is 7.38 ms. The
-`SWAP_BENCH` output of `bench_lora_mixture` times the three phases separately:
+`SWAP_BENCH` output of `bench_lora_mixture` times the three phases separately.
+
+Where that output comes from, stated because it is not reproducible from this ref: the three-phase
+timing was added to `bench_lora_mixture` in `710bae8984`, which is not an ancestor of the branch
+this ADR merges on. At this ref the committed binary emits `BLEND_BENCH` and `DECODE_BENCH` only,
+and a reader who runs it gets the blend column and nothing else. The unload, upload and total
+columns below are real measurements of a binary that exists at `710bae8984` and nowhere in this
+tree. They become reproducible when that commit lands; until then the table carries its ref and
+the reader is told which command does not exist yet, rather than being sent to a marker no source
+file prints. The blend column is reproducible here.
 
 | r | k | blend µs | unload µs | upload µs | total µs | share of one token |
 | - | - | -------: | --------: | --------: | -------: | -----------------: |
@@ -34,11 +43,17 @@ whole run, against `qwen3.5-0.8b-q4`. Decode runs at 135.5 tok/s, so one token i
 
 The bound on that table, stated because the decision below rests on it: these are 6-entry adapters,
 `q_proj` on the 6 full-attention layers of this configuration. A full adapter over every layer and
-every projection is many times that. Blend cost scales close to linearly in entry count across the
-two entry counts measured — 569.8 µs at 12 entries against 261.9 µs at 6, at `r=2 k=8` — so a
-16x-larger adapter extrapolates to roughly one token's cost per selection change. That is a
-derivation from two points, not a measurement, and no decision here depends on its precision, only
-on its order of magnitude.
+every projection is many times that. The
+extrapolation to a full adapter is weaker than two points and needs saying as such. The two blend
+figures available are 569.8 µs at 12 entries and 261.9 µs at 6 entries at `r=2 k=8`, which reads as
+close to linear in entry count, but they do not differ only in entry count: the 12-entry figure is
+the CPU section's `BLEND_BENCH`, which builds `q_proj` and `v_proj` per layer, and the 6-entry
+figure is the GPU section's, which builds `q_proj` only. The benchmark's own header says those two
+`blend_us` figures are not comparable at equal `r` and `k` for exactly that reason. So the ratio
+confounds entry count with the section that produced it, and the honest reading is an order of
+magnitude, not a slope: a 16x-larger adapter costs on the order of one token per selection change.
+No decision here depends on the precision, and a real scaling curve would need one section varied
+over entry count on its own.
 
 The measurement uses the same call shape the serving path uses, including `quarot_seed: None`
 (`lora_registry.rs:20`), so it does not cover the QuaRot rotation that `eval_perplexity` requests
