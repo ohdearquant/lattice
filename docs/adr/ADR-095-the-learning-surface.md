@@ -91,6 +91,44 @@ the first. The predicted failure the original test was aimed at is not subtle, i
 invisible — a feature works in every test that exercises one binary — and removing the copy
 addresses it at the cause instead of detecting it afterwards.
 
+_Amended 2026-09-21._ The mechanism above is not writable against this tree, and the aim survives
+it. "One constructor owns the route table" assumed the duplicated registration was the duplication.
+It is the thinnest layer of it: the two binaries do not share a state type — `lattice/serve.rs`'s
+`AppState` carries a `ModelBackend` that is CPU-safetensors or Metal, with `max_tokens` defaults
+and a request counter, while `lattice_serve.rs`'s is Metal-worker-only and carries the job client,
+a Prometheus registry, the admission cap and byte-decoded vocab for the grammar engine — and the
+handlers are per-binary functions over those types. A shared constructor would therefore be generic
+over the state and take every handler as a parameter, replacing eight `.route()` lines with eight
+handler arguments. That relocates the duplication into a longer call while the handlers and the
+state, which are what actually drift, stay exactly where they are.
+
+The aim — every route in both binaries or in neither — is kept, with a mechanism that exists today:
+
+1. **A shared route list as data, not a constructor.** One `LORA_ROUTES` const in the serving
+   crate, path and methods only, one copy. Data has no state type to be generic over.
+2. **A presence test per binary.** Each binary builds its own `Router` with its own state and
+   drives every entry in the list through tower's `oneshot`, asserting the response is not 404.
+   A 405 or a 4xx from validation both count as registered — the test asks whether the route
+   exists, and nothing else, because anything more would need the state the two binaries do not
+   share. A route added to the list and forgotten in one binary reds that binary's test.
+3. **A lint for the other direction.** A route registered in a binary and never added to the list
+   is invisible to (2), so the set of `/v1/lora` path literals in each binary's source must equal
+   the other's and equal the list. It runs with a must-match control, the way the existing
+   source-marker lint does, in the same CI step — a lint whose discovery can silently empty
+   reports success while checking nothing.
+4. **Validation parity is an audit, not code.** (1)–(3) establish that a route is registered, which
+   is not the same as its behaviour being the same. The ADR carries a table per `/v1/lora*` route
+   naming where each binary's handler performs each check, re-read whenever a handler changes. That
+   is the failure this decision actually saw: both binaries rejected a non-finite adapter scale,
+   but one rejected it at the HTTP boundary and the other only later inside `apply()`. Same route,
+   same shared module, different reachable behaviour, and no route-table mechanism would have
+   caught it, because both tables registered the route correctly.
+
+No state-unification lane follows from this. It would be large and nothing here depends on it.
+
+The retroactive half is unchanged in scope: the three existing `/v1/lora*` routes are covered on
+these terms rather than moved into a constructor.
+
 **5. The mutating routes are loopback-only by default; the read routes keep today's posture.**
 The server's existing posture is local-first — `--host` defaults to `127.0.0.1`
 (`bin/lattice_serve.rs:3436`) and startup already warns on a non-loopback bind (`:3442`). This
