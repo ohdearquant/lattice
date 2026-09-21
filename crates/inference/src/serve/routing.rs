@@ -206,6 +206,34 @@ impl ServingRouter {
                 message: format!("router gate did not load: {err}"),
             }
         })?;
+
+        // THE NAME LIST MUST DESCRIBE THE GATE IT SHIPS WITH. Everything above
+        // treats `adapter_names` as the column labelling, so an artifact whose
+        // list is a different length than the gate's output width is an
+        // artifact lying about its own gate -- and it would pass every check
+        // in this module, because they all compare the list against residency
+        // and never against the network.
+        //
+        // The failure is silent by construction: `route` uses
+        // `available.len().min(scores.len())` columns, so a gate wider than
+        // the list simply ignores its trailing columns. Nothing errors, and
+        // the adapters those columns were trained for never get selected.
+        //
+        // Equality rather than "at least": the list IS the labelling, so an
+        // unnamed column is a column nothing can route to or verify.
+        let declared = artifact.adapter_names.len();
+        let outputs = gate.num_outputs();
+        if declared != outputs {
+            return Err(ApiError::BadRequest {
+                message: format!(
+                    "router artifact declares {declared} adapter name(s) but its gate has \
+                     {outputs} output column(s); the name list is the column labelling, so \
+                     they must agree"
+                ),
+                code: "router_artifact_width_mismatch",
+            });
+        }
+
         Ok(Self {
             router: crate::mixture::AdapterRouter::new(gate),
             artifact,
@@ -423,6 +451,58 @@ mod tests {
             "id must come from residency, not the position"
         );
         assert!((got[0].scale - 0.75).abs() < f32::EPSILON);
+    }
+
+    /// A gate whose output width disagrees with the name list is refused at
+    /// construction. Without this the disagreement is invisible: every other
+    /// check in this module compares the list against RESIDENCY, never against
+    /// the network, and `route` silently uses only the first `available.len()`
+    /// columns -- so a wider gate routes fine while the adapters its trailing
+    /// columns were trained for can never be selected.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn an_artifact_whose_gate_is_wider_than_its_name_list_refuses() {
+        use lattice_fann::{Activation, NetworkBuilder};
+
+        let gate = |outputs: usize| {
+            NetworkBuilder::new()
+                .input(4)
+                .output(outputs, Activation::Linear)
+                .build()
+                .expect("gate must build")
+                .to_bytes()
+        };
+
+        // The must-match control FIRST: an agreeing pair constructs, so a
+        // refusal below is about the width and not about the fixture.
+        let ok = RouterArtifact {
+            version: 1,
+            adapter_names: vec!["technical".into(), "legal".into()],
+            gate_bytes: gate(2),
+        };
+        assert!(
+            ServingRouter::new(ok).is_ok(),
+            "an agreeing artifact must construct, or the refusal arm proves nothing"
+        );
+
+        for (names, outputs) in [(2usize, 3usize), (3, 2)] {
+            let artifact = RouterArtifact {
+                version: 1,
+                adapter_names: (0..names).map(|i| format!("a{i}")).collect(),
+                gate_bytes: gate(outputs),
+            };
+            match ServingRouter::new(artifact) {
+                Err(err) => {
+                    let m = err.message();
+                    assert!(
+                        m.contains(&format!("{names} adapter name"))
+                            && m.contains(&format!("{outputs} output")),
+                        "the refusal must name both widths, got {m}"
+                    );
+                }
+                Ok(_) => panic!("{names} names against a {outputs}-column gate must refuse"),
+            }
+        }
     }
 
     #[cfg(not(feature = "mixture"))]
