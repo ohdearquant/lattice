@@ -115,6 +115,16 @@ enum Command {
         /// request, exactly as if this flag had not been passed.
         #[arg(long)]
         preload_vision: bool,
+        /// Directory holding versioned router gate artifacts (ADR-095
+        /// decision 3). Omitted, the server has no router: a request that
+        /// omits `lora` selects the base model, exactly as it does today.
+        /// Given, the highest version present is loaded at startup and a
+        /// directory that holds an artifact which will not load FAILS the
+        /// startup rather than serving with routing silently off -- those two
+        /// states answer requests differently and only one of them was asked
+        /// for.
+        #[arg(long)]
+        router_state: Option<String>,
     },
     /// Preflight check: memory fit and artifact compatibility, without
     /// loading any model weights (config + tensor index inspection only).
@@ -193,6 +203,7 @@ async fn main() {
             max_resident_adapters,
             max_resident_adapter_bytes,
             preload_vision,
+            router_state,
         } => {
             use std::path::Path;
             use std::sync::Arc;
@@ -305,6 +316,45 @@ async fn main() {
                     }
                 };
 
+            // Fail closed: a configured router that will not load stops the
+            // startup. Degrading to no-router would serve base-model output
+            // under a configuration that asked for routing, and the operator
+            // would learn about it from the responses rather than from here.
+            // The decision itself lives in `router_state::resolve_startup` so
+            // it is a value a test can produce without launching a server.
+            // A build without Metal cannot make an adapter resident, so it
+            // cannot apply one either; accepting a router there would load a
+            // gate nothing on this build could ever use. Refused for the same
+            // reason `adapter_unsupported_build` refuses the adapter routes.
+            #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
+            if router_state.is_some() {
+                eprintln!(
+                    "Error: --router-state requires a macOS Metal build; adapter routing \
+                     selects resident adapters, which this build cannot load."
+                );
+                std::process::exit(1);
+            }
+
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            let router_artifact = {
+                use lattice_inference::router_state::{StartupDisposition, resolve_startup};
+                match resolve_startup(router_state.as_deref().map(Path::new)) {
+                    Ok(StartupDisposition::NoRouter) => None,
+                    Ok(StartupDisposition::Loaded(artifact)) => {
+                        eprintln!(
+                            "Router gate loaded: version {} over {} adapter(s)",
+                            artifact.version_label(),
+                            artifact.adapter_names.len()
+                        );
+                        Some(Arc::new(*artifact))
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            };
+
             let state = serve::AppState {
                 model: model_backend,
                 default_max_tokens: max_tokens,
@@ -312,6 +362,8 @@ async fn main() {
                 model_id: served_model_id.clone(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: router_artifact,
             };
 
             let app = serve::router(state);

@@ -412,6 +412,22 @@ pub struct AppState {
     /// model directory; every `/v1/embeddings` request then fails closed
     /// with `vision_unsupported`.
     pub embedding_model: Option<Arc<lattice_inference::serve::embeddings::EmbeddingModel>>,
+    /// The router gate loaded at startup from `--router-state`, or `None` on a
+    /// server with no router configured.
+    ///
+    /// `None` is a served state, not a failure: a request that omits `lora`
+    /// selects the base model, which is what omitting the field has always
+    /// done. What is NOT a served state is a configured router that would not
+    /// load — startup refuses that rather than arriving here as `None`, since
+    /// the two are indistinguishable from this field alone.
+    ///
+    /// Gated to Metal builds for the same reason every other adapter surface
+    /// here is: routing selects resident adapters, and a build without Metal
+    /// cannot make one resident (see `adapter_unsupported_build`). A
+    /// `--router-state` passed to such a build is refused at startup rather
+    /// than loaded into a field nothing on that build could ever apply.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    pub router_state: Option<Arc<lattice_inference::router_state::RouterArtifact>>,
 }
 
 // -----------------------------------------------------------------------
@@ -1650,7 +1666,22 @@ fn adapter_unsupported_build() -> ApiError {
 pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiError> {
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
-        Ok(Json(serde_json::json!(adapter_client(&state)?.adapter_index())).into_response())
+        // ADR-095 decision 3: the response says which gate is serving, because
+        // "routing is enabled" and "routing ran with the gate I pinned" are
+        // different claims and only the version can tell them apart.
+        let router = match &state.router_state {
+            None => serde_json::json!({"enabled": false}),
+            Some(artifact) => serde_json::json!({
+                "enabled": true,
+                "version": artifact.version_label(),
+                "adapter_names": artifact.adapter_names,
+            }),
+        };
+        Ok(Json(serde_json::json!({
+            "adapters": adapter_client(&state)?.adapter_index(),
+            "router": router,
+        }))
+        .into_response())
     }
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
     {
@@ -1913,6 +1944,8 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             };
             (state, unblock_tx, started_rx)
         }
@@ -3382,6 +3415,8 @@ mod tests {
             model_id: "test-model".to_string(),
             request_counter: Arc::new(AtomicU64::new(0)),
             embedding_model: None,
+            #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+            router_state: None,
         }
     }
 
@@ -3486,6 +3521,8 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             };
 
             let response = router(state)
@@ -4133,6 +4170,8 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             }
         }
 
@@ -4584,6 +4623,8 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             }
         }
 
@@ -4786,6 +4827,8 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             };
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -4929,6 +4972,8 @@ mod tests {
                 model_id: "test-model".to_string(),
                 request_counter: Arc::new(AtomicU64::new(0)),
                 embedding_model: None,
+                #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+                router_state: None,
             }
         }
 

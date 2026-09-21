@@ -120,6 +120,18 @@ pub enum RouterArtifactError {
         message: String,
     },
 
+    /// A router directory was configured but holds no artifact at all.
+    /// Distinct from not configuring one: the operator asked for a router and
+    /// there is none, which is a different state from not asking.
+    #[error(
+        "--router-state {dir} holds no router artifact. Omit the flag to serve \
+         without a router, or point it at a directory holding one"
+    )]
+    EmptyDirectory {
+        /// The directory that was configured.
+        dir: PathBuf,
+    },
+
     /// A version was asked for that this directory does not hold.
     #[error("no router artifact for version {version} in {dir}")]
     NotFound {
@@ -273,6 +285,107 @@ pub fn write_artifact(
         message: e.to_string(),
     })?;
     Ok(path)
+}
+
+/// The versions present in `dir`, ascending.
+///
+/// A version counts as present when its MANIFEST is there. A payload with no
+/// manifest is a crash between the two writes and is deliberately invisible
+/// here, which is the same reading [`read_artifact`] gives it — the two must
+/// agree, or a version would be listed and then refuse to load.
+///
+/// An unreadable directory is an error rather than an empty list: "no
+/// artifacts here" and "I could not look" are different answers, and only one
+/// of them means a server should start without a router.
+pub fn versions(dir: &Path) -> Result<Vec<u64>, RouterArtifactError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(RouterArtifactError::Read {
+                path: dir.to_path_buf(),
+                source: BoundedReadErrorDisplay(e.to_string()),
+            });
+        }
+    };
+
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| RouterArtifactError::Read {
+            path: dir.to_path_buf(),
+            source: BoundedReadErrorDisplay(e.to_string()),
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("router-") else {
+            continue;
+        };
+        let Some(digits) = rest.strip_suffix(".json") else {
+            continue;
+        };
+        // Parsed, never trimmed: `router-007.json` and `router-7.json` would
+        // otherwise both claim version 7 and one would silently shadow the
+        // other. Only the exact spelling this module writes is recognised.
+        let Ok(version) = digits.parse::<u64>() else {
+            continue;
+        };
+        if format!("{version}") == digits {
+            found.push(version);
+        }
+    }
+    found.sort_unstable();
+    Ok(found)
+}
+
+/// What a startup should do about routing, given the configured directory.
+///
+/// This exists so the decision is a VALUE rather than a `process::exit` inside
+/// a binary's argument match. A refusal that can only be produced by launching
+/// a server is a refusal nobody tests, and this one has to distinguish three
+/// states that are easy to collapse into two.
+#[derive(Debug)]
+pub enum StartupDisposition {
+    /// No `--router-state` was given. The server runs without a router, and a
+    /// request that omits `lora` selects the base model — today's behaviour,
+    /// unchanged.
+    NoRouter,
+    /// A router directory was given and its highest version loaded.
+    Loaded(Box<RouterArtifact>),
+}
+
+/// Decide what a startup does about routing.
+///
+/// `Ok(NoRouter)` only when no directory was configured. A configured
+/// directory that is empty, unreadable, or holds an artifact that will not
+/// load is an `Err`, and the caller is expected to stop rather than start
+/// without a router: those two servers answer the same request differently,
+/// and only one of them was asked for. Collapsing them is the failure this
+/// function's shape exists to prevent — it is why `NoRouter` is unreachable
+/// from any input other than `None`.
+pub fn resolve_startup(dir: Option<&Path>) -> Result<StartupDisposition, RouterArtifactError> {
+    let Some(dir) = dir else {
+        return Ok(StartupDisposition::NoRouter);
+    };
+    match load_latest(dir)? {
+        Some(artifact) => Ok(StartupDisposition::Loaded(Box::new(artifact))),
+        None => Err(RouterArtifactError::EmptyDirectory {
+            dir: dir.to_path_buf(),
+        }),
+    }
+}
+
+/// Load the highest version present in `dir`.
+///
+/// `Ok(None)` means the directory holds no artifact at all, which is a server
+/// that has never been given a gate. Every other failure is an `Err`: a
+/// directory that holds an artifact which will not load must stop a startup,
+/// not degrade it to no-router, because those two states serve differently
+/// and only one of them was asked for.
+pub fn load_latest(dir: &Path) -> Result<Option<RouterArtifact>, RouterArtifactError> {
+    match versions(dir)?.last() {
+        None => Ok(None),
+        Some(&version) => read_artifact(dir, version).map(Some),
+    }
 }
 
 /// Read the artifact for `version` from `dir`, refusing anything whose
@@ -494,6 +607,154 @@ mod tests {
         match read_artifact(&dir, 99) {
             Err(RouterArtifactError::NotFound { version, .. }) => assert_eq!(version, 99),
             other => panic!("expected NotFound, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn versions_lists_what_is_there_ascending_and_load_latest_takes_the_highest() {
+        let dir = scratch("select");
+        for v in [3u64, 11, 7] {
+            write_artifact(
+                &dir,
+                &RouterArtifact {
+                    version: v,
+                    adapter_names: vec![format!("a{v}")],
+                    gate_bytes: vec![v as u8],
+                },
+            )
+            .expect("write");
+        }
+        assert_eq!(versions(&dir).expect("versions"), vec![3, 7, 11]);
+        let latest = load_latest(&dir).expect("load").expect("some");
+        assert_eq!(
+            latest.version, 11,
+            "11 must win over 7, not sort as a string"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_or_absent_directory_is_none_not_an_error() {
+        // A server that has never been given a gate is a state, not a failure.
+        let dir = scratch("empty");
+        assert_eq!(versions(&dir).expect("absent dir"), Vec::<u64>::new());
+        assert!(load_latest(&dir).expect("absent dir").is_none());
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        assert!(load_latest(&dir).expect("empty dir").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_holding_an_unloadable_artifact_errors_rather_than_reading_as_no_router() {
+        // The distinction step 2 rests on: "no gate configured" and "the gate
+        // you configured is broken" must not both start a server quietly.
+        let dir = scratch("broken");
+        write_artifact(&dir, &artifact()).expect("write");
+        let mut bytes = std::fs::read(gate_path(&dir, 7)).expect("read");
+        bytes[0] ^= 0xff;
+        std::fs::write(gate_path(&dir, 7), &bytes).expect("corrupt");
+
+        match load_latest(&dir) {
+            Err(RouterArtifactError::HashMismatch { .. }) => {}
+            Ok(None) => panic!("a corrupt artifact read as no-router, which is the bug"),
+            other => panic!("expected a hash mismatch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_payload_without_its_manifest_is_invisible_to_both_readers() {
+        // The crash-between-writes state. `versions` and `read_artifact` must
+        // agree, or a version gets listed and then refuses to load.
+        let dir = scratch("halfwritten");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(gate_path(&dir, 5), [1, 2, 3]).expect("orphan payload");
+        assert_eq!(versions(&dir).expect("versions"), Vec::<u64>::new());
+        assert!(load_latest(&dir).expect("load").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_exact_spelling_this_module_writes_counts_as_a_version() {
+        // `router-007.json` would otherwise claim version 7 and shadow the
+        // real one, with the shadowing decided by directory order.
+        let dir = scratch("spelling");
+        write_artifact(&dir, &artifact()).expect("write v7");
+        std::fs::write(dir.join("router-007.json"), "{}").expect("decoy");
+        std::fs::write(dir.join("router-x.json"), "{}").expect("decoy");
+        std::fs::write(dir.join("router-7.json.bak"), "{}").expect("decoy");
+        assert_eq!(versions(&dir).expect("versions"), vec![7]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_flag_is_the_only_input_that_yields_no_router() {
+        // The whole point of the resolver's shape: NoRouter is unreachable
+        // from any configured directory, so "broken router" can never arrive
+        // at a server as "no router".
+        assert!(matches!(
+            resolve_startup(None).expect("no flag"),
+            StartupDisposition::NoRouter
+        ));
+    }
+
+    #[test]
+    fn a_configured_but_empty_directory_refuses_rather_than_starting_without_a_router() {
+        let dir = scratch("startup-empty");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        match resolve_startup(Some(&dir)) {
+            Err(RouterArtifactError::EmptyDirectory { .. }) => {}
+            Ok(StartupDisposition::NoRouter) => {
+                panic!("a configured directory read as no-router, which is the state this refuses")
+            }
+            other => panic!("expected EmptyDirectory, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_configured_directory_that_does_not_exist_refuses() {
+        let dir = scratch("startup-absent");
+        match resolve_startup(Some(&dir)) {
+            Err(RouterArtifactError::EmptyDirectory { .. }) => {}
+            other => panic!("expected a refusal for an absent configured dir, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_configured_directory_with_a_corrupt_artifact_refuses_with_the_artifacts_own_error() {
+        // Not a generic "could not start": the operator needs to know the hash
+        // failed, because the remedy differs from an empty directory's.
+        let dir = scratch("startup-corrupt");
+        write_artifact(&dir, &artifact()).expect("write");
+        let mut bytes = std::fs::read(gate_path(&dir, 7)).expect("read");
+        bytes[0] ^= 0xff;
+        std::fs::write(gate_path(&dir, 7), &bytes).expect("corrupt");
+
+        match resolve_startup(Some(&dir)) {
+            Err(RouterArtifactError::HashMismatch { version, .. }) => assert_eq!(version, 7),
+            other => panic!("expected the artifact's own hash error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_good_directory_loads_its_highest_version() {
+        let dir = scratch("startup-good");
+        write_artifact(&dir, &artifact()).expect("write v7");
+        write_artifact(
+            &dir,
+            &RouterArtifact {
+                version: 9,
+                adapter_names: vec!["legal".into()],
+                gate_bytes: vec![4, 2],
+            },
+        )
+        .expect("write v9");
+        match resolve_startup(Some(&dir)).expect("load") {
+            StartupDisposition::Loaded(a) => assert_eq!(a.version, 9),
+            other => panic!("expected Loaded, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
