@@ -136,6 +136,51 @@ fail against an artifact this build wrote, only against one written by a build t
 rule — and that is the case with no symptom. Adding it later would invalidate every artifact
 already written, which is the other reason the cost is lowest now.
 
+Asked a fourth time, while wiring the serving path against real checkpoints, it found both a
+second decoder and a fourth member.
+
+**Served model and embedder cannot be the same directory on any server that can route.** Routing
+applies adapters; applying needs the Metal backend; the Metal backend needs a Q4 directory. The
+embeddings loader reads an f16 decoder and refuses a Q4 directory. So the configuration this
+decision assumed — one in-process embedding model, loaded from the served checkpoint — does not
+exist on a routing server, and before this amendment there was no second directory to name. The
+serving binary gains `--embedding-model`, required by `--router-state` and refused at startup with
+that reason rather than failing later inside the gate check. The load is fail-closed when the flag
+is given and stays best-effort when it is not, because those are two different operator claims: one
+names a directory and is owed an error, the other accepts whatever the served checkpoint offers.
+
+**The cost is a second decoder resident in one process, and this ADR does not get to guess it.**
+The f16 embedding checkpoint is a separate set of weights from the Q4 decode weights, held for the
+life of the server. Slot, to be filled from a measurement rather than an estimate: resident-memory
+delta between a server started with `--embedding-model` and the same server without it, same
+checkpoint pair, measured on the quiet host, reported as RSS at steady state after the first
+routed request. **TBD.** A number written here from the on-disk size of the checkpoint would be a
+guess wearing a measurement's clothes, and the whole point of this family of amendments is that an
+unverified claim is worse when it is precise.
+
+**The identity is a NAME, and that bounds what it can detect.** `--embedding-model-id` overrides
+the directory basename, mirroring `--model-id`. It detects a misconfigured server: an operator who
+points the gate at a checkpoint they did not train it on, where the names differ, gets a refusal at
+startup. It does not detect a substituted checkpoint. A different checkpoint of the same family and
+the same hidden size, living under a directory of the same name, reads identical, and the config
+carries only `model_type`, which is the family rather than the weights. Stating the non-detection
+is the point: an identity check that is quietly believed to be a content check is the same class of
+unverifiable pairing this decision keeps relocating, one level further along.
+
+**The fourth member is the loader.** Model, pooling and prompt source say which weights, how the
+hidden states are reduced, and which text goes in. None of them says how the bytes were READ. Two
+loaders over one directory can produce different vectors of the same width from the same text, and
+the width check cannot see it for the reason the pooling check could not: the dimension is the
+checkpoint's hidden size either way. So the representation records `loader_format`, and the
+serving check refuses a gate trained through a loader this build does not use. There is one value
+today, which is exactly when it is cheap to record and impossible to add later without invalidating
+every artifact already written. That is the third time that sentence has been the reason, which is
+the tell that it is one rule and not three coincidences.
+
+Recording it moves the artifact format from 3 to 4, and the field is inside the content hash: a
+representation member outside the hash is a member two artifacts can disagree on while claiming to
+be the same artifact.
+
 **2. The `mixture` gate moves off the call site.** The rule is that a `cfg` never lands on the
 serving call. Either the router module stops being feature-gated, or the serving path acquires a
 gate-free façade whose non-`mixture` build is a compiled-in refusal rather than an absent symbol.
