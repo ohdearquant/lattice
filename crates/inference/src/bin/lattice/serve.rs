@@ -1106,7 +1106,7 @@ pub async fn chat_completions(
 #[allow(clippy::field_reassign_with_default)]
 async fn chat_completions_with_request(
     State(state): State<AppState>,
-    req: ChatCompletionRequest,
+    #[allow(unused_mut)] mut req: ChatCompletionRequest,
 ) -> Result<Response, ApiError> {
     // Resolved ONCE here, upstream of every branch below, so the two submit
     // sites in this handler and the two `registry.apply` sites in the worker all
@@ -1155,6 +1155,18 @@ async fn chat_completions_with_request(
     // prompt, so role/content validation and allocation happen once.
     #[cfg(feature = "metal-gpu")]
     let chat_messages = _normalized_messages;
+
+    // ADR-093 decision 1: the selection is decided ONCE, here at prefill, and held for every token
+    // this request generates. Placed after normalization so the gate reads the same text the model
+    // will, rather than a second rendering of the request that could drift from it.
+    //
+    // An explicit `lora` wins. A caller who named adapters asked for those, and a learned guess
+    // must not overrule a stated intent -- that would make the request field advisory without
+    // saying so anywhere.
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    if let Some(served) = state.router_state.clone().filter(|_| req.lora.is_empty()) {
+        req.lora = route_selection(&state, &served, &chat_messages).await?;
+    }
     // CPU-only builds never render `_normalized_messages` (the CPU
     // closures below capture only `cpu_model`/`prompt`/`gen_cfg`) -- drop
     // it here instead of letting it ride, unused, across the
@@ -1691,6 +1703,67 @@ pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiErr
         let _ = state;
         Err(adapter_unsupported_build())
     }
+}
+
+/// Choose the adapters for one request from the learned gate.
+///
+/// FAIL CLOSED WHEN THE TRAINED SET IS NOT RESIDENT, which is a decision and not a detail. The
+/// gate's columns are labelled by the artifact's adapter names, so a set that does not match
+/// cannot be routed at all. The alternative -- skip routing and serve the base model -- is the
+/// failure this ADR family refuses everywhere else: the operator configured routing, the server
+/// says routing is enabled, and the only place the truth appears is in the answers. The refusal
+/// names both lists side by side, so "which adapter moved" is answered where it is asked.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+async fn route_selection(
+    state: &AppState,
+    served: &Arc<lattice_inference::serve::routing::ServedRouter>,
+    messages: &[ChatMessage],
+) -> Result<Vec<lattice_inference::serve::lora::LoraSelection>, ApiError> {
+    use lattice_inference::serve::routing::{PromptSource, context_text};
+
+    // No user turn means no text under the rule the gate was trained on. Serving the base model is
+    // right here and is NOT the silent degradation above: there is nothing to route ON, rather
+    // than a routable request being quietly skipped.
+    let turns = messages.iter().map(|m| {
+        (
+            matches!(
+                m.role,
+                lattice_inference::forward::metal_qwen35::ChatRole::User
+            ),
+            m.content.as_str(),
+        )
+    });
+    let Some(text) = context_text(PromptSource::SERVED, turns) else {
+        return Ok(Vec::new());
+    };
+
+    // Startup refuses a router without an embedding model, so this is unreachable rather than
+    // merely unlikely -- and it says so instead of unwrapping.
+    let embedder = state.embedding_model.clone().ok_or_else(|| ApiError::Internal {
+        message: "routing is configured but no embedding model is loaded; startup should have                   refused this configuration"
+            .to_string(),
+    })?;
+
+    let pooling = served.pooling();
+    let owned = text.to_string();
+    // Same convention as the embeddings route: the pooled forward pass is synchronous CPU work and
+    // does not belong on an async worker thread.
+    let context_vector = tokio::task::spawn_blocking(move || embedder.embed_text(&owned, pooling))
+        .await
+        .map_err(|_| ApiError::Internal {
+            message: "the routing embedder panicked".to_string(),
+        })?
+        .map_err(|err| ApiError::Internal {
+            message: format!("could not embed the routing context: {err}"),
+        })?;
+
+    let resident = adapter_client(state)?.adapter_index();
+    // Every trained column, with the gate deciding the weight over them. Top-k would need a number
+    // this decision has no evidence for, and truncating the gate's own distribution is the
+    // opposite of letting it choose. `trained_order` has already required the resident set to
+    // match the artifact's, so this width is always routable.
+    let k = served.with_report(|report| report.artifact.adapter_names.len());
+    served.route(&resident, &context_vector, k)
 }
 
 /// Make a PEFT or MLX adapter resident without applying it to generation.

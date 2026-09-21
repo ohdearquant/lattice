@@ -356,6 +356,34 @@ impl PromptSource {
     }
 }
 
+/// The text a request contributes to the gate, under a given rule.
+///
+/// Takes `(is_user, text)` turns rather than a message type. The two binaries
+/// hold different message structs and the engine's is Metal-gated, so naming
+/// one here would either gate this module or pick a favourite; a trait for two
+/// callers is the seam this module's own doc argues against. The caller states
+/// which turns are the user's, in one visible expression.
+///
+/// It lives beside [`PromptSource`] so the rule has ONE definition: the
+/// artifact records a name, `check_representation` compares it, and this
+/// produces the text. Split apart, those three drift with no symptom, because
+/// the vector is the right width either way.
+///
+/// `None` when the request carries no text under the rule. No substitute is
+/// invented: routing on the system prompt instead would use text the gate
+/// never saw and would look like it worked.
+pub fn context_text<'a>(
+    source: PromptSource,
+    turns: impl DoubleEndedIterator<Item = (bool, &'a str)>,
+) -> Option<&'a str> {
+    match source {
+        PromptSource::LastUserMessage => {
+            let mut turns = turns;
+            turns.rfind(|(is_user, _)| *is_user).map(|(_, text)| text)
+        }
+    }
+}
+
 /// Resolve the prompt-selection rule the gate was trained under.
 fn trained_prompt_source(source: &str) -> Result<PromptSource, ApiError> {
     if source == PromptSource::LastUserMessage.as_str() {
@@ -633,6 +661,34 @@ mod tests {
     /// The third member of the representation, and the one a width check can
     /// never stand in for: the same model and the same pooling over different
     /// text produce a correctly-shaped vector of the wrong content.
+    #[test]
+    fn the_context_text_is_the_last_user_turn_not_the_conversation() {
+        let turns = [
+            (false, "you are helpful"),
+            (true, "first question"),
+            (false, "an answer"),
+            (true, "the real question"),
+        ];
+        assert_eq!(
+            context_text(PromptSource::SERVED, turns.into_iter()),
+            Some("the real question"),
+            "routing on the whole conversation makes the vector drift with history length, so the \
+             same question routes differently depending on how long the chat has been running"
+        );
+    }
+
+    #[test]
+    fn a_conversation_with_no_user_turn_yields_no_context_text() {
+        assert_eq!(
+            context_text(
+                PromptSource::SERVED,
+                [(false, "just a system prompt")].into_iter()
+            ),
+            None,
+            "substituting another role's text would route on something the gate never saw"
+        );
+    }
+
     #[test]
     fn an_unrecognised_prompt_source_refuses_rather_than_defaulting() {
         let mut art = artifact(&["technical"]);
