@@ -2648,13 +2648,17 @@ mod tests {
                     embedding_model: "gme-qwen35".into(),
                     pooling: "mean_visual".into(),
                     prompt_source: "last_user_message".into(),
+                    loader_format: "qwen35-f16-decoder".into(),
                     input_width: 4,
                 },
                 gate_bytes: vec![1, 2, 3],
             },
             pinned: true,
         };
-        let body = lattice_inference::serve::lora::lora_list_body(&index, Some(resolved.report()));
+        let body = lattice_inference::serve::lora::lora_list_body(
+            &index,
+            Some(resolved.report("gme-qwen35")),
+        );
         assert!(
             body["adapters"].is_array(),
             "residency shape must not depend on the router"
@@ -2663,6 +2667,10 @@ mod tests {
         assert_eq!(body["router"]["enabled"], true);
         assert_eq!(body["router"]["pinned"], true);
         assert_eq!(body["router"]["adapter_names"][0], "technical");
+        assert_eq!(
+            body["router"]["embedder"], "gme-qwen35",
+            "the endpoint reports what THIS server embeds with, so an operator              can compare it against the checkpoint they think they passed"
+        );
         assert!(
             body["router"]["version"]
                 .as_str()
@@ -2672,8 +2680,30 @@ mod tests {
         );
 
         assert_eq!(
+            body["router"]["routable"], true,
+            "this fixture's trained name IS resident, so routing can run"
+        );
+        assert_eq!(
+            body["router"]["missing"],
+            serde_json::json!([]),
+            "nothing is missing when the trained set is resident"
+        );
+
+        // The other direction, against a residency that genuinely lacks the
+        // trained name. Both arms are here because a routable-only assertion
+        // passes against a `routable` hard-coded true, and a missing-only
+        // assertion passes against one hard-coded false.
+        let empty = AdapterIndex {
+            adapters: vec![],
+            applied: vec![],
+        };
+        let body = lattice_inference::serve::lora::lora_list_body(
+            &empty,
+            Some(resolved.report("gme-qwen35")),
+        );
+        assert_eq!(
             body["router"]["routable"], false,
-            "the fixture residency is empty, so the trained set is not resident"
+            "a trained name that is not resident cannot be routed to"
         );
         assert_eq!(
             body["router"]["missing"][0], "technical",
@@ -2685,8 +2715,10 @@ mod tests {
             ..resolved
         };
         assert_eq!(
-            lattice_inference::serve::lora::lora_list_body(&index, Some(unpinned.report()))["router"]
-                ["pinned"],
+            lattice_inference::serve::lora::lora_list_body(
+                &index,
+                Some(unpinned.report("gme-qwen35"))
+            )["router"]["pinned"],
             false,
             "an unpinned gate must not report itself pinned"
         );

@@ -90,6 +90,12 @@ fn capped_tokenizer(tokenizer: BpeTokenizer, max_context: usize) -> BpeTokenizer
 /// A loaded Qwen3.5 vision-language checkpoint used to serve pooled text and
 /// image embeddings. See the module doc comment for why this loader lives
 /// here instead of reusing `lattice-embed::vision::VisionEmbeddingModel`.
+/// How this loader reads a checkpoint, recorded in a router artifact's
+/// representation so a gate cannot be served by a loader it was not trained
+/// through. One value exists today; the point of the field is that the second
+/// one cannot arrive silently.
+pub const EMBEDDING_LOADER_FORMAT: &str = "qwen35-f16-decoder";
+
 pub struct EmbeddingModel {
     weights: F16ModelWeights,
     config: Qwen35Config,

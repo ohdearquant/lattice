@@ -145,6 +145,7 @@ pub fn lora_list_body(
                 "enabled": true,
                 "version": report.artifact.version_label(),
                 "pinned": report.pinned,
+                "embedder": report.embedder,
                 "adapter_names": report.artifact.adapter_names,
                 "routable": state.routable(),
                 "missing": state.missing,

@@ -488,18 +488,86 @@ fn trained_pooling(pooling: &str) -> Result<crate::forward::cpu_f16::PoolingStra
 /// match is not a warrant of sameness. The width comparison below is the half
 /// that is actually checkable, and its passing is exactly what makes the
 /// unchecked half look settled.
+/// The identity recorded for a server's embedding model.
+///
+/// A type rather than a `&str` because the defect it prevents was exactly a
+/// `&str`: the startup path had the chat model's id and the embedder's object
+/// in the same scope and passed the chat model's, which every test agreed with
+/// because the embedder used to be loaded from the served model's own
+/// directory. The two are different strings the moment they can be different
+/// directories, and nothing about the old signature said which one it wanted.
+///
+/// Derivation lives here rather than in the binary so it can be tested at all;
+/// a `main.rs` that exits the process is not reachable from a unit test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbedderIdentity(String);
+
+impl EmbedderIdentity {
+    /// The directory basename, or an explicit override.
+    ///
+    /// Mirrors how `served_model_id` is derived from `--model`/`--model-id`,
+    /// weakness included: it is a NAME. It separates checkpoints an operator
+    /// has separated, and a different checkpoint of the same family and width
+    /// under a directory of the same name reads identical. The config cannot
+    /// close that gap — it carries `model_type`, which is the family.
+    pub fn resolve(dir: &std::path::Path, override_id: Option<&str>) -> Self {
+        if let Some(id) = override_id {
+            return Self(id.to_string());
+        }
+        // `file_name` is None for a path ending in `..` and for a bare root,
+        // neither of which names a checkpoint; falling back keeps startup on
+        // the refusal path (the artifact will not match "embedder") rather
+        // than panicking on an operator's typo.
+        Self(
+            dir.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("embedder")
+                .to_string(),
+        )
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 pub fn check_representation(
     artifact: &RouterArtifact,
-    served_model_id: &str,
+    embedder_identity: &EmbedderIdentity,
     dimensions: usize,
 ) -> Result<crate::forward::cpu_f16::PoolingStrategy, ApiError> {
+    // The EMBEDDER's identity, never the chat model's. Those were the same
+    // string before ADR-094 decision 1 amendment 2, because the embedder was
+    // loaded from the served model's own directory -- so this check passed by
+    // CO-LOCATION rather than by agreement, and the moment the two could be
+    // different directories it would have been comparing a gate's embedder
+    // against a chat model's name without anything saying so.
     let trained_on = &artifact.representation.embedding_model;
-    if trained_on != served_model_id {
+    if trained_on != embedder_identity.as_str() {
         return Err(ApiError::BadRequest {
             message: format!(
-                "router gate was trained on embedding model {trained_on:?} but this server serves                  {served_model_id:?}; the gate would route on a representation it never saw"
+                "router gate was trained on embedding model {trained_on:?} but this server embeds                  with {:?}; the gate would route on a representation it never saw",
+                embedder_identity.as_str()
             ),
             code: "router_representation_model_mismatch",
+        });
+    }
+
+    // The identity above is a NAME, so it separates checkpoints an operator
+    // has separated and nothing more. This says how the bytes were READ: two
+    // loaders over the same directory can produce different vectors of the
+    // same width from the same text, and the width check below cannot see
+    // that. One value exists today, which is exactly why it is cheap to
+    // record now and impossible to add later without invalidating every
+    // artifact already written.
+    let trained_loader = &artifact.representation.loader_format;
+    if trained_loader != crate::serve::embeddings::EMBEDDING_LOADER_FORMAT {
+        return Err(ApiError::BadRequest {
+            message: format!(
+                "router gate was trained through the {trained_loader:?} embedding loader but this                  server embeds through {:?}",
+                crate::serve::embeddings::EMBEDDING_LOADER_FORMAT
+            ),
+            code: "router_representation_loader_mismatch",
         });
     }
 
@@ -543,6 +611,7 @@ pub struct ServedRouter {
     router: std::sync::Mutex<ServingRouter>,
     pooling: crate::forward::cpu_f16::PoolingStrategy,
     pinned: bool,
+    embedder: EmbedderIdentity,
 }
 
 impl ServedRouter {
@@ -555,7 +624,7 @@ impl ServedRouter {
     /// the process start.
     pub fn new(
         resolved: crate::router_state::ResolvedRouter,
-        served_model_id: &str,
+        embedder_identity: &EmbedderIdentity,
         dimensions: usize,
     ) -> Result<Self, ApiError> {
         // Ordered from the most general refusal to the most specific, which
@@ -567,11 +636,12 @@ impl ServedRouter {
         // `mixture` is told to go fix a representation that was never the
         // problem.
         let router = ServingRouter::new(resolved.artifact)?;
-        let pooling = check_representation(router.artifact(), served_model_id, dimensions)?;
+        let pooling = check_representation(router.artifact(), embedder_identity, dimensions)?;
         Ok(Self {
             router: std::sync::Mutex::new(router),
             pooling,
             pinned: resolved.pinned,
+            embedder: embedder_identity.clone(),
         })
     }
 
@@ -595,6 +665,7 @@ impl ServedRouter {
         f(crate::router_state::RouterReport {
             artifact: guard.artifact(),
             pinned: self.pinned,
+            embedder: self.embedder.as_str(),
         })
     }
 
@@ -640,11 +711,80 @@ mod tests {
         }
     }
 
+    fn identity(name: &str) -> EmbedderIdentity {
+        EmbedderIdentity::resolve(std::path::Path::new("/models"), Some(name))
+    }
+
+    /// The identity is the EMBEDDER's, and the derivation is here rather than
+    /// in `main.rs` so that this test can exist at all.
+    #[test]
+    fn an_embedder_identity_is_the_directory_basename_unless_overridden() {
+        use std::path::Path;
+        assert_eq!(
+            EmbedderIdentity::resolve(Path::new("/models/qwen3.5-0.8b"), None).as_str(),
+            "qwen3.5-0.8b"
+        );
+        // A trailing slash names the same directory and must not change what
+        // the gate is checked against.
+        assert_eq!(
+            EmbedderIdentity::resolve(Path::new("/models/qwen3.5-0.8b/"), None).as_str(),
+            "qwen3.5-0.8b"
+        );
+        // The override wins, mirroring --model-id over the --model basename.
+        assert_eq!(
+            EmbedderIdentity::resolve(Path::new("/models/qwen3.5-0.8b"), Some("gme-qwen35"))
+                .as_str(),
+            "gme-qwen35"
+        );
+        // A path that names no directory falls back rather than panicking, and
+        // the fallback is a value no artifact will match, so startup lands on
+        // the refusal instead of routing on a guess.
+        assert_eq!(
+            EmbedderIdentity::resolve(Path::new(".."), None).as_str(),
+            "embedder"
+        );
+    }
+
+    /// The loader is the half the identity cannot carry. Same name, same
+    /// width, same pooling, same text -- and a different reader of the bytes,
+    /// which no other field in the representation can express.
+    #[test]
+    fn a_gate_trained_through_another_embedding_loader_refuses() {
+        let mut art = artifact(&["technical"]);
+        art.representation.loader_format = "some-other-loader".into();
+        let err = check_representation(&art, &identity("gme-qwen35"), 4)
+            .expect_err("a loader the server does not use must refuse");
+        assert_eq!(err.code(), "router_representation_loader_mismatch");
+        assert!(
+            err.message().contains("some-other-loader")
+                && err
+                    .message()
+                    .contains(crate::serve::embeddings::EMBEDDING_LOADER_FORMAT),
+            "the refusal names BOTH loaders, since which one moved is the question asked: {}",
+            err.message()
+        );
+    }
+
+    /// The agreeing case, so the arm above is not passing on a broken
+    /// comparison that refuses everything.
+    #[test]
+    fn a_gate_trained_through_this_servers_loader_is_accepted() {
+        let art = artifact(&["technical"]);
+        assert_eq!(
+            art.representation.loader_format,
+            crate::serve::embeddings::EMBEDDING_LOADER_FORMAT,
+            "the fixture must carry the value the server actually uses, or the arm above proves nothing"
+        );
+        check_representation(&art, &identity("gme-qwen35"), 4)
+            .expect("an artifact matching this server's loader must be accepted");
+    }
+
     fn representation(input_width: u64) -> crate::router_state::TrainedRepresentation {
         crate::router_state::TrainedRepresentation {
             embedding_model: "gme-qwen35".into(),
             pooling: "mean_visual".into(),
             prompt_source: crate::serve::routing::PromptSource::SERVED.as_str().into(),
+            loader_format: crate::serve::embeddings::EMBEDDING_LOADER_FORMAT.into(),
             input_width,
         }
     }
@@ -675,7 +815,7 @@ mod tests {
     /// nothing about whether this server can produce the vector it wants.
     #[test]
     fn a_gate_trained_on_another_embedding_model_refuses() {
-        let err = check_representation(&artifact(&["technical"]), "some-other-model", 4)
+        let err = check_representation(&artifact(&["technical"]), &identity("some-other-model"), 4)
             .expect_err("a different embedding model must refuse");
         let msg = err.message();
         assert!(
@@ -686,7 +826,7 @@ mod tests {
 
     #[test]
     fn a_gate_whose_width_differs_from_this_servers_embedder_refuses() {
-        let err = check_representation(&artifact(&["technical"]), "gme-qwen35", 1536)
+        let err = check_representation(&artifact(&["technical"]), &identity("gme-qwen35"), 1536)
             .expect_err("a width the embedder cannot produce must refuse");
         let msg = err.message();
         assert!(
@@ -703,7 +843,7 @@ mod tests {
     fn an_unrecognised_pooling_refuses_rather_than_defaulting() {
         let mut art = artifact(&["technical"]);
         art.representation.pooling = "cls".into();
-        let err = check_representation(&art, "gme-qwen35", 4)
+        let err = check_representation(&art, &identity("gme-qwen35"), 4)
             .expect_err("an unknown pooling must refuse");
         assert!(
             err.message().contains("cls"),
@@ -747,7 +887,7 @@ mod tests {
     fn an_unrecognised_prompt_source_refuses_rather_than_defaulting() {
         let mut art = artifact(&["technical"]);
         art.representation.prompt_source = "rendered_conversation".into();
-        let err = check_representation(&art, "gme-qwen35", 4)
+        let err = check_representation(&art, &identity("gme-qwen35"), 4)
             .expect_err("an unknown prompt source must refuse");
         assert!(
             err.message().contains("rendered_conversation"),
@@ -758,7 +898,7 @@ mod tests {
 
     #[test]
     fn a_matching_representation_returns_the_pooling_the_gate_was_trained_under() {
-        let pooling = check_representation(&artifact(&["technical"]), "gme-qwen35", 4)
+        let pooling = check_representation(&artifact(&["technical"]), &identity("gme-qwen35"), 4)
             .expect("a matching representation must resolve");
         assert_eq!(
             pooling,
@@ -777,7 +917,7 @@ mod tests {
         rep.embedding_model = "some-other-model".into();
         // `match` rather than `expect_err`: a test's convenience is not a
         // reason to derive `Debug` on a type that holds a gate.
-        let msg = match ServedRouter::new(resolved(rep), "gme-qwen35", 4) {
+        let msg = match ServedRouter::new(resolved(rep), &identity("gme-qwen35"), 4) {
             Ok(_) => panic!("a build with no gate implementation must refuse"),
             Err(err) => err.message().to_string(),
         };

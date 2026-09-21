@@ -44,7 +44,7 @@ use crate::bounded_read::{BoundedReadError, read_bytes_bounded};
 /// On-disk format revision for the manifest. Bumped only for a change that an
 /// older reader would misread; a reader refuses a revision it does not know
 /// rather than parsing a prefix of it.
-pub const ROUTER_ARTIFACT_FORMAT: u32 = 3;
+pub const ROUTER_ARTIFACT_FORMAT: u32 = 4;
 
 /// Size cap for the manifest read. The manifest is a small JSON object whose
 /// only unbounded field is the adapter-name list.
@@ -241,6 +241,17 @@ pub struct TrainedRepresentation {
     /// precisely when it is cheap to add and impossible to add later without
     /// invalidating every artifact already written.
     pub prompt_source: String,
+    /// Which loader produced the embedding, spelled as that loader names
+    /// itself: `qwen35-f16-decoder`.
+    ///
+    /// Recorded because the identity beside it is a NAME. A name distinguishes
+    /// checkpoints an operator has distinguished; it says nothing about how
+    /// the bytes were read, and two loaders reading the same directory can
+    /// produce different vectors of the same width from the same text. There
+    /// is one loader today, so this field cannot disagree with the server yet
+    /// -- which is the only time a field like this can be added without
+    /// invalidating every artifact already written.
+    pub loader_format: String,
     /// The gate's input width as RECORDED at write time.
     ///
     /// Already implied by the gate payload, and stored anyway so a startup
@@ -288,6 +299,7 @@ impl RouterArtifact {
             self.representation.embedding_model.as_str(),
             self.representation.pooling.as_str(),
             self.representation.prompt_source.as_str(),
+            self.representation.loader_format.as_str(),
         ] {
             hasher.update((field.len() as u64).to_le_bytes());
             hasher.update(field.as_bytes());
@@ -470,14 +482,29 @@ pub struct RouterReport<'a> {
     pub artifact: &'a RouterArtifact,
     /// True when `--router-pin` selected this version.
     pub pinned: bool,
+    /// The identity of the embedding model THIS server loaded.
+    ///
+    /// The server's own value, not the artifact's `trained_on`. Startup
+    /// refuses when the two disagree, so a running server reports the same
+    /// string either way -- which is exactly the reasoning that makes a
+    /// co-located value look like the value it sits beside. If that check is
+    /// ever relaxed or scoped, the report keeps answering the question an
+    /// operator is actually asking, which is what this process embeds with.
+    pub embedder: &'a str,
 }
 
 impl ResolvedRouter {
     /// Borrow this resolution as a report.
-    pub fn report(&self) -> RouterReport<'_> {
+    ///
+    /// The embedder identity is a parameter because a resolution does not
+    /// have one: it is read from disk before this server's embedding model is
+    /// known. Passing it in keeps the caller unable to report a gate without
+    /// saying what it is being served against.
+    pub fn report<'a>(&'a self, embedder: &'a str) -> RouterReport<'a> {
         RouterReport {
             artifact: &self.artifact,
             pinned: self.pinned,
+            embedder,
         }
     }
 }
@@ -610,6 +637,7 @@ mod tests {
             embedding_model: "gme-qwen35".into(),
             pooling: "mean_visual".into(),
             prompt_source: "last_user_message".into(),
+            loader_format: "qwen35-f16-decoder".into(),
             input_width: 8,
         }
     }
