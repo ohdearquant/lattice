@@ -106,6 +106,15 @@ the opposite of letting it choose — the distribution is the thing being learne
 no flag is added: a default of 1 would make a mixture router a single-adapter router for everyone
 who did not read the flag list.
 
+_Amendment 1, 2026-09-21._ That sentence describes the end state, and it was read as a claim about
+current behaviour by the person implementing it, which is the only test of a sentence like this that
+matters. At the serving head today the gate decides neither the selection nor the weight: the weight
+over the routed columns is ADR-091 decision 1's uniform `1/k`, which that decision keeps as the
+default until its evidence gate passes, and nothing on the serving path names another policy. What
+this decision settles is the _set_ that is routed — every trained column, never a top-`k` — and that
+holds under either weighting. Which policy replaces uniform, its temperature, and the evidence that
+admits it are ADR-096's.
+
 **A trained set that is not resident refuses the request, naming both lists.** The gate's columns
 are labelled by the artifact's adapter names, so a resident set that does not match cannot be
 routed at all, and there are only two ways to answer it. Refusing is loud and has a real cost: a
