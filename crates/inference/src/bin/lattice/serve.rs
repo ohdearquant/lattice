@@ -2657,7 +2657,8 @@ mod tests {
                     embedding_model: "gme-qwen35".into(),
                     pooling: "mean_visual".into(),
                     prompt_source: "last_user_message".into(),
-                    loader_format: "qwen35-f16-decoder".into(),
+                    loader_format: lattice_inference::serve::embeddings::QWEN35_F16_DECODER_LOADER
+                        .into(),
                     input_width: 4,
                 },
                 gate_bytes: vec![1, 2, 3],

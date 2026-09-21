@@ -561,11 +561,11 @@ pub fn check_representation(
     // record now and impossible to add later without invalidating every
     // artifact already written.
     let trained_loader = &artifact.representation.loader_format;
-    if trained_loader != crate::serve::embeddings::EMBEDDING_LOADER_FORMAT {
+    if trained_loader != crate::serve::embeddings::QWEN35_F16_DECODER_LOADER {
         return Err(ApiError::BadRequest {
             message: format!(
                 "router gate was trained through the {trained_loader:?} embedding loader but this server embeds through {:?}",
-                crate::serve::embeddings::EMBEDDING_LOADER_FORMAT
+                crate::serve::embeddings::QWEN35_F16_DECODER_LOADER
             ),
             code: "router_representation_loader_mismatch",
         });
@@ -759,7 +759,7 @@ mod tests {
             err.message().contains("some-other-loader")
                 && err
                     .message()
-                    .contains(crate::serve::embeddings::EMBEDDING_LOADER_FORMAT),
+                    .contains(crate::serve::embeddings::QWEN35_F16_DECODER_LOADER),
             "the refusal names BOTH loaders, since which one moved is the question asked: {}",
             err.message()
         );
@@ -772,11 +772,80 @@ mod tests {
         let art = artifact(&["technical"]);
         assert_eq!(
             art.representation.loader_format,
-            crate::serve::embeddings::EMBEDDING_LOADER_FORMAT,
+            crate::serve::embeddings::QWEN35_F16_DECODER_LOADER,
             "the fixture must carry the value the server actually uses, or the arm above proves nothing"
         );
         check_representation(&art, &identity("gme-qwen35"), 4)
             .expect("an artifact matching this server's loader must be accepted");
+    }
+
+    /// Condition (1). The cross-binary arm below compares two constants, so it
+    /// is worth nothing unless they hold different values: an arm that compares
+    /// a value against itself passes for every input and reads exactly like a
+    /// guard.
+    #[test]
+    fn the_two_loader_constants_are_different_values() {
+        assert_ne!(
+            crate::serve::embeddings::QWEN35_F16_DECODER_LOADER,
+            crate::serve::embeddings::BERT_ENCODER_LOADER,
+            "two binaries that read the bytes differently must not share one loader name"
+        );
+    }
+
+    /// Condition (3). The refusal an operator actually meets: a gate trained
+    /// through `lattice_serve`'s BERT encoder, handed to the Qwen3.5 server at
+    /// startup.
+    ///
+    /// Gated on `mixture` deliberately. Without that feature `ServingRouter::new`
+    /// answers first with the build refusal, which is the right ordering and the
+    /// wrong reason for this arm: the test would pass while proving nothing
+    /// about the loader.
+    #[cfg(feature = "mixture")]
+    #[test]
+    fn a_gate_trained_through_the_other_binarys_loader_refuses_at_startup() {
+        use lattice_fann::{Activation, NetworkBuilder};
+
+        let gate = || {
+            NetworkBuilder::new()
+                .input(4)
+                .output(1, Activation::Linear)
+                .build()
+                .expect("gate must build")
+                .to_bytes()
+        };
+        let resolved = |rep| crate::router_state::ResolvedRouter {
+            artifact: RouterArtifact {
+                version: 1,
+                adapter_names: vec!["technical".into()],
+                representation: rep,
+                gate_bytes: gate(),
+            },
+            pinned: false,
+        };
+
+        // The must-match control FIRST, and it is load-bearing here: this
+        // constructor refuses for several reasons before the loader is read, so
+        // without it a green refusal arm could be a gate the constructor was
+        // always going to reject.
+        assert!(
+            ServedRouter::new(resolved(representation(4)), &identity("gme-qwen35"), 4).is_ok(),
+            "an artifact carrying this binary's own loader must start, or the arm below proves nothing"
+        );
+
+        let mut rep = representation(4);
+        rep.loader_format = crate::serve::embeddings::BERT_ENCODER_LOADER.into();
+        let err = ServedRouter::new(resolved(rep), &identity("gme-qwen35"), 4)
+            .expect_err("a gate trained through the other binary's loader must refuse at startup");
+        assert_eq!(err.code(), "router_representation_loader_mismatch");
+        assert!(
+            err.message()
+                .contains(crate::serve::embeddings::BERT_ENCODER_LOADER)
+                && err
+                    .message()
+                    .contains(crate::serve::embeddings::QWEN35_F16_DECODER_LOADER),
+            "the refusal names BOTH loaders, the artifact's and this binary's: {}",
+            err.message()
+        );
     }
 
     fn representation(input_width: u64) -> crate::router_state::TrainedRepresentation {
@@ -784,7 +853,7 @@ mod tests {
             embedding_model: "gme-qwen35".into(),
             pooling: "mean_visual".into(),
             prompt_source: crate::serve::routing::PromptSource::SERVED.as_str().into(),
-            loader_format: crate::serve::embeddings::EMBEDDING_LOADER_FORMAT.into(),
+            loader_format: crate::serve::embeddings::QWEN35_F16_DECODER_LOADER.into(),
             input_width,
         }
     }
