@@ -427,7 +427,7 @@ pub struct AppState {
     /// `--router-state` passed to such a build is refused at startup rather
     /// than loaded into a field nothing on that build could ever apply.
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-    pub router_state: Option<Arc<lattice_inference::router_state::RouterArtifact>>,
+    pub router_state: Option<Arc<lattice_inference::router_state::ResolvedRouter>>,
 }
 
 // -----------------------------------------------------------------------
@@ -1662,25 +1662,71 @@ fn adapter_unsupported_build() -> ApiError {
     )
 }
 
+/// Assemble the `GET /v1/lora` body: the residency snapshot with `router`
+/// added beside it.
+///
+/// A separate function because the shape is the thing that breaks and a
+/// handler's shape can only be checked by launching a server. It already broke
+/// once: adding the router key as `json!({"adapters": index, "router": ...})`
+/// reads like adding a field and is not. `AdapterIndex` serializes to
+/// `{"adapters": [...], "applied": [...]}`, so wrapping it turned the
+/// top-level `adapters` from an array into an object and moved `applied` a
+/// level down -- a breaking change to two existing fields, written while
+/// intending a purely additive one, and invisible without a test that holds
+/// the whole body.
+///
+/// `router` is therefore merged in beside the snapshot's own keys rather than
+/// containing them.
+#[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+fn lora_list_body(
+    index: &lattice_inference::serve::lora::AdapterIndex,
+    router: Option<&lattice_inference::router_state::ResolvedRouter>,
+) -> serde_json::Value {
+    // ADR-095 decision 3: the response says which gate is serving, because
+    // "routing is enabled" and "routing ran with the gate I pinned" are
+    // different claims.
+    //
+    // `pinned` is reported rather than left for the reader to infer, because
+    // the version alone cannot carry it. A server reporting version 7 reports
+    // the same number whether --router-pin selected it or whether 7 is simply
+    // the highest version written so far, and the two only diverge at the next
+    // refit and restart -- which is when nobody is looking, and is the entire
+    // scenario a pin exists for.
+    let router = match router {
+        None => serde_json::json!({"enabled": false}),
+        Some(resolved) => serde_json::json!({
+            "enabled": true,
+            "version": resolved.artifact.version_label(),
+            "pinned": resolved.pinned,
+            "adapter_names": resolved.artifact.adapter_names,
+        }),
+    };
+    let mut body = serde_json::to_value(index).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(map) = body.as_object_mut() {
+        map.insert("router".into(), router);
+    }
+    body
+}
+
 /// List confirmed resident adapters and the currently applied mixture.
 pub async fn lora_list(State(state): State<AppState>) -> Result<Response, ApiError> {
     #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
     {
         // ADR-095 decision 3: the response says which gate is serving, because
         // "routing is enabled" and "routing ran with the gate I pinned" are
-        // different claims and only the version can tell them apart.
-        let router = match &state.router_state {
-            None => serde_json::json!({"enabled": false}),
-            Some(artifact) => serde_json::json!({
-                "enabled": true,
-                "version": artifact.version_label(),
-                "adapter_names": artifact.adapter_names,
-            }),
-        };
-        Ok(Json(serde_json::json!({
-            "adapters": adapter_client(&state)?.adapter_index(),
-            "router": router,
-        }))
+        // different claims.
+        //
+        // `pinned` is reported beside the version rather than left for the
+        // reader to infer, because the version alone cannot carry it. An
+        // earlier draft of this comment said it could. A server reporting
+        // version 7 reports the same number whether --router-pin selected it
+        // or whether 7 is simply the highest version written so far, and the
+        // two only diverge at the next refit and restart -- which is when
+        // nobody is looking and is the entire scenario a pin exists for.
+        Ok(Json(lora_list_body(
+            &adapter_client(&state)?.adapter_index(),
+            state.router_state.as_deref(),
+        ))
         .into_response())
     }
     #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
@@ -2473,6 +2519,84 @@ mod tests {
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
             ));
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
+    #[test]
+    fn the_router_key_is_added_beside_residency_and_never_wraps_it() {
+        // The regression this pins. Adding the router as
+        // `json!({"adapters": index, "router": ...})` reads like an additive
+        // change and silently rewrites two existing fields: top-level
+        // `adapters` stops being an array and `applied` moves a level down.
+        // Asserting only that `router` is present would pass against that bug,
+        // so the pre-existing keys are asserted in their ORIGINAL positions.
+        use lattice_inference::router_state::{ResolvedRouter, RouterArtifact};
+        use lattice_inference::serve::lora::{AdapterIndex, AdapterMetadata, LoraSelection};
+
+        let index = AdapterIndex {
+            adapters: vec![AdapterMetadata {
+                id: 0,
+                name: "technical".into(),
+                path: "/p/a.safetensors".into(),
+                rank: 8,
+                layers: 24,
+            }],
+            applied: vec![
+                serde_json::from_str::<LoraSelection>(r#"{"id":0,"scale":1.0}"#)
+                    .expect("selection"),
+            ],
+        };
+
+        let body = lora_list_body(&index, None);
+        assert!(
+            body["adapters"].is_array(),
+            "top-level adapters must stay an array, got {}",
+            body["adapters"]
+        );
+        assert_eq!(body["adapters"][0]["name"], "technical");
+        assert!(
+            body["applied"].is_array(),
+            "applied must stay at the top level, got {body}"
+        );
+        assert_eq!(body["applied"][0]["id"], 0);
+        assert_eq!(body["router"]["enabled"], false);
+
+        // A gate that is serving reports its version AND whether a pin put it
+        // there; the version alone cannot distinguish the two.
+        let resolved = ResolvedRouter {
+            artifact: RouterArtifact {
+                version: 7,
+                adapter_names: vec!["technical".into()],
+                gate_bytes: vec![1, 2, 3],
+            },
+            pinned: true,
+        };
+        let body = lora_list_body(&index, Some(&resolved));
+        assert!(
+            body["adapters"].is_array(),
+            "residency shape must not depend on the router"
+        );
+        assert!(body["applied"].is_array());
+        assert_eq!(body["router"]["enabled"], true);
+        assert_eq!(body["router"]["pinned"], true);
+        assert_eq!(body["router"]["adapter_names"][0], "technical");
+        assert!(
+            body["router"]["version"]
+                .as_str()
+                .is_some_and(|v| v.starts_with("7:")),
+            "version label carries the counter, got {}",
+            body["router"]["version"]
+        );
+
+        let unpinned = ResolvedRouter {
+            pinned: false,
+            ..resolved
+        };
+        assert_eq!(
+            lora_list_body(&index, Some(&unpinned))["router"]["pinned"],
+            false,
+            "an unpinned gate must not report itself pinned"
+        );
     }
 
     #[cfg(all(feature = "metal-gpu", feature = "test-utils"))]

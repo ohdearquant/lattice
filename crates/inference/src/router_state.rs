@@ -140,6 +140,21 @@ pub enum RouterArtifactError {
         /// The version asked for.
         version: u64,
     },
+
+    /// A pin was given with no directory to resolve it in.
+    ///
+    /// Separate from `NotFound` on purpose. Both mean "the pinned version is
+    /// not serving", and they have different remedies: this one is a missing
+    /// flag, that one is a missing file. The operator reaching for a pin is
+    /// mid-incident and the difference is the whole content of the message.
+    #[error(
+        "--router-pin {version} was given without --router-state; a pinned version names an \
+         artifact in a directory, and no directory was configured"
+    )]
+    PinWithoutState {
+        /// The version that was pinned.
+        version: u64,
+    },
 }
 
 /// `BoundedReadError` is crate-internal and not an `Error`, so it cannot be a
@@ -349,8 +364,26 @@ pub enum StartupDisposition {
     /// request that omits `lora` selects the base model — today's behaviour,
     /// unchanged.
     NoRouter,
-    /// A router directory was given and its highest version loaded.
-    Loaded(Box<RouterArtifact>),
+    /// A router directory was given and an artifact loaded from it.
+    Loaded(Box<ResolvedRouter>),
+}
+
+/// A loaded gate together with how it was selected.
+///
+/// `pinned` is carried rather than derived because it cannot be derived. An
+/// operator who pins version 7 during an incident needs to confirm the pin is
+/// live, and the version number alone cannot tell them: a server reporting
+/// version 7 is reporting the same number whether it is pinned there or
+/// whether 7 simply happens to be the highest version written so far. The two
+/// only diverge later, at the next refit and the next restart, which is
+/// exactly when nobody is watching and exactly what a pin exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRouter {
+    /// The gate artifact that was loaded.
+    pub artifact: RouterArtifact,
+    /// True when `--router-pin` selected this version, false when it was the
+    /// highest version present.
+    pub pinned: bool,
 }
 
 /// Decide what a startup does about routing.
@@ -362,16 +395,41 @@ pub enum StartupDisposition {
 /// and only one of them was asked for. Collapsing them is the failure this
 /// function's shape exists to prevent — it is why `NoRouter` is unreachable
 /// from any input other than `None`.
-pub fn resolve_startup(dir: Option<&Path>) -> Result<StartupDisposition, RouterArtifactError> {
+/// A pin with no directory refuses rather than being ignored. Ignoring it is
+/// the dangerous reading: the operator believes a specific version is serving,
+/// the server serves no router at all, and both facts are silent.
+pub fn resolve_startup(
+    dir: Option<&Path>,
+    pin: Option<u64>,
+) -> Result<StartupDisposition, RouterArtifactError> {
     let Some(dir) = dir else {
-        return Ok(StartupDisposition::NoRouter);
+        return match pin {
+            None => Ok(StartupDisposition::NoRouter),
+            Some(version) => Err(RouterArtifactError::PinWithoutState { version }),
+        };
     };
-    match load_latest(dir)? {
-        Some(artifact) => Ok(StartupDisposition::Loaded(Box::new(artifact))),
-        None => Err(RouterArtifactError::EmptyDirectory {
-            dir: dir.to_path_buf(),
-        }),
-    }
+    let resolved = match pin {
+        // A pinned version that is absent refuses. Falling back to the latest
+        // is the failure this rejects: the pin is reached for precisely when
+        // the latest is the thing misbehaving, so a silent fallback serves the
+        // artifact the operator was trying to get away from.
+        Some(version) => ResolvedRouter {
+            artifact: read_artifact(dir, version)?,
+            pinned: true,
+        },
+        None => match load_latest(dir)? {
+            Some(artifact) => ResolvedRouter {
+                artifact,
+                pinned: false,
+            },
+            None => {
+                return Err(RouterArtifactError::EmptyDirectory {
+                    dir: dir.to_path_buf(),
+                });
+            }
+        },
+    };
+    Ok(StartupDisposition::Loaded(Box::new(resolved)))
 }
 
 /// Load the highest version present in `dir`.
@@ -694,7 +752,7 @@ mod tests {
         // from any configured directory, so "broken router" can never arrive
         // at a server as "no router".
         assert!(matches!(
-            resolve_startup(None).expect("no flag"),
+            resolve_startup(None, None).expect("no flag"),
             StartupDisposition::NoRouter
         ));
     }
@@ -703,7 +761,7 @@ mod tests {
     fn a_configured_but_empty_directory_refuses_rather_than_starting_without_a_router() {
         let dir = scratch("startup-empty");
         std::fs::create_dir_all(&dir).expect("mkdir");
-        match resolve_startup(Some(&dir)) {
+        match resolve_startup(Some(&dir), None) {
             Err(RouterArtifactError::EmptyDirectory { .. }) => {}
             Ok(StartupDisposition::NoRouter) => {
                 panic!("a configured directory read as no-router, which is the state this refuses")
@@ -716,7 +774,7 @@ mod tests {
     #[test]
     fn a_configured_directory_that_does_not_exist_refuses() {
         let dir = scratch("startup-absent");
-        match resolve_startup(Some(&dir)) {
+        match resolve_startup(Some(&dir), None) {
             Err(RouterArtifactError::EmptyDirectory { .. }) => {}
             other => panic!("expected a refusal for an absent configured dir, got {other:?}"),
         }
@@ -732,9 +790,89 @@ mod tests {
         bytes[0] ^= 0xff;
         std::fs::write(gate_path(&dir, 7), &bytes).expect("corrupt");
 
-        match resolve_startup(Some(&dir)) {
+        match resolve_startup(Some(&dir), None) {
             Err(RouterArtifactError::HashMismatch { version, .. }) => assert_eq!(version, 7),
             other => panic!("expected the artifact's own hash error, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pin_with_no_directory_refuses_and_is_not_ignored() {
+        // The dangerous reading is that a pin with nothing to resolve against
+        // is harmless. It is the opposite: the operator believes a named
+        // version is serving and the server has no router at all, with both
+        // facts silent. Distinct from NotFound because the remedies differ --
+        // a missing flag, not a missing file.
+        match resolve_startup(None, Some(7)) {
+            Err(RouterArtifactError::PinWithoutState { version }) => assert_eq!(version, 7),
+            Ok(StartupDisposition::NoRouter) => {
+                panic!("a pin was ignored, which is the state this refuses")
+            }
+            other => panic!("expected PinWithoutState, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pin_selects_its_version_and_not_the_highest() {
+        // The arm that separates a pin from a no-op. Two versions present and
+        // the pin names the LOWER one, so a resolver that ignored the pin
+        // would still return successfully with a valid artifact -- it would
+        // just be the wrong one. Pinning to the highest version would pass
+        // against both the correct and the broken implementation.
+        let dir = scratch("startup-pin-selects");
+        write_artifact(&dir, &artifact()).expect("write v7");
+        write_artifact(
+            &dir,
+            &RouterArtifact {
+                version: 9,
+                adapter_names: vec!["legal".into()],
+                gate_bytes: vec![4, 2],
+            },
+        )
+        .expect("write v9");
+        match resolve_startup(Some(&dir), Some(7)).expect("load") {
+            StartupDisposition::Loaded(r) => {
+                assert_eq!(r.artifact.version, 7, "the pin did not select its version");
+                assert!(r.pinned, "a pinned load must report itself pinned");
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_absent_pinned_version_refuses_rather_than_falling_back_to_the_latest() {
+        // A fallback here would serve precisely the artifact the operator was
+        // pinning away from, under a flag that says otherwise. The directory
+        // deliberately HOLDS a loadable artifact, so a resolver that fell back
+        // would succeed and look healthy.
+        let dir = scratch("startup-pin-absent");
+        write_artifact(&dir, &artifact()).expect("write v7");
+        match resolve_startup(Some(&dir), Some(99)) {
+            Err(RouterArtifactError::NotFound { version, .. }) => assert_eq!(version, 99),
+            Ok(StartupDisposition::Loaded(r)) => panic!(
+                "fell back to version {} instead of refusing the absent pin",
+                r.artifact.version
+            ),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pinned_corrupt_artifact_refuses_with_the_hash_error_not_the_pin_error() {
+        // A pin does not bypass verification, and the refusal must name the
+        // real cause: the remedy for a corrupt artifact is not the remedy for
+        // a mistyped version.
+        let dir = scratch("startup-pin-corrupt");
+        write_artifact(&dir, &artifact()).expect("write");
+        let mut bytes = std::fs::read(gate_path(&dir, 7)).expect("read");
+        bytes[0] ^= 0xff;
+        std::fs::write(gate_path(&dir, 7), &bytes).expect("corrupt");
+        match resolve_startup(Some(&dir), Some(7)) {
+            Err(RouterArtifactError::HashMismatch { version, .. }) => assert_eq!(version, 7),
+            other => panic!("expected HashMismatch, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -752,8 +890,11 @@ mod tests {
             },
         )
         .expect("write v9");
-        match resolve_startup(Some(&dir)).expect("load") {
-            StartupDisposition::Loaded(a) => assert_eq!(a.version, 9),
+        match resolve_startup(Some(&dir), None).expect("load") {
+            StartupDisposition::Loaded(r) => {
+                assert_eq!(r.artifact.version, 9);
+                assert!(!r.pinned, "an unpinned load must not report itself pinned");
+            }
             other => panic!("expected Loaded, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);

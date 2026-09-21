@@ -125,6 +125,17 @@ enum Command {
         /// for.
         #[arg(long)]
         router_state: Option<String>,
+        /// Serve a specific router gate version instead of the highest one
+        /// present (ADR-095 decision 3). This is the rollback arm: when a
+        /// refit degrades output, pinning is what an operator reaches for,
+        /// and it works when the process itself is the thing misbehaving.
+        ///
+        /// A pinned version that is absent FAILS the startup. Falling back to
+        /// the latest would serve exactly the artifact the operator was
+        /// trying to get away from, under a flag that says otherwise. A pin
+        /// without --router-state fails too, naming the missing flag.
+        #[arg(long)]
+        router_pin: Option<u64>,
     },
     /// Preflight check: memory fit and artifact compatibility, without
     /// loading any model weights (config + tensor index inspection only).
@@ -204,6 +215,7 @@ async fn main() {
             max_resident_adapter_bytes,
             preload_vision,
             router_state,
+            router_pin,
         } => {
             use std::path::Path;
             use std::sync::Arc;
@@ -326,11 +338,16 @@ async fn main() {
             // cannot apply one either; accepting a router there would load a
             // gate nothing on this build could ever use. Refused for the same
             // reason `adapter_unsupported_build` refuses the adapter routes.
+            // Both flags, not just --router-state. A pin is meaningless on a
+            // build that cannot route at all, and accepting it silently is the
+            // worse half of the pair: the operator pinning a version during an
+            // incident would get a server that reports success and routes
+            // nothing.
             #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
-            if router_state.is_some() {
+            if router_state.is_some() || router_pin.is_some() {
                 eprintln!(
-                    "Error: --router-state requires a macOS Metal build; adapter routing \
-                     selects resident adapters, which this build cannot load."
+                    "Error: --router-state and --router-pin require a macOS Metal build; adapter \
+                     routing selects resident adapters, which this build cannot load."
                 );
                 std::process::exit(1);
             }
@@ -338,15 +355,16 @@ async fn main() {
             #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
             let router_artifact = {
                 use lattice_inference::router_state::{StartupDisposition, resolve_startup};
-                match resolve_startup(router_state.as_deref().map(Path::new)) {
+                match resolve_startup(router_state.as_deref().map(Path::new), router_pin) {
                     Ok(StartupDisposition::NoRouter) => None,
-                    Ok(StartupDisposition::Loaded(artifact)) => {
+                    Ok(StartupDisposition::Loaded(resolved)) => {
                         eprintln!(
-                            "Router gate loaded: version {} over {} adapter(s)",
-                            artifact.version_label(),
-                            artifact.adapter_names.len()
+                            "Router gate loaded: version {} over {} adapter(s){}",
+                            resolved.artifact.version_label(),
+                            resolved.artifact.adapter_names.len(),
+                            if resolved.pinned { " (pinned)" } else { "" }
                         );
-                        Some(Arc::new(*artifact))
+                        Some(Arc::new(*resolved))
                     }
                     Err(e) => {
                         eprintln!("Error: {e}");

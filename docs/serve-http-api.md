@@ -642,9 +642,23 @@ selection is retried on the next request, never mistaken for a cache hit.
   "adapters": [
     { "id": 0, "name": "technical", "path": "/path/to/adapter.safetensors", "rank": 8, "layers": 24 }
   ],
-  "applied": [{ "id": 0, "scale": 1.0 }]
+  "applied": [{ "id": 0, "scale": 1.0 }],
+  "router": { "enabled": true, "version": "7:1f9fbd2587812a3e", "pinned": false, "adapter_names": ["technical"] }
 }
 ```
+
+`router` describes the routing gate and is additive: `adapters` and `applied`
+keep their shapes and positions. Without `--router-state` the server has no
+gate and reports `{ "enabled": false }` alone; a request that omits `lora` then
+selects the base model, which is the behaviour a server without the flag has
+always had.
+
+`version` is a monotonic counter and a content-hash prefix, so it changes
+whenever the gate or the adapter-name list does. `pinned` says whether
+`--router-pin <version>` selected that version or whether it is simply the
+highest one present. The two are worth distinguishing because the version
+number alone cannot: a pinned server and an unpinned one report the same number
+until the next refit lands, and by then the unpinned one has already moved.
 
 Unload requires an id. Unknown ids are refused; unloading an adapter used by the
 applied mixture clears that mixture, while other resident adapters remain.
