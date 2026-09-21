@@ -111,6 +111,40 @@ pub enum RouterArtifactError {
         computed: String,
     },
 
+    /// The manifest's own version counter disagrees with the one in its
+    /// filename. Both are read: the directory scan lists versions by filename,
+    /// and the loaded artifact reports the manifest's. A disagreement means an
+    /// operator can pin one number and be served an artifact that calls itself
+    /// another, so it is refused rather than resolved in either direction.
+    #[error(
+        "manifest {path} declares version {declared}, but its filename names          version {from_filename}; a pinned version must mean one artifact, so          this pair is refused rather than one half being preferred"
+    )]
+    VersionMismatch {
+        /// The manifest path, whose name carries the other number.
+        path: PathBuf,
+        /// The counter the manifest's own field declares.
+        declared: u64,
+        /// The counter the filename declares.
+        from_filename: u64,
+    },
+
+    /// The manifest's declared payload length disagrees with the payload's
+    /// actual length. A declared size nothing compares is a field that cannot
+    /// detect the truncation it exists to describe.
+    #[error(
+        "manifest {path} declares a {declared}-byte gate payload, but          {payload} holds {actual} bytes; the artifact is truncated or the          manifest belongs to a different payload"
+    )]
+    GateLengthMismatch {
+        /// The manifest path.
+        path: PathBuf,
+        /// The payload path.
+        payload: PathBuf,
+        /// The length the manifest declares.
+        declared: u64,
+        /// The length the payload actually has.
+        actual: u64,
+    },
+
     /// Writing the artifact failed.
     #[error("writing {path}: {message}")]
     Write {
@@ -600,6 +634,19 @@ pub fn read_artifact(dir: &Path, version: u64) -> Result<RouterArtifact, RouterA
         });
     }
 
+    // The counter reaches this function twice by two different routes: as the
+    // `version` argument, which `versions()` derived from the filename, and as
+    // `manifest.version`, which the file declares. Neither is inside the
+    // content hash, so the hash check below cannot see a disagreement between
+    // them.
+    if manifest.version != version {
+        return Err(RouterArtifactError::VersionMismatch {
+            path: manifest_file,
+            declared: manifest.version,
+            from_filename: version,
+        });
+    }
+
     let gate_file = gate_path(dir, version);
     let gate_bytes = read_bytes_bounded(&gate_file, MAX_ROUTER_GATE_LEN).map_err(|e| {
         RouterArtifactError::Read {
@@ -607,6 +654,18 @@ pub fn read_artifact(dir: &Path, version: u64) -> Result<RouterArtifact, RouterA
             source: e.into(),
         }
     })?;
+
+    // `gate_len` is written into every manifest and was, until this check,
+    // read by nobody: the hash covers the payload's actual length, never the
+    // declared one, so the two could disagree and both reads would pass.
+    if manifest.gate_len != gate_bytes.len() as u64 {
+        return Err(RouterArtifactError::GateLengthMismatch {
+            path: manifest_file,
+            payload: gate_path(dir, version),
+            declared: manifest.gate_len,
+            actual: gate_bytes.len() as u64,
+        });
+    }
 
     let artifact = RouterArtifact {
         version: manifest.version,
@@ -789,6 +848,63 @@ mod tests {
                 assert_eq!(known, ROUTER_ARTIFACT_FORMAT);
             }
             other => panic!("expected an unknown-format refusal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_manifest_whose_version_disagrees_with_its_filename_is_refused() {
+        // The counter is not inside the content hash, so this edit leaves the
+        // hash valid: without an explicit comparison the file loads clean and
+        // reports a version the operator never asked for. The control below is
+        // the same directory reading fine before the edit, so a refusal here
+        // cannot come from a broken fixture.
+        let dir = scratch("versionskew");
+        write_artifact(&dir, &artifact()).expect("write");
+        assert_eq!(read_artifact(&dir, 7).expect("control reads"), artifact());
+
+        let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
+        let skewed = raw.replace("\"version\": 7", "\"version\": 3");
+        assert_ne!(skewed, raw, "the version field must have been rewritten");
+        std::fs::write(manifest_path(&dir, 7), skewed).expect("rewrite");
+
+        match read_artifact(&dir, 7) {
+            Err(RouterArtifactError::VersionMismatch {
+                declared,
+                from_filename,
+                ..
+            }) => {
+                assert_eq!(declared, 3);
+                assert_eq!(from_filename, 7);
+            }
+            other => panic!("expected a version mismatch, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_declared_payload_length_that_does_not_match_the_payload_is_refused() {
+        // `gate_len` is written by every writer and, until it was compared,
+        // read by nobody. It is outside the content hash too, so a manifest
+        // that belongs to a different payload passes the hash check whenever
+        // the payload it describes is the one on disk.
+        let dir = scratch("gatelen");
+        write_artifact(&dir, &artifact()).expect("write");
+        assert_eq!(read_artifact(&dir, 7).expect("control reads"), artifact());
+
+        let raw = std::fs::read_to_string(manifest_path(&dir, 7)).expect("read manifest");
+        let skewed = raw.replace("\"gate_len\": 5", "\"gate_len\": 4");
+        assert_ne!(skewed, raw, "the gate_len field must have been rewritten");
+        std::fs::write(manifest_path(&dir, 7), skewed).expect("rewrite");
+
+        match read_artifact(&dir, 7) {
+            Err(RouterArtifactError::GateLengthMismatch {
+                declared, actual, ..
+            }) => {
+                assert_eq!(declared, 4);
+                assert_eq!(actual, 5);
+            }
+            other => panic!("expected a gate-length mismatch, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

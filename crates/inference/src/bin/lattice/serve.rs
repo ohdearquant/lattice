@@ -1783,10 +1783,19 @@ async fn route_selection(
         })?;
 
     let resident = adapter_client(state)?.adapter_index();
-    // Every trained column, with the gate deciding the weight over them. Top-k would need a number
-    // this decision has no evidence for, and truncating the gate's own distribution is the
-    // opposite of letting it choose. `trained_order` has already required the resident set to
-    // match the artifact's, so this width is always routable.
+    // Every trained column. Top-k would need a number this decision has no evidence for, and
+    // `trained_order` has already required the resident set to match the artifact's, so this width
+    // is always routable.
+    //
+    // What this does NOT do, stated because an earlier version of this comment said the gate
+    // decides the weight here: it does not, and that is ADR-091 decision 1, not an oversight.
+    // Uniform `1/k` is the default until that ADR's evidence gate passes. `ServingRouter::new`
+    // builds the router with `AdapterRouter::new`, whose `WeightPolicy::default()` is `Uniform`,
+    // and no serving path calls `set_weight_policy` — so every selected adapter receives `1.0 / k`
+    // and, with `k` equal to the column count, the gate's scores change neither the selection nor
+    // the weights. A response from this path is therefore the same for any gate, a zeroed one
+    // included, which is what any acceptance run over it can and cannot claim. Turning the softmax
+    // on is ADR-091's evidence gate, not a flag.
     let k = served.with_report(|report| report.artifact.adapter_names.len());
     served.route(&resident, &context_vector, k)
 }
