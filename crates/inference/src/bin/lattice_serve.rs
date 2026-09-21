@@ -2026,7 +2026,27 @@ mod imp {
                 return err_response(StatusCode::BAD_REQUEST, err.message(), err.code());
             }
         };
-        if let Err(err) = s.jobs.validate_lora(&req.lora) {
+        // Same resolver as the other binary, for the same reason: these two read
+        // the raw field differently today, and this binary had no request-boundary
+        // `validate_scales` at all — a non-finite scale reached the worker and was
+        // refused inside `apply` instead. Both reject it either way; routing it
+        // through the shared resolver makes them reject it at the same place.
+        let requested = lattice_inference::serve::lora::requested_adapters(req.lora.clone());
+        if let Err(err) = lattice_inference::serve::lora::validate_scales(requested.selection()) {
+            emit_serve_event(
+                &s.metrics,
+                "POST",
+                "/v1/chat/completions",
+                400,
+                None,
+                None,
+                timer.elapsed().as_secs_f64() * 1000.0,
+                false,
+                Some(err.code()),
+            );
+            return err.into_response();
+        }
+        if let Err(err) = s.jobs.validate_lora(requested.selection()) {
             emit_serve_event(
                 &s.metrics,
                 "POST",
@@ -2132,28 +2152,29 @@ mod imp {
         // first-event peek (`rx.recv()` returning `None`) and report
         // identically to this binary's prior up-front `jobs.send(..).is_err()`
         // check.
-        let mut rx = match s
-            .jobs
-            .submit_with_lora(messages, cfg, cancel_rx, req.lora.clone())
-        {
-            Ok(rx) => rx,
-            Err(api_err) => {
-                let code = api_err.code();
-                let response = api_err.into_response();
-                emit_serve_event(
-                    &s.metrics,
-                    "POST",
-                    "/v1/chat/completions",
-                    response.status().as_u16(),
-                    None,
-                    None,
-                    timer.elapsed().as_secs_f64() * 1000.0,
-                    false,
-                    Some(code),
-                );
-                return response;
-            }
-        };
+        let mut rx =
+            match s
+                .jobs
+                .submit_with_lora(messages, cfg, cancel_rx, requested.selection().to_vec())
+            {
+                Ok(rx) => rx,
+                Err(api_err) => {
+                    let code = api_err.code();
+                    let response = api_err.into_response();
+                    emit_serve_event(
+                        &s.metrics,
+                        "POST",
+                        "/v1/chat/completions",
+                        response.status().as_u16(),
+                        None,
+                        None,
+                        timer.elapsed().as_secs_f64() * 1000.0,
+                        false,
+                        Some(code),
+                    );
+                    return response;
+                }
+            };
         // Dropped when nobody cares about the response anymore: at the end of
         // this SSE stream (moved in below) or at the end of this function for
         // the non-streaming branch. Either way that's the client disconnect

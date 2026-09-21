@@ -595,8 +595,21 @@ Select adapters on either streaming or non-streaming `/v1/chat/completions`:
 }
 ```
 
-Omitting `lora`, or sending an empty array, selects the base model even when
-adapters are resident. Each scale multiplies that adapter's alpha/rank scale;
+The `lora` field has three distinct states, and omitting it is not the same as
+sending an empty array:
+
+| `lora`            | Meaning                                                                                                                                                                             |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| omitted           | Let the server choose, once routing is available. Until then, and on any server without routing enabled, this selects the base model — which is what omitting the field does today. |
+| `[]`              | The base model, pinned. Never routed, whatever the server's routing configuration.                                                                                                  |
+| a non-empty array | Exactly those adapters, in order. Never routed.                                                                                                                                     |
+
+Send `"lora": []` rather than omitting the field if you require the base model
+and want that to keep holding when the server you talk to later enables routing.
+Both spellings select the base model on every server shipping today, so adopting
+`[]` now costs nothing and is not a behaviour change.
+
+Each scale multiplies that adapter's alpha/rank scale;
 scales are not normalized and may be negative or zero. Nonfinite scales and
 unknown identifiers return 400; a missing-id message names the identifier.
 Each identifier may appear only once. A repeated identifier returns 400

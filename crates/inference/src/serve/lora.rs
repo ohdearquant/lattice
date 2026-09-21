@@ -101,6 +101,65 @@ pub struct LoraSelection {
     pub scale: f32,
 }
 
+/// What a request asked for in its `lora` field (ADR-094, amended 2026-09-21).
+///
+/// The wire field is `Option<Vec<LoraSelection>>` so that an absent field and an
+/// explicit `[]` stay distinguishable after deserialization. Under a bare `Vec`
+/// with `#[serde(default)]` they are the same value, which leaves no way to spell
+/// "choose for me" — the same problem `ChatRequest.model` already solves with
+/// `Option<String>` for the same stated reason.
+///
+/// Both serving binaries resolve the field through [`requested_adapters`] rather
+/// than reading it themselves. That is deliberate: the two of them handled the
+/// raw field differently, and one shared resolver removes the copy that could
+/// drift instead of leaving two to keep in step.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum RequestedAdapters {
+    /// The field was absent. Route, when routing is enabled; the base model when
+    /// it is not — which is what omitting the field does today.
+    Unspecified,
+    /// The field was an explicit `[]`: the base model, pinned, never routed.
+    ///
+    /// This case exists so that enabling routing cannot change what an existing
+    /// caller gets. A client sending `"lora": []` today to pin the base model
+    /// keeps the base model afterwards, rather than silently starting to receive
+    /// adapter output because an operator turned a flag on elsewhere.
+    PinnedBase,
+    /// An explicit non-empty list: exactly this mixture, never routed.
+    Explicit(Vec<LoraSelection>),
+}
+
+impl RequestedAdapters {
+    /// The selection to apply as things stand, before any routing runs.
+    ///
+    /// `Unspecified` and `PinnedBase` are both empty here and that is correct
+    /// TODAY, when no router exists — it is what makes this change behaviour
+    /// preserving. They are not interchangeable: routing replaces the
+    /// `Unspecified` arm and must leave `PinnedBase` alone, which is why they are
+    /// separate variants rather than one emptiness test.
+    pub fn selection(&self) -> &[LoraSelection] {
+        match self {
+            Self::Unspecified | Self::PinnedBase => &[],
+            Self::Explicit(selection) => selection,
+        }
+    }
+
+    /// Whether routing may choose for this request.
+    pub fn is_routable(&self) -> bool {
+        matches!(self, Self::Unspecified)
+    }
+}
+
+/// Classify a request's `lora` field into its three states.
+pub fn requested_adapters(field: Option<Vec<LoraSelection>>) -> RequestedAdapters {
+    match field {
+        None => RequestedAdapters::Unspecified,
+        Some(selection) if selection.is_empty() => RequestedAdapters::PinnedBase,
+        Some(selection) => RequestedAdapters::Explicit(selection),
+    }
+}
+
 /// Metadata for one resident adapter; contains no weights.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AdapterMetadata {

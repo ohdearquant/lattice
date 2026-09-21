@@ -1083,10 +1083,16 @@ async fn chat_completions_with_request(
     State(state): State<AppState>,
     req: ChatCompletionRequest,
 ) -> Result<Response, ApiError> {
-    lattice_inference::serve::lora::validate_scales(&req.lora)?;
-    if !req.lora.is_empty() {
+    // Resolved ONCE here, upstream of every branch below, so the two submit
+    // sites in this handler and the two `registry.apply` sites in the worker all
+    // read one value. ADR-094's amendment splits the field into three states;
+    // resolving per branch would reintroduce the sibling-path drift the shared
+    // resolver exists to remove.
+    let requested = lattice_inference::serve::lora::requested_adapters(req.lora.clone());
+    lattice_inference::serve::lora::validate_scales(requested.selection())?;
+    if !requested.selection().is_empty() {
         #[cfg(all(target_os = "macos", feature = "metal-gpu"))]
-        adapter_client(&state)?.validate_lora(&req.lora)?;
+        adapter_client(&state)?.validate_lora(requested.selection())?;
         #[cfg(not(all(target_os = "macos", feature = "metal-gpu")))]
         return Err(adapter_unsupported_build());
     }
@@ -1234,11 +1240,11 @@ async fn chat_completions_with_request(
                     chat_messages,
                     gen_cfg,
                     cancel_rx,
-                    req.lora.clone(),
+                    requested.selection().to_vec(),
                 )?;
                 // An unload queued ahead of this job can invalidate the HTTP
                 // snapshot. Resolve the worker's rejection before committing SSE.
-                let first = if req.lora.is_empty() {
+                let first = if requested.selection().is_empty() {
                     None
                 } else {
                     use lattice_inference::serve::metal_worker::WorkerEvent;
@@ -1425,7 +1431,7 @@ async fn chat_completions_with_request(
                     chat_messages,
                     gen_cfg,
                     cancel,
-                    req.lora.clone(),
+                    requested.selection().to_vec(),
                 )?;
                 MetalHandle::drain(&mut rx, None, |_delta| true)
                     .await
