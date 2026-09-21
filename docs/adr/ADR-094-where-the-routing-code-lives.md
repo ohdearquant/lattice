@@ -68,6 +68,43 @@ request's response metadata, and it reports which of the three cases above occur
 Every JSON body that parses today still parses. The change is Rust-side: absent stays absent, `[]`
 stays `[]`, and only the type can now tell them apart.
 
+_Amended again 2026-09-21, re-reading this decision against the tree before wiring it._ The
+mechanism holds — `EmbeddingModel::embed_text` returns the vector, `AppState` already carries the
+model as an `Option`, and `ApiError::EmbeddingModelNotLoaded` is the refusal this decision asks
+for. What does not hold is the sentence "the gate was trained on that representation, so this
+reuses it as trained". Nothing records which representation, and nothing checks it. Two gaps, and
+they are not the same gap.
+
+**The width is checkable and is currently checked in the wrong place.** `AdapterRouter::route`
+compares the context vector's length against the gate's input width and returns
+`InputSizeMismatch` — per request, at serve time. Both halves are in hand at startup:
+`Network::num_inputs` on the loaded gate and `EmbeddingModel::dimensions`. So a gate trained on one
+checkpoint's hidden size, loaded against another's, starts cleanly, reports `"enabled": true` from
+`GET /v1/lora`, and fails every routed request. That is a behaviour change arriving a long way from
+its cause, which is the shape this decision and ADR-095 decision 6 both refuse. **The comparison
+moves to startup and refuses there**, naming both widths, on ADR-095 decision 6's argument: it
+makes "routing is configured" and "routing can run" the same question, answered once, while the
+operator can still act on it. The per-request check stays as the backstop it already is.
+
+**The pooling strategy is not checkable at all today, and the width check cannot stand in for it.**
+`embed_text` takes a `PoolingStrategy`, and the two variants — `MeanVisualTokens` and `LastToken` —
+produce different vectors from the same text. Both produce vectors of the same length, because the
+dimension is the checkpoint's hidden size either way. So a gate trained under one pooling and
+served under the other passes the width check, passes every check in decision 2, and routes
+confidently on a representation it was never trained on. There is no error anywhere, and the only
+symptom is worse adapter selection, which is indistinguishable from a gate that simply did not
+learn much.
+
+This is decision 2's amendment one level out, and it takes decision 2's answer: **the artifact
+records the representation it was trained on — the embedding model's identity and the pooling
+strategy — and the façade refuses when the server's differs.** The same reasoning applies for the
+same reason: an unwritten convention about how two sides encode a vector is unverifiable by
+construction, so the only shape in which a mismatch is detectable at all is one where the artifact
+carries its half of the key. A model identity is weaker evidence than the adapter names (two
+checkpoints can share a name, and fine-tuning changes the representation without changing it), so
+it is a refusal on mismatch and not a warrant of sameness on agreement — which is worth stating
+rather than leaving for a later reader to discover.
+
 **2. The `mixture` gate moves off the call site.** The rule is that a `cfg` never lands on the
 serving call. Either the router module stops being feature-gated, or the serving path acquires a
 gate-free façade whose non-`mixture` build is a compiled-in refusal rather than an absent symbol.
