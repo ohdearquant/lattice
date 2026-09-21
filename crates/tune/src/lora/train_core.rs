@@ -870,6 +870,109 @@ pub fn eval_chain_nll(
     Ok((nll_sum / n.max(1) as f64) as f32)
 }
 
+/// Index of the greatest logit. Ties keep the FIRST index, and no NaN can win a
+/// position: the running best is a VALUE seeded at -inf rather than the element at
+/// the running index, so a NaN never becomes the thing later elements are compared
+/// against. The first draft did compare against `logits[best]`, which loses that
+/// property at exactly one input -- a NaN in position 0 pins `best` at 0 forever,
+/// because every later `v > NaN` is false -- and would have reported token 0 as the
+/// argmax of a diverged row. An all-NaN row has no defensible answer and returns 0.
+/// All of this is pinned by tests; a rewrite to `partial_cmp().unwrap()` would change
+/// the tie rule silently and panic on the degenerate row this survives.
+pub(crate) fn argmax_logit(logits: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, v) in logits.iter().enumerate() {
+        if *v > best_v {
+            best_v = *v;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Fold one sequence's per-position agreements into counts and a verdict.
+///
+/// Returns `(correct, total, sequence_agreed)`. A sequence with NO scored positions
+/// does NOT agree: counting it would let an empty completion raise the score, and
+/// that is the direction which flatters, so it is the direction to refuse.
+pub(crate) fn fold_sequence_agreement(
+    agreements: impl Iterator<Item = bool>,
+) -> (usize, usize, bool) {
+    let mut correct = 0usize;
+    let mut total = 0usize;
+    for ok in agreements {
+        total += 1;
+        if ok {
+            correct += 1;
+        }
+    }
+    (correct, total, total > 0 && correct == total)
+}
+
+/// What one scoring pass measured: mean NLL plus two agreement counts.
+///
+/// Named fields rather than a tuple deliberately. Four of the five members are
+/// `usize` and two of them are a correct-count beside its denominator, so a tuple
+/// lets a caller transpose `positions_correct` with `positions` and get a plausible
+/// ratio out of a silent compile. The numbers end up in a comparison table where
+/// nobody re-derives them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChainScores {
+    pub mean_nll: f32,
+    pub positions_correct: usize,
+    pub positions: usize,
+    pub sequences_correct: usize,
+    pub sequences: usize,
+}
+
+/// Mean NLL plus teacher-forced agreement over the same forward passes.
+///
+/// The agreement is TEACHER-FORCED: at each masked completion position the
+/// argmax of the logits is compared with the gold token, and a sequence counts
+/// as exact only when every one of its positions agrees. It is NOT a free-running
+/// greedy decode, and the two can differ, because a free run conditions on its own
+/// earlier tokens while this conditions on the gold ones. The distinction is stated
+/// here rather than in a caller because the number is going into a comparison table
+/// where the label is all anyone will read.
+pub fn eval_chain_scores(
+    caches: &[SeqCtx],
+    layers: &[LayerW<'_>],
+    loras: &[LoraParams],
+    gdn_loras: &[GdnLoraParams],
+    head: &Head<'_>,
+    train: &TrainCtx<'_>,
+) -> Result<ChainScores> {
+    let mut nll_sum = 0.0f64;
+    let mut n = 0usize;
+    let mut pos_ok = 0usize;
+    let mut seq_ok = 0usize;
+    for ctx in caches {
+        let fwd = forward_full(ctx, layers, loras, gdn_loras, head, train)?;
+        for p in &fwd.positions {
+            nll_sum += position_nll(&p.logits, p.target) as f64;
+        }
+        // p.target is u32, matching position_nll above; compare in usize.
+        let (correct, total, agreed) = fold_sequence_agreement(
+            fwd.positions
+                .iter()
+                .map(|p| argmax_logit(&p.logits) == p.target as usize),
+        );
+        pos_ok += correct;
+        n += total;
+        if agreed {
+            seq_ok += 1;
+        }
+    }
+    Ok(ChainScores {
+        mean_nll: (nll_sum / n.max(1) as f64) as f32,
+        positions_correct: pos_ok,
+        positions: n,
+        sequences_correct: seq_ok,
+        sequences: caches.len(),
+    })
+}
+
 /// Compute reverse-mode NLL and gradients for the assembled tape.
 /// Returns separate GQA and GDN slot gradients; either collection may be empty.
 /// See [`docs/lora-core.md`](../../docs/lora-core.md#nll_and_grads) for reverse-pass ordering.
@@ -1532,6 +1635,70 @@ mod gdn_lora_tests {
         );
         // Untouched (zero-grad) arrays stay at their zero init.
         assert!(gdn_loras[0].a_z.iter().all(|&v| v == 0.0));
+    }
+}
+
+#[cfg(test)]
+mod agreement_tests {
+    use super::{argmax_logit, fold_sequence_agreement};
+
+    #[test]
+    fn argmax_picks_the_greatest_and_keeps_the_first_of_a_tie() {
+        assert_eq!(argmax_logit(&[0.1, 0.9, 0.3]), 1);
+        assert_eq!(argmax_logit(&[5.0]), 0);
+        assert_eq!(argmax_logit(&[-3.0, -1.0, -7.0]), 1);
+        // Ties keep the FIRST index. A rewrite to `max_by(partial_cmp)` returns the
+        // LAST on a tie, which would silently move every tied position's verdict.
+        assert_eq!(argmax_logit(&[2.0, 2.0, 1.0]), 0);
+        assert_eq!(argmax_logit(&[1.0, 2.0, 2.0]), 1);
+        assert_eq!(argmax_logit(&[0.0, 0.0, 0.0]), 0);
+    }
+
+    #[test]
+    fn a_nan_never_wins_and_never_panics() {
+        // Every comparison against NaN is false, so `>` can neither promote the NaN
+        // nor be promoted past it. This is the degenerate input a diverged adapter
+        // actually produces, and the obvious `partial_cmp().unwrap()` rewrite panics
+        // on it instead of scoring the run.
+        assert_eq!(argmax_logit(&[f32::NAN, 1.0, 2.0]), 2);
+        assert_eq!(argmax_logit(&[1.0, f32::NAN, 2.0]), 2);
+        assert_eq!(argmax_logit(&[2.0, 1.0, f32::NAN]), 0);
+        // All-NaN has no defensible answer; it must still return, not panic.
+        assert_eq!(argmax_logit(&[f32::NAN, f32::NAN]), 0);
+    }
+
+    #[test]
+    fn a_sequence_agrees_only_when_every_scored_position_agrees() {
+        assert_eq!(
+            fold_sequence_agreement([true, true, true].into_iter()),
+            (3, 3, true)
+        );
+        assert_eq!(
+            fold_sequence_agreement([true, false, true].into_iter()),
+            (2, 3, false)
+        );
+        assert_eq!(
+            fold_sequence_agreement([false, false].into_iter()),
+            (0, 2, false)
+        );
+        // One disagreement at the very end still sinks the sequence: the rule is
+        // every position, not most of them.
+        assert_eq!(
+            fold_sequence_agreement([true, true, false].into_iter()),
+            (2, 3, false)
+        );
+    }
+
+    #[test]
+    fn an_empty_sequence_does_not_agree() {
+        // The flattering reading of "all positions agreed" is vacuously true on an
+        // empty completion. If this ever returns true, an adapter that emits nothing
+        // scores a perfect sequence rate, which is the failure that would read as a
+        // result rather than as a bug.
+        assert_eq!(
+            fold_sequence_agreement(std::iter::empty::<bool>()),
+            (0, 0, false)
+        );
     }
 }
 

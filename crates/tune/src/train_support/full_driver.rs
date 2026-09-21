@@ -9,9 +9,10 @@ use rayon::prelude::*;
 
 use crate::lora::AdamState;
 use crate::lora::train_core::{
-    AdamConfig, Dims, GdnDims, GdnLoraParams, GdnModuleSelection, Head, LayerW, LoraParams,
-    MixerKind, SeqCtx, SlotLayout, TOP_LAYER, TapeGeometry, TrainCtx, apply_adam_updates,
-    apply_gdn_adam_updates, eval_chain_nll, forward_full, nll_and_grads, rand_fill, shifted,
+    AdamConfig, ChainScores, Dims, GdnDims, GdnLoraParams, GdnModuleSelection, Head, LayerW,
+    LoraParams, MixerKind, SeqCtx, SlotLayout, TOP_LAYER, TapeGeometry, TrainCtx,
+    apply_adam_updates, apply_gdn_adam_updates, eval_chain_nll, eval_chain_scores, forward_full,
+    nll_and_grads, rand_fill, shifted,
 };
 
 use super::{Sample, load_jsonl, verify_tbv};
@@ -1240,13 +1241,18 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
 
     let mut adam = AdamState::new();
 
-    let eval_valid = |loras: &[LoraParams],
-                      gdn_loras: &[GdnLoraParams]|
-     -> Result<Option<f32>, Box<dyn std::error::Error>> {
+    // Held-out scoring also reports teacher-forced agreement, because NLL alone
+    // cannot say whether the adapter would emit the right tokens: two adapters can
+    // sit at the same loss and disagree on every argmax. The counts print beside the
+    // loss rather than replacing it; `eval_chain_scores` documents what the word
+    // "exact" means here and what it does not.
+    let eval_valid_scores = |loras: &[LoraParams],
+                             gdn_loras: &[GdnLoraParams]|
+     -> Result<Option<ChainScores>, Box<dyn std::error::Error>> {
         if valid_caches.is_empty() {
             return Ok(None);
         }
-        Ok(Some(eval_chain_nll(
+        Ok(Some(eval_chain_scores(
             &valid_caches,
             &layers,
             loras,
@@ -1254,6 +1260,11 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
             &head,
             &train_ctx,
         )?))
+    };
+    let eval_valid = |loras: &[LoraParams],
+                      gdn_loras: &[GdnLoraParams]|
+     -> Result<Option<f32>, Box<dyn std::error::Error>> {
+        Ok(eval_valid_scores(loras, gdn_loras)?.map(|s| s.mean_nll))
     };
 
     // These two passes are reported because they are real work that used to print nothing at all.
@@ -1279,7 +1290,12 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     let base_nll = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
     let base_train_secs = tbase_train.elapsed().as_secs_f64();
     let tbase_valid = Instant::now();
-    let base_valid = eval_valid(&loras, &gdn_loras)?;
+    // One pass, both readings. Calling `eval_valid` here and the scorer again below
+    // would buy the agreement counts at the price of a second full held-out pass,
+    // which at the sizes this runs at is the largest single cost outside the step
+    // loop.
+    let base_valid_scores = eval_valid_scores(&loras, &gdn_loras)?;
+    let base_valid = base_valid_scores.map(|s| s.mean_nll);
     let base_valid_secs = tbase_valid.elapsed().as_secs_f64();
     println!(
         "  baseline scoring: train pass {base_train_secs:.1}s, held-out pass {base_valid_secs:.1}s"
@@ -1287,6 +1303,13 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     match base_valid {
         Some(v) => println!("\n  step    0  train NLL: {base_nll:.4}  held-out NLL: {v:.4}"),
         None => println!("\n  step    0  train NLL: {base_nll:.4}"),
+    }
+    if let Some(sc) = base_valid_scores {
+        println!(
+            "  held-out agreement (teacher-forced, not a free-running decode): \
+NLL {:.6}  tokens {}/{}  sequences {}/{}",
+            sc.mean_nll, sc.positions_correct, sc.positions, sc.sequences_correct, sc.sequences
+        );
     }
 
     // THREE CLOCKS, NOT ONE, AND A STEP COST THAT IS READ RATHER THAN DERIVED.
@@ -1350,20 +1373,17 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     }
     let secs = tstep.elapsed().as_secs_f64();
 
-    // steps == 0 leaves the loop with nothing to have scored, so the epilogue still has to. That is
-    // the only path on which this clock is nonzero, and it prints either way so that a reader can
-    // see the redundant pass is gone rather than take it on trust.
-    let mut epilogue_score_secs = 0.0f64;
-    let (final_nll, final_valid) = match last_scored {
-        Some(pair) => pair,
-        None => {
-            let tepi = Instant::now();
-            let n = eval_chain_nll(&caches, &layers, &loras, &gdn_loras, &head, &train_ctx)?;
-            let v = eval_valid(&loras, &gdn_loras)?;
-            epilogue_score_secs = tepi.elapsed().as_secs_f64();
-            (n, v)
-        }
-    };
+    // steps == 0 left the loop with nothing to have scored, and the state it would score is the
+    // state the BASELINE already scored: no step ran, so nothing moved. The epilogue that used to
+    // recompute it paid a full train pass plus a full held-out pass to reproduce a number already
+    // printed, which on an eval-only run is the largest cost in the run. Carry the baseline forward
+    // exactly as the loop carries its last scoring point.
+    //
+    // The old `epilogue_score_secs` clock is gone rather than left printing a constant zero: a
+    // field whose only possible value is the empty one cannot carry the signal its name promises,
+    // and a reader would take the zero for evidence the pass was skipped on paths where it never
+    // ran in the first place.
+    let (final_nll, final_valid) = last_scored.unwrap_or((base_nll, base_valid));
 
     let per_step = if steps > 0 {
         format!("{:.2}s/step", train_step_secs / steps as f64)
@@ -1372,8 +1392,7 @@ pub fn run(config: FullDriverConfig) -> Result<FullDriverOutcome, Box<dyn std::e
     };
     println!(
         "  step loop: {steps} steps in {train_step_secs:.1}s ({per_step}), \
-in-loop scoring {in_loop_score_secs:.1}s over {score_points} point(s), \
-epilogue re-scoring {epilogue_score_secs:.1}s"
+in-loop scoring {in_loop_score_secs:.1}s over {score_points} point(s)"
     );
 
     match (base_valid, final_valid) {
