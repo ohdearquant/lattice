@@ -19,8 +19,11 @@ pub mod loader;
 pub mod manifest;
 pub mod online;
 pub mod optimizer;
+// Moved to `lattice_fann::training::router_update` (ADR-094 decision 3). Re-exported
+// here so `lattice_tune::lora::router_update::*` keeps resolving for existing callers;
+// that those callers compile unmodified is the move's acceptance test.
 #[cfg(feature = "mixture")]
-pub mod router_update;
+pub use lattice_fann::training::router_update;
 #[cfg(feature = "safetensors")]
 mod safetensors;
 #[cfg(feature = "train-backward")]
