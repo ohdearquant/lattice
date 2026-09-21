@@ -23,14 +23,17 @@ Measured on an Apple M4, release build with `metal-gpu,f16`, exclusive bench win
 whole run, against `qwen3.5-0.8b-q4`. Decode runs at 135.5 tok/s, so one token is 7.38 ms. The
 `SWAP_BENCH` output of `bench_lora_mixture` times the three phases separately.
 
-Where that output comes from, stated because it is not reproducible from this ref: the three-phase
-timing was added to `bench_lora_mixture` in `710bae8984`, which is not an ancestor of the branch
-this ADR merges on. At this ref the committed binary emits `BLEND_BENCH` and `DECODE_BENCH` only,
-and a reader who runs it gets the blend column and nothing else. The unload, upload and total
-columns below are real measurements of a binary that exists at `710bae8984` and nowhere in this
-tree. They become reproducible when that commit lands; until then the table carries its ref and
-the reader is told which command does not exist yet, rather than being sent to a marker no source
-file prints. The blend column is reproducible here.
+Where that output comes from. The three-phase timing was added to `bench_lora_mixture` in
+`710bae8984`; the ADR merged ahead of it, so for a window the marker named here existed in no
+committed source and only the blend column was reproducible. It lands with this commit.
+
+Two column headings do not match the marker, and a reader reproducing the table hits both. The
+marker prints `blend_us`, `unload_us`, `load_us` and `iters`. **`upload µs` above is the marker's
+`load_us`** — the same number under the word the surrounding prose uses for it. **`total µs` is not
+emitted at all**: it is the sum of the three timed phases, checked to match every row to the
+tenth of a microsecond. Both are stated rather than silently renamed, because a heading that does
+not appear in the output is indistinguishable, to someone running the command, from a number the
+binary failed to print.
 
 | r | k | blend µs | unload µs | upload µs | total µs | share of one token |
 | - | - | -------: | --------: | --------: | -------: | -----------------: |
