@@ -38,6 +38,36 @@ no embedding model is configured, a request that would route refuses and says so
 back to a default mixture silently, because a silent fallback makes "the router is enabled" and
 "the router ran" indistinguishable at every later reading.
 
+_Amended 2026-09-21._ Wiring decision 1 exposed a question this ADR did not settle: how a request
+asks to be routed at all. `ChatRequest.lora` is `#[serde(default)] pub lora: Vec<LoraSelection>`,
+documented as "omitted or empty selects the base model", and on a `Vec` under `serde(default)` an
+absent field and `"lora": []` deserialize to the identical value. The wire could not express
+"choose for me" as a third state.
+
+The field becomes `Option<Vec<LoraSelection>>`, which is the pattern `ChatRequest.model` four lines
+below it already uses, for the stated reason that an absent field and an explicit empty one "are
+validated differently, so the distinction must survive deserialization". Three states, and each
+means one thing:
+
+- **absent** — route, when routing is enabled; the base model when it is not, which is exactly
+  today's behaviour for every caller that omits the field.
+- **`[]`** — the base model, pinned. Never routed.
+- **an explicit list** — that list. Never routed.
+
+`[]` stays pinned rather than becoming a second spelling of "route", and that is the whole reason
+this is a decision rather than a detail. The cheap alternative was to treat empty as "route": it
+needs no type change, and it would silently start returning adapter output to a client that sends
+`"lora": []` today to pin the base model, at the moment an operator enables routing, with no
+request change and no error anywhere. That is a behaviour change arriving a long way from its
+cause, which is the failure shape decision 1 and ADR-095 decision 6 both refuse.
+
+No second request field is needed to keep "routing was asked for" separable from "routing
+happened": ADR-095 decision 2 already reports the selection a request actually used in that
+request's response metadata, and it reports which of the three cases above occurred.
+
+Every JSON body that parses today still parses. The change is Rust-side: absent stays absent, `[]`
+stays `[]`, and only the type can now tell them apart.
+
 **2. The `mixture` gate moves off the call site.** The rule is that a `cfg` never lands on the
 serving call. Either the router module stops being feature-gated, or the serving path acquires a
 gate-free façade whose non-`mixture` build is a compiled-in refusal rather than an absent symbol.
